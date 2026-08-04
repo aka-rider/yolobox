@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# yolobox-init — everything that must be done before a session starts, and is
+# safe to repeat. The launcher runs this synchronously via `docker exec` on
+# EVERY invocation (before handing off to yolobox-shell or a `-- cmd`), so it
+# must be strictly idempotent and best-effort: a broken step here must never
+# stop a session from starting.
+#
+# `docker exec` does NOT run the image ENTRYPOINT, which is why this exists as
+# a standalone script rather than living in entrypoint.sh. See entrypoint.sh
+# for what still runs as PID 1 (identity export, ssh host key, sshd).
+#
+# Generic by construction: this script sources NO tools/*.sh module and names
+# no tool or harness. It reads exactly the generated manifests
+# tools/install-all.sh wrote at build time -- sourcing the module library here
+# would cost ~25 forks on every single invocation (several modules
+# command-substitute `uname` at source time), and this script sits on the
+# synchronous session path: `yolobox` runs it via `docker exec` before every
+# session starts.
+
+set -uo pipefail
+
+MANIFEST_DIR=/opt/yolobox/manifest
+
+# --- 1. Cache dirs on the /home volume --------------------------------------
+# Cache dirs live on the /home VOLUME. Creating them HERE rather than baking
+# them into the image is deliberate: an empty named volume is seeded from the
+# image exactly ONCE, so a dir added to a future image would never appear in
+# an existing volume. mkdir -p is idempotent and re-runs on every create/start.
+# The dir LIST itself is generated (union of every tools/NN-*.sh's
+# TOOL_HOME_DIRS, bare-relative), not hand-maintained here.
+if [ -f "${MANIFEST_DIR}/home-dirs" ]; then
+    while IFS= read -r d; do
+        [ -n "${d}" ] || continue
+        mkdir -p "${HOME}/${d}" 2>/dev/null || true
+    done < "${MANIFEST_DIR}/home-dirs"
+fi
+
+# --- 2. Per-module runtime seeding ------------------------------------------
+# manifest/seed.sh is generated at build time from every tools/NN-*.sh
+# module's tool_seed() (renamed to tool_seed_<module>, then called -- a bare
+# concatenation of `declare -f` output would emit N definitions of the one
+# name `tool_seed` and execute nothing). Sourcing it here runs every module's
+# seeding WITHOUT this script ever naming a module or sourcing the module
+# library itself.
+if [ -f "${MANIFEST_DIR}/seed.sh" ]; then
+    # shellcheck disable=SC1091
+    source "${MANIFEST_DIR}/seed.sh" || echo "yolobox: seed.sh exited non-zero; continuing" >&2
+fi
+
+exit 0
