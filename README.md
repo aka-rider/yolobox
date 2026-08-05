@@ -126,6 +126,8 @@ replaces that entire stack with a declarative NixOS VM, eliminating the
 manual bootstrap scripts and fragile Docker networking.
 
 limactl version: `limactl version 2.2.0` (bring-up 2026-08-05). Note: lima
->=2.2.0 names the guest home `/home/xiii.guest` — a ".guest" suffix on the
-cidata home dir, unrelated to the account name `xiii` (nixos-lima issue
-#121) — every VM-side path in this repo already accounts for it.
+>=2.1.0 renamed the guest home from `/home/${USER}.linux` to
+`/home/${USER}.guest` (lima-vm/lima#4578), so the guest home here is
+`/home/xiii.guest` — a ".guest" suffix on the cidata home dir, unrelated to
+the account name `xiii` — every VM-side path in this repo already accounts
+for it.
