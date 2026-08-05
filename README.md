@@ -24,8 +24,8 @@ Three host couplings ride SSH:
    host; the VM never sees a private key. Present on both `enter` and `ssh`.
 2. **herdr socket RemoteForward** — the host's herdr socket is forwarded
    INTO the VM, so in-VM harness hooks can report each agent as
-   `yolobox:<agent>` back to the host herd. Present only on `./yolobox2
-   enter`; `./yolobox2 ssh` carries no herd wiring.
+   `yolobox:<agent>` back to the host herd. Present only on
+   `./yolobox2 enter`; `./yolobox2 ssh` carries no herd wiring.
 3. **Your terminal** — the interactive shell you use to reach the VM.
 
 This keeps the blast radius bounded: a compromised agent can only act within
