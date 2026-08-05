@@ -1,158 +1,125 @@
-# yolobox
+# yolobox v2
 
-A Docker **blast-radius devbox** for running AI coding agents (Claude Code, opencode,
-Crush, pi) against **one** project directory, with your host's passwd, secrets, and
-home directory withheld — while still letting agents show up in host
-[herdr](https://herdr.dev) and `git push` through the host **1Password SSH agent**
-with no private key ever entering the box.
-
-> **"Airgapped" here means credential and host isolation, not no-network.** Agents get
-> outbound HTTPS; they don't get your shell environment, your real `~`, your SSH keys,
-> or root.
-
----
+A single NixOS VM running on Mac via Lima (Apple Virtualization.framework),
+serving as a blast-radius devbox for AI coding agents. The VM is the trust
+boundary: every agent tool, every MCP server, every language toolchain lives
+inside it, and the entire system is declared end-to-end by the Nix flake in
+this repository. The VM rebuilds itself from this repo via
+`nixos-rebuild switch --flake`, meaning no Nix installation is required on
+macOS — the host is purely a hypervisor and file bridge.
 
 ## Isolation model
 
-| Withheld from the box | Given to the box |
-|---|---|
-| Your real host `~` / home directory | One project dir, mounted read-write at `/work` |
-| `/etc/shadow`, host passwd entries | Your uid:gid (files you create are owned by you on the host) |
-| `SECRET_*`, `*_TOKEN`, `*_KEY`, `*_PASSWORD` env, including any agent API key | A tiny env allowlist: `TERM`, `COLORTERM`, `LANG`, plus herdr/ssh vars |
-| root / sudo / new privileges (`--cap-drop=ALL`, `no-new-privileges`) | Non-root user, **your host username**, login zsh |
-| Any private SSH key | 1Password **agent socket** only (protocol crosses, key stays in 1Password) |
-| Your host's package caches / config | Its own `/usr/local`, writable and yours to install into (`/opt` stays root-owned) |
+There are zero host mounts. Git is the only file bridge between macOS and
+the VM. The VM runs as a single user, `xiii`, and the directory
+`~/wrk/<project>` inside the VM mirrors the host's project layout.
 
-One container per workdir, persistent across runs. `HOME` lives on a dedicated
-Docker named volume, `yolobox-home` — not your real `~` — so the box keeps its own
-agent logins and caches across runs *and* container recreation. `--stop` stops it,
-`--destroy` removes it (home volume untouched), `--diff` shows what changed,
-`--list` lists every box.
+No private SSH key ever enters the VM. `git push` works through SSH agent
+forwarding of the host's 1Password agent, which means unattended pushes are
+impossible by design — there is no key material on disk to steal.
 
----
+All three host couplings ride a single SSH session:
 
-## Quickstart
+1. **1Password agent forward** — pushes authenticate through 1Password on the
+   host; the VM never sees a private key.
+2. **herdr socket RemoteForward** — agent sockets are forwarded back to the
+   host so the host herd reports each agent as `yolobox:<agent>`.
+3. **Your terminal** — the interactive shell you use to reach the VM.
 
-```bash
-# Drop into a login shell in the box, pointed at a project:
-./yolobox -w ~/Developer/myproject
+This keeps the blast radius bounded: a compromised agent can only act within
+the VM and can only push out through the forwarded 1Password session, which
+requires your active unlock.
 
-# Run a one-shot agent instead of an interactive shell:
-./yolobox -w ~/Developer/myproject -- claude
+## Layers
 
-# Force a rebuild of the image (e.g. after editing tools/ or the Dockerfile):
-./yolobox -w ~/Developer/myproject --build
+The NixOS configuration is structured into three logical layers, each
+expressed as a system module:
 
-# See what an agent installed ad hoc, then tear the container down:
-./yolobox -w ~/Developer/myproject --diff
-./yolobox -w ~/Developer/myproject --destroy
-```
+- **Base** — zsh, git, helix, sshd, nix-ld, and the essential CLI tools that
+  every session needs.
+- **Podman** — rootless podman with a docker-compatible CLI and API socket,
+  enabling container work without root privileges.
+- **Agentic** — the AI coding agents (claude-code, opencode, crush, pi) and
+  herdr, all pulled from nixpkgs with a per-harness version-override valve
+  so you can pin individual agents without forking the flake. MCP servers
+  are declared once in Nix and rendered per-harness automatically.
 
-Install something ad hoc inside the box (`npm install -g`, `cargo install`, …), use
-`--diff` from the host to see what changed, then promote anything worth keeping into
-a `tools/NN-name.sh` module (see `tools/README.md`) so it survives `--destroy`.
+Per-language toolchains are intentionally **not** system packages. They live
+as dev-shell fragments (`rust`, `python`, `node`, `go`, `cxx`, `postgres`)
+composed per-project via `yolobox.lib.shell [ ... ]` and activated through
+direnv. This keeps the base VM small and lets each project pull only the
+toolchains it actually needs.
 
-### Flags
+## Bootstrap
 
-| Flag | Meaning |
-|---|---|
-| `-w <dir>` | **Mandatory** (except `--list`). Mounted rw at `/work`. Must be under a Docker-shared root. |
-| `--ssh` | Forward the host 1Password SSH agent (see below). |
-| `--build` | Rebuild `yolobox:local` even if it already exists. |
-| `--yes` | Recreate an out-of-date box without the confirmation prompt. |
-| `--keep` | Abort instead of recreating an out-of-date box. |
-| `--stop` | Stop the box's container and exit. |
-| `--destroy` | Print `docker diff`, then remove the box's container and exit. Confirms unless `--yes`. |
-| `--diff` | Print `docker diff` for the box's container and exit. |
-| `--list` | List every yolobox container and exit. Doesn't need `-w`. |
-| `-- <cmd...>` | Command to run instead of the default handoff. |
-
-With no `--`, the box starts **herdr** — its own multiplexer, using your seeded
-config — or a login shell if there's no TTY or you launched from a host herd pane
-(herd refuses to nest).
-
-No API keys are ever forwarded. Log agents in inside the box; credentials persist
-in the `yolobox-home` volume across runs. `YOLOBOX_HOME_VOLUME` overrides the
-volume name (default `yolobox-home`) — use a distinct one for an untrusted run.
-
----
-
-## Requirements
-
-- **Docker Desktop for macOS.**
-- **Docker file sharing** must cover your project dirs (Settings → Resources → File
-  Sharing) — yolobox hard-fails `-w` with a clear message otherwise.
-- **1Password** with the SSH agent enabled, for `--ssh` (one-time host setup below).
-
-### 1Password one-time host setup
-
-Needs a full Docker Desktop restart. Docker Desktop is launched by `launchd` and
-ignores your shell environment, so its SSH bridge only reaches 1Password if you
-point `launchctl`'s `SSH_AUTH_SOCK` at the 1Password agent socket **and then fully
-restart Docker Desktop**:
+Get the VM running for the first time with these steps:
 
 ```bash
-launchctl setenv SSH_AUTH_SOCK "$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
-# then: fully quit and reopen Docker Desktop (not just a window — the whole app)
+# 1. Install Lima via Homebrew
+brew install lima
+
+# 2. Start the VM (creates it from the Lima YAML config)
+limactl start --name yolobox --yes lima/yolobox.yaml
+
+# 3. One-time in-VM git init and push to your remote
+limactl shell yolobox sudo -u xiii bash -c '
+  cd ~/wrk && git init yolobox &&
+  cd yolobox && git remote add origin <your-remote-url> &&
+  git add . && git commit -m "initial" &&
+  git push -u origin main
+'
+
+# 4. Build the NixOS configuration inside the VM and reboot
+limactl shell yolobox sudo nixos-rebuild boot --flake .#yolobox
+limactl restart yolobox
 ```
 
-Persist it across reboots with a LaunchAgent.
+After the restart the VM is running the declarative configuration. From now
+on, changes to the flake are applied with
+`nixos-rebuild switch --flake .#yolobox`.
 
-**Touch ID:** expect one approval per session the first time a key is used. Set a
-time-window grant in 1Password to avoid repeated prompts.
+## Daily use
 
-**Commit signing:** set `gpg.format=ssh` and `user.signingkey=<literal public key>`
-in the box, and remove any `op-ssh-sign` program line — the forwarded agent signs
-directly.
+```bash
+# Start or ensure the VM is running
+./yolobox2 up
 
----
+# Open an interactive SSH session
+./yolobox2 ssh
 
-## herdr integration
+# Add a "yolobox" git remote to a host project, mirrored to the same path
+# inside the VM. Push from the VM works to the checked-out branch.
+./yolobox2 link
 
-The box runs an unprivileged, loopback-only sshd; the **host** opens an *outbound*
-reverse tunnel into it, authenticated by your 1Password key — the host never
-listens. Claude Code hooks baked into the image report through that tunnel under
-the source `yolobox:claude`, so `herdr agent list` shows the box's claude live
-beside your other agents.
-
-Bind a key so a pane launches yolobox with the right env automatically:
-
-```toml
-[[keys.command]]
-key = "prefix+alt+y"
-type = "pane"
-command = "/path/to/yolobox -w . -- claude"
+# Seed herdr with the current agent configuration
+./yolobox2 seed-herdr
 ```
 
-`herdr:claude` is reserved for herd's own process detection, which a container
-never satisfies (its foreground process is `docker`) — reporting under
-`yolobox:claude` instead is what makes the boxed agent's status show up at all.
+## Backups and snapshots
 
----
+The vz backend used by Lima has **no snapshot support**. Uncommitted work
+exists only on the VM disk and is lost if the disk is destroyed. Mitigate
+this by pushing to your Mac or to your git remotes regularly — from the VM
+side, use `git push` to your origin, or have the Mac pull from the VM's
+working tree. Treat the VM as rebuildable cattle and the git remotes as the
+durable state. If you need a point-in-time copy of the disk, export it
+manually before any destructive operation.
 
-## Tools & MCP
+## Editors
 
-Everything installable in the image — a CLI tool, a runtime, an agent harness, an
-MCP server — is a single self-describing shell module: one `tools/NN-name.sh` file
-per tool, one `mcp/<name>.json` fragment per server. Adding either is a one-file
-change. Full contracts: [`tools/README.md`](tools/README.md) and
-[`mcp/README.md`](mcp/README.md).
+**Zed over SSH** works well because its remote server is a static musl
+binary. However, Zed-downloaded language servers do **not** work on NixOS:
+Zed strips the environment when spawning them, and nix-ld cannot rescue the
+missing dynamic linker context. Use the dev-shell-provided LSPs instead,
+configured in your helix or zed settings.
 
-Not every harness can report its agent's live state into herdr — each harness
-module declares its own support (`TOOL_REPORT`), and the module is the source of
-truth.
+**VS Code Remote-SSH** works through nix-ld, which allows the VS Code server
+and its extensions to resolve NixOS dynamic libraries correctly.
 
----
+## History
 
-## What is NOT isolated
+The Docker/bash yolobox v1 lives at commit `4c154fc`. The v2 architecture
+replaces that entire stack with a declarative NixOS VM, eliminating the
+manual bootstrap scripts and fragile Docker networking.
 
-- **`/work` is read-write** — agents can modify, create, and delete anything there,
-  and those changes are real on your host.
-- **The `yolobox-home` volume is durable** — it carries the box's own agent logins
-  and caches across runs and container recreation.
-- **Network is full outbound** — agents can reach the internet.
-- **`/usr/local` is writable** and survives until `--destroy` or config-driven
-  recreation.
-- **MCP config integrity, not binary integrity** — the rendered MCP configs are
-  immutable to the box, but the binaries they point at live under the writable
-  `/usr/local` and are not.
+limactl version: _recorded at bring-up_
