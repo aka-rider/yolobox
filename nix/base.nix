@@ -30,9 +30,7 @@
 
   services.openssh.enable = true;
   services.openssh.settings = {
-    # Space-separated string form: NixOS's AcceptEnv under settings
-    # is safest passed as sshd_config natively accepts it, not a list.
-    AcceptEnv = "YOLOBOX_HERD HERDR_PANE_ID HERDR_SOCKET_PATH";
+    AcceptEnv = [ "YOLOBOX_HERD" "HERDR_PANE_ID" "HERDR_SOCKET_PATH" ];
     StreamLocalBindUnlink = "yes";
   };
 
