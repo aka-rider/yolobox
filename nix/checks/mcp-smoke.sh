@@ -32,8 +32,6 @@ failed=""
 while IFS=$'\t' read -r cfg_path format; do
     [ -n "${cfg_path}" ] || continue
 
-    # Normalize every format to one compact JSON object per server:
-    # {name, command, args, env}.
     case "${format}" in
         mcpServers) servers_filter='.mcpServers | to_entries[] | {name: .key, command: .value.command, args: (.value.args // []), env: (.value.env // {})}' ;;
         crush)      servers_filter='.mcp | to_entries[] | {name: .key, command: .value.command, args: (.value.args // []), env: (.value.env // {})}' ;;
