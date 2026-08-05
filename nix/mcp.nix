@@ -2,7 +2,7 @@
 let
   cfg = config.yolobox.mcp.servers;
   homeDir = config.users.users.xiii.home;
-  homeTmpfiles = import ./lib/home-tmpfiles.nix { inherit lib; };
+  homeTmpfiles = import ./lib/home-tmpfiles.nix;
 
   serverType = lib.types.submodule {
     options = {
@@ -21,14 +21,11 @@ let
     };
   };
 
-  # Canonical Claude/pi shape is the option set itself.
-  mcpServers = cfg;
-
   # crush: near 1:1 with the canonical shape, under "mcp" plus its own
   # top-level $schema.
   crushConfig = {
     "$schema" = "https://charm.land/crush.json";
-    mcp = mcpServers;
+    mcp = cfg;
   };
 
   # opencode: argv-merged (command + args into one array) and env renamed to
@@ -52,7 +49,7 @@ let
     { path = "/etc/yolobox/mcp/opencode.json"; format = "opencode"; }
   ];
 
-  rendered = builtins.toJSON mcpServers + builtins.toJSON crushConfig + builtins.toJSON opencodeConfig;
+  rendered = builtins.toJSON cfg + builtins.toJSON crushConfig + builtins.toJSON opencodeConfig;
 
   mcpSmoke = pkgs.writeShellApplication {
     name = "yolobox-mcp-smoke";
@@ -82,8 +79,8 @@ in
       }
     ];
 
-    environment.etc."claude-code/managed-mcp.json".text = builtins.toJSON { mcpServers = mcpServers; };
-    environment.etc."yolobox/mcp/pi.json".text = builtins.toJSON { mcpServers = mcpServers; };
+    environment.etc."claude-code/managed-mcp.json".text = builtins.toJSON { mcpServers = cfg; };
+    environment.etc."yolobox/mcp/pi.json".text = builtins.toJSON { mcpServers = cfg; };
     environment.etc."yolobox/mcp/crush.json".text = builtins.toJSON crushConfig;
     environment.etc."yolobox/mcp/opencode.json".text = builtins.toJSON opencodeConfig;
     environment.etc."yolobox/mcp/manifest.json".text = builtins.toJSON manifest;

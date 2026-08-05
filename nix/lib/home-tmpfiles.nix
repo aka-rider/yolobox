@@ -1,4 +1,3 @@
-{ lib }:
 # Shared tmpfiles pattern for placing a file under a user's $HOME without
 # home-manager (plan Gotcha 14). "d" rules must own every parent directory
 # as the target user first — otherwise tmpfiles auto-creates them
