@@ -21,6 +21,11 @@ let
     # server that answers but rejects the call (e.g. a protocol mismatch)
     # is different: it is appended to a guest-side log instead of being
     # thrown away.
+    # "Never disturb the agent" is a bound on TIME as well as exit status:
+    # the herdr CLI waits indefinitely on a socket that accepts but never
+    # answers (reproduced by pointing HERDR_SOCKET_PATH at any non-herdr
+    # socket), and these run as blocking Claude Code hooks, so every call is
+    # capped by `timeout`.
     text = ''
       state="''${1:-}"
       agent="''${2:-}"
@@ -34,6 +39,8 @@ let
       # key off the state argument instead, so drain it — but only when
       # stdin isn't a TTY, or a manual invocation would block forever.
       [ -t 0 ] || cat >/dev/null 2>&1 || true
+
+      report_timeout=5
 
       log_rejection() {
           [ -n "''${HOME:-}" ] || return 0
@@ -55,13 +62,13 @@ let
 
       case "''${state}" in
           release)
-              if ! out=$(herdr pane release-agent "''${HERDR_PANE_ID}" \
+              if ! out=$(timeout "''${report_timeout}" herdr pane release-agent "''${HERDR_PANE_ID}" \
                       --source "yolobox:''${agent}" --agent "''${agent}" 2>&1); then
                   log_rejection "release ''${agent}: ''${out}"
               fi
               ;;
           working|idle|blocked)
-              if ! out=$(herdr pane report-agent "''${HERDR_PANE_ID}" \
+              if ! out=$(timeout "''${report_timeout}" herdr pane report-agent "''${HERDR_PANE_ID}" \
                       --source "yolobox:''${agent}" --agent "''${agent}" --state "''${state}" 2>&1); then
                   log_rejection "''${state} ''${agent}: ''${out}"
               fi
