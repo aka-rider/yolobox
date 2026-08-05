@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# yolobox2 — thin Mac-side CLI for the NixOS-VM yolobox (lima/vz).
+#
+# Usage:
+#   yolobox2 up|down|status
+#   yolobox2 ssh [cmd...]
+#   yolobox2 link
+#   yolobox2 seed-herdr
+
+set -euo pipefail
+
+readonly INSTANCE="yolobox"
+readonly VM_HOST="lima-yolobox"
+readonly VM_USER_HOME="/home/xiii"
+SSH_CFG="$HOME/.lima/yolobox/ssh.config"
+OP_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+readonly SSH_CFG OP_SOCK
+
+# Script dir resolution (symlink-safe, no readlink -f).
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -h "${SCRIPT_SOURCE}" ]; do
+    dir="$(cd -P "$(dirname "${SCRIPT_SOURCE}")" >/dev/null 2>&1 && pwd)"
+    SCRIPT_SOURCE="$(readlink "${SCRIPT_SOURCE}")"
+    case "${SCRIPT_SOURCE}" in
+        /*) ;; # absolute
+        *) SCRIPT_SOURCE="${dir}/${SCRIPT_SOURCE}" ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${SCRIPT_SOURCE}")" >/dev/null 2>&1 && pwd)"
+readonly SCRIPT_DIR
+
+usage() {
+    cat >&2 <<EOF
+Usage:
+  yolobox2 up|down|status
+  yolobox2 ssh [cmd...]
+  yolobox2 link
+  yolobox2 seed-herdr
+EOF
+}
+
+cmd_up() {
+    if limactl list -q | grep -qx "${INSTANCE}"; then
+        limactl start --yes "${INSTANCE}"
+    else
+        limactl start --name "${INSTANCE}" --yes "${SCRIPT_DIR}/lima/yolobox.yaml"
+    fi
+}
+
+cmd_down() {
+    limactl stop "${INSTANCE}"
+}
+
+cmd_status() {
+    limactl list "${INSTANCE}"
+}
+
+cmd_ssh() {
+    ARGS=(-F "${SSH_CFG}" -o IdentityAgent="${OP_SOCK}" -o ForwardAgent=yes -t)
+    if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] \
+        && [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ]; then
+        ARGS+=(
+            -R "${VM_USER_HOME}/.herdr-host.sock:${HERDR_SOCKET_PATH}"
+            -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${VM_USER_HOME}/.herdr-host.sock"
+        )
+    fi
+    ARGS+=("${VM_HOST}")
+    exec ssh "${ARGS[@]}" "${@+"$@"}"
+}
+
+# Resolve $1 relative to a base dir via cd+pwd -P; empty on failure.
+relative_to() {
+    base_real="$(cd -P "$1" 2>/dev/null && pwd)" || return 1
+    target_real="$2"
+    case "${target_real}" in
+        "${base_real}")
+            printf '%s\n' "."
+            ;;
+        "${base_real}"/*)
+            printf '%s\n' "${target_real#"${base_real}"/}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+cmd_link() {
+    toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+        echo "yolobox2: link must run inside a git repo" >&2
+        exit 1
+    }
+    toplevel_real="$(cd -P "${toplevel}" && pwd)"
+
+    relpath=""
+    if candidate="$(relative_to "$HOME/Developer" "${toplevel_real}")"; then
+        relpath="${candidate}"
+    elif candidate="$(relative_to "$HOME/wrk" "${toplevel_real}")"; then
+        relpath="${candidate}"
+    else
+        echo "yolobox2: repo must be under \$HOME/Developer (or \$HOME/wrk)" >&2
+        exit 1
+    fi
+
+    vmdir="${VM_USER_HOME}/wrk/${relpath}"
+
+    ssh -F "${SSH_CFG}" "${VM_HOST}" \
+        "mkdir -p '${vmdir}' && git -C '${vmdir}' rev-parse --git-dir 2>/dev/null || (git -C '${vmdir}' init -b main && git -C '${vmdir}' config receive.denyCurrentBranch updateInstead)"
+
+    if git -C "${toplevel}" remote get-url yolobox >/dev/null 2>&1; then
+        echo "yolobox2: remote 'yolobox' already exists" >&2
+        exit 1
+    fi
+    git -C "${toplevel}" remote add yolobox "ssh://${VM_HOST}${vmdir}"
+    git -C "${toplevel}" config core.sshCommand "ssh -F ${SSH_CFG}"
+}
+
+cmd_seed_herdr() {
+    host_cfg="$HOME/.config/herdr/config.toml"
+    cat "${host_cfg}" | ssh -F "${SSH_CFG}" "${VM_HOST}" \
+        'mkdir -p ~/.config/herdr && [ -e ~/.config/herdr/config.toml ] || cat > ~/.config/herdr/config.toml'
+}
+
+main() {
+    [ "$#" -ge 1 ] || {
+        usage
+        exit 2
+    }
+    sub="$1"
+    shift
+    case "${sub}" in
+        up) cmd_up ;;
+        down) cmd_down ;;
+        status) cmd_status ;;
+        ssh) cmd_ssh "$@" ;;
+        link) cmd_link ;;
+        seed-herdr) cmd_seed_herdr ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
