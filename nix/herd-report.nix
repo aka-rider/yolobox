@@ -6,7 +6,7 @@ let
 
   herdReport = pkgs.writeShellApplication {
     name = "yolobox-herd-report";
-    runtimeInputs = [ herdrPkg ];
+    runtimeInputs = [ herdrPkg pkgs.coreutils ];
     # Ported from herd-report.sh at 4c154fc, with its guards restructured for
     # set -e. CRITICAL: reports use the `yolobox:<agent>` source, NOT
     # `herdr:<agent>` — the server reserves herdr:* sources for its own
@@ -19,8 +19,8 @@ let
     # turn a guard miss into a nonzero exit. "No herd here" (a guard miss)
     # stays silent — that is the common case in a plain `ssh` session. A
     # server that answers but rejects the call (e.g. a protocol mismatch)
-    # is different: swallowing that too once cost hours of debugging, so it
-    # is appended to a guest-side log instead of being thrown away.
+    # is different: it is appended to a guest-side log instead of being
+    # thrown away.
     text = ''
       state="''${1:-}"
       agent="''${2:-}"
@@ -36,9 +36,19 @@ let
       [ -t 0 ] || cat >/dev/null 2>&1 || true
 
       log_rejection() {
+          [ -n "''${HOME:-}" ] || return 0
           log_dir="''${HOME}/.local/state/yolobox"
           mkdir -p "''${log_dir}" 2>/dev/null || return 0
-          printf '%s %s\n' "$(date -Iseconds)" "$1" >> "''${log_dir}/herd-report.log" 2>/dev/null || true
+          log_file="''${log_dir}/herd-report.log"
+          printf '%s %s\n' "$(date -Iseconds)" "$1" >> "''${log_file}" 2>/dev/null || true
+          # Cap growth: PreToolUse fires on every tool call, so an unbounded
+          # herd never stops appending. Trim to the tail once past 500 lines
+          # rather than pulling in logrotate for a best-effort hook log.
+          lines=$(wc -l < "''${log_file}" 2>/dev/null || echo 0)
+          if [ "''${lines}" -gt 500 ]; then
+              tail -n 250 "''${log_file}" > "''${log_file}.tmp" 2>/dev/null \
+                  && mv "''${log_file}.tmp" "''${log_file}" 2>/dev/null || true
+          fi
       }
 
       case "''${state}" in

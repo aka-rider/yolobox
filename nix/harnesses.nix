@@ -36,10 +36,10 @@ in
     };
 
     herdr = {
-      # Also pins the guest side of `herdr --remote`'s host/guest binary
-      # match — a version drift here makes the remote attach silently
-      # install its own copy into the guest's ~/.local/bin, shadowing this
-      # pin.
+      # Also pins the guest herdr CLI's protocol match with the host herdr
+      # server it talks to over the forwarded socket — a version drift here
+      # reproduces the original defect: every report gets rejected with
+      # protocol_mismatch, silently breaking the herd.
       version = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = "0.8.0";
