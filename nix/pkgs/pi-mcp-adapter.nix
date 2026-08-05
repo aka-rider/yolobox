@@ -25,7 +25,7 @@ buildNpmPackage rec {
     cp ${./pi-mcp-adapter-package-lock.json} package-lock.json
   '';
 
-  npmDepsHash = "sha256-6HkH9XLwYSmYcWpZvsSg1xB0RCf9DODuqiiEUP+cP5g=";
+  npmDepsHash = "sha256-cEWmoa8+VrCrK6MLMm3ZzWH577umJvnQQHoeb/x67pY=";
 
   # No "build" script in package.json — the package exports its .ts sources
   # directly (pi's loader resolves index.ts before index.js).
