@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, pkgs, ... }:
 let
   homeDir = config.users.users.xiii.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
