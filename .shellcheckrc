@@ -1,7 +1,0 @@
-# SC2034 ("appears unused") fires on every tools/NN-name.sh module: the
-# TOOL_NAME/TOOL_VERSION/TOOL_APT/TOOL_SOURCES/TOOL_SMOKE metadata variables
-# are set in one file but read by tools/install-all.sh and tools/smoke.sh
-# AFTER sourcing that module — a cross-file data flow shellcheck cannot see.
-# Without this, `shellcheck -S warning tools/*.sh` fails on a correct
-# implementation.
-disable=SC2034
