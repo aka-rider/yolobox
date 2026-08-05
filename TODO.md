@@ -1,3 +1,4 @@
 - Profilers per language deferred from the initial dev-shell set (A4)
 - Delete the v1 bash/Docker era once the VM is the daily driver
 - Adopt nixos-vscode-server module if nix-ld proves insufficient for VS Code Remote
+- Commit 6ea55d0 message carries a leftover "# Conflicts:" template block; scrub with a history rewrite (e.g. `git rebase -r 6ea55d0^` reword) before any publication, then force-sync the VM clone
