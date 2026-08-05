@@ -95,15 +95,20 @@ cmd_link() {
         echo "yolobox2: link must run inside a git repo" >&2
         exit 1
     }
+
+    if git -C "${toplevel}" remote get-url yolobox >/dev/null 2>&1; then
+        echo "yolobox2: remote 'yolobox' already exists" >&2
+        exit 1
+    fi
+
     toplevel_real="$(cd -P "${toplevel}" && pwd)"
 
-    relpath=""
-    if candidate="$(relative_to "$HOME/Developer" "${toplevel_real}")"; then
-        relpath="${candidate}"
-    elif candidate="$(relative_to "$HOME/wrk" "${toplevel_real}")"; then
-        relpath="${candidate}"
-    else
-        echo "yolobox2: repo must be under \$HOME/Developer (or \$HOME/wrk)" >&2
+    relpath="$(relative_to "$HOME/Developer" "${toplevel_real}")" || {
+        echo "yolobox2: repo must be under \$HOME/Developer" >&2
+        exit 1
+    }
+    if [ "${relpath}" = "." ]; then
+        echo "yolobox2: refusing to link \$HOME/Developer itself" >&2
         exit 1
     fi
 
@@ -112,10 +117,6 @@ cmd_link() {
     ssh -F "${SSH_CFG}" "${VM_HOST}" \
         "mkdir -p '${vmdir}' && git -C '${vmdir}' rev-parse --git-dir 2>/dev/null || (git -C '${vmdir}' init -b main && git -C '${vmdir}' config receive.denyCurrentBranch updateInstead)"
 
-    if git -C "${toplevel}" remote get-url yolobox >/dev/null 2>&1; then
-        echo "yolobox2: remote 'yolobox' already exists" >&2
-        exit 1
-    fi
     git -C "${toplevel}" remote add yolobox "ssh://${VM_HOST}${vmdir}"
     git -C "${toplevel}" config core.sshCommand "ssh -F ${SSH_CFG}"
 }
@@ -123,7 +124,7 @@ cmd_link() {
 cmd_seed_herdr() {
     host_cfg="$HOME/.config/herdr/config.toml"
     cat "${host_cfg}" | ssh -F "${SSH_CFG}" "${VM_HOST}" \
-        'mkdir -p ~/.config/herdr && [ -e ~/.config/herdr/config.toml ] || cat > ~/.config/herdr/config.toml'
+        'mkdir -p ~/.config/herdr && { [ -e ~/.config/herdr/config.toml ] || cat > ~/.config/herdr/config.toml; }'
 }
 
 main() {
