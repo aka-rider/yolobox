@@ -3,7 +3,10 @@
 let
   fragments = {
     rust = with pkgs; [ cargo rustc rust-analyzer clippy rustfmt lldb cargo-flamegraph ];
-    python = with pkgs; [ python3 uv pyright python3Packages.debugpy py-spy ];
+    # py-spy's own test suite fails under aarch64-linux sandboxed builds
+    # (thread-name/line-number assertions sensitive to host scheduling); the
+    # built binary itself works, so skip checks rather than drop the profiler.
+    python = with pkgs; [ python3 uv pyright python3Packages.debugpy (py-spy.overrideAttrs (_: { doCheck = false; })) ];
     node = with pkgs; [ nodejs typescript typescript-language-server ];
     go = with pkgs; [ go gopls delve graphviz ];
     # gcc leads the PATH so `cc`/`gdb` stay a matched pair; clang-tools only
