@@ -75,13 +75,19 @@ cmd_ssh() {
     exec ssh "${SSH_ARGS[@]}" "${@+"$@"}"
 }
 
-# herdr installs its own binary into the guest ~/.local/bin on version drift,
-# shadowing the nix-pinned /run/current-system/sw/bin/herdr — so parity is
-# checked, not assumed. HERDR_REMOTE_BINARY cannot substitute for this check:
-# it names a *local* (client-side) binary path for `herdr --remote` to copy
-# over on a platform match, not a path on the remote host, so it cannot pin
-# the guest binary.
+# herdr --remote installs its own binary into the guest ~/.local/bin on
+# version drift, shadowing the nix-pinned /run/current-system/sw/bin/herdr —
+# so parity is checked, not assumed. This only applies to the HERDR_ENV=1
+# remote-attach path below; plain ssh never touches a host herdr binary at
+# all. HERDR_REMOTE_BINARY cannot substitute for this check: it names a
+# *local* (client-side) binary path for `herdr --remote` to copy over on a
+# platform match, not a path on the remote host, so it cannot pin the guest
+# binary.
 check_herdr_version_parity() {
+    command -v herdr >/dev/null 2>&1 || {
+        echo "yolobox2: herdr not found on host; install it or use 'yolobox2 ssh' instead" >&2
+        exit 1
+    }
     host_version="$(herdr --version)"
     ssh_args
     guest_version="$(ssh "${SSH_ARGS[@]}" "${VM_HOST}" herdr --version)"
@@ -93,8 +99,8 @@ check_herdr_version_parity() {
 }
 
 cmd_enter() {
-    check_herdr_version_parity
     if [ "${HERDR_ENV:-}" = "1" ]; then
+        check_herdr_version_parity
         # herdr --remote shells out to plain ssh against ~/.ssh/config, so it
         # never sees ssh_args()'s -F/-o flags — ForwardAgent must come from
         # ~/.ssh/config itself.
