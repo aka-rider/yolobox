@@ -1,7 +1,0 @@
-{
-  "playwright": {
-    "type": "stdio",
-    "command": "/usr/local/bin/playwright-mcp",
-    "args": ["--headless", "--isolated", "--no-sandbox", "--browser", "chromium"]
-  }
-}

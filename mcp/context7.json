@@ -1,7 +1,0 @@
-{
-  "context7": {
-    "type": "stdio",
-    "command": "/usr/local/bin/context7-mcp",
-    "args": []
-  }
-}
