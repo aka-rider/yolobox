@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    yolobox.url = "git+file:///home/alice/wrk/yolobox";
+    yolobox.url = "git+file:///home/alice.guest/wrk/yolobox";
   };
 
   outputs = { self, nixpkgs, yolobox }:

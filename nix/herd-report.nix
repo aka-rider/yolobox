@@ -145,7 +145,7 @@ in
     # pi may rewrite ~/.pi/agent/settings.json (e.g. via /extensions), so
     # this is copy-if-absent (Gotcha 14), not a symlink.
     systemd.tmpfiles.rules = [
-      "C /home/alice/.pi/agent/settings.json 0644 alice users - /etc/yolobox/pi/settings.json"
+      "C /home/alice.guest/.pi/agent/settings.json 0644 alice users - /etc/yolobox/pi/settings.json"
     ];
   };
 }
