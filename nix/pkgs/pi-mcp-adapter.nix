@@ -26,7 +26,7 @@ buildNpmPackage rec {
   '';
 
   npmDepsFetcherVersion = 2;
-  npmDepsHash = lib.fakeHash;
+  npmDepsHash = "sha256-JSsR2/Dwjauw6kJWfDerY4jgFhxqq25HTsBY99dyKUc=";
 
   # No "build" script in package.json — the package exports its .ts sources
   # directly (pi's loader resolves index.ts before index.js).
