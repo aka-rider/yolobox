@@ -18,14 +18,16 @@ No private SSH key ever enters the VM. `git push` works through SSH agent
 forwarding of the host's 1Password agent, which means unattended pushes are
 impossible by design — there is no key material on disk to steal.
 
-All three host couplings ride a single SSH session:
+Both host couplings ride SSH:
 
 1. **1Password agent forward** — pushes authenticate through 1Password on the
    host; the VM never sees a private key.
-2. **herdr socket RemoteForward** — the host's herdr socket is forwarded
-   INTO the VM, so in-VM harness hooks can report each agent as
-   `yolobox:<agent>` back to the host herd.
-3. **Your terminal** — the interactive shell you use to reach the VM.
+2. **Your terminal** — the interactive shell you use to reach the VM.
+
+herdr runs *inside* the VM as its own persistent server (a systemd user
+service), with its own herd. Agents started inside the box are foreground
+processes of guest panes, so herdr's native process detection recognises
+them directly — there is no reporting bridge back to a host herd.
 
 This keeps the blast radius bounded: a compromised agent can only act within
 the VM and can only push out through the forwarded 1Password session, which
@@ -87,7 +89,11 @@ on, changes to the flake are applied with
 # Start or ensure the VM is running
 ./yolobox2 up
 
-# Open an interactive SSH session
+# Open an interactive herd session inside the box — the herdr TUI, with
+# agents running as guest panes
+./yolobox2 enter
+
+# Open a plain SSH session instead — one-shot commands, scripting, git
 ./yolobox2 ssh
 
 # Add a "yolobox" git remote to a host project, mirrored to the same path
@@ -97,6 +103,40 @@ on, changes to the flake are applied with
 # Copy the host's herdr config into the VM, without overwriting it
 ./yolobox2 seed-herdr
 ```
+
+### `enter` prerequisites
+
+`herdr --remote` shells out to plain `ssh <target>` against your real
+`~/.ssh/config` — it never sees lima's `-F` flag, so the box's ssh config has
+to be pulled in there instead. Add this at the **top** of `~/.ssh/config`,
+above the existing `Host *` (which already supplies the 1Password
+`IdentityAgent`; `ForwardAgent` is the missing piece), as a one-time host
+setup:
+
+```
+Include ~/.lima/yolobox/ssh.config
+Host lima-yolobox
+  ForwardAgent yes
+```
+
+lima's `ssh.config` is entirely inside its own `Host lima-yolobox` block, so
+this `Include` is host-scoped and cannot affect any other ssh target.
+
+Host and guest herdr binaries must stay on matching versions. On drift,
+`herdr --remote` installs its own binary into the guest's `~/.local/bin`,
+shadowing the nix-pinned one — bump `yolobox.harness.herdr.version`/`hash`
+in `nix/harnesses.nix` (or upgrade the host binary) to fix it.
+
+Both sides deliberately share `prefix = "ctrl+a"` — different leader keys
+would break muscle memory — so escape the outer host session with a doubled
+prefix (`ctrl+a ctrl+a`) rather than a different key. `enter` passes
+`--remote-keybindings server` so your keys drive the guest session, not the
+host one.
+
+Agent detection inside the box is herdr's own native process detection.
+`herdr integration install` runs at boot, via a systemd user unit, for
+claude, pi, opencode, and codex. crush has no upstream herdr integration and
+falls back to screen detection only.
 
 ## Backups and snapshots
 
