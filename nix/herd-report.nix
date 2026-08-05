@@ -1,7 +1,7 @@
 { config, lib, pkgs, ... }:
 let
   homeDir = config.users.users.alice.home;
-  homeTmpfiles = import ./lib/home-tmpfiles.nix { inherit lib; };
+  homeTmpfiles = import ./lib/home-tmpfiles.nix;
 
   herdReport = pkgs.writeShellApplication {
     name = "yolobox-herd-report";
