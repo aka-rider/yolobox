@@ -30,14 +30,19 @@
 
   # Matches what lima-init's existence-guarded useradd already created on
   # first boot (Gotcha 1) — including lima >=2.2.0's ".guest"-suffixed home
-  # (nixos-lima issue #121). isNormalUser turns on autoSubUidGidRange,
+  # (nixos-lima issue #121). NixOS refuses isNormalUser below uid 1000
+  # (lima's cidata UID here is 501, matching the host's macOS UID), so this
+  # uses isSystemUser instead and sets autoSubUidGidRange directly — that
+  # option isn't actually gated on isNormalUser, only its *default* is —
   # giving rootless podman its /etc/subuid range declaratively.
   users.users.xiii = {
-    isNormalUser = true;
+    isSystemUser = true;
+    group = "users";
     uid = 501;
     home = "/home/xiii.guest";
     extraGroups = [ "wheel" ];
     shell = pkgs.zsh;
+    autoSubUidGidRange = true;
   };
 
   services.openssh.enable = true;
