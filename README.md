@@ -129,6 +129,16 @@ Host lima-yolobox
 lima's `ssh.config` is entirely inside its own `Host lima-yolobox` block, so
 this `Include` is host-scoped and cannot affect any other ssh target.
 
+Run from inside a host herdr pane, `enter` attaches through
+`herdr --remote`, which the host binary refuses as a nested launch. Enable it
+in the **host** `~/.config/herdr/config.toml` — the guard is client-side, so
+the guest's config has no say:
+
+```toml
+[experimental]
+allow_nested = true
+```
+
 Host and guest herdr binaries must stay on matching versions. On drift,
 `herdr --remote` installs its own binary into the guest's `~/.local/bin`,
 shadowing the nix-pinned one — bump `yolobox.harness.herdr.version`/`hash`
