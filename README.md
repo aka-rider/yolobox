@@ -22,8 +22,9 @@ All three host couplings ride a single SSH session:
 
 1. **1Password agent forward** — pushes authenticate through 1Password on the
    host; the VM never sees a private key.
-2. **herdr socket RemoteForward** — agent sockets are forwarded back to the
-   host so the host herd reports each agent as `yolobox:<agent>`.
+2. **herdr socket RemoteForward** — the host's herdr socket is forwarded
+   INTO the VM, so in-VM harness hooks can report each agent as
+   `yolobox:<agent>` back to the host herd.
 3. **Your terminal** — the interactive shell you use to reach the VM.
 
 This keeps the blast radius bounded: a compromised agent can only act within
@@ -61,16 +62,18 @@ brew install lima
 # 2. Start the VM (creates it from the Lima YAML config)
 limactl start --name yolobox --yes lima/yolobox.yaml
 
-# 3. One-time in-VM git init and push to your remote
-limactl shell yolobox sudo -u xiii bash -c '
-  cd ~/wrk && git init yolobox &&
-  cd yolobox && git remote add origin <your-remote-url> &&
-  git add . && git commit -m "initial" &&
-  git push -u origin main
-'
+# 3. One-time in-VM git init (empty repo, updateInstead so a later push
+#    can update its checked-out branch directly)
+ssh -F ~/.lima/yolobox/ssh.config lima-yolobox -- \
+  'mkdir -p ~/wrk/yolobox && git -C ~/wrk/yolobox init -b main && git -C ~/wrk/yolobox config receive.denyCurrentBranch updateInstead'
 
-# 4. Build the NixOS configuration inside the VM and reboot
-limactl shell yolobox sudo nixos-rebuild boot --flake .#yolobox
+# 4. From your Mac clone of this repo, push it into the VM
+GIT_SSH_COMMAND="ssh -F $HOME/.lima/yolobox/ssh.config" \
+  git push ssh://lima-yolobox/home/xiii.guest/wrk/yolobox main
+
+# 5. Build the NixOS configuration inside the VM and reboot
+ssh -F ~/.lima/yolobox/ssh.config lima-yolobox -- \
+  'cd ~/wrk/yolobox && sudo nixos-rebuild boot --flake .#yolobox'
 limactl restart yolobox
 ```
 
@@ -91,7 +94,7 @@ on, changes to the flake are applied with
 # inside the VM. Push from the VM works to the checked-out branch.
 ./yolobox2 link
 
-# Seed herdr with the current agent configuration
+# Copy the host's herdr config into the VM, without overwriting it
 ./yolobox2 seed-herdr
 ```
 
