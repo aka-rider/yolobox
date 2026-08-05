@@ -117,7 +117,10 @@ missing dynamic linker context. Use the dev-shell-provided LSPs instead,
 configured in your helix or zed settings.
 
 **VS Code Remote-SSH** works through nix-ld, which allows the VS Code server
-and its extensions to resolve NixOS dynamic libraries correctly.
+and its extensions to resolve NixOS dynamic libraries correctly. If VS Code
+Remote ever misbehaves under nix-ld, the
+[nixos-vscode-server](https://github.com/nix-community/nixos-vscode-server)
+module is the fallback.
 
 ## History
 
