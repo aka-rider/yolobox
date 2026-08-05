@@ -1,4 +1,4 @@
-{ stdenvNoCC, fetchurl, autoPatchelfHook, version, hash }:
+{ stdenvNoCC, fetchurl, version, hash }:
 
 # herdr is source-built in nixpkgs (rust + zig, two fixed-output hashes) so
 # claude-code's overrideAttrs+fetchurl valve shape doesn't apply to it
@@ -15,11 +15,6 @@ stdenvNoCC.mkDerivation {
   };
 
   dontUnpack = true;
-
-  # The upstream binary is a static ELF (no dynamic interpreter or libs), so
-  # this has nothing to patch — kept for parity with every other binary
-  # harness derivation should a future release stop being fully static.
-  nativeBuildInputs = [ autoPatchelfHook ];
 
   installPhase = ''
     runHook preInstall
