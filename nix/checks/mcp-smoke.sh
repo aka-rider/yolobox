@@ -3,16 +3,16 @@
 # guarantees each config is well-formed JSON (it wrote it via
 # builtins.toJSON), so unlike the v1 bash smoke test this skips structural
 # checks and goes straight to the protocol check: read
-# /etc/yolobox/mcp/manifest.json, extract each server's command/args/env per
-# its harness format, and speak one JSON-RPC `initialize` request — with the
-# same env the harness would set — to prove the binary resolves and actually
-# answers MCP.
+# /etc/yolobox/mcp/manifest.json, normalize each format to one compact JSON
+# object per server ({name, command, args, env}), and speak one JSON-RPC
+# `initialize` request — with the same env the harness would set — to prove
+# the binary resolves and actually answers MCP.
 #
 # writeShellApplication prepends `set -o errexit -o nounset -o pipefail`.
 
 MANIFEST=/etc/yolobox/mcp/manifest.json
 REQUEST='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"yolobox-smoke","version":"1"}}}'
-ARGSEP=$'\001'
+INIT_TIMEOUT_S=60
 
 echo "=== yolobox MCP smoke ==="
 
@@ -32,18 +32,12 @@ failed=""
 while IFS=$'\t' read -r cfg_path format; do
     [ -n "${cfg_path}" ] || continue
 
-    # Reshape every format to a common "name<TAB>command<TAB>env<TAB>args"
-    # stream; env travels along as a JSON object; args (last field, may be
-    # empty) are joined on 0x01, a byte no server's own arg will contain.
-    # Args must be LAST: bash's `read` squeezes consecutive occurrences of
-    # a whitespace IFS character (tab counts, even set alone) into one
-    # delimiter, silently dropping an EMPTY field between two tabs — a
-    # trailing empty field is unaffected, so the field that's sometimes
-    # empty has to be the trailing one.
+    # Normalize every format to one compact JSON object per server:
+    # {name, command, args, env}.
     case "${format}" in
-        mcpServers) servers_filter='.mcpServers | to_entries[] | [.key, .value.command, (.value.env // {} | tojson), ((.value.args // []) | join(""))] | join("\t")' ;;
-        crush)      servers_filter='.mcp | to_entries[] | [.key, .value.command, (.value.env // {} | tojson), ((.value.args // []) | join(""))] | join("\t")' ;;
-        opencode)   servers_filter='.mcp | to_entries[] | [.key, (.value.command[0]), (.value.environment // {} | tojson), ((.value.command[1:]) | join(""))] | join("\t")' ;;
+        mcpServers) servers_filter='.mcpServers | to_entries[] | {name: .key, command: .value.command, args: (.value.args // []), env: (.value.env // {})}' ;;
+        crush)      servers_filter='.mcp | to_entries[] | {name: .key, command: .value.command, args: (.value.args // []), env: (.value.env // {})}' ;;
+        opencode)   servers_filter='.mcp | to_entries[] | {name: .key, command: .value.command[0], args: .value.command[1:], env: (.value.environment // {})}' ;;
         *)
             echo "mcp-smoke: unrecognised format '${format}' for ${cfg_path}" >&2
             failed="${failed} ${cfg_path}"
@@ -51,21 +45,17 @@ while IFS=$'\t' read -r cfg_path format; do
             ;;
     esac
 
-    while IFS=$'\t' read -r name cmd envjson argstr; do
-        [ -n "${name}" ] || continue
+    while IFS= read -r server; do
+        [ -n "${server}" ] || continue
+
+        name="$(jq -r '.name' <<< "${server}")"
+        cmd="$(jq -r '.command' <<< "${server}")"
         printf '  %-16s (%s)' "${name}" "${cfg_path}"
 
-        args=()
-        if [ -n "${argstr}" ]; then
-            IFS="${ARGSEP}" read -r -a args <<< "${argstr}"
-        fi
+        mapfile -t args < <(jq -r '.args[]' <<< "${server}")
+        mapfile -t envs < <(jq -r '.env | to_entries[] | "\(.key)=\(.value)"' <<< "${server}")
 
-        envs=()
-        while IFS= read -r kv; do
-            [ -n "${kv}" ] && envs+=("${kv}")
-        done < <(printf '%s' "${envjson}" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
-
-        out="$(printf '%s\n' "${REQUEST}" | timeout 60 env "${envs[@]}" "${cmd}" "${args[@]}" 2>/dev/null | head -n1 || true)"
+        out="$(printf '%s\n' "${REQUEST}" | timeout "${INIT_TIMEOUT_S}" env "${envs[@]}" "${cmd}" "${args[@]}" 2>/dev/null | head -n1 || true)"
         server_info="$(printf '%s' "${out}" | jq -r 'select(.id==1) | .result.serverInfo.name // empty' 2>/dev/null || true)"
 
         if [ -n "${server_info}" ]; then
@@ -74,7 +64,7 @@ while IFS=$'\t' read -r cfg_path format; do
             echo "  FAIL"
             failed="${failed} ${name}@${cfg_path}"
         fi
-    done < <(jq -r "${servers_filter}" "${cfg_path}")
+    done < <(jq -c "${servers_filter}" "${cfg_path}")
 done < <(jq -r '.[] | [.path, .format] | join("\t")' "${MANIFEST}")
 
 if [ -n "${failed}" ]; then
