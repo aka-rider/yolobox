@@ -89,7 +89,12 @@ in
     # pi has no native config path for this; it reads ~/.config/mcp/mcp.json
     # via pi-mcp-adapter, and the harness never rewrites it, so a plain
     # symlink (Gotcha 14) tracks /etc across every rebuild.
+    # "d" entries own the parent dirs as xiii first — otherwise tmpfiles
+    # auto-creates them root-owned and then refuses the L+ below as an
+    # "unsafe path transition" (user-owned $HOME -> root-owned subdir).
     systemd.tmpfiles.rules = [
+      "d /home/xiii.guest/.config 0755 xiii users -"
+      "d /home/xiii.guest/.config/mcp 0755 xiii users -"
       "L+ /home/xiii.guest/.config/mcp/mcp.json - - - - /etc/yolobox/mcp/pi.json"
     ];
 

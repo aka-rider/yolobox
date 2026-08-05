@@ -143,8 +143,12 @@ in
     environment.etc."yolobox/pi/settings.json".text = builtins.toJSON piSettings;
 
     # pi may rewrite ~/.pi/agent/settings.json (e.g. via /extensions), so
-    # this is copy-if-absent (Gotcha 14), not a symlink.
+    # this is copy-if-absent (Gotcha 14), not a symlink. "d" entries own the
+    # parent dirs as xiii first — otherwise tmpfiles auto-creates them
+    # root-owned and refuses the C rule as an "unsafe path transition".
     systemd.tmpfiles.rules = [
+      "d /home/xiii.guest/.pi 0755 xiii users -"
+      "d /home/xiii.guest/.pi/agent 0755 xiii users -"
       "C /home/xiii.guest/.pi/agent/settings.json 0644 xiii users - /etc/yolobox/pi/settings.json"
     ];
   };
