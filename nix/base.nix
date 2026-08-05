@@ -28,6 +28,18 @@
   users.mutableUsers = true;
   system.stateVersion = "25.11";
 
+  # Matches what lima-init's existence-guarded useradd already created on
+  # first boot (Gotcha 1) — including lima >=2.2.0's ".guest"-suffixed home
+  # (nixos-lima issue #121). isNormalUser turns on autoSubUidGidRange,
+  # giving rootless podman its /etc/subuid range declaratively.
+  users.users.xiii = {
+    isNormalUser = true;
+    uid = 501;
+    home = "/home/xiii.guest";
+    extraGroups = [ "wheel" ];
+    shell = pkgs.zsh;
+  };
+
   services.openssh.enable = true;
   services.openssh.settings = {
     AcceptEnv = [ "YOLOBOX_HERD" "HERDR_PANE_ID" "HERDR_SOCKET_PATH" ];
