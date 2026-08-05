@@ -2,13 +2,13 @@
 
 let
   fragments = {
-    rust = with pkgs; [ cargo rustc rust-analyzer clippy rustfmt lldb ];
-    python = with pkgs; [ python3 uv pyright python3Packages.debugpy ];
+    rust = with pkgs; [ cargo rustc rust-analyzer clippy rustfmt lldb cargo-flamegraph ];
+    python = with pkgs; [ python3 uv pyright python3Packages.debugpy py-spy ];
     node = with pkgs; [ nodejs typescript typescript-language-server ];
-    go = with pkgs; [ go gopls delve ];
+    go = with pkgs; [ go gopls delve graphviz ];
     # gcc leads the PATH so `cc`/`gdb` stay a matched pair; clang-tools only
     # adds clangd/clang-format/clang-tidy, not a competing `clang` binary.
-    cxx = with pkgs; [ gcc gnumake cmake pkg-config gdb clang-tools ];
+    cxx = with pkgs; [ gcc gnumake cmake pkg-config gdb clang-tools valgrind ];
     postgres = with pkgs; [ postgresql ];
   };
 
