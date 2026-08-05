@@ -83,6 +83,13 @@ After the restart the VM is running the declarative configuration. From now
 on, changes to the flake are applied with
 `nixos-rebuild switch --flake .#yolobox`.
 
+`switch` does not re-run `systemd-tmpfiles-setup.service` — it only runs at
+boot, and refuses a manual restart. Any `"C"` (copy-if-absent) tmpfiles rule,
+such as the one seeding `~/.pi/agent/settings.json`, keeps the file it
+already copied even after a `switch` that changes the seeded content. Pick
+up the change with either a real reboot (`limactl restart yolobox`) or
+`sudo systemd-tmpfiles --create` inside the VM.
+
 ## Daily use
 
 ```bash
@@ -133,10 +140,14 @@ prefix (`ctrl+a ctrl+a`) rather than a different key. `enter` passes
 `--remote-keybindings server` so your keys drive the guest session, not the
 host one.
 
-Agent detection inside the box is herdr's own native process detection.
-`herdr integration install` runs at boot, via a systemd user unit, for
-claude, pi, opencode, and codex. crush has no upstream herdr integration and
-falls back to screen detection only.
+Agent detection inside the box is herdr's own native process detection. A
+systemd user unit runs `herdr integration install` at boot for claude, pi,
+opencode, and codex, best-effort per harness. claude and pi install
+immediately; opencode and codex only succeed once that tool has been run at
+least once and created its config directory (`~/.config/opencode`,
+`~/.codex`) — until then the unit logs "config directory not found" for
+that harness and moves on. crush has no upstream herdr integration and falls
+back to screen detection only.
 
 ## Backups and snapshots
 

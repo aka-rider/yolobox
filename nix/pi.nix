@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, pkgs, ... }:
 let
   homeDir = config.users.users.alice.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
