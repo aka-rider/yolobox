@@ -23,7 +23,11 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        ExecStart = map (kind: "${herdrPkg}/bin/herdr integration install ${kind}") [
+        # "-" prefix: an integration install is a best-effort per-harness
+        # step, not an all-or-nothing unit — herdr refuses e.g. the opencode
+        # integration until opencode itself has been run once and created
+        # its config dir, and that must not block installing the others.
+        ExecStart = map (kind: "-${herdrPkg}/bin/herdr integration install ${kind}") [
           "claude"
           "pi"
           "opencode"
