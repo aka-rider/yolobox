@@ -3,8 +3,7 @@
   imports = [
     ./harnesses.nix
     ./mcp.nix
-    ./pi.nix
-    ./herd.nix
+    ./herd-report.nix
   ];
 
   yolobox.mcp.servers = {

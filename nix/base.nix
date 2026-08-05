@@ -46,6 +46,10 @@
   };
 
   services.openssh.enable = true;
+  services.openssh.settings = {
+    AcceptEnv = [ "YOLOBOX_HERD" "HERDR_PANE_ID" "HERDR_SOCKET_PATH" ];
+    StreamLocalBindUnlink = "yes";
+  };
 
   security.sudo.wheelNeedsPassword = false;
   programs.zsh.enable = true;
