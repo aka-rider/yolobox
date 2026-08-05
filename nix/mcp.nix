@@ -90,7 +90,7 @@ in
     # via pi-mcp-adapter, and the harness never rewrites it, so a plain
     # symlink (Gotcha 14) tracks /etc across every rebuild.
     systemd.tmpfiles.rules = [
-      "L+ /home/xiii/.config/mcp/mcp.json - - - - /etc/yolobox/mcp/pi.json"
+      "L+ /home/xiii.guest/.config/mcp/mcp.json - - - - /etc/yolobox/mcp/pi.json"
     ];
 
     environment.systemPackages = [ mcpSmoke ];

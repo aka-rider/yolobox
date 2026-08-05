@@ -2,9 +2,9 @@
   description = "yolobox: NixOS VM devbox for AI agents";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "git+https://github.com/NixOS/nixpkgs.git?ref=nixos-unstable";
     nixos-lima = {
-      url = "github:nixos-lima/nixos-lima";
+      url = "git+https://github.com/nixos-lima/nixos-lima.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

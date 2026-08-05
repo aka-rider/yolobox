@@ -11,7 +11,9 @@ set -euo pipefail
 
 readonly INSTANCE="yolobox"
 readonly VM_HOST="lima-yolobox"
-readonly VM_USER_HOME="/home/xiii"
+# lima >=2.2.0 appends ".guest" to the cidata username when naming the
+# guest home directory (nixos-lima issue #121); the account name stays "xiii".
+readonly VM_USER_HOME="/home/xiii.guest"
 SSH_CFG="$HOME/.lima/yolobox/ssh.config"
 OP_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
 readonly SSH_CFG OP_SOCK
