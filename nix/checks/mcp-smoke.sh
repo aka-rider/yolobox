@@ -3,10 +3,12 @@
 # guarantees each config is well-formed JSON (it wrote it via
 # builtins.toJSON), so unlike the v1 bash smoke test this skips structural
 # checks and goes straight to the protocol check: read
-# /etc/yolobox/mcp/manifest.json, extract each server's command/args per its
-# harness format, and speak one JSON-RPC `initialize` request to prove the
-# binary resolves and actually answers MCP.
-set -uo pipefail
+# /etc/yolobox/mcp/manifest.json, extract each server's command/args/env per
+# its harness format, and speak one JSON-RPC `initialize` request — with the
+# same env the harness would set — to prove the binary resolves and actually
+# answers MCP.
+#
+# writeShellApplication prepends `set -o errexit -o nounset -o pipefail`.
 
 MANIFEST=/etc/yolobox/mcp/manifest.json
 REQUEST='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"yolobox-smoke","version":"1"}}}'
@@ -30,12 +32,13 @@ failed=""
 while IFS=$'\t' read -r cfg_path format; do
     [ -n "${cfg_path}" ] || continue
 
-    # Reshape every format to a common "name<TAB>command<TAB>args" stream;
-    # args are joined on 0x01 (a byte no server's own arg will contain).
+    # Reshape every format to a common "name<TAB>command<TAB>args<TAB>env"
+    # stream; args are joined on 0x01 (a byte no server's own arg will
+    # contain), env travels along as a JSON object.
     case "${format}" in
-        mcpServers) servers_filter='.mcpServers | to_entries[] | [.key, .value.command, ((.value.args // []) | join("\u0001"))] | join("\t")' ;;
-        crush)      servers_filter='.mcp | to_entries[] | [.key, .value.command, ((.value.args // []) | join("\u0001"))] | join("\t")' ;;
-        opencode)   servers_filter='.mcp | to_entries[] | [.key, (.value.command[0]), ((.value.command[1:]) | join("\u0001"))] | join("\t")' ;;
+        mcpServers) servers_filter='.mcpServers | to_entries[] | [.key, .value.command, ((.value.args // []) | join("")), (.value.env // {} | tojson)] | join("\t")' ;;
+        crush)      servers_filter='.mcp | to_entries[] | [.key, .value.command, ((.value.args // []) | join("")), (.value.env // {} | tojson)] | join("\t")' ;;
+        opencode)   servers_filter='.mcp | to_entries[] | [.key, (.value.command[0]), ((.value.command[1:]) | join("")), (.value.environment // {} | tojson)] | join("\t")' ;;
         *)
             echo "mcp-smoke: unrecognised format '${format}' for ${cfg_path}" >&2
             failed="${failed} ${cfg_path}"
@@ -43,7 +46,7 @@ while IFS=$'\t' read -r cfg_path format; do
             ;;
     esac
 
-    while IFS=$'\t' read -r name cmd argstr; do
+    while IFS=$'\t' read -r name cmd argstr envjson; do
         [ -n "${name}" ] || continue
         printf '  %-16s (%s)' "${name}" "${cfg_path}"
 
@@ -52,7 +55,12 @@ while IFS=$'\t' read -r cfg_path format; do
             IFS="${ARGSEP}" read -r -a args <<< "${argstr}"
         fi
 
-        out="$(printf '%s\n' "${REQUEST}" | timeout 60 "${cmd}" "${args[@]}" 2>/dev/null | head -n1 || true)"
+        envs=()
+        while IFS= read -r kv; do
+            [ -n "${kv}" ] && envs+=("${kv}")
+        done < <(printf '%s' "${envjson}" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+
+        out="$(printf '%s\n' "${REQUEST}" | timeout 60 env "${envs[@]}" "${cmd}" "${args[@]}" 2>/dev/null | head -n1 || true)"
         server_info="$(printf '%s' "${out}" | jq -r 'select(.id==1) | .result.serverInfo.name // empty' 2>/dev/null || true)"
 
         if [ -n "${server_info}" ]; then
