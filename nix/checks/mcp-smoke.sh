@@ -32,13 +32,18 @@ failed=""
 while IFS=$'\t' read -r cfg_path format; do
     [ -n "${cfg_path}" ] || continue
 
-    # Reshape every format to a common "name<TAB>command<TAB>args<TAB>env"
-    # stream; args are joined on 0x01 (a byte no server's own arg will
-    # contain), env travels along as a JSON object.
+    # Reshape every format to a common "name<TAB>command<TAB>env<TAB>args"
+    # stream; env travels along as a JSON object; args (last field, may be
+    # empty) are joined on 0x01, a byte no server's own arg will contain.
+    # Args must be LAST: bash's `read` squeezes consecutive occurrences of
+    # a whitespace IFS character (tab counts, even set alone) into one
+    # delimiter, silently dropping an EMPTY field between two tabs — a
+    # trailing empty field is unaffected, so the field that's sometimes
+    # empty has to be the trailing one.
     case "${format}" in
-        mcpServers) servers_filter='.mcpServers | to_entries[] | [.key, .value.command, ((.value.args // []) | join("")), (.value.env // {} | tojson)] | join("\t")' ;;
-        crush)      servers_filter='.mcp | to_entries[] | [.key, .value.command, ((.value.args // []) | join("")), (.value.env // {} | tojson)] | join("\t")' ;;
-        opencode)   servers_filter='.mcp | to_entries[] | [.key, (.value.command[0]), ((.value.command[1:]) | join("")), (.value.environment // {} | tojson)] | join("\t")' ;;
+        mcpServers) servers_filter='.mcpServers | to_entries[] | [.key, .value.command, (.value.env // {} | tojson), ((.value.args // []) | join(""))] | join("\t")' ;;
+        crush)      servers_filter='.mcp | to_entries[] | [.key, .value.command, (.value.env // {} | tojson), ((.value.args // []) | join(""))] | join("\t")' ;;
+        opencode)   servers_filter='.mcp | to_entries[] | [.key, (.value.command[0]), (.value.environment // {} | tojson), ((.value.command[1:]) | join(""))] | join("\t")' ;;
         *)
             echo "mcp-smoke: unrecognised format '${format}' for ${cfg_path}" >&2
             failed="${failed} ${cfg_path}"
@@ -46,7 +51,7 @@ while IFS=$'\t' read -r cfg_path format; do
             ;;
     esac
 
-    while IFS=$'\t' read -r name cmd argstr envjson; do
+    while IFS=$'\t' read -r name cmd envjson argstr; do
         [ -n "${name}" ] || continue
         printf '  %-16s (%s)' "${name}" "${cfg_path}"
 
