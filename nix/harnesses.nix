@@ -58,7 +58,7 @@ in
   config = {
     # The ONLY definition site for this predicate (Gotcha 11) — claude-code
     # is nixpkgs' sole unfree harness.
-    nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "claude-code" ];
+    nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "claude-code" "crush" ];
 
     environment.variables.DISABLE_AUTOUPDATER = "1";
 
