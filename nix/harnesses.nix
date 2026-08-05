@@ -18,13 +18,7 @@ let
     else
       pkgs.claude-code;
 
-  herdrPkg =
-    if cfg.herdr.hash != null then
-      pkgs.callPackage ./pkgs/herdr-bin.nix {
-        inherit (cfg.herdr) version hash;
-      }
-    else
-      pkgs.herdr;
+  herdrPkg = import ./lib/herdr-pkg.nix { inherit pkgs; cfg = cfg.herdr; };
 in
 {
   options.yolobox.harness = {
@@ -42,6 +36,10 @@ in
     };
 
     herdr = {
+      # Also pins the guest side of `herdr --remote`'s host/guest binary
+      # match — a version drift here makes the remote attach silently
+      # install its own copy into the guest's ~/.local/bin, shadowing this
+      # pin.
       version = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = "0.8.0";
@@ -52,12 +50,6 @@ in
         default = "sha256-9kesZkaNnvvGQv5TT7KERo8K6mBkFgb8AI38DYKjyoc=";
         description = "SRI hash of the herdr release binary at yolobox.harness.herdr.version. Setting this activates the override.";
       };
-
-      package = lib.mkOption {
-        type = lib.types.package;
-        internal = true;
-        description = "The herdr package selected by the version/hash valve above — the single chokepoint every module consumes instead of picking between pkgs.herdr and the herdr-bin.nix override itself.";
-      };
     };
   };
 
@@ -67,8 +59,6 @@ in
     nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "claude-code" "crush" ];
 
     environment.variables.DISABLE_AUTOUPDATER = "1";
-
-    yolobox.harness.herdr.package = herdrPkg;
 
     environment.systemPackages = [
       claudeCodePkg
