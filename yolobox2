@@ -4,6 +4,7 @@
 # Usage:
 #   yolobox2 up|down|status
 #   yolobox2 ssh [cmd...]
+#   yolobox2 enter [herdr-args...]
 #   yolobox2 link
 #   yolobox2 seed-herdr
 
@@ -35,9 +36,21 @@ usage() {
 Usage:
   yolobox2 up|down|status
   yolobox2 ssh [cmd...]
+  yolobox2 enter [herdr-args...]
   yolobox2 link
   yolobox2 seed-herdr
 EOF
+}
+
+# ssh_config values containing spaces need literal quotes inside the
+# -o argument itself (its own tokenizer splits on whitespace otherwise) —
+# the 1Password socket path lives under "Group Containers". Every caller
+# must use this: lima's ssh.config sets ControlMaster auto + ControlPersist
+# yes on a shared ControlPath, so whichever invocation establishes the
+# master decides whether agent forwarding exists for every later session.
+# Sets the SSH_ARGS array (macOS ships bash 3.2, which has no mapfile).
+ssh_args() {
+    SSH_ARGS=(-F "${SSH_CFG}" -o "IdentityAgent=\"${OP_SOCK}\"" -o ForwardAgent=yes)
 }
 
 cmd_up() {
@@ -57,19 +70,53 @@ cmd_status() {
 }
 
 cmd_ssh() {
-    # ssh_config values containing spaces need literal quotes inside the
-    # -o argument itself (its own tokenizer splits on whitespace otherwise) —
-    # the 1Password socket path lives under "Group Containers".
-    ARGS=(-F "${SSH_CFG}" -o "IdentityAgent=\"${OP_SOCK}\"" -o ForwardAgent=yes -t)
-    if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] \
-        && [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ]; then
-        ARGS+=(
-            -R "${VM_USER_HOME}/.herdr-host.sock:${HERDR_SOCKET_PATH}"
-            -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${VM_USER_HOME}/.herdr-host.sock"
-        )
+    ssh_args
+    SSH_ARGS+=(-t "${VM_HOST}")
+    exec ssh "${SSH_ARGS[@]}" "${@+"$@"}"
+}
+
+# herdr installs its own binary into the guest ~/.local/bin on version drift,
+# shadowing the nix-pinned /run/current-system/sw/bin/herdr — so parity is
+# checked, not assumed. HERDR_REMOTE_BINARY cannot substitute for this check:
+# it names a *local* (client-side) binary path for `herdr --remote` to copy
+# over on a platform match, not a path on the remote host, so it cannot pin
+# the guest binary.
+check_herdr_version_parity() {
+    host_version="$(herdr --version)"
+    ssh_args
+    guest_version="$(ssh "${SSH_ARGS[@]}" "${VM_HOST}" herdr --version)"
+    if [ "${host_version}" != "${guest_version}" ]; then
+        echo "yolobox2: herdr version mismatch: host '${host_version}' vs guest '${guest_version}'" >&2
+        echo "yolobox2: bump yolobox.harness.herdr.version/hash in nix/harnesses.nix and rebuild, or upgrade the host binary" >&2
+        exit 1
     fi
-    ARGS+=("${VM_HOST}")
-    exec ssh "${ARGS[@]}" "${@+"$@"}"
+}
+
+cmd_enter() {
+    check_herdr_version_parity
+    if [ "${HERDR_ENV:-}" = "1" ]; then
+        # herdr --remote shells out to plain ssh against ~/.ssh/config, so it
+        # never sees ssh_args()'s -F/-o flags — ForwardAgent must come from
+        # ~/.ssh/config itself.
+        cfg="$(ssh -G "${VM_HOST}")"
+        hostname_val="$(printf '%s\n' "${cfg}" | awk '$1 == "hostname" { print $2; exit }')"
+        forwardagent_val="$(printf '%s\n' "${cfg}" | awk '$1 == "forwardagent" { print $2; exit }')"
+        if [ "${hostname_val}" = "${VM_HOST}" ] || [ -z "${hostname_val}" ] || [ "${forwardagent_val}" != "yes" ]; then
+            cat >&2 <<EOF
+yolobox2: ~/.ssh/config does not resolve ${VM_HOST} with ForwardAgent yes.
+Add this to the TOP of ~/.ssh/config, above the existing "Host *":
+
+Include ~/.lima/yolobox/ssh.config
+Host ${VM_HOST}
+  ForwardAgent yes
+EOF
+            exit 1
+        fi
+        exec herdr --remote "${VM_HOST}" --remote-keybindings server "$@"
+    else
+        ssh_args
+        exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}" herdr
+    fi
 }
 
 # Resolve $1 relative to a base dir via cd+pwd -P; empty on failure.
@@ -113,7 +160,9 @@ cmd_link() {
 
     vmdir="${VM_USER_HOME}/wrk/${relpath}"
 
-    ssh -F "${SSH_CFG}" "${VM_HOST}" \
+    ssh_args
+    # shellcheck disable=SC2029 # vmdir must expand client-side to embed the guest path literally
+    ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
         "mkdir -p '${vmdir}' && { git -C '${vmdir}' rev-parse --git-dir >/dev/null 2>&1 || { git -C '${vmdir}' init -b main && git -C '${vmdir}' config receive.denyCurrentBranch updateInstead; }; }"
 
     git -C "${toplevel}" remote add yolobox "ssh://${VM_HOST}${vmdir}"
@@ -122,7 +171,8 @@ cmd_link() {
 
 cmd_seed_herdr() {
     host_cfg="$HOME/.config/herdr/config.toml"
-    cat "${host_cfg}" | ssh -F "${SSH_CFG}" "${VM_HOST}" \
+    ssh_args
+    cat "${host_cfg}" | ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
         'mkdir -p ~/.config/herdr && { [ -e ~/.config/herdr/config.toml ] || cat > ~/.config/herdr/config.toml; }'
 }
 
@@ -138,6 +188,7 @@ main() {
         down) cmd_down ;;
         status) cmd_status ;;
         ssh) cmd_ssh "$@" ;;
+        enter) cmd_enter "$@" ;;
         link) cmd_link ;;
         seed-herdr) cmd_seed_herdr ;;
         *)
