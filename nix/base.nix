@@ -29,8 +29,8 @@
   system.stateVersion = "25.11";
 
   # Matches what lima-init's existence-guarded useradd already created on
-  # first boot (Gotcha 1) — including lima >=2.2.0's ".guest"-suffixed home
-  # (nixos-lima issue #121). NixOS refuses isNormalUser below uid 1000
+  # first boot (Gotcha 1) — including lima >=2.1.0's ".guest"-suffixed home
+  # (lima-vm/lima#4578). NixOS refuses isNormalUser below uid 1000
   # (lima's cidata UID here is 501, matching the host's macOS UID), so this
   # uses isSystemUser instead and sets autoSubUidGidRange directly — that
   # option isn't actually gated on isNormalUser, only its *default* is —
