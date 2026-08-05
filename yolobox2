@@ -4,7 +4,7 @@
 # Usage:
 #   yolobox2 up|down|status
 #   yolobox2 ssh [cmd...]
-#   yolobox2 enter [herdr-args...]
+#   yolobox2 enter
 #   yolobox2 link
 #   yolobox2 seed-herdr
 
@@ -36,7 +36,7 @@ usage() {
 Usage:
   yolobox2 up|down|status
   yolobox2 ssh [cmd...]
-  yolobox2 enter [herdr-args...]
+  yolobox2 enter
   yolobox2 link
   yolobox2 seed-herdr
 EOF
@@ -75,54 +75,22 @@ cmd_ssh() {
     exec ssh "${SSH_ARGS[@]}" "${@+"$@"}"
 }
 
-# herdr --remote installs its own binary into the guest ~/.local/bin on
-# version drift, shadowing the nix-pinned /run/current-system/sw/bin/herdr —
-# so parity is checked, not assumed. This only applies to the HERDR_ENV=1
-# remote-attach path below; plain ssh never touches a host herdr binary at
-# all. HERDR_REMOTE_BINARY cannot substitute for this check: it names a
-# *local* (client-side) binary path for `herdr --remote` to copy over on a
-# platform match, not a path on the remote host, so it cannot pin the guest
-# binary.
-check_herdr_version_parity() {
-    command -v herdr >/dev/null 2>&1 || {
-        echo "yolobox2: herdr not found on host; install it or use 'yolobox2 ssh' instead" >&2
-        exit 1
-    }
-    host_version="$(herdr --version)"
-    ssh_args
-    guest_version="$(ssh "${SSH_ARGS[@]}" "${VM_HOST}" herdr --version)"
-    if [ "${host_version}" != "${guest_version}" ]; then
-        echo "yolobox2: herdr version mismatch: host '${host_version}' vs guest '${guest_version}'" >&2
-        echo "yolobox2: bump yolobox.harness.herdr.version/hash in nix/harnesses.nix and rebuild, or upgrade the host binary" >&2
-        exit 1
-    fi
-}
-
 cmd_enter() {
-    if [ "${HERDR_ENV:-}" = "1" ]; then
-        check_herdr_version_parity
-        # herdr --remote shells out to plain ssh against ~/.ssh/config, so it
-        # never sees ssh_args()'s -F/-o flags — ForwardAgent must come from
-        # ~/.ssh/config itself.
-        cfg="$(ssh -G "${VM_HOST}")"
-        hostname_val="$(printf '%s\n' "${cfg}" | awk '$1 == "hostname" { print $2; exit }')"
-        forwardagent_val="$(printf '%s\n' "${cfg}" | awk '$1 == "forwardagent" { print $2; exit }')"
-        if [ "${hostname_val}" = "${VM_HOST}" ] || [ -z "${hostname_val}" ] || [ "${forwardagent_val}" != "yes" ]; then
-            cat >&2 <<EOF
-yolobox2: ~/.ssh/config does not resolve ${VM_HOST} with ForwardAgent yes.
-Add this to the TOP of ~/.ssh/config, above the existing "Host *":
-
-Include ~/.lima/yolobox/ssh.config
-Host ${VM_HOST}
-  ForwardAgent yes
-EOF
-            exit 1
-        fi
-        exec herdr --remote "${VM_HOST}" --remote-keybindings server "$@"
-    else
-        ssh_args
-        exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}" herdr
+    ssh_args
+    # A per-pane forward and per-pane SetEnv cannot ride the shared
+    # ControlMaster that ssh_args()'s -F config establishes for cmd_ssh:
+    # the first session to dial in fixes the master's environment for
+    # every later session, leaking a stale HERDR_PANE_ID/HERDR_SOCKET_PATH.
+    # Each enter gets its own connection instead.
+    SSH_ARGS+=(-o ControlPath=none)
+    if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] &&
+        [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ]; then
+        SSH_ARGS+=(
+            -R "${VM_USER_HOME}/.herdr-host.sock:${HERDR_SOCKET_PATH}"
+            -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${VM_USER_HOME}/.herdr-host.sock"
+        )
     fi
+    exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}"
 }
 
 # Resolve $1 relative to a base dir via cd+pwd -P; empty on failure.
@@ -194,7 +162,7 @@ main() {
         down) cmd_down ;;
         status) cmd_status ;;
         ssh) cmd_ssh "$@" ;;
-        enter) cmd_enter "$@" ;;
+        enter) cmd_enter ;;
         link) cmd_link ;;
         seed-herdr) cmd_seed_herdr ;;
         *)
