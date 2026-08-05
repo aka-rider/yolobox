@@ -58,7 +58,10 @@ cmd_status() {
 }
 
 cmd_ssh() {
-    ARGS=(-F "${SSH_CFG}" -o IdentityAgent="${OP_SOCK}" -o ForwardAgent=yes -t)
+    # ssh_config values containing spaces need literal quotes inside the
+    # -o argument itself (its own tokenizer splits on whitespace otherwise) —
+    # the 1Password socket path lives under "Group Containers".
+    ARGS=(-F "${SSH_CFG}" -o "IdentityAgent=\"${OP_SOCK}\"" -o ForwardAgent=yes -t)
     if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] \
         && [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ]; then
         ARGS+=(
