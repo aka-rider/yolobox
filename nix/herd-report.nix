@@ -41,12 +41,14 @@ let
           mkdir -p "''${log_dir}" 2>/dev/null || return 0
           log_file="''${log_dir}/herd-report.log"
           printf '%s %s\n' "$(date -Iseconds)" "$1" >> "''${log_file}" 2>/dev/null || true
-          # Cap growth: PreToolUse fires on every tool call, so an unbounded
-          # herd never stops appending. Trim to the tail once past 500 lines
-          # rather than pulling in logrotate for a best-effort hook log.
+          # Cap growth: PreToolUse fires on every tool call, so a broken herd
+          # never stops appending. Trim to the tail rather than pulling in
+          # logrotate for a best-effort hook log.
+          log_max_lines=500
+          log_keep_lines=250
           lines=$(wc -l < "''${log_file}" 2>/dev/null || echo 0)
-          if [ "''${lines}" -gt 500 ]; then
-              tail -n 250 "''${log_file}" > "''${log_file}.tmp" 2>/dev/null \
+          if [ "''${lines}" -gt "''${log_max_lines}" ]; then
+              tail -n "''${log_keep_lines}" "''${log_file}" > "''${log_file}.tmp" 2>/dev/null \
                   && mv "''${log_file}.tmp" "''${log_file}" 2>/dev/null || true
           fi
       }
