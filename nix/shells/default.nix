@@ -19,5 +19,5 @@ let
   };
 in
 {
-  inherit fragments devShells shell;
+  inherit devShells shell;
 }

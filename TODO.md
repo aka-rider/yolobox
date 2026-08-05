@@ -1,4 +1,3 @@
 - Profilers per language deferred from the initial dev-shell set (A4)
 - Delete the v1 bash/Docker era once the VM is the daily driver
 - Adopt nixos-vscode-server module if nix-ld proves insufficient for VS Code Remote
-- Rootless-podman contingency: if lima-init conflicts with the declarative user, fall back to rootful dockerSocket + podman group
