@@ -76,6 +76,11 @@ cmd_ssh() {
 }
 
 cmd_enter() {
+    [ "$#" -eq 0 ] || {
+        echo "yolobox2: enter takes no arguments" >&2
+        usage
+        exit 2
+    }
     ssh_args
     # A per-pane forward and per-pane SetEnv cannot ride the shared
     # ControlMaster that ssh_args()'s -F config establishes for cmd_ssh:
@@ -85,9 +90,22 @@ cmd_enter() {
     SSH_ARGS+=(-o ControlPath=none)
     if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] &&
         [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ]; then
+        # nix/base.nix sets StreamLocalBindUnlink=yes, so sshd unlinks
+        # whatever already sits at the -R target before binding it. A
+        # path shared by every pane would let a second concurrent enter
+        # delete and rebind the first pane's live socket out from under
+        # it. Scoping the filename to HERDR_PANE_ID keeps each pane's
+        # unlink-and-rebind local to its own socket. Pane ids are
+        # colon-separated (e.g. "wN:p1"), legal in a filename but not
+        # in ssh's own "remote:local" -R syntax, which would split the
+        # path on that colon — so the colon is swapped for "_", a
+        # character herdr's own [A-Za-z0-9]+:p[A-Za-z0-9]+ id scheme
+        # never produces.
+        pane_id_safe="${HERDR_PANE_ID//:/_}"
+        guest_sock="${VM_USER_HOME}/.herdr-host.${pane_id_safe}.sock"
         SSH_ARGS+=(
-            -R "${VM_USER_HOME}/.herdr-host.sock:${HERDR_SOCKET_PATH}"
-            -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${VM_USER_HOME}/.herdr-host.sock"
+            -R "${guest_sock}:${HERDR_SOCKET_PATH}"
+            -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${guest_sock}"
         )
     fi
     exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}"
@@ -162,7 +180,7 @@ main() {
         down) cmd_down ;;
         status) cmd_status ;;
         ssh) cmd_ssh "$@" ;;
-        enter) cmd_enter ;;
+        enter) cmd_enter "$@" ;;
         link) cmd_link ;;
         seed-herdr) cmd_seed_herdr ;;
         *)
