@@ -62,16 +62,18 @@ let
 
       case "''${state}" in
           release)
-              if ! out=$(timeout "''${report_timeout}" herdr pane release-agent "''${HERDR_PANE_ID}" \
-                      --source "yolobox:''${agent}" --agent "''${agent}" 2>&1); then
-                  log_rejection "release ''${agent}: ''${out}"
-              fi
+              rc=0
+              out=$(timeout "''${report_timeout}" herdr pane release-agent "''${HERDR_PANE_ID}" \
+                  --source "yolobox:''${agent}" --agent "''${agent}" 2>&1) || rc=$?
+              # rc 124 is timeout(1)'s "killed on expiry" — the wedged-socket
+              # case, where the killed CLI leaves no output to quote.
+              [ "''${rc}" -eq 0 ] || log_rejection "release ''${agent} (rc=''${rc}): ''${out}"
               ;;
           working|idle|blocked)
-              if ! out=$(timeout "''${report_timeout}" herdr pane report-agent "''${HERDR_PANE_ID}" \
-                      --source "yolobox:''${agent}" --agent "''${agent}" --state "''${state}" 2>&1); then
-                  log_rejection "''${state} ''${agent}: ''${out}"
-              fi
+              rc=0
+              out=$(timeout "''${report_timeout}" herdr pane report-agent "''${HERDR_PANE_ID}" \
+                  --source "yolobox:''${agent}" --agent "''${agent}" --state "''${state}" 2>&1) || rc=$?
+              [ "''${rc}" -eq 0 ] || log_rejection "''${state} ''${agent} (rc=''${rc}): ''${out}"
               ;;
       esac
 
