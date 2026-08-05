@@ -122,4 +122,7 @@ The Docker/bash yolobox v1 lives at commit `4c154fc`. The v2 architecture
 replaces that entire stack with a declarative NixOS VM, eliminating the
 manual bootstrap scripts and fragile Docker networking.
 
-limactl version: _recorded at bring-up_
+limactl version: `limactl version 2.2.0` (bring-up 2026-08-05). Note: lima
+>=2.2.0 names the guest home `/home/xiii.guest` — a ".guest" suffix on the
+cidata home dir, unrelated to the account name `xiii` (nixos-lima issue
+#121) — every VM-side path in this repo already accounts for it.
