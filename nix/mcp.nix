@@ -66,7 +66,7 @@ in
 
   config = {
     # crush executes command substitution in its config file at load time
-    # (plan Gotcha 13 / mcp/README.md's "Two hard rules") — this is the
+    # (plan Gotcha 13 / mcp/README.md at 4c154fc's "Two hard rules") — this is the
     # eval-time enforcement of what v1 stated only as prose.
     assertions = [
       {
