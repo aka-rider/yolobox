@@ -1,6 +1,8 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.yolobox.mcp.servers;
+  homeDir = config.users.users.xiii.home;
+  homeTmpfiles = import ./lib/home-tmpfiles.nix { inherit lib; };
 
   serverType = lib.types.submodule {
     options = {
@@ -19,8 +21,8 @@ let
     };
   };
 
-  # Canonical Claude/pi shape — identity mapping of the option set.
-  mcpServers = lib.mapAttrs (_: s: { inherit (s) command args env; }) cfg;
+  # Canonical Claude/pi shape is the option set itself.
+  mcpServers = cfg;
 
   # crush: near 1:1 with the canonical shape, under "mcp" plus its own
   # top-level $schema.
@@ -74,6 +76,10 @@ in
         assertion = !(lib.hasInfix "$(" rendered);
         message = "yolobox.mcp.servers: a rendered config contains '$(' — crush executes command substitution in its config at load time.";
       }
+      {
+        assertion = lib.all (s: lib.hasPrefix "/" (toString s.command)) (lib.attrValues cfg);
+        message = "yolobox.mcp.servers: every server's command must be an absolute path — no npx.";
+      }
     ];
 
     environment.etc."claude-code/managed-mcp.json".text = builtins.toJSON { mcpServers = mcpServers; };
@@ -89,14 +95,14 @@ in
     # pi has no native config path for this; it reads ~/.config/mcp/mcp.json
     # via pi-mcp-adapter, and the harness never rewrites it, so a plain
     # symlink (Gotcha 14) tracks /etc across every rebuild.
-    # "d" entries own the parent dirs as xiii first — otherwise tmpfiles
-    # auto-creates them root-owned and then refuses the L+ below as an
-    # "unsafe path transition" (user-owned $HOME -> root-owned subdir).
-    systemd.tmpfiles.rules = [
-      "d /home/xiii.guest/.config 0755 xiii users -"
-      "d /home/xiii.guest/.config/mcp 0755 xiii users -"
-      "L+ /home/xiii.guest/.config/mcp/mcp.json - - - - /etc/yolobox/mcp/pi.json"
-    ];
+    systemd.tmpfiles.rules = homeTmpfiles {
+      home = homeDir;
+      dirUser = "xiii";
+      dirs = [ ".config" ".config/mcp" ];
+      rule = "L+";
+      path = ".config/mcp/mcp.json";
+      argument = "/etc/yolobox/mcp/pi.json";
+    };
 
     environment.systemPackages = [ mcpSmoke ];
   };

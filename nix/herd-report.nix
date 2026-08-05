@@ -1,17 +1,21 @@
 { config, lib, pkgs, ... }:
 let
+  homeDir = config.users.users.xiii.home;
+  homeTmpfiles = import ./lib/home-tmpfiles.nix { inherit lib; };
+
   herdReport = pkgs.writeShellApplication {
     name = "yolobox-herd-report";
-    runtimeInputs = [ pkgs.herdr ];
-    # Ported verbatim from herd-report.sh at 4c154fc. CRITICAL: reports use
-    # the `yolobox:<agent>` source, NOT `herdr:<agent>` — the server reserves
-    # herdr:* sources for its own screen/session detection of a real agent
-    # process and clears them for a boxed agent (whose foreground process is
-    # not the agent itself), which is exactly why a boxed agent would
-    # otherwise show as unknown. Best-effort and ALWAYS exit 0: a reporting
-    # failure must never disturb the agent — every guard below is an early
-    # `exit 0`, never a bare failing command, so writeShellApplication's
-    # `set -euo pipefail` cannot turn a guard miss into a nonzero exit.
+    runtimeInputs = [ config.yolobox.harness.herdr.package ];
+    # Ported from herd-report.sh at 4c154fc, with its guards restructured for
+    # set -e. CRITICAL: reports use the `yolobox:<agent>` source, NOT
+    # `herdr:<agent>` — the server reserves herdr:* sources for its own
+    # screen/session detection of a real agent process and clears them for a
+    # boxed agent (whose foreground process is not the agent itself), which
+    # is exactly why a boxed agent would otherwise show as unknown.
+    # Best-effort and ALWAYS exit 0: a reporting failure must never disturb
+    # the agent — every guard below is an early `exit 0`, never a bare
+    # failing command, so writeShellApplication's `set -euo pipefail` cannot
+    # turn a guard miss into a nonzero exit.
     text = ''
       state="''${1:-}"
       agent="''${2:-}"
@@ -19,12 +23,12 @@ let
       [ "''${YOLOBOX_HERD:-}" = "1" ]     || exit 0
       [ -n "''${HERDR_PANE_ID:-}" ]       || exit 0
       [ -S "''${HERDR_SOCKET_PATH:-}" ]   || exit 0
-      command -v herdr >/dev/null 2>&1    || exit 0
       [ -n "''${agent}" ]                 || exit 0
 
       # A hook harness (e.g. Claude Code) may pipe the event JSON on stdin;
-      # key off the state argument instead, so drain it.
-      cat >/dev/null 2>&1 || true
+      # key off the state argument instead, so drain it — but only when
+      # stdin isn't a TTY, or a manual invocation would block forever.
+      [ -t 0 ] || cat >/dev/null 2>&1 || true
 
       case "''${state}" in
           release)
@@ -45,9 +49,9 @@ let
 
   piExtension = ''
     // yolobox pi herd-report extension — plain JavaScript. pi's extension
-    // loader resolves TypeScript via jiti, but Node's `node --check` (used
-    // to validate this file at build time) cannot parse TS syntax, so this
-    // stays plain JS.
+    // loader resolves TypeScript via jiti, but Node's `node --check`, which
+    // validates this file at build time below (see piExtensionChecked),
+    // cannot parse TS syntax, so this stays plain JS.
     //
     // Ported from tools/23-pi.sh at 4c154fc, reporting under source
     // yolobox:pi via yolobox-herd-report (see nix/herd-report.nix), not
@@ -111,6 +115,13 @@ let
     };
   '';
 
+  # node --check can only parse, not execute, so this is a cheap build-time
+  # guard against a syntax error in piExtension reaching the VM.
+  piExtensionChecked = pkgs.runCommand "yolobox-agent-state.js" { } ''
+    cp ${pkgs.writeText "yolobox-agent-state.js" piExtension} "$out"
+    ${lib.getExe' pkgs.nodejs "node"} --check "$out"
+  '';
+
   piSettings = {
     packages = [ "${piMcpAdapter}/lib/node_modules/pi-mcp-adapter" ];
     extensions = [ "/etc/yolobox/pi/yolobox-agent-state.js" ];
@@ -139,17 +150,21 @@ in
       };
     };
 
-    environment.etc."yolobox/pi/yolobox-agent-state.js".text = piExtension;
+    environment.etc."yolobox/pi/yolobox-agent-state.js".source = piExtensionChecked;
     environment.etc."yolobox/pi/settings.json".text = builtins.toJSON piSettings;
 
     # pi may rewrite ~/.pi/agent/settings.json (e.g. via /extensions), so
-    # this is copy-if-absent (Gotcha 14), not a symlink. "d" entries own the
-    # parent dirs as xiii first — otherwise tmpfiles auto-creates them
-    # root-owned and refuses the C rule as an "unsafe path transition".
-    systemd.tmpfiles.rules = [
-      "d /home/xiii.guest/.pi 0755 xiii users -"
-      "d /home/xiii.guest/.pi/agent 0755 xiii users -"
-      "C /home/xiii.guest/.pi/agent/settings.json 0644 xiii users - /etc/yolobox/pi/settings.json"
-    ];
+    # this is copy-if-absent (Gotcha 14), not a symlink.
+    systemd.tmpfiles.rules = homeTmpfiles {
+      home = homeDir;
+      dirUser = "xiii";
+      dirs = [ ".pi" ".pi/agent" ];
+      rule = "C";
+      path = ".pi/agent/settings.json";
+      leafMode = "0644";
+      leafUser = "xiii";
+      leafGroup = "users";
+      argument = "/etc/yolobox/pi/settings.json";
+    };
   };
 }
