@@ -18,13 +18,14 @@ No private SSH key ever enters the VM. `git push` works through SSH agent
 forwarding of the host's 1Password agent, which means unattended pushes are
 impossible by design — there is no key material on disk to steal.
 
-All three host couplings ride a single SSH session:
+Three host couplings ride SSH:
 
 1. **1Password agent forward** — pushes authenticate through 1Password on the
-   host; the VM never sees a private key.
+   host; the VM never sees a private key. Present on both `enter` and `ssh`.
 2. **herdr socket RemoteForward** — the host's herdr socket is forwarded
    INTO the VM, so in-VM harness hooks can report each agent as
-   `yolobox:<agent>` back to the host herd.
+   `yolobox:<agent>` back to the host herd. Present only on `./yolobox2
+   enter`; `./yolobox2 ssh` carries no herd wiring.
 3. **Your terminal** — the interactive shell you use to reach the VM.
 
 This keeps the blast radius bounded: a compromised agent can only act within
@@ -110,10 +111,26 @@ up the change with either a real reboot (`limactl restart yolobox`) or
 ```
 
 `./yolobox2 enter` opens a guest shell in your current host herdr pane, with
-the herd socket forwarded into the VM. Run an agent there and it shows up in
-your host herd as `yolobox:<agent>` — no guest TUI, no nesting, one herd,
+the herd socket forwarded into the VM — no guest TUI, no nesting, one herd,
 the host's. `./yolobox2 ssh` stays the plain command/scripting path and
 carries no herd wiring: no forwarded socket, no herd env.
+
+Only two of the five in-box harnesses actually report into that herd:
+**claude** (via a managed-settings.json hook map) and **pi** (via a bundled
+herd-report extension) — see `nix/herd-report.nix`. opencode and codex lost
+their herd reporting when `nix/herd.nix` (which used to run `herdr
+integration install` for both) was deleted, and crush has no upstream herdr
+integration to install in the first place. An unreported agent still runs
+fine inside the box; it just shows as `unknown` in the herd instead of
+`yolobox:<agent>`.
+
+If a boxed agent doesn't show up at all — not even as `unknown` — the host
+herdr server may be rejecting its reports outright (usually a host/guest
+herdr protocol mismatch). Rejections are appended to a guest-side log at
+`~/.local/state/yolobox/herd-report.log` (reports are otherwise best-effort
+and silent, by design — see `nix/herd-report.nix`). Check `herdr status` on
+the host for its `compatible:` line, and compare against the guest's pinned
+version at `yolobox.harness.herdr.version`/`hash` in `nix/harnesses.nix`.
 
 ## Backups and snapshots
 
