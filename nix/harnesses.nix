@@ -83,6 +83,10 @@ in
         assertion = (cfg.claude-code.version == null) == (cfg.claude-code.hash == null);
         message = "yolobox.harness.claude-code: version and hash must both be null or both be set.";
       }
+      {
+        assertion = (cfg.herdr.version == null) == (cfg.herdr.hash == null);
+        message = "yolobox.harness.herdr: version and hash must both be null or both be set.";
+      }
     ];
   };
 }
