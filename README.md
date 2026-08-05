@@ -18,16 +18,14 @@ No private SSH key ever enters the VM. `git push` works through SSH agent
 forwarding of the host's 1Password agent, which means unattended pushes are
 impossible by design — there is no key material on disk to steal.
 
-Both host couplings ride SSH:
+All three host couplings ride a single SSH session:
 
 1. **1Password agent forward** — pushes authenticate through 1Password on the
    host; the VM never sees a private key.
-2. **Your terminal** — the interactive shell you use to reach the VM.
-
-herdr runs *inside* the VM as its own persistent server (a systemd user
-service), with its own herd. Agents started inside the box are foreground
-processes of guest panes, so herdr's native process detection recognises
-them directly — there is no reporting bridge back to a host herd.
+2. **herdr socket RemoteForward** — the host's herdr socket is forwarded
+   INTO the VM, so in-VM harness hooks can report each agent as
+   `yolobox:<agent>` back to the host herd.
+3. **Your terminal** — the interactive shell you use to reach the VM.
 
 This keeps the blast radius bounded: a compromised agent can only act within
 the VM and can only push out through the forwarded 1Password session, which
@@ -96,8 +94,8 @@ up the change with either a real reboot (`limactl restart yolobox`) or
 # Start or ensure the VM is running
 ./yolobox2 up
 
-# Open an interactive herd session inside the box — the herdr TUI, with
-# agents running as guest panes
+# Open a guest shell in the current host herdr pane, with the herd socket
+# forwarded — agents run here and show up in the host herd
 ./yolobox2 enter
 
 # Open a plain SSH session instead — one-shot commands, scripting, git
@@ -111,65 +109,11 @@ up the change with either a real reboot (`limactl restart yolobox`) or
 ./yolobox2 seed-herdr
 ```
 
-`enter` reaches the same guest herd by two different routes, picked
-automatically. From inside a host herdr session it runs `herdr --remote`: the
-host client attaches the *guest* server and streams the guest UI into the
-pane, with `--remote-keybindings server` negotiating keys so the guest side
-drives. From a plain terminal it runs `ssh -t … herdr`: a guest client
-attaches that same guest server directly — no nesting, no keybinding
-conflict. Either route lands in the same session; detach and re-enter by
-either one and the workspace and its agents are still there. A raw
-`ssh lima-yolobox` (or `./yolobox2 ssh`) is deliberately a plain shell, not a
-herd entry point. The `herdr --remote` route has one-time host setup; the
-plain-terminal route needs none of it.
-
-### `enter` prerequisites
-
-`herdr --remote` shells out to plain `ssh <target>` against your real
-`~/.ssh/config` — it never sees lima's `-F` flag, so the box's ssh config has
-to be pulled in there instead. Add this at the **top** of `~/.ssh/config`,
-above the existing `Host *` (which already supplies the 1Password
-`IdentityAgent`; `ForwardAgent` is the missing piece), as a one-time host
-setup:
-
-```
-Include ~/.lima/yolobox/ssh.config
-Host lima-yolobox
-  ForwardAgent yes
-```
-
-lima's `ssh.config` is entirely inside its own `Host lima-yolobox` block, so
-this `Include` is host-scoped and cannot affect any other ssh target.
-
-Run from inside a host herdr pane, `enter` attaches through
-`herdr --remote`, which the host binary refuses as a nested launch. Enable it
-in the **host** `~/.config/herdr/config.toml` — the guard is client-side, so
-the guest's config has no say:
-
-```toml
-[experimental]
-allow_nested = true
-```
-
-Host and guest herdr binaries must stay on matching versions. On drift,
-`herdr --remote` installs its own binary into the guest's `~/.local/bin`,
-shadowing the nix-pinned one — bump `yolobox.harness.herdr.version`/`hash`
-in `nix/harnesses.nix` (or upgrade the host binary) to fix it.
-
-Both sides deliberately share `prefix = "ctrl+a"` — different leader keys
-would break muscle memory — so escape the outer host session with a doubled
-prefix (`ctrl+a ctrl+a`) rather than a different key. `enter` passes
-`--remote-keybindings server` so your keys drive the guest session, not the
-host one.
-
-Agent detection inside the box is herdr's own native process detection. A
-systemd user unit runs `herdr integration install` at boot for claude, pi,
-opencode, and codex, best-effort per harness. claude and pi install
-immediately; opencode and codex only succeed once that tool has been run at
-least once and created its config directory (`~/.config/opencode`,
-`~/.codex`) — until then the unit logs "config directory not found" for
-that harness and moves on. crush has no upstream herdr integration and falls
-back to screen detection only.
+`./yolobox2 enter` opens a guest shell in your current host herdr pane, with
+the herd socket forwarded into the VM. Run an agent there and it shows up in
+your host herd as `yolobox:<agent>` — no guest TUI, no nesting, one herd,
+the host's. `./yolobox2 ssh` stays the plain command/scripting path and
+carries no herd wiring: no forwarded socket, no herd env.
 
 ## Backups and snapshots
 
