@@ -111,6 +111,18 @@ up the change with either a real reboot (`limactl restart yolobox`) or
 ./yolobox2 seed-herdr
 ```
 
+`enter` reaches the same guest herd by two different routes, picked
+automatically. From inside a host herdr session it runs `herdr --remote`: the
+host client attaches the *guest* server and streams the guest UI into the
+pane, with `--remote-keybindings server` negotiating keys so the guest side
+drives. From a plain terminal it runs `ssh -t … herdr`: a guest client
+attaches that same guest server directly — no nesting, no keybinding
+conflict. Either route lands in the same session; detach and re-enter by
+either one and the workspace and its agents are still there. A raw
+`ssh lima-yolobox` (or `./yolobox2 ssh`) is deliberately a plain shell, not a
+herd entry point. The `herdr --remote` route has one-time host setup; the
+plain-terminal route needs none of it.
+
 ### `enter` prerequisites
 
 `herdr --remote` shells out to plain `ssh <target>` against your real
