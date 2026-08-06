@@ -25,6 +25,7 @@
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
   services.lima.enable = true;
+  networking.hostName = "yolobox";
   users.mutableUsers = true;
   system.stateVersion = "25.11";
 
