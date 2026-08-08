@@ -14,6 +14,9 @@ readonly INSTANCE="yolobox"
 readonly VM_HOST="lima-yolobox"
 # ".guest" suffix: lima >= 2.1.0 renames the guest home (see README).
 readonly VM_USER_HOME="/home/xiii.guest"
+# Created by a systemd-tmpfiles rule in nix/base.nix — see there for why the
+# forwarded sockets live outside VM_USER_HOME.
+readonly GUEST_SOCK_DIR="/run/yolobox"
 SSH_CFG="$HOME/.lima/yolobox/ssh.config"
 OP_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
 readonly SSH_CFG OP_SOCK
@@ -102,7 +105,7 @@ cmd_enter() {
         # character herdr's own [A-Za-z0-9]+:p[A-Za-z0-9]+ id scheme
         # never produces.
         pane_id_safe="${HERDR_PANE_ID//:/_}"
-        guest_sock="${VM_USER_HOME}/.herdr-host.${pane_id_safe}.sock"
+        guest_sock="${GUEST_SOCK_DIR}/herd-host.${pane_id_safe}.sock"
         SSH_ARGS+=(
             -R "${guest_sock}:${HERDR_SOCKET_PATH}"
             -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${guest_sock}"

@@ -52,6 +52,14 @@
     StreamLocalBindUnlink = "yes";
   };
 
+  # Forwarded herdr sockets (see cmd_enter in yolobox2) land under /run, not
+  # $HOME: a unix socket anywhere under a Nix source root makes evaluation of
+  # that root fail with "file ... has an unsupported type", and /run is tmpfs
+  # so an orphaned socket dies at reboot instead of accumulating. This is safe
+  # ahead of any ssh connection because systemd-tmpfiles-setup.service runs
+  # Before=sysinit.target, while sshd only arrives with multi-user.target.
+  systemd.tmpfiles.rules = [ "d /run/yolobox 0700 xiii users -" ];
+
   security.sudo.wheelNeedsPassword = false;
   programs.zsh.enable = true;
   programs.direnv.enable = true;
