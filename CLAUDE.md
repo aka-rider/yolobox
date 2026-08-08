@@ -44,9 +44,13 @@ checkout and is refused like any other.
 - Resolution needs network on the first add: package metadata from
   search.devbox.sh, store paths from cache.nixos.org.
 - `.devbox/` is per-machine state and is gitignored per project.
-- direnv auto-trusts every `.envrc` under `/home/xiii.guest/wrk` via a
-  declaratively seeded `~/.config/direnv/direnv.toml` whitelist, so no
-  `direnv allow` step exists.
+- direnv auto-trusts every `.envrc` under `/home/xiii.guest/wrk`, so no
+  `direnv allow` step exists. The whitelist lives in `/etc/direnv/direnv.toml`,
+  rendered by `programs.direnv.settings`. The NixOS direnv module exports
+  `DIRENV_CONFIG=/etc/direnv`, which overrides the XDG location — a
+  `~/.config/direnv/direnv.toml` is silently ignored, so never put the
+  whitelist there. Being an `/etc` symlink, it flips on `nixos-rebuild
+  switch`; no tmpfiles or reboot step applies.
 
 ## tmpfiles rules do not take effect on `switch`
 
