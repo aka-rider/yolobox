@@ -40,39 +40,51 @@ expressed as a system module:
   so you can pin individual agents without forking the flake. MCP servers
   are declared once in Nix and rendered per-harness automatically.
 
-Per-language toolchains are intentionally **not** system packages. They live
-as dev-shell fragments (`rust`, `python`, `node`, `go`, `cxx`, `postgres`)
-composed per-project via `yolobox.lib.shell [ ... ]` and activated through
-direnv. This keeps the base VM small and lets each project pull only the
-toolchains it actually needs.
+Per-language toolchains are intentionally **not** system packages. Each
+project declares them in its `devbox.json`; devbox 0.17.5, installed VM-wide
+from nixpkgs, resolves them against the shared nix store, and direnv
+activates the result. This keeps the base VM small and lets each project
+pull only the toolchains it actually needs.
 
 ### Per-project dev shells
 
-A project opts in with a two-file flake, authored **on the host** and pushed
-in. It goes in the project directory, never `$HOME`, and the project must be
-a git repo. On the host:
+A project opts in with two files, `devbox.json` and `.envrc`. Once per
+project, on the host:
 
 ```bash
 ./yolobox2 link                                    # once per repo
-cp ~/Developer/yolobox/templates/default/{flake.nix,.envrc} .
-$EDITOR flake.nix                                  # pick fragments
-printf '.direnv/\n' >> .gitignore
-git add flake.nix .envrc .gitignore && git commit -m "add yolobox dev shell"
+cp ~/Developer/yolobox/templates/default/{devbox.json,.envrc} .
+$EDITOR devbox.json                                # pick packages
+printf '.devbox/\n' >> .gitignore
+git add devbox.json .envrc .gitignore && git commit -m "add devbox env"
 git push yolobox main
 ```
 
-In the VM, in `~/wrk/<project>`:
+In the VM, nothing is manual: direnv is whitelisted for everything under
+`~/wrk`, so the first `cd ~/wrk/<project>` resolves the packages and writes
+`devbox.lock`. The agent commits the lock alongside its work; the host picks
+it up with a normal `git pull yolobox main`.
 
-```bash
-direnv allow          # resolves the shell, writes flake.lock
-git add flake.lock && git commit -m "lock yolobox dev shell"
-```
+The old dev-shell fragments map to devbox packages roughly as:
 
-Then `git pull yolobox main` on the host, to bring the lock back.
+| fragment | devbox packages |
+| --- | --- |
+| rust | cargo rustc rust-analyzer clippy rustfmt |
+| python | python@3.13 uv pyright |
+| node | nodejs typescript typescript-language-server |
+| go | go gopls delve |
+| cxx | gcc gnumake cmake pkg-config gdb |
+| postgres | `"postgresql": { "version": "latest", "disable_plugin": true }` |
 
-To pick up a `nix/shells/default.nix` change: commit and push it into the VM,
-then `nix flake update yolobox` in the project. See CLAUDE.md for why each
-step is load-bearing.
+Package names are searchable with `devbox search <name>`, not guaranteed —
+treat the table as a starting point. The postgres row disables devbox's
+postgresql plugin, which is broken on NixOS (jetify-com/devbox#1559).
+
+#### Migrating a flake-based project
+
+Delete `flake.nix` and `flake.lock`; replace the `.envrc` content with
+`eval "$(devbox generate direnv --print-envrc)"`; add a `devbox.json`; swap
+`.direnv/` for `.devbox/` in `.gitignore`.
 
 ## Bootstrap
 
@@ -112,7 +124,10 @@ on, changes to the flake are applied with
 # Start or ensure the VM is running
 ./yolobox2 up
 
-# Open an interactive SSH session
+# Open a session: ssh plus the herd socket forward and the herd env
+./yolobox2 enter
+
+# Open a plain interactive SSH session, no herd wiring
 ./yolobox2 ssh
 
 # Add a "yolobox" git remote to a host project, mirrored to the same path
@@ -141,8 +156,9 @@ manually before any destructive operation.
 **Zed over SSH** works well because its remote server is a static musl
 binary. However, Zed-downloaded language servers do **not** work on NixOS:
 Zed strips the environment when spawning them, and nix-ld cannot rescue the
-missing dynamic linker context. Use the dev-shell-provided LSPs instead,
-configured in your helix or zed settings.
+missing dynamic linker context. Use the devbox-provided LSPs instead — add
+them to the project's `devbox.json` — configured in your helix or zed
+settings.
 
 **VS Code Remote-SSH** works through nix-ld, which allows the VS Code server
 and its extensions to resolve NixOS dynamic libraries correctly. If VS Code
