@@ -1,32 +1,26 @@
 # yolobox v2
 
 A single NixOS VM running on Mac via Lima (Apple Virtualization.framework),
-serving as a blast-radius devbox for AI coding agents. The VM is the trust
-boundary: every agent tool, every MCP server, every language toolchain lives
-inside it, and the entire system is declared end-to-end by the Nix flake in
-this repository. The VM rebuilds itself from this repo via
-`nixos-rebuild switch --flake`, meaning no Nix installation is required on
-macOS — the host is purely a hypervisor and file bridge.
+serving as a blast-radius devbox for AI coding agents. 
+The VM contains all devtools, packages, harnesses, language and MCP servers, Docker.
+
+It is made to be self-sufficient and the host to have a very limited exposure inside the VM.
 
 ## Isolation model
 
-There are zero host mounts. Git is the only file bridge between macOS and
-the VM. The VM runs as a single user, `xiii`, and the directory
-`~/wrk/<project>` inside the VM mirrors the host's project layout.
+There are zero host files mounts. Git is the only file bridge between macOS and the VM. The VM runs as a single user, and the directory `~/wrk/<project>` inside the VM mirrors the host's project layout.
 
-No private SSH key ever enters the VM. `git push` works through SSH agent
-forwarding of the host's 1Password agent, which means unattended pushes are
-impossible by design — there is no key material on disk to steal.
+No private SSH key ever enters the VM.
 
-Three host couplings ride SSH:
+All host couplings ride a single SSH session:
 
 1. **1Password agent forward** — pushes authenticate through 1Password on the
-   host; the VM never sees a private key. Present on both `enter` and `ssh`.
+   host; the VM never sees a private key.
 2. **herdr socket RemoteForward** — the host's herdr socket is forwarded
-   INTO the VM, so in-VM harness hooks can report each agent as
-   `yolobox:<agent>` back to the host herd. Present only on
-   `./yolobox2 enter`; `./yolobox2 ssh` carries no herd wiring.
+   INTO the VM at `/run/yolobox/herd-host.<pane>.sock`, so in-VM harness
+   hooks can report each agent as `yolobox:<agent>` back to the host herd.
 3. **Your terminal** — the interactive shell you use to reach the VM.
+4. VSCode / Zed remote ssh sessions
 
 This keeps the blast radius bounded: a compromised agent can only act within
 the VM and can only push out through the forwarded 1Password session, which
@@ -51,6 +45,34 @@ as dev-shell fragments (`rust`, `python`, `node`, `go`, `cxx`, `postgres`)
 composed per-project via `yolobox.lib.shell [ ... ]` and activated through
 direnv. This keeps the base VM small and lets each project pull only the
 toolchains it actually needs.
+
+### Per-project dev shells
+
+A project opts in with a two-file flake, authored **on the host** and pushed
+in. It goes in the project directory, never `$HOME`, and the project must be
+a git repo. On the host:
+
+```bash
+./yolobox2 link                                    # once per repo
+cp ~/Developer/yolobox/templates/default/{flake.nix,.envrc} .
+$EDITOR flake.nix                                  # pick fragments
+printf '.direnv/\n' >> .gitignore
+git add flake.nix .envrc .gitignore && git commit -m "add yolobox dev shell"
+git push yolobox main
+```
+
+In the VM, in `~/wrk/<project>`:
+
+```bash
+direnv allow          # resolves the shell, writes flake.lock
+git add flake.lock && git commit -m "lock yolobox dev shell"
+```
+
+Then `git pull yolobox main` on the host, to bring the lock back.
+
+To pick up a `nix/shells/default.nix` change: commit and push it into the VM,
+then `nix flake update yolobox` in the project. See CLAUDE.md for why each
+step is load-bearing.
 
 ## Bootstrap
 
@@ -80,14 +102,9 @@ limactl restart yolobox
 
 After the restart the VM is running the declarative configuration. From now
 on, changes to the flake are applied with
-`nixos-rebuild switch --flake .#yolobox`.
-
-`switch` does not re-run `systemd-tmpfiles-setup.service` — it only runs at
-boot, and refuses a manual restart. Any `"C"` (copy-if-absent) tmpfiles rule,
-such as the one seeding `~/.pi/agent/settings.json`, keeps the file it
-already copied even after a `switch` that changes the seeded content. Pick
-up the change with either a real reboot (`limactl restart yolobox`) or
-`sudo systemd-tmpfiles --create` inside the VM.
+`nixos-rebuild switch --flake .#yolobox`. A `switch` that adds a
+`systemd.tmpfiles.rules` entry needs `sudo systemd-tmpfiles --create` or
+`limactl restart yolobox` after it — see CLAUDE.md.
 
 ## Daily use
 
@@ -95,11 +112,7 @@ up the change with either a real reboot (`limactl restart yolobox`) or
 # Start or ensure the VM is running
 ./yolobox2 up
 
-# Open a guest shell in the current host herdr pane, with the herd socket
-# forwarded — agents run here and show up in the host herd
-./yolobox2 enter
-
-# Open a plain SSH session instead — one-shot commands, scripting, git
+# Open an interactive SSH session
 ./yolobox2 ssh
 
 # Add a "yolobox" git remote to a host project, mirrored to the same path
@@ -110,27 +123,8 @@ up the change with either a real reboot (`limactl restart yolobox`) or
 ./yolobox2 seed-herdr
 ```
 
-`./yolobox2 enter` opens a guest shell in your current host herdr pane, with
-the herd socket forwarded into the VM — no guest TUI, no nesting, one herd,
-the host's. `./yolobox2 ssh` stays the plain command/scripting path and
-carries no herd wiring: no forwarded socket, no herd env.
-
-Only two of the five in-box harnesses actually report into that herd:
-**claude** (via a managed-settings.json hook map) and **pi** (via a bundled
-herd-report extension) — see `nix/herd-report.nix`. opencode and codex lost
-their herd reporting when `nix/herd.nix` (which used to run `herdr
-integration install` for both) was deleted, and crush has no upstream herdr
-integration to install in the first place. An unreported agent still runs
-fine inside the box; it just shows as `unknown` in the herd instead of
-`yolobox:<agent>`.
-
-If a boxed agent doesn't show up at all — not even as `unknown` — the host
-herdr server may be rejecting its reports outright (usually a host/guest
-herdr protocol mismatch). Rejections are appended to a guest-side log at
-`~/.local/state/yolobox/herd-report.log` (reports are otherwise best-effort
-and silent, by design — see `nix/herd-report.nix`). Check `herdr status` on
-the host for its `compatible:` line, and compare against the guest's pinned
-version at `yolobox.harness.herdr.version`/`hash` in `nix/harnesses.nix`.
+`link` is where a new project starts — see [Per-project dev
+shells](#per-project-dev-shells) for the bootstrap that follows it.
 
 ## Backups and snapshots
 
