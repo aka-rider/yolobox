@@ -41,7 +41,7 @@ expressed as a system module:
   are declared once in Nix and rendered per-harness automatically.
 
 Per-language toolchains are intentionally **not** system packages. Each
-project declares them in its `devbox.json`; devbox 0.17.5, installed VM-wide
+project declares them in its `devbox.json`; devbox, installed VM-wide
 from nixpkgs, resolves them against the shared nix store, and direnv
 activates the result. This keeps the base VM small and lets each project
 pull only the toolchains it actually needs.
