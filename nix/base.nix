@@ -1,4 +1,8 @@
 { config, lib, pkgs, modulesPath, ... }:
+let
+  homeDir = config.users.users.xiii.home;
+  homeTmpfiles = import ./lib/home-tmpfiles.nix;
+in
 {
   # Boot/fs block below is verbatim from nixos-lima-config-sample's
   # nixos-lima-config.nix — it must match the shipped v0.2.1 image exactly
@@ -58,11 +62,26 @@
   # so an orphaned socket dies at reboot instead of accumulating. This is safe
   # ahead of any ssh connection because systemd-tmpfiles-setup.service runs
   # Before=sysinit.target, while sshd only arrives with multi-user.target.
-  systemd.tmpfiles.rules = [ "d /run/yolobox 0700 xiii users -" ];
+  systemd.tmpfiles.rules = [ "d /run/yolobox 0700 xiii users -" ]
+    ++ homeTmpfiles {
+      home = homeDir;
+      dirUser = "xiii";
+      dirs = [ ".config" ".config/direnv" ];
+      rule = "L+";
+      path = ".config/direnv/direnv.toml";
+      argument = "/etc/yolobox/direnv/direnv.toml";
+    };
 
   security.sudo.wheelNeedsPassword = false;
   programs.zsh.enable = true;
   programs.direnv.enable = true;
+
+  # Agents cannot answer a `direnv allow` prompt, so every .envrc under ~/wrk
+  # is auto-trusted — the VM itself is the blast-radius boundary.
+  environment.etc."yolobox/direnv/direnv.toml".text = ''
+    [whitelist]
+    prefix = ["/home/xiii.guest/wrk"]
+  '';
 
   programs.nix-ld.enable = true;
   programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl ];
@@ -99,7 +118,8 @@
     curl
     wget
     unzip
+    devbox
   ];
 
-  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+  nix.settings.experimental-features = [ "nix-command" "flakes" "fetch-closure" "ca-derivations" ];
 }
