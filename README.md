@@ -139,15 +139,20 @@ on, changes to the flake are applied with
 
 # Open VS Code Remote-SSH in the VM, at the mirrored dir of the current
 # repo (or ~/wrk when outside one)
-./yo code
+./yo code [project]
 
 # Open Zed over SSH in the VM, same directory resolution
-./yo zed
+./yo zed [project]
 ```
+
+With a `project` argument, `code` and `zed` fuzzy-pick (fzf) among the
+VM's git repos under `~/wrk` — including projects that exist only in the
+VM. An unambiguous query opens directly; an ambiguous one opens the fzf
+picker preloaded with it.
 
 `code` and `zed` rely on the `Include ~/.lima/yolobox/ssh.config` line in
 `~/.ssh/config`; VS Code also needs the `ms-vscode-remote.remote-ssh`
-extension.
+extension, and the picker needs `fzf` on the host.
 
 `link` is where a new project starts — see [Per-project dev
 shells](#per-project-dev-shells) for the bootstrap that follows it.
