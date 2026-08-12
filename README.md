@@ -52,7 +52,7 @@ A project opts in with two files, `devbox.json` and `.envrc`. Once per
 project, on the host:
 
 ```bash
-./yolobox2 link                                    # once per repo
+./yo link                                    # once per repo
 cp ~/Developer/yolobox/templates/default/{devbox.json,.envrc} .
 $EDITOR devbox.json                                # pick packages
 printf '.devbox/\n' >> .gitignore
@@ -122,20 +122,20 @@ on, changes to the flake are applied with
 
 ```bash
 # Start or ensure the VM is running
-./yolobox2 up
+./yo up
 
 # Open a session: ssh plus the herd socket forward and the herd env
-./yolobox2 enter
+./yo enter
 
 # Open a plain interactive SSH session, no herd wiring
-./yolobox2 ssh
+./yo ssh
 
 # Add a "yolobox" git remote to a host project, mirrored to the same path
 # inside the VM. Push from the VM works to the checked-out branch.
-./yolobox2 link
+./yo link
 
 # Copy the host's herdr config into the VM, without overwriting it
-./yolobox2 seed-herdr
+./yo seed-herdr
 ```
 
 `link` is where a new project starts — see [Per-project dev
