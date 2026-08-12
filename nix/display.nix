@@ -46,7 +46,7 @@ let
 
         ffmpeg -nostdin -loglevel error -f x11grab -video_size 1920x1080 \
           -framerate 15 -i "''${DISPLAY:-:0}" -c:v libx264 -preset ultrafast \
-          -pix_fmt yuv420p "$out" 2>"$log" &
+          -pix_fmt yuv420p "$out" >/dev/null 2>"$log" &
         pid=$!
 
         sleep 0.2
