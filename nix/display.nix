@@ -14,7 +14,9 @@ let
 
   screenRecord = pkgs.writeShellApplication {
     name = "yolobox-screen-record";
-    runtimeInputs = [ pkgs.ffmpeg pkgs.coreutils ];
+    # ffmpeg-full, not the default ffmpeg: nixpkgs' default build is
+    # --disable-xlib/--disable-libxcb*, so x11grab doesn't exist in it.
+    runtimeInputs = [ pkgs.ffmpeg-full pkgs.coreutils ];
     text = ''
       # State lives under ~/.local/state, not /run/user: /run/user is torn
       # down at last logout while a backgrounded ffmpeg keeps running,
@@ -137,5 +139,7 @@ in
 
   fonts.packages = with pkgs; [ dejavu_fonts liberation_ttf noto-fonts noto-fonts-color-emoji ];
 
-  environment.systemPackages = [ pkgs.xdotool pkgs.maim pkgs.ffmpeg screenRecord ];
+  # ffmpeg-full, not the default ffmpeg: nixpkgs' default build is
+  # --disable-xlib/--disable-libxcb*, so x11grab doesn't exist in it.
+  environment.systemPackages = [ pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord ];
 }
