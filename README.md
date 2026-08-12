@@ -52,7 +52,7 @@ A project opts in with two files, `devbox.json` and `.envrc`. Once per
 project, on the host:
 
 ```bash
-./yo link                                    # once per repo
+./yo link                                          # once per repo
 cp ~/Developer/yolobox/templates/default/{devbox.json,.envrc} .
 $EDITOR devbox.json                                # pick packages
 printf '.devbox/\n' >> .gitignore
@@ -136,7 +136,18 @@ on, changes to the flake are applied with
 
 # Copy the host's herdr config into the VM, without overwriting it
 ./yo seed-herdr
+
+# Open VS Code Remote-SSH in the VM, at the mirrored dir of the current
+# repo (or ~/wrk when outside one)
+./yo code
+
+# Open Zed over SSH in the VM, same directory resolution
+./yo zed
 ```
+
+`code` and `zed` rely on the `Include ~/.lima/yolobox/ssh.config` line in
+`~/.ssh/config`; VS Code also needs the `ms-vscode-remote.remote-ssh`
+extension.
 
 `link` is where a new project starts — see [Per-project dev
 shells](#per-project-dev-shells) for the bootstrap that follows it.

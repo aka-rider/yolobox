@@ -73,7 +73,9 @@ unreported agent still runs fine; it shows as `unknown` rather than
 `yolobox:<agent>`.
 
 Herd wiring rides `./yo enter` only — the forwarded socket and the herd
-env come from `cmd_enter`. `./yo ssh` deliberately carries neither.
+env come from `cmd_enter`. `./yo ssh` deliberately carries neither. `yo code`
+and `yo zed` sessions carry no herd env either — agents started from editor
+terminals report as `unknown`; expected, not a failure.
 
 The forwarded herdr socket lives at `/run/yolobox/herd-host.<pane>.sock`; the
 tmpfiles rule in `nix/base.nix` explains why it is not under `$HOME`.
