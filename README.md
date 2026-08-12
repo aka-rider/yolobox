@@ -70,7 +70,7 @@ The old dev-shell fragments map to devbox packages roughly as:
 | fragment | devbox packages |
 | --- | --- |
 | rust | cargo rustc rust-analyzer clippy rustfmt |
-| python | python@3.13 uv pyright |
+| python | python@3.12 basedpyright |
 | node | nodejs typescript typescript-language-server |
 | go | go gopls delve |
 | cxx | gcc gnumake cmake pkg-config gdb |
@@ -114,9 +114,7 @@ limactl restart yolobox
 
 After the restart the VM is running the declarative configuration. From now
 on, changes to the flake are applied with
-`nixos-rebuild switch --flake .#yolobox`. A `switch` that adds a
-`systemd.tmpfiles.rules` entry needs `sudo systemd-tmpfiles --create` or
-`limactl restart yolobox` after it — see CLAUDE.md.
+`nixos-rebuild switch --flake .#yolobox`.
 
 ## Daily use
 
@@ -138,11 +136,13 @@ on, changes to the flake are applied with
 ./yo seed-herdr
 
 # Open VS Code Remote-SSH in the VM, at the mirrored dir of the current
-# repo (or ~/wrk when outside one)
-./yo code
+# repo (or ~/wrk when outside one). With a project argument, fuzzy-pick
+# (fzf) among the VM's git repos under ~/wrk — including projects that
+# exist only in the VM.
+./yo code [project]
 
 # Open Zed over SSH in the VM, same directory resolution
-./yo zed
+./yo zed [project]
 ```
 
 `code` and `zed` rely on the `Include ~/.lima/yolobox/ssh.config` line in
@@ -160,9 +160,12 @@ drive a real headed browser and take screenshots.
 Two Playwright MCP servers are available, one per engine:
 `playwright-chromium` and `playwright-firefox`. Both run headed on `:0`.
 Each project gets its own persistent browser profile per engine, so logins
-survive across sessions of the same project. Two sessions of the same engine
-in the same project share — and contend for — one profile; don't run two at
-once.
+survive across sessions of the same project. A second same-engine session in
+the same project does not error: Chromium hands the launch off to the
+already-running instance, so both sessions drive the same browser. Run one
+at a time for predictable control. To guarantee the last writes to a site's
+storage persist, end a session with `browser_close` — a killed session can
+drop the final write.
 
 Other ways to see or drive the screen:
 
@@ -214,6 +217,26 @@ Zed strips the environment when spawning them, and nix-ld cannot rescue the
 missing dynamic linker context. Use the devbox-provided LSPs instead — add
 them to the project's `devbox.json` — configured in your helix or zed
 settings.
+
+### Python LSP recipe
+
+One chokepoint makes every consumer (Zed, VS Code, opencode, crush, pi,
+claude) resolve the same interpreter and server:
+
+1. `devbox.json` packages `python@3.12` and `basedpyright` (a native nix
+   build — no glibc hazard).
+2. `.envrc` activates devbox, then creates and activates a project `.venv`
+   from that python; dependencies are pip-installed into it.
+3. `pyrightconfig.json` pins `{"venvPath": ".", "venv": ".venv"}` — every
+   basedpyright instance finds the interpreter regardless of which client
+   launched it.
+
+`nix/lsp.nix` wires the VM side: Zed's remote server loads direnv
+(`load_direnv: "direct"`), and claude auto-loads a basedpyright plugin from
+`~/.claude/skills`. opencode and crush read per-project `opencode.json` /
+`.crush.json` LSP entries (see PortHub for the reference shape). VS Code
+needs its recommended workspace extensions accepted once per remote
+(`.vscode/extensions.json`: basedpyright, ms-python, direnv).
 
 **VS Code Remote-SSH** works through nix-ld, which allows the VS Code server
 and its extensions to resolve NixOS dynamic libraries correctly. If VS Code
