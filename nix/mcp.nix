@@ -96,9 +96,9 @@ in
       home = homeDir;
       dirUser = "xiii";
       dirs = [ ".config" ".config/mcp" ];
-      rule = "L+";
-      path = ".config/mcp/mcp.json";
-      argument = "/etc/yolobox/mcp/pi.json";
+      links = [
+        { path = ".config/mcp/mcp.json"; argument = "/etc/yolobox/mcp/pi.json"; }
+      ];
     };
 
     environment.systemPackages = [ mcpSmoke ];

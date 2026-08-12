@@ -65,6 +65,8 @@ in
       pkgs.opencode
       pkgs.crush
       pkgs.pi-coding-agent
+      # pi shells out to npm to install the packages listed in its settings.
+      pkgs.nodejs
       herdrPkg
     ];
 

@@ -158,10 +158,7 @@ let
     ${lib.getExe' pkgs.nodejs "node"} --check "$out"
   '';
 
-  piSettings = {
-    packages = [ "${piMcpAdapter}/lib/node_modules/pi-mcp-adapter" ];
-    extensions = [ "/etc/yolobox/pi/yolobox-agent-state.js" ];
-  };
+  piAdapterDir = "${piMcpAdapter}/lib/node_modules/pi-mcp-adapter";
 
   hookCmd = state: {
     hooks = [{ type = "command"; command = "${herdReport}/bin/yolobox-herd-report ${state} claude"; }];
@@ -187,20 +184,39 @@ in
     };
 
     environment.etc."yolobox/pi/yolobox-agent-state.js".source = piExtensionChecked;
-    environment.etc."yolobox/pi/settings.json".text = builtins.toJSON piSettings;
+    environment.etc."yolobox/pi/pi-mcp-adapter".source = piAdapterDir;
+    environment.etc."yolobox/pi/mcp-scripting".source = "${piAdapterDir}/skills/mcp-scripting";
 
-    # pi may rewrite ~/.pi/agent/settings.json (e.g. via /extensions), so
-    # this is copy-if-absent (Gotcha 14), not a symlink.
+    # ~/.pi/agent/settings.json belongs to ~/.dotfiles, so nothing VM-specific
+    # may live in it. pi auto-discovers ~/.pi/agent/extensions (a .js file, or
+    # a directory whose package.json carries a "pi" manifest) and
+    # ~/.pi/agent/skills, and follows symlinks, so both entries ride L+ links
+    # instead. The adapter's manifest declares extensions AND skills;
+    # extension auto-discovery honours only the first, hence the separate
+    # link for its one skill.
+    #
+    # Every link targets /etc, never a store path directly: a link is
+    # rewritten only when the tmpfiles services run, whereas /etc flips on
+    # every `switch`, so pointing into the store risks serving the previous
+    # closure to pi.
     systemd.tmpfiles.rules = homeTmpfiles {
       home = homeDir;
       dirUser = "xiii";
-      dirs = [ ".pi" ".pi/agent" ];
-      rule = "C";
-      path = ".pi/agent/settings.json";
-      leafMode = "0644";
-      leafUser = "xiii";
-      leafGroup = "users";
-      argument = "/etc/yolobox/pi/settings.json";
+      dirs = [ ".pi" ".pi/agent" ".pi/agent/extensions" ".pi/agent/skills" ];
+      links = [
+        {
+          path = ".pi/agent/extensions/yolobox-agent-state.js";
+          argument = "/etc/yolobox/pi/yolobox-agent-state.js";
+        }
+        {
+          path = ".pi/agent/extensions/pi-mcp-adapter";
+          argument = "/etc/yolobox/pi/pi-mcp-adapter";
+        }
+        {
+          path = ".pi/agent/skills/mcp-scripting";
+          argument = "/etc/yolobox/pi/mcp-scripting";
+        }
+      ];
     };
   };
 }
