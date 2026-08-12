@@ -7,6 +7,8 @@
 #   yo enter
 #   yo link
 #   yo seed-herdr
+#   yo code
+#   yo zed
 
 set -euo pipefail
 
@@ -42,6 +44,8 @@ Usage:
   yo enter
   yo link
   yo seed-herdr
+  yo code
+  yo zed
 EOF
 }
 
@@ -131,6 +135,48 @@ relative_to() {
     esac
 }
 
+# VM directory mirroring the host cwd's repo; ~/wrk when outside one.
+vm_dir_for_cwd() {
+    toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" &&
+        toplevel_real="$(cd -P "${toplevel}" && pwd)" &&
+        relpath="$(relative_to "$HOME/Developer" "${toplevel_real}")" &&
+        [ "${relpath}" != "." ] &&
+        {
+            printf '%s\n' "${VM_USER_HOME}/wrk/${relpath}"
+            return
+        }
+    printf '%s\n' "${VM_USER_HOME}/wrk"
+}
+
+cmd_code() {
+    [ "$#" -eq 0 ] || {
+        echo "yo: code takes no arguments" >&2
+        usage
+        exit 2
+    }
+    code_cli="$(command -v code || true)"
+    [ -n "${code_cli}" ] ||
+        code_cli="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+    [ -x "${code_cli}" ] || {
+        echo "yo: VS Code CLI not found" >&2
+        exit 1
+    }
+    exec "${code_cli}" --folder-uri "vscode-remote://ssh-remote+${VM_HOST}$(vm_dir_for_cwd)"
+}
+
+cmd_zed() {
+    [ "$#" -eq 0 ] || {
+        echo "yo: zed takes no arguments" >&2
+        usage
+        exit 2
+    }
+    command -v zed >/dev/null || {
+        echo "yo: zed CLI not found" >&2
+        exit 1
+    }
+    exec zed "ssh://${VM_HOST}$(vm_dir_for_cwd)"
+}
+
 cmd_link() {
     toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || {
         echo "yo: link must run inside a git repo" >&2
@@ -186,6 +232,8 @@ main() {
         enter) cmd_enter "$@" ;;
         link) cmd_link ;;
         seed-herdr) cmd_seed_herdr ;;
+        code) cmd_code "$@" ;;
+        zed) cmd_zed "$@" ;;
         *)
             usage
             exit 2
