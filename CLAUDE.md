@@ -52,20 +52,15 @@ checkout and is refused like any other.
   whitelist there. Being an `/etc` symlink, it flips on `nixos-rebuild
   switch`; no tmpfiles or reboot step applies.
 
-## tmpfiles rules do not take effect on `switch`
+## tmpfiles rules apply on `switch` via resetup
 
-`nixos-rebuild switch` does not re-run `systemd-tmpfiles-setup.service` — it is
-boot-only and refuses a manual restart. A **new** rule of any type does not
-take effect on `switch` alone; this covers both the `L+` links that fill pi's
-auto-discovery directories (`nix/herd-report.nix`) and the `d /run/yolobox`
-directory rule the herdr forward depends on. It is also why every such link
-points at `/etc` rather than at a store path: `/etc` flips on `switch`, so the
-content follows a rebuild without waiting for a boot. Pick a new rule up with
-a real reboot
-(`limactl restart yolobox`) or `sudo systemd-tmpfiles --create` in the VM. Note
-the latter re-runs *every* rule system-wide, including force-replacing `L+`
-rules. The `~/artifacts` directory rule backing screen recordings and
-Playwright output is a new rule too, so the same caveat applies to it.
+The VM carries `systemd-tmpfiles-resetup.service`, upstream's switch-time
+twin of the boot-only setup unit, so a `switch` that adds a new tmpfiles rule
+(verified with the `~/artifacts` directory rule) takes effect immediately —
+no reboot needed. `sudo systemd-tmpfiles --create` still re-runs every rule
+system-wide, including force-replacing `L+` links, and resetup does the same
+on every `switch` — relied upon for the `L+` links that fill pi's
+auto-discovery directories (`nix/herd-report.nix`).
 
 ## Browsers and the virtual display
 
@@ -113,8 +108,26 @@ cwd, so it creates a stray profile and artifacts directory named after that
 cwd. Harmless, just a smoke-test byproduct.
 
 Same-engine, same-project concurrency (two sessions racing the one
-persistent profile) has not been observed yet — the actual failure mode
-needs to be confirmed and documented during in-VM verification.
+persistent profile) produces no lock error and no hang: Chromium's singleton
+lock forwards the second launch to the running instance (~8s), so concurrent
+same-project sessions silently share one browser. Not isolation, but not a
+failure either.
+
+Chromium launches and navigates sandboxed (no `--no-sandbox`) as non-root
+`xiii`; Firefox likewise needed no dbus workaround.
+
+Profiles persist per project, but Chromium's LevelDB-backed storage flushes
+lazily — a session killed without `browser_close` can lose its last write
+(verified: a write two generations back survived, the latest didn't). End
+sessions with a clean `browser_close` before shutdown.
+
+Default nixpkgs ffmpeg has no x11grab (built with
+`--disable-xlib`/`--disable-libxcb*`) — that's why `nix/display.nix` uses
+`ffmpeg-full`.
+
+Native browser video is `browser_start_video` / `browser_stop_video` (gated
+by `--caps devtools`), verified producing VP8 webm in
+`~/artifacts/<project>/`.
 
 ## Herd reporting: recognising a silent failure
 
