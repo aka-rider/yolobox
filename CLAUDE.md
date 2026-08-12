@@ -7,7 +7,7 @@ steps and the failure modes worth recognising.
 
 ### Why a project must be a git repo
 
-For one reason only: the push channel. `./yolobox2 link` git-inits the VM
+For one reason only: the push channel. `./yo link` git-inits the VM
 side, so linked projects are correct by construction; a project created
 directly in the VM needs `git init` first.
 
@@ -72,8 +72,8 @@ extension) — see `nix/herd-report.nix`. opencode and codex lost theirs when
 unreported agent still runs fine; it shows as `unknown` rather than
 `yolobox:<agent>`.
 
-Herd wiring rides `./yolobox2 enter` only — the forwarded socket and the herd
-env come from `cmd_enter`. `./yolobox2 ssh` deliberately carries neither.
+Herd wiring rides `./yo enter` only — the forwarded socket and the herd
+env come from `cmd_enter`. `./yo ssh` deliberately carries neither.
 
 The forwarded herdr socket lives at `/run/yolobox/herd-host.<pane>.sock`; the
 tmpfiles rule in `nix/base.nix` explains why it is not under `$HOME`.
