@@ -17,6 +17,7 @@
         ./nix/base.nix
         ./nix/podman.nix
         ./nix/agentic.nix
+        ./nix/lsp.nix
       ];
     };
   };
