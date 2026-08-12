@@ -139,23 +139,62 @@ on, changes to the flake are applied with
 
 # Open VS Code Remote-SSH in the VM, at the mirrored dir of the current
 # repo (or ~/wrk when outside one)
-./yo code [project]
+./yo code
 
 # Open Zed over SSH in the VM, same directory resolution
-./yo zed [project]
+./yo zed
 ```
-
-With a `project` argument, `code` and `zed` fuzzy-pick (fzf) among the
-VM's git repos under `~/wrk` — including projects that exist only in the
-VM. An unambiguous query opens directly; an ambiguous one opens the fzf
-picker preloaded with it.
 
 `code` and `zed` rely on the `Include ~/.lima/yolobox/ssh.config` line in
 `~/.ssh/config`; VS Code also needs the `ms-vscode-remote.remote-ssh`
-extension, and the picker needs `fzf` on the host.
+extension.
 
 `link` is where a new project starts — see [Per-project dev
 shells](#per-project-dev-shells) for the bootstrap that follows it.
+
+## Browsers and screen
+
+The VM carries a persistent virtual display (`:0`, 1920x1080) so agents can
+drive a real headed browser and take screenshots.
+
+Two Playwright MCP servers are available, one per engine:
+`playwright-chromium` and `playwright-firefox`. Both run headed on `:0`.
+Each project gets its own persistent browser profile per engine, so logins
+survive across sessions of the same project. Two sessions of the same engine
+in the same project share — and contend for — one profile; don't run two at
+once.
+
+Other ways to see or drive the screen:
+
+- `browser_take_screenshot` (MCP) — screenshot of the browser page.
+- `maim` — screenshot of the whole virtual display.
+- `xdotool` — synthetic keyboard/mouse input.
+- `yolobox-screen-record start|stop` — records the whole display to
+  `~/artifacts/screen-<ts>.mp4`, with a log next to it.
+- `browser_start_video` / `browser_stop_video` (MCP) — records the browser
+  tab alone.
+
+All Playwright output — screenshots, PDFs, videos — lands in
+`~/artifacts/<project>/`, never inside `~/wrk/<project>`: the push channel
+must not see stray binaries in a project's git checkout.
+
+`DISPLAY=:0` is preset in login shells only. In an editor terminal (Zed,
+VS Code Remote-SSH), export it yourself before using the display or the
+browsers.
+
+Migration note: the MCP server rename (`playwright` →
+`playwright-chromium` / `playwright-firefox`) breaks any host-side
+permission rule that still matches `mcp__playwright__*`.
+
+The 12GiB memory bump backing this is instance-create-only. An existing
+instance needs:
+
+```bash
+limactl stop yolobox
+limactl edit yolobox --memory 12 --start
+```
+
+(`limactl edit` refuses a running instance.)
 
 ## Backups and snapshots
 

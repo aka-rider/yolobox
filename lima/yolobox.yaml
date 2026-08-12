@@ -6,7 +6,7 @@ images:
 
 mounts: []
 
-memory: 8GiB
+memory: 12GiB
 cpus: 4
 disk: 100GiB
 
