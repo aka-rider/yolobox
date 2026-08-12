@@ -56,12 +56,65 @@ checkout and is refused like any other.
 
 `nixos-rebuild switch` does not re-run `systemd-tmpfiles-setup.service` — it is
 boot-only and refuses a manual restart. A **new** rule of any type does not
-take effect on `switch` alone; this covers both `"C"` copy-if-absent rules
-(such as the one seeding `~/.pi/agent/settings.json`) and the `d /run/yolobox`
-directory rule the herdr forward depends on. Pick it up with a real reboot
+take effect on `switch` alone; this covers both the `L+` links that fill pi's
+auto-discovery directories (`nix/herd-report.nix`) and the `d /run/yolobox`
+directory rule the herdr forward depends on. It is also why every such link
+points at `/etc` rather than at a store path: `/etc` flips on `switch`, so the
+content follows a rebuild without waiting for a boot. Pick a new rule up with
+a real reboot
 (`limactl restart yolobox`) or `sudo systemd-tmpfiles --create` in the VM. Note
 the latter re-runs *every* rule system-wide, including force-replacing `L+`
-rules.
+rules. The `~/artifacts` directory rule backing screen recordings and
+Playwright output is a new rule too, so the same caveat applies to it.
+
+## Browsers and the virtual display
+
+The nixpkgs `playwright-mcp` wrapper `--set`s `PLAYWRIGHT_BROWSERS_PATH` to
+the full browsers bundle unconditionally, so setting that variable at the
+config level is a no-op — this supersedes the old Gotcha 9 note that used to
+live in `nix/agentic.nix`. The wrapper also exports `PLAYWRIGHT_MCP_ISOLATED=1`
+unless `PLAYWRIGHT_MCP_USER_DATA_DIR` is set, and passing both throws; the
+per-engine wrapper scripts export the user-data-dir env before `exec` so
+isolated mode never turns on.
+
+Upstream's headed/headless choice is `headless = linux && !DISPLAY`: a
+missing `DISPLAY` silently degrades to headless instead of failing. The
+wrapper checks the X socket itself and refuses loudly if the display isn't
+up, rather than falling through to a silent headless run.
+
+Project identity for a browser profile is the git toplevel path relative to
+`~/wrk`, slashes turned into `--` — not `basename($PWD)`. Basename would
+merge unrelated `a/web` and `b/web` into one profile (cookie bleed across
+projects) and would split subdirectory-started sessions of the same repo
+into separate profiles.
+
+`openbox` readiness is an `ExecStartPre` that waits on the X socket, not a
+`Restart=` crash loop: five restarts in ten seconds trips systemd's default
+start-limit and leaves the unit permanently failed.
+
+Use `pkgs.xvfb`, not the deprecated `pkgs.xorg.xvfb` alias. Its
+`meta.mainProgram` is wrongly set to `"X"`, so `lib.getExe` on it resolves to
+a binary that doesn't exist — spell out `${pkgs.xvfb}/bin/Xvfb` directly.
+
+No project-local tmpfiles rule for `/tmp/.X11-unix`: systemd's own `x11.conf`
+already ships one, and a duplicate just logs errors every boot.
+
+The `yolobox-screen-record` pidfile lives under `~/.local/state/yolobox`, not
+`/run/user/$UID`: `/run/user/$UID` is destroyed at last-session logout, but
+the backgrounded `ffmpeg` survives it (NixOS sets `KillUserProcesses=false`),
+which would orphan a recording no one can finalize. `SIGINT` finalizes the
+mp4; `SIGKILL` corrupts it.
+
+Fonts matter now: headless rendering worked with no `fonts.packages` at all;
+headed screenshots without fonts render as tofu.
+
+`yolobox-mcp-smoke` spawns the MCP servers with env rendered from its own
+cwd, so it creates a stray profile and artifacts directory named after that
+cwd. Harmless, just a smoke-test byproduct.
+
+Same-engine, same-project concurrency (two sessions racing the one
+persistent profile) has not been observed yet — the actual failure mode
+needs to be confirmed and documented during in-VM verification.
 
 ## Herd reporting: recognising a silent failure
 
@@ -71,6 +124,12 @@ extension) — see `nix/herd-report.nix`. opencode and codex lost theirs when
 `nix/herd.nix` was deleted, and crush has no upstream herdr integration. An
 unreported agent still runs fine; it shows as `unknown` rather than
 `yolobox:<agent>`.
+
+pi's extension reaches pi through auto-discovery: `nix/herd-report.nix` links
+it into `~/.pi/agent/extensions/`, next to the pi-mcp-adapter package (its one
+skill is linked into `~/.pi/agent/skills/`). Nothing VM-specific sits in
+`~/.pi/agent/settings.json` — that file is a `~/.dotfiles` symlink and carries
+the user's package list only.
 
 Herd wiring rides `./yo enter` only — the forwarded socket and the herd
 env come from `cmd_enter`. `./yo ssh` deliberately carries neither. `yo code`
