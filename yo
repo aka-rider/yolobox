@@ -7,8 +7,8 @@
 #   yo enter
 #   yo link
 #   yo seed-herdr
-#   yo code
-#   yo zed
+#   yo code [project]
+#   yo zed [project]
 
 set -euo pipefail
 
@@ -44,8 +44,8 @@ Usage:
   yo enter
   yo link
   yo seed-herdr
-  yo code
-  yo zed
+  yo code [project]
+  yo zed [project]
 EOF
 }
 
@@ -148,9 +148,41 @@ vm_dir_for_cwd() {
     printf '%s\n' "${VM_USER_HOME}/wrk"
 }
 
+# A project is a git repo under ~/wrk: worktrees leave a .git file,
+# clones a .git dir, so the find matches both.
+vm_project_pick() {
+    command -v fzf >/dev/null || {
+        echo "yo: fzf not found (brew install fzf)" >&2
+        exit 1
+    }
+    ssh_args
+    projects="$(ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" \
+        'find ~/wrk -mindepth 2 -maxdepth 4 -name .git \( -type d -o -type f \) -printf "%h\n"' |
+        sed "s|^${VM_USER_HOME}/wrk/||" | sort)"
+    [ -n "${projects}" ] || {
+        echo "yo: no projects under ~/wrk in the VM" >&2
+        exit 1
+    }
+    choice="$(printf '%s\n' "${projects}" |
+        fzf --select-1 --exit-0 --query="$1")" || {
+        rc="$?"
+        [ "${rc}" -eq 130 ] || echo "yo: no project matches '$1'" >&2
+        exit "${rc}"
+    }
+    printf '%s\n' "${VM_USER_HOME}/wrk/${choice}"
+}
+
+vm_target_dir() {
+    if [ "$#" -eq 1 ]; then
+        vm_project_pick "$1"
+    else
+        vm_dir_for_cwd
+    fi
+}
+
 cmd_code() {
-    [ "$#" -eq 0 ] || {
-        echo "yo: code takes no arguments" >&2
+    [ "$#" -le 1 ] || {
+        echo "yo: code takes at most one project argument" >&2
         usage
         exit 2
     }
@@ -161,12 +193,13 @@ cmd_code() {
         echo "yo: VS Code CLI not found" >&2
         exit 1
     }
-    exec "${code_cli}" --folder-uri "vscode-remote://ssh-remote+${VM_HOST}$(vm_dir_for_cwd)"
+    target="$(vm_target_dir "${@+"$@"}")"
+    exec "${code_cli}" --folder-uri "vscode-remote://ssh-remote+${VM_HOST}${target}"
 }
 
 cmd_zed() {
-    [ "$#" -eq 0 ] || {
-        echo "yo: zed takes no arguments" >&2
+    [ "$#" -le 1 ] || {
+        echo "yo: zed takes at most one project argument" >&2
         usage
         exit 2
     }
@@ -174,7 +207,8 @@ cmd_zed() {
         echo "yo: zed CLI not found" >&2
         exit 1
     }
-    exec zed "ssh://${VM_HOST}$(vm_dir_for_cwd)"
+    target="$(vm_target_dir "${@+"$@"}")"
+    exec zed "ssh://${VM_HOST}${target}"
 }
 
 cmd_link() {
