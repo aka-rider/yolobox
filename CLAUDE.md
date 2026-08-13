@@ -144,6 +144,12 @@ skill is linked into `~/.pi/agent/skills/`). Nothing VM-specific sits in
 `~/.pi/agent/settings.json` — that file is a `~/.dotfiles` symlink and carries
 the user's package list only.
 
+A herdr-installed `~/.pi/agent/extensions/herdr-agent-state.ts` (written by
+herdr's own integration installer) silently knocks pi out of the herd: it
+reports under source `herdr:pi`, which the server reserves for its own
+screen/session detection and clears for a boxed agent. A tmpfiles `r` rule
+in `nix/herd-report.nix` deletes it on every boot and switch.
+
 Herd wiring rides `./yo enter` only — the forwarded socket and the herd
 env come from `cmd_enter`. `./yo ssh` deliberately carries neither. `yo code`
 and `yo zed` sessions carry no herd env either — agents started from editor
