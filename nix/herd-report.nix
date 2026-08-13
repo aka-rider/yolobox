@@ -199,6 +199,13 @@ in
     # rewritten only when the tmpfiles services run, whereas /etc flips on
     # every `switch`, so pointing into the store risks serving the previous
     # closure to pi.
+    #
+    # A herdr-installed ~/.pi/agent/extensions/herdr-agent-state.ts (from
+    # herdr's own integration installer) would report under source herdr:pi,
+    # which the server reserves for its own screen/session detection and
+    # clears for a boxed agent — knocking pi out of the herd. The `r` rule
+    # below deletes that file on every boot and switch (resetup), keeping
+    # yolobox:pi the only reporter.
     systemd.tmpfiles.rules = homeTmpfiles {
       home = homeDir;
       dirUser = "xiii";
@@ -217,6 +224,8 @@ in
           argument = "/etc/yolobox/pi/mcp-scripting";
         }
       ];
-    };
+    } ++ [
+      "r ${homeDir}/.pi/agent/extensions/herdr-agent-state.ts"
+    ];
   };
 }
