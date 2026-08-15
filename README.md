@@ -234,7 +234,10 @@ claude) resolve the same interpreter and server:
 `nix/lsp.nix` wires the VM side: Zed's remote server loads direnv
 (`load_direnv: "direct"`), and claude auto-loads a basedpyright plugin from
 `~/.claude/skills`. opencode and crush read per-project `opencode.json` /
-`.crush.json` LSP entries (see PortHub for the reference shape). VS Code
+`.crush.json` LSP entries (see PortHub for the reference shape). pi gets it
+from pi-lens, an npm extension in the user layer
+(`~/.dotfiles/pi/packages.json`), which finds the same `basedpyright` on the
+project PATH. VS Code
 needs its recommended workspace extensions accepted once per remote
 (`.vscode/extensions.json`: basedpyright, ms-python, direnv).
 

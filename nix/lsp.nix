@@ -12,12 +12,10 @@
 # global config files live in nix/mcp.nix, which carries unrelated parallel
 # work at the time of writing — lifting the LSP sections into those renders
 # is tracked in TODO.md.
-{ config, pkgs, ... }:
+{ config, ... }:
 let
   homeDir = config.users.users.xiii.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
-
-  piLsp = pkgs.callPackage ./pkgs/pi-lsp.nix { };
 
   basedpyrightLsp = {
     command = "basedpyright-langserver";
@@ -50,34 +48,19 @@ in
   environment.etc."yolobox/lsp/claude-basedpyright/.lsp.json".text =
     builtins.toJSON { basedpyright = basedpyrightLsp; };
 
-  # pi gains LSP through the pi-lsp extension (nix/pkgs/pi-lsp.nix),
-  # auto-discovered from ~/.pi/agent/extensions like pi-mcp-adapter in
-  # nix/herd-report.nix. Its global config (~/.pi/agent/lsp.json) is
-  # auto-trusted, unlike a project-local .pi/lsp.json. Schema note: the
-  # command key is "bin", and the file shape is {version, servers[]}.
-  environment.etc."yolobox/pi/pi-lsp".source = "${piLsp}/lib/node_modules/pi-lsp";
-  environment.etc."yolobox/lsp/pi-lsp.json".text = builtins.toJSON {
-    version = 1;
-    servers = [
-      {
-        id = "basedpyright";
-        bin = basedpyrightLsp.command;
-        args = basedpyrightLsp.args;
-        rootMarkers = [ "pyrightconfig.json" "requirements.txt" "pyproject.toml" ];
-        languageIdByExtension = basedpyrightLsp.extensionToLanguage;
-      }
-    ];
-  };
-
+  # pi is absent from this module on purpose. It gains LSP from pi-lens, an
+  # npm extension in the user layer (~/.dotfiles/pi/packages.json), which
+  # auto-detects basedpyright off the same project devbox PATH and covers
+  # every other language too. The flake's own pi-lsp extension registered a
+  # second `lsp_diagnostics` tool, and pi refuses to start on a tool-name
+  # conflict — one provider only.
   systemd.tmpfiles.rules = homeTmpfiles {
     home = homeDir;
     dirUser = "xiii";
-    dirs = [ ".config" ".config/zed" ".claude" ".claude/skills" ".pi" ".pi/agent" ".pi/agent/extensions" ];
+    dirs = [ ".config" ".config/zed" ".claude" ".claude/skills" ];
     links = [
       { path = ".config/zed/settings.json"; argument = "/etc/yolobox/lsp/zed-settings.json"; }
       { path = ".claude/skills/basedpyright"; argument = "/etc/yolobox/lsp/claude-basedpyright"; }
-      { path = ".pi/agent/extensions/pi-lsp"; argument = "/etc/yolobox/pi/pi-lsp"; }
-      { path = ".pi/agent/lsp.json"; argument = "/etc/yolobox/lsp/pi-lsp.json"; }
     ];
   };
 }
