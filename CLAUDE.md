@@ -140,9 +140,7 @@ unreported agent still runs fine; it shows as `unknown` rather than
 
 pi's extension reaches pi through auto-discovery: `nix/herd-report.nix` links
 it into `~/.pi/agent/extensions/`, next to the pi-mcp-adapter package (its one
-skill is linked into `~/.pi/agent/skills/`). Nothing VM-specific sits in
-`~/.pi/agent/settings.json` — that file is a `~/.dotfiles` symlink and carries
-the user's package list only.
+skill is linked into `~/.pi/agent/skills/`).
 
 A herdr-installed `~/.pi/agent/extensions/herdr-agent-state.ts` (written by
 herdr's own integration installer) silently knocks pi out of the herd: it
@@ -176,3 +174,56 @@ pathname socket bumps atime (`unix_find_bsd()` → `touch_atime()`), but
 `relatime` caps the refresh at roughly 24h and traffic on an established
 connection touches nothing — so an `age` would reap a live pane's socket and
 silently kill its reporting. tmpfs makes the question moot anyway.
+
+## pi's settings.json belongs to pi
+
+`~/.pi/agent/settings.json` is pi's own writable file. pi rewrites it on its
+own (theme, model, `lastChangelogVersion`, and every `pi install`), and its
+write path logs the error instead of raising it. So neither nix nor
+`~/.dotfiles` may link it — `~/.dotfiles/_do_install.sh` deliberately never
+links it either.
+
+A deleted `nix/pi.nix` module (commit `cb5e863`) used to render
+`/etc/yolobox/pi/settings.json` and seed the home copy. The module went, the
+seeded symlink stayed: `~/.pi/agent/settings.json ->
+/etc/static/yolobox/pi/settings.json` dangled in the VM home until it was
+removed by hand.
+
+Consequence, while it dangled: `settings.json` is the only place pi keeps its
+`packages` list, so nothing pinned in `~/.dotfiles/pi/packages.json`
+installed. `pi list` printed "No packages installed",
+`~/.pi/agent/npm/node_modules` did not exist, and `cc-compat` printed
+"AskUserQuestion is unavailable — cannot load
+@juicesharp/rpiv-ask-user-question@not installed" on every start.
+
+How to recognise it: `ls -l ~/.pi/agent/settings.json`. A symlink there is
+the defect. Fix is `rm` — pi recreates the file on its next write. No
+tmpfiles rule can do this instead: there is no "delete only if dangling"
+rule, and an unconditional `r` would delete the real settings file pi
+creates in its place.
+
+Apply the pinned list with pi's own command, `pi install <source>` per
+entry — never by writing pi's settings file by hand.
+
+The box carries no C or Python toolchain, so an extension whose dependency
+tree holds a native module without an aarch64 prebuild cannot install: npm
+falls back to `node-gyp`, which finds no `python3`, `gcc` or `make`. This
+dropped `@plannotator/pi-extension` from the pinned list — it pulls
+`node-pty`, whose 1.1.0 release publishes no prebuilt binaries at all.
+Prebuilt native packages are fine: `@ast-grep/napi` and its `ast-grep` binary
+(pi-lens, pi-simplify) load and run as glibc builds.
+
+Division of ownership worth stating once: the flake owns only
+`pi-mcp-adapter`, the herd-report extension, and the `mcp-scripting` skill.
+The user layer — skills, agents, prompts, `cc-compat`, packages — comes from
+`~/.dotfiles/_do_install.sh`, which must be re-run inside the VM after a
+dotfiles pull.
+
+Two extensions that register the same tool name kill pi at startup: it
+refuses to load and names both files. This retired the flake's own pi-lsp
+extension, which collided with pi-lens (`lsp_diagnostics`) from the user
+layer — pi-lens covers basedpyright off the same devbox PATH plus every
+other language, so pi's LSP now belongs to the user layer entirely. A
+retired `L+` link is not removed by the rebuild that drops its rule: delete
+`~/.pi/agent/extensions/<name>` and any stale config by hand, or pi keeps
+loading the previous closure.
