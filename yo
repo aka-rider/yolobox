@@ -242,7 +242,7 @@ cmd_link() {
         "mkdir -p '${vmdir}' && { git -C '${vmdir}' rev-parse --git-dir >/dev/null 2>&1 || { git -C '${vmdir}' init -b main && git -C '${vmdir}' config receive.denyCurrentBranch updateInstead; }; }"
 
     git -C "${toplevel}" remote add yolobox "ssh://${VM_HOST}${vmdir}"
-    git -C "${toplevel}" config core.sshCommand "ssh -F ${SSH_CFG}"
+    git -C "${toplevel}" config remote.yolobox.sshCommand "ssh -F ${SSH_CFG}"
 }
 
 cmd_seed_herdr() {
