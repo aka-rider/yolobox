@@ -35,10 +35,11 @@ let
       [ -S "''${HERDR_SOCKET_PATH:-}" ]   || exit 0
       [ -n "''${agent}" ]                 || exit 0
 
-      # A hook harness (e.g. Claude Code) may pipe the event JSON on stdin;
-      # key off the state argument instead, so drain it — but only when
-      # stdin isn't a TTY, or a manual invocation would block forever.
-      [ -t 0 ] || cat >/dev/null 2>&1 || true
+      # A hook harness may pipe event JSON on stdin, which is drained here
+      # since the state argument is what matters. A non-TTY stdin can be a
+      # pipe the parent never closes, so the drain is bounded rather than
+      # trusting every caller to close it.
+      [ -t 0 ] || timeout 1 cat >/dev/null 2>&1 || true
 
       report_timeout=5
 
@@ -102,13 +103,17 @@ let
     //     agent_end pairs in quick succession) doesn't flicker the pane
     //     between working and idle.
 
-    const { execFile } = require("node:child_process");
+    const { spawn } = require("node:child_process");
 
     const HERD_REPORT = "${herdReport}/bin/yolobox-herd-report";
     const AGENT_END_DEBOUNCE_MS = 250;
 
+    // spawn, not execFile: execFile silently ignores stdio and always pipes,
+    // leaving the reporter an stdin that is never closed.
     function report(state) {
-        execFile(HERD_REPORT, [state, "pi"], () => {});
+        const child = spawn(HERD_REPORT, [state, "pi"], { stdio: "ignore" });
+        child.on("error", () => {});
+        child.unref();
     }
 
     module.exports = function (pi) {
