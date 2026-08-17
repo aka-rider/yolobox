@@ -122,8 +122,9 @@ on, changes to the flake are applied with
 # Start or ensure the VM is running
 ./yo up
 
-# Open a session: ssh plus the herd socket forward and the herd env
-./yo enter
+# Open a session: ssh plus the herd socket forward and the herd env,
+# in the same directory that `code` and `zed` resolve
+./yo enter [project]
 
 # Open a plain interactive SSH session, no herd wiring
 ./yo ssh
@@ -144,6 +145,10 @@ on, changes to the flake are applied with
 # Open Zed over SSH in the VM, same directory resolution
 ./yo zed [project]
 ```
+
+`enter`, `code` and `zed` share one directory resolution: with a project
+argument, fuzzy-pick (fzf) among the VM's git repos under `~/wrk`; without
+one, the mirrored dir of the host's current repo, or `~/wrk` outside a repo.
 
 `code` and `zed` rely on the `Include ~/.lima/yolobox/ssh.config` line in
 `~/.ssh/config`; VS Code also needs the `ms-vscode-remote.remote-ssh`

@@ -4,7 +4,7 @@
 # Usage:
 #   yo up|down|status
 #   yo ssh [cmd...]
-#   yo enter
+#   yo enter [project]
 #   yo link
 #   yo seed-herdr
 #   yo code [project]
@@ -41,7 +41,7 @@ usage() {
 Usage:
   yo up|down|status
   yo ssh [cmd...]
-  yo enter
+  yo enter [project]
   yo link
   yo seed-herdr
   yo code [project]
@@ -83,11 +83,12 @@ cmd_ssh() {
 }
 
 cmd_enter() {
-    [ "$#" -eq 0 ] || {
-        echo "yo: enter takes no arguments" >&2
+    [ "$#" -le 1 ] || {
+        echo "yo: enter takes at most one project argument" >&2
         usage
         exit 2
     }
+    target="$(vm_target_dir "${@+"$@"}")"
     ssh_args
     # A per-pane forward and per-pane SetEnv cannot ride the shared
     # ControlMaster that ssh_args()'s -F config establishes for cmd_ssh:
@@ -115,7 +116,7 @@ cmd_enter() {
             -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${guest_sock}"
         )
     fi
-    exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}"
+    exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}" "cd $(printf '%q' "${target}") && exec \"\$SHELL\" -l"
 }
 
 # Resolve $1 relative to a base dir via cd+pwd -P; empty on failure.
