@@ -264,6 +264,31 @@ tarball and pin its `hash`; unpack it, `jq 'del(.overrides)'`, run
 `npm install --package-lock-only --ignore-scripts`, and vendor the result;
 then build once with a wrong `npmDepsHash` and pin the hash nix reports.
 
+### Why dist/bin.mjs must be patched too
+
+t3's Claude capability probe hardcodes `strictMcpConfig: true`. Claude Code
+refuses `--strict-mcp-config` whenever an enterprise MCP config is present,
+and `nix/mcp.nix` renders exactly that at `/etc/claude-code/managed-mcp.json`.
+So the probe exits 1 within ~150ms with "You cannot use --strict-mcp-config
+when an enterprise MCP config is present".
+
+Recognising it is the hard part, because t3 hides the failure completely: the
+probe options set `stderr: () => {}` and the call site is wrapped in
+`Effect.orElseSucceed(() => void 0)`. Nothing reaches journald — `journalctl -u
+t3 | grep -c claude` returns 0 even while this is happening. The evidence lives
+in `~/.t3/caches/claudeAgent.json` instead: `status: "warning"`, `auth:
+{"status": "unknown"}`, no slash commands, and the message "Could not verify
+Claude authentication status from initialization result."
+
+The `postPatch` flips the flag to `false`. The cost is that each probe now
+starts the three servers in `managed-mcp.json` instead of being isolated from
+them; they are short-lived node processes, and playwright starts no browser
+until a tool call, so the probe still finishes well inside its 25s timeout.
+
+That cache is not invalidated by a rebuild. To re-test, delete
+`~/.t3/caches/claudeAgent.json`, restart the unit and read the file back — do
+not go looking in journald.
+
 ### Why nix builds it at all
 
 `node-pty@1.1.0` ships prebuilds for darwin and win32 only, and its install

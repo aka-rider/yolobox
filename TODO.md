@@ -6,3 +6,9 @@
   https://charm.land/crush.json (opencode: command array + extensions with
   dots; crush: command string + filetypes without dots; LSP commands stay
   bare names resolved from the project devbox PATH, unlike MCP servers).
+- Report upstream (pingdotgg/t3code): the Claude capability probe hardcodes
+  `strictMcpConfig: true`, which Claude Code refuses whenever an enterprise MCP
+  config is present, and t3 swallows the failure so its Claude provider silently
+  ends up unauthenticated with no slash commands. Affects any enterprise MCP
+  deployment, not just yolobox. Carried as a `substituteInPlace` in
+  `nix/pkgs/t3.nix`; drop it once upstream fixes it.
