@@ -209,7 +209,8 @@ The box carries no C or Python toolchain, so an extension whose dependency
 tree holds a native module without an aarch64 prebuild cannot install: npm
 falls back to `node-gyp`, which finds no `python3`, `gcc` or `make`. This
 dropped `@plannotator/pi-extension` from the pinned list — it pulls
-`node-pty`, whose 1.1.0 release publishes no prebuilt binaries at all.
+`node-pty`, whose 1.1.0 release ships prebuilds for darwin and win32 only,
+so on aarch64-linux it always falls through to a compile.
 Prebuilt native packages are fine: `@ast-grep/napi` and its `ast-grep` binary
 (pi-lens, pi-simplify) load and run as glibc builds.
 
@@ -227,3 +228,66 @@ other language, so pi's LSP now belongs to the user layer entirely. A
 retired `L+` link is not removed by the rebuild that drops its rule: delete
 `~/.pi/agent/extensions/<name>` and any stale config by hand, or pi keeps
 loading the previous closure.
+
+## t3: a nix-built npm CLI, run as a service
+
+`nix/pkgs/t3.nix` builds the npm package `t3` (t3code) from its registry
+tarball; `nix/t3.nix` puts it in `environment.systemPackages` and runs
+`t3 serve --host 127.0.0.1 --port 3773` as `systemd.services.t3` under
+`xiii`. Loopback only — reach it through the ssh forward, not from outside
+the box.
+
+The service gets `HOME` and a `path` entry for `/run/current-system/sw`,
+because a system unit inherits neither a login PATH nor a home, and t3
+shells out to the harnesses it drives (claude, opencode) and to git.
+Use the `path` option, not `environment.PATH`: NixOS already defines
+`environment.PATH` for every service, so a second definition is an
+option conflict, not an override.
+
+### Why the package.json must be patched
+
+The published `package.json` carries the t3code monorepo's pnpm-style
+`overrides`, whose keys use the `parent>child` form
+(`"@clerk/clerk-js>@base-org/account": "-"`). npm accepts those keys in a
+workspace root but validates them as package names once this package is the
+install root, so any npm command dies with `EINVALIDPACKAGENAME`. Thus
+`postPatch` deletes the field with `jq` before npm sees it. It calls jq by
+store path rather than through `nativeBuildInputs`, because the same
+`postPatch` also runs inside the npm-deps fixed-output derivation, which
+does not inherit build inputs — a jq from `nativeBuildInputs` gives
+`jq: command not found` there and nowhere else.
+
+The vendored `nix/pkgs/t3-package-lock.json` must be generated from the
+*stripped* package.json, or the same rejection happens at lock time. The
+version-bump ritual is therefore three hashes in order: fetch the new
+tarball and pin its `hash`; unpack it, `jq 'del(.overrides)'`, run
+`npm install --package-lock-only --ignore-scripts`, and vendor the result;
+then build once with a wrong `npmDepsHash` and pin the hash nix reports.
+
+### Why nix builds it at all
+
+`node-pty@1.1.0` ships prebuilds for darwin and win32 only, and its install
+script is `node scripts/prebuild.js || node-gyp rebuild`, so on aarch64-linux
+it compiles. `python3` is in `nativeBuildInputs` for exactly that. Building in
+nix is what keeps the box's runtime free of a C and Python toolchain — the
+same absence that blocks `pi install` of native extensions.
+
+### Log noise that is not a failure
+
+No `linux-arm64` `dist/resource-monitor` binary ships upstream (darwin-arm64,
+darwin-x64, linux-x64, win32-x64 only), so t3 reports resource monitoring as
+unsupported and carries on.
+
+`Grok CLI health check failed { errorTag: 'PlatformError' }` at startup only
+means the grok binary is not in the box. Same for any other provider CLI the
+box does not carry.
+
+`Failed to flush telemetry ... HttpClientError` repeats every second when t3
+cannot reach its telemetry endpoint. It does not stop the server.
+
+### The web UI needs a pairing token
+
+A bookmarked bare URL fails auth. `t3 serve` prints a Pairing URL at startup —
+read it from `journalctl -u t3` — or mint a fresh one from an ssh session with
+`t3 pair`, which is why the package is in `systemPackages` and not only in the
+unit.

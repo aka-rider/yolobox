@@ -144,6 +144,9 @@ on, changes to the flake are applied with
 
 # Open Zed over SSH in the VM, same directory resolution
 ./yo zed [project]
+
+# Open t3code's web UI, served by the VM, in the Mac's browser
+./yo t3
 ```
 
 `enter`, `code` and `zed` share one directory resolution: with a project
@@ -156,6 +159,15 @@ extension.
 
 `link` is where a new project starts — see [Per-project dev
 shells](#per-project-dev-shells) for the bootstrap that follows it.
+
+`t3` runs t3code as a system service inside the VM, on loopback only. Each
+`./yo t3` checks that the service is up, makes the guest port reachable from
+the Mac (lima's own loopback forwarding when it already covers the port, an
+ssh `-L` tunnel otherwise), mints a fresh pairing token with `t3 pair`, and
+opens that pairing URL. The token is what authenticates the browser, so a
+bookmarked URL fails with "Authentication required" — run `./yo t3` again
+instead of reusing an old link. If the command reports the service is not
+active, look at `./yo ssh journalctl -u t3 -n 50`.
 
 ## Browsers and screen
 

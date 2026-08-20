@@ -9,6 +9,7 @@
 #   yo seed-herdr
 #   yo code [project]
 #   yo zed [project]
+#   yo t3
 
 set -euo pipefail
 
@@ -19,6 +20,9 @@ readonly VM_USER_HOME="/home/xiii.guest"
 # Created by a systemd-tmpfiles rule in nix/base.nix — see there for why the
 # forwarded sockets live outside VM_USER_HOME.
 readonly GUEST_SOCK_DIR="/run/yolobox"
+# The guest's t3 service binds loopback only; same port on both sides.
+readonly T3_PORT=3773
+readonly T3_TUNNEL_TRIES=100
 SSH_CFG="$HOME/.lima/yolobox/ssh.config"
 OP_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
 readonly SSH_CFG OP_SOCK
@@ -46,6 +50,7 @@ Usage:
   yo seed-herdr
   yo code [project]
   yo zed [project]
+  yo t3
 EOF
 }
 
@@ -212,6 +217,86 @@ cmd_zed() {
     exec zed "ssh://${VM_HOST}${target}"
 }
 
+# One-shot guest command on a connection of its own: the shared
+# ControlMaster of ssh_args()'s -F config belongs to whichever session
+# opened it, and a t3 invocation must neither inherit that session's
+# forwards nor become the master for later ones.
+t3_ssh() {
+    ssh_args
+    ssh -n "${SSH_ARGS[@]}" -o ControlPath=none "${VM_HOST}" "$@"
+}
+
+t3_port_answers() {
+    (exec 3<>"/dev/tcp/127.0.0.1/${T3_PORT}") 2>/dev/null
+}
+
+# lima already forwards guest loopback ports to the host, so the only
+# question asked here is whether the port answers — never which mechanism
+# made it answer.
+t3_ensure_port() {
+    if t3_port_answers; then
+        return
+    fi
+    ssh_args
+    ssh -f -N -o ControlPath=none -o ExitOnForwardFailure=yes \
+        -L "${T3_PORT}:127.0.0.1:${T3_PORT}" "${SSH_ARGS[@]}" "${VM_HOST}" || {
+        echo "yo: could not forward 127.0.0.1:${T3_PORT} out of the VM" >&2
+        exit 1
+    }
+    tries=0
+    while [ "${tries}" -lt "${T3_TUNNEL_TRIES}" ]; do
+        if t3_port_answers; then
+            return
+        fi
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    echo "yo: 127.0.0.1:${T3_PORT} does not answer, tunnel or not" >&2
+    exit 1
+}
+
+# t3's web UI authenticates with a freshly minted pairing token; a bare
+# http://127.0.0.1:${T3_PORT} is rejected. Sets PAIRING_URL.
+t3_mint_pairing_url() {
+    pair_out="$(t3_ssh 't3 pair --ttl 2m --label yo' 2>&1)" || true
+    PAIRING_URL="$(printf '%s\n' "${pair_out}" | tr -d '\r' |
+        sed -n 's/^[[:space:]]*Pairing URL:[[:space:]]*//p' | head -n 1)"
+    [ -n "${PAIRING_URL}" ] || {
+        echo "yo: 't3 pair' printed no 'Pairing URL:' line:" >&2
+        printf '%s\n' "${pair_out}" >&2
+        exit 1
+    }
+}
+
+cmd_t3() {
+    [ "$#" -eq 0 ] || {
+        echo "yo: t3 takes no arguments" >&2
+        usage
+        exit 2
+    }
+    # LoadState, not just is-active: `systemctl is-active` reports a unit the
+    # running closure has never heard of as "inactive", which reads as a
+    # stopped service when the real answer is that the VM was never switched.
+    unit="$(t3_ssh 'systemctl show -p LoadState -p ActiveState --value t3' || true)"
+    load_state="$(printf '%s\n' "${unit}" | tr -d '\r' | sed -n '1p')"
+    active_state="$(printf '%s\n' "${unit}" | tr -d '\r' | sed -n '2p')"
+    [ -n "${load_state}" ] || {
+        echo "yo: cannot reach the VM to ask about t3 — is it up? (yo status)" >&2
+        exit 1
+    }
+    [ "${load_state}" = "loaded" ] || {
+        echo "yo: no t3 unit in the VM's current system — switch it: yo ssh sudo nixos-rebuild switch --flake '~/wrk/yolobox#yolobox'" >&2
+        exit 1
+    }
+    [ "${active_state}" = "active" ] || {
+        echo "yo: t3 service is ${active_state} in the VM — diagnose with: yo ssh journalctl -u t3 -n 50" >&2
+        exit 1
+    }
+    t3_ensure_port
+    t3_mint_pairing_url
+    exec open "${PAIRING_URL}"
+}
+
 cmd_link() {
     toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || {
         echo "yo: link must run inside a git repo" >&2
@@ -269,6 +354,7 @@ main() {
         seed-herdr) cmd_seed_herdr ;;
         code) cmd_code "$@" ;;
         zed) cmd_zed "$@" ;;
+        t3) cmd_t3 "$@" ;;
         *)
             usage
             exit 2
