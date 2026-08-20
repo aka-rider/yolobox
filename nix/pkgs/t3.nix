@@ -23,10 +23,24 @@ buildNpmPackage rec {
   # same stripped package.json; regenerate both together on a version bump.
   # jq by store path, not via nativeBuildInputs: this postPatch also runs in
   # the npm-deps fixed-output derivation, which does not inherit them.
+  # sed rather than substituteInPlace for the dist edit: bin.mjs carries four
+  # NUL bytes, and substituteInPlace's replacement helper rejects those with
+  # "consumeEntire(): ERROR: Input null bytes, won't process". grep gates the
+  # sed so that under stdenv's set -e a vanished pattern fails the build.
+  #
+  # The second edit is unrelated to npm. t3's Claude capability probe hardcodes
+  # strictMcpConfig, and Claude Code refuses --strict-mcp-config whenever an
+  # enterprise MCP config is present — nix/mcp.nix renders one at
+  # /etc/claude-code/managed-mcp.json. The probe then exits 1, t3 swallows the
+  # error, and its Claude provider silently reports no auth and no slash
+  # commands. The grep turns a t3 bump that renames this into a build error
+  # instead of a silent return of the defect.
   postPatch = ''
     ${lib.getExe jq} 'del(.overrides)' package.json > package.json.stripped
     mv package.json.stripped package.json
     cp ${./t3-package-lock.json} package-lock.json
+    grep -q 'strictMcpConfig: true,' dist/bin.mjs
+    sed -i 's/strictMcpConfig: true,/strictMcpConfig: false,/' dist/bin.mjs
   '';
 
   npmDepsFetcherVersion = 2;
