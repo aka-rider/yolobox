@@ -33,6 +33,7 @@ in
     ./mcp.nix
     ./herd-report.nix
     ./display.nix
+    ./t3.nix
   ];
 
   yolobox.mcp.servers = {
