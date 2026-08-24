@@ -154,6 +154,9 @@ to the same name every time).
 
 # Open t3code's web UI, served by the VM, in the Mac's browser
 ./yo t3
+
+# Print a t3 pairing URL that names this Mac, to open on another machine
+./yo pair [base-url]
 ```
 
 `enter`, `code` and `zed` share one directory resolution: with a project
@@ -167,14 +170,46 @@ extension.
 `link` is where a new project starts — see [Per-project dev
 shells](#per-project-dev-shells) for the bootstrap that follows it.
 
-`t3` runs t3code as a system service inside the VM, on loopback only. Each
-`./yo t3` checks that the service is up, makes the guest port reachable from
-the Mac (lima's own loopback forwarding when it already covers the port, an
-ssh `-L` tunnel otherwise), mints a fresh pairing token with `t3 pair`, and
-opens that pairing URL. The token is what authenticates the browser, so a
-bookmarked URL fails with "Authentication required" — run `./yo t3` again
-instead of reusing an old link. If the command reports the service is not
-active, look at `./yo ssh journalctl -u t3 -n 50`.
+`t3` runs t3code as a system service inside the VM, bound to the guest's
+loopback. `lima/yolobox.yaml` declares one forward for guest port 3773 with
+`hostIP: "0.0.0.0"`, so the UI is published on all of the Mac's interfaces
+and another machine on the LAN can reach it. Each `./yo t3` checks that the
+service is up, mints a fresh pairing token with `t3 pair`, and opens that
+pairing URL. The token is what authenticates the browser, so a bookmarked URL
+fails with "Authentication required" — run `./yo t3` again instead of reusing
+an old link. If the command reports the service is not active, look at
+`./yo ssh journalctl -u t3 -n 50`.
+
+`pair` is the same thing for a browser that is not on this Mac. `t3 pair`
+builds its URL out of the address the server was started with — `127.0.0.1`,
+which means nothing on another machine — so `./yo pair` mints the token with
+`t3 auth pairing create --base-url` instead, defaulting to
+`http://$(scutil --get LocalHostName).local:3773`. Give it a base URL
+argument to name this Mac some other way, e.g. by its VPN address instead of
+its LAN name. It prints the URL rather than opening it, because the browser
+that needs it is elsewhere.
+
+Two boxes are driven from one browser, not by linking their servers: t3
+pairing only ever runs client→server, and no server-to-server pairing exists.
+So run `./yo pair` on each Mac, redeem both URLs in the same browser, and
+both boxes sit in that UI's environment list — every saved environment is
+offered, not only the local one.
+
+That 3773 forward reaches an **existing** VM only after a one-time migration:
+lima materialises `lima/yolobox.yaml` into `~/.lima/yolobox/lima.yaml` when it
+creates the instance, and from then on `./yo up` starts the instance from that
+copy — so editing the repo file changes nothing. The fix is `limactl edit`,
+which needs the instance stopped just like the memory bump below:
+
+```bash
+limactl stop yolobox
+limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"hostIP":"0.0.0.0"},{"proto":"udp","guestPort":68,"guestIP":"0.0.0.0","ignore":true}]'
+./yo up
+```
+
+The whole array has to be restated, udp/68 rule included — `--set` is yq v4,
+and lima disables yq's `load`/`env` operators, so the expression cannot read
+`lima/yolobox.yaml` for you.
 
 ## Browsers and screen
 

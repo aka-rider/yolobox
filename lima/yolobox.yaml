@@ -20,6 +20,13 @@ vmOpts:
       binfmt: true
 
 portForwards:
+  # t3's web UI must be reachable from another Mac on the LAN. Lima's default
+  # host side is 127.0.0.1 for every port, so publishing it takes an explicit
+  # rule; t3 itself keeps binding 127.0.0.1 guest-side, and lima's forwarder
+  # dials it from inside the guest, so the guest firewall is never traversed.
+  - guestPort: 3773
+    hostIP: "0.0.0.0"
+
   # Tell Lima's port-forwarding to ignore port 68 to prevent interception of host DHCP packets
   # Apparently this is an issue with NixOS that does not occur on other Linux distros
   # See: https://github.com/nixos-lima/nixos-lima/issues/50
