@@ -303,8 +303,34 @@ loading the previous closure.
 `nix/pkgs/t3.nix` builds the npm package `t3` (t3code) from its registry
 tarball; `nix/t3.nix` puts it in `environment.systemPackages` and runs
 `t3 serve --host 127.0.0.1 --port 3773` as `systemd.services.t3` under
-the guest account. Loopback only — reach it through the ssh forward, not
-from outside the box.
+the guest account. Loopback inside the guest — but not private to the Mac:
+`lima/yolobox.yaml` declares a `guestPort: 3773` forward with
+`hostIP: "0.0.0.0"`, and lima's forwarder dials the guest's loopback from
+*inside* the guest, so the port is published on every host interface without
+the guest firewall (NixOS default-deny, only 22 open) ever being traversed.
+
+But that forward is inert on a VM that already exists. Lima materialises the
+instance config at *creation* time into `~/.lima/yolobox/lima.yaml`, and
+`yo up` on an existing instance runs `limactl start --yes yolobox`, which
+reads that copy; `cmd_up` names `lima/yolobox.yaml` only in the branch that
+creates a missing instance. So the repo file is authoritative exactly once,
+and everything after that is drift — verified here: the 3773 rule was in the
+repo file and absent from `~/.lima/yolobox/lima.yaml`. Migrating an existing
+VM means stopping it (`limactl edit` on a running instance is a hard
+`cannot edit a running instance`) and restating the whole array:
+
+```sh
+limactl stop yolobox
+limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"hostIP":"0.0.0.0"},{"proto":"udp","guestPort":68,"guestIP":"0.0.0.0","ignore":true}]'
+./yo up
+```
+
+The udp/68 rule is repeated there because `--set` is yq v4 and lima
+deliberately disables yq's `load`/`load_str`/`env` operators (see
+`limactl help yq-restrictions`), so the expression cannot read
+`lima/yolobox.yaml` and merge from it. `yo` does not paper over the drift on
+purpose: syncing would need a YAML parser on the host, and only Homebrew's
+python3 carries one here — the system python3 does not.
 
 `t3 serve`'s `$HOME` must be the exact same `$HOME` an interactive SSH
 session gets — `t3 pair` (run interactively to mint the web UI's pairing
@@ -393,3 +419,47 @@ A bookmarked bare URL fails auth. `t3 serve` prints a Pairing URL at startup —
 read it from `journalctl -u t3` — or mint a fresh one from an ssh session with
 `t3 pair`, which is why the package is in `systemPackages` and not only in the
 unit.
+
+### The pairing URL's host is whatever `--host` the server was started with
+
+t3 computes it as `resolveDirectPairingBaseUrl = (state) => state.devUrl ??
+resolveHeadlessConnectionString(state.host, state.port)`. The unit starts it
+with `--host 127.0.0.1`, so every URL `t3 pair` mints is loopback-only and
+useless on another machine — and `t3 pair` has no override for it. Only
+`t3 auth pairing create --base-url` takes one. That is why `yo pair` is a
+separate command rather than a flag on `yo t3`: it goes through
+`auth pairing create`, defaulting the base URL to
+`http://$(scutil --get LocalHostName).local:3773`, and prints the result
+instead of opening it locally.
+
+### Pairing runs client→server only; two boxes meet in one browser
+
+There is no operation that pairs two t3 servers with each other, so do not go
+looking for one. t3's own bundle documents `t3 auth pairing create` as "Issue
+a new *client* pairing token", redeeming a token yields a browser session, and
+the paired device type is one of `["desktop","mobile","tablet","bot"]`.
+Multi-machine use is a *client-side* list instead: the web UI carries the
+string `Click "Add environment" to pair another environment`, and the docs
+say "Every saved environment is offered, not only the local one". Thus the way
+to drive two VMs is one browser holding both environments — `yo pair` on each
+box, both URLs redeemed in the same browser.
+
+### `lsof` shows lima listening on `*:80` and `*:443` — pseudoloopback, not exposure
+
+`lsof -nP -iTCP -sTCP:LISTEN -a -c limactl` shows lima bound to the host
+wildcard on 80 and 443 while every other forwarded port sits on `127.0.0.1`.
+It looks like a hole and is not. From lima's `pkg/portfwd/listener_darwin.go`:
+when `hostIP == 127.0.0.1 && hostPort < 1024`, lima binds `0.0.0.0:<port>`
+instead, because on macOS a non-root process cannot bind `127.0.0.1:80` but
+*can* bind `0.0.0.0:80`. The listener it returns is a
+`pseudoLoopbackListener`, whose `Accept()` closes any connection whose peer
+is not loopback — so a LAN client completes the TCP handshake and is then
+dropped. The `<1024` boundary is why guest 8443 lands on `127.0.0.1:8443`
+while 80 and 443 do not.
+
+Deliberately left alone: an explicit `hostIP: "127.0.0.1"` would be a no-op,
+since that is already the resolved value and is exactly what triggers the
+branch; and remapping to unprivileged host ports would move the project's
+caddy off `https://localhost` for no security gain. The real cost is worth
+naming, though: lima occupies host ports 80 and 443 on every interface, so
+nothing else on the Mac can bind them.

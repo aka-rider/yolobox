@@ -10,6 +10,7 @@
 #   yo code [project]
 #   yo zed [project]
 #   yo t3
+#   yo pair [base-url]
 
 set -euo pipefail
 
@@ -22,9 +23,9 @@ readonly VM_USER_HOME
 # Created by a systemd-tmpfiles rule in nix/base.nix — see there for why the
 # forwarded sockets live outside VM_USER_HOME.
 readonly GUEST_SOCK_DIR="/run/yolobox"
-# The guest's t3 service binds loopback only; same port on both sides.
+# The guest's t3 service binds loopback only; lima/yolobox.yaml forwards
+# that port to the host, so the same number names it on both sides.
 readonly T3_PORT=3773
-readonly T3_TUNNEL_TRIES=100
 SSH_CFG="$HOME/.lima/yolobox/ssh.config"
 OP_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
 readonly SSH_CFG OP_SOCK
@@ -53,6 +54,7 @@ Usage:
   yo code [project]
   yo zed [project]
   yo t3
+  yo pair [base-url]
 EOF
 }
 
@@ -231,35 +233,6 @@ t3_ssh() {
     ssh -n "${SSH_ARGS[@]}" -o ControlPath=none "${VM_HOST}" "$@"
 }
 
-t3_port_answers() {
-    (exec 3<>"/dev/tcp/127.0.0.1/${T3_PORT}") 2>/dev/null
-}
-
-# lima already forwards guest loopback ports to the host, so the only
-# question asked here is whether the port answers — never which mechanism
-# made it answer.
-t3_ensure_port() {
-    if t3_port_answers; then
-        return
-    fi
-    ssh_args
-    ssh -f -N -o ControlPath=none -o ExitOnForwardFailure=yes \
-        -L "${T3_PORT}:127.0.0.1:${T3_PORT}" "${SSH_ARGS[@]}" "${VM_HOST}" || {
-        echo "yo: could not forward 127.0.0.1:${T3_PORT} out of the VM" >&2
-        exit 1
-    }
-    tries=0
-    while [ "${tries}" -lt "${T3_TUNNEL_TRIES}" ]; do
-        if t3_port_answers; then
-            return
-        fi
-        sleep 0.1
-        tries=$((tries + 1))
-    done
-    echo "yo: 127.0.0.1:${T3_PORT} does not answer, tunnel or not" >&2
-    exit 1
-}
-
 # t3's web UI authenticates with a freshly minted pairing token; a bare
 # http://127.0.0.1:${T3_PORT} is rejected. Sets PAIRING_URL.
 t3_mint_pairing_url() {
@@ -273,12 +246,7 @@ t3_mint_pairing_url() {
     }
 }
 
-cmd_t3() {
-    [ "$#" -eq 0 ] || {
-        echo "yo: t3 takes no arguments" >&2
-        usage
-        exit 2
-    }
+t3_require_service() {
     # LoadState, not just is-active: `systemctl is-active` reports a unit the
     # running closure has never heard of as "inactive", which reads as a
     # stopped service when the real answer is that the VM was never switched.
@@ -297,9 +265,37 @@ cmd_t3() {
         echo "yo: t3 service is ${active_state} in the VM — diagnose with: yo ssh journalctl -u t3 -n 50" >&2
         exit 1
     }
-    t3_ensure_port
+}
+
+cmd_t3() {
+    [ "$#" -eq 0 ] || {
+        echo "yo: t3 takes no arguments" >&2
+        usage
+        exit 2
+    }
+    t3_require_service
     t3_mint_pairing_url
     exec open "${PAIRING_URL}"
+}
+
+cmd_pair() {
+    [ "$#" -le 1 ] || {
+        echo "yo: pair takes at most one base-url argument" >&2
+        usage
+        exit 2
+    }
+    t3_require_service
+    host_name="$(scutil --get LocalHostName)"
+    base_url="${1:-http://${host_name}.local:${T3_PORT}}"
+    # `t3 pair` mints its URL from the address the server was started with,
+    # and the unit starts it with --host 127.0.0.1 — unreachable from any
+    # other machine. `t3 auth pairing create` is the only form that takes
+    # a --base-url to name this host instead.
+    pair_out="$(t3_ssh "t3 auth pairing create --ttl 5m --label $(printf '%q' "yo@${host_name}") --base-url $(printf '%q' "${base_url}")" 2>&1)" || {
+        printf '%s\n' "${pair_out}" >&2
+        exit 1
+    }
+    printf '%s\n' "${pair_out}"
 }
 
 cmd_link() {
@@ -414,6 +410,7 @@ main() {
         code) cmd_code "$@" ;;
         zed) cmd_zed "$@" ;;
         t3) cmd_t3 "$@" ;;
+        pair) cmd_pair "$@" ;;
         *)
             usage
             exit 2
