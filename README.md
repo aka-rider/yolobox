@@ -104,17 +104,22 @@ ssh -F ~/.lima/yolobox/ssh.config lima-yolobox -- \
 
 # 4. From your Mac clone of this repo, push it into the VM
 GIT_SSH_COMMAND="ssh -F $HOME/.lima/yolobox/ssh.config" \
-  git push ssh://lima-yolobox/home/xiii.guest/wrk/yolobox main
+  git push "ssh://lima-yolobox/home/$(id -un).guest/wrk/yolobox" main
 
-# 5. Build the NixOS configuration inside the VM and reboot
+# 5. Build the NixOS configuration inside the VM and reboot. The guest
+#    account is declared to mirror whichever host user is bootstrapping it
+#    (see flake.nix) — Nix has no pure way to learn that name, so it's
+#    passed in impurely.
 ssh -F ~/.lima/yolobox/ssh.config lima-yolobox -- \
-  'cd ~/wrk/yolobox && sudo nixos-rebuild boot --flake .#yolobox'
+  "sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild boot --impure --flake ~/wrk/yolobox#yolobox"
 limactl restart yolobox
 ```
 
 After the restart the VM is running the declarative configuration. From now
-on, changes to the flake are applied with
-`nixos-rebuild switch --flake .#yolobox`.
+on, changes to the flake are applied from inside the VM with
+`sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake ~/wrk/yolobox#yolobox`
+(`yo ssh` already runs from your Mac account, so `$(id -un)` there resolves
+to the same name every time).
 
 ## Daily use
 
@@ -133,8 +138,10 @@ on, changes to the flake are applied with
 # inside the VM. Push from the VM works to the checked-out branch.
 ./yo link
 
-# Copy the host's herdr config into the VM, without overwriting it
-./yo seed-herdr
+# Copy the host-only files the VM needs into it: the herdr config (kept if
+# one is already there), the ssh config plus every public key, and the
+# directory-level git identities from ~/Developer/*/.gitconfig
+./yo seed
 
 # Open VS Code Remote-SSH in the VM, at the mirrored dir of the current
 # repo (or ~/wrk when outside one). With a project argument, fuzzy-pick
@@ -272,7 +279,14 @@ manual bootstrap scripts and fragile Docker networking.
 
 limactl version: `limactl version 2.2.0` (bring-up 2026-08-05). Note: lima
 >=2.1.0 renamed the guest home from `/home/${USER}.linux` to
-`/home/${USER}.guest` (lima-vm/lima#4578), so the guest home here is
-`/home/xiii.guest` — a ".guest" suffix on the cidata home dir, unrelated to
-the account name `xiii` — every VM-side path in this repo already accounts
-for it.
+`/home/${USER}.guest` (lima-vm/lima#4578) — every VM-side path in this repo
+already accounts for the ".guest" suffix.
+
+The guest account name mirrors the host Mac account exactly (lima's cidata
+names and uid-matches it that way); there is no fixed "yolobox account" of
+its own. An earlier revision hardcoded the account as `xiii` in the flake
+— a leftover from a previous Mac account of that name — which silently
+diverged from `yo`'s own `$(id -un)`-derived paths once the Mac account
+changed, splitting state across two `/home/*.guest` directories with the
+same uid. `flake.nix` now threads the real username in via
+`YOLOBOX_USERNAME`/`--impure` (see `yo t3`'s switch hint) instead.

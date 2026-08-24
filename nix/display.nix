@@ -1,6 +1,6 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, username, ... }:
 let
-  homeDir = config.users.users.xiii.home;
+  homeDir = config.users.users.${username}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
 
   waitForX = pkgs.writeShellScript "wait-for-x" ''
@@ -101,7 +101,7 @@ in
   systemd.services.xvfb = {
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
-      User = "xiii";
+      User = username;
       Group = "users";
       Restart = "always";
       # -xkbdir works around nixpkgs#3441 ("cannot find xkbcomp" keymap
@@ -116,7 +116,7 @@ in
     requires = [ "xvfb.service" ];
     environment.DISPLAY = ":0";
     serviceConfig = {
-      User = "xiii";
+      User = username;
       Group = "users";
       Restart = "always";
       # Xvfb's socket lags its own service start; without this wait,
@@ -130,7 +130,7 @@ in
 
   systemd.tmpfiles.rules = homeTmpfiles {
     home = homeDir;
-    dirUser = "xiii";
+    dirUser = username;
     dirs = [ "artifacts" ];
     links = [ ];
   };

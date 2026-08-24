@@ -12,9 +12,9 @@
 # global config files live in nix/mcp.nix, which carries unrelated parallel
 # work at the time of writing — lifting the LSP sections into those renders
 # is tracked in TODO.md.
-{ config, ... }:
+{ config, username, ... }:
 let
-  homeDir = config.users.users.xiii.home;
+  homeDir = config.users.users.${username}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
 
   basedpyrightLsp = {
@@ -56,7 +56,7 @@ in
   # conflict — one provider only.
   systemd.tmpfiles.rules = homeTmpfiles {
     home = homeDir;
-    dirUser = "xiii";
+    dirUser = username;
     dirs = [ ".config" ".config/zed" ".claude" ".claude/skills" ];
     links = [
       { path = ".config/zed/settings.json"; argument = "/etc/yolobox/lsp/zed-settings.json"; }

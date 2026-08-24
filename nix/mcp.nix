@@ -1,7 +1,7 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, username, ... }:
 let
   cfg = config.yolobox.mcp.servers;
-  homeDir = config.users.users.xiii.home;
+  homeDir = config.users.users.${username}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
 
   serverType = lib.types.submodule {
@@ -94,7 +94,7 @@ in
     # symlink (Gotcha 14) tracks /etc across every rebuild.
     systemd.tmpfiles.rules = homeTmpfiles {
       home = homeDir;
-      dirUser = "xiii";
+      dirUser = username;
       dirs = [ ".config" ".config/mcp" ];
       links = [
         { path = ".config/mcp/mcp.json"; argument = "/etc/yolobox/mcp/pi.json"; }

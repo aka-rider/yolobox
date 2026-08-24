@@ -3,6 +3,74 @@
 README is the hit-the-ground guide. This file holds the reasoning behind the
 steps and the failure modes worth recognising.
 
+## The guest account mirrors the host
+
+There is no fixed "yolobox account". Lima's cidata provisions a guest
+account named and uid-matched after whichever Mac account started the VM
+(`lima/yolobox.yaml`'s `user: false` does not disable this — it only turns
+off a different lima default). `flake.nix` declares that same account
+declaratively (`users.users.${username}` in every `nix/*.nix` module that
+needs it) rather than inventing a separate one, because Nix has no pure way
+to learn the host username: `YOLOBOX_USERNAME=$(id -un)` plus `--impure` on
+every `nixos-rebuild` invocation is how it gets in (`yo t3`'s switch hint
+shows the exact form; `yo`'s own `VM_USER_HOME` is computed the same way).
+
+An earlier revision hardcoded this account as `xiii` — a leftover from a
+previous Mac account of that name. Once the Mac account changed to
+something else, `xiii` silently kept existing as a second, colliding
+identity: same uid as the real account (nixos-rebuild pins it there on
+purpose, for podman/virtiofs uid compatibility), but a different
+`/home/*.guest` directory. Every nix module that stores state under
+`config.users.users.xiii.home` (mcp, lsp, herd-report, display, t3) was
+writing into that second, never-interactively-used home instead of the
+real one — invisible to `getpwuid`-based lookups (`whoami`, `sudo`'s
+`SUDO_USER`) too, since those resolve ambiguously to whichever of the two
+same-uid passwd entries comes first. `nixos-rebuild switch` removes a
+previously-declared user once its module stops declaring it (`mutableUsers
+= true` only stops nix from touching accounts it never declared), so
+retiring `xiii` from every module in one switch was enough to clear the
+collision — no manual `userdel` needed.
+
+## SSH identities: the forwarded agent, and the two GitHub accounts
+
+`ForwardAgent yes` forwards `$SSH_AUTH_SOCK`, **not** `IdentityAgent`. On this
+Mac those are two different agents: `$SSH_AUTH_SOCK` is Apple's launchd agent,
+which holds no identities, while every real key lives in 1Password. So `yes`
+forwarded an empty agent — `ssh-add -l` in the box answered "Could not open a
+connection to your authentication agent", because sshd sets `SSH_AUTH_SOCK`
+only once the forward carries something. `ssh_args` in `yo` therefore gives
+`ForwardAgent` the 1Password socket path itself.
+
+Because the forward is decided by whichever session opens lima's shared
+`ControlMaster`, a change here is invisible until the old master goes:
+`ssh -F ~/.lima/yolobox/ssh.config -O exit lima-yolobox`.
+
+Two GitHub accounts (`github@iurii.net` and the work `iurii-tech`) share one
+`github.com`, so the account is chosen by *which key* is offered. The host
+does that with a `Host github-iurii-tech` alias whose `IdentityFile` names a
+**public** key file — that is the agent-key selector, not a key — and
+`~/.dotfiles/gitconfig` rewrites `git@github.com:brocc-ab/` to that alias.
+`yo seed` copies the Mac's `~/.ssh/config` and every `~/.ssh/*.pub` in, minus
+two host-only lines: lima's own `Include`, and `IdentityAgent` — the box must
+use the forwarded socket, and a copied `IdentityAgent` would point at a path
+that does not exist there and take the agent away. Still no private key in the
+box.
+
+`yo seed` also carries the directory-level git identities,
+`~/Developer/<group>/.gitconfig`, into `~/wrk/<group>/.gitconfig`. Those files
+sit *next to* a group of repos rather than inside one, so no `yo link` push
+ever moves them, and without them the `includeIf` in `~/.dotfiles/gitconfig`
+resolves to nothing and work repos silently commit under the personal email.
+For the same reason that include's `path` must be spelled `~/wrk/...` for the
+`gitdir:~/wrk/` case: on the Mac `~/wrk` is a symlink to `~/Developer`, but in
+the box `~/wrk` is the real directory and `~/Developer` does not exist.
+
+How to recognise the whole class of failure: `ssh -T git@github.com` and
+`ssh -T git@github-iurii-tech` inside the box must greet two *different*
+account names. "Could not resolve hostname github-iurii-tech" means the ssh
+config never arrived; a greeting with the wrong account name means the pub
+keys did not.
+
 ## Per-project dev shells
 
 ### Why a project must be a git repo
@@ -44,7 +112,8 @@ checkout and is refused like any other.
 - Resolution needs network on the first add: package metadata from
   search.devbox.sh, store paths from cache.nixos.org.
 - `.devbox/` is per-machine state and is gitignored per project.
-- direnv auto-trusts every `.envrc` under `/home/xiii.guest/wrk`, so no
+- direnv auto-trusts every `.envrc` under `~/wrk` (the guest account's own
+  home — see "The guest account mirrors the host" below), so no
   `direnv allow` step exists. The whitelist lives in `/etc/direnv/direnv.toml`,
   rendered by `programs.direnv.settings`. The NixOS direnv module exports
   `DIRENV_CONFIG=/etc/direnv`, which overrides the XDG location — a
@@ -113,8 +182,8 @@ lock forwards the second launch to the running instance (~8s), so concurrent
 same-project sessions silently share one browser. Not isolation, but not a
 failure either.
 
-Chromium launches and navigates sandboxed (no `--no-sandbox`) as non-root
-`xiii`; Firefox likewise needed no dbus workaround.
+Chromium launches and navigates sandboxed (no `--no-sandbox`) as the
+non-root guest account; Firefox likewise needed no dbus workaround.
 
 Profiles persist per project, but Chromium's LevelDB-backed storage flushes
 lazily — a session killed without `browser_close` can lose its last write
@@ -234,8 +303,16 @@ loading the previous closure.
 `nix/pkgs/t3.nix` builds the npm package `t3` (t3code) from its registry
 tarball; `nix/t3.nix` puts it in `environment.systemPackages` and runs
 `t3 serve --host 127.0.0.1 --port 3773` as `systemd.services.t3` under
-`xiii`. Loopback only — reach it through the ssh forward, not from outside
-the box.
+the guest account. Loopback only — reach it through the ssh forward, not
+from outside the box.
+
+`t3 serve`'s `$HOME` must be the exact same `$HOME` an interactive SSH
+session gets — `t3 pair` (run interactively to mint the web UI's pairing
+token) discovers the running server by looking for
+`$HOME/.t3/{userdata,dev}/server-runtime.json`, so a mismatch here makes
+`yo t3` fail with "No running T3 Code server found" even though the
+service is active. This is exactly the failure mode the guest-account
+mirroring below exists to prevent.
 
 The service gets `HOME` and a `path` entry for `/run/current-system/sw`,
 because a system unit inherits neither a login PATH nor a home, and t3

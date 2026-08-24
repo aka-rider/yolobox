@@ -1,6 +1,6 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, username, ... }:
 let
-  homeDir = config.users.users.xiii.home;
+  homeDir = config.users.users.${username}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
   herdrPkg = import ./lib/herdr-pkg.nix { inherit pkgs; cfg = config.yolobox.harness.herdr; };
 
@@ -213,7 +213,7 @@ in
     # yolobox:pi the only reporter.
     systemd.tmpfiles.rules = homeTmpfiles {
       home = homeDir;
-      dirUser = "xiii";
+      dirUser = username;
       dirs = [ ".pi" ".pi/agent" ".pi/agent/extensions" ".pi/agent/skills" ];
       links = [
         {

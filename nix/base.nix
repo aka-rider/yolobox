@@ -1,4 +1,4 @@
-{ config, lib, pkgs, modulesPath, ... }:
+{ config, lib, pkgs, modulesPath, username, ... }:
 {
   # Boot/fs block below is verbatim from nixos-lima-config-sample's
   # nixos-lima-config.nix — it must match the shipped v0.2.1 image exactly
@@ -29,18 +29,22 @@
   users.mutableUsers = true;
   system.stateVersion = "25.11";
 
-  # Matches what lima-init's existence-guarded useradd already created on
-  # first boot (Gotcha 1) — including lima >=2.1.0's ".guest"-suffixed home
-  # (lima-vm/lima#4578). NixOS refuses isNormalUser below uid 1000
-  # (lima's cidata UID here is 501, matching the host's macOS UID), so this
-  # uses isSystemUser instead and sets autoSubUidGidRange directly — that
-  # option isn't actually gated on isNormalUser, only its *default* is —
-  # giving rootless podman its /etc/subuid range declaratively.
-  users.users.xiii = {
+  # Takes over lima-init's existence-guarded useradd from first boot
+  # (Gotcha 1) — including lima >=2.1.0's ".guest"-suffixed home
+  # (lima-vm/lima#4578). That account is named after the host Mac user
+  # (`username`, threaded in impurely — see flake.nix), not a fixed name:
+  # there is no separate "yolobox account", this declares the same account
+  # cidata already created so nix and interactive SSH sessions share one
+  # $HOME. NixOS refuses isNormalUser below uid 1000 (lima's cidata UID
+  # here is 501, matching the host's macOS UID), so this uses isSystemUser
+  # instead and sets autoSubUidGidRange directly — that option isn't
+  # actually gated on isNormalUser, only its *default* is — giving
+  # rootless podman its /etc/subuid range declaratively.
+  users.users.${username} = {
     isSystemUser = true;
     group = "users";
     uid = 501;
-    home = "/home/xiii.guest";
+    home = "/home/${username}.guest";
     extraGroups = [ "wheel" ];
     shell = pkgs.zsh;
     autoSubUidGidRange = true;
@@ -58,7 +62,7 @@
   # so an orphaned socket dies at reboot instead of accumulating. This is safe
   # ahead of any ssh connection because systemd-tmpfiles-setup.service runs
   # Before=sysinit.target, while sshd only arrives with multi-user.target.
-  systemd.tmpfiles.rules = [ "d /run/yolobox 0700 xiii users -" ];
+  systemd.tmpfiles.rules = [ "d /run/yolobox 0700 ${username} users -" ];
 
   security.sudo.wheelNeedsPassword = false;
   programs.zsh.enable = true;
@@ -70,7 +74,7 @@
   # boundary.
   programs.direnv = {
     enable = true;
-    settings.whitelist.prefix = [ "${config.users.users.xiii.home}/wrk" ];
+    settings.whitelist.prefix = [ "${config.users.users.${username}.home}/wrk" ];
   };
 
   programs.nix-ld.enable = true;

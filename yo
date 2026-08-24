@@ -6,7 +6,7 @@
 #   yo ssh [cmd...]
 #   yo enter [project]
 #   yo link
-#   yo seed-herdr
+#   yo seed
 #   yo code [project]
 #   yo zed [project]
 #   yo t3
@@ -17,7 +17,8 @@ readonly INSTANCE="yolobox"
 readonly VM_HOST="lima-yolobox"
 # ".guest" suffix: lima >= 2.1.0 renames the guest home (see README).
 # Lima's default guest username mirrors the host username, not a fixed "xiii".
-readonly VM_USER_HOME="/home/$(id -un).guest"
+VM_USER_HOME="/home/$(id -un).guest"
+readonly VM_USER_HOME
 # Created by a systemd-tmpfiles rule in nix/base.nix — see there for why the
 # forwarded sockets live outside VM_USER_HOME.
 readonly GUEST_SOCK_DIR="/run/yolobox"
@@ -48,7 +49,7 @@ Usage:
   yo ssh [cmd...]
   yo enter [project]
   yo link
-  yo seed-herdr
+  yo seed
   yo code [project]
   yo zed [project]
   yo t3
@@ -61,9 +62,12 @@ EOF
 # must use this: lima's ssh.config sets ControlMaster auto + ControlPersist
 # yes on a shared ControlPath, so whichever invocation establishes the
 # master decides whether agent forwarding exists for every later session.
+# ForwardAgent names the 1Password socket instead of saying "yes": "yes"
+# forwards whatever $SSH_AUTH_SOCK points at, which on this Mac is the
+# launchd agent that holds no identities at all.
 # Sets the SSH_ARGS array (macOS ships bash 3.2, which has no mapfile).
 ssh_args() {
-    SSH_ARGS=(-F "${SSH_CFG}" -o "IdentityAgent=\"${OP_SOCK}\"" -o ForwardAgent=yes)
+    SSH_ARGS=(-F "${SSH_CFG}" -o "IdentityAgent=\"${OP_SOCK}\"" -o "ForwardAgent=\"${OP_SOCK}\"")
 }
 
 cmd_up() {
@@ -286,7 +290,7 @@ cmd_t3() {
         exit 1
     }
     [ "${load_state}" = "loaded" ] || {
-        echo "yo: no t3 unit in the VM's current system — switch it: yo ssh sudo nixos-rebuild switch --flake '~/wrk/yolobox#yolobox'" >&2
+        echo "yo: no t3 unit in the VM's current system — switch it: yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '~/wrk/yolobox#yolobox'" >&2
         exit 1
     }
     [ "${active_state}" = "active" ] || {
@@ -331,11 +335,65 @@ cmd_link() {
     git -C "${toplevel}" config remote.yolobox.sshCommand "ssh -F ${SSH_CFG}"
 }
 
-cmd_seed_herdr() {
-    host_cfg="$HOME/.config/herdr/config.toml"
+# The guest's ~/.gitconfig and the rest of the user layer come from
+# ~/.dotfiles, and the flake owns everything system-wide. What is left are
+# the host-only files below: they are personal, so they live on the Mac and
+# are copied in, never committed here.
+cmd_seed() {
+    seed_herdr
+    seed_ssh
+    seed_gitconfig
+}
+
+seed_herdr() {
     ssh_args
-    cat "${host_cfg}" | ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
-        'mkdir -p ~/.config/herdr && { [ -e ~/.config/herdr/config.toml ] || cat > ~/.config/herdr/config.toml; }'
+    ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
+        'mkdir -p ~/.config/herdr && { [ -e ~/.config/herdr/config.toml ] || cat > ~/.config/herdr/config.toml; }' \
+        <"$HOME/.config/herdr/config.toml"
+}
+
+# The guest gets the Mac's ssh config verbatim except for two host-only
+# lines. Include names lima's own generated config, which exists on the Mac
+# only. IdentityAgent names the 1Password socket, which the guest reaches
+# through the forward ssh_args() sets up — as $SSH_AUTH_SOCK, under a path
+# of sshd's choosing, so a copied IdentityAgent line would just point at
+# nothing and take the agent away.
+#
+# The public keys travel with the config, because an IdentityFile naming a
+# .pub file is what makes ssh ask the agent for that one key: it is how
+# `git@github.com` and `git@github-iurii-tech` stay two GitHub accounts and
+# not whichever key the agent happens to offer first.
+seed_ssh() {
+    ssh_args
+    sed -E '/^[[:space:]]*(Include|IdentityAgent)[[:space:]]/d' "$HOME/.ssh/config" |
+        ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
+            'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >~/.ssh/config && chmod 600 ~/.ssh/config'
+
+    pubkeys=()
+    for pubkey in "$HOME"/.ssh/*.pub; do
+        [ -e "${pubkey}" ] || continue
+        pubkeys+=("${pubkey##*/}")
+    done
+    [ "${#pubkeys[@]}" -gt 0 ] || return 0
+    tar -C "$HOME/.ssh" --no-xattrs -cf - "${pubkeys[@]}" |
+        ssh "${SSH_ARGS[@]}" "${VM_HOST}" 'tar -C ~/.ssh -xf -'
+}
+
+# Directory-level git identities: ~/.dotfiles/gitconfig includeIf's a
+# .gitconfig sitting next to a group of repos (work email, work SSH alias),
+# and that file is untracked host state, not part of any repo that `yo link`
+# pushes. ~/Developer/<group> maps to ~/wrk/<group> in the VM, the same
+# mapping cmd_link uses.
+seed_gitconfig() {
+    ssh_args
+    identities=()
+    for identity in "$HOME"/Developer/*/.gitconfig; do
+        [ -e "${identity}" ] || continue
+        identities+=("${identity#"$HOME/Developer/"}")
+    done
+    [ "${#identities[@]}" -gt 0 ] || return 0
+    tar -C "$HOME/Developer" --no-xattrs -cf - "${identities[@]}" |
+        ssh "${SSH_ARGS[@]}" "${VM_HOST}" 'mkdir -p ~/wrk && tar -C ~/wrk -xf -'
 }
 
 main() {
@@ -352,7 +410,7 @@ main() {
         ssh) cmd_ssh "$@" ;;
         enter) cmd_enter "$@" ;;
         link) cmd_link ;;
-        seed-herdr) cmd_seed_herdr ;;
+        seed) cmd_seed ;;
         code) cmd_code "$@" ;;
         zed) cmd_zed "$@" ;;
         t3) cmd_t3 "$@" ;;
