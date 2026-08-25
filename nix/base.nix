@@ -1,19 +1,30 @@
-{ config, lib, pkgs, modulesPath, username, ... }:
+{ config, pkgs, modulesPath, username, ... }:
 {
-  # Boot/fs block below is verbatim from nixos-lima-config-sample's
-  # nixos-lima-config.nix — it must match the shipped v0.2.1 image exactly
-  # or the first `nixos-rebuild boot` bricks the VM (vz has no snapshots).
   imports = [
     (modulesPath + "/profiles/qemu-guest.nix")
   ];
 
+  # The prebuilt nixos-lima qcow2 sizes its ESP with make-disk-image's
+  # bootSize default, 249 MiB, and nothing in this repo can grow it: vda1
+  # ends where vda2 begins, and the disk is fully allocated. A kernel set
+  # here is ~91 MiB, so the ESP holds two of them — and
+  # linuxPackages_latest ships a new one every few weeks. Once it fills,
+  # the failure lands late and looks like a build problem it isn't: the
+  # closure builds fine, the system profile advances, and activation then
+  # dies installing the bootloader with "No space left on device",
+  # leaving the box booted on the old generation with a profile that
+  # claims otherwise. So /boot lives on the 99 GiB ext4 root (this GRUB
+  # reads ext4) and the ESP is demoted to /boot/efi, where it carries
+  # nothing but BOOTAA64.EFI.
   boot.loader.grub = {
     device = "nodev";
     efiSupport = true;
     efiInstallAsRemovable = true;
+    configurationLimit = 10;
   };
-  fileSystems."/boot" = {
-    device = lib.mkForce "/dev/vda1"; # /dev/disk/by-label/ESP
+  boot.loader.efi.efiSysMountPoint = "/boot/efi";
+  fileSystems."/boot/efi" = {
+    device = "/dev/vda1"; # /dev/disk/by-label/ESP
     fsType = "vfat";
   };
   fileSystems."/" = {
