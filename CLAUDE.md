@@ -197,6 +197,86 @@ makes `nix/base.nix` diverge from the shipped image, which means every
 freshly created instance needs a manual mount migration before its first
 switch — a footgun on a VM whose whole point is being cheap to recreate.
 
+## Disk space: recognising 100% full without becoming wedged
+
+`/dev/vda2` is the VM's only real filesystem, 99 GiB. It is possible to fill it
+to 100%, 0 bytes available to unprivileged processes — and the VM survives the
+incident, not wedged but crippled in a particular way. The failure surfaces as
+the agent harness dying with `ENOSPC: no space left on device, mkdir
+'/tmp/claude-501/...'` before any command runs. That happens because `/tmp` is
+not a tmpfs but a directory on `/dev/vda2`. The only tmpfs mounts in the system
+are `/run`, `/dev/shm`, `/run/wrappers`, and `/run/user/$UID`.
+
+The key recognition is **ext4's reserve for root: 1,057,641 blocks × 4 KiB = 4.3
+GB**. The `df` tool excludes that reserve from the "Avail" column, so when `df`
+reports 0 available, it means 0 available to unprivileged processes — not to
+root. Every `sudo` command still works while every unprivileged tool dies trying
+to write to its home directory, /tmp, or the nix store. `df` reporting 0 is
+therefore not proof that the VM is truly wedged; a `sudo` shell still has room
+to work in.
+
+The second key recognition is **diagnose from the Mac, not from inside**. In-VM
+tooling is the first thing that dies; `./yo ssh` reaches in from the Mac and is
+unaffected by the full disk. That is why the remedy — `yo gc` — lives in the `yo`
+script on the Mac, a tool the failure mode cannot kill.
+
+In this incident, `/dev/vda2` hit 100% after five days of agent work. `df` and
+`du` agreed, blocks were exhausted (not inodes), and `lsof | grep -c deleted`
+was 0, so unlinking reclaimed immediately — no process restart was needed. The
+culprit was one directory: `~/wrk/rune/target`, 41 GiB, 43% of the whole
+filesystem. The `debug/` subdirectory was 39 GiB alone — `debug/deps` spanned
+3,910 files at 34 GiB, with 154 of them over 50 MiB and the largest at ~232 MiB
+each. `debug/incremental` added another 3.8 GiB. File mtimes spanned 2026-08-20
+to 2026-08-25, five days of accumulation, not one build.
+
+The root cause was specific to that project: `rune/Cargo.toml` declares only
+`[profile.dist]` and no `[profile.dev]`, so every dev build linked full
+unstripped DWARF binaries and every integration test left behind its own ~230
+MiB copy; cargo never prunes old hashes. The durable fix is a `[profile.dev]`
+with `debug = "line-tables-only"` and `[profile.dev.package."*"] debug = false`,
+but that belongs in the rune repo, not here.
+
+Runners-up for scale: `/nix/store` held 32 GiB across 2,328 dead paths; podman
+storage consumed 4.7 GiB; `/root/.cache/nix` claimed 2.9 GiB; `~/.npm` 2.5 GiB;
+`~/.cache` 1.5 GiB (984 MiB of that Playwright browsers); `/var/log/journal` 630
+MiB.
+
+The remedy is `yo gc`: no flags reports disk usage only, `--yes` performs the
+"machine tier" (journald vacuum, nix-collect-garbage -d, /root/.cache/nix, npm
+cache, podman prune), and `--deep --yes` also deletes the "project tier"
+(`target`, `node_modules`, `.next` directories discovered under ~/wrk). The
+ordering of cleanup is deliberate: root-only steps (journald, nix-collect-garbage,
+rm /root/.cache/nix) run first specifically to free space for the two
+unprivileged steps (npm cache clean, podman prune), which can themselves die of
+ENOSPC on a full disk — npm writes `~/.npm/_logs` before it clears anything.
+Order only matters on a full disk, which is the only time the command matters. `nix-collect-garbage
+-d` drops the rollback generation, consistent with the repo's existing posture —
+`configurationLimit = 1` already means the ESP keeps exactly one generation.
+`.venv` and `.devbox/virtenv` are deliberately excluded from `--deep` because
+`nix/lsp.nix` wires basedpyright to the per-project `.venv`, so deleting it
+silently breaks the Python LSP chokepoint; `.devbox/virtenv` is devbox's own
+toolchain state (1.5 GiB in rune's case, rustup), not build output.
+
+Two failure modes are worth recognising. First, deleting a build directory that
+the project's `.gitignore` does NOT ignore dirties the VM worktree, and
+`receive.denyCurrentBranch = "updateInstead"` then refuses every later `git push
+yolobox`. It surfaces much later, on an unrelated push, with no obvious link back.
+Anchoring matters: `iurii.net/.gitignore` anchors `/node_modules` and `/.next/`
+with leading slashes, so a nested `web/node_modules` is NOT ignored, while rune's
+unanchored `target/` is matched anywhere. Hence `--deep` gates every directory
+deletion on `git check-ignore`.
+
+Second, `nix-collect-garbage -d` is unsafe in one specific state: if the disk
+filled mid-`nixos-rebuild switch`, the switch half-fails and `readlink
+/run/current-system` disagrees with `readlink /nix/var/nix/profiles/system` —
+the system is running one generation while the profile points to another. `-d`
+would then delete the generation actually booted. See "The ESP is 249 MiB..."
+for how that disagreement looks and why a full disk is one way to produce it.
+`yo gc` compares the two readlinks itself and skips the nix step when they
+disagree, so the guard is not a manual pre-flight — but the skip is reported,
+and a reported skip means the box needs a repaired switch before it needs a
+garbage collection.
+
 ## Browsers and the virtual display
 
 The nixpkgs `playwright-mcp` wrapper `--set`s `PLAYWRIGHT_BROWSERS_PATH` to

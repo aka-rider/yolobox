@@ -31,3 +31,9 @@
   on every nixpkgs bump even when semantics are identical. The consequence is
   that a `nixos-rebuild switch` with a nixpkgs version bump silently breaks all
   dynamic port forwarding until a host-agent restart.
+- rune/Cargo.toml declares only `[profile.dist]` and no `[profile.dev]`, so dev
+  builds carry full unstripped DWARF and each integration test links its own
+  ~230M binary; cargo never prunes old hashes. This caused 41G of bloat in a
+  five-day run. The fix is a `[profile.dev]` with `debug = "line-tables-only"`
+  plus `[profile.dev.package."*"] debug = false` in the rune repo. Without it,
+  `yo gc --deep` becomes a recurring chore rather than a one-off cleanup.
