@@ -1,4 +1,4 @@
-{ config, pkgs, modulesPath, username, ... }:
+{ config, pkgs, modulesPath, username, lib, ... }:
 {
   imports = [
     (modulesPath + "/profiles/qemu-guest.nix")
@@ -39,6 +39,21 @@
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
   services.lima.enable = true;
+  # nixos-lima declares lima-init and lima-guestagent as ordinary NixOS
+  # units, so a nixpkgs bump alone rehashes the store paths their
+  # Environment= and ExecStart= embed and switch-to-configuration reads that
+  # as "restart". Restarting the guestagent is not an ordinary bounce: lima
+  # 2.2.0 serves the event stream and the TCP Tunnel RPC from one
+  # grpc.ClientConn, and on reconnect it replaces that conn but never
+  # refreshes the dialer an existing listener already captured, so every
+  # forwarded port accepts and then resets until the host agent itself is
+  # restarted. Both units must be pinned, not just the guestagent:
+  # stopIfChanged defaults to true, and a stopped lima-init drags the
+  # guestagent down through its Requires=. mkForce only on lima-init,
+  # which upstream already assigns explicitly. New guestagent code lands on
+  # the next boot, which is when the host agent is recreated anyway.
+  systemd.services.lima-guestagent.restartIfChanged = false;
+  systemd.services.lima-init.restartIfChanged = lib.mkForce false;
   networking.hostName = "yolobox";
   users.mutableUsers = true;
   system.stateVersion = "25.11";
