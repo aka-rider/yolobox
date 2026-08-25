@@ -11,6 +11,7 @@
 #   yo zed [project]
 #   yo t3
 #   yo pair [base-url]
+#   yo herd-check
 
 set -euo pipefail
 
@@ -55,6 +56,7 @@ Usage:
   yo zed [project]
   yo t3
   yo pair [base-url]
+  yo herd-check
 EOF
 }
 
@@ -72,6 +74,124 @@ ssh_args() {
     SSH_ARGS=(-F "${SSH_CFG}" -o "IdentityAgent=\"${OP_SOCK}\"" -o "ForwardAgent=\"${OP_SOCK}\"")
 }
 
+# Appends this pane's herd forward and herd env to SSH_ARGS, and names the
+# guest-side socket in HERD_GUEST_SOCK (empty when this shell is not a herdr
+# pane, in which case nothing is appended). One definition site, because
+# `enter` and `herd-check` must wire the herd identically — a check that
+# proves a differently-built forward proves nothing about `enter`.
+herd_ssh_forward_args() {
+    HERD_GUEST_SOCK=""
+    if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] &&
+        [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ]; then
+        # nix/base.nix sets StreamLocalBindUnlink=yes, so sshd unlinks
+        # whatever already sits at the -R target before binding it. A
+        # path shared by every pane would let a second concurrent enter
+        # delete and rebind the first pane's live socket out from under
+        # it. Scoping the filename to HERDR_PANE_ID keeps each pane's
+        # unlink-and-rebind local to its own socket. Pane ids are
+        # colon-separated (e.g. "wN:p1"), legal in a filename but not
+        # in ssh's own "remote:local" -R syntax, which would split the
+        # path on that colon — so the colon is swapped for "_", a
+        # character herdr's own [A-Za-z0-9]+:p[A-Za-z0-9]+ id scheme
+        # never produces.
+        pane_id_safe="${HERDR_PANE_ID//:/_}"
+        HERD_GUEST_SOCK="${GUEST_SOCK_DIR}/herd-host.${pane_id_safe}.sock"
+        SSH_ARGS+=(
+            -R "${HERD_GUEST_SOCK}:${HERDR_SOCKET_PATH}"
+            -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${HERD_GUEST_SOCK}"
+        )
+    fi
+}
+
+readonly HERD_VERSION_CACHE="$HOME/.local/state/yolobox/herd-guest-version"
+
+# "herdr 0.8.2" (or any line carrying a version) -> "0.8.2".
+herd_parse_version() {
+    tr -d '\r' |
+        sed -n 's/[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' |
+        head -n 1
+}
+
+# Prints the box's herdr version, or fails (silently) when the box cannot be
+# asked. There is no version literal in this repo to read any more: herdr
+# comes from nixpkgs, so only the guest knows which one it got.
+#
+# The answer is cached in HERD_VERSION_CACHE as "<generation> <version>", but
+# the cache deliberately does *not* skip the round trip. The only host-side
+# signals that are free — the lima instance directory's mtime, ha.pid — move
+# when the VM restarts, and the guest's generation can change without any of
+# them moving: `nixos-rebuild switch` inside the box is precisely how this
+# drift gets fixed. Keying on them would keep the guard failing after the fix
+# and pass it before, which is worse than no guard. So each check spends one
+# ssh, which rides the ControlMaster lima's ssh.config already keeps open and
+# costs tens of milliseconds; generation and version come back in that one
+# round trip. What the cache is for, then, is the *previous* observation: it
+# is the only way to tell that the box was switched and its herdr still did
+# not move — the case where the printed remedy is a dead end. Sets
+# HERD_GUEST_GENERATION plus HERD_PREV_GENERATION/HERD_PREV_VERSION.
+herd_guest_version() {
+    HERD_PREV_GENERATION=""
+    HERD_PREV_VERSION=""
+    if [ -r "${HERD_VERSION_CACHE}" ]; then
+        read -r HERD_PREV_GENERATION HERD_PREV_VERSION <"${HERD_VERSION_CACHE}" || true
+    fi
+    ssh_args
+    probe="$(ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" \
+        'readlink /run/current-system && herdr --version' 2>/dev/null)" || return 1
+    HERD_GUEST_GENERATION="$(printf '%s\n' "${probe}" | tr -d '\r' | sed -n '1p')"
+    version="$(printf '%s\n' "${probe}" | sed -n '2p' | herd_parse_version)"
+    [ -n "${version}" ] || return 1
+    mkdir -p "$(dirname "${HERD_VERSION_CACHE}")"
+    printf '%s %s\n' "${HERD_GUEST_GENERATION}" "${version}" >"${HERD_VERSION_CACHE}"
+    printf '%s\n' "${version}"
+}
+
+herd_host_version() {
+    herdr --version 2>/dev/null | herd_parse_version
+}
+
+herd_drift_report() {
+    cat >&2 <<EOF
+yo: herd version drift — this Mac runs herdr $1, the box has $2.
+    If the wire protocol differs, every in-box agent report is rejected and
+    the box's agents show as unknown in the herd.
+    Fix:  ./yo ssh -- 'cd ~/wrk/yolobox && nix flake update nixpkgs'
+          then commit, push, and nixos-rebuild switch; finally ./yo herd-check
+    Skip: YOLOBOX_SKIP_HERD_CHECK=1 ./yo enter
+EOF
+}
+
+# Exact equality is the only honest cheap proxy for compatibility: herdr
+# bumped its wire protocol 19 -> 20 across a *patch* release (0.8.0 -> 0.8.2),
+# so no version-range rule can be derived from the numbers. Unequal means
+# "cannot be proven compatible", which is why the message says "if".
+#
+# With no argument this refuses (exit 3); with "report" it only prints, for
+# `status`, which is a doctor surface and must show every finding at once.
+#
+# The escape hatch is load-bearing, not politeness. The box's herdr comes from
+# nixpkgs, which can lag a Homebrew herdr release by days, and during that
+# window there is no remedy at all — the "fix" above simply has nothing newer
+# to fetch. `yo enter` is the one command whose failure has no workaround
+# (`yo ssh` gets you a shell but no herd), so a guard that refuses with no
+# override would block all work in the box until nixpkgs caught up.
+herd_drift_check() {
+    [ "${YOLOBOX_SKIP_HERD_CHECK:-}" = "1" ] && return 0
+    command -v herdr >/dev/null 2>&1 || return 0
+    [ "${HERDR_ENV:-}" = "1" ] || return 0
+    [ -n "${HERDR_PANE_ID:-}" ] || return 0
+
+    host_version="$(herd_host_version)"
+    [ -n "${host_version}" ] || return 0
+    guest_version="$(herd_guest_version)" || return 0
+    [ "${host_version}" != "${guest_version}" ] || return 0
+
+    herd_drift_report "${host_version}" "${guest_version}"
+    if [ "${1:-refuse}" != "report" ]; then
+        exit 3
+    fi
+}
+
 cmd_up() {
     if limactl list -q | grep -qx "${INSTANCE}"; then
         limactl start --yes "${INSTANCE}"
@@ -86,6 +206,7 @@ cmd_down() {
 
 cmd_status() {
     limactl list "${INSTANCE}"
+    herd_drift_check report
 }
 
 cmd_ssh() {
@@ -108,27 +229,140 @@ cmd_enter() {
     # every later session, leaking a stale HERDR_PANE_ID/HERDR_SOCKET_PATH.
     # Each enter gets its own connection instead.
     SSH_ARGS+=(-o ControlPath=none)
-    if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] &&
-        [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ]; then
-        # nix/base.nix sets StreamLocalBindUnlink=yes, so sshd unlinks
-        # whatever already sits at the -R target before binding it. A
-        # path shared by every pane would let a second concurrent enter
-        # delete and rebind the first pane's live socket out from under
-        # it. Scoping the filename to HERDR_PANE_ID keeps each pane's
-        # unlink-and-rebind local to its own socket. Pane ids are
-        # colon-separated (e.g. "wN:p1"), legal in a filename but not
-        # in ssh's own "remote:local" -R syntax, which would split the
-        # path on that colon — so the colon is swapped for "_", a
-        # character herdr's own [A-Za-z0-9]+:p[A-Za-z0-9]+ id scheme
-        # never produces.
-        pane_id_safe="${HERDR_PANE_ID//:/_}"
-        guest_sock="${GUEST_SOCK_DIR}/herd-host.${pane_id_safe}.sock"
-        SSH_ARGS+=(
-            -R "${guest_sock}:${HERDR_SOCKET_PATH}"
-            -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${guest_sock}"
-        )
-    fi
+    herd_ssh_forward_args
+    herd_drift_check
     exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}" "cd $(printf '%q' "${target}") && exec \"\$SHELL\" -l"
+}
+
+hc_ok() {
+    printf 'ok:   %s\n' "$1"
+}
+
+# Every failure carries its own remedy on the following lines: this command is
+# the thing you run when the herd is silent, so "something is wrong" is not an
+# answer.
+hc_fail() {
+    HERD_CHECK_FAILED=1
+    printf 'FAIL: %s\n' "$1" >&2
+    shift
+    for remedy in "$@"; do
+        printf '      %s\n' "${remedy}" >&2
+    done
+}
+
+hc_abort() {
+    hc_fail "$@"
+    exit 1
+}
+
+# End-to-end proof that a boxed agent's report reaches this Mac's herd: the
+# host client, the host server, this pane, the two herdr versions, and finally
+# the guest half over the very forward `yo enter` builds.
+cmd_herd_check() {
+    [ "$#" -eq 0 ] || {
+        echo "yo: herd-check takes no arguments" >&2
+        usage
+        exit 2
+    }
+    HERD_CHECK_FAILED=0
+
+    command -v herdr >/dev/null 2>&1 ||
+        hc_abort "herdr is not on this Mac's PATH" \
+            "Install it (brew install herdr) — the box reports into this Mac's herdr server."
+    command -v jq >/dev/null 2>&1 || {
+        echo "yo: jq not found (brew install jq)" >&2
+        exit 1
+    }
+
+    status_out="$(herdr status 2>&1)" ||
+        hc_abort "'herdr status' failed: ${status_out}" \
+            "Start the herdr server on this Mac, then rerun ./yo herd-check."
+    server_block="$(printf '%s\n' "${status_out}" | sed -n '/^server:/,/^$/p')"
+    server_status="$(printf '%s\n' "${server_block}" |
+        sed -n 's/^[[:space:]]*status:[[:space:]]*//p' | head -n 1)"
+    server_compatible="$(printf '%s\n' "${server_block}" |
+        sed -n 's/^[[:space:]]*compatible:[[:space:]]*//p' | head -n 1)"
+    [ "${server_status}" = "running" ] ||
+        hc_abort "this Mac's herdr server is not running (status: ${server_status:-unknown})" \
+            "Start it and rerun ./yo herd-check — no report from anywhere lands while it is down."
+    [ "${server_compatible}" = "yes" ] ||
+        hc_abort "this Mac's herdr client and server are incompatible (compatible: ${server_compatible:-unknown})" \
+            "brew upgrade herdr, then restart the herdr server." \
+            "Nothing in the box can work until the Mac's own two halves agree."
+    hc_ok "host herdr server running and compatible"
+
+    [ -n "${HERDR_PANE_ID:-}" ] ||
+        hc_abort "HERDR_PANE_ID is empty — this is not a herdr pane" \
+            "Run ./yo herd-check from a pane inside herdr's terminal."
+
+    # The check reports an agent into this pane and then releases it. Doing
+    # that in a pane a real agent already owns would knock that agent out of
+    # the herd — which is exactly the instinct, since the pane you suspect is
+    # the misbehaving claude. Refuse before touching anything.
+    pane_json="$(herdr pane get "${HERDR_PANE_ID}" 2>&1)" ||
+        hc_abort "'herdr pane get ${HERDR_PANE_ID}' failed: ${pane_json}" \
+            "The pane id does not exist on this server — rerun from a live herdr pane."
+    pane_agent="$(printf '%s\n' "${pane_json}" | jq -r '.result.pane.agent // ""')" ||
+        hc_abort "could not parse 'herdr pane get' output: ${pane_json}" \
+            "Check that the host herdr version still emits JSON from pane get."
+    [ -z "${pane_agent}" ] ||
+        hc_abort "pane ${HERDR_PANE_ID} already holds an agent (${pane_agent})" \
+            "This check reports an agent into the pane and then releases it, so running" \
+            "it here would drop ${pane_agent} out of the herd. Open a plain pane and" \
+            "rerun ./yo herd-check there."
+    hc_ok "pane ${HERDR_PANE_ID} is free"
+
+    host_version="$(herd_host_version)"
+    if guest_version="$(herd_guest_version)"; then
+        if [ "${host_version}" = "${guest_version}" ]; then
+            hc_ok "herdr ${host_version} on both sides"
+        else
+            hc_fail "herd version drift: this Mac runs herdr ${host_version}, the box has ${guest_version}"
+            herd_drift_report "${host_version}" "${guest_version}"
+            if [ -n "${HERD_PREV_VERSION}" ] &&
+                [ "${HERD_PREV_GENERATION}" != "${HERD_GUEST_GENERATION}" ] &&
+                [ "${HERD_PREV_VERSION}" = "${guest_version}" ]; then
+                printf '      The box has been switched since the last check and its herdr did not\n' >&2
+                printf '      move: nixpkgs carries no newer one yet. Skip until it does.\n' >&2
+            fi
+        fi
+    else
+        hc_fail "cannot ask the box for its herdr version" \
+            "Is the VM up? ./yo status"
+    fi
+
+    ssh_args
+    SSH_ARGS+=(-o ControlPath=none)
+    herd_ssh_forward_args
+    [ -n "${HERD_GUEST_SOCK}" ] ||
+        hc_abort "this pane exports no live herdr socket (HERDR_SOCKET_PATH)" \
+            "The forward yo enter builds cannot exist without it — rerun from a herdr pane."
+
+    if ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" yolobox-herd-check; then
+        guest_rc=0
+    else
+        guest_rc=$?
+        if [ "${guest_rc}" -eq 127 ]; then
+            hc_fail "the box has no yolobox-herd-check" \
+                "rebuild it: ./yo ssh -- 'sudo YOLOBOX_USERNAME=\$(id -un) nixos-rebuild switch --impure --flake \"~/wrk/yolobox#yolobox\"'"
+        else
+            hc_fail "the guest half failed (exit ${guest_rc}) — see its output above"
+        fi
+    fi
+
+    pane_json="$(herdr pane get "${HERDR_PANE_ID}" 2>&1)" ||
+        hc_abort "'herdr pane get ${HERDR_PANE_ID}' failed after the guest run: ${pane_json}"
+    pane_agent="$(printf '%s\n' "${pane_json}" | jq -r '.result.pane.agent // ""')"
+    if [ -z "${pane_agent}" ]; then
+        hc_ok "pane ${HERDR_PANE_ID} released again"
+    else
+        hc_fail "pane ${HERDR_PANE_ID} still holds an agent (${pane_agent}) after the check" \
+            "The guest's release path is broken; clear it by hand with:" \
+            "herdr pane release-agent ${HERDR_PANE_ID}"
+    fi
+
+    [ "${HERD_CHECK_FAILED}" -eq 0 ] || exit 1
+    exit "${guest_rc}"
 }
 
 # Resolve $1 relative to a base dir via cd+pwd -P; empty on failure.
@@ -411,6 +645,7 @@ main() {
         zed) cmd_zed "$@" ;;
         t3) cmd_t3 "$@" ;;
         pair) cmd_pair "$@" ;;
+        herd-check) cmd_herd_check "$@" ;;
         *)
             usage
             exit 2
