@@ -269,8 +269,8 @@ by `--caps devtools`), verified producing VP8 webm in
 Only two of the in-box harnesses report into the herd: **claude** (via a
 hook map) and **pi** (via a bundled herd-report extension) — see
 `nix/herd-report.nix`. opencode and codex lost theirs when `nix/herd.nix`
-was deleted, and crush has no upstream herdr integration. An unreported
-agent still runs fine; it shows as `unknown` rather than `yolobox:<agent>`.
+was deleted. An unreported agent still runs fine; it shows as `unknown`
+rather than `yolobox:<agent>`.
 
 pi's extension reaches pi through auto-discovery: `nix/herd-report.nix` links
 it into `~/.pi/agent/extensions/`, next to the pi-mcp-adapter package (its one

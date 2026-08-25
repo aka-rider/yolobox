@@ -35,7 +35,7 @@ expressed as a system module:
   every session needs.
 - **Podman** — rootless podman with a docker-compatible CLI and API socket,
   enabling container work without root privileges.
-- **Agentic** — the AI coding agents (claude-code, opencode, crush, pi) and
+- **Agentic** — the AI coding agents (claude-code, opencode, pi) and
   herdr, all pulled from nixpkgs with a per-harness version-override valve
   so you can pin individual agents without forking the flake. MCP servers
   are declared once in Nix and rendered per-harness automatically.
@@ -290,7 +290,7 @@ settings.
 
 ### Python LSP recipe
 
-One chokepoint makes every consumer (Zed, VS Code, opencode, crush, pi,
+One chokepoint makes every consumer (Zed, VS Code, opencode, pi,
 claude) resolve the same interpreter and server:
 
 1. `devbox.json` packages `python@3.12` and `basedpyright` (a native nix
@@ -303,8 +303,8 @@ claude) resolve the same interpreter and server:
 
 `nix/lsp.nix` wires the VM side: Zed's remote server loads direnv
 (`load_direnv: "direct"`), and claude auto-loads a basedpyright plugin from
-`~/.claude/skills`. opencode and crush read per-project `opencode.json` /
-`.crush.json` LSP entries (see PortHub for the reference shape). pi gets it
+`~/.claude/skills`. opencode reads per-project `opencode.json` LSP entries
+(see PortHub for the reference shape). pi gets it
 from pi-lens, an npm extension in the user layer
 (`~/.dotfiles/pi/packages.json`), which finds the same `basedpyright` on the
 project PATH. VS Code

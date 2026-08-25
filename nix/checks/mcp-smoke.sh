@@ -34,7 +34,6 @@ while IFS=$'\t' read -r cfg_path format; do
 
     case "${format}" in
         mcpServers) servers_filter='.mcpServers | to_entries[] | {name: .key, command: .value.command, args: (.value.args // []), env: (.value.env // {})}' ;;
-        crush)      servers_filter='.mcp | to_entries[] | {name: .key, command: .value.command, args: (.value.args // []), env: (.value.env // {})}' ;;
         opencode)   servers_filter='.mcp | to_entries[] | {name: .key, command: .value.command[0], args: .value.command[1:], env: (.value.environment // {})}' ;;
         *)
             echo "mcp-smoke: unrecognised format '${format}' for ${cfg_path}" >&2

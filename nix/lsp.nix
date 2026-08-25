@@ -7,11 +7,10 @@
 # store paths: resolution happens in the per-project environment, unlike
 # MCP servers (nix/mcp.nix), which are system-wide and must be absolute.
 #
-# opencode and crush read their LSP entries from per-project config files
-# (opencode.json / .crush.json, committed to each project) because their
-# global config files live in nix/mcp.nix, which carries unrelated parallel
-# work at the time of writing — lifting the LSP sections into those renders
-# is tracked in TODO.md.
+# opencode reads its LSP entries from a per-project config file
+# (opencode.json, committed to each project) because its global config file
+# lives in nix/mcp.nix, which carries unrelated parallel work at the time of
+# writing — lifting the LSP section into that render is tracked in TODO.md.
 { config, username, ... }:
 let
   homeDir = config.users.users.${username}.home;
