@@ -214,14 +214,23 @@ fi
 echo
 echo "--- the next stage starts claude with a one-word prompt: it makes one small API call ---"
 
+# The pane reaching agent=claude is the proof, and the only one: nothing but an
+# executed hook can put it there, because that label travels from the hook
+# through the forwarded socket to the Mac's herdr server and back. The debug
+# stream is corroboration only — it is claude's own `--debug` rendering, which
+# changes without notice (headless `-p` prints none of it at all unless
+# `--debug-file` is given), so a missing marker is a statement about claude's
+# logging, never about the hooks.
 hook_marker="yolobox-herd-report"
 
 if [ -z "${claude_bin}" ]; then
     skip "claude hook execution" "claude is not on PATH in this shell."
 else
-    debug_log=$(mktemp)
+    debug_dir=$(mktemp -d)
+    debug_log="${debug_dir}/claude-debug.log"
+    output_log="${debug_dir}/claude-output.log"
     claude_rc=0
-    timeout "${CLAUDE_TIMEOUT_S}" claude --debug -p 'ok' > "${debug_log}" 2>&1 &
+    timeout "${CLAUDE_TIMEOUT_S}" claude --debug --debug-file "${debug_log}" -p 'ok' > "${output_log}" 2>&1 &
     claude_pid=$!
     reported=yes
 
@@ -240,22 +249,26 @@ else
     wait "${claude_pid}" || claude_rc=$?
 
     saw_marker=no
-    if grep -qF "${hook_marker}" "${debug_log}"; then
+    if [ -s "${debug_log}" ] && grep -qF "${hook_marker}" "${debug_log}"; then
         saw_marker=yes
     fi
 
     if [ "${claude_rc}" -ne 0 ]; then
         skip "claude hook execution" \
-             "claude exited ${claude_rc} — unauthenticated, offline, or the API call failed, so this stage proves nothing either way. It is NOT evidence that the hooks are broken. Last lines: $(tail -n 3 "${debug_log}" | tr '\n' ' ')"
-    elif [ "${saw_marker}" = yes ] && [ "${saw_agent}" = yes ]; then
-        ok "claude hook execution — the debug stream ran ${hook_marker} and the pane independently reached agent=claude"
+             "claude exited ${claude_rc} — unauthenticated, offline, or the API call failed, so this stage proves nothing either way. It is NOT evidence that the hooks are broken. Last lines: $(tail -n 3 "${output_log}" | tr '\n' ' ')"
+    elif [ "${saw_agent}" = yes ]; then
+        ok "claude hook execution — pane ${HERDR_PANE_ID} independently reached agent=claude while claude ran"
+        if [ "${saw_marker}" = no ]; then
+            printf '      note: the debug stream never mentions %s. Corroboration only — the pane transition above already proves the hook ran, so this just means claude'"'"'s --debug format changed. Kept for inspection: %s\n' \
+                   "${hook_marker}" "${debug_dir}" >&2
+        fi
     else
         fail "claude hook execution" \
-             "claude ran but debug-stream-mentions-hook=${saw_marker}, pane-reached-agent-claude=${saw_agent}. Both must hold: claude can read ${HERD_HOOKS} and still never execute its hooks, and that defect leaves NO trace anywhere except this stage. Full debug output: ${debug_log}"
+             "claude ran but pane ${HERDR_PANE_ID} never reached agent=claude (debug-stream-mentions-hook=${saw_marker}, corroborating only). claude can read ${HERD_HOOKS} and still never execute its hooks, and that defect leaves NO trace anywhere except this stage. Do not paper over it by rendering /etc/claude-code/managed-settings.json instead: claude takes only the first non-empty of its three policy tiers, and this account's server-fetched remote settings are permanently non-empty, so that file is discarded wholesale. Full debug output: ${debug_dir}"
     fi
 
-    if [ "${saw_marker}" = yes ] && [ "${saw_agent}" = yes ] && [ "${claude_rc}" -eq 0 ]; then
-        rm -f "${debug_log}"
+    if [ "${claude_rc}" -eq 0 ] && [ "${saw_agent}" = yes ] && [ "${saw_marker}" = yes ]; then
+        rm -rf "${debug_dir}"
     fi
 fi
 
