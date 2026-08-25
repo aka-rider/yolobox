@@ -4,26 +4,26 @@
     (modulesPath + "/profiles/qemu-guest.nix")
   ];
 
-  # The prebuilt nixos-lima qcow2 sizes its ESP with make-disk-image's
-  # bootSize default, 249 MiB, and nothing in this repo can grow it: vda1
-  # ends where vda2 begins, and the disk is fully allocated. A kernel set
-  # here is ~91 MiB, so the ESP holds two of them — and
-  # linuxPackages_latest ships a new one every few weeks. Once it fills,
-  # the failure lands late and looks like a build problem it isn't: the
-  # closure builds fine, the system profile advances, and activation then
-  # dies installing the bootloader with "No space left on device",
-  # leaving the box booted on the old generation with a profile that
-  # claims otherwise. So /boot lives on the 99 GiB ext4 root (this GRUB
-  # reads ext4) and the ESP is demoted to /boot/efi, where it carries
-  # nothing but BOOTAA64.EFI.
+  # /boot is the ESP itself, as the shipped nixos-lima image mounts it —
+  # matching the image is what keeps the first `nixos-rebuild switch` on a
+  # fresh instance from having to migrate anything. The cost is that vda1 is
+  # 249 MiB (make-disk-image's bootSize default, baked into the prebuilt
+  # qcow2 and not overridable from here), and a kernel set is ~91 MiB on top
+  # of ~14 MiB of GRUB, so only two fit in the ~235 MiB usable.
+  # linuxPackages_latest brings a new set every few weeks, and a full ESP
+  # fails late and ugly: the closure builds, the system profile advances,
+  # then activation dies installing the bootloader with "No space left on
+  # device" — booted on the old generation with a profile claiming
+  # otherwise. Hence the cap. Two, not one: a switch transiently needs the
+  # outgoing kernel alongside the incoming one. This box is disposable, so
+  # there is nothing to keep more generations for.
   boot.loader.grub = {
     device = "nodev";
     efiSupport = true;
     efiInstallAsRemovable = true;
-    configurationLimit = 10;
+    configurationLimit = 2;
   };
-  boot.loader.efi.efiSysMountPoint = "/boot/efi";
-  fileSystems."/boot/efi" = {
+  fileSystems."/boot" = {
     device = "/dev/vda1"; # /dev/disk/by-label/ESP
     fsType = "vfat";
   };
