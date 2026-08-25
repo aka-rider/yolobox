@@ -201,11 +201,10 @@ by `--caps devtools`), verified producing VP8 webm in
 ## Herd reporting: recognising a silent failure
 
 Only two of the in-box harnesses report into the herd: **claude** (via a
-managed-settings.json hook map) and **pi** (via a bundled herd-report
-extension) — see `nix/herd-report.nix`. opencode and codex lost theirs when
-`nix/herd.nix` was deleted, and crush has no upstream herdr integration. An
-unreported agent still runs fine; it shows as `unknown` rather than
-`yolobox:<agent>`.
+hook map) and **pi** (via a bundled herd-report extension) — see
+`nix/herd-report.nix`. opencode and codex lost theirs when `nix/herd.nix`
+was deleted, and crush has no upstream herdr integration. An unreported
+agent still runs fine; it shows as `unknown` rather than `yolobox:<agent>`.
 
 pi's extension reaches pi through auto-discovery: `nix/herd-report.nix` links
 it into `~/.pi/agent/extensions/`, next to the pi-mcp-adapter package (its one
@@ -220,23 +219,114 @@ in `nix/herd-report.nix` deletes it on every boot and switch.
 Herd wiring rides `./yo enter` only — the forwarded socket and the herd
 env come from `cmd_enter`. `./yo ssh` deliberately carries neither. `yo code`
 and `yo zed` sessions carry no herd env either — agents started from editor
-terminals report as `unknown`; expected, not a failure.
+terminals report as `unknown`; expected, not a failure. t3-spawned claude is
+a partial exception now (see the wrapper below): it carries the hooks, since
+t3 execs `claude` from `/run/current-system/sw` and picks up the wrapper like
+any other caller, but it still has no `HERDR_PANE_ID` or forwarded socket
+unless something arranges one, so it still cannot actually report — it just
+now fails for the *expected* reason (no herd env) instead of the old one (no
+hooks).
 
 The forwarded herdr socket lives at `/run/yolobox/herd-host.<pane>.sock`; the
 tmpfiles rule in `nix/base.nix` explains why it is not under `$HOME`.
 
-When an agent shows nothing in the herd, `ls -l /run/yolobox/` first. No socket
-means the `-R` forward failed to bind, and the ssh client said so at connect
-time (`Warning: remote port forwarding failed for listen path ...`) — usually
-`/run/yolobox` missing after a `switch` that was never followed by a reboot.
-The failure is otherwise invisible: `nix/herd-report.nix` guards on
-`[ -S "$HERDR_SOCKET_PATH" ]` and exits 0 before it can log anything.
+Every in-box claude session was invisible in the host herd until two
+independent defects were found and fixed, and the second one overturns an
+invariant this section used to state as fact — read it before trusting
+anything the log does or doesn't show.
 
-If the socket *is* there and reports still vanish, the host herdr server is
-rejecting them — usually a host/guest protocol mismatch. Those rejections do
-get logged, to `~/.local/state/yolobox/herd-report.log`. Compare `herdr
-status`'s `compatible:` line on the host against the guest's pinned
-`yolobox.harness.herdr.version`/`hash` in `nix/harnesses.nix`.
+**Defect 1 — herdr protocol drift.** The Mac's Homebrew herdr self-updated to
+0.8.2 (wire protocol 20) while the box stayed pinned at 0.8.0 (protocol 19).
+Every report was rejected with `protocol_mismatch`. The sharp edge: the
+protocol moved across a *patch* bump, so version equality — not
+major.minor equality — is the only honest cheap proxy for compatibility.
+The pin was a hand-copied duplicate of a fact that lives on the host and
+updates itself behind Homebrew, so drift was the design, not an accident.
+Fixed structurally: `yolobox.harness.herdr.version`/`hash` now default to
+null so the box tracks nixpkgs' `pkgs.herdr`, and the version/hash option
+remains only as an escape hatch for when nixpkgs lags a herdr release. The
+invariant to hold is: **the box's herdr version must equal the Mac's
+Homebrew herdr version.** `yo enter` refuses on drift (exit 3, overridable
+with `YOLOBOX_SKIP_HERD_CHECK=1` — load-bearing, because during a nixpkgs
+lag there may be no remedy at all and `yo enter` is the one command with no
+other workaround); `yo status` reports the drift without failing;
+`yo herd-check` is the authoritative end-to-end proof.
+
+**Defect 2 — claude never ran the hooks at all, and this is the one worth
+remembering.** The hook map in `/etc/claude-code/managed-settings.json` was
+always correct — the byte-identical file passed as `--settings` fires every
+event. But Claude Code 2.1.220 assembles `policySettings` from three tiers —
+remote server-fetched managed settings, MDM, then
+`/etc/claude-code/managed-settings.json` — and takes **only the first
+non-empty tier, with no merge**. This account's `~/.claude/remote-settings.json`
+holds `{"channelsEnabled": true}`; that single flag makes the remote tier
+non-empty, so it becomes the entire `policySettings` object and the `/etc`
+file is discarded wholesale. Nothing warns, nothing logs. Proven causally:
+emptying that cache to `{}` made the hooks fire immediately and created the
+rejection log for the first time ever; restoring the flag stopped them
+again. Worse, the remote payload is re-fetched and re-applied roughly 180ms
+into every session (`Programmatic settings change notification for
+policySettings` in `--debug` output), so it clobbers policySettings
+mid-session too — even an initially-empty cache would not have saved it.
+The policy channel is therefore unusable for this, permanently.
+
+The fix is the `flagSettings` channel: the same hook map is rendered to
+`/etc/claude-code/herd-hooks.json` and delivered by a `claude` wrapper on the
+box's PATH that prepends `--settings`. claude adds `flagSettings` to its
+allowed sources unconditionally, and those hooks were verified to survive
+the mid-session remote refresh.
+
+**The invariant this section used to state, and why it was false.** It used
+to say that a rejected report "does get logged, to
+`~/.local/state/yolobox/herd-report.log`." That log's absence proves
+nothing: a hook that never runs writes nothing, and the socket guard exits 0
+before the log path is even reached — exactly defect 2's failure mode, and
+it produced total silence, not a rejection entry. The log file had never
+been created in any session, going back weeks. The host's herdr server log
+does not record `protocol_mismatch` rejections either, so its silence is not
+evidence in the other direction.
+
+When an agent shows nothing in the herd, work down this ladder rather than
+guessing:
+
+1. `ls -l /run/yolobox/` — is the forwarded socket there at all. No socket
+   means the `-R` forward failed to bind, and the ssh client said so at
+   connect time (`Warning: remote port forwarding failed for listen path
+   ...`) — usually `/run/yolobox` missing after a `switch` that was never
+   followed by a reboot.
+2. `sudo strace -f -qq -e trace=execve -p <claude pid>` grepped for
+   `herd-report` — do the hooks actually run at all. `sudo` is required
+   because `kernel.yama.ptrace_scope=1` blocks an unprivileged tracer.
+3. `strace -e trace=openat claude mcp list | grep managed-settings` — is the
+   file even read. This is already answered yes, so don't re-derive it: the
+   file being read tells you nothing, because it is read and then discarded
+   whole by the tier collapse in defect 2.
+4. `claude --debug` and grep for `Hook output` / `policySettings` — the
+   authoritative view of which channel actually won.
+
+A grep gotcha that cost real minutes, worth recording: filtering
+`/proc/<pid>/environ` for the herd variables needs
+`grep -E '^(YOLOBOX_HERD|HERDR_)'`. Writing `'^(HOME|HERDR_|PATH)='` silently
+matches nothing, because the `=` binds after the alternation — it searches
+for a variable literally named `HERDR_`. It briefly looked like claude was
+scrubbing the env; it was not.
+
+The reporter's always-exit-0 contract now has one deliberate exception:
+`SessionStart` routes to a `start` state token which, on a failed report,
+writes the diagnostic to stderr as well as the log and exits 1. That is safe
+because SessionStart is off the work path — it runs once, before any tool
+call, and cannot interrupt anything in flight — and Claude Code treats a
+nonzero-but-not-2 hook exit as a non-blocking error whose stderr surfaces to
+the user. The other five events keep exit-0 verbatim: `PreToolUse` fires on
+every tool call and would otherwise turn one broken socket into a wall of
+warnings. The log line now carries the guest herdr version and socket path
+so a rejection is self-describing without cross-referencing nix files.
+
+`yo herd-check` proves the whole chain end to end — host server health,
+version parity, the forwarded socket, a reporter round trip, a release round
+trip, that the hook map's commands exist, and that claude actually executes
+them. Run it from a herdr pane with no agent on it: it reports and then
+releases that pane, so a live agent's pane is not the one to use.
 
 Do not add age-based tmpfiles cleanup for stale sockets. `connect(2)` on a
 pathname socket bumps atime (`unix_find_bsd()` → `touch_atime()`), but
