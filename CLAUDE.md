@@ -603,6 +603,58 @@ read it from `journalctl -u t3` — or mint a fresh one from an ssh session with
 `t3 pair`, which is why the package is in `systemPackages` and not only in the
 unit.
 
+### An empty page means lima's forwarder died, not t3
+
+A browser shows an empty page or a reset error (`NS_ERROR_NET_EMPTY_RESPONSE` in
+Firefox) when accessing t3. From the Mac, `curl -v http://127.0.0.1:3773/`
+connects and sends the request but receives `Recv failure: Connection reset by
+peer` — zero bytes returned. Meanwhile inside the box, `curl` against the same
+address returns 200 and `ss -lntp` shows t3 listening normally. That asymmetry
+is the diagnosis itself; nothing about t3 is wrong.
+
+The evidence lives in `~/.lima/yolobox/ha.stderr.log`, which repeats on each
+connection attempt:
+
+```
+tcpproxy: for incoming conn 127.0.0.1:NNNNN, error dialing "127.0.0.1:3773": could not open tunnel for addr: 127.0.0.1:3773 error:rpc error: code = Canceled desc = grpc: the client connection is closing
+```
+
+This is a lima 2.2.0 defect in the port-forwarding internals. A single
+`grpc.ClientConn` carries the guest-agent Info/Events/SyncTime streams
+*and* the TCP `Tunnel` RPC. When the guest agent restarts — which happens
+when a `nixos-rebuild switch` changes the unit files textually (pure
+store-path churn from a nixpkgs bump) — the host agent closes that conn and
+dials a new one, rebuilding the dialer. But `pkg/portfwd/listener.go`'s
+`forwardTCP` short-circuits when a listener for that port already exists, so
+the accept loop that is already running keeps dialing the closed conn. The
+listener stays bound, so every forwarded port accepts and then resets,
+permanently. Nothing in the reconnect path closes or refreshes existing
+listeners. This is unreported upstream; `v2.2.0...master` carries no fix.
+
+The reason this is a trap unique to this repo: `services.lima.enable = true`
+in `nix/base.nix` makes nixos-lima declare `lima-init` and `lima-guestagent`
+as ordinary NixOS units, whose `Environment=` and `ExecStart=` embed store
+paths. A nixpkgs bump rehashes coreutils/systemd/tzdata — semantics
+byte-identical, pure store-path churn — and `switch-to-configuration` restarts
+both units. So an in-VM `nixos-rebuild switch` breaks the Mac's port
+forwarding whenever, and only whenever, the nixpkgs pin moved. A machine that
+stayed on the same pin for twenty switches never saw the breakage; the first
+bump after that triggered it. This is now pinned shut with `restartIfChanged =
+false` on both units in `nix/base.nix`.
+
+The breakage is not limited to 3773: every dynamically forwarded port dies the
+same way, including the project caddy on 80/443. Why `yo` could not have caught
+it: `t3_require_service` asks the guest's `systemctl` over ssh, and `t3 pair`
+runs in the guest too — every check sat on the healthy side of the broken hop.
+A bare TCP-connect probe cannot catch it either; lima's tcpproxy accepts before
+it resets, so the probe would complete the handshake and be dropped. A real
+HTTP request is required to expose the reset.
+
+Recovery, once broken: only a host-agent restart rebuilds the listeners.
+`limactl stop yolobox && ./yo up` does this; there is no lighter command.
+`limactl` exposes no way to restart just the host agent without stopping the
+guest.
+
 ### The pairing URL's host is whatever `--host` the server was started with
 
 t3 computes it as `resolveDirectPairingBaseUrl = (state) => state.devUrl ??
