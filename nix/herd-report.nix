@@ -2,6 +2,7 @@
 let
   homeDir = config.users.users.${username}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
+  claudeHooksFile = import ./lib/claude-hooks-file.nix;
   herdrPkg = import ./lib/herdr-pkg.nix { inherit pkgs; cfg = config.yolobox.harness.herdr; };
 
   herdReport = pkgs.writeShellApplication {
@@ -13,14 +14,31 @@ let
     # screen/session detection of a real agent process and clears them for a
     # boxed agent (whose foreground process is not the agent itself), which
     # is exactly why a boxed agent would otherwise show as unknown.
-    # Best-effort and ALWAYS exit 0: a reporting failure must never disturb
-    # the agent — every guard below is an early `exit 0`, never a bare
-    # failing command, so writeShellApplication's `set -euo pipefail` cannot
-    # turn a guard miss into a nonzero exit. "No herd here" (a guard miss)
-    # stays silent — that is the common case in a plain `ssh` session. A
-    # server that answers but rejects the call (e.g. a protocol mismatch)
-    # is different: it is appended to a guest-side log instead of being
-    # thrown away.
+    #
+    # Best-effort and exit 0 for every state but `start`: a reporting failure
+    # must never disturb the agent — every guard below is an early `exit 0`,
+    # never a bare failing command, so writeShellApplication's `set -euo
+    # pipefail` cannot turn a guard miss into a nonzero exit. "No herd here"
+    # (a guard miss on YOLOBOX_HERD or HERDR_PANE_ID) stays silent in EVERY
+    # state — that is the ordinary `yo ssh` and editor-terminal case, and
+    # turning it into output would make noise the common path.
+    #
+    # `start` is the one loud state, and it exists because always-exit-0 is
+    # how the herd stayed broken for weeks: a rejected report was appended to
+    # a guest-side log that nobody read, and which — since nothing ever
+    # failed on a machine where the socket itself was missing — was usually
+    # never even created. So `start` writes its diagnostic to stderr as well
+    # as the log and exits 1.
+    #
+    # Three facts make that safe. `SessionStart` is not on the work path: it
+    # runs once, before any tool call, so a nonzero exit cannot interrupt
+    # anything in flight. Claude Code treats a nonzero-but-not-2 hook exit as
+    # a NON-blocking error and surfaces its stderr to the user — precisely
+    # the loud-but-harmless channel wanted. And the other five events stay at
+    # exit 0 because `PreToolUse` fires on every single tool call: making it
+    # loud would turn one broken socket into a wall of warnings for the whole
+    # session.
+    #
     # "Never disturb the agent" is a bound on TIME as well as exit status:
     # the herdr CLI waits indefinitely on a socket that accepts but never
     # answers (reproduced by pointing HERDR_SOCKET_PATH at any non-herdr
@@ -30,10 +48,22 @@ let
       state="''${1:-}"
       agent="''${2:-}"
 
+      guest_herdr_version="${herdrPkg.version}"
+
       [ "''${YOLOBOX_HERD:-}" = "1" ]     || exit 0
       [ -n "''${HERDR_PANE_ID:-}" ]       || exit 0
-      [ -S "''${HERDR_SOCKET_PATH:-}" ]   || exit 0
       [ -n "''${agent}" ]                 || exit 0
+
+      if [ "''${state}" = "start" ]; then loud=yes; else loud=no; fi
+
+      if [ ! -S "''${HERDR_SOCKET_PATH:-}" ]; then
+          if [ "''${loud}" = yes ]; then
+              printf 'yolobox-herd: no socket at "%s" — the ssh -R forward never bound (the client warns at connect time); check "ls -ld /run/yolobox". This session will not appear in the herd.\n' \
+                  "''${HERDR_SOCKET_PATH:-}" >&2
+              exit 1
+          fi
+          exit 0
+      fi
 
       # A hook harness may pipe event JSON on stdin, which is drained here
       # since the state argument is what matters. A non-TTY stdin can be a
@@ -48,7 +78,9 @@ let
           log_dir="''${HOME}/.local/state/yolobox"
           mkdir -p "''${log_dir}" 2>/dev/null || return 0
           log_file="''${log_dir}/herd-report.log"
-          printf '%s %s\n' "$(date -Iseconds)" "$1" >> "''${log_file}" 2>/dev/null || true
+          printf '%s herdr=%s socket=%s %s\n' \
+              "$(date -Iseconds)" "''${guest_herdr_version}" "''${HERDR_SOCKET_PATH}" "$1" \
+              >> "''${log_file}" 2>/dev/null || true
           # Cap growth: PreToolUse fires on every tool call, so a broken herd
           # never stops appending. Trim to the tail rather than pulling in
           # logrotate for a best-effort hook log.
@@ -61,6 +93,14 @@ let
           fi
       }
 
+      report_failed() {
+          log_rejection "$1"
+          [ "''${loud}" = yes ] || return 0
+          printf 'yolobox-herd: %s (guest herdr %s via %s). This session will not appear in the herd; run yolobox-herd-check for the diagnosis.\n' \
+              "$1" "''${guest_herdr_version}" "''${HERDR_SOCKET_PATH}" >&2
+          exit 1
+      }
+
       case "''${state}" in
           release)
               rc=0
@@ -68,18 +108,36 @@ let
                   --source "yolobox:''${agent}" --agent "''${agent}" 2>&1) || rc=$?
               # rc 124 is timeout(1)'s "killed on expiry" — the wedged-socket
               # case, where the killed CLI leaves no output to quote.
-              [ "''${rc}" -eq 0 ] || log_rejection "release ''${agent} (rc=''${rc}): ''${out}"
+              [ "''${rc}" -eq 0 ] || report_failed "release ''${agent} (rc=''${rc}): ''${out}"
               ;;
-          working|idle|blocked)
+          start|working|idle|blocked)
+              # `start` is a routing token, not a herdr state: it carries the
+              # loud contract above and reports the same `idle` the old
+              # SessionStart hook did.
+              if [ "''${state}" = "start" ]; then report_state=idle; else report_state="''${state}"; fi
               rc=0
               out=$(timeout "''${report_timeout}" herdr pane report-agent "''${HERDR_PANE_ID}" \
-                  --source "yolobox:''${agent}" --agent "''${agent}" --state "''${state}" 2>&1) || rc=$?
-              [ "''${rc}" -eq 0 ] || log_rejection "''${state} ''${agent} (rc=''${rc}): ''${out}"
+                  --source "yolobox:''${agent}" --agent "''${agent}" --state "''${report_state}" 2>&1) || rc=$?
+              [ "''${rc}" -eq 0 ] || report_failed "''${report_state} ''${agent} (rc=''${rc}): ''${out}"
               ;;
       esac
 
       exit 0
     '';
+  };
+
+  # The guest half of `yo herd-check`. It lives here rather than in a checks
+  # module of its own because it exercises exactly what this file renders:
+  # the reporter, the hook map, and the forwarded socket they both depend on.
+  herdCheck = pkgs.writeShellApplication {
+    name = "yolobox-herd-check";
+    runtimeInputs = [ herdrPkg herdReport pkgs.jq pkgs.coreutils pkgs.gnugrep ];
+    # @HERD_HOOKS@ is substituted rather than repeated as a literal in the
+    # script, so lib/claude-hooks-file.nix stays the only place that path is
+    # spelled out. The placeholder is still valid bash, so the script remains
+    # shellcheck-clean and `bash -n`-able on its own.
+    text = builtins.replaceStrings [ "@HERD_HOOKS@" ] [ claudeHooksFile.path ]
+      (builtins.readFile ./checks/herd-check.sh);
   };
 
   piMcpAdapter = pkgs.callPackage ./pkgs/pi-mcp-adapter.nix { };
@@ -171,15 +229,42 @@ let
 in
 {
   config = {
-    environment.systemPackages = [ herdReport ];
+    environment.systemPackages = [ herdReport herdCheck ];
 
-    # Hook map ported verbatim from tools/20-claude-code.sh:38-65 at 4c154fc
+    # Hook map ported from tools/20-claude-code.sh:38-65 at 4c154fc
     # (SessionStart/UserPromptSubmit/PreToolUse/PermissionRequest/Stop/
     # SessionEnd), calling yolobox-herd-report instead of the old
-    # /opt/yolobox/herd-report.sh path.
-    environment.etc."claude-code/managed-settings.json".text = builtins.toJSON {
+    # /opt/yolobox/herd-report.sh path. One deviation from the original:
+    # SessionStart passes `start`, not `idle` — same report, but the state
+    # that is allowed to fail loudly (see herdReport above).
+    #
+    # This map is delivered to claude by `--settings <this file>` (the wrapper
+    # in nix/harnesses.nix), NOT by /etc/claude-code/managed-settings.json,
+    # and that is not a style choice — the managed-settings channel provably
+    # cannot carry it. Claude Code (verified on 2.1.220) builds its
+    # `policySettings` from three tiers — remote server-fetched managed
+    # settings, MDM, and /etc/claude-code/managed-settings.json — and takes
+    # only the FIRST non-empty tier, with no merge:
+    #
+    #     let u = [remote, mdm, etcFile].filter(g => g !== null), d = u[0] ?? null;
+    #
+    # "Non-empty" means *any* key at all. This account's
+    # ~/.claude/remote-settings.json is `{"channelsEnabled": true}`, so that
+    # single unrelated flag becomes the entire policySettings object and the
+    # /etc file is discarded wholesale — silently, with nothing logged and no
+    # warning. Emptying that cache to `{}` made these hooks fire immediately;
+    # restoring the flag stopped them again. Worse, the remote payload is
+    # re-fetched and re-applied about 180ms into every session
+    # ("Programmatic settings change notification for policySettings"), so
+    # even a momentarily-empty cache is clobbered mid-session. The policy
+    # channel is therefore unusable for this, permanently.
+    #
+    # `flagSettings` — what `--settings` produces — is added to the allowed
+    # sources unconditionally and was verified to SURVIVE that mid-session
+    # refresh. It is the only durable channel.
+    environment.etc.${claudeHooksFile.etcPath}.text = builtins.toJSON {
       hooks = {
-        SessionStart = [ (hookCmd "idle") ];
+        SessionStart = [ (hookCmd "start") ];
         UserPromptSubmit = [ (hookCmd "working") ];
         PreToolUse = [ ((hookCmd "working") // { matcher = "*"; }) ];
         PermissionRequest = [ (hookCmd "blocked") ];
