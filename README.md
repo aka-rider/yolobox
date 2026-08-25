@@ -138,9 +138,9 @@ to the same name every time).
 # inside the VM. Push from the VM works to the checked-out branch.
 ./yo link
 
-# Copy the host-only files the VM needs into it: the herdr config (kept if
-# one is already there), the ssh config plus every public key, and the
-# directory-level git identities from ~/Developer/*/.gitconfig
+# Copy the host-only files the VM needs into it: the ssh config plus every
+# public key, and the directory-level git identities from
+# ~/Developer/*/.gitconfig
 ./yo seed
 
 # Open VS Code Remote-SSH in the VM, at the mirrored dir of the current
