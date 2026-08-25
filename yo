@@ -570,16 +570,8 @@ cmd_link() {
 # the host-only files below: they are personal, so they live on the Mac and
 # are copied in, never committed here.
 cmd_seed() {
-    seed_herdr
     seed_ssh
     seed_gitconfig
-}
-
-seed_herdr() {
-    ssh_args
-    ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
-        'mkdir -p ~/.config/herdr && { [ -e ~/.config/herdr/config.toml ] || cat > ~/.config/herdr/config.toml; }' \
-        <"$HOME/.config/herdr/config.toml"
 }
 
 # The guest gets the Mac's ssh config verbatim except for two host-only
