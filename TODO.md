@@ -17,3 +17,17 @@
   ends up unauthenticated with no slash commands. Affects any enterprise MCP
   deployment, not just yolobox. Carried as a `substituteInPlace` in
   `nix/pkgs/t3.nix`; drop it once upstream fixes it.
+- Report upstream (lima-vm/lima): on guest-agent restart the host agent
+  replaces its grpc.ClientConn but `pkg/portfwd/listener.go`'s `forwardTCP`
+  never refreshes the dialer captured by an existing listener, so all
+  dynamically forwarded ports are dead until the host agent restarts. Confirmed
+  in v2.2.0 source, still present on master. Nearest existing report is issue
+  #4558 (open, no root cause assigned). Workaround is `restartIfChanged = false`
+  on the guest-agent units to prevent `nixos-rebuild switch` from triggering
+  the restart.
+- Report to nixos-lima: `lima-init` and `lima-guestagent` units should carry
+  `restartIfChanged = false`, since restarting the guest agent breaks the host's
+  port forwarding and their unit text churns textually (store-path rehashing)
+  on every nixpkgs bump even when semantics are identical. The consequence is
+  that a `nixos-rebuild switch` with a nixpkgs version bump silently breaks all
+  dynamic port forwarding until a host-agent restart.
