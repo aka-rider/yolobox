@@ -499,6 +499,18 @@ t3_require_service() {
         echo "yo: t3 service is ${active_state} in the VM — diagnose with: yo ssh journalctl -u t3 -n 50" >&2
         exit 1
     }
+    # A bare TCP connect is not enough: when a guestagent restart has wedged
+    # lima's forward, its tcpproxy still accepts the connection and only
+    # then resets it, so a connect-only probe reports success on a dead
+    # forward. Only an actual HTTP exchange surfaces the reset — and no -f,
+    # because any status line at all proves the transport works; whether t3
+    # likes the request is the guest-side check's business.
+    curl -sS -o /dev/null --max-time 5 "http://127.0.0.1:${T3_PORT}/" || {
+        echo "yo: t3 is healthy in the VM but 127.0.0.1:${T3_PORT} does not answer on this Mac —" >&2
+        echo "    lima's port forwarding is dead (see ~/.lima/${INSTANCE}/ha.stderr.log)." >&2
+        echo "    Recover with: limactl stop ${INSTANCE} && ./yo up" >&2
+        exit 1
+    }
 }
 
 cmd_t3() {
