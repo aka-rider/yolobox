@@ -8,20 +8,23 @@
   # matching the image is what keeps the first `nixos-rebuild switch` on a
   # fresh instance from having to migrate anything. The cost is that vda1 is
   # 249 MiB (make-disk-image's bootSize default, baked into the prebuilt
-  # qcow2 and not overridable from here), and a kernel set is ~91 MiB on top
-  # of ~14 MiB of GRUB, so only two fit in the ~235 MiB usable.
+  # qcow2 and not overridable from here), and a kernel set is ~92 MiB on top
+  # of ~14 MiB of GRUB, so two sets fit and three never do.
   # linuxPackages_latest brings a new set every few weeks, and a full ESP
   # fails late and ugly: the closure builds, the system profile advances,
   # then activation dies installing the bootloader with "No space left on
-  # device" — booted on the old generation with a profile claiming
-  # otherwise. Hence the cap. Two, not one: a switch transiently needs the
-  # outgoing kernel alongside the incoming one. This box is disposable, so
-  # there is nothing to keep more generations for.
+  # device" — the box still booted on the old generation while the profile
+  # claims otherwise. install-grub.pl copies every retained generation's
+  # kernel before it unlinks any obsolete one, so peak occupancy is retained
+  # plus dropped, and one is the only limit whose steady-state peak — the
+  # retained set alongside the incoming one — fits. Keeping a rollback
+  # generation across a kernel bump is thus impossible at this ESP size; on
+  # a disposable box that is a fair trade.
   boot.loader.grub = {
     device = "nodev";
     efiSupport = true;
     efiInstallAsRemovable = true;
-    configurationLimit = 2;
+    configurationLimit = 1;
   };
   fileSystems."/boot" = {
     device = "/dev/vda1"; # /dev/disk/by-label/ESP
