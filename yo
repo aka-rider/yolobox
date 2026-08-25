@@ -3,6 +3,7 @@
 #
 # Usage:
 #   yo up|down|status
+#   yo gc [--deep] [--yes]
 #   yo ssh [cmd...]
 #   yo enter [project]
 #   yo link
@@ -48,6 +49,7 @@ usage() {
     cat >&2 <<EOF
 Usage:
   yo up|down|status
+  yo gc [--deep] [--yes]
   yo ssh [cmd...]
   yo enter [project]
   yo link
@@ -207,6 +209,180 @@ cmd_down() {
 cmd_status() {
     limactl list "${INSTANCE}"
     herd_drift_check report
+}
+
+# Reclaims the guest root filesystem. It runs from the Mac on purpose: the
+# failure it exists for is a 100%-full /dev/vda2, where every unprivileged
+# in-box tool dies with ENOSPC before it starts, so a guest-side script would
+# be unrunnable exactly when it is needed. ext4's 4.3 GB root reserve is what
+# keeps a sudo-driven cleanup possible at all.
+#
+# The whole cleanup is one remote script over one ssh, and its exit status is
+# this command's: no host-side line can run after `exec ssh`, so every ok/FAIL
+# line and both df snapshots are printed by the guest half.
+cmd_gc() {
+    gc_deep=0
+    gc_apply=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --deep) gc_deep=1 ;;
+            --yes) gc_apply=1 ;;
+            *)
+                echo "yo: unknown gc option '$1'" >&2
+                usage
+                exit 2
+                ;;
+        esac
+        shift
+    done
+
+    ssh_args
+    # No -t: gc is non-interactive, and the script arrives on stdin so the
+    # quoted heredoc below reaches the guest byte for byte — every $HOME and
+    # $(...) in it belongs to the guest.
+    exec ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
+        "YO_GC_DEEP=${gc_deep} YO_GC_APPLY=${gc_apply} bash -s" <<'GUEST_GC'
+set -uo pipefail
+
+GC_FAILED=0
+
+ok() {
+    printf 'ok:   %s\n' "$1"
+}
+
+fail() {
+    GC_FAILED=1
+    printf 'FAIL: %s\n' "$1" >&2
+    shift
+    for remedy in "$@"; do
+        printf '      %s\n' "${remedy}" >&2
+    done
+}
+
+# A cleanup step that legitimately finds nothing to do still exits nonzero
+# (podman does), and that must not cancel the steps after it — so no `set -e`
+# here. Nothing is hidden either: a failure prints, and decides the final exit.
+# stdin comes from /dev/null because this whole script is being read from the
+# ssh channel's stdin, which a curious child would otherwise eat.
+step() {
+    label="$1"
+    shift
+    if "$@" </dev/null; then
+        ok "${label}"
+    else
+        rc=$?
+        fail "${label} (exit ${rc})"
+    fi
+}
+
+measure() {
+    # sudo for the existence test too: /root is mode 700, so an unprivileged
+    # -e on /root/.cache/nix says "absent" about a path that is really there.
+    sudo test -e "$1" || return 0
+    size="$(sudo du -x -s -h "$1" 2>/dev/null | awk '{print $1}')"
+    # -x, because /nix/store is a bind mount of the same device and would
+    # otherwise be counted twice.
+    printf '  %-7s %s\n' "${size:-?}" "$1"
+}
+
+# .devbox, .venv and .git are pruned in the first branch so the walk cannot
+# reach a target/ or node_modules/ living inside them: .venv backs the
+# per-project basedpyright (nix/lsp.nix) and .devbox holds devbox's toolchain
+# state — neither is build output. Matching directories are pruned in turn, so
+# nothing nested inside a hit is walked or reported twice.
+project_targets() {
+    find "$HOME/wrk" -mindepth 1 -maxdepth 4 \
+        \( -name .devbox -o -name .venv -o -name .git \) -prune -o \
+        \( -name target -o -name node_modules -o -name .next \) \
+        -type d -prune -print 2>/dev/null
+}
+
+MACHINE_PATHS="/var/log/journal /nix/store /root/.cache/nix $HOME/.npm $HOME/.local/share/containers/storage"
+
+if [ "${YO_GC_APPLY}" != 1 ]; then
+    printf 'yo gc: report only, nothing is deleted. Add --yes to act.\n\n'
+    df -h /
+    printf '\nmachine tier (current size of each target):\n'
+    for path in ${MACHINE_PATHS}; do
+        measure "${path}"
+    done
+    if [ "${YO_GC_DEEP}" = 1 ]; then
+        printf '\nproject tier (--deep):\n'
+        found=0
+        while IFS= read -r target; do
+            found=1
+            measure "${target}"
+        done < <(project_targets)
+        [ "${found}" = 1 ] || printf '  (none)\n'
+    else
+        printf '\nproject tier not measured; add --deep to include it.\n'
+    fi
+    exit 0
+fi
+
+printf 'before:\n'
+df -h /
+printf '\n'
+
+# Root-only steps first, and that ordering is the point: ext4's reserve is
+# root's alone, so on a full disk the two unprivileged steps below cannot even
+# write their own logs until these have freed something. --rotate before
+# --vacuum-size because vacuuming only ever unlinks archived journals; without
+# the rotation the active file — usually most of the 630M — is untouchable.
+step 'journalctl --rotate --vacuum-size=50M' sudo journalctl --rotate --vacuum-size=50M
+
+# A nixos-rebuild that ran out of space on the ESP advances the system profile
+# and then dies installing the bootloader, leaving the booted generation and
+# the profile pointing at different closures (see CLAUDE.md). `-d` deletes
+# every generation but the profile's, which in that state is the one that is
+# *not* running — the box would lose its own booted system.
+booted="$(readlink -f /run/current-system)"
+profile="$(readlink -f /nix/var/nix/profiles/system)"
+if [ -n "${booted}" ] && [ "${booted}" = "${profile}" ]; then
+    step 'nix-collect-garbage -d' sudo nix-collect-garbage -d
+else
+    fail "skipped nix-collect-garbage -d: booted and profile generations disagree" \
+        "booted:  ${booted:-<unreadable>}" \
+        "profile: ${profile:-<unreadable>}" \
+        "A nixos-rebuild switch half-failed (check df /boot). Re-run the switch" \
+        "until both agree, then ./yo gc --yes again."
+fi
+
+# Outside that guard on purpose: this is nix's download cache, tied to no
+# generation, so it is safe to drop even when the profile is in the broken
+# state above — and that is exactly when the space is most needed.
+step 'rm -rf /root/.cache/nix' sudo rm -rf /root/.cache/nix
+
+step 'npm cache clean --force' npm cache clean --force
+# -f only: dangling containers, networks and build cache. Unused *images* need
+# a registry pull to come back, which is not regenerable offline, so they wait
+# for --deep. nix/podman.nix already runs a periodic autoPrune besides.
+step 'podman system prune -f' podman system prune -f
+
+if [ "${YO_GC_DEEP}" = 1 ]; then
+    step 'podman system prune -af' podman system prune -af
+    while IFS= read -r target; do
+        # Deleting a path git does not ignore dirties the VM worktree, and
+        # receive.denyCurrentBranch=updateInstead then refuses every later
+        # `git push yolobox` — a breakage that surfaces much later with no
+        # link back to here. The name alone does not settle it: an anchored
+        # /node_modules in .gitignore leaves a nested one tracked.
+        if git -C "$(dirname "${target}")" check-ignore -q "${target}" 2>/dev/null; then
+            step "rm -rf ${target}" rm -rf "${target}"
+        else
+            fail "kept ${target}: git does not ignore it" \
+                "Deleting it would dirty the worktree and block every later" \
+                "push to the yolobox remote. Add it to that repo's .gitignore" \
+                "(or remove it by hand and commit) if it really is build output."
+        fi
+    done < <(project_targets)
+fi
+
+printf '\nafter:\n'
+df -h /
+
+[ "${GC_FAILED}" = 0 ] || exit 1
+GUEST_GC
 }
 
 cmd_ssh() {
@@ -641,6 +817,7 @@ main() {
         up) cmd_up ;;
         down) cmd_down ;;
         status) cmd_status ;;
+        gc) cmd_gc "$@" ;;
         ssh) cmd_ssh "$@" ;;
         enter) cmd_enter "$@" ;;
         link) cmd_link ;;
