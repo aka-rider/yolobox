@@ -97,15 +97,14 @@ in
 
   config = {
     # The ONLY definition site for this predicate (Gotcha 11) — claude-code
-    # and crush are nixpkgs' unfree harnesses.
-    nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "claude-code" "crush" ];
+    # is nixpkgs' unfree harness.
+    nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "claude-code" ];
 
     environment.variables.DISABLE_AUTOUPDATER = "1";
 
     environment.systemPackages = [
       claudeCodePkg
       pkgs.opencode
-      pkgs.crush
       pkgs.pi-coding-agent
       # pi shells out to npm to install the packages listed in its settings.
       pkgs.nodejs

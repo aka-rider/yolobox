@@ -21,13 +21,6 @@ let
     };
   };
 
-  # crush: near 1:1 with the canonical shape, under "mcp" plus its own
-  # top-level $schema.
-  crushConfig = {
-    "$schema" = "https://charm.land/crush.json";
-    mcp = cfg;
-  };
-
   # opencode: argv-merged (command + args into one array) and env renamed to
   # "environment" (plan Gotcha 13 / critic R6).
   opencodeConfig = {
@@ -45,11 +38,10 @@ let
   manifest = [
     { path = "/etc/claude-code/managed-mcp.json"; format = "mcpServers"; }
     { path = "/etc/yolobox/mcp/pi.json"; format = "mcpServers"; }
-    { path = "/etc/yolobox/mcp/crush.json"; format = "crush"; }
     { path = "/etc/yolobox/mcp/opencode.json"; format = "opencode"; }
   ];
 
-  rendered = builtins.toJSON cfg + builtins.toJSON crushConfig + builtins.toJSON opencodeConfig;
+  rendered = builtins.toJSON cfg + builtins.toJSON opencodeConfig;
 
   mcpSmoke = pkgs.writeShellApplication {
     name = "yolobox-mcp-smoke";
@@ -65,13 +57,14 @@ in
   };
 
   config = {
-    # crush executes command substitution in its config file at load time
-    # (plan Gotcha 13 / mcp/README.md at 4c154fc's "Two hard rules") — this is the
-    # eval-time enforcement of what v1 stated only as prose.
+    # A harness that expands command substitution while loading its config
+    # would turn a rendered server entry into arbitrary execution. crush did
+    # exactly that and is gone, but the guard is kept: it is free at eval time
+    # and the next harness added here is not audited in advance.
     assertions = [
       {
         assertion = !(lib.hasInfix "$(" rendered);
-        message = "yolobox.mcp.servers: a rendered config contains '$(' — crush executes command substitution in its config at load time.";
+        message = "yolobox.mcp.servers: a rendered config contains '$(' — a harness that expands it at config-load time would execute it.";
       }
       {
         assertion = lib.all (s: lib.hasPrefix "/" (toString s.command)) (lib.attrValues cfg);
@@ -81,13 +74,11 @@ in
 
     environment.etc."claude-code/managed-mcp.json".text = builtins.toJSON { mcpServers = cfg; };
     environment.etc."yolobox/mcp/pi.json".text = builtins.toJSON { mcpServers = cfg; };
-    environment.etc."yolobox/mcp/crush.json".text = builtins.toJSON crushConfig;
     environment.etc."yolobox/mcp/opencode.json".text = builtins.toJSON opencodeConfig;
     environment.etc."yolobox/mcp/manifest.json".text = builtins.toJSON manifest;
 
     # Gotcha 12 — nothing reads /etc/yolobox/mcp/*.json unless these are set.
     environment.variables.OPENCODE_CONFIG = "/etc/yolobox/mcp/opencode.json";
-    environment.variables.CRUSH_GLOBAL_CONFIG = "/etc/yolobox/mcp/crush.json";
 
     # pi has no native config path for this; it reads ~/.config/mcp/mcp.json
     # via pi-mcp-adapter, and the harness never rewrites it, so a plain
