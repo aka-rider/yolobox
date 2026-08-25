@@ -162,6 +162,12 @@ to the same name every time).
 # host client and server, this pane, both herdr versions, then the guest half
 # over the same forward `enter` builds
 ./yo herd-check
+
+# Report what is using the VM's disk. Reports only, unless --yes, which then
+# reclaims the machine's own caches (journald, nix garbage, npm, podman).
+# --deep widens both the report and the deletion to per-project build outputs
+# (target, node_modules, .next), each gated on git check-ignore.
+./yo gc [--deep] [--yes]
 ```
 
 `enter` refuses (exit 3) when this Mac's herdr version differs from the box's,
