@@ -157,7 +157,18 @@ to the same name every time).
 
 # Print a t3 pairing URL that names this Mac, to open on another machine
 ./yo pair [base-url]
+
+# Prove end to end that a boxed agent's report reaches this Mac's herd:
+# host client and server, this pane, both herdr versions, then the guest half
+# over the same forward `enter` builds
+./yo herd-check
 ```
+
+`enter` refuses (exit 3) when this Mac's herdr version differs from the box's,
+because herdr has changed its wire protocol across a patch release and a
+mismatch makes the server reject every in-box report silently — `status`
+prints the same warning without failing, and `YOLOBOX_SKIP_HERD_CHECK=1`
+overrides it for the window where nixpkgs has no matching herdr yet.
 
 `enter`, `code` and `zed` share one directory resolution: with a project
 argument, fuzzy-pick (fzf) among the VM's git repos under `~/wrk`; without
