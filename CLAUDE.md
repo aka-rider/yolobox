@@ -131,6 +131,72 @@ system-wide, including force-replacing `L+` links, and resetup does the same
 on every `switch` — relied upon for the `L+` links that fill pi's
 auto-discovery directories (`nix/herd-report.nix`).
 
+## The ESP is 249 MiB and only ever holds one kernel generation
+
+`/boot` in the guest is the EFI System Partition itself, `/dev/vda1`, 249 MiB
+(260,796,416 bytes) — `nix/base.nix` mounts it there deliberately, matching
+the shipped nixos-lima image, so the first `nixos-rebuild switch` on a fresh
+instance never has to migrate a mount. That size is `make-disk-image`'s
+`bootSize` default (256M), baked into the prebuilt
+`nixos-lima-v0.2.1-aarch64.qcow2` that `lima/yolobox.yaml` downloads, and it
+is not overridable from this repo: changing it means building the image
+yourself from the nixos-lima flake, and the Mac has no nix, so that build
+would itself have to happen inside a Linux VM. The partition cannot be grown
+either — `/dev/vda1` ends at sector 526335 and `/dev/vda2` starts at 526336,
+zero gap, and vda2 runs to the last usable LBA, so there is no slack at
+either end. The only free extent is 7 MiB before vda1, and a FAT filesystem
+can't use space before its own start.
+
+A kernel set is about 92 MiB (Image ~64 MiB, initrd ~28 MiB), fixed overhead
+(GRUB modules, the EFI binary, fonts, background) is about 14 MiB, and
+`boot.kernelPackages = pkgs.linuxPackages_latest` means a new set arrives
+every few weeks. Two sets fit in the ~235 MiB usable; three never do — and
+the naive read of that arithmetic is wrong in a way worth recording, because
+it comes straight from reading `install-grub.pl` in the store rather than
+guessing at GRUB's behaviour. `copyToKernelsDir` copies every retained
+generation's kernel and initrd into `/boot/kernels` first, recording each in
+a `%copied` ledger; obsolete files are unlinked only afterwards, after all
+copying and even after the atomic `grub.cfg` rename. So peak occupancy during
+a switch is the retained sets plus every set already on the ESP that is about
+to be dropped — not just the retained count. Copies are content-addressed by
+store path, so generations sharing a kernel share one file.
+
+Two consequences follow from that ordering, and both are counterintuitive.
+First, `configurationLimit = 2` does not work on this ESP: the next kernel
+bump would hold three sets transiently, roughly 290 MB against 260.8 MB
+available, and die inside the copy. Hence `configurationLimit = 1`, whose
+steady-state peak is one retained set plus the incoming one, about 198 MB,
+leaving ~62 MB spare. Second, lowering the limit frees nothing on the switch
+that first applies it, precisely because pruning happens last — it takes one
+intervening switch that does *not* change the kernel to drain the obsolete
+set. That's what was done here: the drain took `/boot` from 198,569,984 bytes
+used to 105,672,704, freeing the previous kernel's set.
+
+The failure mode worth recognising is that it surfaces late and lies about
+itself. The closure builds fine, the system profile advances to the new
+generation, and only then does activation die installing the bootloader with
+`No space left on device`. The box is left running the old generation while
+`/nix/var/nix/profiles/system` claims the new one — `readlink
+/run/current-system` and `readlink /nix/var/nix/profiles/system` disagree,
+the bootloader was never updated, and a reboot comes back on the old
+generation. Worse, if the failing command is piped (e.g. through `tail`), the
+shell reports exit 0 and the failure is invisible except in the log text.
+Check `df /boot` first when a switch behaves strangely.
+
+The accepted trade, stated plainly: at this ESP size a rollback generation
+cannot survive a kernel bump, so the box keeps exactly one. That's acceptable
+because the VM is disposable and rebuildable from this repo.
+
+One alternative was tried and deliberately reverted, so it's worth naming
+here rather than re-litigating blind: `/boot` was briefly moved onto the
+ext4 root with the ESP demoted to `/boot/efi` (commits `a2057d8` then
+`03e2dbc`). That does give effectively unlimited space — and notably, once
+`/boot` is not a separate filesystem, NixOS stops copying kernels into it at
+all and GRUB reads them straight from the store. It was reverted because it
+makes `nix/base.nix` diverge from the shipped image, which means every
+freshly created instance needs a manual mount migration before its first
+switch — a footgun on a VM whose whole point is being cheap to recreate.
+
 ## Browsers and the virtual display
 
 The nixpkgs `playwright-mcp` wrapper `--set`s `PLAYWRIGHT_BROWSERS_PATH` to
@@ -303,6 +369,33 @@ guessing:
    whole by the tier collapse in defect 2.
 4. `claude --debug` and grep for `Hook output` / `policySettings` — the
    authoritative view of which channel actually won.
+
+A measurement trap that fooled this diagnosis twice, worth recording
+alongside the ladder above: a headless `claude -p '<prompt>'` run fires the
+entire session lifecycle in about two seconds — `SessionStart` reports
+`idle`, `UserPromptSubmit` reports `working`, `Stop` reports `idle`, and
+`SessionEnd` reports `release`. That last hook is what removes the agent
+from the herd, and it is correct behaviour, not a bug — it is the mechanism
+that stops dead sessions lingering there forever. The trap is that running
+`claude -p ...` and then looking at the herd afterwards shows no agent,
+because it registered and unregistered before you looked, and that end
+state is **identical** to the one produced by hooks that never ran at all —
+the actual defect this section exists to help diagnose. Same observation,
+opposite causes. What broke the tie both times was removing `SessionEnd`
+from a throwaway copy of the hook map and re-running: the agent then stayed
+visible as `agent=claude status=done`, proving the reports had been landing
+the whole time. The reliable ways to avoid the trap, in order worth trying:
+use an interactive `claude` with no `-p`, since it stays registered until
+you quit and the herd can actually be observed; read
+`~/.local/state/yolobox/herd-report.log`, which as of the loud-reporter
+change above records each failed report with the guest herdr version and
+socket path, so a genuine failure now says so instead of staying silent; or
+watch the herd while the headless run is still in flight rather than after
+it exits. One related "looks broken, isn't": an orphaned socket in
+`/run/yolobox/` left by a dead `yo enter` (no listener, so a report against
+it answers `server_not_running`) is harmless — `nix/base.nix` sets
+`StreamLocalBindUnlink = "yes"`, so the next `yo enter` from that pane
+unlinks and rebinds it.
 
 A grep gotcha that cost real minutes, worth recording: filtering
 `/proc/<pid>/environ` for the herd variables needs
