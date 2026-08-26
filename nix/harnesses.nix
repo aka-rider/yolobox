@@ -3,6 +3,7 @@ let
   cfg = config.yolobox.harness;
 
   claudeHooksFile = import ./lib/claude-hooks-file.nix;
+  claudeMcpFile = import ./lib/claude-mcp-file.nix;
 
   claudeCodeUnwrapped =
     if cfg.claude-code.hash != null then
@@ -28,8 +29,25 @@ let
   # types: nix/t3.nix runs `t3 serve`, which spawns claude itself out of
   # /run/current-system/sw.
   #
-  # --add-flags puts the flag BEFORE the user's arguments, so a user's own
-  # `--settings` later on the command line still wins.
+  # The same reasoning carries the MCP config: `--mcp-config <file>` rides
+  # this wrapper rather than any per-session invocation, for the identical
+  # reason — t3-spawned claude never goes through `yo enter` or a typed
+  # command line, so a wrapper is the only place that reaches it. See
+  # nix/mcp.nix for why this file, not the enterprise tier, is where MCP
+  # servers are delivered: claude refuses any dynamic `--mcp-config` when an
+  # enterprise config is present, and t3 itself passes `--mcp-config` at turn
+  # time for its own bridge server, so the enterprise tier and t3 are
+  # mutually exclusive.
+  #
+  # --add-flags puts the flags BEFORE the user's arguments, so a user's own
+  # `--settings` or `--mcp-config` later on the command line still wins.
+  #
+  # The order of the two is load-bearing: `--mcp-config` is variadic
+  # (`<configs...>`), so it keeps consuming arguments until the next one
+  # starting with `-`. Left last it would eat the user's positional prompt —
+  # `claude 'say hi'` dies with "MCP config file not found: .../say hi".
+  # Naming `--settings` after it bounds the variadic before user arguments
+  # are reached.
   #
   # symlinkJoin + wrapProgram wraps the wrapper: upstream's bin/claude is
   # already a makeCWrapper that sets DISABLE_AUTOUPDATER,
@@ -43,7 +61,7 @@ let
     paths = [ claudeCodeUnwrapped ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      wrapProgram "$out/bin/claude" --add-flags "--settings ${claudeHooksFile.path}"
+      wrapProgram "$out/bin/claude" --add-flags "--mcp-config ${claudeMcpFile.path} --settings ${claudeHooksFile.path}"
     '';
     meta.mainProgram = "claude";
   };

@@ -3,6 +3,7 @@ let
   cfg = config.yolobox.mcp.servers;
   homeDir = config.users.users.${username}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
+  claudeMcpFile = import ./lib/claude-mcp-file.nix;
 
   serverType = lib.types.submodule {
     options = {
@@ -36,7 +37,7 @@ let
   };
 
   manifest = [
-    { path = "/etc/claude-code/managed-mcp.json"; format = "mcpServers"; }
+    { path = claudeMcpFile.path; format = "mcpServers"; }
     { path = "/etc/yolobox/mcp/pi.json"; format = "mcpServers"; }
     { path = "/etc/yolobox/mcp/opencode.json"; format = "opencode"; }
   ];
@@ -72,7 +73,13 @@ in
       }
     ];
 
-    environment.etc."claude-code/managed-mcp.json".text = builtins.toJSON { mcpServers = cfg; };
+    # claude is deliberately NOT on the enterprise tier
+    # (/etc/claude-code/managed-mcp.json): Claude Code refuses every dynamic
+    # `--mcp-config` whenever an enterprise MCP config exists, and that is
+    # exactly how t3 injects its own t3-code bridge server at turn time — see
+    # nix/harnesses.nix. Restoring an enterprise config here would silently
+    # break every t3 turn again.
+    environment.etc.${claudeMcpFile.etcPath}.text = builtins.toJSON { mcpServers = cfg; };
     environment.etc."yolobox/mcp/pi.json".text = builtins.toJSON { mcpServers = cfg; };
     environment.etc."yolobox/mcp/opencode.json".text = builtins.toJSON opencodeConfig;
     environment.etc."yolobox/mcp/manifest.json".text = builtins.toJSON manifest;
