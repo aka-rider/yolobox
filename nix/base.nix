@@ -91,7 +91,15 @@
 
   services.openssh.enable = true;
   services.openssh.settings = {
-    AcceptEnv = [ "YOLOBOX_HERD" "HERDR_PANE_ID" "HERDR_SOCKET_PATH" ];
+    AcceptEnv = [
+      "YOLOBOX_HERD"
+      "HERDR_PANE_ID"
+      "HERDR_SOCKET_PATH"
+      "AWS_ACCESS_KEY_ID"
+      "AWS_SECRET_ACCESS_KEY"
+      "AWS_SESSION_TOKEN"
+      "AWS_CREDENTIAL_EXPIRATION"
+    ];
     StreamLocalBindUnlink = "yes";
   };
 
@@ -127,6 +135,12 @@
     };
   };
 
+  # The AWS CLI's telemetry sqlite db lives under ~/.aws/cli/cache by default
+  # — the one thing here that must never write anything under guest ~/.aws,
+  # to hold the no-creds-at-rest invariant even though telemetry itself
+  # carries no credentials.
+  environment.variables.AWS_CLI_SESSION_ID_DISABLED = "true";
+
   virtualisation.rosetta = {
     enable = true;
     mountTag = "vz-rosetta";
@@ -152,6 +166,7 @@
     wget
     unzip
     devbox
+    awscli2
   ];
 
   nix.settings.experimental-features = [ "nix-command" "flakes" "fetch-closure" "ca-derivations" ];

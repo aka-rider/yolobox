@@ -144,6 +144,77 @@ herd_ssh_forward_args() {
     fi
 }
 
+# Appends this pane's AWS session credentials to SSH_ARGS, opt-in via
+# YOLOBOX_AWS_PROFILE on the host. Unset/empty: appends nothing, silently —
+# same posture as herd_ssh_forward_args for a non-herdr pane. `yo ssh` never
+# calls this, so a plain shell into the box never carries AWS env either.
+#
+# `aws configure export-credentials` runs the *host's* full credential
+# resolution for the named profile — including a credential_process that
+# shells out to 1Password — and prints flat AWS_* lines. Only the flat,
+# already-resolved values cross into the guest; the profile, any
+# credential_process, and 1Password itself never do.
+#
+# Refuses loudly rather than silently degrading when the resolved
+# credentials have no AWS_SESSION_TOKEN: that means the profile handed back
+# long-lived IAM user keys, which must never enter the guest (they have no
+# expiry, so a leak or a stale env has no time bound). Point
+# YOLOBOX_AWS_PROFILE at a profile that yields temporary credentials
+# instead (role_arn/credential_process/sso).
+#
+# The values travel as exported env plus SendEnv (names only in argv), not
+# SetEnv: a SetEnv option carries the secrets inside ssh's argument list,
+# which `ps` shows to every process on the Mac for the session's lifetime.
+# The guest's AcceptEnv whitelist treats both mechanisms identically.
+aws_ssh_env_args() {
+    profile="${YOLOBOX_AWS_PROFILE:-}"
+    [ -n "${profile}" ] || return 0
+
+    command -v aws >/dev/null 2>&1 || {
+        echo "yo: YOLOBOX_AWS_PROFILE is set but 'aws' is not on this Mac's PATH" >&2
+        exit 1
+    }
+
+    creds_out="$(aws configure export-credentials --profile "${profile}" --format env-no-export 2>&1)" || {
+        echo "yo: 'aws configure export-credentials --profile ${profile}' failed:" >&2
+        printf '%s\n' "${creds_out}" >&2
+        exit 1
+    }
+
+    aws_access_key_id=""
+    aws_secret_access_key=""
+    aws_session_token=""
+    aws_credential_expiration=""
+    while IFS= read -r line; do
+        case "${line}" in
+            AWS_ACCESS_KEY_ID=*) aws_access_key_id="${line#AWS_ACCESS_KEY_ID=}" ;;
+            AWS_SECRET_ACCESS_KEY=*) aws_secret_access_key="${line#AWS_SECRET_ACCESS_KEY=}" ;;
+            AWS_SESSION_TOKEN=*) aws_session_token="${line#AWS_SESSION_TOKEN=}" ;;
+            AWS_CREDENTIAL_EXPIRATION=*) aws_credential_expiration="${line#AWS_CREDENTIAL_EXPIRATION=}" ;;
+        esac
+    done <<EOF
+${creds_out}
+EOF
+
+    [ -n "${aws_session_token}" ] || {
+        echo "yo: profile '${profile}' returned no AWS_SESSION_TOKEN — these are long-lived keys" >&2
+        echo "    and must never enter the guest. Point YOLOBOX_AWS_PROFILE at a profile that" >&2
+        echo "    yields temporary credentials (role_arn or credential_process), not a static" >&2
+        echo "    IAM user profile." >&2
+        exit 1
+    }
+
+    export AWS_ACCESS_KEY_ID="${aws_access_key_id}"
+    export AWS_SECRET_ACCESS_KEY="${aws_secret_access_key}"
+    export AWS_SESSION_TOKEN="${aws_session_token}"
+    aws_send_env="AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN"
+    if [ -n "${aws_credential_expiration}" ]; then
+        export AWS_CREDENTIAL_EXPIRATION="${aws_credential_expiration}"
+        aws_send_env="${aws_send_env} AWS_CREDENTIAL_EXPIRATION"
+    fi
+    SSH_ARGS+=(-o "SendEnv=${aws_send_env}")
+}
+
 readonly HERD_VERSION_CACHE="$HOME/.local/state/yolobox/herd-guest-version"
 
 # "herdr 0.8.2" (or any line carrying a version) -> "0.8.2".
@@ -608,6 +679,7 @@ cmd_enter() {
     # Each enter gets its own connection instead.
     SSH_ARGS+=(-o ControlPath=none)
     herd_ssh_forward_args
+    aws_ssh_env_args
     herd_drift_check
     exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}" "cd $(printf '%q' "${target}") && exec \"\$SHELL\" -l"
 }
