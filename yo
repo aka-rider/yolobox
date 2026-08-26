@@ -1,18 +1,7 @@
 #!/usr/bin/env bash
 # yo — thin Mac-side CLI for the NixOS-VM yolobox (lima/vz).
 #
-# Usage:
-#   yo up|down|status
-#   yo gc [--deep] [--yes]
-#   yo ssh [cmd...]
-#   yo enter [project]
-#   yo link
-#   yo seed
-#   yo code [project]
-#   yo zed [project]
-#   yo t3
-#   yo pair [base-url]
-#   yo herd-check
+# Run `yo --help` for the command reference (usage() below).
 
 set -euo pipefail
 
@@ -46,19 +35,69 @@ SCRIPT_DIR="$(cd -P "$(dirname "${SCRIPT_SOURCE}")" >/dev/null 2>&1 && pwd)"
 readonly SCRIPT_DIR
 
 usage() {
-    cat >&2 <<EOF
-Usage:
-  yo up|down|status
-  yo gc [--deep] [--yes]
-  yo ssh [cmd...]
-  yo enter [project]
-  yo link
-  yo seed
-  yo code [project]
-  yo zed [project]
-  yo t3
-  yo pair [base-url]
-  yo herd-check
+    cat <<EOF
+Usage: yo <command> [args]
+
+  up | down | status
+      Start, stop, or describe the VM. status also reports disk usage on
+      both sides and warns when this Mac's herdr version differs from the VM's.
+
+  bootstrap
+      Create the VM, push this repo into it, build and (if needed) reboot
+      into the NixOS configuration, and seed identities. Safe to run again:
+      every step checks before it acts.
+
+  gc [--deep] [--yes]
+      Report what is using the VM's disk. --yes reclaims the machine's own
+      caches (journald, nix garbage, npm, podman). --deep adds per-project
+      build output (target, node_modules, .next) under ~/wrk, each deleted
+      only if git ignores it. Run this from the Mac; in-VM tools die first.
+
+  disk-grow <GiB>
+      Raise the VM's disk ceiling (grow-only; the backing file is sparse, so
+      a large ceiling costs nothing until used). Stops and restarts the VM.
+      Refuses unless the VM already runs a generation with boot.growPartition.
+
+  ssh [cmd...]
+      Plain interactive shell in the VM, or run one command there. No herd
+      wiring; agents started here show as "unknown" in the herd.
+
+  enter [project]
+      Shell in the VM with the herd socket forwarded and the herd env set, so
+      agents started there report to this Mac's herd. Exits 3 when this Mac's
+      herdr version differs from the VM's; YOLOBOX_SKIP_HERD_CHECK=1 overrides.
+
+  link
+      Add a "yolobox" git remote to the current repo, pointing at the same
+      path under ~/wrk in the VM (created there if missing). Then
+      "git push yolobox main" carries the project in.
+
+  seed
+      Copy into the VM what it cannot do without: ~/.ssh/config (minus lima's
+      Include and IdentityAgent), every ~/.ssh/*.pub, and each
+      ~/Developer/<group>/.gitconfig. Never a private key.
+
+  code [project]
+  zed [project]
+      Open VS Code Remote-SSH or Zed in the VM. Needs
+      "Include ~/.lima/yolobox/ssh.config" in ~/.ssh/config; VS Code also
+      needs the ms-vscode-remote.remote-ssh extension.
+
+  t3
+      Open t3code's web UI, served by the VM, in this Mac's browser with a
+      fresh pairing token. A bookmarked URL fails auth; run this again.
+
+  pair [base-url]
+      Print a t3 pairing URL that names this Mac (default
+      http://<hostname>.local:3773) for a browser on another device.
+
+  herd-check
+      Prove end to end that an agent in the VM can report to this Mac's
+      herd. Run from a herdr pane with no agent on it; it releases that pane.
+
+enter, code and zed resolve the directory the same way: with a project
+argument, pick among the VM's git repos under ~/wrk with fzf; without one,
+the mirrored directory of the current repo, or ~/wrk outside a repo.
 EOF
 }
 
@@ -208,7 +247,93 @@ cmd_down() {
 
 cmd_status() {
     limactl list "${INSTANCE}"
+
+    guest_df="$(guest_ssh 'df -h /' 2>/dev/null | tr -d '\r' | sed -n '2p')" || true
+    if [ -n "${guest_df}" ]; then
+        printf 'disk: guest %s\n' "${guest_df}"
+        use_pct="$(printf '%s\n' "${guest_df}" | awk '{print $5}' | tr -d '%')"
+        case "${use_pct}" in
+            '' | *[!0-9]*) ;;
+            *)
+                [ "${use_pct}" -lt 90 ] ||
+                    printf 'disk: WARNING guest / is %s%% full — reclaim with: yo gc --deep --yes, or raise the ceiling with: yo disk-grow <GiB>\n' "${use_pct}"
+                ;;
+        esac
+    fi
+    image_kib="$(du -k "$HOME/.lima/${INSTANCE}/disk" 2>/dev/null | awk '{print $1}')" || true
+    [ -z "${image_kib}" ] ||
+        printf 'disk: image ~/.lima/%s/disk allocates %sGiB on this Mac\n' \
+            "${INSTANCE}" "$((image_kib / 1024 / 1024))"
+
     herd_drift_check report
+}
+
+cmd_bootstrap() {
+    [ "$#" -eq 0 ] || {
+        echo "yo: bootstrap takes no arguments" >&2
+        usage >&2
+        exit 2
+    }
+
+    cmd_up
+    hc_ok "VM up"
+
+    vmdir="${VM_USER_HOME}/wrk/yolobox"
+    guest_repo_ensure "${vmdir}"
+    hc_ok "guest repo ready at ${vmdir}"
+
+    if ! git -C "${SCRIPT_DIR}" remote get-url yolobox >/dev/null 2>&1; then
+        git -C "${SCRIPT_DIR}" remote add yolobox "ssh://${VM_HOST}${vmdir}"
+        git -C "${SCRIPT_DIR}" config remote.yolobox.sshCommand "ssh -F ${SSH_CFG}"
+    fi
+
+    [ -z "$(git -C "${SCRIPT_DIR}" status --porcelain)" ] ||
+        echo "yo: this repo's worktree has uncommitted changes — only HEAD travels to the VM" >&2
+
+    GIT_SSH_COMMAND="ssh -F ${SSH_CFG}" \
+        git -C "${SCRIPT_DIR}" push "ssh://${VM_HOST}${vmdir}" HEAD:main
+    hc_ok "pushed to ${vmdir}"
+
+    ssh_args
+    # shellcheck disable=SC2029 # $(id -un) must expand client-side: Nix has no way to learn the guest username on its own
+    ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
+        "sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild boot --impure --flake ~/wrk/yolobox#yolobox"
+    hc_ok "built"
+
+    bootstrap_reboot_if_needed
+
+    cmd_seed
+    hc_ok "seeded"
+
+    grep -q 'Include ~/.lima/yolobox/ssh.config' "$HOME/.ssh/config" 2>/dev/null || cat >&2 <<EOF
+yo: add this line to ~/.ssh/config so ssh lima-yolobox, Zed and VS Code can find the VM:
+    Include ~/.lima/yolobox/ssh.config
+EOF
+}
+
+bootstrap_reboot_if_needed() {
+    if guest_runs_its_system_profile; then
+        hc_ok "already running the built generation"
+        return
+    fi
+
+    limactl restart "${INSTANCE}"
+
+    guest_runs_its_system_profile ||
+        hc_abort "the VM rebooted but is still not running the built generation" \
+            "profile: ${PROFILE_GENERATION}" \
+            "booted:  ${BOOTED_GENERATION}" \
+            "Check df /boot in the VM — a half-failed bootloader install leaves the two" \
+            "generations disagreeing (see CLAUDE.md)."
+    hc_ok "rebooted into the built generation"
+}
+
+guest_runs_its_system_profile() {
+    generations="$(guest_ssh 'readlink /nix/var/nix/profiles/system && readlink /run/current-system' | tr -d '\r')"
+    PROFILE_GENERATION="$(printf '%s\n' "${generations}" | sed -n '1p')"
+    BOOTED_GENERATION="$(printf '%s\n' "${generations}" | sed -n '2p')"
+    [ -n "${BOOTED_GENERATION}" ] || hc_abort "cannot read the VM's generations — is it up? (yo status)"
+    [ "${PROFILE_GENERATION}" = "${BOOTED_GENERATION}" ]
 }
 
 # Reclaims the guest root filesystem. It runs from the Mac on purpose: the
@@ -229,7 +354,7 @@ cmd_gc() {
             --yes) gc_apply=1 ;;
             *)
                 echo "yo: unknown gc option '$1'" >&2
-                usage
+                usage >&2
                 exit 2
                 ;;
         esac
@@ -385,6 +510,83 @@ df -h /
 GUEST_GC
 }
 
+# The lima ceiling and the guest partition are two separate resizes: raising
+# the ceiling alone leaves /dev/vda2 at its old size, so `df` in the box does
+# not move and nothing anywhere reports an error. The growpart unit that
+# `boot.growPartition` renders is what grows the partition at the next boot
+# (autoResize then grows the filesystem), so its presence is proven before
+# the instance is stopped — otherwise the whole command is a silent no-op.
+cmd_disk_grow() {
+    [ "$#" -eq 1 ] || {
+        echo "yo: disk-grow takes one argument, the new size in GiB" >&2
+        usage >&2
+        exit 2
+    }
+    case "$1" in
+        '' | *[!0-9]*)
+            echo "yo: disk-grow size must be a whole number of GiB, got '$1'" >&2
+            exit 2
+            ;;
+    esac
+    [ "$1" -gt 0 ] || {
+        echo "yo: disk-grow size must be greater than 0 GiB" >&2
+        exit 2
+    }
+
+    current_bytes="$(limactl list "${INSTANCE}" --format '{{.Disk}}' 2>/dev/null | tr -d '\r')" || true
+    [ -n "${current_bytes}" ] || {
+        echo "yo: limactl reports no disk size for ${INSTANCE} — does the instance exist? (yo status)" >&2
+        exit 1
+    }
+    current_gib="$((current_bytes / 1024 / 1024 / 1024))"
+    [ "$1" -gt "${current_gib}" ] || {
+        echo "yo: ${INSTANCE}'s ceiling is already ${current_gib}GiB and lima can only grow it — ask for more than ${current_gib}" >&2
+        exit 1
+    }
+
+    load_state="$(guest_ssh 'systemctl show -p LoadState --value growpart' 2>/dev/null | tr -d '\r' | sed -n '1p')" || true
+    [ -n "${load_state}" ] || {
+        echo "yo: cannot reach the VM to ask about growpart — is it up? (yo status)" >&2
+        exit 1
+    }
+    [ "${load_state}" = "loaded" ] || {
+        echo "yo: no growpart unit in the VM's current system, so growing the ceiling would leave /dev/vda2 untouched — switch it: yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '~/wrk/yolobox#yolobox'" >&2
+        exit 1
+    }
+
+    df_before="$(guest_ssh 'df -h /' 2>/dev/null | tr -d '\r' | sed -n '2p')" || true
+    blocks_before="$(guest_ssh 'df -k /' 2>/dev/null | tr -d '\r' | sed -n '2p' | awk '{print $2}')" || true
+
+    # Reported, never refused: the backing file is sparse, so a ceiling far
+    # above the host's free space costs nothing until the guest actually
+    # writes that much — over-declaring it is the intended use.
+    free_kib="$(df -k "$HOME/.lima" | awk 'NR==2 {print $4}')"
+    image_kib="$(du -k "$HOME/.lima/${INSTANCE}/disk" 2>/dev/null | awk '{print $1}')" || true
+    printf 'host: ~/.lima has %sGiB free; the disk image allocates %sGiB today\n' \
+        "$((free_kib / 1024 / 1024))" "$((${image_kib:-0} / 1024 / 1024))"
+    printf 'lima: raising %s from %sGiB to %sGiB\n' "${INSTANCE}" "${current_gib}" "$1"
+
+    limactl stop "${INSTANCE}"
+    limactl edit --yes "${INSTANCE}" --disk "$1" || {
+        echo "yo: limactl refused the resize and ${INSTANCE} is left stopped — start it again with: yo up" >&2
+        exit 1
+    }
+    cmd_up
+
+    df_after="$(guest_ssh 'df -h /' 2>/dev/null | tr -d '\r' | sed -n '2p')" || true
+    blocks_after="$(guest_ssh 'df -k /' 2>/dev/null | tr -d '\r' | sed -n '2p' | awk '{print $2}')" || true
+    vda2_after="$(guest_ssh 'lsblk -no SIZE /dev/vda2' 2>/dev/null | tr -d '\r' | sed -n '1p')" || true
+    printf 'before: %s\n' "${df_before}"
+    printf 'after:  %s\n' "${df_after}"
+    printf 'after:  vda2 is %s\n' "${vda2_after}"
+    # Blocks, not the human-readable size: `df -h` rounds, so a modest bump
+    # can print the same string on both sides of a resize that did work.
+    if [ -z "${blocks_after}" ] || [ "${blocks_after}" -le "${blocks_before:-0}" ]; then
+        echo "yo: the ceiling is now $1GiB but the guest root did not grow — diagnose with: yo ssh systemctl status growpart" >&2
+        exit 1
+    fi
+}
+
 cmd_ssh() {
     ssh_args
     SSH_ARGS+=(-t "${VM_HOST}")
@@ -394,7 +596,7 @@ cmd_ssh() {
 cmd_enter() {
     [ "$#" -le 1 ] || {
         echo "yo: enter takes at most one project argument" >&2
-        usage
+        usage >&2
         exit 2
     }
     target="$(vm_target_dir "${@+"$@"}")"
@@ -437,7 +639,7 @@ hc_abort() {
 cmd_herd_check() {
     [ "$#" -eq 0 ] || {
         echo "yo: herd-check takes no arguments" >&2
-        usage
+        usage >&2
         exit 2
     }
     HERD_CHECK_FAILED=0
@@ -606,7 +808,7 @@ vm_target_dir() {
 cmd_code() {
     [ "$#" -le 1 ] || {
         echo "yo: code takes at most one project argument" >&2
-        usage
+        usage >&2
         exit 2
     }
     code_cli="$(command -v code || true)"
@@ -623,7 +825,7 @@ cmd_code() {
 cmd_zed() {
     [ "$#" -le 1 ] || {
         echo "yo: zed takes at most one project argument" >&2
-        usage
+        usage >&2
         exit 2
     }
     command -v zed >/dev/null || {
@@ -636,9 +838,9 @@ cmd_zed() {
 
 # One-shot guest command on a connection of its own: the shared
 # ControlMaster of ssh_args()'s -F config belongs to whichever session
-# opened it, and a t3 invocation must neither inherit that session's
+# opened it, and a one-shot probe must neither inherit that session's
 # forwards nor become the master for later ones.
-t3_ssh() {
+guest_ssh() {
     ssh_args
     ssh -n "${SSH_ARGS[@]}" -o ControlPath=none "${VM_HOST}" "$@"
 }
@@ -646,7 +848,7 @@ t3_ssh() {
 # t3's web UI authenticates with a freshly minted pairing token; a bare
 # http://127.0.0.1:${T3_PORT} is rejected. Sets PAIRING_URL.
 t3_mint_pairing_url() {
-    pair_out="$(t3_ssh 't3 pair --ttl 2m --label yo' 2>&1)" || true
+    pair_out="$(guest_ssh 't3 pair --ttl 2m --label yo' 2>&1)" || true
     PAIRING_URL="$(printf '%s\n' "${pair_out}" | tr -d '\r' |
         sed -n 's/^[[:space:]]*Pairing URL:[[:space:]]*//p' | head -n 1)"
     [ -n "${PAIRING_URL}" ] || {
@@ -660,7 +862,7 @@ t3_require_service() {
     # LoadState, not just is-active: `systemctl is-active` reports a unit the
     # running closure has never heard of as "inactive", which reads as a
     # stopped service when the real answer is that the VM was never switched.
-    unit="$(t3_ssh 'systemctl show -p LoadState -p ActiveState --value t3' || true)"
+    unit="$(guest_ssh 'systemctl show -p LoadState -p ActiveState --value t3' || true)"
     load_state="$(printf '%s\n' "${unit}" | tr -d '\r' | sed -n '1p')"
     active_state="$(printf '%s\n' "${unit}" | tr -d '\r' | sed -n '2p')"
     [ -n "${load_state}" ] || {
@@ -692,7 +894,7 @@ t3_require_service() {
 cmd_t3() {
     [ "$#" -eq 0 ] || {
         echo "yo: t3 takes no arguments" >&2
-        usage
+        usage >&2
         exit 2
     }
     t3_require_service
@@ -703,7 +905,7 @@ cmd_t3() {
 cmd_pair() {
     [ "$#" -le 1 ] || {
         echo "yo: pair takes at most one base-url argument" >&2
-        usage
+        usage >&2
         exit 2
     }
     t3_require_service
@@ -713,7 +915,7 @@ cmd_pair() {
     # and the unit starts it with --host 127.0.0.1 — unreachable from any
     # other machine. `t3 auth pairing create` is the only form that takes
     # a --base-url to name this host instead.
-    pair_out="$(t3_ssh "t3 auth pairing create --ttl 5m --label $(printf '%q' "yo@${host_name}") --base-url $(printf '%q' "${base_url}")" 2>&1)" || {
+    pair_out="$(guest_ssh "t3 auth pairing create --ttl 5m --label $(printf '%q' "yo@${host_name}") --base-url $(printf '%q' "${base_url}")" 2>&1)" || {
         printf '%s\n' "${pair_out}" >&2
         exit 1
     }
@@ -744,13 +946,18 @@ cmd_link() {
 
     vmdir="${VM_USER_HOME}/wrk/${relpath}"
 
+    guest_repo_ensure "${vmdir}"
+
+    git -C "${toplevel}" remote add yolobox "ssh://${VM_HOST}${vmdir}"
+    git -C "${toplevel}" config remote.yolobox.sshCommand "ssh -F ${SSH_CFG}"
+}
+
+guest_repo_ensure() {
+    vmdir="$1"
     ssh_args
     # shellcheck disable=SC2029 # vmdir must expand client-side to embed the guest path literally
     ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
         "mkdir -p '${vmdir}' && { git -C '${vmdir}' rev-parse --git-dir >/dev/null 2>&1 || { git -C '${vmdir}' init -b main && git -C '${vmdir}' config receive.denyCurrentBranch updateInstead; }; }"
-
-    git -C "${toplevel}" remote add yolobox "ssh://${VM_HOST}${vmdir}"
-    git -C "${toplevel}" config remote.yolobox.sshCommand "ssh -F ${SSH_CFG}"
 }
 
 # The guest's ~/.gitconfig and the rest of the user layer come from
@@ -775,9 +982,13 @@ cmd_seed() {
 # not whichever key the agent happens to offer first.
 seed_ssh() {
     ssh_args
-    sed -E '/^[[:space:]]*(Include|IdentityAgent)[[:space:]]/d' "$HOME/.ssh/config" |
-        ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
-            'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >~/.ssh/config && chmod 600 ~/.ssh/config'
+    if [ -r "$HOME/.ssh/config" ]; then
+        sed -E '/^[[:space:]]*(Include|IdentityAgent)[[:space:]]/d' "$HOME/.ssh/config" |
+            ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
+                'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >~/.ssh/config && chmod 600 ~/.ssh/config'
+    else
+        hc_ok "no ~/.ssh/config on this Mac — skipped"
+    fi
 
     pubkeys=()
     for pubkey in "$HOME"/.ssh/*.pub; do
@@ -808,16 +1019,22 @@ seed_gitconfig() {
 
 main() {
     [ "$#" -ge 1 ] || {
-        usage
+        usage >&2
         exit 2
     }
     sub="$1"
     shift
     case "${sub}" in
+        --help | -h | help)
+            usage
+            exit 0
+            ;;
         up) cmd_up ;;
         down) cmd_down ;;
         status) cmd_status ;;
+        bootstrap) cmd_bootstrap "$@" ;;
         gc) cmd_gc "$@" ;;
+        disk-grow) cmd_disk_grow "$@" ;;
         ssh) cmd_ssh "$@" ;;
         enter) cmd_enter "$@" ;;
         link) cmd_link ;;
@@ -828,7 +1045,7 @@ main() {
         pair) cmd_pair "$@" ;;
         herd-check) cmd_herd_check "$@" ;;
         *)
-            usage
+            usage >&2
             exit 2
             ;;
     esac
