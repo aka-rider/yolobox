@@ -1,586 +1,381 @@
-# yolobox — operating notes
+# yolobox — notes for whoever works on this repo next
 
-README is the hit-the-ground guide. This file holds the reasoning behind the
-steps and the failure modes worth recognising.
+This repo describes one NixOS VM on a Mac, run by Lima, where coding agents
+work with no host mounts and git as the only bridge. `README.md` gets a
+person from nothing to a working project. This file holds the reasoning
+behind the design and the shape of each failure we have met, so you can
+recognise one instead of rediscovering it.
+
+Read `CONSTITUTION.md` before changing anything. It is the short list of
+rules this file justifies.
+
+## Where things live
+
+- `yo` — the Mac-side CLI. Everything the Mac does to the VM goes through
+  it; `yo --help` describes each command.
+- `flake.nix` — wires the modules together and threads the host username
+  in.
+- `nix/base.nix` — filesystems, boot, sshd, tmpfiles, git defaults, the
+  lima units, core packages.
+- `nix/podman.nix` — rootless podman with a docker-compatible socket.
+- `nix/harnesses.nix`, `nix/agentic.nix` — the coding agents and their
+  version overrides.
+- `nix/mcp.nix` — MCP servers declared once, rendered per harness.
+- `nix/herd-report.nix` — how in-VM agents report to the Mac's herd.
+- `nix/display.nix` — the virtual X display, browsers, screen recording.
+- `nix/lsp.nix` — the Python language-server wiring for every editor.
+- `nix/t3.nix`, `nix/pkgs/t3.nix` — t3code built from npm and run as a
+  service.
+- `nix/pkgs/` — packages nixpkgs lacks or lags on.
+- `lima/yolobox.yaml` — read once, when the instance is created.
+- `templates/default` — `devbox.json` and `.envrc` for a new project.
+- `TODO.md` — known problems, including the upstream reports still owed.
 
 ## The guest account mirrors the host
 
-There is no fixed "yolobox account". Lima's cidata provisions a guest
-account named and uid-matched after whichever Mac account started the VM
-(`lima/yolobox.yaml`'s `user: false` does not disable this — it only turns
-off a different lima default). `flake.nix` declares that same account
-declaratively (`users.users.${username}` in every `nix/*.nix` module that
-needs it) rather than inventing a separate one, because Nix has no pure way
-to learn the host username: `YOLOBOX_USERNAME=$(id -un)` plus `--impure` on
-every `nixos-rebuild` invocation is how it gets in (`yo t3`'s switch hint
-shows the exact form; `yo`'s own `VM_USER_HOME` is computed the same way).
+Lima creates a guest account named and uid-matched after the Mac account
+that started the VM. `flake.nix` declares that same account as
+`users.users.${username}` rather than inventing one, and since Nix has no
+pure way to learn the name, `YOLOBOX_USERNAME=$(id -un)` plus `--impure`
+carries it in on every `nixos-rebuild`.
 
-An earlier revision hardcoded this account as `xiii` — a leftover from a
-previous Mac account of that name. Once the Mac account changed to
-something else, `xiii` silently kept existing as a second, colliding
-identity: same uid as the real account (nixos-rebuild pins it there on
-purpose, for podman/virtiofs uid compatibility), but a different
-`/home/*.guest` directory. Every nix module that stores state under
-`config.users.users.xiii.home` (mcp, lsp, herd-report, display, t3) was
-writing into that second, never-interactively-used home instead of the
-real one — invisible to `getpwuid`-based lookups (`whoami`, `sudo`'s
-`SUDO_USER`) too, since those resolve ambiguously to whichever of the two
-same-uid passwd entries comes first. `nixos-rebuild switch` removes a
-previously-declared user once its module stops declaring it (`mutableUsers
-= true` only stops nix from touching accounts it never declared), so
-retiring `xiii` from every module in one switch was enough to clear the
-collision — no manual `userdel` needed.
+An earlier revision hardcoded `xiii`, an old Mac account name. When the
+Mac account changed, `xiii` lived on as a second account with the same uid
+but its own `/home/xiii.guest`, and every module storing state under
+`config.users.users.xiii.home` wrote there instead of the real home.
+`whoami` and `SUDO_USER` could not show it, because they resolve a uid to
+whichever passwd entry comes first. Retiring `xiii` from every module in
+one switch was enough: `nixos-rebuild` removes a user it once declared and
+no longer does.
 
-## SSH identities: the forwarded agent, and the two GitHub accounts
+Lima >= 2.1.0 names the guest home `/home/<user>.guest` (it was
+`/home/<user>.linux` before; lima-vm/lima#4578). This box was brought up on
+limactl 2.2.0. v1 of yolobox, the Docker-based predecessor, lives at commit
+`4c154fc`.
 
-`ForwardAgent yes` forwards `$SSH_AUTH_SOCK`, **not** `IdentityAgent`. On this
-Mac those are two different agents: `$SSH_AUTH_SOCK` is Apple's launchd agent,
-which holds no identities, while every real key lives in 1Password. So `yes`
-forwarded an empty agent — `ssh-add -l` in the box answered "Could not open a
-connection to your authentication agent", because sshd sets `SSH_AUTH_SOCK`
-only once the forward carries something. `ssh_args` in `yo` therefore gives
-`ForwardAgent` the 1Password socket path itself.
+## SSH identities and the two GitHub accounts
 
-Because the forward is decided by whichever session opens lima's shared
-`ControlMaster`, a change here is invisible until the old master goes:
+`ForwardAgent yes` forwards `$SSH_AUTH_SOCK`, which on this Mac is Apple's
+launchd agent holding nothing; the real keys live in 1Password. So `yo`
+hands `ForwardAgent` the 1Password socket path itself. The forward belongs
+to whichever session opened lima's shared `ControlMaster`, so a change here
+is invisible until that master is closed:
 `ssh -F ~/.lima/yolobox/ssh.config -O exit lima-yolobox`.
 
-Two GitHub accounts (`github@iurii.net` and the work `iurii-tech`) share one
-`github.com`, so the account is chosen by *which key* is offered. The host
-does that with a `Host github-iurii-tech` alias whose `IdentityFile` names a
-**public** key file — that is the agent-key selector, not a key — and
+Two GitHub accounts share `github.com`, so the account is chosen by which
+key is offered. The Mac does that with a `Host github-iurii-tech` alias
+whose `IdentityFile` names a public key — a selector, not a key — and
 `~/.dotfiles/gitconfig` rewrites `git@github.com:brocc-ab/` to that alias.
-`yo seed` copies the Mac's `~/.ssh/config` and every `~/.ssh/*.pub` in, minus
-two host-only lines: lima's own `Include`, and `IdentityAgent` — the box must
-use the forwarded socket, and a copied `IdentityAgent` would point at a path
-that does not exist there and take the agent away. Still no private key in the
-box.
+`yo seed` copies `~/.ssh/config` and every `*.pub` in, minus lima's
+`Include` and `IdentityAgent`, both of which name paths that do not exist
+in the VM and would take the forwarded agent away.
 
-`yo seed` also carries the directory-level git identities,
-`~/Developer/<group>/.gitconfig`, into `~/wrk/<group>/.gitconfig`. Those files
-sit *next to* a group of repos rather than inside one, so no `yo link` push
-ever moves them, and without them the `includeIf` in `~/.dotfiles/gitconfig`
-resolves to nothing and work repos silently commit under the personal email.
-For the same reason that include's `path` must be spelled `~/wrk/...` for the
-`gitdir:~/wrk/` case: on the Mac `~/wrk` is a symlink to `~/Developer`, but in
-the box `~/wrk` is the real directory and `~/Developer` does not exist.
+`yo seed` also copies `~/Developer/<group>/.gitconfig` to
+`~/wrk/<group>/.gitconfig`. Those files sit next to repos, not inside one,
+so no push ever carries them, and without them the `includeIf` in
+`~/.dotfiles/gitconfig` matches nothing and work repos commit under the
+personal email. That include must say `~/wrk/...`: in the VM `~/wrk` is
+real and `~/Developer` does not exist.
 
-How to recognise the whole class of failure: `ssh -T git@github.com` and
-`ssh -T git@github-iurii-tech` inside the box must greet two *different*
-account names. "Could not resolve hostname github-iurii-tech" means the ssh
-config never arrived; a greeting with the wrong account name means the pub
-keys did not.
+How to recognise the class: `ssh -T git@github.com` and `ssh -T
+git@github-iurii-tech` in the VM must greet two different names. "Could
+not resolve hostname" means the ssh config never arrived; the wrong name
+means the public keys did not.
 
 ## Per-project dev shells
 
-### Why a project must be a git repo
+A project must be a git repo for one reason: the push channel. `yo link`
+git-inits the VM side, so linked projects are correct by construction; a
+project born in the VM needs `git init` first.
 
-For one reason only: the push channel. `./yo link` git-inits the VM
-side, so linked projects are correct by construction; a project created
-directly in the VM needs `git init` first.
+The VM checkout is a push-to-checkout target and refuses a push when the
+worktree or index differs from HEAD. `nix/base.nix` sets
+`receive.denyCurrentBranch = "updateInstead"` in `/etc/gitconfig`, so this
+holds for every repo in the VM. devbox never touches the index, so
+authoring `devbox.json` on either side is safe; the remaining discipline is
+ordinary git — the VM commits `devbox.lock`, pull it before pushing again.
 
-The flake-evaluation reasons that used to apply — `git+file:` sees tracked
-files only, and `path:` copies a directory verbatim, dying with
-`file '...' has an unsupported type` on a unix socket under the source
-root — now concern only the yolobox repo itself. `~/wrk/yolobox` is still a
-flake (`nixosConfigurations` only), so there and only there the old
-corollary holds: untracked files do not exist as far as Nix is concerned,
-and a file git has never heard of makes evaluation fail as though it were
-absent from the store copy. `git add` before `nixos-rebuild`.
+Resolution needs network on the first add. `.devbox/` is per-machine and
+gitignored. direnv trusts every `.envrc` under `~/wrk` through
+`/etc/direnv/direnv.toml`; the NixOS module exports `DIRENV_CONFIG=/etc/direnv`,
+so a `~/.config/direnv/direnv.toml` is silently ignored — never put the
+whitelist there.
 
-### Authoring can happen on either side
+The yolobox repo itself is still a flake, and there a file git has never
+seen does not exist to Nix. `git add` before `nixos-rebuild`.
 
-The VM's project checkout is a push-to-checkout target, which refuses a push
-when the worktree **or the index** differs from HEAD. This is not a property
-of linked repos: `nix/base.nix` sets `receive.denyCurrentBranch = "updateInstead"`
-in the VM's `/etc/gitconfig`, so it holds for every repo in the VM, including
-one you `git init` by hand. `cmd_link` sets it repo-locally too, redundantly.
-Fetch is unrestricted; only push is gated.
+`yo bootstrap` decides whether the VM needs a reboot by comparing `readlink
+/nix/var/nix/profiles/system` against `readlink /run/current-system` — the
+same two readlinks `yo gc` compares to decide whether it may run
+`nix-collect-garbage -d`. Equal means the built generation is already
+running, so bootstrap skips the reboot; different means `nixos-rebuild
+boot` just installed a generation the box has not started yet, so it
+restarts the VM and re-checks, aborting with a `df /boot` hint if the two
+still disagree (the half-failed bootloader install from the ESP section
+below).
 
-devbox never touches the git index. The flake-era hazard — `direnv allow`
-ran `git add --intent-to-add flake.lock`, which dirtied the index and broke
-the push channel for good — is gone, so authoring `devbox.json` VM-side is
-as safe as host-side. The remaining discipline is ordinary git: the VM
-commits `devbox.lock` alongside its work on the checked-out branch, so pull
-the VM's commits before pushing again, or the push lands on a diverged
-checkout and is refused like any other.
+## tmpfiles rules apply on `switch`
 
-### devbox specifics
+The VM carries `systemd-tmpfiles-resetup.service`, the switch-time twin of
+the boot-only setup unit, so a new tmpfiles rule takes effect on `switch`
+with no reboot. It re-runs every rule, including force-replacing `L+`
+links, which `nix/herd-report.nix` relies on to fill pi's auto-discovery
+directories.
 
-- `devbox.lock` is committed to each project. VM-side agents commit it with
-  their work; the host pulls it back.
-- Resolution needs network on the first add: package metadata from
-  search.devbox.sh, store paths from cache.nixos.org.
-- `.devbox/` is per-machine state and is gitignored per project.
-- direnv auto-trusts every `.envrc` under `~/wrk` (the guest account's own
-  home — see "The guest account mirrors the host" below), so no
-  `direnv allow` step exists. The whitelist lives in `/etc/direnv/direnv.toml`,
-  rendered by `programs.direnv.settings`. The NixOS direnv module exports
-  `DIRENV_CONFIG=/etc/direnv`, which overrides the XDG location — a
-  `~/.config/direnv/direnv.toml` is silently ignored, so never put the
-  whitelist there. Being an `/etc` symlink, it flips on `nixos-rebuild
-  switch`; no tmpfiles or reboot step applies.
+## The ESP is 249 MiB and holds one kernel
 
-## tmpfiles rules apply on `switch` via resetup
+`/boot` is the EFI partition itself, `/dev/vda1`, 249 MiB (260,796,416
+bytes), mounted there to match the shipped nixos-lima image so a fresh
+instance never needs a mount migration. The size is baked into the prebuilt
+image and cannot be grown: vda1 ends at sector 526335 and vda2 starts at
+526336, the very next sector, with no gap to grow into.
 
-The VM carries `systemd-tmpfiles-resetup.service`, upstream's switch-time
-twin of the boot-only setup unit, so a `switch` that adds a new tmpfiles rule
-(verified with the `~/artifacts` directory rule) takes effect immediately —
-no reboot needed. `sudo systemd-tmpfiles --create` still re-runs every rule
-system-wide, including force-replacing `L+` links, and resetup does the same
-on every `switch` — relied upon for the `L+` links that fill pi's
-auto-discovery directories (`nix/herd-report.nix`).
+A kernel set is about 92 MiB and `linuxPackages_latest` brings a new one
+every few weeks. Two sets fit; three never do — and the count that matters
+is not the retained one. `install-grub.pl` copies every retained
+generation's kernel into `/boot/kernels` first and unlinks obsolete files
+only after the `grub.cfg` rename. So peak usage during a switch is the
+retained sets plus every set already there. With `configurationLimit = 2`
+the next kernel bump holds three sets transiently and dies mid-copy; with
+`1` the peak is about 198 MB against 260.8 MB. Lowering the limit frees
+nothing on the switch that applies it, because pruning runs last; one more
+switch without a kernel change drains the old set — verified here, taking
+`/boot` from 198,569,984 bytes used down to 105,672,704.
 
-## The ESP is 249 MiB and only ever holds one kernel generation
-
-`/boot` in the guest is the EFI System Partition itself, `/dev/vda1`, 249 MiB
-(260,796,416 bytes) — `nix/base.nix` mounts it there deliberately, matching
-the shipped nixos-lima image, so the first `nixos-rebuild switch` on a fresh
-instance never has to migrate a mount. That size is `make-disk-image`'s
-`bootSize` default (256M), baked into the prebuilt
-`nixos-lima-v0.2.1-aarch64.qcow2` that `lima/yolobox.yaml` downloads, and it
-is not overridable from this repo: changing it means building the image
-yourself from the nixos-lima flake, and the Mac has no nix, so that build
-would itself have to happen inside a Linux VM. The partition cannot be grown
-either — `/dev/vda1` ends at sector 526335 and `/dev/vda2` starts at 526336,
-zero gap, and vda2 runs to the last usable LBA, so there is no slack at
-either end. The only free extent is 7 MiB before vda1, and a FAT filesystem
-can't use space before its own start.
-
-A kernel set is about 92 MiB (Image ~64 MiB, initrd ~28 MiB), fixed overhead
-(GRUB modules, the EFI binary, fonts, background) is about 14 MiB, and
-`boot.kernelPackages = pkgs.linuxPackages_latest` means a new set arrives
-every few weeks. Two sets fit in the ~235 MiB usable; three never do — and
-the naive read of that arithmetic is wrong in a way worth recording, because
-it comes straight from reading `install-grub.pl` in the store rather than
-guessing at GRUB's behaviour. `copyToKernelsDir` copies every retained
-generation's kernel and initrd into `/boot/kernels` first, recording each in
-a `%copied` ledger; obsolete files are unlinked only afterwards, after all
-copying and even after the atomic `grub.cfg` rename. So peak occupancy during
-a switch is the retained sets plus every set already on the ESP that is about
-to be dropped — not just the retained count. Copies are content-addressed by
-store path, so generations sharing a kernel share one file.
-
-Two consequences follow from that ordering, and both are counterintuitive.
-First, `configurationLimit = 2` does not work on this ESP: the next kernel
-bump would hold three sets transiently, roughly 290 MB against 260.8 MB
-available, and die inside the copy. Hence `configurationLimit = 1`, whose
-steady-state peak is one retained set plus the incoming one, about 198 MB,
-leaving ~62 MB spare. Second, lowering the limit frees nothing on the switch
-that first applies it, precisely because pruning happens last — it takes one
-intervening switch that does *not* change the kernel to drain the obsolete
-set. That's what was done here: the drain took `/boot` from 198,569,984 bytes
-used to 105,672,704, freeing the previous kernel's set.
-
-The failure mode worth recognising is that it surfaces late and lies about
-itself. The closure builds fine, the system profile advances to the new
-generation, and only then does activation die installing the bootloader with
-`No space left on device`. The box is left running the old generation while
+The failure surfaces late and lies. The closure builds, the profile
+advances, and only then does the bootloader install die with `No space left
+on device`. The box keeps running the old generation while
 `/nix/var/nix/profiles/system` claims the new one — `readlink
-/run/current-system` and `readlink /nix/var/nix/profiles/system` disagree,
-the bootloader was never updated, and a reboot comes back on the old
-generation. Worse, if the failing command is piped (e.g. through `tail`), the
-shell reports exit 0 and the failure is invisible except in the log text.
-Check `df /boot` first when a switch behaves strangely.
+/run/current-system` and the profile disagree, and a reboot comes back on
+the old one. If the switch was piped through `tail`, the shell reports exit
+0. Check `df /boot` first when a switch behaves strangely.
 
-The accepted trade, stated plainly: at this ESP size a rollback generation
-cannot survive a kernel bump, so the box keeps exactly one. That's acceptable
-because the VM is disposable and rebuildable from this repo.
+The trade: no rollback generation survives a kernel bump. Acceptable,
+because the VM is rebuildable from this repo.
 
-One alternative was tried and deliberately reverted, so it's worth naming
-here rather than re-litigating blind: `/boot` was briefly moved onto the
-ext4 root with the ESP demoted to `/boot/efi` (commits `a2057d8` then
-`03e2dbc`). That does give effectively unlimited space — and notably, once
-`/boot` is not a separate filesystem, NixOS stops copying kernels into it at
-all and GRUB reads them straight from the store. It was reverted because it
-makes `nix/base.nix` diverge from the shipped image, which means every
-freshly created instance needs a manual mount migration before its first
-switch — a footgun on a VM whose whole point is being cheap to recreate.
+Moving `/boot` onto the root filesystem was tried (`a2057d8`, reverted in
+`03e2dbc`). It gives unlimited space, but makes `nix/base.nix` diverge from
+the image, so every fresh instance would need a manual mount migration
+before its first switch.
 
-## Disk space: recognising 100% full without becoming wedged
+## A full disk: recognising it without getting stuck
 
-`/dev/vda2` is the VM's only real filesystem, 99 GiB. It is possible to fill it
-to 100%, 0 bytes available to unprivileged processes — and the VM survives the
-incident, not wedged but crippled in a particular way. The failure surfaces as
-the agent harness dying with `ENOSPC: no space left on device, mkdir
-'/tmp/claude-501/...'` before any command runs. That happens because `/tmp` is
-not a tmpfs but a directory on `/dev/vda2`. The only tmpfs mounts in the system
-are `/run`, `/dev/shm`, `/run/wrappers`, and `/run/user/$UID`.
+`/dev/vda2` is the only real filesystem, and `/tmp` is a directory on it,
+not a tmpfs. So a full disk first shows up as the agent harness dying with
+`ENOSPC ... mkdir '/tmp/claude-501/...'` before any command runs.
 
-The key recognition is **ext4's reserve for root: 1,057,641 blocks × 4 KiB = 4.3
-GB**. The `df` tool excludes that reserve from the "Avail" column, so when `df`
-reports 0 available, it means 0 available to unprivileged processes — not to
-root. Every `sudo` command still works while every unprivileged tool dies trying
-to write to its home directory, /tmp, or the nix store. `df` reporting 0 is
-therefore not proof that the VM is truly wedged; a `sudo` shell still has room
-to work in.
+Two facts make it survivable. ext4 reserves 1,057,641 blocks x 4 KiB = 4.3
+GB for root that `df`'s "Avail" column does not count, so every `sudo`
+command still works while every unprivileged one dies. And `yo ssh` reaches
+in from the Mac, which the full disk cannot hurt — hence the remedy,
+`yo gc`, lives on the Mac.
 
-The second key recognition is **diagnose from the Mac, not from inside**. In-VM
-tooling is the first thing that dies; `./yo ssh` reaches in from the Mac and is
-unaffected by the full disk. That is why the remedy — `yo gc` — lives in the `yo`
-script on the Mac, a tool the failure mode cannot kill.
+In the one incident so far, `~/wrk/rune/target` held 41 GiB, 43% of the
+disk: `rune/Cargo.toml` had no `[profile.dev]`, so every dev build and
+every integration test linked its own unstripped ~230 MiB binary, and cargo
+never prunes old hashes. The fix belongs in that repo (see `TODO.md`).
+Runners-up: 32 GiB of dead nix store paths, 4.7 GiB podman, 2.9 GiB
+`/root/.cache/nix`, 2.5 GiB `~/.npm`.
 
-In this incident, `/dev/vda2` hit 100% after five days of agent work. `df` and
-`du` agreed, blocks were exhausted (not inodes), and `lsof | grep -c deleted`
-was 0, so unlinking reclaimed immediately — no process restart was needed. The
-culprit was one directory: `~/wrk/rune/target`, 41 GiB, 43% of the whole
-filesystem. The `debug/` subdirectory was 39 GiB alone — `debug/deps` spanned
-3,910 files at 34 GiB, with 154 of them over 50 MiB and the largest at ~232 MiB
-each. `debug/incremental` added another 3.8 GiB. File mtimes spanned 2026-08-20
-to 2026-08-25, five days of accumulation, not one build.
+`yo gc` reports; `--yes` cleans the machine tier (journald, nix garbage,
+root's nix cache, npm cache, podman); `--deep --yes` also deletes `target`,
+`node_modules` and `.next` under `~/wrk`. Root-only steps run first on
+purpose: they free the space the unprivileged steps need, since npm writes
+a log before it clears anything. `.venv` and `.devbox/virtenv` are
+excluded — `nix/lsp.nix` points basedpyright at `.venv`, and `virtenv` is
+devbox's toolchain, not build output.
 
-The root cause was specific to that project: `rune/Cargo.toml` declares only
-`[profile.dist]` and no `[profile.dev]`, so every dev build linked full
-unstripped DWARF binaries and every integration test left behind its own ~230
-MiB copy; cargo never prunes old hashes. The durable fix is a `[profile.dev]`
-with `debug = "line-tables-only"` and `[profile.dev.package."*"] debug = false`,
-but that belongs in the rune repo, not here.
+Two traps. Deleting a build directory the project's `.gitignore` does not
+match dirties the checkout, and every later `git push yolobox` is refused
+with no obvious link back; `iurii.net` anchors `/node_modules`, so a nested
+`web/node_modules` is tracked. Hence `--deep` asks `git check-ignore` per
+directory. And `nix-collect-garbage -d` deletes the running generation
+when a switch half-failed (see the ESP section); `yo gc` compares the two
+readlinks and reports a skip, which means the box needs a repaired switch
+before it needs a garbage collection.
 
-Runners-up for scale: `/nix/store` held 32 GiB across 2,328 dead paths; podman
-storage consumed 4.7 GiB; `/root/.cache/nix` claimed 2.9 GiB; `~/.npm` 2.5 GiB;
-`~/.cache` 1.5 GiB (984 MiB of that Playwright browsers); `/var/log/journal` 630
-MiB.
+## The root disk grows; the ESP cannot
 
-The remedy is `yo gc`: no flags reports disk usage only, `--yes` performs the
-"machine tier" (journald vacuum, nix-collect-garbage -d, /root/.cache/nix, npm
-cache, podman prune), and `--deep --yes` also deletes the "project tier"
-(`target`, `node_modules`, `.next` directories discovered under ~/wrk). The
-ordering of cleanup is deliberate: root-only steps (journald, nix-collect-garbage,
-rm /root/.cache/nix) run first specifically to free space for the two
-unprivileged steps (npm cache clean, podman prune), which can themselves die of
-ENOSPC on a full disk — npm writes `~/.npm/_logs` before it clears anything.
-Order only matters on a full disk, which is the only time the command matters. `nix-collect-garbage
--d` drops the rollback generation, consistent with the repo's existing posture —
-`configurationLimit = 1` already means the ESP keeps exactly one generation.
-`.venv` and `.devbox/virtenv` are deliberately excluded from `--deep` because
-`nix/lsp.nix` wires basedpyright to the per-project `.venv`, so deleting it
-silently breaks the Python LSP chokepoint; `.devbox/virtenv` is devbox's own
-toolchain state (1.5 GiB in rune's case, rustup), not build output.
+`~/.lima/yolobox/disk` is sparse: it reads 100G and allocates only what
+the guest wrote. The guest mounts `/` with `discard` and `fstrim.timer`
+runs weekly, so freed blocks are punched back out of the host file.
+Over-declaring the ceiling costs nothing, which is the intended use.
 
-Two failure modes are worth recognising. First, deleting a build directory that
-the project's `.gitignore` does NOT ignore dirties the VM worktree, and
-`receive.denyCurrentBranch = "updateInstead"` then refuses every later `git push
-yolobox`. It surfaces much later, on an unrelated push, with no obvious link back.
-Anchoring matters: `iurii.net/.gitignore` anchors `/node_modules` and `/.next/`
-with leading slashes, so a nested `web/node_modules` is NOT ignored, while rune's
-unanchored `target/` is matched anywhere. Hence `--deep` gates every directory
-deletion on `git check-ignore`.
+Raising the ceiling has two halves, and they do two different things.
+`fileSystems."/".autoResize` was already set; it renders `x-systemd.growfs`
+into `/etc/fstab`, which grows the ext4 *filesystem* to fill whatever
+partition it already sits in — that half was never the gap. The host half
+is `limactl edit yolobox --disk <GiB>`, grow-only, instance stopped. The
+guest half is `boot.growPartition = true` in `nix/base.nix`: a `growpart`
+unit that runs before `systemd-growfs-root.service` and grows the
+*partition*, vda2, to fill the disk. Its `SuccessExitStatus = "0 1"` makes
+an already-grown boot a harmless no-op, so re-running it on every later boot
+costs nothing. This partition-growing half was missing, because vda2 only
+reached 99.7G thanks to nixos-lima's own image config growing it at first
+boot, before our config took over.
 
-Second, `nix-collect-garbage -d` is unsafe in one specific state: if the disk
-filled mid-`nixos-rebuild switch`, the switch half-fails and `readlink
-/run/current-system` disagrees with `readlink /nix/var/nix/profiles/system` —
-the system is running one generation while the profile points to another. `-d`
-would then delete the generation actually booted. See "The ESP is 249 MiB..."
-for how that disagreement looks and why a full disk is one way to produce it.
-`yo gc` compares the two readlinks itself and skips the nix step when they
-disagree, so the guard is not a manual pre-flight — but the skip is reported,
-and a reported skip means the box needs a repaired switch before it needs a
-garbage collection.
+Skipping the guest half is silent: the backing file grows, the guest boots
+clean, `df` is unchanged, and nothing logs. `systemctl show -p LoadState
+--value growpart` must answer `loaded`; `not-found` means the running
+generation cannot grow anything. `growpart` only runs on a boot whose
+generation carries the option, so the switch must land before the resize —
+`yo disk-grow` checks this before touching anything.
 
 ## Browsers and the virtual display
 
-The nixpkgs `playwright-mcp` wrapper `--set`s `PLAYWRIGHT_BROWSERS_PATH` to
-the full browsers bundle unconditionally, so setting that variable at the
-config level is a no-op — this supersedes the old Gotcha 9 note that used to
-live in `nix/agentic.nix`. The wrapper also exports `PLAYWRIGHT_MCP_ISOLATED=1`
-unless `PLAYWRIGHT_MCP_USER_DATA_DIR` is set, and passing both throws; the
-per-engine wrapper scripts export the user-data-dir env before `exec` so
-isolated mode never turns on.
+The nixpkgs `playwright-mcp` wrapper sets `PLAYWRIGHT_BROWSERS_PATH`
+unconditionally, so setting it in config is a no-op. It also exports
+`PLAYWRIGHT_MCP_ISOLATED=1` unless `PLAYWRIGHT_MCP_USER_DATA_DIR` is set,
+and passing both throws; the per-engine wrappers export the user-data-dir
+before `exec`.
 
-Upstream's headed/headless choice is `headless = linux && !DISPLAY`: a
-missing `DISPLAY` silently degrades to headless instead of failing. The
-wrapper checks the X socket itself and refuses loudly if the display isn't
-up, rather than falling through to a silent headless run.
+Upstream picks headless whenever `DISPLAY` is unset, silently. The wrapper
+checks the X socket itself and refuses loudly instead.
 
-Project identity for a browser profile is the git toplevel path relative to
-`~/wrk`, slashes turned into `--` — not `basename($PWD)`. Basename would
-merge unrelated `a/web` and `b/web` into one profile (cookie bleed across
-projects) and would split subdirectory-started sessions of the same repo
-into separate profiles.
+A browser profile is named after the git toplevel relative to `~/wrk`,
+slashes turned into `--`. A basename would merge `a/web` with `b/web` and
+split sessions started from a subdirectory.
 
-`openbox` readiness is an `ExecStartPre` that waits on the X socket, not a
-`Restart=` crash loop: five restarts in ten seconds trips systemd's default
-start-limit and leaves the unit permanently failed.
+Things learned the hard way, each one line:
 
-Use `pkgs.xvfb`, not the deprecated `pkgs.xorg.xvfb` alias. Its
-`meta.mainProgram` is wrongly set to `"X"`, so `lib.getExe` on it resolves to
-a binary that doesn't exist — spell out `${pkgs.xvfb}/bin/Xvfb` directly.
-
-No project-local tmpfiles rule for `/tmp/.X11-unix`: systemd's own `x11.conf`
-already ships one, and a duplicate just logs errors every boot.
-
-The `yolobox-screen-record` pidfile lives under `~/.local/state/yolobox`, not
-`/run/user/$UID`: `/run/user/$UID` is destroyed at last-session logout, but
-the backgrounded `ffmpeg` survives it (NixOS sets `KillUserProcesses=false`),
-which would orphan a recording no one can finalize. `SIGINT` finalizes the
-mp4; `SIGKILL` corrupts it.
-
-Fonts matter now: headless rendering worked with no `fonts.packages` at all;
-headed screenshots without fonts render as tofu.
-
-`yolobox-mcp-smoke` spawns the MCP servers with env rendered from its own
-cwd, so it creates a stray profile and artifacts directory named after that
-cwd. Harmless, just a smoke-test byproduct.
-
-Same-engine, same-project concurrency (two sessions racing the one
-persistent profile) produces no lock error and no hang: Chromium's singleton
-lock forwards the second launch to the running instance (~8s), so concurrent
-same-project sessions silently share one browser. Not isolation, but not a
-failure either.
-
-Chromium launches and navigates sandboxed (no `--no-sandbox`) as the
-non-root guest account; Firefox likewise needed no dbus workaround.
-
-Profiles persist per project, but Chromium's LevelDB-backed storage flushes
-lazily — a session killed without `browser_close` can lose its last write
-(verified: a write two generations back survived, the latest didn't). End
-sessions with a clean `browser_close` before shutdown.
-
-Default nixpkgs ffmpeg has no x11grab (built with
-`--disable-xlib`/`--disable-libxcb*`) — that's why `nix/display.nix` uses
-`ffmpeg-full`.
-
-Native browser video is `browser_start_video` / `browser_stop_video` (gated
-by `--caps devtools`), verified producing VP8 webm in
-`~/artifacts/<project>/`.
+- `openbox` waits for the X socket in `ExecStartPre`; a `Restart=` loop
+  trips systemd's start limit and stays failed.
+- Use `${pkgs.xvfb}/bin/Xvfb`; `lib.getExe` on it names a binary that does
+  not exist.
+- No tmpfiles rule for `/tmp/.X11-unix`; systemd ships one.
+- The screen-record pidfile lives in `~/.local/state/yolobox`, because
+  `/run/user/$UID` dies at logout while the backgrounded `ffmpeg` survives.
+  `SIGINT` finalizes the mp4; `SIGKILL` corrupts it.
+- Headed screenshots without `fonts.packages` render as tofu.
+- Default ffmpeg has no x11grab; `nix/display.nix` uses `ffmpeg-full`.
+- Two same-project sessions on one engine share one browser: Chromium's
+  singleton lock forwards the second launch (~8 s). Not isolation, not a
+  failure.
+- Chromium's storage flushes lazily; a session killed without
+  `browser_close` can lose its last write.
+- `yolobox-mcp-smoke` creates a stray profile named after its own cwd.
+  Harmless.
 
 ## Herd reporting: recognising a silent failure
 
-Only two of the in-box harnesses report into the herd: **claude** (via a
-hook map) and **pi** (via a bundled herd-report extension) — see
-`nix/herd-report.nix`. opencode and codex lost theirs when `nix/herd.nix`
-was deleted. An unreported agent still runs fine; it shows as `unknown`
-rather than `yolobox:<agent>`.
+Only claude (a hook map) and pi (a bundled extension) report into the
+herd; see `nix/herd-report.nix`. An unreported agent runs fine and shows as
+`unknown`. Reporting rides `yo enter` only — it forwards the herdr socket
+to `/run/yolobox/herd-host.<pane>.sock` and sets the herd env. `yo ssh`,
+`yo code`, `yo zed` and t3-spawned agents carry neither, so they show as
+`unknown` by design.
 
-pi's extension reaches pi through auto-discovery: `nix/herd-report.nix` links
-it into `~/.pi/agent/extensions/`, next to the pi-mcp-adapter package (its one
-skill is linked into `~/.pi/agent/skills/`).
+A herdr-installed `~/.pi/agent/extensions/herdr-agent-state.ts` reports
+under `herdr:pi`, a source the server reserves for itself, and knocks pi
+out of the herd. A tmpfiles `r` rule deletes it on every boot and switch.
 
-A herdr-installed `~/.pi/agent/extensions/herdr-agent-state.ts` (written by
-herdr's own integration installer) silently knocks pi out of the herd: it
-reports under source `herdr:pi`, which the server reserves for its own
-screen/session detection and clears for a boxed agent. A tmpfiles `r` rule
-in `nix/herd-report.nix` deletes it on every boot and switch.
+Two defects once made every in-VM claude session invisible.
 
-Herd wiring rides `./yo enter` only — the forwarded socket and the herd
-env come from `cmd_enter`. `./yo ssh` deliberately carries neither. `yo code`
-and `yo zed` sessions carry no herd env either — agents started from editor
-terminals report as `unknown`; expected, not a failure. t3-spawned claude is
-a partial exception now (see the wrapper below): it carries the hooks, since
-t3 execs `claude` from `/run/current-system/sw` and picks up the wrapper like
-any other caller, but it still has no `HERDR_PANE_ID` or forwarded socket
-unless something arranges one, so it still cannot actually report — it just
-now fails for the *expected* reason (no herd env) instead of the old one (no
-hooks).
+**Version drift.** Homebrew herdr moved to 0.8.2 (protocol 20) while the
+box was pinned at 0.8.0 (protocol 19), and every report was rejected with
+`protocol_mismatch`. The protocol moved across a patch bump, so only exact
+version equality is an honest proxy. The pin is gone: the box tracks
+nixpkgs' `pkgs.herdr`, with `yolobox.harness.herdr.version`/`hash` as an
+escape hatch for when nixpkgs lags. `yo enter` refuses on drift (exit 3;
+`YOLOBOX_SKIP_HERD_CHECK=1` overrides, needed when nixpkgs has no matching
+version yet), `yo status` warns, `yo herd-check` proves the chain.
 
-The forwarded herdr socket lives at `/run/yolobox/herd-host.<pane>.sock`; the
-tmpfiles rule in `nix/base.nix` explains why it is not under `$HOME`.
+**The hooks never ran.** Claude Code assembles policy settings from three
+tiers — remote, MDM, `/etc/claude-code/managed-settings.json` — and takes
+only the first non-empty one, no merge. `~/.claude/remote-settings.json`
+holds `{"channelsEnabled": true}`, which is enough to make the remote tier
+win and drop the `/etc` file whole, with no log line. The remote payload is
+re-applied about 180 ms into every session, so even an empty cache would
+not help. The policy channel is therefore unusable. The fix is a `claude`
+wrapper on the VM's PATH that prepends `--settings
+/etc/claude-code/herd-hooks.json`; that channel is always honoured and was
+verified to survive the mid-session refresh.
 
-Every in-box claude session was invisible in the host herd until two
-independent defects were found and fixed, and the second one overturns an
-invariant this section used to state as fact — read it before trusting
-anything the log does or doesn't show.
+The absence of `~/.local/state/yolobox/herd-report.log` proves nothing: a
+hook that never runs writes nothing. When an agent is missing from the
+herd, work down this ladder:
 
-**Defect 1 — herdr protocol drift.** The Mac's Homebrew herdr self-updated to
-0.8.2 (wire protocol 20) while the box stayed pinned at 0.8.0 (protocol 19).
-Every report was rejected with `protocol_mismatch`. The sharp edge: the
-protocol moved across a *patch* bump, so version equality — not
-major.minor equality — is the only honest cheap proxy for compatibility.
-The pin was a hand-copied duplicate of a fact that lives on the host and
-updates itself behind Homebrew, so drift was the design, not an accident.
-Fixed structurally: `yolobox.harness.herdr.version`/`hash` now default to
-null so the box tracks nixpkgs' `pkgs.herdr`, and the version/hash option
-remains only as an escape hatch for when nixpkgs lags a herdr release. The
-invariant to hold is: **the box's herdr version must equal the Mac's
-Homebrew herdr version.** `yo enter` refuses on drift (exit 3, overridable
-with `YOLOBOX_SKIP_HERD_CHECK=1` — load-bearing, because during a nixpkgs
-lag there may be no remedy at all and `yo enter` is the one command with no
-other workaround); `yo status` reports the drift without failing;
-`yo herd-check` is the authoritative end-to-end proof.
-
-**Defect 2 — claude never ran the hooks at all, and this is the one worth
-remembering.** The hook map in `/etc/claude-code/managed-settings.json` was
-always correct — the byte-identical file passed as `--settings` fires every
-event. But Claude Code 2.1.220 assembles `policySettings` from three tiers —
-remote server-fetched managed settings, MDM, then
-`/etc/claude-code/managed-settings.json` — and takes **only the first
-non-empty tier, with no merge**. This account's `~/.claude/remote-settings.json`
-holds `{"channelsEnabled": true}`; that single flag makes the remote tier
-non-empty, so it becomes the entire `policySettings` object and the `/etc`
-file is discarded wholesale. Nothing warns, nothing logs. Proven causally:
-emptying that cache to `{}` made the hooks fire immediately and created the
-rejection log for the first time ever; restoring the flag stopped them
-again. Worse, the remote payload is re-fetched and re-applied roughly 180ms
-into every session (`Programmatic settings change notification for
-policySettings` in `--debug` output), so it clobbers policySettings
-mid-session too — even an initially-empty cache would not have saved it.
-The policy channel is therefore unusable for this, permanently.
-
-The fix is the `flagSettings` channel: the same hook map is rendered to
-`/etc/claude-code/herd-hooks.json` and delivered by a `claude` wrapper on the
-box's PATH that prepends `--settings`. claude adds `flagSettings` to its
-allowed sources unconditionally, and those hooks were verified to survive
-the mid-session remote refresh.
-
-**The invariant this section used to state, and why it was false.** It used
-to say that a rejected report "does get logged, to
-`~/.local/state/yolobox/herd-report.log`." That log's absence proves
-nothing: a hook that never runs writes nothing, and the socket guard exits 0
-before the log path is even reached — exactly defect 2's failure mode, and
-it produced total silence, not a rejection entry. The log file had never
-been created in any session, going back weeks. The host's herdr server log
-does not record `protocol_mismatch` rejections either, so its silence is not
-evidence in the other direction.
-
-When an agent shows nothing in the herd, work down this ladder rather than
-guessing:
-
-1. `ls -l /run/yolobox/` — is the forwarded socket there at all. No socket
-   means the `-R` forward failed to bind, and the ssh client said so at
-   connect time (`Warning: remote port forwarding failed for listen path
-   ...`) — usually `/run/yolobox` missing after a `switch` that was never
-   followed by a reboot.
+1. `ls -l /run/yolobox/` — no socket means the `-R` forward failed to bind,
+   and ssh said so at connect time; usually `/run/yolobox` missing after a
+   switch with no reboot.
 2. `sudo strace -f -qq -e trace=execve -p <claude pid>` grepped for
-   `herd-report` — do the hooks actually run at all. `sudo` is required
-   because `kernel.yama.ptrace_scope=1` blocks an unprivileged tracer.
-3. `strace -e trace=openat claude mcp list | grep managed-settings` — is the
-   file even read. This is already answered yes, so don't re-derive it: the
-   file being read tells you nothing, because it is read and then discarded
-   whole by the tier collapse in defect 2.
-4. `claude --debug` and grep for `Hook output` / `policySettings` — the
-   authoritative view of which channel actually won.
+   `herd-report` — do the hooks run at all. `sudo`, because
+   `ptrace_scope=1`.
+3. `claude --debug` grepped for `Hook output` / `policySettings` — which
+   channel won.
 
-A measurement trap that fooled this diagnosis twice, worth recording
-alongside the ladder above: a headless `claude -p '<prompt>'` run fires the
-entire session lifecycle in about two seconds — `SessionStart` reports
-`idle`, `UserPromptSubmit` reports `working`, `Stop` reports `idle`, and
-`SessionEnd` reports `release`. That last hook is what removes the agent
-from the herd, and it is correct behaviour, not a bug — it is the mechanism
-that stops dead sessions lingering there forever. The trap is that running
-`claude -p ...` and then looking at the herd afterwards shows no agent,
-because it registered and unregistered before you looked, and that end
-state is **identical** to the one produced by hooks that never ran at all —
-the actual defect this section exists to help diagnose. Same observation,
-opposite causes. What broke the tie both times was removing `SessionEnd`
-from a throwaway copy of the hook map and re-running: the agent then stayed
-visible as `agent=claude status=done`, proving the reports had been landing
-the whole time. The reliable ways to avoid the trap, in order worth trying:
-use an interactive `claude` with no `-p`, since it stays registered until
-you quit and the herd can actually be observed; read
-`~/.local/state/yolobox/herd-report.log`, which as of the loud-reporter
-change above records each failed report with the guest herdr version and
-socket path, so a genuine failure now says so instead of staying silent; or
-watch the herd while the headless run is still in flight rather than after
-it exits. One related "looks broken, isn't": an orphaned socket in
-`/run/yolobox/` left by a dead `yo enter` (no listener, so a report against
-it answers `server_not_running`) is harmless — `nix/base.nix` sets
-`StreamLocalBindUnlink = "yes"`, so the next `yo enter` from that pane
-unlinks and rebinds it.
+A measurement trap that fooled this twice: `claude -p '<prompt>'` runs the
+whole lifecycle in two seconds — `SessionStart`, `UserPromptSubmit`,
+`Stop`, `SessionEnd` — and `SessionEnd` releases the agent from the herd.
+So a headless run followed by a look at the herd shows nothing, exactly
+like hooks that never ran. Use an interactive `claude`, read the log, or
+watch the herd while the run is in flight. A leftover socket from a dead
+`yo enter` answers `server_not_running` and is harmless;
+`StreamLocalBindUnlink` lets the next `yo enter` rebind it.
 
-A grep gotcha that cost real minutes, worth recording: filtering
-`/proc/<pid>/environ` for the herd variables needs
-`grep -E '^(YOLOBOX_HERD|HERDR_)'`. Writing `'^(HOME|HERDR_|PATH)='` silently
-matches nothing, because the `=` binds after the alternation — it searches
-for a variable literally named `HERDR_`. It briefly looked like claude was
-scrubbing the env; it was not.
+The reporter always exits 0, with one exception: `SessionStart` exits 1 on
+a failed report and writes the diagnostic to stderr, where Claude Code
+surfaces it. It is off the work path, so it cannot interrupt anything;
+`PreToolUse` fires on every tool call and would turn one broken socket
+into a wall of warnings. Each log line carries the guest herdr version and
+socket path.
 
-The reporter's always-exit-0 contract now has one deliberate exception:
-`SessionStart` routes to a `start` state token which, on a failed report,
-writes the diagnostic to stderr as well as the log and exits 1. That is safe
-because SessionStart is off the work path — it runs once, before any tool
-call, and cannot interrupt anything in flight — and Claude Code treats a
-nonzero-but-not-2 hook exit as a non-blocking error whose stderr surfaces to
-the user. The other five events keep exit-0 verbatim: `PreToolUse` fires on
-every tool call and would otherwise turn one broken socket into a wall of
-warnings. The log line now carries the guest herdr version and socket path
-so a rejection is self-describing without cross-referencing nix files.
+`yo herd-check` proves the chain end to end. Run it from a herdr pane with
+no agent on it: it reports and then releases that pane.
 
-`yo herd-check` proves the whole chain end to end — host server health,
-version parity, the forwarded socket, a reporter round trip, a release round
-trip, that the hook map's commands exist, and that claude actually executes
-them. Run it from a herdr pane with no agent on it: it reports and then
-releases that pane, so a live agent's pane is not the one to use.
+Do not add age-based tmpfiles cleanup for stale sockets: `relatime` caps
+the atime refresh at about a day and an established connection touches
+nothing, so an age would reap a live pane's socket.
 
-Do not add age-based tmpfiles cleanup for stale sockets. `connect(2)` on a
-pathname socket bumps atime (`unix_find_bsd()` → `touch_atime()`), but
-`relatime` caps the refresh at roughly 24h and traffic on an established
-connection touches nothing — so an `age` would reap a live pane's socket and
-silently kill its reporting. tmpfs makes the question moot anyway.
+Grep gotcha: filtering `/proc/<pid>/environ` needs
+`grep -E '^(YOLOBOX_HERD|HERDR_)'`. Writing `'^(HOME|HERDR_|PATH)='` binds
+the `=` after the alternation and matches nothing.
 
 ## pi's settings.json belongs to pi
 
-`~/.pi/agent/settings.json` is pi's own writable file. pi rewrites it on its
-own (theme, model, `lastChangelogVersion`, and every `pi install`), and its
-write path logs the error instead of raising it. So neither nix nor
-`~/.dotfiles` may link it — `~/.dotfiles/_do_install.sh` deliberately never
-links it either.
+pi rewrites `~/.pi/agent/settings.json` on its own and logs, rather than
+raises, a failed write. A deleted `nix/pi.nix` (`cb5e863`) once linked it
+to `/etc/static/...`; the module went, the dangling link stayed, and since
+that file is the only place pi keeps its `packages` list, nothing from
+`~/.dotfiles/pi/packages.json` installed. `pi list` said "No packages
+installed" and `cc-compat` complained that `AskUserQuestion` was
+unavailable on every start.
 
-A deleted `nix/pi.nix` module (commit `cb5e863`) used to render
-`/etc/yolobox/pi/settings.json` and seed the home copy. The module went, the
-seeded symlink stayed: `~/.pi/agent/settings.json ->
-/etc/static/yolobox/pi/settings.json` dangled in the VM home until it was
-removed by hand.
+Recognise it with `ls -l ~/.pi/agent/settings.json`: a symlink is the
+defect, `rm` is the fix. No tmpfiles rule can do this — there is no
+"delete only if dangling", and an unconditional `r` would delete the real
+file.
 
-Consequence, while it dangled: `settings.json` is the only place pi keeps its
-`packages` list, so nothing pinned in `~/.dotfiles/pi/packages.json`
-installed. `pi list` printed "No packages installed",
-`~/.pi/agent/npm/node_modules` did not exist, and `cc-compat` printed
-"AskUserQuestion is unavailable — cannot load
-@juicesharp/rpiv-ask-user-question@not installed" on every start.
+The VM has no C or Python toolchain, so an extension pulling a native
+module without an aarch64 prebuild cannot install. That dropped
+`@plannotator/pi-extension` (`node-pty` prebuilds darwin and win32 only).
+Prebuilt glibc packages like `@ast-grep/napi` are fine.
 
-How to recognise it: `ls -l ~/.pi/agent/settings.json`. A symlink there is
-the defect. Fix is `rm` — pi recreates the file on its next write. No
-tmpfiles rule can do this instead: there is no "delete only if dangling"
-rule, and an unconditional `r` would delete the real settings file pi
-creates in its place.
-
-Apply the pinned list with pi's own command, `pi install <source>` per
-entry — never by writing pi's settings file by hand.
-
-The box carries no C or Python toolchain, so an extension whose dependency
-tree holds a native module without an aarch64 prebuild cannot install: npm
-falls back to `node-gyp`, which finds no `python3`, `gcc` or `make`. This
-dropped `@plannotator/pi-extension` from the pinned list — it pulls
-`node-pty`, whose 1.1.0 release ships prebuilds for darwin and win32 only,
-so on aarch64-linux it always falls through to a compile.
-Prebuilt native packages are fine: `@ast-grep/napi` and its `ast-grep` binary
-(pi-lens, pi-simplify) load and run as glibc builds.
-
-Division of ownership worth stating once: the flake owns only
-`pi-mcp-adapter`, the herd-report extension, and the `mcp-scripting` skill.
-The user layer — skills, agents, prompts, `cc-compat`, packages — comes from
-`~/.dotfiles/_do_install.sh`, which must be re-run inside the VM after a
-dotfiles pull.
-
-Two extensions that register the same tool name kill pi at startup: it
-refuses to load and names both files. This retired the flake's own pi-lsp
-extension, which collided with pi-lens (`lsp_diagnostics`) from the user
-layer — pi-lens covers basedpyright off the same devbox PATH plus every
-other language, so pi's LSP now belongs to the user layer entirely. A
-retired `L+` link is not removed by the rebuild that drops its rule: delete
-`~/.pi/agent/extensions/<name>` and any stale config by hand, or pi keeps
-loading the previous closure.
+Ownership: the flake owns `pi-mcp-adapter`, the herd-report extension and
+the `mcp-scripting` skill. Skills, agents, prompts, `cc-compat` and
+packages come from `~/.dotfiles/_do_install.sh`, re-run after a dotfiles
+pull. Two extensions registering the same tool name kill pi at startup —
+that retired the flake's pi-lsp extension in favour of pi-lens. A retired
+`L+` link is not removed by the rebuild that drops it; delete it by hand.
 
 ## t3: a nix-built npm CLI, run as a service
 
-`nix/pkgs/t3.nix` builds the npm package `t3` (t3code) from its registry
-tarball; `nix/t3.nix` puts it in `environment.systemPackages` and runs
-`t3 serve --host 127.0.0.1 --port 3773` as `systemd.services.t3` under
-the guest account. Loopback inside the guest — but not private to the Mac:
-`lima/yolobox.yaml` declares a `guestPort: 3773` forward with
-`hostIP: "0.0.0.0"`, and lima's forwarder dials the guest's loopback from
-*inside* the guest, so the port is published on every host interface without
-the guest firewall (NixOS default-deny, only 22 open) ever being traversed.
+`nix/pkgs/t3.nix` builds `t3` from its npm tarball; `nix/t3.nix` runs `t3
+serve --host 127.0.0.1 --port 3773` as the guest account. Loopback in the
+guest, but lima forwards 3773 with `hostIP: "0.0.0.0"`, dialing from
+inside the guest, so the guest firewall is never traversed.
 
-But that forward is inert on a VM that already exists. Lima materialises the
-instance config at *creation* time into `~/.lima/yolobox/lima.yaml`, and
-`yo up` on an existing instance runs `limactl start --yes yolobox`, which
-reads that copy; `cmd_up` names `lima/yolobox.yaml` only in the branch that
-creates a missing instance. So the repo file is authoritative exactly once,
-and everything after that is drift — verified here: the 3773 rule was in the
-repo file and absent from `~/.lima/yolobox/lima.yaml`. Migrating an existing
-VM means stopping it (`limactl edit` on a running instance is a hard
-`cannot edit a running instance`) and restating the whole array:
+`t3 serve`'s `$HOME` must equal an interactive session's: `t3 pair` finds
+the server through `$HOME/.t3/*/server-runtime.json`, and a mismatch makes
+`yo t3` say "No running T3 Code server found" while the unit is active.
+The unit gets `HOME` and a `path` entry for `/run/current-system/sw`, using
+the `path` option because `environment.PATH` is already defined for every
+service.
+
+The forward is inert on an instance that already exists: lima copies
+`lima/yolobox.yaml` into `~/.lima/yolobox/lima.yaml` at creation and reads
+only that afterwards. Migrating means stopping and restating the whole
+array, because lima's yq cannot read the repo file:
 
 ```sh
 limactl stop yolobox
@@ -588,193 +383,78 @@ limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"hostIP":"0.0.0.0
 ./yo up
 ```
 
-The udp/68 rule is repeated there because `--set` is yq v4 and lima
-deliberately disables yq's `load`/`load_str`/`env` operators (see
-`limactl help yq-restrictions`), so the expression cannot read
-`lima/yolobox.yaml` and merge from it. `yo` does not paper over the drift on
-purpose: syncing would need a YAML parser on the host, and only Homebrew's
-python3 carries one here — the system python3 does not.
+### Why package.json is patched
 
-`t3 serve`'s `$HOME` must be the exact same `$HOME` an interactive SSH
-session gets — `t3 pair` (run interactively to mint the web UI's pairing
-token) discovers the running server by looking for
-`$HOME/.t3/{userdata,dev}/server-runtime.json`, so a mismatch here makes
-`yo t3` fail with "No running T3 Code server found" even though the
-service is active. This is exactly the failure mode the guest-account
-mirroring below exists to prevent.
+The published `package.json` carries pnpm-style `overrides` with
+`parent>child` keys, which npm rejects with `EINVALIDPACKAGENAME` once the
+package is the install root. `postPatch` deletes the field with `jq`,
+called by store path, because the same `postPatch` runs inside the
+npm-deps fixed-output derivation, which does not inherit
+`nativeBuildInputs`. The vendored `t3-package-lock.json` must be generated
+from the stripped file. Version bump: pin the tarball hash; unpack, `jq
+'del(.overrides)'`, `npm install --package-lock-only --ignore-scripts`,
+vendor the lock; build with a wrong `npmDepsHash` and pin what nix reports.
 
-The service gets `HOME` and a `path` entry for `/run/current-system/sw`,
-because a system unit inherits neither a login PATH nor a home, and t3
-shells out to the harnesses it drives (claude, opencode) and to git.
-Use the `path` option, not `environment.PATH`: NixOS already defines
-`environment.PATH` for every service, so a second definition is an
-option conflict, not an override.
+### Why dist/bin.mjs is patched
 
-### Why the package.json must be patched
+t3's Claude probe hardcodes `strictMcpConfig: true`, which Claude Code
+refuses when an enterprise MCP config exists — and `nix/mcp.nix` renders
+one at `/etc/claude-code/managed-mcp.json`. t3 swallows the failure
+completely; nothing reaches journald. The evidence is
+`~/.t3/caches/claudeAgent.json`: `status: "warning"`, `auth: {"status":
+"unknown"}`, no slash commands. `postPatch` flips the flag to `false`. The
+cache survives rebuilds — delete it, restart the unit, read it back.
 
-The published `package.json` carries the t3code monorepo's pnpm-style
-`overrides`, whose keys use the `parent>child` form
-(`"@clerk/clerk-js>@base-org/account": "-"`). npm accepts those keys in a
-workspace root but validates them as package names once this package is the
-install root, so any npm command dies with `EINVALIDPACKAGENAME`. Thus
-`postPatch` deletes the field with `jq` before npm sees it. It calls jq by
-store path rather than through `nativeBuildInputs`, because the same
-`postPatch` also runs inside the npm-deps fixed-output derivation, which
-does not inherit build inputs — a jq from `nativeBuildInputs` gives
-`jq: command not found` there and nowhere else.
+### Why nix builds it
 
-The vendored `nix/pkgs/t3-package-lock.json` must be generated from the
-*stripped* package.json, or the same rejection happens at lock time. The
-version-bump ritual is therefore three hashes in order: fetch the new
-tarball and pin its `hash`; unpack it, `jq 'del(.overrides)'`, run
-`npm install --package-lock-only --ignore-scripts`, and vendor the result;
-then build once with a wrong `npmDepsHash` and pin the hash nix reports.
-
-### Why dist/bin.mjs must be patched too
-
-t3's Claude capability probe hardcodes `strictMcpConfig: true`. Claude Code
-refuses `--strict-mcp-config` whenever an enterprise MCP config is present,
-and `nix/mcp.nix` renders exactly that at `/etc/claude-code/managed-mcp.json`.
-So the probe exits 1 within ~150ms with "You cannot use --strict-mcp-config
-when an enterprise MCP config is present".
-
-Recognising it is the hard part, because t3 hides the failure completely: the
-probe options set `stderr: () => {}` and the call site is wrapped in
-`Effect.orElseSucceed(() => void 0)`. Nothing reaches journald — `journalctl -u
-t3 | grep -c claude` returns 0 even while this is happening. The evidence lives
-in `~/.t3/caches/claudeAgent.json` instead: `status: "warning"`, `auth:
-{"status": "unknown"}`, no slash commands, and the message "Could not verify
-Claude authentication status from initialization result."
-
-The `postPatch` flips the flag to `false`. The cost is that each probe now
-starts the three servers in `managed-mcp.json` instead of being isolated from
-them; they are short-lived node processes, and playwright starts no browser
-until a tool call, so the probe still finishes well inside its 25s timeout.
-
-That cache is not invalidated by a rebuild. To re-test, delete
-`~/.t3/caches/claudeAgent.json`, restart the unit and read the file back — do
-not go looking in journald.
-
-### Why nix builds it at all
-
-`node-pty@1.1.0` ships prebuilds for darwin and win32 only, and its install
-script is `node scripts/prebuild.js || node-gyp rebuild`, so on aarch64-linux
-it compiles. `python3` is in `nativeBuildInputs` for exactly that. Building in
-nix is what keeps the box's runtime free of a C and Python toolchain — the
-same absence that blocks `pi install` of native extensions.
+`node-pty` compiles on aarch64-linux, so `python3` is in
+`nativeBuildInputs`. Building in nix is what keeps the VM's runtime free
+of a C and Python toolchain.
 
 ### Log noise that is not a failure
 
-No `linux-arm64` `dist/resource-monitor` binary ships upstream (darwin-arm64,
-darwin-x64, linux-x64, win32-x64 only), so t3 reports resource monitoring as
-unsupported and carries on.
+No `linux-arm64` resource-monitor binary ships, so t3 reports monitoring
+unsupported. `Grok CLI health check failed` means no grok binary. `Failed
+to flush telemetry` repeats every second when the endpoint is unreachable.
 
-`Grok CLI health check failed { errorTag: 'PlatformError' }` at startup only
-means the grok binary is not in the box. Same for any other provider CLI the
-box does not carry.
+### Pairing
 
-`Failed to flush telemetry ... HttpClientError` repeats every second when t3
-cannot reach its telemetry endpoint. It does not stop the server.
+A bare URL fails auth; `t3 serve` prints a pairing URL in `journalctl -u
+t3`, or `t3 pair` mints one. `t3 pair` builds the URL from the `--host`
+the server started with, `127.0.0.1`, useless elsewhere and with no
+override; only `t3 auth pairing create --base-url` takes one, which is why
+`yo pair` is a separate command that defaults to
+`http://<LocalHostName>.local:3773` and prints instead of opening.
 
-### The web UI needs a pairing token
-
-A bookmarked bare URL fails auth. `t3 serve` prints a Pairing URL at startup —
-read it from `journalctl -u t3` — or mint a fresh one from an ssh session with
-`t3 pair`, which is why the package is in `systemPackages` and not only in the
-unit.
+Pairing runs client→server only; no server-to-server pairing exists. Two
+boxes are driven from one browser: `yo pair` on each, both URLs redeemed
+in the same browser, both appear in its environment list.
 
 ### An empty page means lima's forwarder died, not t3
 
-A browser shows an empty page or a reset error (`NS_ERROR_NET_EMPTY_RESPONSE` in
-Firefox) when accessing t3. From the Mac, `curl -v http://127.0.0.1:3773/`
-connects and sends the request but receives `Recv failure: Connection reset by
-peer` — zero bytes returned. Meanwhile inside the box, `curl` against the same
-address returns 200 and `ss -lntp` shows t3 listening normally. That asymmetry
-is the diagnosis itself; nothing about t3 is wrong.
+From the Mac, `curl -v http://127.0.0.1:3773/` gets `Connection reset by
+peer` with zero bytes, while inside the VM the same request returns 200.
+That asymmetry is the diagnosis. `~/.lima/yolobox/ha.stderr.log` repeats
+`tcpproxy: ... grpc: the client connection is closing`.
 
-The evidence lives in `~/.lima/yolobox/ha.stderr.log`, which repeats on each
-connection attempt:
+Lima 2.2.0 carries the guest-agent streams and the TCP tunnel on one grpc
+connection. When the guest agent restarts, the host agent dials a new
+connection, but an existing listener keeps its old dialer, so every
+forwarded port accepts and then resets, permanently. Unreported upstream
+(see `TODO.md`).
 
-```
-tcpproxy: for incoming conn 127.0.0.1:NNNNN, error dialing "127.0.0.1:3773": could not open tunnel for addr: 127.0.0.1:3773 error:rpc error: code = Canceled desc = grpc: the client connection is closing
-```
+Why it bites here: `services.lima.enable` makes `lima-init` and
+`lima-guestagent` ordinary units whose text embeds store paths, so a
+nixpkgs bump rehashes them and `switch` restarts both. Twenty switches on
+one pin never showed it; the first bump did. Pinned shut with
+`restartIfChanged = false` on both units. `yo` could not have caught it —
+every check ran on the healthy side of the hop, and a TCP-connect probe
+succeeds because the handshake completes before the reset. Recovery:
+`limactl stop yolobox && ./yo up`; nothing lighter restarts the host agent.
 
-This is a lima 2.2.0 defect in the port-forwarding internals. A single
-`grpc.ClientConn` carries the guest-agent Info/Events/SyncTime streams
-*and* the TCP `Tunnel` RPC. When the guest agent restarts — which happens
-when a `nixos-rebuild switch` changes the unit files textually (pure
-store-path churn from a nixpkgs bump) — the host agent closes that conn and
-dials a new one, rebuilding the dialer. But `pkg/portfwd/listener.go`'s
-`forwardTCP` short-circuits when a listener for that port already exists, so
-the accept loop that is already running keeps dialing the closed conn. The
-listener stays bound, so every forwarded port accepts and then resets,
-permanently. Nothing in the reconnect path closes or refreshes existing
-listeners. This is unreported upstream; `v2.2.0...master` carries no fix.
+### `lsof` shows lima on `*:80` and `*:443`
 
-The reason this is a trap unique to this repo: `services.lima.enable = true`
-in `nix/base.nix` makes nixos-lima declare `lima-init` and `lima-guestagent`
-as ordinary NixOS units, whose `Environment=` and `ExecStart=` embed store
-paths. A nixpkgs bump rehashes coreutils/systemd/tzdata — semantics
-byte-identical, pure store-path churn — and `switch-to-configuration` restarts
-both units. So an in-VM `nixos-rebuild switch` breaks the Mac's port
-forwarding whenever, and only whenever, the nixpkgs pin moved. A machine that
-stayed on the same pin for twenty switches never saw the breakage; the first
-bump after that triggered it. This is now pinned shut with `restartIfChanged =
-false` on both units in `nix/base.nix`.
-
-The breakage is not limited to 3773: every dynamically forwarded port dies the
-same way, including the project caddy on 80/443. Why `yo` could not have caught
-it: `t3_require_service` asks the guest's `systemctl` over ssh, and `t3 pair`
-runs in the guest too — every check sat on the healthy side of the broken hop.
-A bare TCP-connect probe cannot catch it either; lima's tcpproxy accepts before
-it resets, so the probe would complete the handshake and be dropped. A real
-HTTP request is required to expose the reset.
-
-Recovery, once broken: only a host-agent restart rebuilds the listeners.
-`limactl stop yolobox && ./yo up` does this; there is no lighter command.
-`limactl` exposes no way to restart just the host agent without stopping the
-guest.
-
-### The pairing URL's host is whatever `--host` the server was started with
-
-t3 computes it as `resolveDirectPairingBaseUrl = (state) => state.devUrl ??
-resolveHeadlessConnectionString(state.host, state.port)`. The unit starts it
-with `--host 127.0.0.1`, so every URL `t3 pair` mints is loopback-only and
-useless on another machine — and `t3 pair` has no override for it. Only
-`t3 auth pairing create --base-url` takes one. That is why `yo pair` is a
-separate command rather than a flag on `yo t3`: it goes through
-`auth pairing create`, defaulting the base URL to
-`http://$(scutil --get LocalHostName).local:3773`, and prints the result
-instead of opening it locally.
-
-### Pairing runs client→server only; two boxes meet in one browser
-
-There is no operation that pairs two t3 servers with each other, so do not go
-looking for one. t3's own bundle documents `t3 auth pairing create` as "Issue
-a new *client* pairing token", redeeming a token yields a browser session, and
-the paired device type is one of `["desktop","mobile","tablet","bot"]`.
-Multi-machine use is a *client-side* list instead: the web UI carries the
-string `Click "Add environment" to pair another environment`, and the docs
-say "Every saved environment is offered, not only the local one". Thus the way
-to drive two VMs is one browser holding both environments — `yo pair` on each
-box, both URLs redeemed in the same browser.
-
-### `lsof` shows lima listening on `*:80` and `*:443` — pseudoloopback, not exposure
-
-`lsof -nP -iTCP -sTCP:LISTEN -a -c limactl` shows lima bound to the host
-wildcard on 80 and 443 while every other forwarded port sits on `127.0.0.1`.
-It looks like a hole and is not. From lima's `pkg/portfwd/listener_darwin.go`:
-when `hostIP == 127.0.0.1 && hostPort < 1024`, lima binds `0.0.0.0:<port>`
-instead, because on macOS a non-root process cannot bind `127.0.0.1:80` but
-*can* bind `0.0.0.0:80`. The listener it returns is a
-`pseudoLoopbackListener`, whose `Accept()` closes any connection whose peer
-is not loopback — so a LAN client completes the TCP handshake and is then
-dropped. The `<1024` boundary is why guest 8443 lands on `127.0.0.1:8443`
-while 80 and 443 do not.
-
-Deliberately left alone: an explicit `hostIP: "127.0.0.1"` would be a no-op,
-since that is already the resolved value and is exactly what triggers the
-branch; and remapping to unprivileged host ports would move the project's
-caddy off `https://localhost` for no security gain. The real cost is worth
-naming, though: lima occupies host ports 80 and 443 on every interface, so
-nothing else on the Mac can bind them.
+On macOS a non-root process cannot bind `127.0.0.1:80` but can bind
+`0.0.0.0:80`, so lima does that for any host port below 1024 and wraps it
+in a listener that drops any non-loopback peer after the handshake. Not
+exposure. The real cost: nothing else on the Mac can bind 80 or 443.
