@@ -36,6 +36,16 @@
     fsType = "ext4";
     options = [ "noatime" "nodiratime" "discard" ];
   };
+  # The two halves of growing the root disk, and they only work together:
+  # autoResize above grows the ext4 filesystem into vda2, this grows vda2
+  # into whatever the disk has become. Upstream orders the growpart oneshot
+  # before systemd-growfs-root, so a boot after `limactl edit --disk` picks
+  # up the extra space in that order and needs nothing else; SuccessExitStatus
+  # "0 1" makes the already-grown case a no-op on every later boot. Without
+  # this the bump is silent: the backing file gets bigger, the guest boots
+  # clean, vda2 stays where it was and df is unchanged. Only vda2 moves —
+  # vda1 ends at the sector vda2 starts on, so the ESP above is unaffected.
+  boot.growPartition = true;
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
   services.lima.enable = true;
