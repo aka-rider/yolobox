@@ -497,3 +497,16 @@ inside the box answers with the assumed-role ARN when the session is wired
 correctly, and "Unable to locate credentials" when it isn't — either because
 the shell predates setting `YOLOBOX_AWS_PROFILE`, or because it came in
 through `yo ssh` rather than `yo enter`.
+
+A third failure shape met on the very first launch: credentials arrive but
+`aws sts get-caller-identity` dies with `Could not connect to the endpoint
+URL: "https://sts.amazonaws.com/"`. That is DNS, not AWS: this Mac's DNS
+filter sinkholes the *global* `sts.amazonaws.com` name to 0.0.0.0, the
+guest inherits the Mac's resolver through lima's forwarder (192.168.5.2),
+and the CLI only targets global endpoints when it has no region. Regional
+endpoints (`sts.eu-west-1.amazonaws.com`) resolve fine on both sides. So
+`yo` forwards `AWS_REGION` alongside the credentials — resolved from the
+profile's `region` key, falling back to the host's `AWS_REGION` /
+`AWS_DEFAULT_REGION`, refusing loudly when neither exists, because
+`export-credentials` never prints one and a region-less guest CLI is
+broken for most services anyway.

@@ -204,10 +204,27 @@ EOF
         exit 1
     }
 
+    # The region must cross too, and not as a nicety: without one the CLI
+    # falls back to global endpoints like sts.amazonaws.com, and this Mac's
+    # DNS filter sinkholes that exact name to 0.0.0.0 (the guest inherits
+    # the Mac's resolver through lima) — regional endpoints resolve fine.
+    # export-credentials never prints a region, so it is resolved here:
+    # the profile's own `region` key first, the host's env second.
+    aws_region="$(aws configure get region --profile "${profile}" 2>/dev/null)" || aws_region=""
+    [ -n "${aws_region}" ] || aws_region="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+    [ -n "${aws_region}" ] || {
+        echo "yo: profile '${profile}' has no region and neither AWS_REGION nor" >&2
+        echo "    AWS_DEFAULT_REGION is set on this Mac. The guest CLI would target" >&2
+        echo "    global endpoints, which this Mac's DNS sinkholes. Add 'region = ...'" >&2
+        echo "    to the profile in ~/.aws/config." >&2
+        exit 1
+    }
+
     export AWS_ACCESS_KEY_ID="${aws_access_key_id}"
     export AWS_SECRET_ACCESS_KEY="${aws_secret_access_key}"
     export AWS_SESSION_TOKEN="${aws_session_token}"
-    aws_send_env="AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN"
+    export AWS_REGION="${aws_region}"
+    aws_send_env="AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION"
     if [ -n "${aws_credential_expiration}" ]; then
         export AWS_CREDENTIAL_EXPIRATION="${aws_credential_expiration}"
         aws_send_env="${aws_send_env} AWS_CREDENTIAL_EXPIRATION"
