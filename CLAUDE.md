@@ -459,54 +459,121 @@ On macOS a non-root process cannot bind `127.0.0.1:80` but can bind
 in a listener that drops any non-loopback peer after the handshake. Not
 exposure. The real cost: nothing else on the Mac can bind 80 or 443.
 
-## AWS credentials ride `yo enter`, never guest disk
+## AWS credentials ride `yo enter` through a host-side broker, never guest disk
 
-AWS access is opt-in and host-minted: set `YOLOBOX_AWS_PROFILE` to a host
-AWS CLI profile before `yo enter`, and that one `yo enter` call runs
-`aws configure export-credentials --profile "$YOLOBOX_AWS_PROFILE"
---format env-no-export` on the Mac — which does the *host's* full
-credential resolution, including a `credential_process` that shells out to
-1Password — and forwards the resulting flat `AWS_ACCESS_KEY_ID` /
-`AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_CREDENTIAL_EXPIRATION`
-into the guest session's environment as exported vars plus `-o SendEnv=...`
-— not `SetEnv`, which the herd wiring uses for its non-secret vars: SetEnv
-embeds the values in ssh's argv, where `ps` shows them to every process on
-the Mac for the session's lifetime, while SendEnv puts only the *names* in
-argv and the guest's `AcceptEnv` whitelist accepts both alike. Nothing is
-written under guest `~/.aws`: the AWS CLI's env-var credential provider
-reads only process environment, and `AWS_CLI_SESSION_ID_DISABLED = "true"`
-(`nix/base.nix`) keeps its telemetry sqlite out of `~/.aws/cli/cache` too.
+AWS access is opt-in: set `YOLOBOX_AWS_PROFILE` to a host AWS CLI profile
+before `yo enter`. v1 minted STS creds once, at enter time, and froze them
+in the guest session's flat env (`AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) — a session outliving the
+STS duration (an hour, for this SSO) needed a fresh `yo enter`. v2 replaces
+that with botocore's **container credential provider**: `aws_broker_start`
+in `yo` starts `aws-broker` (repo root, `#!/usr/bin/env python3`, stdlib
+only) on the Mac for that one pane, and the guest gets a loopback URL plus a
+bearer token instead of the credentials themselves. The guest CLI calls back
+to the broker for every request; the broker re-runs
+`aws configure export-credentials --profile "$YOLOBOX_AWS_PROFILE" --format
+process` shortly before the cached creds expire. An SSO re-auth on the Mac
+(`aws sso login`) heals a running guest session with no re-enter — the
+broker's next re-mint just succeeds again.
 
-Only expiring STS session credentials ever cross the boundary: the mint
-function refuses loudly, before touching SSH_ARGS, when the exported
-credentials carry no `AWS_SESSION_TOKEN` — that shape means the profile
-handed back long-lived IAM user keys, which have no expiry and must never
-reach the guest. The fix is pointing `YOLOBOX_AWS_PROFILE` at a profile
-that assumes a role or runs a `credential_process` (anything yielding
-temporary creds), not a static-key profile.
+Flat env-var forwarding is gone from `yo` entirely, not merely unused:
+botocore's credential provider chain ranks explicit `AWS_ACCESS_KEY_ID` env
+vars above the container provider, so if `yo` still exported the frozen v1
+vars alongside the broker's URL, they would win and silently defeat every
+refresh — the guest would look wired up and would in fact be back to v1's
+one-hour cliff. So `aws_ssh_env_args` now forwards only `AWS_REGION` (see
+below); all credential minting and the no-long-lived-keys refusal moved
+into `aws-broker`'s startup.
 
-Because the credentials live only in that one SSH session's environment,
-they die with it: a shell that outlives the STS session's duration (default
-one hour, profile-dependent) needs a fresh `yo enter`, not a reused shell.
+`aws-broker --profile P --watch-pid PID` runs `export-credentials`
+synchronously at startup — this **is** the fail-fast validation, moved
+here from v1's `aws_ssh_env_args`. A nonzero exit or a response with no
+`SessionToken` (long-lived IAM user keys, which must never enter the guest
+because they never expire) prints `ERROR=<one line>` to stdout and exits 1
+before any socket opens. On success it binds `127.0.0.1:0` (kernel-assigned
+port, so two concurrent `yo enter`s never collide on the host side),
+mints a bearer token with `secrets.token_urlsafe(32)`, and prints exactly
+`TOKEN=<t>\nPORT=<p>\n` — the only place a credential-adjacent value is
+ever written, anywhere, including logs. Immediately after, it
+`os.dup2`s `/dev/null` onto its own stdout, so nothing written later can
+block a reader that only ever reads those two lines. `GET /creds` (with the
+bearer token in `Authorization`, compared via `hmac.compare_digest`) serves
+the cache when it has ≥10 minutes left, re-mints first (throttled to at
+most one attempt per `--min-remint-interval`) when it doesn't, and keeps
+serving a not-yet-expired cache across a failed re-mint — a real 500
+`CredentialsNotAvailable` only happens once the cache is truly expired with
+no fresh mint to replace it. `GET /health` (no auth) is for `yo aws-check`'s
+guest-side forward probe.
+
+`aws_broker_start` hands the broker's stdout to a fifo rather than a plain
+pipe, so it can `read -t 30` each handshake line with a bound: a broker
+that dies before handshaking fails `yo enter` loudly within 30s instead of
+hanging it forever. The broker's own stderr goes to
+`~/.local/state/yolobox/aws-broker/$$.log`, named by `$$` — `yo`'s own pid
+— because `exec ssh` at the end of `cmd_enter` replaces that process
+in place rather than forking a child, so the pid the broker's watch-pid
+thread polls (`kill -0` every 5s; gone → `os._exit(0)`) is the exact pid
+that names the log file, with no second handshake field needed to tell
+`yo` where to look. That same `exec` is what makes watch-pid correct at
+all: an early exit after the broker starts (`herd_drift_check`'s exit 3,
+for instance) leaves no orphan, because the watched pid disappears within
+5s of `yo enter` itself exiting — there is no lingering parent shell to
+keep it alive. A broker that somehow outlives its watched pid despite this
+(pane killed hard enough that even `os._exit` housekeeping never runs) is
+still bounded by `--idle-timeout` (4h default): no authenticated `/creds`
+hit in that window and it exits on its own. That backstop is not currently
+wired to anything log-visible beyond the broker's own stderr — a genuinely
+orphaned broker is a leaked process, not a leaked credential, since its
+bearer token dies with it and nothing else ever learns that token.
+
+The forward itself is TCP `-R`, not the unix-socket forward the herd wiring
+uses — a container-credentials URL has no `unix://` form botocore accepts
+— and TCP `-R` has no `StreamLocalBindUnlink` equivalent to atomically
+reclaim a stale guest-side listener. So claiming a guest port is
+probe-and-retry: up to 5 candidates in `41000 + RANDOM % 1000`, each proved
+with a throwaway `ssh -o ExitOnForwardFailure=yes -R <candidate>:...
+true` before the real forward reuses that same candidate. The gap between
+a successful probe and the real forward is an accepted, documented TOCTOU,
+not a bug to fix — a collision in that window is vanishingly unlikely, and
+a real one just fails the real forward exactly as a failed probe would
+have. Once a port is claimed, `AWS_CONTAINER_CREDENTIALS_FULL_URI=http://
+127.0.0.1:<guest-port>/creds` and `AWS_CONTAINER_AUTHORIZATION_TOKEN=<token>`
+cross via `-o SendEnv=...` plus host-side exported env — not `SetEnv`,
+which the herd wiring uses for its non-secret vars: `SetEnv` embeds values
+in ssh's argv, where `ps` shows them to every process on the Mac for the
+session's lifetime, while `SendEnv` puts only the *names* in argv and the
+guest's `AcceptEnv` whitelist (`nix/base.nix`) accepts both mechanisms
+alike. Nothing is written under guest `~/.aws`: the container credential
+provider talks HTTP, not disk, and `AWS_CLI_SESSION_ID_DISABLED = "true"`
+keeps the CLI's telemetry sqlite out of `~/.aws/cli/cache` too.
+
 `yo ssh` and editor sessions (`yo code`, `yo zed`) deliberately carry no AWS
-env at all — same posture as the herd wiring, opt-in-and-silent rather than
-an error, since most sessions have no need for AWS.
+env or broker at all — same opt-in-and-silent posture as the herd wiring,
+since most sessions have no need for AWS. `yo aws-check` is the doctor:
+it proves the host prerequisites, starts a real throwaway broker and
+forward (through `aws_broker_start` itself, not a reimplementation), then
+from the guest curls `/health`, curls `/creds` and asserts all four keys
+(`AccessKeyId`, `SecretAccessKey`, `Token` — not `SessionToken`, remapped —
+and `Expiration`), then runs `aws sts get-caller-identity` and asserts a
+role ARN comes back. It kills the throwaway broker on every exit path.
 
-How to recognise which state a shell is in: `aws sts get-caller-identity`
-inside the box answers with the assumed-role ARN when the session is wired
-correctly, and "Unable to locate credentials" when it isn't — either because
-the shell predates setting `YOLOBOX_AWS_PROFILE`, or because it came in
-through `yo ssh` rather than `yo enter`.
+**Migration note.** v2 needs one guest `nixos-rebuild switch` before it
+works — `nix/base.nix`'s `AcceptEnv` swapped the four flat `AWS_*` names for
+`AWS_CONTAINER_CREDENTIALS_FULL_URI`/`AWS_CONTAINER_AUTHORIZATION_TOKEN`.
+Until that switch lands, sshd silently drops both new vars (they are not
+yet in its whitelist) and the guest CLI says "Unable to locate credentials"
+with no error anywhere from `yo enter` — recognise it with
+`sudo sshd -T | grep -i acceptenv` in the guest.
 
-A third failure shape met on the very first launch: credentials arrive but
-`aws sts get-caller-identity` dies with `Could not connect to the endpoint
-URL: "https://sts.amazonaws.com/"`. That is DNS, not AWS: this Mac's DNS
-filter sinkholes the *global* `sts.amazonaws.com` name to 0.0.0.0, the
-guest inherits the Mac's resolver through lima's forwarder (192.168.5.2),
-and the CLI only targets global endpoints when it has no region. Regional
-endpoints (`sts.eu-west-1.amazonaws.com`) resolve fine on both sides. So
-`yo` forwards `AWS_REGION` alongside the credentials — resolved from the
-profile's `region` key, falling back to the host's `AWS_REGION` /
-`AWS_DEFAULT_REGION`, refusing loudly when neither exists, because
-`export-credentials` never prints one and a region-less guest CLI is
-broken for most services anyway.
+A DNS failure shape met on the very first v1 launch still applies unchanged:
+credentials arrive but `aws sts get-caller-identity` dies with `Could not
+connect to the endpoint URL: "https://sts.amazonaws.com/"`. That is DNS,
+not AWS: this Mac's DNS filter sinkholes the *global* `sts.amazonaws.com`
+name to 0.0.0.0, the guest inherits the Mac's resolver through lima's
+forwarder (192.168.5.2), and the CLI only targets global endpoints when it
+has no region. Regional endpoints (`sts.eu-west-1.amazonaws.com`) resolve
+fine on both sides. So `yo` still forwards `AWS_REGION` alongside the
+broker wiring — resolved from the profile's `region` key, falling back to
+the host's `AWS_REGION` / `AWS_DEFAULT_REGION`, refusing loudly when
+neither exists, because `export-credentials` never prints one and a
+region-less guest CLI is broken for most services anyway.
