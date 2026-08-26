@@ -458,3 +458,42 @@ On macOS a non-root process cannot bind `127.0.0.1:80` but can bind
 `0.0.0.0:80`, so lima does that for any host port below 1024 and wraps it
 in a listener that drops any non-loopback peer after the handshake. Not
 exposure. The real cost: nothing else on the Mac can bind 80 or 443.
+
+## AWS credentials ride `yo enter`, never guest disk
+
+AWS access is opt-in and host-minted: set `YOLOBOX_AWS_PROFILE` to a host
+AWS CLI profile before `yo enter`, and that one `yo enter` call runs
+`aws configure export-credentials --profile "$YOLOBOX_AWS_PROFILE"
+--format env-no-export` on the Mac — which does the *host's* full
+credential resolution, including a `credential_process` that shells out to
+1Password — and forwards the resulting flat `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_CREDENTIAL_EXPIRATION`
+into the guest session's environment as exported vars plus `-o SendEnv=...`
+— not `SetEnv`, which the herd wiring uses for its non-secret vars: SetEnv
+embeds the values in ssh's argv, where `ps` shows them to every process on
+the Mac for the session's lifetime, while SendEnv puts only the *names* in
+argv and the guest's `AcceptEnv` whitelist accepts both alike. Nothing is
+written under guest `~/.aws`: the AWS CLI's env-var credential provider
+reads only process environment, and `AWS_CLI_SESSION_ID_DISABLED = "true"`
+(`nix/base.nix`) keeps its telemetry sqlite out of `~/.aws/cli/cache` too.
+
+Only expiring STS session credentials ever cross the boundary: the mint
+function refuses loudly, before touching SSH_ARGS, when the exported
+credentials carry no `AWS_SESSION_TOKEN` — that shape means the profile
+handed back long-lived IAM user keys, which have no expiry and must never
+reach the guest. The fix is pointing `YOLOBOX_AWS_PROFILE` at a profile
+that assumes a role or runs a `credential_process` (anything yielding
+temporary creds), not a static-key profile.
+
+Because the credentials live only in that one SSH session's environment,
+they die with it: a shell that outlives the STS session's duration (default
+one hour, profile-dependent) needs a fresh `yo enter`, not a reused shell.
+`yo ssh` and editor sessions (`yo code`, `yo zed`) deliberately carry no AWS
+env at all — same posture as the herd wiring, opt-in-and-silent rather than
+an error, since most sessions have no need for AWS.
+
+How to recognise which state a shell is in: `aws sts get-caller-identity`
+inside the box answers with the assumed-role ARN when the session is wired
+correctly, and "Unable to locate credentials" when it isn't — either because
+the shell predates setting `YOLOBOX_AWS_PROFILE`, or because it came in
+through `yo ssh` rather than `yo enter`.
