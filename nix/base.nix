@@ -99,6 +99,7 @@
       "AWS_SECRET_ACCESS_KEY"
       "AWS_SESSION_TOKEN"
       "AWS_CREDENTIAL_EXPIRATION"
+      "AWS_REGION"
     ];
     StreamLocalBindUnlink = "yes";
   };
