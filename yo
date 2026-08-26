@@ -95,6 +95,11 @@ Usage: yo <command> [args]
       Prove end to end that an agent in the VM can report to this Mac's
       herd. Run from a herdr pane with no agent on it; it releases that pane.
 
+  aws-check
+      Prove end to end that YOLOBOX_AWS_PROFILE's credentials reach the VM:
+      host export-credentials, a throwaway broker and forward, the guest's
+      /health and /creds, and a guest sts get-caller-identity.
+
 enter, code and zed resolve the directory the same way: with a project
 argument, pick among the VM's git repos under ~/wrk with fzf; without one,
 the mirrored directory of the current repo, or ~/wrk outside a repo.
@@ -144,28 +149,19 @@ herd_ssh_forward_args() {
     fi
 }
 
-# Appends this pane's AWS session credentials to SSH_ARGS, opt-in via
-# YOLOBOX_AWS_PROFILE on the host. Unset/empty: appends nothing, silently —
-# same posture as herd_ssh_forward_args for a non-herdr pane. `yo ssh` never
-# calls this, so a plain shell into the box never carries AWS env either.
+# Appends only the region to SSH_ARGS, opt-in via YOLOBOX_AWS_PROFILE on the
+# host. Unset/empty: appends nothing, silently — same posture as
+# herd_ssh_forward_args for a non-herdr pane. `yo ssh` never calls this, so a
+# plain shell into the box never carries AWS env either.
 #
-# `aws configure export-credentials` runs the *host's* full credential
-# resolution for the named profile — including a credential_process that
-# shells out to 1Password — and prints flat AWS_* lines. Only the flat,
-# already-resolved values cross into the guest; the profile, any
-# credential_process, and 1Password itself never do.
-#
-# Refuses loudly rather than silently degrading when the resolved
-# credentials have no AWS_SESSION_TOKEN: that means the profile handed back
-# long-lived IAM user keys, which must never enter the guest (they have no
-# expiry, so a leak or a stale env has no time bound). Point
-# YOLOBOX_AWS_PROFILE at a profile that yields temporary credentials
-# instead (role_arn/credential_process/sso).
-#
-# The values travel as exported env plus SendEnv (names only in argv), not
-# SetEnv: a SetEnv option carries the secrets inside ssh's argument list,
-# which `ps` shows to every process on the Mac for the session's lifetime.
-# The guest's AcceptEnv whitelist treats both mechanisms identically.
+# v1 forwarded flat AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN
+# too; v2 (aws_broker_start, below) replaces that with botocore's container
+# credential provider, which auto-refreshes instead of freezing creds for
+# the session's lifetime. Flat env vars are gone from here entirely, not
+# just unused: botocore's credential chain ranks explicit env vars above the
+# container provider, so if both were present the frozen ones would win and
+# silently defeat the broker's refresh. Credential minting and the
+# no-long-lived-keys refusal now live in aws-broker's startup instead.
 aws_ssh_env_args() {
     profile="${YOLOBOX_AWS_PROFILE:-}"
     [ -n "${profile}" ] || return 0
@@ -175,41 +171,12 @@ aws_ssh_env_args() {
         exit 1
     }
 
-    creds_out="$(aws configure export-credentials --profile "${profile}" --format env-no-export 2>&1)" || {
-        echo "yo: 'aws configure export-credentials --profile ${profile}' failed:" >&2
-        printf '%s\n' "${creds_out}" >&2
-        exit 1
-    }
-
-    aws_access_key_id=""
-    aws_secret_access_key=""
-    aws_session_token=""
-    aws_credential_expiration=""
-    while IFS= read -r line; do
-        case "${line}" in
-            AWS_ACCESS_KEY_ID=*) aws_access_key_id="${line#AWS_ACCESS_KEY_ID=}" ;;
-            AWS_SECRET_ACCESS_KEY=*) aws_secret_access_key="${line#AWS_SECRET_ACCESS_KEY=}" ;;
-            AWS_SESSION_TOKEN=*) aws_session_token="${line#AWS_SESSION_TOKEN=}" ;;
-            AWS_CREDENTIAL_EXPIRATION=*) aws_credential_expiration="${line#AWS_CREDENTIAL_EXPIRATION=}" ;;
-        esac
-    done <<EOF
-${creds_out}
-EOF
-
-    [ -n "${aws_session_token}" ] || {
-        echo "yo: profile '${profile}' returned no AWS_SESSION_TOKEN — these are long-lived keys" >&2
-        echo "    and must never enter the guest. Point YOLOBOX_AWS_PROFILE at a profile that" >&2
-        echo "    yields temporary credentials (role_arn or credential_process), not a static" >&2
-        echo "    IAM user profile." >&2
-        exit 1
-    }
-
-    # The region must cross too, and not as a nicety: without one the CLI
-    # falls back to global endpoints like sts.amazonaws.com, and this Mac's
-    # DNS filter sinkholes that exact name to 0.0.0.0 (the guest inherits
-    # the Mac's resolver through lima) — regional endpoints resolve fine.
-    # export-credentials never prints a region, so it is resolved here:
-    # the profile's own `region` key first, the host's env second.
+    # The region must cross, and not as a nicety: without one the CLI falls
+    # back to global endpoints like sts.amazonaws.com, and this Mac's DNS
+    # filter sinkholes that exact name to 0.0.0.0 (the guest inherits the
+    # Mac's resolver through lima) — regional endpoints resolve fine.
+    # export-credentials never prints a region, so it is resolved here: the
+    # profile's own `region` key first, the host's env second.
     aws_region="$(aws configure get region --profile "${profile}" 2>/dev/null)" || aws_region=""
     [ -n "${aws_region}" ] || aws_region="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
     [ -n "${aws_region}" ] || {
@@ -220,16 +187,132 @@ EOF
         exit 1
     }
 
-    export AWS_ACCESS_KEY_ID="${aws_access_key_id}"
-    export AWS_SECRET_ACCESS_KEY="${aws_secret_access_key}"
-    export AWS_SESSION_TOKEN="${aws_session_token}"
     export AWS_REGION="${aws_region}"
-    aws_send_env="AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION"
-    if [ -n "${aws_credential_expiration}" ]; then
-        export AWS_CREDENTIAL_EXPIRATION="${aws_credential_expiration}"
-        aws_send_env="${aws_send_env} AWS_CREDENTIAL_EXPIRATION"
+    SSH_ARGS+=(-o "SendEnv=AWS_REGION")
+}
+
+# Starts the host-side credential broker for this pane (aws-broker, repo
+# root) and appends its forward plus its two container-provider vars to
+# SSH_ARGS. Opt-in via YOLOBOX_AWS_PROFILE, same posture as
+# aws_ssh_env_args: unset means append nothing, silently.
+#
+# The broker prints its handshake (TOKEN=/PORT=) over a fifo rather than a
+# plain pipe, because a plain pipe's writer blocks until read either way —
+# the fifo changes nothing about that, but it does give this function a
+# named path to open with a timeout instead of racing `wait` against a
+# background job. `read -t 30` on each line is what turns "broker died
+# before handshaking" into a loud, bounded failure instead of a hung
+# `yo enter`: without it, a broker that crashes pre-handshake leaves this
+# function blocked on the fifo forever.
+#
+# The broker's own stderr goes to a log file named by $$ — yo's pid, which
+# `exec ssh` below preserves — because that is the one name aws_broker_start
+# and the broker's watch-pid thread agree on with no coordination needed;
+# naming it by the broker's own (not-yet-known) pid instead would need a
+# second handshake field just to tell this function what file to read.
+#
+# Guest-port collisions are handled by probe-and-retry, not by asking the
+# guest what is free first: TCP -R has no StreamLocalBindUnlink equivalent
+# to atomically claim a port, so a probe-then-bind has an inherent
+# TOCTOU window. Accepted, not fixed — a colliding port is vanishingly
+# unlikely in the 41000-41999 range this picks from, and a real collision
+# just fails the real forward the same way a failed probe would have.
+aws_broker_start() {
+    AWS_BROKER_SSH_ARGS=()
+    profile="${YOLOBOX_AWS_PROFILE:-}"
+    [ -n "${profile}" ] || return 0
+
+    command -v python3 >/dev/null 2>&1 || {
+        echo "yo: YOLOBOX_AWS_PROFILE is set but 'python3' is not on this Mac's PATH" >&2
+        exit 1
+    }
+
+    broker_dir="$(mktemp -d)"
+    broker_fifo="${broker_dir}/handshake"
+    mkfifo "${broker_fifo}"
+    broker_log_dir="$HOME/.local/state/yolobox/aws-broker"
+    mkdir -p "${broker_log_dir}"
+    broker_log="${broker_log_dir}/$$.log"
+
+    "${SCRIPT_DIR}/aws-broker" --profile "${profile}" --watch-pid "$$" \
+        >"${broker_fifo}" 2>"${broker_log}" &
+    broker_pid=$!
+
+    # Opened once, read twice: a fifo's writer blocks on open until a
+    # reader shows up, and once open its two handshake lines arrive over the
+    # same descriptor. Reopening per read would race the broker exiting
+    # between the two opens.
+    exec 3<"${broker_fifo}"
+    broker_token=""
+    broker_port=""
+    line1=""
+    line2=""
+    # Read and inspect line1 before even attempting line2: an ERROR= first
+    # line means the broker exits right after printing it, with no second
+    # line ever coming — chaining both reads with && would make that read
+    # fail (EOF on the now-closed fifo) and fall through to the generic
+    # "no handshake" message below instead of surfacing the real ERROR text.
+    if IFS= read -r -t 30 line1 <&3; then
+        case "${line1}" in
+            "ERROR="*)
+                exec 3<&-
+                wait "${broker_pid}" 2>/dev/null || true
+                rm -rf "${broker_dir}"
+                echo "yo: aws-broker failed: ${line1#ERROR=}" >&2
+                exit 1
+                ;;
+            "TOKEN="*)
+                broker_token="${line1#TOKEN=}"
+                IFS= read -r -t 30 line2 <&3 || true
+                case "${line2}" in
+                    "PORT="*) broker_port="${line2#PORT=}" ;;
+                esac
+                ;;
+        esac
     fi
-    SSH_ARGS+=(-o "SendEnv=${aws_send_env}")
+    exec 3<&-
+    rm -rf "${broker_dir}"
+
+    if [ -z "${broker_token}" ] || [ -z "${broker_port}" ]; then
+        kill "${broker_pid}" 2>/dev/null || true
+        wait "${broker_pid}" 2>/dev/null || true
+        echo "yo: aws-broker produced no handshake within 30s — see ${broker_log}" >&2
+        exit 1
+    fi
+
+    probe_err_file="$(mktemp)"
+    guest_port=""
+    tries=0
+    while [ "${tries}" -lt 5 ]; do
+        tries=$((tries + 1))
+        candidate=$((41000 + RANDOM % 1000))
+        # SSH_ARGS already carries -o ControlPath=none at this point (see
+        # cmd_enter): a probe on the shared ControlMaster would prove
+        # nothing about a port this pane's own forward could actually use.
+        # A full handshake per try costs low hundreds of ms; accepted.
+        if ssh "${SSH_ARGS[@]}" -o ExitOnForwardFailure=yes \
+            -R "127.0.0.1:${candidate}:127.0.0.1:${broker_port}" "${VM_HOST}" true 2>"${probe_err_file}"; then
+            guest_port="${candidate}"
+            break
+        fi
+        probe_err="$(cat "${probe_err_file}")"
+    done
+    rm -f "${probe_err_file}"
+
+    if [ -z "${guest_port}" ]; then
+        kill "${broker_pid}" 2>/dev/null || true
+        wait "${broker_pid}" 2>/dev/null || true
+        echo "yo: could not claim a guest port for the aws-broker forward after 5 tries:" >&2
+        printf '%s\n' "${probe_err}" >&2
+        exit 1
+    fi
+
+    AWS_BROKER_SSH_ARGS=(
+        -R "127.0.0.1:${guest_port}:127.0.0.1:${broker_port}"
+        -o "SendEnv=AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN"
+    )
+    export AWS_CONTAINER_CREDENTIALS_FULL_URI="http://127.0.0.1:${guest_port}/creds"
+    export AWS_CONTAINER_AUTHORIZATION_TOKEN="${broker_token}"
 }
 
 readonly HERD_VERSION_CACHE="$HOME/.local/state/yolobox/herd-guest-version"
@@ -697,7 +780,18 @@ cmd_enter() {
     SSH_ARGS+=(-o ControlPath=none)
     herd_ssh_forward_args
     aws_ssh_env_args
+    aws_broker_start
     herd_drift_check
+    # Early exits after this point (e.g. herd_drift_check's exit 3) leave no
+    # orphan broker: its watch-pid thread sees this pid gone within 5s. exec
+    # below is what makes that true — it replaces this process rather than
+    # forking a child, so the broker's watched pid stays valid for the whole
+    # ssh session and disappears exactly when the session ends.
+    # Guarded, not a plain append: bash 3.2 (this Mac's /bin/bash) treats
+    # "${arr[@]}" on a zero-element array as an unbound-variable error under
+    # set -u, and AWS_BROKER_SSH_ARGS is empty whenever YOLOBOX_AWS_PROFILE
+    # is unset.
+    [ "${#AWS_BROKER_SSH_ARGS[@]}" -eq 0 ] || SSH_ARGS+=("${AWS_BROKER_SSH_ARGS[@]}")
     exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}" "cd $(printf '%q' "${target}") && exec \"\$SHELL\" -l"
 }
 
@@ -830,6 +924,117 @@ cmd_herd_check() {
 
     [ "${HERD_CHECK_FAILED}" -eq 0 ] || exit 1
     exit "${guest_rc}"
+}
+
+# End-to-end proof that the AWS credential broker works, mirroring
+# cmd_herd_check's shape (hc_ok/hc_fail, one host-side prerequisite check
+# per line, a throwaway forward built the same way `yo enter` builds its
+# real one). Reuses aws_broker_start rather than reimplementing the
+# handshake and port-probe logic a second time — a check built differently
+# from `enter` would prove nothing about `enter`.
+cmd_aws_check() {
+    [ "$#" -eq 0 ] || {
+        echo "yo: aws-check takes no arguments" >&2
+        usage >&2
+        exit 2
+    }
+    HERD_CHECK_FAILED=0
+
+    profile="${YOLOBOX_AWS_PROFILE:-}"
+    [ -n "${profile}" ] ||
+        hc_abort "YOLOBOX_AWS_PROFILE is not set" \
+            "Set it to a host AWS CLI profile and rerun: YOLOBOX_AWS_PROFILE=<profile> ./yo aws-check"
+
+    command -v aws >/dev/null 2>&1 ||
+        hc_abort "'aws' is not on this Mac's PATH"
+    command -v python3 >/dev/null 2>&1 ||
+        hc_abort "'python3' is not on this Mac's PATH — aws-broker needs it"
+    command -v jq >/dev/null 2>&1 || {
+        echo "yo: jq not found (brew install jq)" >&2
+        exit 1
+    }
+    hc_ok "aws, python3 and jq are on this Mac's PATH"
+
+    creds_out="$(aws configure export-credentials --profile "${profile}" --format process 2>&1)" ||
+        hc_abort "'aws configure export-credentials --profile ${profile}' failed:" "${creds_out}"
+    session_token="$(printf '%s\n' "${creds_out}" | jq -r '.SessionToken // empty' 2>/dev/null)"
+    [ -n "${session_token}" ] ||
+        hc_abort "profile '${profile}' returned no SessionToken — these are long-lived keys" \
+            "and must never enter the guest. Point YOLOBOX_AWS_PROFILE at a profile that" \
+            "yields temporary credentials (role_arn or credential_process), not a static" \
+            "IAM user profile."
+    hc_ok "host export-credentials succeeded for '${profile}', SessionToken present"
+
+    aws_region="$(aws configure get region --profile "${profile}" 2>/dev/null)" || aws_region=""
+    [ -n "${aws_region}" ] || aws_region="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+    [ -n "${aws_region}" ] ||
+        hc_abort "profile '${profile}' has no region and neither AWS_REGION nor AWS_DEFAULT_REGION is set on this Mac"
+    hc_ok "region resolves to ${aws_region}"
+
+    ssh_args
+    SSH_ARGS+=(-o ControlPath=none)
+    aws_broker_start
+    hc_ok "broker started, host port ${broker_port} forwarded to guest port ${guest_port}"
+
+    # Kills the throwaway broker on every exit path below, hc_abort's exit 1
+    # included — traps fire on exit even from inside a called function.
+    trap 'kill "${broker_pid}" 2>/dev/null || true; wait "${broker_pid}" 2>/dev/null || true' EXIT
+
+    # The guest script reads AWS_CONTAINER_CREDENTIALS_FULL_URI/
+    # AWS_CONTAINER_AUTHORIZATION_TOKEN from its own environment rather than
+    # taking them as script arguments, so the bearer token never appears in
+    # a remote command line (visible to `ps` in the guest) — it only ever
+    # crosses via SendEnv, exactly as a real `yo enter` session carries it.
+    guest_out="$(ssh "${SSH_ARGS[@]}" "${AWS_BROKER_SSH_ARGS[@]}" "${VM_HOST}" bash -s 2>&1 <<'GUEST_AWS_CHECK'
+set -u
+url="${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}"
+token="${AWS_CONTAINER_AUTHORIZATION_TOKEN:-}"
+if [ -z "${url}" ] || [ -z "${token}" ]; then
+    printf 'ENV_MISSING=1\n'
+    exit 0
+fi
+health_url="${url%/creds}/health"
+health="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${health_url}")"
+printf 'HEALTH=%s\n' "${health}"
+creds="$(curl -sS -H "Authorization: ${token}" --max-time 5 "${url}")"
+printf 'CREDS=%s\n' "${creds}"
+sts="$(aws sts get-caller-identity 2>&1)"
+printf 'STS=%s\n' "${sts}"
+GUEST_AWS_CHECK
+    )" || true
+
+    env_missing="$(printf '%s\n' "${guest_out}" | sed -n 's/^ENV_MISSING=//p')"
+    [ -z "${env_missing}" ] ||
+        hc_fail "the guest session never saw AWS_CONTAINER_CREDENTIALS_FULL_URI/AWS_CONTAINER_AUTHORIZATION_TOKEN" \
+            "Check AcceptEnv in nix/base.nix and that the guest is running the switch that carries it."
+
+    health_status="$(printf '%s\n' "${guest_out}" | sed -n 's/^HEALTH=//p')"
+    if [ "${health_status}" = "200" ]; then
+        hc_ok "guest curl to the broker's /health returned 200"
+    else
+        hc_fail "guest curl to the broker's /health returned '${health_status:-<no response>}', expected 200"
+    fi
+
+    creds_json="$(printf '%s\n' "${guest_out}" | sed -n 's/^CREDS=//p')"
+    if printf '%s' "${creds_json}" | jq -e 'has("AccessKeyId") and has("SecretAccessKey") and has("Token") and has("Expiration")' >/dev/null 2>&1; then
+        hc_ok "guest /creds answers with AccessKeyId, SecretAccessKey, Token and Expiration"
+    else
+        hc_fail "guest /creds did not answer with all four expected keys" "${creds_json}"
+    fi
+
+    sts_out="$(printf '%s\n' "${guest_out}" | sed -n 's/^STS=//p')"
+    role_arn="$(printf '%s\n' "${sts_out}" | jq -r '.Arn // empty' 2>/dev/null)"
+    if [ -n "${role_arn}" ]; then
+        hc_ok "guest sts get-caller-identity answers with ${role_arn}"
+    else
+        hc_fail "guest sts get-caller-identity did not return a role ARN:" "${sts_out}"
+    fi
+
+    kill "${broker_pid}" 2>/dev/null || true
+    wait "${broker_pid}" 2>/dev/null || true
+    trap - EXIT
+
+    [ "${HERD_CHECK_FAILED}" -eq 0 ] || exit 1
 }
 
 # Resolve $1 relative to a base dir via cd+pwd -P; empty on failure.
@@ -1133,6 +1338,7 @@ main() {
         t3) cmd_t3 "$@" ;;
         pair) cmd_pair "$@" ;;
         herd-check) cmd_herd_check "$@" ;;
+        aws-check) cmd_aws_check "$@" ;;
         *)
             usage >&2
             exit 2

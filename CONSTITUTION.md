@@ -73,6 +73,15 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   the real directory and `~/Developer` does not exist.
 - NEVER copy a private key into the VM.
 
+## AWS credentials
+
+- ALWAYS let the host-side broker (`aws-broker`), never a flat env var,
+  carry AWS secrets into the guest. Explicit env creds outrank the
+  container credential provider in botocore's chain, so a flat var sitting
+  alongside the broker's URL would win and silently defeat its refresh.
+- NEVER let the broker write a secret or the bearer token to stdout after
+  its one handshake line, or to any log.
+
 ## Agents and the herd
 
 - ALWAYS keep the VM's herdr version equal to the Mac's Homebrew herdr.
