@@ -37,3 +37,8 @@
   five-day run. The fix is a `[profile.dev]` with `debug = "line-tables-only"`
   plus `[profile.dev.package."*"] debug = false` in the rune repo. Without it,
   `yo gc --deep` becomes a recurring chore rather than a one-off cleanup.
+- Revisit whether the `strictMcpConfig` flip in `nix/pkgs/t3.nix` can now be
+  dropped entirely: the enterprise MCP config that motivated it is gone (see
+  `nix/mcp.nix`), so the guard it worked around no longer fires. Left in place
+  here because testing removal needs a t3 rebuild, which was out of scope for
+  the change that dropped the enterprise config.

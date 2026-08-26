@@ -28,13 +28,17 @@ buildNpmPackage rec {
   # "consumeEntire(): ERROR: Input null bytes, won't process". grep gates the
   # sed so that under stdenv's set -e a vanished pattern fails the build.
   #
-  # The second edit is unrelated to npm. t3's Claude capability probe hardcodes
-  # strictMcpConfig, and Claude Code refuses --strict-mcp-config whenever an
-  # enterprise MCP config is present — nix/mcp.nix renders one at
-  # /etc/claude-code/managed-mcp.json. The probe then exits 1, t3 swallows the
-  # error, and its Claude provider silently reports no auth and no slash
-  # commands. The grep turns a t3 bump that renames this into a build error
-  # instead of a silent return of the defect.
+  # The second edit is unrelated to npm. t3's Claude capability probe used to
+  # hardcode strictMcpConfig, and Claude Code refuses --strict-mcp-config
+  # whenever an enterprise MCP config is present — nix/mcp.nix used to render
+  # one at /etc/claude-code/managed-mcp.json. The probe then exited 1, t3
+  # swallowed the error, and its Claude provider silently reported no auth and
+  # no slash commands. nix/mcp.nix no longer ships an enterprise config (see
+  # that file), so the guard this sed works around no longer fires either way
+  # — but the flip is left in place rather than reverted, because reverting it
+  # buys nothing functionally and would rebuild t3 for no gain. The grep still
+  # earns its keep as a canary: it turns a t3 bump that renames this field
+  # into a build error instead of a silent return of the defect.
   postPatch = ''
     ${lib.getExe jq} 'del(.overrides)' package.json > package.json.stripped
     mv package.json.stripped package.json
