@@ -156,6 +156,7 @@
     fzf
     zoxide
     eza
+    btop
     delta
     gh
     shellcheck

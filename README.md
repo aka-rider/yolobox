@@ -82,11 +82,11 @@ The VM's disk survives restarts.
 `yo enter` and setup the system as your usual Linux, install dotfiles, etc.
 
 
-Three settings in `lima/yolobox.yaml` — `disk`, `portForwards`, and `memory` — are read once, when the VM is created. Changing the file later does nothing to an existing VM; stop it and use `limactl edit yolobox` (or `yo disk-grow` for the disk).
-For memory:
+Four settings in `lima/yolobox.yaml` — `disk`, `portForwards`, `memory`, and `cpus` — are read once, when the VM is created. Changing the file later does nothing to an existing VM; stop it and use `limactl edit yolobox` (or `yo disk-grow` for the disk).
+For memory and CPUs:
 
 ```bash
-limactl stop yolobox && limactl edit yolobox --memory 12 --start
+limactl stop yolobox && limactl edit yolobox --memory 16 --cpus 8 --start
 ```
 
 ### Use Zed or VS Code

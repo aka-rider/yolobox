@@ -6,8 +6,8 @@ images:
 
 mounts: []
 
-memory: 12GiB
-cpus: 4
+memory: 16GiB
+cpus: 8
 disk: 100GiB
 
 ssh:
