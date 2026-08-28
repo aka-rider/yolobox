@@ -42,7 +42,7 @@
   `nix/mcp.nix`), so the guard it worked around no longer fires. Left in place
   here because testing removal needs a t3 rebuild, which was out of scope for
   the change that dropped the enterprise config.
-- The VM has no swap, so memory pressure ends in a global OOM with no warning
+- The VM had no swap, so memory pressure ended in a global OOM with no warning
   stage. On 2026-08-27 a `nixos-rebuild switch` run against a box already at
   ~2.1G available of 12G (ten agent sessions, a five-container podman stack, a
   Rust link job) tipped it over: the kernel killed the uid-501 systemd manager,
@@ -50,8 +50,8 @@
   container died with exit 137. The ssh session scopes sit under `user.slice`
   directly rather than under `user@501.service`, so the agents themselves
   survived — the blast radius of a user-manager OOM is exactly the rootless
-  containers. Two things would soften this: a swap file or zram so reclaim has
-  somewhere to go before the killer runs, and `OOMScoreAdjust` on
-  `user@.service` so the manager is not a preferred victim while its own
-  children are. Neither is in place; the box was raised to 16GiB/8cpu in
-  `lima/yolobox.yaml` instead, which only widens the margin.
+  containers. `nix/base.nix` now declares a 16GiB `/var/swapfile` via
+  `swapDevices`, giving reclaim somewhere to go before the killer runs. Still
+  open: `OOMScoreAdjust` on `user@.service` so the manager is not a preferred
+  victim while its own children are. The box was also raised to 16GiB/8cpu in
+  `lima/yolobox.yaml`, which further widens the margin.
