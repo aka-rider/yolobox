@@ -48,9 +48,6 @@
   boot.growPartition = true;
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
-  # No fileSystems entry names /var, so it lives on / (vda2) and this file
-  # lands there too. NixOS's mkswap-*.service creates it if missing, so the
-  # only manual step ever needed is a switch.
   swapDevices = [{ device = "/var/swapfile"; size = 16384; }];
 
   services.lima.enable = true;
