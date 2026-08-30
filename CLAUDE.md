@@ -114,6 +114,16 @@ restarts the VM and re-checks, aborting with a `df /boot` hint if the two
 still disagree (the half-failed bootloader install from the ESP section
 below).
 
+A project is any git repo at any depth under `~/wrk`, not only
+`~/wrk/<group>/<repo>` — a monorepo puts one at depth 7. So the walk in
+`vm_project_pick` is bounded by pruning `node_modules`, `target`, `.next`,
+`.devbox`, `.venv` and `.git` itself, not by a depth cap, because a depth cap
+has to be re-guessed every time a monorepo nests one level deeper. Recognise
+the failure by its shape: a cap surfaces as fzf reporting "no project matches"
+for a repo that plainly exists, so what to check is the list handed to fzf, not
+fzf. `yo gc`'s `project_targets` carried the same cap, which made `--deep`
+blind to build directories inside monorepo projects.
+
 ## tmpfiles rules apply on `switch`
 
 The VM carries `systemd-tmpfiles-resetup.service`, the switch-time twin of
