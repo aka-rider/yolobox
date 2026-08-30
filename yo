@@ -587,7 +587,7 @@ measure() {
 # state — neither is build output. Matching directories are pruned in turn, so
 # nothing nested inside a hit is walked or reported twice.
 project_targets() {
-    find "$HOME/wrk" -mindepth 1 -maxdepth 4 \
+    find "$HOME/wrk" -mindepth 1 \
         \( -name .devbox -o -name .venv -o -name .git \) -prune -o \
         \( -name target -o -name node_modules -o -name .next \) \
         -type d -prune -print 2>/dev/null
@@ -1076,7 +1076,9 @@ vm_project_pick() {
     }
     ssh_args
     projects="$(ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" \
-        'find ~/wrk -mindepth 2 -maxdepth 4 -name .git \( -type d -o -type f \) -printf "%h\n"' |
+        'find ~/wrk -mindepth 2 \
+             \( -name node_modules -o -name target -o -name .next -o -name .devbox -o -name .venv \) -prune -o \
+             -name .git \( -type d -o -type f \) -printf "%h\n" -prune' |
         sed "s|^${VM_USER_HOME}/wrk/||" | sort)"
     [ -n "${projects}" ] || {
         echo "yo: no projects under ~/wrk in the VM" >&2
