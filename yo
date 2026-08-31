@@ -50,8 +50,9 @@ Usage: yo <command> [args]
   gc [--deep] [--yes]
       Report what is using the VM's disk. --yes reclaims the machine's own
       caches (journald, nix garbage, npm, podman). --deep adds per-project
-      build output (target, node_modules, .next) under ~/wrk, each deleted
-      only if git ignores it. Run this from the Mac; in-VM tools die first.
+      build output (target, node_modules, .next) under the guest home, each
+      deleted only if git ignores it. Run this from the Mac; in-VM tools die
+      first.
 
   disk-grow <GiB>
       Raise the VM's disk ceiling (grow-only; the backing file is sparse, so
@@ -69,13 +70,15 @@ Usage: yo <command> [args]
 
   link
       Add a "yolobox" git remote to the current repo, pointing at the same
-      path under ~/wrk in the VM (created there if missing). Then
+      \$HOME-relative path in the VM (created there if missing). Then
       "git push yolobox main" carries the project in.
 
   seed
       Copy into the VM what it cannot do without: ~/.ssh/config (minus lima's
       Include and IdentityAgent), every ~/.ssh/*.pub, and each
-      ~/Developer/<group>/.gitconfig. Never a private key.
+      <group>/.gitconfig under the top-level trees the VM's home shares with
+      this Mac's. Never a private key. Re-run after the first link on a
+      fresh VM.
 
   code [project]
   zed [project]
@@ -101,8 +104,9 @@ Usage: yo <command> [args]
       /health and /creds, and a guest sts get-caller-identity.
 
 enter, code and zed resolve the directory the same way: with a project
-argument, pick among the VM's git repos under ~/wrk with fzf; without one,
-the mirrored directory of the current repo, or ~/wrk outside a repo.
+argument, pick among the VM's git repos with fzf; without one, the guest
+mirror of the current directory (its deepest existing ancestor when the
+mirror is missing, the guest home when the cwd is outside \$HOME).
 EOF
 }
 
@@ -367,7 +371,7 @@ herd_drift_report() {
 yo: herd version drift — this Mac runs herdr $1, the box has $2.
     If the wire protocol differs, every in-box agent report is rejected and
     the box's agents show as unknown in the herd.
-    Fix:  ./yo ssh -- 'cd ~/wrk/yolobox && nix flake update nixpkgs'
+    Fix:  ./yo ssh -- 'cd $(yolobox_vmdir) && nix flake update nixpkgs'
           then commit, push, and nixos-rebuild switch; finally ./yo herd-check
     Skip: YOLOBOX_SKIP_HERD_CHECK=1 ./yo enter
 EOF
@@ -439,6 +443,19 @@ cmd_status() {
     herd_drift_check report
 }
 
+# This repo's guest checkout: the recorded yolobox remote when one exists
+# (so the push target and every rebuild path can never disagree), else the
+# mirror of the script's own logical directory. SCRIPT_DIR is resolved with
+# cd -P and would lose the user's spelling, hence the separate logical cd.
+yolobox_vmdir() {
+    if url="$(git -C "${SCRIPT_DIR}" remote get-url yolobox 2>/dev/null)"; then
+        printf '%s\n' "${url#ssh://"${VM_HOST}"}"
+        return
+    fi
+    script_dir_logical="$(cd "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
+    vm_mirror "${script_dir_logical}"
+}
+
 cmd_bootstrap() {
     [ "$#" -eq 0 ] || {
         echo "yo: bootstrap takes no arguments" >&2
@@ -449,7 +466,17 @@ cmd_bootstrap() {
     cmd_up
     hc_ok "VM up"
 
-    vmdir="${VM_USER_HOME}/wrk/yolobox"
+    vmdir="$(yolobox_vmdir)" || {
+        echo "yo: this repo has no yolobox remote and ${SCRIPT_DIR} is outside \$HOME — cannot pick its guest path" >&2
+        exit 1
+    }
+    case "${vmdir}" in
+        "${VM_USER_HOME}" | "${VM_USER_HOME}"/*) ;;
+        *)
+            echo "yo: this repo's guest path '${vmdir}' is outside the guest home ${VM_USER_HOME} — fix the yolobox remote URL" >&2
+            exit 1
+            ;;
+    esac
     guest_repo_ensure "${vmdir}"
     hc_ok "guest repo ready at ${vmdir}"
 
@@ -468,7 +495,7 @@ cmd_bootstrap() {
     ssh_args
     # shellcheck disable=SC2029 # $(id -un) must expand client-side: Nix has no way to learn the guest username on its own
     ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
-        "sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild boot --impure --flake ~/wrk/yolobox#yolobox"
+        "sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild boot --impure --flake '${vmdir}#yolobox'"
     hc_ok "built"
 
     bootstrap_reboot_if_needed
@@ -581,14 +608,16 @@ measure() {
     printf '  %-7s %s\n' "${size:-?}" "$1"
 }
 
-# .devbox, .venv and .git are pruned in the first branch so the walk cannot
-# reach a target/ or node_modules/ living inside them: .venv backs the
-# per-project basedpyright (nix/lsp.nix) and .devbox holds devbox's toolchain
-# state — neither is build output. Matching directories are pruned in turn, so
-# nothing nested inside a hit is walked or reported twice.
+# Hidden directories are pruned in the first branch — except .next, which
+# is itself a wanted match — so the walk cannot reach a target/ or
+# node_modules/ living inside .git, .devbox or .venv: .venv backs the
+# per-project basedpyright (nix/lsp.nix) and .devbox holds devbox's
+# toolchain state — neither is build output. Matching directories are
+# pruned in turn, so nothing nested inside a hit is walked or reported
+# twice.
 project_targets() {
-    find "$HOME/wrk" -mindepth 1 \
-        \( -name .devbox -o -name .venv -o -name .git \) -prune -o \
+    find "$HOME" -mindepth 1 \
+        \( -name ".*" ! -name .next \) -prune -o \
         \( -name target -o -name node_modules -o -name .next \) \
         -type d -prune -print 2>/dev/null
 }
@@ -721,7 +750,7 @@ cmd_disk_grow() {
         exit 1
     }
     [ "${load_state}" = "loaded" ] || {
-        echo "yo: no growpart unit in the VM's current system, so growing the ceiling would leave /dev/vda2 untouched — switch it: yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '~/wrk/yolobox#yolobox'" >&2
+        echo "yo: no growpart unit in the VM's current system, so growing the ceiling would leave /dev/vda2 untouched — switch it: yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '$(yolobox_vmdir)#yolobox'" >&2
         exit 1
     }
 
@@ -905,7 +934,7 @@ cmd_herd_check() {
         guest_rc=$?
         if [ "${guest_rc}" -eq 127 ]; then
             hc_fail "the box has no yolobox-herd-check" \
-                "rebuild it: ./yo ssh -- 'sudo YOLOBOX_USERNAME=\$(id -un) nixos-rebuild switch --impure --flake \"~/wrk/yolobox#yolobox\"'"
+                "rebuild it: ./yo ssh -- 'sudo YOLOBOX_USERNAME=\$(id -un) nixos-rebuild switch --impure --flake \"$(yolobox_vmdir)#yolobox\"'"
         else
             hc_fail "the guest half failed (exit ${guest_rc}) — see its output above"
         fi
@@ -1037,38 +1066,40 @@ GUEST_AWS_CHECK
     [ "${HERD_CHECK_FAILED}" -eq 0 ] || exit 1
 }
 
-# Resolve $1 relative to a base dir via cd+pwd -P; empty on failure.
-relative_to() {
-    base_real="$(cd -P "$1" 2>/dev/null && pwd)" || return 1
-    target_real="$2"
-    case "${target_real}" in
-        "${base_real}")
-            printf '%s\n' "."
-            ;;
-        "${base_real}"/*)
-            printf '%s\n' "${target_real#"${base_real}"/}"
-            ;;
-        *)
-            return 1
-            ;;
+# Guest twin of a Mac logical absolute path: the same $HOME-relative path
+# under the guest home. Fails on anything outside $HOME, so every guest
+# target built from it is contained in the guest home by construction.
+vm_mirror() {
+    case "$1" in
+        "$HOME") printf '%s\n' "${VM_USER_HOME}" ;;
+        "$HOME"/*) printf '%s\n' "${VM_USER_HOME}/${1#"$HOME"/}" ;;
+        *) return 1 ;;
     esac
 }
 
-# VM directory mirroring the host cwd's repo; ~/wrk when outside one.
+# Guest directory mirroring the Mac's logical cwd. A cwd outside $HOME lands
+# at the guest home; a mirrored path missing in the guest walks up to its
+# deepest existing ancestor. Either detour notifies on stderr — stdout is
+# captured by vm_target_dir and must carry the path alone.
 vm_dir_for_cwd() {
-    toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" &&
-        toplevel_real="$(cd -P "${toplevel}" && pwd)" &&
-        relpath="$(relative_to "$HOME/Developer" "${toplevel_real}")" &&
-        [ "${relpath}" != "." ] &&
-        {
-            printf '%s\n' "${VM_USER_HOME}/wrk/${relpath}"
-            return
-        }
-    printf '%s\n' "${VM_USER_HOME}/wrk"
+    if ! desired="$(vm_mirror "$PWD")"; then
+        printf 'path "%s" does not exist in the yolobox you are in "%s"\n' \
+            "$PWD" "${VM_USER_HOME}" >&2
+        printf '%s\n' "${VM_USER_HOME}"
+        return
+    fi
+    landing="$(guest_ssh "d=$(printf '%q' "${desired}")
+        while [ -n \"\$d\" ] && [ ! -d \"\$d\" ]; do d=\"\${d%/*}\"; done
+        printf '%s\n' \"\${d:-\$HOME}\"")"
+    [ "${landing}" = "${desired}" ] ||
+        printf 'path "%s" does not exist in the yolobox you are in "%s"\n' \
+            "${desired}" "${landing}" >&2
+    printf '%s\n' "${landing}"
 }
 
-# A project is a git repo under ~/wrk: worktrees leave a .git file,
-# clones a .git dir, so the find matches both.
+# A project is a git repo under the guest home: worktrees leave a .git
+# file, clones a .git dir, so the find matches both. Hidden directories are
+# pruned — except .git itself, the very name the find is looking for.
 vm_project_pick() {
     command -v fzf >/dev/null || {
         echo "yo: fzf not found (brew install fzf)" >&2
@@ -1076,12 +1107,12 @@ vm_project_pick() {
     }
     ssh_args
     projects="$(ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" \
-        'find ~/wrk -mindepth 2 \
-             \( -name node_modules -o -name target -o -name .next -o -name .devbox -o -name .venv \) -prune -o \
+        'find "$HOME" -mindepth 2 \
+             \( -name node_modules -o -name target -o -name .next -o \( -name ".*" ! -name .git \) \) -prune -o \
              -name .git \( -type d -o -type f \) -printf "%h\n" -prune' |
-        sed "s|^${VM_USER_HOME}/wrk/||" | sort)"
+        sed "s|^${VM_USER_HOME}/||" | sort)"
     [ -n "${projects}" ] || {
-        echo "yo: no projects under ~/wrk in the VM" >&2
+        echo "yo: no projects in the VM" >&2
         exit 1
     }
     choice="$(printf '%s\n' "${projects}" |
@@ -1090,7 +1121,7 @@ vm_project_pick() {
         [ "${rc}" -eq 130 ] || echo "yo: no project matches '$1'" >&2
         exit "${rc}"
     }
-    printf '%s\n' "${VM_USER_HOME}/wrk/${choice}"
+    printf '%s\n' "${VM_USER_HOME}/${choice}"
 }
 
 vm_target_dir() {
@@ -1166,7 +1197,7 @@ t3_require_service() {
         exit 1
     }
     [ "${load_state}" = "loaded" ] || {
-        echo "yo: no t3 unit in the VM's current system — switch it: yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '~/wrk/yolobox#yolobox'" >&2
+        echo "yo: no t3 unit in the VM's current system — switch it: yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '$(yolobox_vmdir)#yolobox'" >&2
         exit 1
     }
     [ "${active_state}" = "active" ] || {
@@ -1219,28 +1250,27 @@ cmd_pair() {
 }
 
 cmd_link() {
-    toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    # --show-toplevel resolves symlinks; cdup + logical cd/pwd is what keeps
+    # the user's own spelling of the path, which is what the mirror carries.
+    cdup="$(git rev-parse --show-cdup 2>/dev/null)" || {
         echo "yo: link must run inside a git repo" >&2
         exit 1
     }
+    toplevel="$(cd "./${cdup}" && pwd)"
 
     if git -C "${toplevel}" remote get-url yolobox >/dev/null 2>&1; then
         echo "yo: remote 'yolobox' already exists" >&2
         exit 1
     fi
 
-    toplevel_real="$(cd -P "${toplevel}" && pwd)"
-
-    relpath="$(relative_to "$HOME/Developer" "${toplevel_real}")" || {
-        echo "yo: repo must be under \$HOME/Developer" >&2
-        exit 1
-    }
-    if [ "${relpath}" = "." ]; then
-        echo "yo: refusing to link \$HOME/Developer itself" >&2
+    if [ "${toplevel}" = "$HOME" ]; then
+        echo "yo: refusing to link \$HOME itself" >&2
         exit 1
     fi
-
-    vmdir="${VM_USER_HOME}/wrk/${relpath}"
+    vmdir="$(vm_mirror "${toplevel}")" || {
+        echo "yo: repo must be under \$HOME (it is at ${toplevel})" >&2
+        exit 1
+    }
 
     guest_repo_ensure "${vmdir}"
 
@@ -1299,18 +1329,24 @@ seed_ssh() {
 # Directory-level git identities: ~/.dotfiles/gitconfig includeIf's a
 # .gitconfig sitting next to a group of repos (work email, work SSH alias),
 # and that file is untracked host state, not part of any repo that `yo link`
-# pushes. ~/Developer/<group> maps to ~/wrk/<group> in the VM, the same
-# mapping cmd_link uses.
+# pushes. The guest names the top-level trees it already has; each one that
+# also exists on the Mac gets its <group>/.gitconfig files copied at the
+# same $HOME-relative paths, so nothing here hardcodes either side's layout.
 seed_gitconfig() {
-    ssh_args
+    roots="$(guest_ssh 'find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\n"')"
     identities=()
-    for identity in "$HOME"/Developer/*/.gitconfig; do
-        [ -e "${identity}" ] || continue
-        identities+=("${identity#"$HOME/Developer/"}")
-    done
+    while IFS= read -r root; do
+        [ -n "${root}" ] || continue
+        [ -d "$HOME/${root}" ] || continue
+        for identity in "$HOME/${root}"/*/.gitconfig; do
+            [ -e "${identity}" ] || continue
+            identities+=("${identity#"$HOME/"}")
+        done
+    done <<<"${roots}"
     [ "${#identities[@]}" -gt 0 ] || return 0
-    tar -C "$HOME/Developer" --no-xattrs -cf - "${identities[@]}" |
-        ssh "${SSH_ARGS[@]}" "${VM_HOST}" 'mkdir -p ~/wrk && tar -C ~/wrk -xf -'
+    ssh_args
+    tar -C "$HOME" --no-xattrs -cf - "${identities[@]}" |
+        ssh "${SSH_ARGS[@]}" "${VM_HOST}" 'tar -C "$HOME" -xf -'
 }
 
 main() {

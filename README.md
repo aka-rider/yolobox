@@ -43,14 +43,25 @@ Create and build the VM once:
 
 Add `Include ~/.lima/yolobox/ssh.config` to `~/.ssh/config` so `ssh lima-yolobox`, Zed and VS Code can all find the VM.
 
-Then, in any project on the Mac:
+Then, in any project under your home directory on the Mac:
 
 ```bash
 cd ~/Developer/some-project
-yo link            # adds a "yolobox" git remote mirrored at ~/wrk/some-project in the VM
+yo link            # adds a "yolobox" git remote; the VM mirrors the same $HOME-relative path
 git push yolobox main
-yo enter           # ssh into that directory inside the VM
+yo enter           # ssh into the mirrored directory inside the VM
 ```
+
+`yo enter` (and `yo code`, `yo zed`) always lands in the guest twin of
+your Mac working directory — subdirectories included, symlinked spellings
+preserved, so the VM path reads exactly like the Mac path. If that path
+does not exist in the VM yet, it says so on stderr and drops you at the
+nearest existing ancestor; a working directory outside `$HOME` lands you
+at the guest home, because the VM mirrors nothing outside it.
+
+On a fresh box, re-run `yo seed` after your first `yo link`: seed copies
+group `.gitconfig` files only into directory trees that already exist in
+the VM.
 
 Inside the VM, give the project its toolchain with [devbox](https://www.jetify.com/devbox).
 
@@ -69,11 +80,11 @@ Find packages with `devbox search <name>`.
 ### Make the VM your own
 
 The VM is described by `flake.nix` and the modules in `nix/`.
-To add a tool for everyday use, say `helix` or `vim`, add it to `environment.systemPackages` in `nix/base.nix`, then from inside the VM:
+To add a tool for everyday use, say `helix` or `vim`, add it to `environment.systemPackages` in `nix/base.nix`, then from this repo's checkout inside the VM (mirrored at the same `$HOME`-relative path as on the Mac):
 
 ```bash
 git add -A                       # Nix only sees files git knows about
-sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake ~/wrk/yolobox#yolobox
+sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake .#yolobox
 ```
 
 `yo ssh` gets you a shell to troubleshoot the VM.

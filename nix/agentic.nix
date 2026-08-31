@@ -9,7 +9,7 @@ let
         exit 1
       }
       top="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
-      project="''${top#"$HOME/wrk/"}"
+      project="''${top#"$HOME/"}"
       project="''${project//\//--}"
       export PLAYWRIGHT_MCP_USER_DATA_DIR="$HOME/.local/state/yolobox/browser-profiles/${engine}/$project"
       export PLAYWRIGHT_MCP_OUTPUT_DIR="$HOME/artifacts/$project"
