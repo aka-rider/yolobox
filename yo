@@ -527,7 +527,7 @@ bootstrap_reboot_if_needed() {
 }
 
 guest_runs_its_system_profile() {
-    generations="$(guest_ssh 'readlink /nix/var/nix/profiles/system && readlink /run/current-system' | tr -d '\r')"
+    generations="$(guest_ssh 'readlink -f /nix/var/nix/profiles/system && readlink -f /run/current-system' | tr -d '\r')"
     PROFILE_GENERATION="$(printf '%s\n' "${generations}" | sed -n '1p')"
     BOOTED_GENERATION="$(printf '%s\n' "${generations}" | sed -n '2p')"
     [ -n "${BOOTED_GENERATION}" ] || hc_abort "cannot read the VM's generations — is it up? (yo status)"
