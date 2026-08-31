@@ -117,12 +117,11 @@
 
   # Rendered to /etc/direnv/direnv.toml, which is where the module's
   # DIRENV_CONFIG=/etc/direnv makes direnv look — an XDG ~/.config file is
-  # never read. Agents cannot answer a `direnv allow` prompt, so every
-  # .envrc under ~/wrk is auto-trusted; the VM itself is the blast-radius
-  # boundary.
+  # never read.
+  # every .envrc in the guest home is auto-trusted; the VM itself is the blast-radius boundary.
   programs.direnv = {
     enable = true;
-    settings.whitelist.prefix = [ "${config.users.users.${username}.home}/wrk" ];
+    settings.whitelist.prefix = [ config.users.users.${username}.home ];
   };
 
   programs.nix-ld.enable = true;

@@ -70,17 +70,41 @@ whose `IdentityFile` names a public key — a selector, not a key — and
 `Include` and `IdentityAgent`, both of which name paths that do not exist
 in the VM and would take the forwarded agent away.
 
-`yo seed` also copies `~/Developer/<group>/.gitconfig` to
-`~/wrk/<group>/.gitconfig`. Those files sit next to repos, not inside one,
-so no push ever carries them, and without them the `includeIf` in
+`yo seed` also copies group `.gitconfig` files. It asks the guest which
+non-hidden top-level directories exist under its home, and for each one
+that also exists under the Mac `$HOME` (a symlink to a directory counts)
+it copies every `<root>/<group>/.gitconfig` with its `$HOME`-relative
+path preserved. Those files sit next to repos, not inside one, so no push
+ever carries them, and without them the `includeIf` in
 `~/.dotfiles/gitconfig` matches nothing and work repos commit under the
-personal email. That include must say `~/wrk/...`: in the VM `~/wrk` is
-real and `~/Developer` does not exist.
+personal email. That include must spell the path exactly as the project
+is spelled on the Mac, because the mirror carries the spelling into the
+VM verbatim. Seed creates no guest directory, so on a fresh box it copies
+nothing until the first `yo link` grows a tree — re-run `yo seed` after
+that first link.
 
 How to recognise the class: `ssh -T git@github.com` and `ssh -T
 git@github-iurii-tech` in the VM must greet two different names. "Could
 not resolve hostname" means the ssh config never arrived; the wrong name
 means the public keys did not.
+
+## The mirror: how a Mac path becomes a guest path
+
+`yo enter`, `yo code` and `yo zed` land in the guest twin of the Mac's
+logical `$PWD`: the path relative to the Mac `$HOME`, grafted onto the
+guest `$HOME`, subdirectory included. Logical means `$PWD` as the shell
+spells it — a symlinked spelling is mirrored, never resolved, so the
+guest sees whatever name you `cd` through on the Mac. `yo link` maps a
+repo's logical toplevel the same way and refuses a repo outside `$HOME`.
+When the mirrored path does not exist in the VM, the session lands at
+the deepest existing ancestor; when the Mac cwd is outside `$HOME`, it
+lands at the guest home. Both cases print exactly
+`path "%s" does not exist in the yolobox you are in "%s"` to stderr, and
+no `yo` command can target a guest path outside the guest `$HOME`. The
+fzf picker behind `yo enter <fuzzy>` lists git repos anywhere under the
+guest home, hidden directories pruned. `yo bootstrap` finds this repo's
+guest checkout through its recorded `yolobox` remote, falling back to
+mirroring the script's own logical location.
 
 ## Per-project dev shells
 
@@ -96,7 +120,7 @@ authoring `devbox.json` on either side is safe; the remaining discipline is
 ordinary git — the VM commits `devbox.lock`, pull it before pushing again.
 
 Resolution needs network on the first add. `.devbox/` is per-machine and
-gitignored. direnv trusts every `.envrc` under `~/wrk` through
+gitignored. direnv trusts every `.envrc` under the guest home through
 `/etc/direnv/direnv.toml`; the NixOS module exports `DIRENV_CONFIG=/etc/direnv`,
 so a `~/.config/direnv/direnv.toml` is silently ignored — never put the
 whitelist there.
@@ -114,11 +138,12 @@ restarts the VM and re-checks, aborting with a `df /boot` hint if the two
 still disagree (the half-failed bootloader install from the ESP section
 below).
 
-A project is any git repo at any depth under `~/wrk`, not only
-`~/wrk/<group>/<repo>` — a monorepo puts one at depth 7. So the walk in
-`vm_project_pick` is bounded by pruning `node_modules`, `target`, `.next`,
-`.devbox`, `.venv` and `.git` itself, not by a depth cap, because a depth cap
-has to be re-guessed every time a monorepo nests one level deeper. Recognise
+A project is any git repo at any depth under the guest home, not only
+`<group>/<repo>` — a monorepo puts one at depth 7. So the walk in
+`vm_project_pick` is bounded by pruning `node_modules`, `target`, `.next`
+and every hidden directory (`.git` itself included), not by a depth cap,
+because a depth cap has to be re-guessed every time a monorepo nests one
+level deeper. Recognise
 the failure by its shape: a cap surfaces as fzf reporting "no project matches"
 for a repo that plainly exists, so what to check is the list handed to fzf, not
 fzf. `yo gc`'s `project_targets` carried the same cap, which made `--deep`
@@ -180,8 +205,9 @@ command still works while every unprivileged one dies. And `yo ssh` reaches
 in from the Mac, which the full disk cannot hurt — hence the remedy,
 `yo gc`, lives on the Mac.
 
-In the one incident so far, `~/wrk/rune/target` held 41 GiB, 43% of the
-disk: `rune/Cargo.toml` had no `[profile.dev]`, so every dev build and
+In the one incident so far, the `rune` project's `target/` under the
+guest home held 41 GiB, 43% of the disk: `rune/Cargo.toml` had no
+`[profile.dev]`, so every dev build and
 every integration test linked its own unstripped ~230 MiB binary, and cargo
 never prunes old hashes. The fix belongs in that repo (see `TODO.md`).
 Runners-up: 32 GiB of dead nix store paths, 4.7 GiB podman, 2.9 GiB
@@ -189,8 +215,9 @@ Runners-up: 32 GiB of dead nix store paths, 4.7 GiB podman, 2.9 GiB
 
 `yo gc` reports; `--yes` cleans the machine tier (journald, nix garbage,
 root's nix cache, npm cache, podman); `--deep --yes` also deletes `target`,
-`node_modules` and `.next` under `~/wrk`. Root-only steps run first on
-purpose: they free the space the unprivileged steps need, since npm writes
+`node_modules` and `.next` anywhere under the guest home, hidden
+directories pruned. Root-only steps run first on purpose: they free the
+space the unprivileged steps need, since npm writes
 a log before it clears anything. `.venv` and `.devbox/virtenv` are
 excluded — `nix/lsp.nix` points basedpyright at `.venv`, and `virtenv` is
 devbox's toolchain, not build output.
@@ -242,9 +269,9 @@ before `exec`.
 Upstream picks headless whenever `DISPLAY` is unset, silently. The wrapper
 checks the X socket itself and refuses loudly instead.
 
-A browser profile is named after the git toplevel relative to `~/wrk`,
-slashes turned into `--`. A basename would merge `a/web` with `b/web` and
-split sessions started from a subdirectory.
+A browser profile is named after the git toplevel relative to the guest
+`$HOME`, slashes turned into `--`. A basename would merge `a/web` with
+`b/web` and split sessions started from a subdirectory.
 
 Things learned the hard way, each one line:
 

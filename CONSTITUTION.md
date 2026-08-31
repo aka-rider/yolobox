@@ -69,8 +69,9 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 - ALWAYS strip `IdentityAgent` and lima's `Include` when copying
   `~/.ssh/config` into the VM. Both name paths that do not exist there and
   take the forwarded agent away.
-- ALWAYS spell git `includeIf` paths as `~/wrk/...`. In the VM `~/wrk` is
-  the real directory and `~/Developer` does not exist.
+- ALWAYS spell git `includeIf` paths exactly as the project path is
+  spelled on the Mac. `yo` mirrors the logical spelling into the VM
+  verbatim, so any other spelling matches nothing there.
 - NEVER copy a private key into the VM.
 
 ## AWS credentials
@@ -108,6 +109,17 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   live connection never touches the file, so an age would reap a working
   pane's socket.
 
+## Paths
+
+- ALWAYS derive a guest path by mirroring the Mac's logical `$PWD` (or a
+  repo's logical toplevel) relative to `$HOME` onto the guest `$HOME`.
+  Logical, never `realpath` or `cd -P`: physical resolution loses the
+  spelling the user stands in, and a hardcoded root splits state across
+  two trees the way a hardcoded username once split it across two homes.
+- NEVER let a `yo` command target a guest path outside the guest `$HOME`.
+  A path the mirror cannot place lands at the guest home with a loud
+  stderr notification instead of a silent guess.
+
 ## Project repos in the VM
 
 - ALWAYS keep a project's VM checkout clean before pushing to it. The push
@@ -116,4 +128,4 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 - ALWAYS pull the VM's commits (it commits `devbox.lock`) before pushing
   again, or the push lands on a diverged branch and is refused.
 - ALWAYS keep Playwright output in `~/artifacts/<project>/`, never inside
-  `~/wrk/<project>`, so the push channel never sees stray binaries.
+  the project checkout, so the push channel never sees stray binaries.
