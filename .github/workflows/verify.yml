@@ -9,14 +9,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: shellcheck yo
-        run: shellcheck yo
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
 
-      - name: Compile-check aws-broker (python3 -m py_compile)
-        run: python3 -m py_compile aws-broker
+      - name: Compile-check yo and aws-broker (python 3.9)
+        run: python3 -m py_compile yo aws-broker
 
-      - name: Syntax-check yo (bash -n)
-        run: bash -n yo
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
 
       - name: Install nix
         uses: cachix/install-nix-action@v27

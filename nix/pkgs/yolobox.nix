@@ -4,14 +4,11 @@
 , src
 , version
 , fzf
-, jq
 , git
 , openssh
 , curl
 , python3
 , coreutils
-, gnused
-, gawk
 , lima
 }:
 
@@ -32,12 +29,12 @@ stdenvNoCC.mkDerivation {
     install -Dm644 lima/yolobox.yaml "$out/libexec/yolobox/lima/yolobox.yaml"
 
     substituteInPlace "$out/libexec/yolobox/yo" \
-      --replace-fail 'YO_VERSION="dev"' 'YO_VERSION="${version}"'
+      --replace-fail 'YO_VERSION = "dev"' 'YO_VERSION = "${version}"'
 
     patchShebangs "$out/libexec/yolobox/yo" "$out/libexec/yolobox/aws-broker"
 
     makeWrapper "$out/libexec/yolobox/yo" "$out/bin/yo" \
-      --prefix PATH : ${lib.makeBinPath ([ fzf jq git openssh curl python3 coreutils gnused gawk ]
+      --prefix PATH : ${lib.makeBinPath ([ fzf git openssh curl python3 coreutils ]
         ++ lib.optional stdenvNoCC.hostPlatform.isDarwin lima)}
 
     runHook postInstall
