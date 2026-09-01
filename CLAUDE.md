@@ -31,7 +31,8 @@ rules this file justifies.
 - `lima/yolobox.yaml` — read once, when the instance is created.
 - `templates/default` — `devbox.json` and `.envrc` for a new project.
 - `homebrew/yolobox.rb` — the brew formula, with `@URL@`/`@SHA256@` holes;
-  `release.yml` renders it into `aka-rider/homebrew-tap` on every tag.
+  `release.yml` renders it into `aka-rider/homebrew-tap` on every published
+  release.
 - `tests/test_yo.py` — unit tests for yo's pure functions and argv builders;
   `python3 -m unittest discover -s tests`.
 - `TODO.md` — known problems, including the upstream reports still owed.
@@ -252,13 +253,24 @@ github:aka-rider/yolobox` — and `yo bootstrap` builds the VM directly from
 a pinned flake ref, `nixos-rebuild boot --impure --flake
 'github:aka-rider/yolobox/v<version>#yolobox'`, with no push and no guest
 checkout at all. The version is baked into `yo` at package build time;
-`VERSION` at the repo root is the single source of truth for it, and the
-brew and nix release for a given tag both read the same file, so the two
-channels never drift from each other. The formula itself lives here too,
-at `homebrew/yolobox.rb`: the release job renders it into the tap from a
-`git archive` asset it uploaded itself, so the tap never holds a hand-edited
-formula and the hash never rests on GitHub's non-stable auto-tarballs. `YOLOBOX_FLAKE` overrides the ref
-for anyone running their own fork wholesale, e.g.
+the release workflow takes the published release's tag
+(`github.event.release.tag_name`) as the single source of truth: it writes
+`.version` from that tag, commits the stamp to `main`, and force-moves the
+tag onto the stamp commit. The moving tag is the part worth understanding.
+Both channels read `.version`, but at different moments — homebrew reads it
+out of the `git archive` tarball CI builds, there and then, while nix reads
+it out of whatever tree the published tag points at, whenever a guest later
+fetches the flake ref. So writing the stamp into the tarball alone would
+leave every nix fetch on a stale version; the stamp has to be inside the
+tagged tree, and moving the tag is how it gets there. What makes that safe
+is a guard: the workflow refuses unless the release tag is already the tip
+of `main`, because force-moving a tag cut from an older commit would
+republish different content under a name someone may already have fetched.
+The formula itself lives here too, at `homebrew/yolobox.rb`: the release job
+renders it into the tap from that same tarball, hashed locally rather than
+re-downloaded, so the tap never holds a hand-edited formula and the hash
+never rests on GitHub's non-stable auto-tarballs. `YOLOBOX_FLAKE` overrides
+the ref for anyone running their own fork wholesale, e.g.
 `YOLOBOX_FLAKE=github:you/yolobox/your-branch yo bootstrap`. Customising
 the box now means dropping a `/etc/yolobox/local.nix` inside the VM, which
 `nix/base.nix` imports when present, then `sudo nixos-rebuild switch
@@ -294,6 +306,12 @@ each recognisable on its own:
   hits that throw immediately; it needs `--impure` with
   `YOLOBOX_USERNAME=$(id -un)` set, same as every `nixos-rebuild` in this
   repo.
+- **Release published from a non-main commit.** The release workflow refuses
+  to run unless the release tag is already the tip of `main`, because the
+  workflow force-moves the tag onto its stamp commit — moving a tag from an
+  older commit would silently republish different content. Recognise this by
+  a workflow failure on a release created from a feature branch, with an
+  explicit refusal message before any tag move or archive happens.
 
 ## tmpfiles rules apply on `switch`
 
