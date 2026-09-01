@@ -72,6 +72,16 @@ dump_diagnostics() {
 
 echo "=== yolobox herd check ==="
 
+# ----------------------------------------------------------------- 0. the account
+
+if [ "$(id -un)" != "@AGENT_USER@" ]; then
+    fail "account" \
+         "running as $(id -un), not @AGENT_USER@ — this session was opened with the wrong ssh role. Herd reporting and every stage below assume the agent account; nothing past this point is meaningful."
+    echo "=== HERD CHECK FAILED:${failures} ===" >&2
+    exit 1
+fi
+ok "running as @AGENT_USER@"
+
 # ---------------------------------------------------------------- 1. the forward
 
 env_ok=yes

@@ -1,0 +1,38 @@
+name: Verify
+
+on:
+  workflow_call:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: shellcheck yo
+        run: shellcheck yo
+
+      - name: Compile-check aws-broker (python3 -m py_compile)
+        run: python3 -m py_compile aws-broker
+
+      - name: Syntax-check yo (bash -n)
+        run: bash -n yo
+
+      - name: Install nix
+        uses: cachix/install-nix-action@v27
+
+      - name: nix flake check --impure
+        # flake.nix throws unless YOLOBOX_USERNAME is set (it threads a real
+        # host username into the NixOS module), so this must run --impure.
+        env:
+          YOLOBOX_USERNAME: runner
+        run: nix flake check --impure
+
+      - name: Evaluate aarch64-darwin.yolobox purely (proves evaluation only, not a cross build)
+        run: nix eval .#packages.aarch64-darwin.yolobox.name
+
+      - name: Assert VERSION is well-formed semver
+        run: |
+          set -euo pipefail
+          version="$(cat VERSION)"
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'

@@ -33,15 +33,40 @@ Run (`yo zed`, `yo code`).
 
 ### Prerequisites
 
-[1Password](https://1password.com/) with its SSH agent turned on (it holds your keys), and Lima (`brew install lima`).
+[1Password](https://1password.com/) with its SSH agent turned on (it holds your keys).
+
+```bash
+brew install aka-rider/tap/yolobox
+```
+
+This pulls `yo` from the `aka-rider/tap` tap and installs `lima`, `fzf` and
+`jq` for you as formula dependencies — nothing else to set up by hand. On
+Nix, `nix run github:aka-rider/yolobox` runs the same release without a
+`brew` install at all.
 
 Create and build the VM once:
 
 ```bash
-./yo bootstrap     # create the VM, push this repo in, build NixOS, seed identities; rerunnable
+yo bootstrap     # create the VM, build NixOS from the pinned yolobox release, seed identities; rerunnable
 ```
 
-Add `Include ~/.lima/yolobox/ssh.config` to `~/.ssh/config` so `ssh lima-yolobox`, Zed and VS Code can all find the VM.
+The VM has two accounts: you, the **operator** (`${username}`, matched to
+your Mac account, the only one with sudo), and `agent`, the account every
+AI coding session runs as, with no sudo at all. Add both to
+`~/.ssh/config` — the `Match` block ABOVE the `Include`, because ssh keeps
+only the first value it sees per keyword, so a `Match` placed below the
+`Include` never takes effect:
+
+```
+Match host lima-yolobox user agent
+  ControlPath ~/.lima/yolobox/ssh-agent.sock
+
+Include ~/.lima/yolobox/ssh.config
+```
+
+That lets `ssh lima-yolobox`, Zed and VS Code all find the VM as either
+account, without an agent session ever landing on the operator's own
+connection.
 
 Then, in any project under your home directory on the Mac:
 
@@ -63,6 +88,13 @@ On a fresh box, re-run `yo seed` after your first `yo link`: seed copies
 group `.gitconfig` files only into directory trees that already exist in
 the VM.
 
+Pulling back the other way — `git fetch yolobox && git diff
+..yolobox/main` — is the trust boundary of the sandbox: those commits are
+authored by whatever coding agent worked in the VM, and they can carry not
+just code but files the Mac may execute on your behalf, like `.envrc` or
+scripts. Review the diff before merging, and merge before running
+anything from it.
+
 Inside the VM, give the project its toolchain with [devbox](https://www.jetify.com/devbox).
 
 ```bash
@@ -79,18 +111,30 @@ Find packages with `devbox search <name>`.
 
 ### Make the VM your own
 
-The VM is described by `flake.nix` and the modules in `nix/`.
-To add a tool for everyday use, say `helix` or `vim`, add it to `environment.systemPackages` in `nix/base.nix`, then from this repo's checkout inside the VM (mirrored at the same `$HOME`-relative path as on the Mac):
+The VM is described by `flake.nix` and the modules in `nix/`, and there is
+no checkout of any of that inside the VM any more — `yo bootstrap` builds
+straight from the published flake, not from a repo it pushed in.
+Customising the box is the **operator's** job: the agent has no sudo, so
+it cannot rebuild the system even if asked to. To add a
+tool for everyday use, say `helix` or `vim`, drop it into
+`/etc/yolobox/local.nix` inside the VM instead; `nix/base.nix` imports that
+file when it exists, so it never needs upstreaming. Then rebuild:
 
 ```bash
-git add -A                       # Nix only sees files git knows about
-sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake .#yolobox
+sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake 'github:aka-rider/yolobox/v<version>#yolobox'
 ```
 
-`yo ssh` gets you a shell to troubleshoot the VM.
+Use the same flake ref `yo bootstrap` built the box from (`yo --version`
+inside the VM reports the release number; if you built from `YOLOBOX_FLAKE`, use that ref instead). To run your own fork of the whole box instead of
+`aka-rider/yolobox`, point `YOLOBOX_FLAKE` at it before `yo bootstrap` —
+both it and the rebuild above will follow, e.g.
+`YOLOBOX_FLAKE=github:you/yolobox/your-branch yo bootstrap`.
+
+`yo ssh` gets you a shell to troubleshoot the VM, as the operator.
 
 The VM's disk survives restarts.
-`yo enter` and setup the system as your usual Linux, install dotfiles, etc.
+`yo ssh` in and set the system up as your usual Linux, install dotfiles,
+etc. — as the operator, since that account is the one with sudo.
 
 
 Four settings in `lima/yolobox.yaml` — `disk`, `portForwards`, `memory`, and `cpus` — are read once, when the VM is created. Changing the file later does nothing to an existing VM; stop it and use `limactl edit yolobox` (or `yo disk-grow` for the disk).

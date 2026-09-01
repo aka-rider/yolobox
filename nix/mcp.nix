@@ -1,7 +1,7 @@
-{ config, lib, pkgs, username, ... }:
+{ config, lib, pkgs, agentUser, ... }:
 let
   cfg = config.yolobox.mcp.servers;
-  homeDir = config.users.users.${username}.home;
+  homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
   claudeMcpFile = import ./lib/claude-mcp-file.nix;
 
@@ -64,8 +64,8 @@ in
     # and the next harness added here is not audited in advance.
     assertions = [
       {
-        assertion = !(lib.hasInfix "$(" rendered);
-        message = "yolobox.mcp.servers: a rendered config contains '$(' — a harness that expands it at config-load time would execute it.";
+        assertion = lib.all (m: !(lib.hasInfix m rendered)) [ "$(" "`" "\${" ];
+        message = "yolobox.mcp.servers: a rendered config contains a shell expansion marker ($(, backtick, or \${) — a harness that expands it at config-load time would execute it.";
       }
       {
         assertion = lib.all (s: lib.hasPrefix "/" (toString s.command)) (lib.attrValues cfg);
@@ -92,7 +92,7 @@ in
     # symlink (Gotcha 14) tracks /etc across every rebuild.
     systemd.tmpfiles.rules = homeTmpfiles {
       home = homeDir;
-      dirUser = username;
+      dirUser = agentUser;
       dirs = [ ".config" ".config/mcp" ];
       links = [
         { path = ".config/mcp/mcp.json"; argument = "/etc/yolobox/mcp/pi.json"; }

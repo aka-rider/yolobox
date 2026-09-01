@@ -1,4 +1,4 @@
-- Commit 6ea55d0 message carries a leftover "# Conflicts:" template block; scrub with a history rewrite (e.g. `git rebase -r 6ea55d0^` reword) before any publication, then force-sync the VM clone
+- Commit 6ea55d0 message carries a leftover "# Conflicts:" template block; scrub with a history rewrite (e.g. `git rebase -r 6ea55d0^` reword) before any publication
 - Lift the opencode LSP entries (basedpyright, currently per-project in
   PortHub's `opencode.json`) into the global render in `nix/mcp.nix` once the
   parallel MCP/display work there is committed — the shape is schema-checked
@@ -55,3 +55,35 @@
   open: `OOMScoreAdjust` on `user@.service` so the manager is not a preferred
   victim while its own children are. The box was also raised to 16GiB/8cpu in
   `lima/yolobox.yaml`, which further widens the margin.
+- Verify `aka-rider/yolobox` is public before cutting a release, and on every
+  release after: `nixos-rebuild` fetches the flake ref anonymously, so a repo
+  that goes private (even by accident, e.g. an org default) breaks every
+  `yo bootstrap` and every `/etc/yolobox/local.nix` rebuild in the field with
+  an auth error, not a graceful degrade.
+- Create the `HOMEBREW_TAP_TOKEN` secret in the yolobox repo: a PAT scoped
+  `repo`, used to push the formula update to `aka-rider/homebrew-tap` on
+  release. Without it the brew side of a release has nothing to push with.
+- `yo` inside the guest is inert beyond `--version` — every other subcommand
+  needs `limactl` and `~/.lima`, neither of which exists in the guest.
+  Decide whether it still earns its place in `environment.systemPackages`
+  for that one command, or whether reporting the building release belongs
+  somewhere cheaper than shipping the whole CLI into every VM.
+- `seed_gitconfig` and `vm_project_pick` (`yo`) still split `find` output on
+  newlines, the same newline-in-dirname fragility just fixed in
+  `yo gc --deep`'s loops (`project_targets` now emits `-print0`, read with
+  `while IFS= read -r -d ''`). Neither can take that same mechanical fix:
+  both split the output of an `ssh` call captured into a bash variable, and
+  a bash variable cannot carry NUL, so fixing them means restructuring the
+  loop to stream from the `ssh` command directly rather than swapping in
+  `-print0`. Impact is low — top-level guest directory names for
+  `seed_gitconfig`, fzf picker paths for `vm_project_pick`.
+- `virtualisation.podman.autoPrune` (`nix/podman.nix`) runs `podman system
+  prune` as root, but this box is rootless-only by design — no
+  `dockerSocket.enable`, no `podman` group — so every container and image
+  actually lives under an unprivileged account's own storage instead of
+  root's. Root's prune therefore has nothing of its own to reclaim and
+  silently no-ops; the podman bloat `yo gc --deep` cleans up is real disk
+  use that `autoPrune` was never able to touch. Pre-existing, out of scope
+  for the two-account split; worth its own fix — most likely a user-level
+  systemd timer running `podman system prune` as the account that actually
+  owns the rootless storage.

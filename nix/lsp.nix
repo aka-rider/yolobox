@@ -11,9 +11,9 @@
 # (opencode.json, committed to each project) because its global config file
 # lives in nix/mcp.nix, which carries unrelated parallel work at the time of
 # writing — lifting the LSP section into that render is tracked in TODO.md.
-{ config, username, ... }:
+{ config, agentUser, ... }:
 let
-  homeDir = config.users.users.${username}.home;
+  homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
 
   basedpyrightLsp = {
@@ -55,7 +55,7 @@ in
   # conflict — one provider only.
   systemd.tmpfiles.rules = homeTmpfiles {
     home = homeDir;
-    dirUser = username;
+    dirUser = agentUser;
     dirs = [ ".config" ".config/zed" ".claude" ".claude/skills" ];
     links = [
       { path = ".config/zed/settings.json"; argument = "/etc/yolobox/lsp/zed-settings.json"; }

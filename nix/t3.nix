@@ -1,7 +1,7 @@
-{ config, lib, pkgs, username, ... }:
+{ config, lib, pkgs, agentUser, ... }:
 let
   t3 = pkgs.callPackage ./pkgs/t3.nix { };
-  homeDir = config.users.users.${username}.home;
+  homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
 in
 {
@@ -16,7 +16,7 @@ in
     path = [ "/run/current-system/sw" ];
     environment.HOME = homeDir;
     serviceConfig = {
-      User = username;
+      User = agentUser;
       Group = "users";
       Restart = "always";
       ExecStart = "${lib.getExe t3} serve --host 127.0.0.1 --port 3773";
@@ -25,7 +25,7 @@ in
 
   systemd.tmpfiles.rules = homeTmpfiles {
     home = homeDir;
-    dirUser = username;
+    dirUser = agentUser;
     dirs = [ ".t3" ];
     links = [ ];
   };
