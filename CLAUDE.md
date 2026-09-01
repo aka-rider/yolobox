@@ -11,8 +11,9 @@ rules this file justifies.
 
 ## Where things live
 
-- `yo` — the Mac-side CLI. Everything the Mac does to the VM goes through
-  it; `yo --help` describes each command.
+- `yo` — the Mac-side CLI, a single Python 3.9 file with no dependencies
+  beyond the stdlib. Everything the Mac does to the VM goes through it;
+  `yo --help` describes each command.
 - `flake.nix` — wires the modules together and threads the host username
   in.
 - `nix/base.nix` — filesystems, boot, sshd, tmpfiles, git defaults, the
@@ -31,6 +32,8 @@ rules this file justifies.
 - `templates/default` — `devbox.json` and `.envrc` for a new project.
 - `homebrew/yolobox.rb` — the brew formula, with `@URL@`/`@SHA256@` holes;
   `release.yml` renders it into `aka-rider/homebrew-tap` on every tag.
+- `tests/test_yo.py` — unit tests for yo's pure functions and argv builders;
+  `python3 -m unittest discover -s tests`.
 - `TODO.md` — known problems, including the upstream reports still owed.
 
 ## Two accounts: the operator mirrors the host, the agent does not
@@ -272,8 +275,8 @@ each recognisable on its own:
   public is now load-bearing for every box in the field, not just a
   publishing preference.
 - **`YO_VERSION` is still `dev`.** Running `./yo` straight out of an
-  unreleased clone has no version to pin a flake ref from — `flake_ref()`
-  refuses outright rather than guess at a ref that may not exist yet, and
+  unreleased clone has no version to pin a flake ref from — the flake_ref
+  function refuses outright rather than guess at a ref that may not exist yet, and
   says so on stderr, naming `YOLOBOX_FLAKE` as the way out. Recognise this
   by the exact wording of that refusal, not by a bare Nix fetch error.
 - **The guest's own `yo` is inert.** The flake puts the `yolobox` package
@@ -655,7 +658,7 @@ before `yo enter`. v1 minted STS creds once, at enter time, and froze them
 in the guest session's flat env (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) — a session outliving the
 STS duration (an hour, for this SSO) needed a fresh `yo enter`. v2 replaces
-that with botocore's **container credential provider**: `aws_broker_start`
+that with botocore's **container credential provider**: `start_aws_broker`
 in `yo` starts `aws-broker` (repo root, `#!/usr/bin/env python3`, stdlib
 only) on the Mac for that one pane, and the guest gets a loopback URL plus a
 bearer token instead of the credentials themselves. The guest CLI calls back
@@ -670,13 +673,13 @@ botocore's credential provider chain ranks explicit `AWS_ACCESS_KEY_ID` env
 vars above the container provider, so if `yo` still exported the frozen v1
 vars alongside the broker's URL, they would win and silently defeat every
 refresh — the guest would look wired up and would in fact be back to v1's
-one-hour cliff. So `aws_ssh_env_args` now forwards only `AWS_REGION` (see
+one-hour cliff. So the region resolution in `yo` now forwards only `AWS_REGION` (see
 below); all credential minting and the no-long-lived-keys refusal moved
 into `aws-broker`'s startup.
 
 `aws-broker --profile P --watch-pid PID` runs `export-credentials`
 synchronously at startup — this **is** the fail-fast validation, moved
-here from v1's `aws_ssh_env_args`. A nonzero exit or a response with no
+here from v1's region resolution. A nonzero exit or a response with no
 `SessionToken` (long-lived IAM user keys, which must never enter the guest
 because they never expire) prints `ERROR=<one line>` to stdout and exits 1
 before any socket opens. On success it binds `127.0.0.1:0` (kernel-assigned
@@ -694,17 +697,17 @@ serving a not-yet-expired cache across a failed re-mint — a real 500
 no fresh mint to replace it. `GET /health` (no auth) is for `yo aws-check`'s
 guest-side forward probe.
 
-`aws_broker_start` hands the broker's stdout to a fifo rather than a plain
-pipe, so it can `read -t 30` each handshake line with a bound: a broker
-that dies before handshaking fails `yo enter` loudly within 30s instead of
-hanging it forever. The broker's own stderr goes to
-`~/.local/state/yolobox/aws-broker/$$.log`, named by `$$` — `yo`'s own pid
-— because `exec ssh` at the end of `cmd_enter` replaces that process
-in place rather than forking a child, so the pid the broker's watch-pid
-thread polls (`kill -0` every 5s; gone → `os._exit(0)`) is the exact pid
-that names the log file, with no second handshake field needed to tell
-`yo` where to look. That same `exec` is what makes watch-pid correct at
-all: an early exit after the broker starts (`herd_drift_check`'s exit 3,
+`start_aws_broker` reads the broker's stdout as a pipe on its raw file
+descriptor under a single 30 s deadline with `select`: a broker that dies
+before handshaking fails `yo enter` loudly within 30s instead of hanging it
+forever. The broker's own stderr goes to
+`~/.local/state/yolobox/aws-broker/<pid>.log`, named by `os.getpid()` —
+`yo`'s own pid — because `os.execvpe` at the end of enter replaces that
+process in place rather than forking a child, so the pid the broker's
+watch-pid thread polls (`kill -0` every 5s; gone → `os._exit(0)`) is the
+exact pid that names the log file, with no second handshake field needed to
+tell `yo` where to look. That same `os.execvpe` is what makes watch-pid
+correct at all: an early exit after the broker starts (`check_herd_drift`'s exit 3,
 for instance) leaves no orphan, because the watched pid disappears within
 5s of `yo enter` itself exiting — there is no lingering parent shell to
 keep it alive. A broker that somehow outlives its watched pid despite this
@@ -727,12 +730,9 @@ not a bug to fix — a collision in that window is vanishingly unlikely, and
 a real one just fails the real forward exactly as a failed probe would
 have. Once a port is claimed, `AWS_CONTAINER_CREDENTIALS_FULL_URI=http://
 127.0.0.1:<guest-port>/creds` and `AWS_CONTAINER_AUTHORIZATION_TOKEN=<token>`
-cross via `-o SendEnv=...` plus host-side exported env — not `SetEnv`,
-which the herd wiring uses for its non-secret vars: `SetEnv` embeds values
-in ssh's argv, where `ps` shows them to every process on the Mac for the
-session's lifetime, while `SendEnv` puts only the *names* in argv and the
-guest's `AcceptEnv` whitelist (`nix/base.nix`) accepts both mechanisms
-alike. Nothing is written under guest `~/.aws`: the container credential
+cross via `-o SendEnv=...` plus host-side exported env. Every forwarded
+variable, herd and AWS alike, crosses by `SendEnv`, so no value ever appears
+in ssh's argv. Nothing is written under guest `~/.aws`: the container credential
 provider talks HTTP, not disk, and `AWS_CLI_SESSION_ID_DISABLED = "true"`
 keeps the CLI's telemetry sqlite out of `~/.aws/cli/cache` too.
 
@@ -740,7 +740,7 @@ keeps the CLI's telemetry sqlite out of `~/.aws/cli/cache` too.
 env or broker at all — same opt-in-and-silent posture as the herd wiring,
 since most sessions have no need for AWS. `yo aws-check` is the doctor:
 it proves the host prerequisites, starts a real throwaway broker and
-forward (through `aws_broker_start` itself, not a reimplementation), then
+forward (through `start_aws_broker` itself, not a reimplementation), then
 from the guest curls `/health`, curls `/creds` and asserts all four keys
 (`AccessKeyId`, `SecretAccessKey`, `Token` — not `SessionToken`, remapped —
 and `Expiration`), then runs `aws sts get-caller-identity` and asserts a

@@ -21,7 +21,7 @@
       # Mac account's uid) — there is no such thing as a "yolobox user" of
       # its own. Nix has no pure way to learn that name, so it's threaded
       # in impurely: `yo` sets YOLOBOX_USERNAME=$(id -un) on every
-      # nixos-rebuild invocation (see cmd_t3/usage's --impure hints in yo).
+      # nixos-rebuild invocation (see yo's rebuild hint and usage text).
       username =
         let u = builtins.getEnv "YOLOBOX_USERNAME";
         in if u == "" then

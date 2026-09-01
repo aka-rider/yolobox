@@ -1,48 +1,98 @@
-#!/usr/bin/env bash
-# yo — thin Mac-side CLI for the NixOS-VM yolobox (lima/vz).
-#
-# Run `yo --help` for the command reference (usage() below).
+#!/usr/bin/env python3
+"""yo — thin Mac-side CLI for the NixOS-VM yolobox (lima/vz).
 
-set -euo pipefail
+Run `yo --help` for the command reference (USAGE below).
+"""
 
-readonly INSTANCE="yolobox"
-readonly VM_HOST="lima-yolobox"
-# Every AI session in the box runs as this unprivileged account; the human
-# operator keeps lima's own uid-matched one. Projects live in the agent's
-# home, so that home is what the Mac's $HOME mirrors onto.
-readonly VM_AGENT_USER="agent"
-readonly VM_USER_HOME="/home/${VM_AGENT_USER}"
-readonly AGENT_CTL="$HOME/.lima/${INSTANCE}/ssh-agent.sock"
-# Created by a systemd-tmpfiles rule in nix/base.nix — see there for why the
-# forwarded sockets live outside VM_USER_HOME.
-readonly GUEST_SOCK_DIR="/run/yolobox"
-# The guest's t3 service binds loopback only; lima/yolobox.yaml forwards
-# that port to the host, so the same number names it on both sides.
-readonly T3_PORT=3773
-SSH_CFG="$HOME/.lima/yolobox/ssh.config"
-OP_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
-readonly SSH_CFG OP_SOCK
+from __future__ import annotations
+
+import io
+import json
+import os
+import pwd
+import random
+import re
+import select
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.parse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # Rewritten at build time: nix substituteInPlace, Homebrew inreplace.
-YO_VERSION="dev"
-readonly YO_VERSION
+YO_VERSION = "dev"
 
-# Script dir resolution (symlink-safe, no readlink -f).
-SCRIPT_SOURCE="${BASH_SOURCE[0]}"
-while [ -h "${SCRIPT_SOURCE}" ]; do
-    dir="$(cd -P "$(dirname "${SCRIPT_SOURCE}")" >/dev/null 2>&1 && pwd)"
-    SCRIPT_SOURCE="$(readlink "${SCRIPT_SOURCE}")"
-    case "${SCRIPT_SOURCE}" in
-        /*) ;; # absolute
-        *) SCRIPT_SOURCE="${dir}/${SCRIPT_SOURCE}" ;;
-    esac
-done
-SCRIPT_DIR="$(cd -P "$(dirname "${SCRIPT_SOURCE}")" >/dev/null 2>&1 && pwd)"
-readonly SCRIPT_DIR
+INSTANCE = "yolobox"
+VM_HOST = "lima-yolobox"
+AGENT_USER = "agent"
+AGENT_HOME = "/home/agent"
+GUEST_SOCK_DIR = "/run/yolobox"
+T3_PORT = 3773
 
-usage() {
-    cat <<EOF
-Usage: yo <command> [args]
+FORWARDED_ENV = frozenset(
+    {
+        "YOLOBOX_HERD",
+        "HERDR_PANE_ID",
+        "HERDR_SOCKET_PATH",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_REGION",
+    }
+)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def home() -> str:
+    return os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+
+
+def lima_dir() -> str:
+    return os.path.join(home(), ".lima", INSTANCE)
+
+
+def ssh_cfg() -> str:
+    return os.path.join(lima_dir(), "ssh.config")
+
+
+def agent_control_path() -> str:
+    return os.path.join(lima_dir(), "ssh-agent.sock")
+
+
+def op_sock() -> str:
+    return os.path.join(
+        home(), "Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+    )
+
+
+def state_dir() -> str:
+    return os.path.join(home(), ".local/state/yolobox")
+
+
+def herd_version_cache() -> str:
+    return os.path.join(state_dir(), "herd-guest-version")
+
+
+class YoError(Exception):
+    def __init__(self, message: Optional[str] = None, code: int = 1, show_usage: bool = False):
+        super().__init__(message or "")
+        self.message = message
+        self.code = code
+        self.show_usage = show_usage
+
+
+def usage_error(message: str) -> YoError:
+    return YoError(message, code=2, show_usage=True)
+
+
+USAGE = r"""Usage: yo <command> [args]
 
   --version | -V
       Print yo's version and exit.
@@ -83,7 +133,7 @@ Usage: yo <command> [args]
 
   link
       Add a "yolobox" git remote to the current repo, pointing at the same
-      \$HOME-relative path in the VM (created there if missing). Then
+      $HOME-relative path in the VM (created there if missing). Then
       "git push yolobox main" carries the project in.
 
   seed
@@ -120,545 +170,508 @@ Usage: yo <command> [args]
 enter, code and zed resolve the directory the same way: with a project
 argument, pick among the VM's git repos with fzf; without one, the guest
 mirror of the current directory (its deepest existing ancestor when the
-mirror is missing, the guest home when the cwd is outside \$HOME).
-EOF
-}
+mirror is missing, the guest home when the cwd is outside $HOME).
+"""
 
-# The role owns the ControlPath, and it has to: lima's ssh.config names one
-# shared socket with no %r in it, and ssh's multiplexing client never
-# re-checks the login user against the master's — so `-o User=agent` over an
-# already-open operator master silently opens an operator session. Each role
-# therefore gets its own socket. And since ssh keeps the *first* value it
-# sees for a keyword, a caller that wants no multiplexing must say so here
-# (`ssh_role <role> nomux`); appending -o ControlPath=none afterwards is
-# silently ignored. Sets the SSH_ARGS array (macOS ships bash 3.2, which has
-# no mapfile).
-ssh_role() {
-    SSH_ARGS=(-F "${SSH_CFG}")
-    case "$1" in
-        operator) ;;
-        agent) SSH_ARGS+=(-o "User=${VM_AGENT_USER}") ;;
-        *)
-            echo "yo: internal error: unknown ssh role '$1'" >&2
-            exit 1
-            ;;
-    esac
-    if [ "${2:-mux}" = nomux ]; then
-        SSH_ARGS+=(-o "ControlPath=none")
-    elif [ "$1" = agent ]; then
-        SSH_ARGS+=(-o "ControlPath=${AGENT_CTL}")
-    fi
-}
 
-ssh_args() { ssh_role operator; }
-agent_ssh_args() { ssh_role agent; }
+def out(line: str = "") -> None:
+    print(line, flush=True)
 
-# Appends the 1Password agent forward to SSH_ARGS. ONLY the two interactive
-# commands (`enter`, `ssh`) call this: they are where a human pushes to GitHub
-# or reaches another host, and the forwarded agent is the user's live SSH
-# identity — approved per use by 1Password's biometrics — for as long as the
-# connection lives. Every other `yo` path leaves it off, so the shared lima
-# ControlMaster never carries the agent and `yo code`/`yo zed`/a bare
-# `ssh lima-yolobox` cannot inherit it, nor can a lingering ControlPersist
-# master leave the agent socket alive in the VM after the session ends.
-#
-# ForwardAgent names the 1Password socket explicitly rather than "yes", which
-# would forward $SSH_AUTH_SOCK — Apple's launchd agent, empty on this Mac.
-# No IdentityAgent: lima's ssh.config authenticates to the VM with
-# `IdentitiesOnly yes` and its own IdentityFile, so ssh never consults an agent
-# for VM auth and the old IdentityAgent option was inert.
-ssh_forward_agent_args() {
-    SSH_ARGS+=(-o "ForwardAgent=\"${OP_SOCK}\"")
-}
 
-# Refuses when the box predates the operator/agent split, instead of letting
-# a bare "Permission denied (publickey)" stand for it — but only diagnoses
-# that when the operator role *can* reach the VM: a "rebuild it" advice that
-# fires on a stopped VM or a dead forwarder would send someone to delete a
-# disk that was never the problem. When the operator probe fails too, this
-# prints the agent probe's own stderr instead of guessing.
-agent_require() {
-    agent_err="$(agent_ssh true 2>&1 >/dev/null)" && return 0
-    if guest_ssh true >/dev/null 2>&1; then
-        echo "yo: cannot ssh into ${INSTANCE} as '${VM_AGENT_USER}'." >&2
-        echo "    Every AI session runs as that account, and this VM has no working one —" >&2
-        echo "    it predates the operator/agent split. Rebuild it:" >&2
-        echo "        limactl delete ${INSTANCE} && yo bootstrap" >&2
-    else
-        printf '%s\n' "${agent_err}" >&2
-        echo "yo: cannot reach ${INSTANCE} as operator either — is the VM up? yo status" >&2
-    fi
-    exit 1
-}
+def err(line: str = "") -> None:
+    print(line, file=sys.stderr, flush=True)
 
-# Appends this pane's herd forward and herd env to SSH_ARGS, and names the
-# guest-side socket in HERD_GUEST_SOCK (empty when this shell is not a herdr
-# pane, in which case nothing is appended). One definition site, because
-# `enter` and `herd-check` must wire the herd identically — a check that
-# proves a differently-built forward proves nothing about `enter`.
-herd_ssh_forward_args() {
-    HERD_GUEST_SOCK=""
-    if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] &&
-        [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ]; then
-        # nix/base.nix sets StreamLocalBindUnlink=yes, so sshd unlinks
-        # whatever already sits at the -R target before binding it. A
-        # path shared by every pane would let a second concurrent enter
-        # delete and rebind the first pane's live socket out from under
-        # it. Scoping the filename to HERDR_PANE_ID keeps each pane's
-        # unlink-and-rebind local to its own socket. Pane ids are
-        # colon-separated (e.g. "wN:p1"), legal in a filename but not
-        # in ssh's own "remote:local" -R syntax, which would split the
-        # path on that colon — so the colon is swapped for "_", a
-        # character herdr's own [A-Za-z0-9]+:p[A-Za-z0-9]+ id scheme
-        # never produces.
-        pane_id_safe="${HERDR_PANE_ID//:/_}"
-        HERD_GUEST_SOCK="${GUEST_SOCK_DIR}/herd-host.${pane_id_safe}.sock"
-        SSH_ARGS+=(
-            -R "${HERD_GUEST_SOCK}:${HERDR_SOCKET_PATH}"
-            -o "SetEnv=YOLOBOX_HERD=1 HERDR_PANE_ID=${HERDR_PANE_ID} HERDR_SOCKET_PATH=${HERD_GUEST_SOCK}"
-        )
-    fi
-}
 
-# Appends only the region to SSH_ARGS, opt-in via YOLOBOX_AWS_PROFILE on the
-# host. Unset/empty: appends nothing, silently — same posture as
-# herd_ssh_forward_args for a non-herdr pane. `yo ssh` never calls this, so a
-# plain shell into the box never carries AWS env either.
-#
-# v1 forwarded flat AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN
-# too; v2 (aws_broker_start, below) replaces that with botocore's container
-# credential provider, which auto-refreshes instead of freezing creds for
-# the session's lifetime. Flat env vars are gone from here entirely, not
-# just unused: botocore's credential chain ranks explicit env vars above the
-# container provider, so if both were present the frozen ones would win and
-# silently defeat the broker's refresh. Credential minting and the
-# no-long-lived-keys refusal now live in aws-broker's startup instead.
-aws_ssh_env_args() {
-    profile="${YOLOBOX_AWS_PROFILE:-}"
-    [ -n "${profile}" ] || return 0
+class Report:
+    def __init__(self) -> None:
+        self.failed = False
 
-    command -v aws >/dev/null 2>&1 || {
-        echo "yo: YOLOBOX_AWS_PROFILE is set but 'aws' is not on this Mac's PATH" >&2
-        exit 1
-    }
+    def ok(self, message: str) -> None:
+        out("ok:   %s" % message)
 
-    # The region must cross, and not as a nicety: without one the CLI falls
-    # back to global endpoints like sts.amazonaws.com, and this Mac's DNS
-    # filter sinkholes that exact name to 0.0.0.0 (the guest inherits the
-    # Mac's resolver through lima) — regional endpoints resolve fine.
-    # export-credentials never prints a region, so it is resolved here: the
-    # profile's own `region` key first, the host's env second.
-    aws_region="$(aws configure get region --profile "${profile}" 2>/dev/null)" || aws_region=""
-    [ -n "${aws_region}" ] || aws_region="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
-    [ -n "${aws_region}" ] || {
-        echo "yo: profile '${profile}' has no region and neither AWS_REGION nor" >&2
-        echo "    AWS_DEFAULT_REGION is set on this Mac. The guest CLI would target" >&2
-        echo "    global endpoints, which this Mac's DNS sinkholes. Add 'region = ...'" >&2
-        echo "    to the profile in ~/.aws/config." >&2
-        exit 1
-    }
+    def fail(self, message: str, *remedies: str) -> None:
+        self.failed = True
+        err("FAIL: %s" % message)
+        for remedy in remedies:
+            err("      %s" % remedy)
 
-    export AWS_REGION="${aws_region}"
-    SSH_ARGS+=(-o "SendEnv=AWS_REGION")
-}
+    def abort(self, message: str, *remedies: str) -> "YoError":
+        self.fail(message, *remedies)
+        return YoError(None, code=1)
 
-# Starts the host-side credential broker for this pane (aws-broker, repo
-# root) and appends its forward plus its two container-provider vars to
-# SSH_ARGS. Opt-in via YOLOBOX_AWS_PROFILE, same posture as
-# aws_ssh_env_args: unset means append nothing, silently.
-#
-# The broker prints its handshake (TOKEN=/PORT=) over a fifo rather than a
-# plain pipe, because a plain pipe's writer blocks until read either way —
-# the fifo changes nothing about that, but it does give this function a
-# named path to open with a timeout instead of racing `wait` against a
-# background job. `read -t 30` on each line is what turns "broker died
-# before handshaking" into a loud, bounded failure instead of a hung
-# `yo enter`: without it, a broker that crashes pre-handshake leaves this
-# function blocked on the fifo forever.
-#
-# The broker's own stderr goes to a log file named by $$ — yo's pid, which
-# `exec ssh` below preserves — because that is the one name aws_broker_start
-# and the broker's watch-pid thread agree on with no coordination needed;
-# naming it by the broker's own (not-yet-known) pid instead would need a
-# second handshake field just to tell this function what file to read.
-#
-# Guest-port collisions are handled by probe-and-retry, not by asking the
-# guest what is free first: TCP -R has no StreamLocalBindUnlink equivalent
-# to atomically claim a port, so a probe-then-bind has an inherent
-# TOCTOU window. Accepted, not fixed — a colliding port is vanishingly
-# unlikely in the 41000-41999 range this picks from, and a real collision
-# just fails the real forward the same way a failed probe would have.
-aws_broker_start() {
-    AWS_BROKER_SSH_ARGS=()
-    profile="${YOLOBOX_AWS_PROFILE:-}"
-    [ -n "${profile}" ] || return 0
 
-    command -v python3 >/dev/null 2>&1 || {
-        echo "yo: YOLOBOX_AWS_PROFILE is set but 'python3' is not on this Mac's PATH" >&2
-        exit 1
-    }
+def require_tool(name: str, hint: str) -> str:
+    path = shutil.which(name)
+    if path is None:
+        raise YoError("%s not found (%s)" % (name, hint))
+    return path
 
-    broker_dir="$(mktemp -d)"
-    broker_fifo="${broker_dir}/handshake"
-    mkfifo "${broker_fifo}"
-    broker_log_dir="$HOME/.local/state/yolobox/aws-broker"
-    mkdir -p "${broker_log_dir}"
-    broker_log="${broker_log_dir}/$$.log"
 
-    "${SCRIPT_DIR}/aws-broker" --profile "${profile}" --watch-pid "$$" \
-        >"${broker_fifo}" 2>"${broker_log}" &
-    broker_pid=$!
-
-    # Opened once, read twice: a fifo's writer blocks on open until a
-    # reader shows up, and once open its two handshake lines arrive over the
-    # same descriptor. Reopening per read would race the broker exiting
-    # between the two opens.
-    exec 3<"${broker_fifo}"
-    broker_token=""
-    broker_port=""
-    line1=""
-    line2=""
-    # Read and inspect line1 before even attempting line2: an ERROR= first
-    # line means the broker exits right after printing it, with no second
-    # line ever coming — chaining both reads with && would make that read
-    # fail (EOF on the now-closed fifo) and fall through to the generic
-    # "no handshake" message below instead of surfacing the real ERROR text.
-    if IFS= read -r -t 30 line1 <&3; then
-        case "${line1}" in
-            "ERROR="*)
-                exec 3<&-
-                wait "${broker_pid}" 2>/dev/null || true
-                rm -rf "${broker_dir}"
-                echo "yo: aws-broker failed: ${line1#ERROR=}" >&2
-                exit 1
-                ;;
-            "TOKEN="*)
-                broker_token="${line1#TOKEN=}"
-                IFS= read -r -t 30 line2 <&3 || true
-                case "${line2}" in
-                    "PORT="*) broker_port="${line2#PORT=}" ;;
-                esac
-                ;;
-        esac
-    fi
-    exec 3<&-
-    rm -rf "${broker_dir}"
-
-    if [ -z "${broker_token}" ] || [ -z "${broker_port}" ]; then
-        kill "${broker_pid}" 2>/dev/null || true
-        wait "${broker_pid}" 2>/dev/null || true
-        echo "yo: aws-broker produced no handshake within 30s — see ${broker_log}" >&2
-        exit 1
-    fi
-
-    probe_err_file="$(mktemp)"
-    guest_port=""
-    tries=0
-    while [ "${tries}" -lt 5 ]; do
-        tries=$((tries + 1))
-        candidate=$((41000 + RANDOM % 1000))
-        # SSH_ARGS already carries the nomux role at this point (see
-        # cmd_enter): a probe on a shared ControlMaster would prove
-        # nothing about a port this pane's own forward could actually use.
-        # A full handshake per try costs low hundreds of ms; accepted.
-        if ssh "${SSH_ARGS[@]}" -o ExitOnForwardFailure=yes \
-            -R "127.0.0.1:${candidate}:127.0.0.1:${broker_port}" "${VM_HOST}" true 2>"${probe_err_file}"; then
-            guest_port="${candidate}"
-            break
-        fi
-        probe_err="$(cat "${probe_err_file}")"
-    done
-    rm -f "${probe_err_file}"
-
-    if [ -z "${guest_port}" ]; then
-        kill "${broker_pid}" 2>/dev/null || true
-        wait "${broker_pid}" 2>/dev/null || true
-        echo "yo: could not claim a guest port for the aws-broker forward after 5 tries:" >&2
-        printf '%s\n' "${probe_err}" >&2
-        exit 1
-    fi
-
-    AWS_BROKER_SSH_ARGS=(
-        -R "127.0.0.1:${guest_port}:127.0.0.1:${broker_port}"
-        -o "SendEnv=AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN"
+def run(
+    argv: Sequence[str],
+    *,
+    capture: bool = True,
+    check: bool = False,
+    stdin: Optional[bytes] = None,
+    env: Optional[Dict[str, str]] = None,
+    merge_stderr: bool = False,
+) -> subprocess.CompletedProcess:
+    proc = subprocess.run(
+        list(argv),
+        input=stdin,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE) if capture else None,
+        env=env,
     )
-    export AWS_CONTAINER_CREDENTIALS_FULL_URI="http://127.0.0.1:${guest_port}/creds"
-    export AWS_CONTAINER_AUTHORIZATION_TOKEN="${broker_token}"
-}
+    if capture:
+        proc.stdout = (proc.stdout or b"").decode("utf-8", "replace").replace("\r", "")
+        if proc.stderr is not None:
+            proc.stderr = proc.stderr.decode("utf-8", "replace").replace("\r", "")
+    if check and proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() if capture else ""
+        raise YoError(
+            "%s failed (exit %d)%s" % (shlex.join(argv), proc.returncode, ": " + detail if detail else "")
+        )
+    return proc
 
-readonly HERD_VERSION_CACHE="$HOME/.local/state/yolobox/herd-guest-version"
 
-# "herdr 0.8.2" (or any line carrying a version) -> "0.8.2".
-herd_parse_version() {
-    tr -d '\r' |
-        sed -n 's/[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' |
-        head -n 1
-}
+def exec_process(argv: Sequence[str], env: Optional[Dict[str, str]] = None) -> None:
+    # CPython starts with SIGPIPE ignored and exec preserves an ignored
+    # disposition, so a pipeline reader that exits would leave the exec'd
+    # process seeing EPIPE instead of dying, unlike bash's `exec ssh`.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    os.execvpe(argv[0], list(argv), env if env is not None else os.environ)
 
-# Prints the box's herdr version, or fails (silently) when the box cannot be
-# asked. There is no version literal in this repo to read any more: herdr
-# comes from nixpkgs, so only the guest knows which one it got.
-#
-# The answer is cached in HERD_VERSION_CACHE as "<generation> <version>", but
-# the cache deliberately does *not* skip the round trip. The only host-side
-# signals that are free — the lima instance directory's mtime, ha.pid — move
-# when the VM restarts, and the guest's generation can change without any of
-# them moving: `nixos-rebuild switch` inside the box is precisely how this
-# drift gets fixed. Keying on them would keep the guard failing after the fix
-# and pass it before, which is worse than no guard. So each check spends one
-# ssh, which rides the ControlMaster lima's ssh.config already keeps open and
-# costs tens of milliseconds; generation and version come back in that one
-# round trip. What the cache is for, then, is the *previous* observation: it
-# is the only way to tell that the box was switched and its herdr still did
-# not move — the case where the printed remedy is a dead end. Sets
-# HERD_GUEST_GENERATION plus HERD_PREV_GENERATION/HERD_PREV_VERSION.
-herd_guest_version() {
-    HERD_PREV_GENERATION=""
-    HERD_PREV_VERSION=""
-    if [ -r "${HERD_VERSION_CACHE}" ]; then
-        read -r HERD_PREV_GENERATION HERD_PREV_VERSION <"${HERD_VERSION_CACHE}" || true
-    fi
-    ssh_args
-    probe="$(ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" \
-        'readlink /run/current-system && herdr --version' 2>/dev/null)" || return 1
-    HERD_GUEST_GENERATION="$(printf '%s\n' "${probe}" | tr -d '\r' | sed -n '1p')"
-    version="$(printf '%s\n' "${probe}" | sed -n '2p' | herd_parse_version)"
-    [ -n "${version}" ] || return 1
-    mkdir -p "$(dirname "${HERD_VERSION_CACHE}")"
-    printf '%s %s\n' "${HERD_GUEST_GENERATION}" "${version}" >"${HERD_VERSION_CACHE}"
-    printf '%s\n' "${version}"
-}
 
-herd_host_version() {
-    herdr --version 2>/dev/null | herd_parse_version
-}
+@dataclass(frozen=True)
+class SshRole:
+    user: Optional[str]
+    own_control_path: bool
 
-herd_drift_report() {
-    cat >&2 <<EOF
-yo: herd version drift — this Mac runs herdr $1, the box has $2.
-    If the wire protocol differs, every in-box agent report is rejected and
-    the box's agents show as unknown in the herd.
-    Fix:  updating nixpkgs now means releasing a new yolobox version (or pointing YOLOBOX_FLAKE at a branch that has one), then nixos-rebuild switch; finally ./yo herd-check
-    Skip: YOLOBOX_SKIP_HERD_CHECK=1 ./yo enter
-EOF
-}
 
-# Exact equality is the only honest cheap proxy for compatibility: herdr
-# bumped its wire protocol 19 -> 20 across a *patch* release (0.8.0 -> 0.8.2),
-# so no version-range rule can be derived from the numbers. Unequal means
-# "cannot be proven compatible", which is why the message says "if".
-#
-# With no argument this refuses (exit 3); with "report" it only prints, for
-# `status`, which is a doctor surface and must show every finding at once.
-#
-# The escape hatch is load-bearing, not politeness. The box's herdr comes from
-# nixpkgs, which can lag a Homebrew herdr release by days, and during that
-# window there is no remedy at all — the "fix" above simply has nothing newer
-# to fetch. `yo enter` is the one command whose failure has no workaround
-# (`yo ssh` gets you a shell but no herd), so a guard that refuses with no
-# override would block all work in the box until nixpkgs caught up.
-herd_drift_check() {
-    [ "${YOLOBOX_SKIP_HERD_CHECK:-}" = "1" ] && return 0
-    command -v herdr >/dev/null 2>&1 || return 0
-    [ "${HERDR_ENV:-}" = "1" ] || return 0
-    [ -n "${HERDR_PANE_ID:-}" ] || return 0
+OPERATOR = SshRole(None, False)
+AGENT = SshRole(AGENT_USER, True)
 
-    host_version="$(herd_host_version)"
-    [ -n "${host_version}" ] || return 0
-    guest_version="$(herd_guest_version)" || return 0
-    [ "${host_version}" != "${guest_version}" ] || return 0
 
-    herd_drift_report "${host_version}" "${guest_version}"
-    if [ "${1:-refuse}" != "report" ]; then
-        exit 3
-    fi
-}
+def ssh_base(role: SshRole, mux: bool = False) -> List[str]:
+    argv = ["ssh", "-F", ssh_cfg()]
+    if role.user is not None:
+        argv += ["-o", "User=%s" % role.user]
+    if not mux:
+        argv += ["-o", "ControlPath=none"]
+    elif role.own_control_path:
+        argv += ["-o", "ControlPath=%s" % agent_control_path()]
+    return argv
 
-require_limactl() {
-    command -v limactl >/dev/null 2>&1 || {
-        echo "yo: limactl not found (brew install lima)" >&2
-        exit 1
-    }
-}
 
-cmd_up() {
-    if limactl list -q | grep -qx "${INSTANCE}"; then
-        limactl start --yes "${INSTANCE}"
-    else
-        limactl start --name "${INSTANCE}" --yes "${SCRIPT_DIR}/lima/yolobox.yaml"
-    fi
-}
+def remote(argv: Sequence[str]) -> str:
+    return shlex.join(argv)
 
-cmd_down() {
-    limactl stop "${INSTANCE}"
-}
 
-cmd_status() {
-    limactl list "${INSTANCE}"
+def forward_agent_opts() -> List[str]:
+    return ["-o", 'ForwardAgent="%s"' % op_sock()]
 
-    guest_df="$(guest_ssh 'df -h /' 2>/dev/null | tr -d '\r' | sed -n '2p')" || true
-    if [ -n "${guest_df}" ]; then
-        printf 'disk: guest %s\n' "${guest_df}"
-        use_pct="$(printf '%s\n' "${guest_df}" | awk '{print $5}' | tr -d '%')"
-        case "${use_pct}" in
-            '' | *[!0-9]*) ;;
-            *)
-                [ "${use_pct}" -lt 90 ] ||
-                    printf 'disk: WARNING guest / is %s%% full — reclaim with: yo gc --deep --yes, or raise the ceiling with: yo disk-grow <GiB>\n' "${use_pct}"
-                ;;
-        esac
-    fi
-    image_kib="$(du -k "$HOME/.lima/${INSTANCE}/disk" 2>/dev/null | awk '{print $1}')" || true
-    [ -z "${image_kib}" ] ||
-        printf 'disk: image ~/.lima/%s/disk allocates %sGiB on this Mac\n' \
-            "${INSTANCE}" "$((image_kib / 1024 / 1024))"
 
-    herd_drift_check report
-}
+def send_env(values: Dict[str, str]) -> Tuple[List[str], Dict[str, str]]:
+    for name in values:
+        if name not in FORWARDED_ENV:
+            raise YoError(
+                "internal error: %s is not in the guest's AcceptEnv whitelist" % name
+            )
+    env = dict(os.environ)
+    env.update(values)
+    return ["-o", "SendEnv=" + " ".join(values)], env
 
-flake_ref() {
-    if [ -n "${YOLOBOX_FLAKE:-}" ]; then
-        printf '%s\n' "${YOLOBOX_FLAKE}"
+
+def ssh_run(
+    role: SshRole,
+    argv: Sequence[str],
+    *,
+    stdin: Optional[bytes] = None,
+    extra_opts: Sequence[str] = (),
+    env: Optional[Dict[str, str]] = None,
+    mux: bool = False,
+    capture: bool = True,
+    check: bool = False,
+    merge_stderr: bool = False,
+    inherit_stdin: bool = False,
+) -> subprocess.CompletedProcess:
+    cmd = ssh_base(role, mux=mux) + list(extra_opts)
+    if stdin is None and not inherit_stdin:
+        cmd.append("-n")
+    cmd += [VM_HOST, remote(argv)]
+    return run(cmd, capture=capture, check=check, stdin=stdin, env=env, merge_stderr=merge_stderr)
+
+
+def guest_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> str:
+    return ssh_run(OPERATOR, argv, mux=mux, check=check).stdout
+
+
+def agent_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> str:
+    return ssh_run(AGENT, argv, mux=mux, check=check).stdout
+
+
+def require_agent_account() -> None:
+    probe = ssh_run(AGENT, ["true"])
+    if probe.returncode == 0:
         return
-    fi
-    [ "${YO_VERSION}" != "dev" ] || {
-        echo "yo: this is an unreleased build with no pinned flake — set YOLOBOX_FLAKE to what the VM should build from (e.g. YOLOBOX_FLAKE=github:aka-rider/yolobox/my-branch)" >&2
-        return 1
-    }
-    printf 'github:aka-rider/yolobox/v%s\n' "${YO_VERSION}"
-}
+    if ssh_run(OPERATOR, ["true"]).returncode == 0:
+        err("yo: cannot ssh into %s as '%s'." % (INSTANCE, AGENT_USER))
+        err("    Every AI session runs as that account, and this VM has no working one —")
+        err("    it predates the operator/agent split. Rebuild it:")
+        err("        limactl delete %s && yo bootstrap" % INSTANCE)
+    else:
+        err(probe.stderr.rstrip("\n"))
+        err("yo: cannot reach %s as operator either — is the VM up? yo status" % INSTANCE)
+    raise YoError(None, code=1)
 
-# The "rebuild the guest" hint every stale-generation refusal needs. flake_ref
-# already prints why it has no ref on a dev build; this only ever adds what to
-# do about it, never repeats the reason, so the two messages read as one.
-rebuild_hint() {
-    if ref="$(flake_ref)"; then
-        printf "yo ssh sudo YOLOBOX_USERNAME=\$(id -un) nixos-rebuild switch --impure --flake '%s#yolobox'" "${ref}"
-    else
-        printf 'set YOLOBOX_FLAKE to a flake ref the box should build from, then retry'
-    fi
-}
 
-cmd_bootstrap() {
-    [ "$#" -eq 0 ] || {
-        echo "yo: bootstrap takes no arguments" >&2
-        usage >&2
-        exit 2
-    }
+def guest_path(path: str) -> str:
+    if "\0" in path or "\n" in path:
+        raise YoError("refusing a guest path with a newline or NUL byte")
+    normalised = os.path.normpath(path)
+    if normalised != AGENT_HOME and not normalised.startswith(AGENT_HOME + "/"):
+        raise YoError(
+            'refusing to target "%s": no yo command may leave the guest home "%s"'
+            % (path, AGENT_HOME)
+        )
+    return normalised
 
-    ref="$(flake_ref)" || exit 1
 
-    cmd_up
-    hc_ok "VM up"
+def logical_cwd() -> str:
+    pwd_env = os.environ.get("PWD", "")
+    if os.path.isabs(pwd_env):
+        try:
+            if os.path.samefile(pwd_env, os.getcwd()):
+                return pwd_env
+        except OSError:
+            pass
+    return os.getcwd()
 
-    ssh_args
-    # shellcheck disable=SC2029 # $(id -un) must expand client-side: Nix has no way to learn the guest username on its own
-    ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
-        "sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild boot --impure --flake '${ref}#yolobox'"
-    hc_ok "built from ${ref}"
 
-    bootstrap_reboot_if_needed
+def mirror(mac_path: str) -> Optional[str]:
+    host = home()
+    if mac_path == host:
+        return AGENT_HOME
+    if mac_path.startswith(host + "/"):
+        return AGENT_HOME + "/" + mac_path[len(host) + 1 :]
+    return None
 
-    cmd_seed
-    hc_ok "seeded"
 
-    config_ok=0
-    editor_ssh_config_ok || config_ok=1
-    [ -n "${include_ln}" ] || cat >&2 <<EOF
-yo: add this line to ~/.ssh/config so ssh lima-yolobox, Zed and VS Code can find the VM:
-    Include ~/.lima/yolobox/ssh.config
-EOF
-    [ "${config_ok}" -eq 0 ] || {
-        cat >&2 <<EOF
-yo: and this block ABOVE that Include line, so Zed and VS Code open the VM as
-    the ${VM_AGENT_USER} account instead of reusing the operator's ssh master:
-EOF
-        editor_ssh_block | sed 's/^/    /' >&2
-    }
-}
+ANCESTOR_WALK = r"""d="$1"
+while [ -n "$d" ] && [ ! -d "$d" ]; do d="${d%/*}"; done
+printf '%s\n' "${d:-$HOME}"
+"""
 
-bootstrap_reboot_if_needed() {
-    if guest_runs_its_system_profile; then
-        hc_ok "already running the built generation"
+PROJECT_FIND = r"""find "$HOME" -mindepth 2 -maxdepth 5 \( -name ".*" ! -name .git \) -prune -o -name .git \( -type d -o -type f \) -printf "%h\n"
+"""
+
+GITCONFIG_ROOTS_FIND = r"""find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\n"
+"""
+
+ENSURE_REPO = r"""mkdir -p "$1" && { git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || { git -C "$1" init -b main && git -C "$1" config receive.denyCurrentBranch updateInstead; }; }
+"""
+
+SEED_SSH_CONFIG = r"""mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >~/.ssh/config && chmod 600 ~/.ssh/config"""
+
+SEED_UNTAR_SSH = r"""tar -C "$HOME/.ssh" -xf -"""
+
+SEED_UNTAR_HOME = r"""tar -C "$HOME" -xf -"""
+
+MISSING_PATH_NOTE = 'path "%s" does not exist in the yolobox you are in "%s"'
+
+
+def dir_for_cwd() -> str:
+    desired = mirror(logical_cwd())
+    if desired is None:
+        err(MISSING_PATH_NOTE % (logical_cwd(), AGENT_HOME))
+        return AGENT_HOME
+    landing = agent_out(["sh", "-c", ANCESTOR_WALK, "sh", desired]).strip("\n")
+    if landing != desired:
+        err(MISSING_PATH_NOTE % (desired, landing))
+    return guest_path(landing)
+
+
+def pick_project(query: str) -> str:
+    require_tool("fzf", "brew install fzf")
+    listing = agent_out(["sh", "-c", PROJECT_FIND])
+    prefix = AGENT_HOME + "/"
+    projects = sorted(
+        line[len(prefix) :] for line in listing.splitlines() if line.startswith(prefix)
+    )
+    if not projects:
+        raise YoError("no projects in the VM")
+    picker = subprocess.run(
+        ["fzf", "--select-1", "--exit-0", "--query=" + query],
+        input="\n".join(projects).encode(),
+        stdout=subprocess.PIPE,
+    )
+    if picker.returncode != 0:
+        if picker.returncode != 130:
+            err("yo: no project matches '%s'" % query)
+        raise YoError(None, code=picker.returncode)
+    choice = picker.stdout.decode("utf-8", "replace").strip("\n")
+    return guest_path(AGENT_HOME + "/" + choice)
+
+
+def target_dir(args: Sequence[str]) -> str:
+    if len(args) == 1:
+        return pick_project(args[0])
+    return dir_for_cwd()
+
+
+@dataclass(frozen=True)
+class HerdForward:
+    guest_sock: str
+    ssh_opts: List[str]
+    env: Dict[str, str]
+
+
+def herd_forward() -> Optional[HerdForward]:
+    if os.environ.get("HERDR_ENV") != "1":
+        return None
+    pane_id = os.environ.get("HERDR_PANE_ID", "")
+    host_sock = os.environ.get("HERDR_SOCKET_PATH", "")
+    if not pane_id or not host_sock:
+        return None
+    try:
+        if not stat.S_ISSOCK(os.stat(host_sock).st_mode):
+            return None
+    except OSError:
+        return None
+    if ":" in host_sock:
+        raise YoError(
+            "HERDR_SOCKET_PATH \"%s\" contains a colon, which ssh's -R syntax splits on"
+            % host_sock
+        )
+    guest_sock = "%s/herd-host.%s.sock" % (
+        GUEST_SOCK_DIR,
+        re.sub(r"[^A-Za-z0-9]", "_", pane_id),
+    )
+    opts, env = send_env(
+        {
+            "YOLOBOX_HERD": "1",
+            "HERDR_PANE_ID": pane_id,
+            "HERDR_SOCKET_PATH": guest_sock,
+        }
+    )
+    return HerdForward(guest_sock, ["-R", "%s:%s" % (guest_sock, host_sock)] + opts, env)
+
+
+def parse_herd_version(text: str) -> Optional[str]:
+    match = re.search(r"(\d+\.\d+\.\d+)", text.replace("\r", ""))
+    return match.group(1) if match else None
+
+
+@dataclass(frozen=True)
+class GuestHerd:
+    generation: str
+    version: str
+    prev_generation: str
+    prev_version: str
+
+
+def guest_herd_version() -> Optional[GuestHerd]:
+    prev_generation = ""
+    prev_version = ""
+    try:
+        with open(herd_version_cache(), "r") as handle:
+            fields = handle.readline().split()
+        if len(fields) >= 2:
+            prev_generation, prev_version = fields[0], fields[1]
+    except OSError:
+        pass
+
+    probe = ssh_run(
+        OPERATOR, ["sh", "-c", "readlink /run/current-system && herdr --version"], mux=True
+    )
+    if probe.returncode != 0:
+        return None
+    lines = probe.stdout.splitlines()
+    if not lines:
+        return None
+    generation = lines[0]
+    version = parse_herd_version(lines[1]) if len(lines) > 1 else None
+    if not version:
+        return None
+    os.makedirs(state_dir(), exist_ok=True)
+    with open(herd_version_cache(), "w") as handle:
+        handle.write("%s %s\n" % (generation, version))
+    return GuestHerd(generation, version, prev_generation, prev_version)
+
+
+def host_herd_version() -> Optional[str]:
+    if shutil.which("herdr") is None:
+        return None
+    probe = run(["herdr", "--version"])
+    if probe.returncode != 0:
+        return None
+    return parse_herd_version(probe.stdout)
+
+
+def herd_drift_report(host_version: str, guest_version: str) -> None:
+    err("yo: herd version drift — this Mac runs herdr %s, the box has %s." % (host_version, guest_version))
+    err("    If the wire protocol differs, every in-box agent report is rejected and")
+    err("    the box's agents show as unknown in the herd.")
+    err("    Fix:  updating nixpkgs now means releasing a new yolobox version (or pointing YOLOBOX_FLAKE at a branch that has one), then nixos-rebuild switch; finally ./yo herd-check")
+    err("    Skip: YOLOBOX_SKIP_HERD_CHECK=1 ./yo enter")
+
+
+def check_herd_drift(refuse: bool) -> None:
+    if os.environ.get("YOLOBOX_SKIP_HERD_CHECK") == "1":
         return
-    fi
+    if shutil.which("herdr") is None:
+        return
+    if os.environ.get("HERDR_ENV") != "1":
+        return
+    if not os.environ.get("HERDR_PANE_ID"):
+        return
+    host_version = host_herd_version()
+    if not host_version:
+        return
+    guest = guest_herd_version()
+    if guest is None or host_version == guest.version:
+        return
+    herd_drift_report(host_version, guest.version)
+    if refuse:
+        raise YoError(None, code=3)
 
-    limactl restart "${INSTANCE}"
 
-    guest_runs_its_system_profile ||
-        hc_abort "the VM rebooted but is still not running the built generation" \
-            "profile: ${PROFILE_GENERATION}" \
-            "booted:  ${BOOTED_GENERATION}" \
-            "Check df /boot in the VM — a half-failed bootloader install leaves the two" \
-            "generations disagreeing (see CLAUDE.md)."
-    hc_ok "rebooted into the built generation"
-}
+@dataclass
+class AwsBroker:
+    proc: subprocess.Popen
+    host_port: int
+    guest_port: int
+    token: str
+    ssh_opts: List[str]
+    env: Dict[str, str]
 
-guest_runs_its_system_profile() {
-    generations="$(guest_ssh 'readlink -f /nix/var/nix/profiles/system && readlink -f /run/current-system' | tr -d '\r')"
-    PROFILE_GENERATION="$(printf '%s\n' "${generations}" | sed -n '1p')"
-    BOOTED_GENERATION="$(printf '%s\n' "${generations}" | sed -n '2p')"
-    [ -n "${BOOTED_GENERATION}" ] || hc_abort "cannot read the VM's generations — is it up? (yo status)"
-    [ "${PROFILE_GENERATION}" = "${BOOTED_GENERATION}" ]
-}
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
 
-# Reclaims the guest root filesystem. It runs from the Mac on purpose: the
-# failure it exists for is a 100%-full /dev/vda2, where every unprivileged
-# in-box tool dies with ENOSPC before it starts, so a guest-side script would
-# be unrunnable exactly when it is needed. ext4's 4.3 GB root reserve is what
-# keeps a sudo-driven cleanup possible at all.
-#
-# It takes two ssh sessions because the box has two accounts and the cleanup
-# spans both. The machine tier is root's and rides the operator. The user tier
-# is the agent's and cannot be done for it: rootless podman prunes per-user
-# (as the operator it would prune a different, empty graph root and report
-# success), ~/.npm and the container storage are the agent's own, and
-# `git check-ignore` run by anyone but the owner hits git's dubious-ownership
-# refusal, which this script would read as "git does not ignore it".
-# Machine tier first, and that ordering is load-bearing: the root reserve it
-# frees is what lets the unprivileged half write anything at all on a full
-# disk. Each session prints its own ok/FAIL lines; the machine tier's report
-# shows the before df snapshot, the user tier's the after one. The host
-# aggregates the two exit statuses, so a failure in either tier fails the
-# command.
-cmd_gc() {
-    gc_deep=0
-    gc_apply=0
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --deep) gc_deep=1 ;;
-            --yes) gc_apply=1 ;;
-            *)
-                echo "yo: unknown gc option '$1'" >&2
-                usage >&2
-                exit 2
-                ;;
-        esac
-        shift
-    done
 
-    gc_env="YO_GC_DEEP=${gc_deep} YO_GC_APPLY=${gc_apply}"
-    gc_rc=0
+def require_aws_cli() -> None:
+    if shutil.which("aws") is None:
+        raise YoError("YOLOBOX_AWS_PROFILE is set but 'aws' is not on this Mac's PATH")
 
-    # No -t: gc is non-interactive, and each script arrives on stdin so its
-    # quoted heredocs reach the guest byte for byte — every $HOME and $(...)
-    # in them belongs to the guest.
-    ssh_args
-    # shellcheck disable=SC2029 # gc_env must expand client-side; it carries this run's flags
-    gc_machine_script | ssh "${SSH_ARGS[@]}" "${VM_HOST}" "${gc_env} bash -s" || gc_rc=1
-    agent_require
-    agent_ssh_args
-    # shellcheck disable=SC2029 # gc_env must expand client-side; it carries this run's flags
-    gc_user_script | ssh "${SSH_ARGS[@]}" "${VM_HOST}" "${gc_env} bash -s" || gc_rc=1
 
-    exit "${gc_rc}"
-}
+def aws_region(profile: str) -> str:
+    require_aws_cli()
+    probe = run(["aws", "configure", "get", "region", "--profile", profile])
+    region = probe.stdout.strip() if probe.returncode == 0 else ""
+    if not region:
+        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or ""
+    if not region:
+        raise YoError(
+            "profile '%s' has no region and neither AWS_REGION nor\n"
+            "    AWS_DEFAULT_REGION is set on this Mac. The guest CLI would target\n"
+            "    global endpoints, which this Mac's DNS sinkholes. Add 'region = ...'\n"
+            "    to the profile in ~/.aws/config." % profile
+        )
+    return region
 
-# Both guest halves share these, so the two tiers cannot drift into printing
-# different things.
-gc_common_script() {
-    cat <<'GC_COMMON'
-set -uo pipefail
+
+def read_handshake(proc: subprocess.Popen, deadline: float) -> List[str]:
+    fd = proc.stdout.fileno()
+    buffer = b""
+    while buffer.count(b"\n") < 2:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            break
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        buffer += chunk
+        if buffer.startswith(b"ERROR=") and b"\n" in buffer:
+            break
+    return buffer.decode("utf-8", "replace").splitlines()
+
+
+def start_aws_broker(profile: str) -> AwsBroker:
+    require_aws_cli()
+    log_dir = os.path.join(state_dir(), "aws-broker")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "%d.log" % os.getpid())
+
+    # --watch-pid must name the pid that exec becomes ssh, so the broker dies
+    # exactly when this session does; exec_process keeps that pid.
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen(
+            [
+                str(SCRIPT_DIR / "aws-broker"),
+                "--profile",
+                profile,
+                "--watch-pid",
+                str(os.getpid()),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=log,
+            bufsize=0,
+        )
+
+    lines = read_handshake(proc, time.monotonic() + 30)
+    token = ""
+    port = ""
+    for line in lines:
+        if line.startswith("ERROR="):
+            proc.terminate()
+            proc.wait()
+            raise YoError("aws-broker failed: %s" % line[len("ERROR=") :])
+        if line.startswith("TOKEN="):
+            token = line[len("TOKEN=") :]
+        elif line.startswith("PORT="):
+            port = line[len("PORT=") :]
+    if not token or not port:
+        proc.terminate()
+        proc.wait()
+        raise YoError("aws-broker produced no handshake within 30s — see %s" % log_path)
+    host_port = int(port)
+
+    probe_err = ""
+    guest_port = 0
+    for _ in range(5):
+        candidate = random.randrange(41000, 42000)
+        probe = ssh_run(
+            AGENT,
+            ["true"],
+            extra_opts=[
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-R",
+                "127.0.0.1:%d:127.0.0.1:%d" % (candidate, host_port),
+            ],
+        )
+        if probe.returncode == 0:
+            guest_port = candidate
+            break
+        probe_err = probe.stderr
+    if not guest_port:
+        proc.terminate()
+        proc.wait()
+        raise YoError(
+            "could not claim a guest port for the aws-broker forward after 5 tries:\n%s"
+            % probe_err.rstrip("\n")
+        )
+
+    opts, env = send_env(
+        {
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:%d/creds" % guest_port,
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN": token,
+        }
+    )
+    ssh_opts = ["-R", "127.0.0.1:%d:127.0.0.1:%d" % (guest_port, host_port)] + opts
+    return AwsBroker(proc, host_port, guest_port, token, ssh_opts, env)
+
+
+GC_COMMON = r"""set -uo pipefail
 
 GC_FAILED=0
 
@@ -708,13 +721,9 @@ measure() {
     fi
     printf '  %-7s %s\n' "${size:-?}" "$1"
 }
-GC_COMMON
-}
+"""
 
-gc_machine_script() {
-    gc_common_script
-    cat <<'GC_MACHINE'
-
+GC_MACHINE = GC_COMMON + r"""
 MEASURE_AS=sudo
 MACHINE_PATHS="/var/log/journal /nix/store /root/.cache/nix"
 
@@ -762,13 +771,9 @@ fi
 step 'rm -rf /root/.cache/nix' sudo rm -rf /root/.cache/nix
 
 [ "${GC_FAILED}" = 0 ] || exit 1
-GC_MACHINE
-}
+"""
 
-gc_user_script() {
-    gc_common_script
-    cat <<'GC_USER'
-
+GC_USER = GC_COMMON + r"""
 MEASURE_AS=
 
 # Hidden directories are pruned in the first branch — except .next, which
@@ -835,314 +840,9 @@ printf '\nafter:\n'
 df -h /
 
 [ "${GC_FAILED}" = 0 ] || exit 1
-GC_USER
-}
+"""
 
-# The lima ceiling and the guest partition are two separate resizes: raising
-# the ceiling alone leaves /dev/vda2 at its old size, so `df` in the box does
-# not move and nothing anywhere reports an error. The growpart unit that
-# `boot.growPartition` renders is what grows the partition at the next boot
-# (autoResize then grows the filesystem), so its presence is proven before
-# the instance is stopped — otherwise the whole command is a silent no-op.
-cmd_disk_grow() {
-    [ "$#" -eq 1 ] || {
-        echo "yo: disk-grow takes one argument, the new size in GiB" >&2
-        usage >&2
-        exit 2
-    }
-    case "$1" in
-        '' | *[!0-9]*)
-            echo "yo: disk-grow size must be a whole number of GiB, got '$1'" >&2
-            exit 2
-            ;;
-    esac
-    [ "$1" -gt 0 ] || {
-        echo "yo: disk-grow size must be greater than 0 GiB" >&2
-        exit 2
-    }
-
-    current_bytes="$(limactl list "${INSTANCE}" --format '{{.Disk}}' 2>/dev/null | tr -d '\r')" || true
-    [ -n "${current_bytes}" ] || {
-        echo "yo: limactl reports no disk size for ${INSTANCE} — does the instance exist? (yo status)" >&2
-        exit 1
-    }
-    current_gib="$((current_bytes / 1024 / 1024 / 1024))"
-    [ "$1" -gt "${current_gib}" ] || {
-        echo "yo: ${INSTANCE}'s ceiling is already ${current_gib}GiB and lima can only grow it — ask for more than ${current_gib}" >&2
-        exit 1
-    }
-
-    load_state="$(guest_ssh 'systemctl show -p LoadState --value growpart' 2>/dev/null | tr -d '\r' | sed -n '1p')" || true
-    [ -n "${load_state}" ] || {
-        echo "yo: cannot reach the VM to ask about growpart — is it up? (yo status)" >&2
-        exit 1
-    }
-    [ "${load_state}" = "loaded" ] || {
-        echo "yo: no growpart unit in the VM's current system, so growing the ceiling would leave /dev/vda2 untouched — switch it: $(rebuild_hint)" >&2
-        exit 1
-    }
-
-    df_before="$(guest_ssh 'df -h /' 2>/dev/null | tr -d '\r' | sed -n '2p')" || true
-    blocks_before="$(guest_ssh 'df -k /' 2>/dev/null | tr -d '\r' | sed -n '2p' | awk '{print $2}')" || true
-
-    # Reported, never refused: the backing file is sparse, so a ceiling far
-    # above the host's free space costs nothing until the guest actually
-    # writes that much — over-declaring it is the intended use.
-    free_kib="$(df -k "$HOME/.lima" | awk 'NR==2 {print $4}')"
-    image_kib="$(du -k "$HOME/.lima/${INSTANCE}/disk" 2>/dev/null | awk '{print $1}')" || true
-    printf 'host: ~/.lima has %sGiB free; the disk image allocates %sGiB today\n' \
-        "$((free_kib / 1024 / 1024))" "$((${image_kib:-0} / 1024 / 1024))"
-    printf 'lima: raising %s from %sGiB to %sGiB\n' "${INSTANCE}" "${current_gib}" "$1"
-
-    limactl stop "${INSTANCE}"
-    limactl edit --yes "${INSTANCE}" --disk "$1" || {
-        echo "yo: limactl refused the resize and ${INSTANCE} is left stopped — start it again with: yo up" >&2
-        exit 1
-    }
-    cmd_up
-
-    df_after="$(guest_ssh 'df -h /' 2>/dev/null | tr -d '\r' | sed -n '2p')" || true
-    blocks_after="$(guest_ssh 'df -k /' 2>/dev/null | tr -d '\r' | sed -n '2p' | awk '{print $2}')" || true
-    vda2_after="$(guest_ssh 'lsblk -no SIZE /dev/vda2' 2>/dev/null | tr -d '\r' | sed -n '1p')" || true
-    printf 'before: %s\n' "${df_before}"
-    printf 'after:  %s\n' "${df_after}"
-    printf 'after:  vda2 is %s\n' "${vda2_after}"
-    # Blocks, not the human-readable size: `df -h` rounds, so a modest bump
-    # can print the same string on both sides of a resize that did work.
-    if [ -z "${blocks_after}" ] || [ "${blocks_after}" -le "${blocks_before:-0}" ]; then
-        echo "yo: the ceiling is now $1GiB but the guest root did not grow — diagnose with: yo ssh systemctl status growpart" >&2
-        exit 1
-    fi
-}
-
-cmd_ssh() {
-    ssh_args
-    ssh_forward_agent_args
-    SSH_ARGS+=(-o ControlPath=none -t "${VM_HOST}")
-    exec ssh "${SSH_ARGS[@]}" "${@+"$@"}"
-}
-
-cmd_enter() {
-    [ "$#" -le 1 ] || {
-        echo "yo: enter takes at most one project argument" >&2
-        usage >&2
-        exit 2
-    }
-    agent_require
-    target="$(vm_target_dir "${@+"$@"}")"
-    # A per-pane forward and per-pane SetEnv cannot ride a ControlMaster:
-    # the first session to dial in fixes the master's environment for
-    # every later session, leaking a stale HERDR_PANE_ID/HERDR_SOCKET_PATH.
-    # Each enter gets its own connection instead.
-    ssh_role agent nomux
-    ssh_forward_agent_args
-    herd_ssh_forward_args
-    aws_ssh_env_args
-    aws_broker_start
-    herd_drift_check
-    # Early exits after this point (e.g. herd_drift_check's exit 3) leave no
-    # orphan broker: its watch-pid thread sees this pid gone within 5s. exec
-    # below is what makes that true — it replaces this process rather than
-    # forking a child, so the broker's watched pid stays valid for the whole
-    # ssh session and disappears exactly when the session ends.
-    # Guarded, not a plain append: bash 3.2 (this Mac's /bin/bash) treats
-    # "${arr[@]}" on a zero-element array as an unbound-variable error under
-    # set -u, and AWS_BROKER_SSH_ARGS is empty whenever YOLOBOX_AWS_PROFILE
-    # is unset.
-    [ "${#AWS_BROKER_SSH_ARGS[@]}" -eq 0 ] || SSH_ARGS+=("${AWS_BROKER_SSH_ARGS[@]}")
-    exec ssh "${SSH_ARGS[@]}" -t "${VM_HOST}" "cd $(printf '%q' "${target}") && exec \"\$SHELL\" -l"
-}
-
-hc_ok() {
-    printf 'ok:   %s\n' "$1"
-}
-
-# Every failure carries its own remedy on the following lines: this command is
-# the thing you run when the herd is silent, so "something is wrong" is not an
-# answer.
-hc_fail() {
-    HERD_CHECK_FAILED=1
-    printf 'FAIL: %s\n' "$1" >&2
-    shift
-    for remedy in "$@"; do
-        printf '      %s\n' "${remedy}" >&2
-    done
-}
-
-hc_abort() {
-    hc_fail "$@"
-    exit 1
-}
-
-# End-to-end proof that a boxed agent's report reaches this Mac's herd: the
-# host client, the host server, this pane, the two herdr versions, and finally
-# the guest half over the very forward `yo enter` builds.
-cmd_herd_check() {
-    [ "$#" -eq 0 ] || {
-        echo "yo: herd-check takes no arguments" >&2
-        usage >&2
-        exit 2
-    }
-    HERD_CHECK_FAILED=0
-
-    command -v herdr >/dev/null 2>&1 ||
-        hc_abort "herdr is not on this Mac's PATH" \
-            "Install it (brew install herdr) — the box reports into this Mac's herdr server."
-    command -v jq >/dev/null 2>&1 || {
-        echo "yo: jq not found (brew install jq)" >&2
-        exit 1
-    }
-
-    status_out="$(herdr status 2>&1)" ||
-        hc_abort "'herdr status' failed: ${status_out}" \
-            "Start the herdr server on this Mac, then rerun ./yo herd-check."
-    server_block="$(printf '%s\n' "${status_out}" | sed -n '/^server:/,/^$/p')"
-    server_status="$(printf '%s\n' "${server_block}" |
-        sed -n 's/^[[:space:]]*status:[[:space:]]*//p' | head -n 1)"
-    server_compatible="$(printf '%s\n' "${server_block}" |
-        sed -n 's/^[[:space:]]*compatible:[[:space:]]*//p' | head -n 1)"
-    [ "${server_status}" = "running" ] ||
-        hc_abort "this Mac's herdr server is not running (status: ${server_status:-unknown})" \
-            "Start it and rerun ./yo herd-check — no report from anywhere lands while it is down."
-    [ "${server_compatible}" = "yes" ] ||
-        hc_abort "this Mac's herdr client and server are incompatible (compatible: ${server_compatible:-unknown})" \
-            "brew upgrade herdr, then restart the herdr server." \
-            "Nothing in the box can work until the Mac's own two halves agree."
-    hc_ok "host herdr server running and compatible"
-
-    [ -n "${HERDR_PANE_ID:-}" ] ||
-        hc_abort "HERDR_PANE_ID is empty — this is not a herdr pane" \
-            "Run ./yo herd-check from a pane inside herdr's terminal."
-
-    # The check reports an agent into this pane and then releases it. Doing
-    # that in a pane a real agent already owns would knock that agent out of
-    # the herd — which is exactly the instinct, since the pane you suspect is
-    # the misbehaving claude. Refuse before touching anything.
-    pane_json="$(herdr pane get "${HERDR_PANE_ID}" 2>&1)" ||
-        hc_abort "'herdr pane get ${HERDR_PANE_ID}' failed: ${pane_json}" \
-            "The pane id does not exist on this server — rerun from a live herdr pane."
-    pane_agent="$(printf '%s\n' "${pane_json}" | jq -r '.result.pane.agent // ""')" ||
-        hc_abort "could not parse 'herdr pane get' output: ${pane_json}" \
-            "Check that the host herdr version still emits JSON from pane get."
-    [ -z "${pane_agent}" ] ||
-        hc_abort "pane ${HERDR_PANE_ID} already holds an agent (${pane_agent})" \
-            "This check reports an agent into the pane and then releases it, so running" \
-            "it here would drop ${pane_agent} out of the herd. Open a plain pane and" \
-            "rerun ./yo herd-check there."
-    hc_ok "pane ${HERDR_PANE_ID} is free"
-
-    host_version="$(herd_host_version)"
-    if guest_version="$(herd_guest_version)"; then
-        if [ "${host_version}" = "${guest_version}" ]; then
-            hc_ok "herdr ${host_version} on both sides"
-        else
-            hc_fail "herd version drift: this Mac runs herdr ${host_version}, the box has ${guest_version}"
-            herd_drift_report "${host_version}" "${guest_version}"
-            if [ -n "${HERD_PREV_VERSION}" ] &&
-                [ "${HERD_PREV_GENERATION}" != "${HERD_GUEST_GENERATION}" ] &&
-                [ "${HERD_PREV_VERSION}" = "${guest_version}" ]; then
-                printf '      The box has been switched since the last check and its herdr did not\n' >&2
-                printf '      move: nixpkgs carries no newer one yet. Skip until it does.\n' >&2
-            fi
-        fi
-    else
-        hc_fail "cannot ask the box for its herdr version" \
-            "Is the VM up? ./yo status"
-    fi
-
-    ssh_role agent nomux
-    herd_ssh_forward_args
-    [ -n "${HERD_GUEST_SOCK}" ] ||
-        hc_abort "this pane exports no live herdr socket (HERDR_SOCKET_PATH)" \
-            "The forward yo enter builds cannot exist without it — rerun from a herdr pane."
-
-    if ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" yolobox-herd-check; then
-        guest_rc=0
-    else
-        guest_rc=$?
-        if [ "${guest_rc}" -eq 127 ]; then
-            hc_fail "the box has no yolobox-herd-check" \
-                "rebuild it: $(rebuild_hint)"
-        else
-            hc_fail "the guest half failed (exit ${guest_rc}) — see its output above"
-        fi
-    fi
-
-    pane_json="$(herdr pane get "${HERDR_PANE_ID}" 2>&1)" ||
-        hc_abort "'herdr pane get ${HERDR_PANE_ID}' failed after the guest run: ${pane_json}"
-    pane_agent="$(printf '%s\n' "${pane_json}" | jq -r '.result.pane.agent // ""')"
-    if [ -z "${pane_agent}" ]; then
-        hc_ok "pane ${HERDR_PANE_ID} released again"
-    else
-        hc_fail "pane ${HERDR_PANE_ID} still holds an agent (${pane_agent}) after the check" \
-            "The guest's release path is broken; clear it by hand with:" \
-            "herdr pane release-agent ${HERDR_PANE_ID}"
-    fi
-
-    [ "${HERD_CHECK_FAILED}" -eq 0 ] || exit 1
-    exit "${guest_rc}"
-}
-
-# End-to-end proof that the AWS credential broker works, mirroring
-# cmd_herd_check's shape (hc_ok/hc_fail, one host-side prerequisite check
-# per line, a throwaway forward built the same way `yo enter` builds its
-# real one). Reuses aws_broker_start rather than reimplementing the
-# handshake and port-probe logic a second time — a check built differently
-# from `enter` would prove nothing about `enter`.
-cmd_aws_check() {
-    [ "$#" -eq 0 ] || {
-        echo "yo: aws-check takes no arguments" >&2
-        usage >&2
-        exit 2
-    }
-    HERD_CHECK_FAILED=0
-
-    profile="${YOLOBOX_AWS_PROFILE:-}"
-    [ -n "${profile}" ] ||
-        hc_abort "YOLOBOX_AWS_PROFILE is not set" \
-            "Set it to a host AWS CLI profile and rerun: YOLOBOX_AWS_PROFILE=<profile> ./yo aws-check"
-
-    command -v aws >/dev/null 2>&1 ||
-        hc_abort "'aws' is not on this Mac's PATH"
-    command -v python3 >/dev/null 2>&1 ||
-        hc_abort "'python3' is not on this Mac's PATH — aws-broker needs it"
-    command -v jq >/dev/null 2>&1 || {
-        echo "yo: jq not found (brew install jq)" >&2
-        exit 1
-    }
-    hc_ok "aws, python3 and jq are on this Mac's PATH"
-
-    creds_out="$(aws configure export-credentials --profile "${profile}" --format process 2>&1)" ||
-        hc_abort "'aws configure export-credentials --profile ${profile}' failed:" "${creds_out}"
-    session_token="$(printf '%s\n' "${creds_out}" | jq -r '.SessionToken // empty' 2>/dev/null)"
-    [ -n "${session_token}" ] ||
-        hc_abort "profile '${profile}' returned no SessionToken — these are long-lived keys" \
-            "and must never enter the guest. Point YOLOBOX_AWS_PROFILE at a profile that" \
-            "yields temporary credentials (role_arn or credential_process), not a static" \
-            "IAM user profile."
-    hc_ok "host export-credentials succeeded for '${profile}', SessionToken present"
-
-    aws_region="$(aws configure get region --profile "${profile}" 2>/dev/null)" || aws_region=""
-    [ -n "${aws_region}" ] || aws_region="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
-    [ -n "${aws_region}" ] ||
-        hc_abort "profile '${profile}' has no region and neither AWS_REGION nor AWS_DEFAULT_REGION is set on this Mac"
-    hc_ok "region resolves to ${aws_region}"
-
-    ssh_role agent nomux
-    aws_broker_start
-    hc_ok "broker started, host port ${broker_port} forwarded to guest port ${guest_port}"
-
-    # Kills the throwaway broker on every exit path below, hc_abort's exit 1
-    # included — traps fire on exit even from inside a called function.
-    trap 'kill "${broker_pid}" 2>/dev/null || true; wait "${broker_pid}" 2>/dev/null || true' EXIT
-
-    # The guest script reads AWS_CONTAINER_CREDENTIALS_FULL_URI/
-    # AWS_CONTAINER_AUTHORIZATION_TOKEN from its own environment rather than
-    # taking them as script arguments, so the bearer token never appears in
-    # a remote command line (visible to `ps` in the guest) — it only ever
-    # crosses via SendEnv, exactly as a real `yo enter` session carries it.
-    guest_out="$(ssh "${SSH_ARGS[@]}" "${AWS_BROKER_SSH_ARGS[@]}" "${VM_HOST}" bash -s 2>&1 <<'GUEST_AWS_CHECK'
-set -u
+GUEST_AWS_CHECK = r"""set -u
 url="${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}"
 token="${AWS_CONTAINER_AUTHORIZATION_TOKEN:-}"
 if [ -z "${url}" ] || [ -z "${token}" ]; then
@@ -1156,455 +856,914 @@ creds="$(curl -sS -H "Authorization: ${token}" --max-time 5 "${url}")"
 printf 'CREDS=%s\n' "${creds}"
 sts="$(aws sts get-caller-identity 2>&1)"
 printf 'STS=%s\n' "${sts}"
-GUEST_AWS_CHECK
-    )" || true
+"""
 
-    env_missing="$(printf '%s\n' "${guest_out}" | sed -n 's/^ENV_MISSING=//p')"
-    [ -z "${env_missing}" ] ||
-        hc_fail "the guest session never saw AWS_CONTAINER_CREDENTIALS_FULL_URI/AWS_CONTAINER_AUTHORIZATION_TOKEN" \
-            "Check AcceptEnv in nix/base.nix and that the guest is running the switch that carries it."
 
-    health_status="$(printf '%s\n' "${guest_out}" | sed -n 's/^HEALTH=//p')"
-    if [ "${health_status}" = "200" ]; then
-        hc_ok "guest curl to the broker's /health returned 200"
-    else
-        hc_fail "guest curl to the broker's /health returned '${health_status:-<no response>}', expected 200"
-    fi
+def cmd_up(args: Sequence[str]) -> None:
+    listing = run(["limactl", "list", "-q"]).stdout.splitlines()
+    if INSTANCE in listing:
+        run(["limactl", "start", "--yes", INSTANCE], capture=False, check=True)
+    else:
+        run(
+            [
+                "limactl",
+                "start",
+                "--name",
+                INSTANCE,
+                "--yes",
+                str(SCRIPT_DIR / "lima" / "yolobox.yaml"),
+            ],
+            capture=False,
+            check=True,
+        )
 
-    creds_json="$(printf '%s\n' "${guest_out}" | sed -n 's/^CREDS=//p')"
-    if printf '%s' "${creds_json}" | jq -e 'has("AccessKeyId") and has("SecretAccessKey") and has("Token") and has("Expiration")' >/dev/null 2>&1; then
-        hc_ok "guest /creds answers with AccessKeyId, SecretAccessKey, Token and Expiration"
-    else
-        hc_fail "guest /creds did not answer with all four expected keys" "${creds_json}"
-    fi
 
-    sts_out="$(printf '%s\n' "${guest_out}" | sed -n 's/^STS=//p')"
-    role_arn="$(printf '%s\n' "${sts_out}" | jq -r '.Arn // empty' 2>/dev/null)"
-    if [ -n "${role_arn}" ]; then
-        hc_ok "guest sts get-caller-identity answers with ${role_arn}"
-    else
-        hc_fail "guest sts get-caller-identity did not return a role ARN:" "${sts_out}"
-    fi
+def cmd_down(args: Sequence[str]) -> None:
+    run(["limactl", "stop", INSTANCE], capture=False, check=True)
 
-    kill "${broker_pid}" 2>/dev/null || true
-    wait "${broker_pid}" 2>/dev/null || true
-    trap - EXIT
 
-    [ "${HERD_CHECK_FAILED}" -eq 0 ] || exit 1
-}
+def second_line(text: str) -> str:
+    lines = text.splitlines()
+    return lines[1] if len(lines) > 1 else ""
 
-# Guest twin of a Mac logical absolute path: the same $HOME-relative path
-# under the guest home. Fails on anything outside $HOME, so every guest
-# target built from it is contained in the guest home by construction.
-vm_mirror() {
-    case "$1" in
-        "$HOME") printf '%s\n' "${VM_USER_HOME}" ;;
-        "$HOME"/*) printf '%s\n' "${VM_USER_HOME}/${1#"$HOME"/}" ;;
-        *) return 1 ;;
-    esac
-}
 
-# Guest directory mirroring the Mac's logical cwd. A cwd outside $HOME lands
-# at the guest home; a mirrored path missing in the guest walks up to its
-# deepest existing ancestor. Either detour notifies on stderr — stdout is
-# captured by vm_target_dir and must carry the path alone.
-vm_dir_for_cwd() {
-    if ! desired="$(vm_mirror "$PWD")"; then
-        printf 'path "%s" does not exist in the yolobox you are in "%s"\n' \
-            "$PWD" "${VM_USER_HOME}" >&2
-        printf '%s\n' "${VM_USER_HOME}"
+def du_kib(path: str) -> Optional[int]:
+    probe = run(["du", "-k", path])
+    if probe.returncode != 0:
+        return None
+    fields = probe.stdout.split()
+    return int(fields[0]) if fields and fields[0].isdigit() else None
+
+
+def cmd_status(args: Sequence[str]) -> None:
+    run(["limactl", "list", INSTANCE], capture=False)
+
+    guest_df = second_line(guest_out(["df", "-h", "/"], check=False))
+    if guest_df:
+        out("disk: guest %s" % guest_df)
+        fields = guest_df.split()
+        use_pct = fields[4].rstrip("%") if len(fields) > 4 else ""
+        if use_pct.isdigit() and int(use_pct) >= 90:
+            out(
+                "disk: WARNING guest / is %s%% full — reclaim with: yo gc --deep --yes, or raise the ceiling with: yo disk-grow <GiB>"
+                % use_pct
+            )
+    image_kib = du_kib(os.path.join(lima_dir(), "disk"))
+    if image_kib is not None:
+        out(
+            "disk: image ~/.lima/%s/disk allocates %dGiB on this Mac"
+            % (INSTANCE, image_kib // 1024 // 1024)
+        )
+
+    check_herd_drift(refuse=False)
+
+
+def flake_ref() -> str:
+    override = os.environ.get("YOLOBOX_FLAKE")
+    if override:
+        return override
+    if YO_VERSION == "dev":
+        raise YoError(
+            "this is an unreleased build with no pinned flake — set YOLOBOX_FLAKE to what the VM should build from (e.g. YOLOBOX_FLAKE=github:aka-rider/yolobox/my-branch)"
+        )
+    return "github:aka-rider/yolobox/v%s" % YO_VERSION
+
+
+def rebuild_hint() -> str:
+    try:
+        ref = flake_ref()
+    except YoError as failure:
+        err("yo: %s" % failure.message)
+        return "set YOLOBOX_FLAKE to a flake ref the box should build from, then retry"
+    return (
+        "yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '%s#yolobox'"
+        % ref
+    )
+
+
+def host_user() -> str:
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def guest_generations() -> Tuple[str, str]:
+    probe = guest_out(
+        ["sh", "-c", "readlink -f /nix/var/nix/profiles/system && readlink -f /run/current-system"],
+        check=False,
+    )
+    lines = probe.splitlines()
+    profile = lines[0] if lines else ""
+    booted = lines[1] if len(lines) > 1 else ""
+    return profile, booted
+
+
+def cmd_bootstrap(args: Sequence[str]) -> None:
+    if args:
+        raise usage_error("bootstrap takes no arguments")
+
+    report = Report()
+    ref = flake_ref()
+
+    cmd_up([])
+    report.ok("VM up")
+
+    ssh_run(
+        OPERATOR,
+        [
+            "sudo",
+            "YOLOBOX_USERNAME=%s" % host_user(),
+            "nixos-rebuild",
+            "boot",
+            "--impure",
+            "--flake",
+            "%s#yolobox" % ref,
+        ],
+        mux=True,
+        capture=False,
+        check=True,
+        inherit_stdin=True,
+    )
+    report.ok("built from %s" % ref)
+
+    profile, booted = guest_generations()
+    if not booted:
+        raise report.abort("cannot read the VM's generations — is it up? (yo status)")
+    if profile == booted:
+        report.ok("already running the built generation")
+    else:
+        run(["limactl", "restart", INSTANCE], capture=False, check=True)
+        profile, booted = guest_generations()
+        if not booted:
+            raise report.abort("cannot read the VM's generations — is it up? (yo status)")
+        if profile != booted:
+            raise report.abort(
+                "the VM rebooted but is still not running the built generation",
+                "profile: %s" % profile,
+                "booted:  %s" % booted,
+                "Check df /boot in the VM — a half-failed bootloader install leaves the two",
+                "generations disagreeing (see CLAUDE.md).",
+            )
+        report.ok("rebooted into the built generation")
+
+    cmd_seed([])
+    report.ok("seeded")
+
+    config = editor_ssh_config()
+    if config.include_line is None:
+        err("yo: add this line to ~/.ssh/config so ssh lima-yolobox, Zed and VS Code can find the VM:")
+        err("    Include ~/.lima/yolobox/ssh.config")
+    if config.problem is not None:
+        err("yo: and this block ABOVE that Include line, so Zed and VS Code open the VM as")
+        err("    the %s account instead of reusing the operator's ssh master:" % AGENT_USER)
+        for line in EDITOR_SSH_BLOCK.splitlines():
+            err("    " + line)
+
+
+def cmd_gc(args: Sequence[str]) -> None:
+    deep = 0
+    apply_now = 0
+    for arg in args:
+        if arg == "--deep":
+            deep = 1
+        elif arg == "--yes":
+            apply_now = 1
+        else:
+            raise usage_error("unknown gc option '%s'" % arg)
+
+    env_prefix = ["env", "YO_GC_DEEP=%d" % deep, "YO_GC_APPLY=%d" % apply_now, "bash", "-s"]
+    failed = False
+
+    machine = ssh_run(
+        OPERATOR, env_prefix, stdin=GC_MACHINE.encode(), mux=True, capture=False
+    )
+    failed = failed or machine.returncode != 0
+
+    require_agent_account()
+    user = ssh_run(AGENT, env_prefix, stdin=GC_USER.encode(), mux=True, capture=False)
+    failed = failed or user.returncode != 0
+
+    if failed:
+        raise YoError(None, code=1)
+
+
+def cmd_disk_grow(args: Sequence[str]) -> None:
+    if len(args) != 1:
+        raise usage_error("disk-grow takes one argument, the new size in GiB")
+    if not args[0].isdigit():
+        raise YoError(
+            "disk-grow size must be a whole number of GiB, got '%s'" % args[0], code=2
+        )
+    wanted = int(args[0])
+    if wanted <= 0:
+        raise YoError("disk-grow size must be greater than 0 GiB", code=2)
+
+    probe = run(["limactl", "list", INSTANCE, "--format", "{{.Disk}}"])
+    current_bytes = probe.stdout.strip() if probe.returncode == 0 else ""
+    if not current_bytes.isdigit():
+        raise YoError(
+            "limactl reports no disk size for %s — does the instance exist? (yo status)"
+            % INSTANCE
+        )
+    current_gib = int(current_bytes) // 1024 // 1024 // 1024
+    if wanted <= current_gib:
+        raise YoError(
+            "%s's ceiling is already %dGiB and lima can only grow it — ask for more than %d"
+            % (INSTANCE, current_gib, current_gib)
+        )
+
+    load_state = guest_out(
+        ["systemctl", "show", "-p", "LoadState", "--value", "growpart"], check=False
+    ).splitlines()
+    load_state = load_state[0] if load_state else ""
+    if not load_state:
+        raise YoError("cannot reach the VM to ask about growpart — is it up? (yo status)")
+    if load_state != "loaded":
+        raise YoError(
+            "no growpart unit in the VM's current system, so growing the ceiling would leave /dev/vda2 untouched — switch it: %s"
+            % rebuild_hint()
+        )
+
+    df_before = second_line(guest_out(["df", "-h", "/"], check=False))
+    blocks_before = df_blocks(guest_out(["df", "-k", "/"], check=False))
+
+    free_kib = df_blocks(run(["df", "-k", os.path.join(home(), ".lima")]).stdout, field=3)
+    image_kib = du_kib(os.path.join(lima_dir(), "disk")) or 0
+    out(
+        "host: ~/.lima has %dGiB free; the disk image allocates %dGiB today"
+        % ((free_kib or 0) // 1024 // 1024, image_kib // 1024 // 1024)
+    )
+    out("lima: raising %s from %dGiB to %dGiB" % (INSTANCE, current_gib, wanted))
+
+    run(["limactl", "stop", INSTANCE], capture=False, check=True)
+    resize = run(["limactl", "edit", "--yes", INSTANCE, "--disk", str(wanted)], capture=False)
+    if resize.returncode != 0:
+        raise YoError(
+            "limactl refused the resize and %s is left stopped — start it again with: yo up"
+            % INSTANCE
+        )
+    cmd_up([])
+
+    df_after = second_line(guest_out(["df", "-h", "/"], check=False))
+    blocks_after = df_blocks(guest_out(["df", "-k", "/"], check=False))
+    vda2_after = guest_out(["lsblk", "-no", "SIZE", "/dev/vda2"], check=False).splitlines()
+    out("before: %s" % df_before)
+    out("after:  %s" % df_after)
+    out("after:  vda2 is %s" % (vda2_after[0] if vda2_after else ""))
+    if blocks_after is None or blocks_after <= (blocks_before or 0):
+        raise YoError(
+            "the ceiling is now %dGiB but the guest root did not grow — diagnose with: yo ssh systemctl status growpart"
+            % wanted
+        )
+
+
+def df_blocks(text: str, field: int = 1) -> Optional[int]:
+    line = second_line(text)
+    fields = line.split()
+    if len(fields) > field and fields[field].isdigit():
+        return int(fields[field])
+    return None
+
+
+def cmd_ssh(args: Sequence[str]) -> None:
+    argv = ssh_base(OPERATOR) + forward_agent_opts() + ["-t", VM_HOST] + list(args)
+    exec_process(argv)
+
+
+def cmd_enter(args: Sequence[str]) -> None:
+    if len(args) > 1:
+        raise usage_error("enter takes at most one project argument")
+    require_agent_account()
+    target = target_dir(args)
+
+    argv = ssh_base(AGENT) + forward_agent_opts()
+    env = dict(os.environ)
+
+    forward = herd_forward()
+    if forward is not None:
+        argv += forward.ssh_opts
+        env.update(forward.env)
+
+    profile = os.environ.get("YOLOBOX_AWS_PROFILE", "")
+    broker = None
+    if profile:
+        region_opts, region_env = send_env({"AWS_REGION": aws_region(profile)})
+        argv += region_opts
+        env.update(region_env)
+        broker = start_aws_broker(profile)
+        argv += broker.ssh_opts
+        env.update(broker.env)
+
+    check_herd_drift(refuse=True)
+
+    argv += ["-t", VM_HOST, remote(["cd", target]) + ' && exec "$SHELL" -l']
+    exec_process(argv, env)
+
+
+EDITOR_SSH_BLOCK = "Match host %s user %s\n  ControlPath ~/.lima/%s/ssh-agent.sock" % (
+    VM_HOST,
+    AGENT_USER,
+    INSTANCE,
+)
+
+MATCH_RE = re.compile(
+    r"^\s*Match\s+host\s+%s\s+user\s+%s(\s|$)" % (re.escape(VM_HOST), re.escape(AGENT_USER)),
+    re.IGNORECASE,
+)
+INCLUDE_RE = re.compile(
+    r"^\s*Include\s+.*\.lima/%s/ssh\.config" % re.escape(INSTANCE), re.IGNORECASE
+)
+BLOCK_END_RE = re.compile(r"^\s*(Host|Match)\s", re.IGNORECASE)
+CONTROL_PATH_RE = re.compile(r'ssh-agent\.sock"?$')
+
+
+@dataclass(frozen=True)
+class EditorSshConfig:
+    problem: Optional[str]
+    match_line: Optional[int]
+    include_line: Optional[int]
+
+
+def editor_ssh_config() -> EditorSshConfig:
+    path = os.path.join(home(), ".ssh", "config")
+    try:
+        with open(path, "r", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return EditorSshConfig("missing", None, None)
+
+    match_line = None
+    include_line = None
+    for number, line in enumerate(lines, 1):
+        if match_line is None and MATCH_RE.search(line):
+            match_line = number
+        if include_line is None and INCLUDE_RE.search(line):
+            include_line = number
+
+    if match_line is None:
+        return EditorSshConfig("missing", None, include_line)
+
+    block_ok = False
+    for line in lines[match_line:]:
+        if BLOCK_END_RE.search(line):
+            break
+        fields = line.split()
+        if len(fields) > 1 and fields[0].lower() == "controlpath" and CONTROL_PATH_RE.search(fields[1]):
+            block_ok = True
+            break
+
+    if not block_ok:
+        return EditorSshConfig("incomplete", match_line, include_line)
+    if include_line is not None and match_line > include_line:
+        return EditorSshConfig("below", match_line, include_line)
+    return EditorSshConfig(None, match_line, include_line)
+
+
+def require_editor_ssh_config() -> None:
+    config = editor_ssh_config()
+    if config.problem is None:
         return
-    fi
-    landing="$(agent_ssh "d=$(printf '%q' "${desired}")
-        while [ -n \"\$d\" ] && [ ! -d \"\$d\" ]; do d=\"\${d%/*}\"; done
-        printf '%s\n' \"\${d:-\$HOME}\"")"
-    [ "${landing}" = "${desired}" ] ||
-        printf 'path "%s" does not exist in the yolobox you are in "%s"\n' \
-            "${desired}" "${landing}" >&2
-    printf '%s\n' "${landing}"
+    if config.problem == "missing":
+        err("yo: ~/.ssh/config has no ssh block for the %s account, so the editor" % AGENT_USER)
+        err("    would reuse the operator's ssh master and silently open the project as the")
+        err("    operator. Add this block ABOVE the 'Include ~/.lima/%s/ssh.config'" % INSTANCE)
+        err("    line — ssh keeps the first value it sees for each keyword:")
+    elif config.problem == "incomplete":
+        err("yo: ~/.ssh/config has the %s block on line %d, but it names no" % (AGENT_USER, config.match_line))
+        err("    ControlPath of its own, so the editor would still land on the operator's")
+        err("    shared master. Make it read:")
+    else:
+        err("yo: ~/.ssh/config has the %s block on line %d, below the lima" % (AGENT_USER, config.match_line))
+        err("    Include on line %d. ssh keeps the first value it sees for each" % config.include_line)
+        err("    keyword, so the Include's shared ControlPath wins and the editor would open")
+        err("    the project as the operator. Move this block above that Include line:")
+    for line in EDITOR_SSH_BLOCK.splitlines():
+        err("    " + line)
+    raise YoError(None, code=1)
+
+
+def cmd_code(args: Sequence[str]) -> None:
+    if len(args) > 1:
+        raise usage_error("code takes at most one project argument")
+    code_cli = shutil.which("code")
+    if code_cli is None:
+        code_cli = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+    if not os.access(code_cli, os.X_OK):
+        raise YoError("VS Code CLI not found")
+    require_editor_ssh_config()
+    require_agent_account()
+    target = target_dir(args)
+    exec_process(
+        [code_cli, "--folder-uri", "vscode-remote://ssh-remote+%s@%s%s" % (AGENT_USER, VM_HOST, target)]
+    )
+
+
+def cmd_zed(args: Sequence[str]) -> None:
+    if len(args) > 1:
+        raise usage_error("zed takes at most one project argument")
+    if shutil.which("zed") is None:
+        raise YoError("zed CLI not found")
+    require_editor_ssh_config()
+    require_agent_account()
+    target = target_dir(args)
+    exec_process(["zed", "ssh://%s@%s%s" % (AGENT_USER, VM_HOST, target)])
+
+
+def t3_require_service() -> None:
+    unit = guest_out(
+        ["systemctl", "show", "-p", "LoadState", "-p", "ActiveState", "--value", "t3"],
+        check=False,
+    ).splitlines()
+    load_state = unit[0] if unit else ""
+    active_state = unit[1] if len(unit) > 1 else ""
+    if not load_state:
+        raise YoError("cannot reach the VM to ask about t3 — is it up? (yo status)")
+    if load_state != "loaded":
+        raise YoError("no t3 unit in the VM's current system — switch it: %s" % rebuild_hint())
+    if active_state != "active":
+        raise YoError(
+            "t3 service is %s in the VM — diagnose with: yo ssh journalctl -u t3 -n 50"
+            % active_state
+        )
+    probe = run(["curl", "-sS", "-o", "/dev/null", "--max-time", "5", "http://127.0.0.1:%d/" % T3_PORT])
+    if probe.returncode != 0:
+        err("yo: t3 is healthy in the VM but 127.0.0.1:%d does not answer on this Mac —" % T3_PORT)
+        err("    lima's port forwarding is dead (see ~/.lima/%s/ha.stderr.log)." % INSTANCE)
+        err("    Recover with: limactl stop %s && ./yo up" % INSTANCE)
+        raise YoError(None, code=1)
+
+
+def parse_pairing_url(text: str) -> Optional[str]:
+    url = ""
+    for line in text.replace("\r", "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Pairing URL:"):
+            url = stripped[len("Pairing URL:") :].strip()
+            break
+    if not url:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ("127.0.0.1", "localhost"):
+        raise YoError("'t3 pair' printed a pairing URL yo will not open: %s" % url)
+    return url
+
+
+def cmd_t3(args: Sequence[str]) -> None:
+    if args:
+        raise usage_error("t3 takes no arguments")
+    t3_require_service()
+    pair_out = ssh_run(AGENT, ["t3", "pair", "--ttl", "2m", "--label", "yo"], merge_stderr=True).stdout
+    url = parse_pairing_url(pair_out)
+    if url is None:
+        err("yo: 't3 pair' printed no 'Pairing URL:' line:")
+        err(pair_out.rstrip("\n"))
+        raise YoError(None, code=1)
+    exec_process(["open", url])
+
+
+def cmd_pair(args: Sequence[str]) -> None:
+    if len(args) > 1:
+        raise usage_error("pair takes at most one base-url argument")
+    t3_require_service()
+    host_name = run(["scutil", "--get", "LocalHostName"], check=True).stdout.strip()
+    base_url = args[0] if args else "http://%s.local:%d" % (host_name, T3_PORT)
+    pair = ssh_run(
+        AGENT,
+        [
+            "t3",
+            "auth",
+            "pairing",
+            "create",
+            "--ttl",
+            "5m",
+            "--label",
+            "yo@%s" % host_name,
+            "--base-url",
+            base_url,
+        ],
+        merge_stderr=True,
+    )
+    if pair.returncode != 0:
+        err(pair.stdout.rstrip("\n"))
+        raise YoError(None, code=1)
+    out(pair.stdout.rstrip("\n"))
+
+
+def cmd_link(args: Sequence[str]) -> None:
+    if args:
+        raise usage_error("link takes no arguments")
+    require_agent_account()
+    cdup = run(["git", "rev-parse", "--show-cdup"])
+    if cdup.returncode != 0:
+        raise YoError("link must run inside a git repo")
+    toplevel = os.path.normpath(os.path.join(logical_cwd(), cdup.stdout.strip()))
+
+    if run(["git", "-C", toplevel, "remote", "get-url", "yolobox"]).returncode == 0:
+        raise YoError("remote 'yolobox' already exists")
+    if toplevel == home():
+        raise YoError("refusing to link $HOME itself")
+    vmdir = mirror(toplevel)
+    if vmdir is None:
+        raise YoError("repo must be under $HOME (it is at %s)" % toplevel)
+    vmdir = guest_path(vmdir)
+
+    agent_out(["sh", "-c", ENSURE_REPO, "sh", vmdir], check=True)
+
+    run(
+        ["git", "-C", toplevel, "remote", "add", "yolobox", "ssh://%s@%s%s" % (AGENT_USER, VM_HOST, vmdir)],
+        check=True,
+    )
+    run(
+        [
+            "git",
+            "-C",
+            toplevel,
+            "config",
+            "remote.yolobox.sshCommand",
+            shlex.join(["ssh", "-F", ssh_cfg(), "-o", "ControlPath=none"]),
+        ],
+        check=True,
+    )
+
+
+def tar_stream(members: Sequence[Tuple[str, str]]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for path, arcname in members:
+            archive.add(path, arcname=arcname, recursive=False)
+    return buffer.getvalue()
+
+
+SEED_STRIP_RE = re.compile(r"^\s*(Include|IdentityAgent)\s", re.IGNORECASE)
+
+
+def seed_ssh(report: Report) -> None:
+    config_path = os.path.join(home(), ".ssh", "config")
+    try:
+        with open(config_path, "r", errors="replace") as handle:
+            lines = handle.read().splitlines(True)
+    except OSError:
+        report.ok("no ~/.ssh/config on this Mac — skipped")
+    else:
+        filtered = "".join(line for line in lines if not SEED_STRIP_RE.search(line))
+        ssh_run(
+            AGENT,
+            ["sh", "-c", SEED_SSH_CONFIG],
+            stdin=filtered.encode(),
+            mux=True,
+            capture=False,
+            check=True,
+        )
+
+    ssh_dir = Path(home()) / ".ssh"
+    pubkeys = sorted(str(p) for p in ssh_dir.glob("*.pub") if p.is_file())
+    if not pubkeys:
+        return
+    members = [(path, os.path.basename(path)) for path in pubkeys]
+    ssh_run(
+        AGENT,
+        ["sh", "-c", SEED_UNTAR_SSH],
+        stdin=tar_stream(members),
+        mux=True,
+        capture=False,
+        check=True,
+    )
+
+
+def seed_gitconfig() -> None:
+    roots = agent_out(["sh", "-c", GITCONFIG_ROOTS_FIND]).splitlines()
+    members = []
+    for root in roots:
+        if not root or "/" in root or root in (".", ".."):
+            continue
+        root_path = Path(home()) / root
+        if not root_path.is_dir():
+            continue
+        for identity in sorted(root_path.glob("*/.gitconfig")):
+            if identity.is_file():
+                members.append((str(identity), str(identity.relative_to(home()))))
+    if not members:
+        return
+    ssh_run(
+        AGENT,
+        ["sh", "-c", SEED_UNTAR_HOME],
+        stdin=tar_stream(members),
+        mux=True,
+        capture=False,
+        check=True,
+    )
+
+
+def cmd_seed(args: Sequence[str]) -> None:
+    if args:
+        raise usage_error("seed takes no arguments")
+    require_agent_account()
+    seed_ssh(Report())
+    seed_gitconfig()
+
+
+def herdr_pane_agent(pane_id: str, report: Report, when: str = "") -> str:
+    probe = run(["herdr", "pane", "get", pane_id], merge_stderr=True)
+    if probe.returncode != 0:
+        raise report.abort(
+            "'herdr pane get %s' failed%s: %s" % (pane_id, when, probe.stdout.strip()),
+            *(
+                ["The pane id does not exist on this server — rerun from a live herdr pane."]
+                if not when
+                else []
+            )
+        )
+    try:
+        return json.loads(probe.stdout)["result"]["pane"].get("agent") or ""
+    except (ValueError, KeyError, TypeError):
+        raise report.abort(
+            "could not parse 'herdr pane get' output: %s" % probe.stdout.strip(),
+            "Check that the host herdr version still emits JSON from pane get.",
+        )
+
+
+def herdr_server_field(status_text: str, field: str) -> str:
+    inside = False
+    for line in status_text.splitlines():
+        if line.startswith("server:"):
+            inside = True
+            continue
+        if inside:
+            if not line.strip():
+                break
+            match = re.match(r"^\s*%s:\s*(.*)$" % re.escape(field), line)
+            if match:
+                return match.group(1).strip()
+    return ""
+
+
+def cmd_herd_check(args: Sequence[str]) -> None:
+    if args:
+        raise usage_error("herd-check takes no arguments")
+    report = Report()
+
+    if shutil.which("herdr") is None:
+        raise report.abort(
+            "herdr is not on this Mac's PATH",
+            "Install it (brew install herdr) — the box reports into this Mac's herdr server.",
+        )
+
+    status = run(["herdr", "status"], merge_stderr=True)
+    if status.returncode != 0:
+        raise report.abort(
+            "'herdr status' failed: %s" % status.stdout.strip(),
+            "Start the herdr server on this Mac, then rerun ./yo herd-check.",
+        )
+    server_status = herdr_server_field(status.stdout, "status")
+    server_compatible = herdr_server_field(status.stdout, "compatible")
+    if server_status != "running":
+        raise report.abort(
+            "this Mac's herdr server is not running (status: %s)" % (server_status or "unknown"),
+            "Start it and rerun ./yo herd-check — no report from anywhere lands while it is down.",
+        )
+    if server_compatible != "yes":
+        raise report.abort(
+            "this Mac's herdr client and server are incompatible (compatible: %s)"
+            % (server_compatible or "unknown"),
+            "brew upgrade herdr, then restart the herdr server.",
+            "Nothing in the box can work until the Mac's own two halves agree.",
+        )
+    report.ok("host herdr server running and compatible")
+
+    pane_id = os.environ.get("HERDR_PANE_ID", "")
+    if not pane_id:
+        raise report.abort(
+            "HERDR_PANE_ID is empty — this is not a herdr pane",
+            "Run ./yo herd-check from a pane inside herdr's terminal.",
+        )
+
+    pane_agent = herdr_pane_agent(pane_id, report)
+    if pane_agent:
+        raise report.abort(
+            "pane %s already holds an agent (%s)" % (pane_id, pane_agent),
+            "This check reports an agent into the pane and then releases it, so running",
+            "it here would drop %s out of the herd. Open a plain pane and" % pane_agent,
+            "rerun ./yo herd-check there.",
+        )
+    report.ok("pane %s is free" % pane_id)
+
+    host_version = host_herd_version()
+    guest = guest_herd_version()
+    if guest is None:
+        report.fail("cannot ask the box for its herdr version", "Is the VM up? ./yo status")
+    elif host_version == guest.version:
+        report.ok("herdr %s on both sides" % host_version)
+    else:
+        report.fail(
+            "herd version drift: this Mac runs herdr %s, the box has %s"
+            % (host_version, guest.version)
+        )
+        herd_drift_report(host_version or "", guest.version)
+        if (
+            guest.prev_version
+            and guest.prev_generation != guest.generation
+            and guest.prev_version == guest.version
+        ):
+            err("      The box has been switched since the last check and its herdr did not")
+            err("      move: nixpkgs carries no newer one yet. Skip until it does.")
+
+    forward = herd_forward()
+    if forward is None:
+        raise report.abort(
+            "this pane exports no live herdr socket (HERDR_SOCKET_PATH)",
+            "The forward yo enter builds cannot exist without it — rerun from a herdr pane.",
+        )
+
+    guest_run = ssh_run(
+        AGENT,
+        ["yolobox-herd-check"],
+        extra_opts=forward.ssh_opts,
+        env=forward.env,
+        capture=False,
+    )
+    guest_rc = guest_run.returncode
+    if guest_rc == 127:
+        report.fail("the box has no yolobox-herd-check", "rebuild it: %s" % rebuild_hint())
+    elif guest_rc != 0:
+        report.fail("the guest half failed (exit %d) — see its output above" % guest_rc)
+
+    pane_agent = herdr_pane_agent(pane_id, report, when=" after the guest run")
+    if not pane_agent:
+        report.ok("pane %s released again" % pane_id)
+    else:
+        report.fail(
+            "pane %s still holds an agent (%s) after the check" % (pane_id, pane_agent),
+            "The guest's release path is broken; clear it by hand with:",
+            "herdr pane release-agent %s" % pane_id,
+        )
+
+    if report.failed:
+        raise YoError(None, code=1)
+    if guest_rc != 0:
+        raise YoError(None, code=guest_rc)
+
+
+def guest_field(text: str, key: str) -> str:
+    prefix = key + "="
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix) :]
+    return ""
+
+
+def cmd_aws_check(args: Sequence[str]) -> None:
+    if args:
+        raise usage_error("aws-check takes no arguments")
+    report = Report()
+
+    profile = os.environ.get("YOLOBOX_AWS_PROFILE", "")
+    if not profile:
+        raise report.abort(
+            "YOLOBOX_AWS_PROFILE is not set",
+            "Set it to a host AWS CLI profile and rerun: YOLOBOX_AWS_PROFILE=<profile> ./yo aws-check",
+        )
+    if shutil.which("aws") is None:
+        raise report.abort("'aws' is not on this Mac's PATH")
+    report.ok("aws is on this Mac's PATH")
+
+    creds = run(
+        ["aws", "configure", "export-credentials", "--profile", profile, "--format", "process"],
+        merge_stderr=True,
+    )
+    if creds.returncode != 0:
+        raise report.abort(
+            "'aws configure export-credentials --profile %s' failed:" % profile,
+            creds.stdout.strip(),
+        )
+    try:
+        session_token = json.loads(creds.stdout).get("SessionToken") or ""
+    except ValueError:
+        session_token = ""
+    if not session_token:
+        raise report.abort(
+            "profile '%s' returned no SessionToken — these are long-lived keys" % profile,
+            "and must never enter the guest. Point YOLOBOX_AWS_PROFILE at a profile that",
+            "yields temporary credentials (role_arn or credential_process), not a static",
+            "IAM user profile.",
+        )
+    report.ok("host export-credentials succeeded for '%s', SessionToken present" % profile)
+
+    region = aws_region(profile)
+    report.ok("region resolves to %s" % region)
+
+    broker = start_aws_broker(profile)
+    try:
+        report.ok(
+            "broker started, host port %d forwarded to guest port %d"
+            % (broker.host_port, broker.guest_port)
+        )
+
+        region_opts, region_env = send_env({"AWS_REGION": region})
+        env = dict(os.environ)
+        env.update(region_env)
+        env.update(broker.env)
+        guest_out_text = ssh_run(
+            AGENT,
+            ["bash", "-s"],
+            stdin=GUEST_AWS_CHECK.encode(),
+            extra_opts=list(broker.ssh_opts) + region_opts,
+            env=env,
+            merge_stderr=True,
+        ).stdout
+
+        if guest_field(guest_out_text, "ENV_MISSING"):
+            report.fail(
+                "the guest session never saw AWS_CONTAINER_CREDENTIALS_FULL_URI/AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                "Check AcceptEnv in nix/base.nix and that the guest is running the switch that carries it.",
+            )
+
+        health = guest_field(guest_out_text, "HEALTH")
+        if health == "200":
+            report.ok("guest curl to the broker's /health returned 200")
+        else:
+            report.fail(
+                "guest curl to the broker's /health returned '%s', expected 200"
+                % (health or "<no response>")
+            )
+
+        creds_json = guest_field(guest_out_text, "CREDS")
+        try:
+            payload = json.loads(creds_json)
+        except ValueError:
+            payload = {}
+        expected = {"AccessKeyId", "SecretAccessKey", "Token", "Expiration"}
+        if isinstance(payload, dict) and expected <= set(payload):
+            report.ok("guest /creds answers with AccessKeyId, SecretAccessKey, Token and Expiration")
+        else:
+            report.fail("guest /creds did not answer with all four expected keys", creds_json)
+
+        sts_out = guest_field(guest_out_text, "STS")
+        try:
+            role_arn = json.loads(sts_out).get("Arn") or ""
+        except ValueError:
+            role_arn = ""
+        if role_arn:
+            report.ok("guest sts get-caller-identity answers with %s" % role_arn)
+        else:
+            report.fail("guest sts get-caller-identity did not return a role ARN:", sts_out)
+    finally:
+        broker.stop()
+
+    if report.failed:
+        raise YoError(None, code=1)
+
+
+COMMANDS = {
+    "up": cmd_up,
+    "down": cmd_down,
+    "status": cmd_status,
+    "bootstrap": cmd_bootstrap,
+    "gc": cmd_gc,
+    "disk-grow": cmd_disk_grow,
+    "ssh": cmd_ssh,
+    "enter": cmd_enter,
+    "link": cmd_link,
+    "seed": cmd_seed,
+    "code": cmd_code,
+    "zed": cmd_zed,
+    "t3": cmd_t3,
+    "pair": cmd_pair,
+    "herd-check": cmd_herd_check,
+    "aws-check": cmd_aws_check,
 }
 
-# A project is a git repo under the guest home: worktrees leave a .git
-# file, clones a .git dir, so the find matches both. Hidden directories are
-# pruned — except .git itself, the very name the find is looking for.
-vm_project_pick() {
-    command -v fzf >/dev/null || {
-        echo "yo: fzf not found (brew install fzf)" >&2
-        exit 1
-    }
-    # shellcheck disable=SC2016 # $HOME must reach the guest unexpanded
-    projects="$(agent_ssh \
-        'find "$HOME" -mindepth 2 \
-             \( -name node_modules -o -name target -o -name .next -o \( -name ".*" ! -name .git \) \) -prune -o \
-             -name .git \( -type d -o -type f \) -printf "%h\n" -prune' |
-        sed "s|^${VM_USER_HOME}/||" | sort)"
-    [ -n "${projects}" ] || {
-        echo "yo: no projects in the VM" >&2
-        exit 1
-    }
-    choice="$(printf '%s\n' "${projects}" |
-        fzf --select-1 --exit-0 --query="$1")" || {
-        rc="$?"
-        [ "${rc}" -eq 130 ] || echo "yo: no project matches '$1'" >&2
-        exit "${rc}"
-    }
-    printf '%s\n' "${VM_USER_HOME}/${choice}"
-}
 
-vm_target_dir() {
-    if [ "$#" -eq 1 ]; then
-        vm_project_pick "$1"
-    else
-        vm_dir_for_cwd
-    fi
-}
+def main(argv: Sequence[str]) -> int:
+    if not argv:
+        err(USAGE.rstrip("\n"))
+        return 2
+    sub, rest = argv[0], list(argv[1:])
 
-# VS Code and Zed spawn their own ssh against ~/.ssh/config, so yo cannot
-# hand them -o User/-o ControlPath: without a host-side block naming the
-# agent's own ControlPath they reuse lima's shared master and silently open
-# the project as the operator. Refuse instead of opening the wrong session.
-editor_ssh_block() {
-    printf 'Match host %s user %s\n' "${VM_HOST}" "${VM_AGENT_USER}"
-    printf '  ControlPath ~/.lima/%s/ssh-agent.sock\n' "${INSTANCE}"
-}
-
-# Sets EDITOR_SSH_PROBLEM to what is wrong (missing, incomplete or below)
-# plus the two line numbers, and returns nonzero — so bootstrap can hint and
-# the editors can refuse off one detection.
-editor_ssh_config_ok() {
-    cfg="$HOME/.ssh/config"
-    match_ln=""
-    include_ln=""
-    block_ok=""
-    if [ -r "${cfg}" ]; then
-        match_ln="$(grep -n -i -E "^[[:space:]]*Match[[:space:]]+host[[:space:]]+${VM_HOST}[[:space:]]+user[[:space:]]+${VM_AGENT_USER}([[:space:]]|\$)" "${cfg}" |
-            head -n 1 | cut -d: -f1)" || true
-        include_ln="$(grep -n -i -E "^[[:space:]]*Include[[:space:]]+.*\.lima/${INSTANCE}/ssh\.config" "${cfg}" |
-            head -n 1 | cut -d: -f1)" || true
-        if [ -n "${match_ln}" ]; then
-            block_ok="$(awk -v start="${match_ln}" '
-                NR <= start { next }
-                /^[[:space:]]*(Host|Match)[[:space:]]/ { exit }
-                tolower($1) == "controlpath" && $2 ~ /ssh-agent\.sock"?$/ { print "yes"; exit }
-            ' "${cfg}")"
-        fi
-    fi
-
-    if [ -z "${match_ln}" ]; then
-        EDITOR_SSH_PROBLEM="missing"
-    elif [ "${block_ok}" != "yes" ]; then
-        EDITOR_SSH_PROBLEM="incomplete"
-    elif [ -n "${include_ln}" ] && [ "${match_ln}" -gt "${include_ln}" ]; then
-        EDITOR_SSH_PROBLEM="below"
-    else
-        EDITOR_SSH_PROBLEM=""
+    if sub in ("--help", "-h", "help"):
+        out(USAGE.rstrip("\n"))
         return 0
-    fi
-    return 1
-}
+    if sub in ("--version", "-V"):
+        out("yolobox %s" % YO_VERSION)
+        return 0
 
-editor_require_ssh_config() {
-    editor_ssh_config_ok && return 0
+    command = COMMANDS.get(sub)
+    if command is None:
+        err(USAGE.rstrip("\n"))
+        return 2
 
-    case "${EDITOR_SSH_PROBLEM}" in
-        missing)
-            echo "yo: ~/.ssh/config has no ssh block for the ${VM_AGENT_USER} account, so the editor" >&2
-            echo "    would reuse the operator's ssh master and silently open the project as the" >&2
-            echo "    operator. Add this block ABOVE the 'Include ~/.lima/${INSTANCE}/ssh.config'" >&2
-            echo "    line — ssh keeps the first value it sees for each keyword:" >&2
-            ;;
-        incomplete)
-            echo "yo: ~/.ssh/config has the ${VM_AGENT_USER} block on line ${match_ln}, but it names no" >&2
-            echo "    ControlPath of its own, so the editor would still land on the operator's" >&2
-            echo "    shared master. Make it read:" >&2
-            ;;
-        below)
-            echo "yo: ~/.ssh/config has the ${VM_AGENT_USER} block on line ${match_ln}, below the lima" >&2
-            echo "    Include on line ${include_ln}. ssh keeps the first value it sees for each" >&2
-            echo "    keyword, so the Include's shared ControlPath wins and the editor would open" >&2
-            echo "    the project as the operator. Move this block above that Include line:" >&2
-            ;;
-    esac
-    editor_ssh_block | sed 's/^/    /' >&2
-    exit 1
-}
+    require_tool("limactl", "brew install lima")
+    command(rest)
+    return 0
 
-cmd_code() {
-    [ "$#" -le 1 ] || {
-        echo "yo: code takes at most one project argument" >&2
-        usage >&2
-        exit 2
-    }
-    code_cli="$(command -v code || true)"
-    [ -n "${code_cli}" ] ||
-        code_cli="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
-    [ -x "${code_cli}" ] || {
-        echo "yo: VS Code CLI not found" >&2
-        exit 1
-    }
-    editor_require_ssh_config
-    agent_require
-    target="$(vm_target_dir "${@+"$@"}")"
-    exec "${code_cli}" --folder-uri "vscode-remote://ssh-remote+${VM_AGENT_USER}@${VM_HOST}${target}"
-}
 
-cmd_zed() {
-    [ "$#" -le 1 ] || {
-        echo "yo: zed takes at most one project argument" >&2
-        usage >&2
-        exit 2
-    }
-    command -v zed >/dev/null || {
-        echo "yo: zed CLI not found" >&2
-        exit 1
-    }
-    editor_require_ssh_config
-    agent_require
-    target="$(vm_target_dir "${@+"$@"}")"
-    exec zed "ssh://${VM_AGENT_USER}@${VM_HOST}${target}"
-}
-
-# One-shot guest command on a connection of its own: a role's ControlMaster
-# belongs to whichever session opened it, and a one-shot probe must neither
-# inherit that session's forwards nor become the master for later ones.
-# Operator role: the box's own state, never the agent's home.
-guest_ssh() {
-    ssh_role operator nomux
-    ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" "$@"
-}
-
-# Same, as the agent: anything reading or writing the agent's home, or the
-# GitHub identity that belongs to it.
-agent_ssh() {
-    ssh_role agent nomux
-    ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" "$@"
-}
-
-# t3's web UI authenticates with a freshly minted pairing token; a bare
-# http://127.0.0.1:${T3_PORT} is rejected. Sets PAIRING_URL.
-t3_mint_pairing_url() {
-    pair_out="$(agent_ssh 't3 pair --ttl 2m --label yo' 2>&1)" || true
-    PAIRING_URL="$(printf '%s\n' "${pair_out}" | tr -d '\r' |
-        sed -n 's/^[[:space:]]*Pairing URL:[[:space:]]*//p' | head -n 1)"
-    [ -n "${PAIRING_URL}" ] || {
-        echo "yo: 't3 pair' printed no 'Pairing URL:' line:" >&2
-        printf '%s\n' "${pair_out}" >&2
-        exit 1
-    }
-}
-
-t3_require_service() {
-    # LoadState, not just is-active: `systemctl is-active` reports a unit the
-    # running closure has never heard of as "inactive", which reads as a
-    # stopped service when the real answer is that the VM was never switched.
-    unit="$(guest_ssh 'systemctl show -p LoadState -p ActiveState --value t3' || true)"
-    load_state="$(printf '%s\n' "${unit}" | tr -d '\r' | sed -n '1p')"
-    active_state="$(printf '%s\n' "${unit}" | tr -d '\r' | sed -n '2p')"
-    [ -n "${load_state}" ] || {
-        echo "yo: cannot reach the VM to ask about t3 — is it up? (yo status)" >&2
-        exit 1
-    }
-    [ "${load_state}" = "loaded" ] || {
-        echo "yo: no t3 unit in the VM's current system — switch it: $(rebuild_hint)" >&2
-        exit 1
-    }
-    [ "${active_state}" = "active" ] || {
-        echo "yo: t3 service is ${active_state} in the VM — diagnose with: yo ssh journalctl -u t3 -n 50" >&2
-        exit 1
-    }
-    # A bare TCP connect is not enough: when a guestagent restart has wedged
-    # lima's forward, its tcpproxy still accepts the connection and only
-    # then resets it, so a connect-only probe reports success on a dead
-    # forward. Only an actual HTTP exchange surfaces the reset — and no -f,
-    # because any status line at all proves the transport works; whether t3
-    # likes the request is the guest-side check's business.
-    curl -sS -o /dev/null --max-time 5 "http://127.0.0.1:${T3_PORT}/" || {
-        echo "yo: t3 is healthy in the VM but 127.0.0.1:${T3_PORT} does not answer on this Mac —" >&2
-        echo "    lima's port forwarding is dead (see ~/.lima/${INSTANCE}/ha.stderr.log)." >&2
-        echo "    Recover with: limactl stop ${INSTANCE} && ./yo up" >&2
-        exit 1
-    }
-}
-
-cmd_t3() {
-    [ "$#" -eq 0 ] || {
-        echo "yo: t3 takes no arguments" >&2
-        usage >&2
-        exit 2
-    }
-    t3_require_service
-    t3_mint_pairing_url
-    exec open "${PAIRING_URL}"
-}
-
-cmd_pair() {
-    [ "$#" -le 1 ] || {
-        echo "yo: pair takes at most one base-url argument" >&2
-        usage >&2
-        exit 2
-    }
-    t3_require_service
-    host_name="$(scutil --get LocalHostName)"
-    base_url="${1:-http://${host_name}.local:${T3_PORT}}"
-    # `t3 pair` mints its URL from the address the server was started with,
-    # and the unit starts it with --host 127.0.0.1 — unreachable from any
-    # other machine. `t3 auth pairing create` is the only form that takes
-    # a --base-url to name this host instead.
-    pair_out="$(agent_ssh "t3 auth pairing create --ttl 5m --label $(printf '%q' "yo@${host_name}") --base-url $(printf '%q' "${base_url}")" 2>&1)" || {
-        printf '%s\n' "${pair_out}" >&2
-        exit 1
-    }
-    printf '%s\n' "${pair_out}"
-}
-
-cmd_link() {
-    agent_require
-    # --show-toplevel resolves symlinks; cdup + logical cd/pwd is what keeps
-    # the user's own spelling of the path, which is what the mirror carries.
-    cdup="$(git rev-parse --show-cdup 2>/dev/null)" || {
-        echo "yo: link must run inside a git repo" >&2
-        exit 1
-    }
-    toplevel="$(cd "./${cdup}" && pwd)"
-
-    if git -C "${toplevel}" remote get-url yolobox >/dev/null 2>&1; then
-        echo "yo: remote 'yolobox' already exists" >&2
-        exit 1
-    fi
-
-    if [ "${toplevel}" = "$HOME" ]; then
-        echo "yo: refusing to link \$HOME itself" >&2
-        exit 1
-    fi
-    vmdir="$(vm_mirror "${toplevel}")" || {
-        echo "yo: repo must be under \$HOME (it is at ${toplevel})" >&2
-        exit 1
-    }
-
-    guest_repo_ensure "${vmdir}"
-
-    # The remote names the agent and refuses multiplexing on purpose: a push
-    # over the operator's master would run git-receive-pack as the operator,
-    # and receive.denyCurrentBranch=updateInstead would then check the tree
-    # out under the wrong ownership.
-    git -C "${toplevel}" remote add yolobox "ssh://${VM_AGENT_USER}@${VM_HOST}${vmdir}"
-    git -C "${toplevel}" config remote.yolobox.sshCommand "ssh -F ${SSH_CFG} -o ControlPath=none"
-}
-
-guest_repo_ensure() {
-    vmdir_q="$(printf '%q' "$1")"
-    # shellcheck disable=SC2029 # vmdir_q must expand client-side to embed the guest path literally
-    agent_ssh \
-        "mkdir -p ${vmdir_q} && { git -C ${vmdir_q} rev-parse --git-dir >/dev/null 2>&1 || { git -C ${vmdir_q} init -b main && git -C ${vmdir_q} config receive.denyCurrentBranch updateInstead; }; }"
-}
-
-# The guest's ~/.gitconfig and the rest of the user layer come from
-# ~/.dotfiles, and the flake owns everything system-wide. What is left are
-# the host-only files below: they are personal, so they live on the Mac and
-# are copied in, never committed here.
-cmd_seed() {
-    agent_require
-    seed_ssh
-    seed_gitconfig
-}
-
-# The guest gets the Mac's ssh config verbatim except for two host-only
-# lines. Include names lima's own generated config, which exists on the Mac
-# only. IdentityAgent names the 1Password socket, which the guest reaches
-# through the forward ssh_args() sets up — as $SSH_AUTH_SOCK, under a path
-# of sshd's choosing, so a copied IdentityAgent line would just point at
-# nothing and take the agent away.
-#
-# The public keys travel with the config, because an IdentityFile naming a
-# .pub file is what makes ssh ask the agent for that one key: it is how
-# `git@github.com` and `git@github-iurii-tech` stay two GitHub accounts and
-# not whichever key the agent happens to offer first.
-seed_ssh() {
-    agent_ssh_args
-    if [ -r "$HOME/.ssh/config" ]; then
-        sed -E '/^[[:space:]]*(Include|IdentityAgent)[[:space:]]/d' "$HOME/.ssh/config" |
-            ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
-                'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >~/.ssh/config && chmod 600 ~/.ssh/config'
-    else
-        hc_ok "no ~/.ssh/config on this Mac — skipped"
-    fi
-
-    pubkeys=()
-    for pubkey in "$HOME"/.ssh/*.pub; do
-        [ -e "${pubkey}" ] || continue
-        pubkeys+=("${pubkey##*/}")
-    done
-    [ "${#pubkeys[@]}" -gt 0 ] || return 0
-    tar -C "$HOME/.ssh" --no-xattrs -cf - "${pubkeys[@]}" |
-        ssh "${SSH_ARGS[@]}" "${VM_HOST}" 'tar -C ~/.ssh -xf -'
-}
-
-# Directory-level git identities: ~/.dotfiles/gitconfig includeIf's a
-# .gitconfig sitting next to a group of repos (work email, work SSH alias),
-# and that file is untracked host state, not part of any repo that `yo link`
-# pushes. The guest names the top-level trees it already has; each one that
-# also exists on the Mac gets its <group>/.gitconfig files copied at the
-# same $HOME-relative paths, so nothing here hardcodes either side's layout.
-seed_gitconfig() {
-    # shellcheck disable=SC2016 # $HOME must reach the guest unexpanded
-    roots="$(agent_ssh 'find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\n"')"
-    identities=()
-    while IFS= read -r root; do
-        [ -n "${root}" ] || continue
-        [ -d "$HOME/${root}" ] || continue
-        for identity in "$HOME/${root}"/*/.gitconfig; do
-            [ -e "${identity}" ] || continue
-            identities+=("${identity#"$HOME/"}")
-        done
-    done <<<"${roots}"
-    [ "${#identities[@]}" -gt 0 ] || return 0
-    agent_ssh_args
-    tar -C "$HOME" --no-xattrs -cf - "${identities[@]}" |
-        ssh "${SSH_ARGS[@]}" "${VM_HOST}" 'tar -C "$HOME" -xf -'
-}
-
-main() {
-    [ "$#" -ge 1 ] || {
-        usage >&2
-        exit 2
-    }
-    sub="$1"
-    shift
-    case "${sub}" in
-        --help | -h | help)
-            usage
-            exit 0
-            ;;
-        --version | -V)
-            printf 'yolobox %s\n' "${YO_VERSION}"
-            exit 0
-            ;;
-    esac
-
-    require_limactl
-
-    case "${sub}" in
-        up) cmd_up ;;
-        down) cmd_down ;;
-        status) cmd_status ;;
-        bootstrap) cmd_bootstrap "$@" ;;
-        gc) cmd_gc "$@" ;;
-        disk-grow) cmd_disk_grow "$@" ;;
-        ssh) cmd_ssh "$@" ;;
-        enter) cmd_enter "$@" ;;
-        link) cmd_link ;;
-        seed) cmd_seed ;;
-        code) cmd_code "$@" ;;
-        zed) cmd_zed "$@" ;;
-        t3) cmd_t3 "$@" ;;
-        pair) cmd_pair "$@" ;;
-        herd-check) cmd_herd_check "$@" ;;
-        aws-check) cmd_aws_check "$@" ;;
-        *)
-            usage >&2
-            exit 2
-            ;;
-    esac
-}
-
-main "$@"
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except YoError as failure:
+        if failure.message:
+            err("yo: %s" % failure.message)
+        if failure.show_usage:
+            err(USAGE.rstrip("\n"))
+        sys.exit(failure.code)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os._exit(0)

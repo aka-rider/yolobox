@@ -6,13 +6,12 @@ class Yolobox < Formula
   license "MIT"
 
   depends_on "fzf"
-  depends_on "jq"
   depends_on "lima"
 
   def install
     libexec.install "yo", "aws-broker"
     (libexec/"lima").install "lima/yolobox.yaml"
-    inreplace libexec/"yo", 'YO_VERSION="dev"', "YO_VERSION=\"#{version}\""
+    inreplace libexec/"yo", 'YO_VERSION = "dev"', "YO_VERSION = \"#{version}\""
     bin.install_symlink libexec/"yo"
   end
 

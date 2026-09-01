@@ -129,7 +129,7 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   container credential provider in botocore's chain, so a flat var sitting
   alongside the broker's URL would win and silently defeat its refresh.
 - NEVER let the broker write a secret or the bearer token to stdout after
-  its one handshake line, or to any log.
+  its two handshake lines, or to any log.
 
 ## Agents and the herd
 
