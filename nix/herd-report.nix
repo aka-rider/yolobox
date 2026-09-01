@@ -1,6 +1,6 @@
-{ config, lib, pkgs, username, ... }:
+{ config, lib, pkgs, agentUser, ... }:
 let
-  homeDir = config.users.users.${username}.home;
+  homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
   claudeHooksFile = import ./lib/claude-hooks-file.nix;
   herdrPkg = import ./lib/herdr-pkg.nix { inherit pkgs; cfg = config.yolobox.harness.herdr; };
@@ -132,11 +132,11 @@ let
   herdCheck = pkgs.writeShellApplication {
     name = "yolobox-herd-check";
     runtimeInputs = [ herdrPkg herdReport pkgs.jq pkgs.coreutils pkgs.gnugrep ];
-    # @HERD_HOOKS@ is substituted rather than repeated as a literal in the
-    # script, so lib/claude-hooks-file.nix stays the only place that path is
-    # spelled out. The placeholder is still valid bash, so the script remains
-    # shellcheck-clean and `bash -n`-able on its own.
-    text = builtins.replaceStrings [ "@HERD_HOOKS@" ] [ claudeHooksFile.path ]
+    # @HERD_HOOKS@ and @AGENT_USER@ are substituted rather than repeated as
+    # literals in the script, so this file stays the only place either value
+    # is spelled out. Both placeholders are still valid bash, so the script
+    # remains shellcheck-clean and `bash -n`-able on its own.
+    text = builtins.replaceStrings [ "@HERD_HOOKS@" "@AGENT_USER@" ] [ claudeHooksFile.path agentUser ]
       (builtins.readFile ./checks/herd-check.sh);
   };
 
@@ -298,7 +298,7 @@ in
     # yolobox:pi the only reporter.
     systemd.tmpfiles.rules = homeTmpfiles {
       home = homeDir;
-      dirUser = username;
+      dirUser = agentUser;
       dirs = [ ".pi" ".pi/agent" ".pi/agent/extensions" ".pi/agent/skills" ];
       links = [
         {

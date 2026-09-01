@@ -1,8 +1,12 @@
-{ config, pkgs, modulesPath, username, lib, ... }:
+{ config, pkgs, modulesPath, username, agentUser, lib, yolobox, ... }:
 {
+  # Lets someone drop a package or setting into the running box without a
+  # checkout or push: the guest no longer carries a copy of this repo, so
+  # the old "edit nix/base.nix in the VM and rebuild" workflow needs a
+  # replacement.
   imports = [
     (modulesPath + "/profiles/qemu-guest.nix")
-  ];
+  ] ++ lib.optional (builtins.pathExists /etc/yolobox/local.nix) /etc/yolobox/local.nix;
 
   # /boot is the ESP itself, as the shipped nixos-lima image mounts it —
   # matching the image is what keeps the first `nixos-rebuild switch` on a
@@ -70,7 +74,8 @@
   users.mutableUsers = true;
   system.stateVersion = "25.11";
 
-  # Takes over lima-init's existence-guarded useradd from first boot
+  # This is the operator's account — the human who drives the Mac, not any
+  # agent. Takes over lima-init's existence-guarded useradd from first boot
   # (Gotcha 1) — including lima >=2.1.0's ".guest"-suffixed home
   # (lima-vm/lima#4578). That account is named after the host Mac user
   # (`username`, threaded in impurely — see flake.nix), not a fixed name:
@@ -78,9 +83,8 @@
   # cidata already created so nix and interactive SSH sessions share one
   # $HOME. NixOS refuses isNormalUser below uid 1000 (lima's cidata UID
   # here is 501, matching the host's macOS UID), so this uses isSystemUser
-  # instead and sets autoSubUidGidRange directly — that option isn't
-  # actually gated on isNormalUser, only its *default* is — giving
-  # rootless podman its /etc/subuid range declaratively.
+  # instead. It keeps wheel and runs no agent; rootless podman's
+  # autoSubUidGidRange lives on the agent account below instead.
   users.users.${username} = {
     isSystemUser = true;
     group = "users";
@@ -88,7 +92,28 @@
     home = "/home/${username}.guest";
     extraGroups = [ "wheel" ];
     shell = pkgs.zsh;
+  };
+
+  # The agent's account. uid must not be 501: a second account sharing
+  # lima's uid is an outage this repo already paid for once (see CLAUDE.md,
+  # "The guest account mirrors the host") — passwd lookups resolve a uid to
+  # whichever entry comes first, so two accounts at 501 are indistinguishable
+  # to whoami/SUDO_USER while modules silently write state into the wrong
+  # home. It is deliberately not lima's cidata account either, because
+  # lima-init runs `usermod -a -G wheel $LIMA_CIDATA_USER` unconditionally on
+  # every boot, after activation — removing wheel from that account here
+  # would not stick. systemd-journal is required, not cosmetic: xvfb,
+  # openbox and t3 are system units, so their logs go to the system journal,
+  # whose ACL grants read only to wheel and adm (other::---) — without this
+  # group `journalctl -u t3` silently narrows to the agent's own messages.
+  users.users.${agentUser} = {
+    isNormalUser = true;
+    uid = 1000;
+    group = "users";
+    home = "/home/${agentUser}";
+    shell = pkgs.zsh;
     autoSubUidGidRange = true;
+    extraGroups = [ "systemd-journal" ];
   };
 
   services.openssh.enable = true;
@@ -102,7 +127,16 @@
       "AWS_REGION"
     ];
     StreamLocalBindUnlink = "yes";
+    PasswordAuthentication = false;
+    PermitRootLogin = "prohibit-password";
   };
+  # The default (~agent/.ssh/authorized_keys) must not be honoured: it is
+  # agent-writable, so the agent could mint its own persistent login.
+  # lima-init writes this root-owned file every boot instead.
+  services.openssh.extraConfig = ''
+    Match User ${agentUser}
+      AuthorizedKeysFile /etc/ssh/authorized_keys.d/${username}
+  '';
 
   # Forwarded herdr sockets (see cmd_enter in yo) land under /run, not
   # $HOME: a unix socket anywhere under a Nix source root makes evaluation of
@@ -110,7 +144,10 @@
   # so an orphaned socket dies at reboot instead of accumulating. This is safe
   # ahead of any ssh connection because systemd-tmpfiles-setup.service runs
   # Before=sysinit.target, while sshd only arrives with multi-user.target.
-  systemd.tmpfiles.rules = [ "d /run/yolobox 0700 ${username} users -" ];
+  # Owned by the agent, not the operator: sshd binds the -R herd forward as
+  # the agent, and an operator-owned 0700 directory would break every
+  # `yo enter`.
+  systemd.tmpfiles.rules = [ "d /run/yolobox 0700 ${agentUser} users -" ];
 
   security.sudo.wheelNeedsPassword = false;
   programs.zsh.enable = true;
@@ -118,10 +155,12 @@
   # Rendered to /etc/direnv/direnv.toml, which is where the module's
   # DIRENV_CONFIG=/etc/direnv makes direnv look — an XDG ~/.config file is
   # never read.
-  # every .envrc in the guest home is auto-trusted; the VM itself is the blast-radius boundary.
+  # The whitelist covers only the agent's home: an .envrc is arbitrary code
+  # the agent writes, and auto-trusting it in the operator's shell would
+  # hand over the operator's sudo on the first cd.
   programs.direnv = {
     enable = true;
-    settings.whitelist.prefix = [ config.users.users.${username}.home ];
+    settings.whitelist.prefix = [ config.users.users.${agentUser}.home ];
   };
 
   programs.nix-ld.enable = true;
@@ -168,6 +207,7 @@
     unzip
     devbox
     awscli2
+    yolobox
   ];
 
   nix.settings.experimental-features = [ "nix-command" "flakes" "fetch-closure" "ca-derivations" ];

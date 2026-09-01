@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  check-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Assert tag matches VERSION
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag_version="${TAG#v}"
+          file_version="$(cat VERSION)"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "::error::tag ${TAG} does not match VERSION file (${file_version})"
+            exit 1
+          fi
+
+  verify:
+    uses: ./.github/workflows/verify.yml
+
+  release:
+    needs: [check-tag, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build source tarball
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git archive --format=tar.gz --prefix="yolobox-${TAG#v}/" -o "yolobox-${TAG#v}.tar.gz" HEAD
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --generate-notes "yolobox-${TAG#v}.tar.gz"
+
+  bump-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute release-asset sha256
+        id: tarball
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/aka-rider/yolobox/releases/download/${TAG}/yolobox-${TAG#v}.tar.gz"
+          sha256="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+          repository: aka-rider/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Render homebrew/yolobox.rb into the tap
+        env:
+          URL: ${{ steps.tarball.outputs.url }}
+          SHA256: ${{ steps.tarball.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p homebrew-tap/Formula
+          sed -e "s#@URL@#${URL}#" -e "s#@SHA256@#${SHA256}#" homebrew/yolobox.rb > homebrew-tap/Formula/yolobox.rb
+          if [ -z "$(git -C homebrew-tap status --porcelain -- Formula/yolobox.rb)" ]; then
+            echo "::error::Formula/yolobox.rb did not change; refusing to push a no-op commit"
+            exit 1
+          fi
+
+      - name: Commit and push
+        env:
+          TAG: ${{ github.ref_name }}
+        working-directory: homebrew-tap
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/yolobox.rb
+          git commit -m "bump(yolobox): ${TAG#v} [skip ci]"
+          git push

@@ -7,10 +7,12 @@ set -euo pipefail
 
 readonly INSTANCE="yolobox"
 readonly VM_HOST="lima-yolobox"
-# ".guest" suffix: lima >= 2.1.0 renames the guest home (see README).
-# Lima's default guest username mirrors the host username, not a fixed "xiii".
-VM_USER_HOME="/home/$(id -un).guest"
-readonly VM_USER_HOME
+# Every AI session in the box runs as this unprivileged account; the human
+# operator keeps lima's own uid-matched one. Projects live in the agent's
+# home, so that home is what the Mac's $HOME mirrors onto.
+readonly VM_AGENT_USER="agent"
+readonly VM_USER_HOME="/home/${VM_AGENT_USER}"
+readonly AGENT_CTL="$HOME/.lima/${INSTANCE}/ssh-agent.sock"
 # Created by a systemd-tmpfiles rule in nix/base.nix — see there for why the
 # forwarded sockets live outside VM_USER_HOME.
 readonly GUEST_SOCK_DIR="/run/yolobox"
@@ -20,6 +22,10 @@ readonly T3_PORT=3773
 SSH_CFG="$HOME/.lima/yolobox/ssh.config"
 OP_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
 readonly SSH_CFG OP_SOCK
+
+# Rewritten at build time: nix substituteInPlace, Homebrew inreplace.
+YO_VERSION="dev"
+readonly YO_VERSION
 
 # Script dir resolution (symlink-safe, no readlink -f).
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
@@ -38,14 +44,19 @@ usage() {
     cat <<EOF
 Usage: yo <command> [args]
 
+  --version | -V
+      Print yo's version and exit.
+
   up | down | status
       Start, stop, or describe the VM. status also reports disk usage on
       both sides and warns when this Mac's herdr version differs from the VM's.
 
   bootstrap
-      Create the VM, push this repo into it, build and (if needed) reboot
-      into the NixOS configuration, and seed identities. Safe to run again:
-      every step checks before it acts.
+      Create the VM and build/(if needed) reboot it into the NixOS
+      configuration from the pinned yolobox flake ref, then seed
+      identities. Safe to run again: every step checks before it acts.
+      YOLOBOX_FLAKE overrides which flake ref to build from (e.g. a
+      branch), and is required on an unreleased ("dev") build.
 
   gc [--deep] [--yes]
       Report what is using the VM's disk. --yes reclaims the machine's own
@@ -60,13 +71,15 @@ Usage: yo <command> [args]
       Refuses unless the VM already runs a generation with boot.growPartition.
 
   ssh [cmd...]
-      Plain interactive shell in the VM, or run one command there. No herd
-      wiring; agents started here show as "unknown" in the herd.
+      Plain interactive shell in the VM as the operator account (the one with
+      sudo), or run one command there. No herd wiring; agents started here
+      show as "unknown" in the herd.
 
   enter [project]
-      Shell in the VM with the herd socket forwarded and the herd env set, so
-      agents started there report to this Mac's herd. Exits 3 when this Mac's
-      herdr version differs from the VM's; YOLOBOX_SKIP_HERD_CHECK=1 overrides.
+      Shell in the VM as the unprivileged agent account, with the herd socket
+      forwarded and the herd env set, so agents started there report to this
+      Mac's herd. Exits 3 when this Mac's herdr version differs from the VM's;
+      YOLOBOX_SKIP_HERD_CHECK=1 overrides.
 
   link
       Add a "yolobox" git remote to the current repo, pointing at the same
@@ -82,9 +95,10 @@ Usage: yo <command> [args]
 
   code [project]
   zed [project]
-      Open VS Code Remote-SSH or Zed in the VM. Needs
-      "Include ~/.lima/yolobox/ssh.config" in ~/.ssh/config; VS Code also
-      needs the ms-vscode-remote.remote-ssh extension.
+      Open VS Code Remote-SSH or Zed in the VM, as the agent account. Needs
+      "Include ~/.lima/yolobox/ssh.config" in ~/.ssh/config, plus the agent
+      Match block above it (yo code refuses and prints it otherwise); VS Code
+      also needs the ms-vscode-remote.remote-ssh extension.
 
   t3
       Open t3code's web UI, served by the VM, in this Mac's browser with a
@@ -110,18 +124,71 @@ mirror is missing, the guest home when the cwd is outside \$HOME).
 EOF
 }
 
-# ssh_config values containing spaces need literal quotes inside the
-# -o argument itself (its own tokenizer splits on whitespace otherwise) —
-# the 1Password socket path lives under "Group Containers". Every caller
-# must use this: lima's ssh.config sets ControlMaster auto + ControlPersist
-# yes on a shared ControlPath, so whichever invocation establishes the
-# master decides whether agent forwarding exists for every later session.
-# ForwardAgent names the 1Password socket instead of saying "yes": "yes"
-# forwards whatever $SSH_AUTH_SOCK points at, which on this Mac is the
-# launchd agent that holds no identities at all.
-# Sets the SSH_ARGS array (macOS ships bash 3.2, which has no mapfile).
-ssh_args() {
-    SSH_ARGS=(-F "${SSH_CFG}" -o "IdentityAgent=\"${OP_SOCK}\"" -o "ForwardAgent=\"${OP_SOCK}\"")
+# The role owns the ControlPath, and it has to: lima's ssh.config names one
+# shared socket with no %r in it, and ssh's multiplexing client never
+# re-checks the login user against the master's — so `-o User=agent` over an
+# already-open operator master silently opens an operator session. Each role
+# therefore gets its own socket. And since ssh keeps the *first* value it
+# sees for a keyword, a caller that wants no multiplexing must say so here
+# (`ssh_role <role> nomux`); appending -o ControlPath=none afterwards is
+# silently ignored. Sets the SSH_ARGS array (macOS ships bash 3.2, which has
+# no mapfile).
+ssh_role() {
+    SSH_ARGS=(-F "${SSH_CFG}")
+    case "$1" in
+        operator) ;;
+        agent) SSH_ARGS+=(-o "User=${VM_AGENT_USER}") ;;
+        *)
+            echo "yo: internal error: unknown ssh role '$1'" >&2
+            exit 1
+            ;;
+    esac
+    if [ "${2:-mux}" = nomux ]; then
+        SSH_ARGS+=(-o "ControlPath=none")
+    elif [ "$1" = agent ]; then
+        SSH_ARGS+=(-o "ControlPath=${AGENT_CTL}")
+    fi
+}
+
+ssh_args() { ssh_role operator; }
+agent_ssh_args() { ssh_role agent; }
+
+# Appends the 1Password agent forward to SSH_ARGS. ONLY the two interactive
+# commands (`enter`, `ssh`) call this: they are where a human pushes to GitHub
+# or reaches another host, and the forwarded agent is the user's live SSH
+# identity — approved per use by 1Password's biometrics — for as long as the
+# connection lives. Every other `yo` path leaves it off, so the shared lima
+# ControlMaster never carries the agent and `yo code`/`yo zed`/a bare
+# `ssh lima-yolobox` cannot inherit it, nor can a lingering ControlPersist
+# master leave the agent socket alive in the VM after the session ends.
+#
+# ForwardAgent names the 1Password socket explicitly rather than "yes", which
+# would forward $SSH_AUTH_SOCK — Apple's launchd agent, empty on this Mac.
+# No IdentityAgent: lima's ssh.config authenticates to the VM with
+# `IdentitiesOnly yes` and its own IdentityFile, so ssh never consults an agent
+# for VM auth and the old IdentityAgent option was inert.
+ssh_forward_agent_args() {
+    SSH_ARGS+=(-o "ForwardAgent=\"${OP_SOCK}\"")
+}
+
+# Refuses when the box predates the operator/agent split, instead of letting
+# a bare "Permission denied (publickey)" stand for it — but only diagnoses
+# that when the operator role *can* reach the VM: a "rebuild it" advice that
+# fires on a stopped VM or a dead forwarder would send someone to delete a
+# disk that was never the problem. When the operator probe fails too, this
+# prints the agent probe's own stderr instead of guessing.
+agent_require() {
+    agent_err="$(agent_ssh true 2>&1 >/dev/null)" && return 0
+    if guest_ssh true >/dev/null 2>&1; then
+        echo "yo: cannot ssh into ${INSTANCE} as '${VM_AGENT_USER}'." >&2
+        echo "    Every AI session runs as that account, and this VM has no working one —" >&2
+        echo "    it predates the operator/agent split. Rebuild it:" >&2
+        echo "        limactl delete ${INSTANCE} && yo bootstrap" >&2
+    else
+        printf '%s\n' "${agent_err}" >&2
+        echo "yo: cannot reach ${INSTANCE} as operator either — is the VM up? yo status" >&2
+    fi
+    exit 1
 }
 
 # Appends this pane's herd forward and herd env to SSH_ARGS, and names the
@@ -290,8 +357,8 @@ aws_broker_start() {
     while [ "${tries}" -lt 5 ]; do
         tries=$((tries + 1))
         candidate=$((41000 + RANDOM % 1000))
-        # SSH_ARGS already carries -o ControlPath=none at this point (see
-        # cmd_enter): a probe on the shared ControlMaster would prove
+        # SSH_ARGS already carries the nomux role at this point (see
+        # cmd_enter): a probe on a shared ControlMaster would prove
         # nothing about a port this pane's own forward could actually use.
         # A full handshake per try costs low hundreds of ms; accepted.
         if ssh "${SSH_ARGS[@]}" -o ExitOnForwardFailure=yes \
@@ -371,8 +438,7 @@ herd_drift_report() {
 yo: herd version drift — this Mac runs herdr $1, the box has $2.
     If the wire protocol differs, every in-box agent report is rejected and
     the box's agents show as unknown in the herd.
-    Fix:  ./yo ssh -- 'cd $(yolobox_vmdir) && nix flake update nixpkgs'
-          then commit, push, and nixos-rebuild switch; finally ./yo herd-check
+    Fix:  updating nixpkgs now means releasing a new yolobox version (or pointing YOLOBOX_FLAKE at a branch that has one), then nixos-rebuild switch; finally ./yo herd-check
     Skip: YOLOBOX_SKIP_HERD_CHECK=1 ./yo enter
 EOF
 }
@@ -406,6 +472,13 @@ herd_drift_check() {
     if [ "${1:-refuse}" != "report" ]; then
         exit 3
     fi
+}
+
+require_limactl() {
+    command -v limactl >/dev/null 2>&1 || {
+        echo "yo: limactl not found (brew install lima)" >&2
+        exit 1
+    }
 }
 
 cmd_up() {
@@ -443,17 +516,27 @@ cmd_status() {
     herd_drift_check report
 }
 
-# This repo's guest checkout: the recorded yolobox remote when one exists
-# (so the push target and every rebuild path can never disagree), else the
-# mirror of the script's own logical directory. SCRIPT_DIR is resolved with
-# cd -P and would lose the user's spelling, hence the separate logical cd.
-yolobox_vmdir() {
-    if url="$(git -C "${SCRIPT_DIR}" remote get-url yolobox 2>/dev/null)"; then
-        printf '%s\n' "${url#ssh://"${VM_HOST}"}"
+flake_ref() {
+    if [ -n "${YOLOBOX_FLAKE:-}" ]; then
+        printf '%s\n' "${YOLOBOX_FLAKE}"
         return
     fi
-    script_dir_logical="$(cd "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
-    vm_mirror "${script_dir_logical}"
+    [ "${YO_VERSION}" != "dev" ] || {
+        echo "yo: this is an unreleased build with no pinned flake — set YOLOBOX_FLAKE to what the VM should build from (e.g. YOLOBOX_FLAKE=github:aka-rider/yolobox/my-branch)" >&2
+        return 1
+    }
+    printf 'github:aka-rider/yolobox/v%s\n' "${YO_VERSION}"
+}
+
+# The "rebuild the guest" hint every stale-generation refusal needs. flake_ref
+# already prints why it has no ref on a dev build; this only ever adds what to
+# do about it, never repeats the reason, so the two messages read as one.
+rebuild_hint() {
+    if ref="$(flake_ref)"; then
+        printf "yo ssh sudo YOLOBOX_USERNAME=\$(id -un) nixos-rebuild switch --impure --flake '%s#yolobox'" "${ref}"
+    else
+        printf 'set YOLOBOX_FLAKE to a flake ref the box should build from, then retry'
+    fi
 }
 
 cmd_bootstrap() {
@@ -463,50 +546,35 @@ cmd_bootstrap() {
         exit 2
     }
 
+    ref="$(flake_ref)" || exit 1
+
     cmd_up
     hc_ok "VM up"
-
-    vmdir="$(yolobox_vmdir)" || {
-        echo "yo: this repo has no yolobox remote and ${SCRIPT_DIR} is outside \$HOME — cannot pick its guest path" >&2
-        exit 1
-    }
-    case "${vmdir}" in
-        "${VM_USER_HOME}" | "${VM_USER_HOME}"/*) ;;
-        *)
-            echo "yo: this repo's guest path '${vmdir}' is outside the guest home ${VM_USER_HOME} — fix the yolobox remote URL" >&2
-            exit 1
-            ;;
-    esac
-    guest_repo_ensure "${vmdir}"
-    hc_ok "guest repo ready at ${vmdir}"
-
-    if ! git -C "${SCRIPT_DIR}" remote get-url yolobox >/dev/null 2>&1; then
-        git -C "${SCRIPT_DIR}" remote add yolobox "ssh://${VM_HOST}${vmdir}"
-        git -C "${SCRIPT_DIR}" config remote.yolobox.sshCommand "ssh -F ${SSH_CFG}"
-    fi
-
-    [ -z "$(git -C "${SCRIPT_DIR}" status --porcelain)" ] ||
-        echo "yo: this repo's worktree has uncommitted changes — only HEAD travels to the VM" >&2
-
-    GIT_SSH_COMMAND="ssh -F ${SSH_CFG}" \
-        git -C "${SCRIPT_DIR}" push "ssh://${VM_HOST}${vmdir}" HEAD:main
-    hc_ok "pushed to ${vmdir}"
 
     ssh_args
     # shellcheck disable=SC2029 # $(id -un) must expand client-side: Nix has no way to learn the guest username on its own
     ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
-        "sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild boot --impure --flake '${vmdir}#yolobox'"
-    hc_ok "built"
+        "sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild boot --impure --flake '${ref}#yolobox'"
+    hc_ok "built from ${ref}"
 
     bootstrap_reboot_if_needed
 
     cmd_seed
     hc_ok "seeded"
 
-    grep -q 'Include ~/.lima/yolobox/ssh.config' "$HOME/.ssh/config" 2>/dev/null || cat >&2 <<EOF
+    config_ok=0
+    editor_ssh_config_ok || config_ok=1
+    [ -n "${include_ln}" ] || cat >&2 <<EOF
 yo: add this line to ~/.ssh/config so ssh lima-yolobox, Zed and VS Code can find the VM:
     Include ~/.lima/yolobox/ssh.config
 EOF
+    [ "${config_ok}" -eq 0 ] || {
+        cat >&2 <<EOF
+yo: and this block ABOVE that Include line, so Zed and VS Code open the VM as
+    the ${VM_AGENT_USER} account instead of reusing the operator's ssh master:
+EOF
+        editor_ssh_block | sed 's/^/    /' >&2
+    }
 }
 
 bootstrap_reboot_if_needed() {
@@ -540,9 +608,19 @@ guest_runs_its_system_profile() {
 # be unrunnable exactly when it is needed. ext4's 4.3 GB root reserve is what
 # keeps a sudo-driven cleanup possible at all.
 #
-# The whole cleanup is one remote script over one ssh, and its exit status is
-# this command's: no host-side line can run after `exec ssh`, so every ok/FAIL
-# line and both df snapshots are printed by the guest half.
+# It takes two ssh sessions because the box has two accounts and the cleanup
+# spans both. The machine tier is root's and rides the operator. The user tier
+# is the agent's and cannot be done for it: rootless podman prunes per-user
+# (as the operator it would prune a different, empty graph root and report
+# success), ~/.npm and the container storage are the agent's own, and
+# `git check-ignore` run by anyone but the owner hits git's dubious-ownership
+# refusal, which this script would read as "git does not ignore it".
+# Machine tier first, and that ordering is load-bearing: the root reserve it
+# frees is what lets the unprivileged half write anything at all on a full
+# disk. Each session prints its own ok/FAIL lines; the machine tier's report
+# shows the before df snapshot, the user tier's the after one. The host
+# aggregates the two exit statuses, so a failure in either tier fails the
+# command.
 cmd_gc() {
     gc_deep=0
     gc_apply=0
@@ -559,12 +637,27 @@ cmd_gc() {
         shift
     done
 
+    gc_env="YO_GC_DEEP=${gc_deep} YO_GC_APPLY=${gc_apply}"
+    gc_rc=0
+
+    # No -t: gc is non-interactive, and each script arrives on stdin so its
+    # quoted heredocs reach the guest byte for byte — every $HOME and $(...)
+    # in them belongs to the guest.
     ssh_args
-    # No -t: gc is non-interactive, and the script arrives on stdin so the
-    # quoted heredoc below reaches the guest byte for byte — every $HOME and
-    # $(...) in it belongs to the guest.
-    exec ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
-        "YO_GC_DEEP=${gc_deep} YO_GC_APPLY=${gc_apply} bash -s" <<'GUEST_GC'
+    # shellcheck disable=SC2029 # gc_env must expand client-side; it carries this run's flags
+    gc_machine_script | ssh "${SSH_ARGS[@]}" "${VM_HOST}" "${gc_env} bash -s" || gc_rc=1
+    agent_require
+    agent_ssh_args
+    # shellcheck disable=SC2029 # gc_env must expand client-side; it carries this run's flags
+    gc_user_script | ssh "${SSH_ARGS[@]}" "${VM_HOST}" "${gc_env} bash -s" || gc_rc=1
+
+    exit "${gc_rc}"
+}
+
+# Both guest halves share these, so the two tiers cannot drift into printing
+# different things.
+gc_common_script() {
+    cat <<'GC_COMMON'
 set -uo pipefail
 
 GC_FAILED=0
@@ -598,31 +691,32 @@ step() {
     fi
 }
 
+# MEASURE_AS is set by the tier script below before this is ever called:
+# "sudo" in the machine tier, empty in the user tier.
 measure() {
-    # sudo for the existence test too: /root is mode 700, so an unprivileged
-    # -e on /root/.cache/nix says "absent" about a path that is really there.
-    sudo test -e "$1" || return 0
-    size="$(sudo du -x -s -h "$1" 2>/dev/null | awk '{print $1}')"
-    # -x, because /nix/store is a bind mount of the same device and would
-    # otherwise be counted twice.
+    # -x, because a bind mount of the same device would otherwise be counted
+    # twice.
+    if [ -n "${MEASURE_AS}" ]; then
+        # sudo also for the existence test: /root is mode 700, so an
+        # unprivileged -e on /root/.cache/nix says "absent" about a path
+        # that is really there.
+        sudo test -e "$1" || return 0
+        size="$(sudo du -x -s -h "$1" 2>/dev/null | awk '{print $1}')"
+    else
+        test -e "$1" || return 0
+        size="$(du -x -s -h "$1" 2>/dev/null | awk '{print $1}')"
+    fi
     printf '  %-7s %s\n' "${size:-?}" "$1"
 }
-
-# Hidden directories are pruned in the first branch — except .next, which
-# is itself a wanted match — so the walk cannot reach a target/ or
-# node_modules/ living inside .git, .devbox or .venv: .venv backs the
-# per-project basedpyright (nix/lsp.nix) and .devbox holds devbox's
-# toolchain state — neither is build output. Matching directories are
-# pruned in turn, so nothing nested inside a hit is walked or reported
-# twice.
-project_targets() {
-    find "$HOME" -mindepth 1 \
-        \( -name ".*" ! -name .next \) -prune -o \
-        \( -name target -o -name node_modules -o -name .next \) \
-        -type d -prune -print 2>/dev/null
+GC_COMMON
 }
 
-MACHINE_PATHS="/var/log/journal /nix/store /root/.cache/nix $HOME/.npm $HOME/.local/share/containers/storage"
+gc_machine_script() {
+    gc_common_script
+    cat <<'GC_MACHINE'
+
+MEASURE_AS=sudo
+MACHINE_PATHS="/var/log/journal /nix/store /root/.cache/nix"
 
 if [ "${YO_GC_APPLY}" != 1 ]; then
     printf 'yo gc: report only, nothing is deleted. Add --yes to act.\n\n'
@@ -631,17 +725,6 @@ if [ "${YO_GC_APPLY}" != 1 ]; then
     for path in ${MACHINE_PATHS}; do
         measure "${path}"
     done
-    if [ "${YO_GC_DEEP}" = 1 ]; then
-        printf '\nproject tier (--deep):\n'
-        found=0
-        while IFS= read -r target; do
-            found=1
-            measure "${target}"
-        done < <(project_targets)
-        [ "${found}" = 1 ] || printf '  (none)\n'
-    else
-        printf '\nproject tier not measured; add --deep to include it.\n'
-    fi
     exit 0
 fi
 
@@ -650,7 +733,7 @@ df -h /
 printf '\n'
 
 # Root-only steps first, and that ordering is the point: ext4's reserve is
-# root's alone, so on a full disk the two unprivileged steps below cannot even
+# root's alone, so on a full disk the agent's unprivileged steps cannot even
 # write their own logs until these have freed something. --rotate before
 # --vacuum-size because vacuuming only ever unlinks archived journals; without
 # the rotation the active file — usually most of the 630M — is untouchable.
@@ -678,6 +761,51 @@ fi
 # state above — and that is exactly when the space is most needed.
 step 'rm -rf /root/.cache/nix' sudo rm -rf /root/.cache/nix
 
+[ "${GC_FAILED}" = 0 ] || exit 1
+GC_MACHINE
+}
+
+gc_user_script() {
+    gc_common_script
+    cat <<'GC_USER'
+
+MEASURE_AS=
+
+# Hidden directories are pruned in the first branch — except .next, which
+# is itself a wanted match — so the walk cannot reach a target/ or
+# node_modules/ living inside .git, .devbox or .venv: .venv backs the
+# per-project basedpyright (nix/lsp.nix) and .devbox holds devbox's
+# toolchain state — neither is build output. Matching directories are
+# pruned in turn, so nothing nested inside a hit is walked or reported
+# twice.
+project_targets() {
+    find "$HOME" -mindepth 1 \
+        \( -name ".*" ! -name .next \) -prune -o \
+        \( -name target -o -name node_modules -o -name .next \) \
+        -type d -prune -print0 2>/dev/null
+}
+
+USER_PATHS="$HOME/.npm $HOME/.local/share/containers/storage"
+
+if [ "${YO_GC_APPLY}" != 1 ]; then
+    printf 'user tier (current size of each target):\n'
+    for path in ${USER_PATHS}; do
+        measure "${path}"
+    done
+    if [ "${YO_GC_DEEP}" = 1 ]; then
+        printf '\nproject tier (--deep):\n'
+        found=0
+        while IFS= read -r -d '' target; do
+            found=1
+            measure "${target}"
+        done < <(project_targets)
+        [ "${found}" = 1 ] || printf '  (none)\n'
+    else
+        printf '\nproject tier not measured; add --deep to include it.\n'
+    fi
+    exit 0
+fi
+
 step 'npm cache clean --force' npm cache clean --force
 # -f only: dangling containers, networks and build cache. Unused *images* need
 # a registry pull to come back, which is not regenerable offline, so they wait
@@ -686,7 +814,7 @@ step 'podman system prune -f' podman system prune -f
 
 if [ "${YO_GC_DEEP}" = 1 ]; then
     step 'podman system prune -af' podman system prune -af
-    while IFS= read -r target; do
+    while IFS= read -r -d '' target; do
         # Deleting a path git does not ignore dirties the VM worktree, and
         # receive.denyCurrentBranch=updateInstead then refuses every later
         # `git push yolobox` — a breakage that surfaces much later with no
@@ -707,7 +835,7 @@ printf '\nafter:\n'
 df -h /
 
 [ "${GC_FAILED}" = 0 ] || exit 1
-GUEST_GC
+GC_USER
 }
 
 # The lima ceiling and the guest partition are two separate resizes: raising
@@ -750,7 +878,7 @@ cmd_disk_grow() {
         exit 1
     }
     [ "${load_state}" = "loaded" ] || {
-        echo "yo: no growpart unit in the VM's current system, so growing the ceiling would leave /dev/vda2 untouched — switch it: yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '$(yolobox_vmdir)#yolobox'" >&2
+        echo "yo: no growpart unit in the VM's current system, so growing the ceiling would leave /dev/vda2 untouched — switch it: $(rebuild_hint)" >&2
         exit 1
     }
 
@@ -789,7 +917,8 @@ cmd_disk_grow() {
 
 cmd_ssh() {
     ssh_args
-    SSH_ARGS+=(-t "${VM_HOST}")
+    ssh_forward_agent_args
+    SSH_ARGS+=(-o ControlPath=none -t "${VM_HOST}")
     exec ssh "${SSH_ARGS[@]}" "${@+"$@"}"
 }
 
@@ -799,14 +928,14 @@ cmd_enter() {
         usage >&2
         exit 2
     }
+    agent_require
     target="$(vm_target_dir "${@+"$@"}")"
-    ssh_args
-    # A per-pane forward and per-pane SetEnv cannot ride the shared
-    # ControlMaster that ssh_args()'s -F config establishes for cmd_ssh:
+    # A per-pane forward and per-pane SetEnv cannot ride a ControlMaster:
     # the first session to dial in fixes the master's environment for
     # every later session, leaking a stale HERDR_PANE_ID/HERDR_SOCKET_PATH.
     # Each enter gets its own connection instead.
-    SSH_ARGS+=(-o ControlPath=none)
+    ssh_role agent nomux
+    ssh_forward_agent_args
     herd_ssh_forward_args
     aws_ssh_env_args
     aws_broker_start
@@ -921,8 +1050,7 @@ cmd_herd_check() {
             "Is the VM up? ./yo status"
     fi
 
-    ssh_args
-    SSH_ARGS+=(-o ControlPath=none)
+    ssh_role agent nomux
     herd_ssh_forward_args
     [ -n "${HERD_GUEST_SOCK}" ] ||
         hc_abort "this pane exports no live herdr socket (HERDR_SOCKET_PATH)" \
@@ -934,7 +1062,7 @@ cmd_herd_check() {
         guest_rc=$?
         if [ "${guest_rc}" -eq 127 ]; then
             hc_fail "the box has no yolobox-herd-check" \
-                "rebuild it: ./yo ssh -- 'sudo YOLOBOX_USERNAME=\$(id -un) nixos-rebuild switch --impure --flake \"$(yolobox_vmdir)#yolobox\"'"
+                "rebuild it: $(rebuild_hint)"
         else
             hc_fail "the guest half failed (exit ${guest_rc}) — see its output above"
         fi
@@ -1000,8 +1128,7 @@ cmd_aws_check() {
         hc_abort "profile '${profile}' has no region and neither AWS_REGION nor AWS_DEFAULT_REGION is set on this Mac"
     hc_ok "region resolves to ${aws_region}"
 
-    ssh_args
-    SSH_ARGS+=(-o ControlPath=none)
+    ssh_role agent nomux
     aws_broker_start
     hc_ok "broker started, host port ${broker_port} forwarded to guest port ${guest_port}"
 
@@ -1088,7 +1215,7 @@ vm_dir_for_cwd() {
         printf '%s\n' "${VM_USER_HOME}"
         return
     fi
-    landing="$(guest_ssh "d=$(printf '%q' "${desired}")
+    landing="$(agent_ssh "d=$(printf '%q' "${desired}")
         while [ -n \"\$d\" ] && [ ! -d \"\$d\" ]; do d=\"\${d%/*}\"; done
         printf '%s\n' \"\${d:-\$HOME}\"")"
     [ "${landing}" = "${desired}" ] ||
@@ -1105,8 +1232,8 @@ vm_project_pick() {
         echo "yo: fzf not found (brew install fzf)" >&2
         exit 1
     }
-    ssh_args
-    projects="$(ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" \
+    # shellcheck disable=SC2016 # $HOME must reach the guest unexpanded
+    projects="$(agent_ssh \
         'find "$HOME" -mindepth 2 \
              \( -name node_modules -o -name target -o -name .next -o \( -name ".*" ! -name .git \) \) -prune -o \
              -name .git \( -type d -o -type f \) -printf "%h\n" -prune' |
@@ -1132,6 +1259,76 @@ vm_target_dir() {
     fi
 }
 
+# VS Code and Zed spawn their own ssh against ~/.ssh/config, so yo cannot
+# hand them -o User/-o ControlPath: without a host-side block naming the
+# agent's own ControlPath they reuse lima's shared master and silently open
+# the project as the operator. Refuse instead of opening the wrong session.
+editor_ssh_block() {
+    printf 'Match host %s user %s\n' "${VM_HOST}" "${VM_AGENT_USER}"
+    printf '  ControlPath ~/.lima/%s/ssh-agent.sock\n' "${INSTANCE}"
+}
+
+# Sets EDITOR_SSH_PROBLEM to what is wrong (missing, incomplete or below)
+# plus the two line numbers, and returns nonzero — so bootstrap can hint and
+# the editors can refuse off one detection.
+editor_ssh_config_ok() {
+    cfg="$HOME/.ssh/config"
+    match_ln=""
+    include_ln=""
+    block_ok=""
+    if [ -r "${cfg}" ]; then
+        match_ln="$(grep -n -i -E "^[[:space:]]*Match[[:space:]]+host[[:space:]]+${VM_HOST}[[:space:]]+user[[:space:]]+${VM_AGENT_USER}([[:space:]]|\$)" "${cfg}" |
+            head -n 1 | cut -d: -f1)" || true
+        include_ln="$(grep -n -i -E "^[[:space:]]*Include[[:space:]]+.*\.lima/${INSTANCE}/ssh\.config" "${cfg}" |
+            head -n 1 | cut -d: -f1)" || true
+        if [ -n "${match_ln}" ]; then
+            block_ok="$(awk -v start="${match_ln}" '
+                NR <= start { next }
+                /^[[:space:]]*(Host|Match)[[:space:]]/ { exit }
+                tolower($1) == "controlpath" && $2 ~ /ssh-agent\.sock"?$/ { print "yes"; exit }
+            ' "${cfg}")"
+        fi
+    fi
+
+    if [ -z "${match_ln}" ]; then
+        EDITOR_SSH_PROBLEM="missing"
+    elif [ "${block_ok}" != "yes" ]; then
+        EDITOR_SSH_PROBLEM="incomplete"
+    elif [ -n "${include_ln}" ] && [ "${match_ln}" -gt "${include_ln}" ]; then
+        EDITOR_SSH_PROBLEM="below"
+    else
+        EDITOR_SSH_PROBLEM=""
+        return 0
+    fi
+    return 1
+}
+
+editor_require_ssh_config() {
+    editor_ssh_config_ok && return 0
+
+    case "${EDITOR_SSH_PROBLEM}" in
+        missing)
+            echo "yo: ~/.ssh/config has no ssh block for the ${VM_AGENT_USER} account, so the editor" >&2
+            echo "    would reuse the operator's ssh master and silently open the project as the" >&2
+            echo "    operator. Add this block ABOVE the 'Include ~/.lima/${INSTANCE}/ssh.config'" >&2
+            echo "    line — ssh keeps the first value it sees for each keyword:" >&2
+            ;;
+        incomplete)
+            echo "yo: ~/.ssh/config has the ${VM_AGENT_USER} block on line ${match_ln}, but it names no" >&2
+            echo "    ControlPath of its own, so the editor would still land on the operator's" >&2
+            echo "    shared master. Make it read:" >&2
+            ;;
+        below)
+            echo "yo: ~/.ssh/config has the ${VM_AGENT_USER} block on line ${match_ln}, below the lima" >&2
+            echo "    Include on line ${include_ln}. ssh keeps the first value it sees for each" >&2
+            echo "    keyword, so the Include's shared ControlPath wins and the editor would open" >&2
+            echo "    the project as the operator. Move this block above that Include line:" >&2
+            ;;
+    esac
+    editor_ssh_block | sed 's/^/    /' >&2
+    exit 1
+}
+
 cmd_code() {
     [ "$#" -le 1 ] || {
         echo "yo: code takes at most one project argument" >&2
@@ -1145,8 +1342,10 @@ cmd_code() {
         echo "yo: VS Code CLI not found" >&2
         exit 1
     }
+    editor_require_ssh_config
+    agent_require
     target="$(vm_target_dir "${@+"$@"}")"
-    exec "${code_cli}" --folder-uri "vscode-remote://ssh-remote+${VM_HOST}${target}"
+    exec "${code_cli}" --folder-uri "vscode-remote://ssh-remote+${VM_AGENT_USER}@${VM_HOST}${target}"
 }
 
 cmd_zed() {
@@ -1159,23 +1358,32 @@ cmd_zed() {
         echo "yo: zed CLI not found" >&2
         exit 1
     }
+    editor_require_ssh_config
+    agent_require
     target="$(vm_target_dir "${@+"$@"}")"
-    exec zed "ssh://${VM_HOST}${target}"
+    exec zed "ssh://${VM_AGENT_USER}@${VM_HOST}${target}"
 }
 
-# One-shot guest command on a connection of its own: the shared
-# ControlMaster of ssh_args()'s -F config belongs to whichever session
-# opened it, and a one-shot probe must neither inherit that session's
-# forwards nor become the master for later ones.
+# One-shot guest command on a connection of its own: a role's ControlMaster
+# belongs to whichever session opened it, and a one-shot probe must neither
+# inherit that session's forwards nor become the master for later ones.
+# Operator role: the box's own state, never the agent's home.
 guest_ssh() {
-    ssh_args
-    ssh -n "${SSH_ARGS[@]}" -o ControlPath=none "${VM_HOST}" "$@"
+    ssh_role operator nomux
+    ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" "$@"
+}
+
+# Same, as the agent: anything reading or writing the agent's home, or the
+# GitHub identity that belongs to it.
+agent_ssh() {
+    ssh_role agent nomux
+    ssh -n "${SSH_ARGS[@]}" "${VM_HOST}" "$@"
 }
 
 # t3's web UI authenticates with a freshly minted pairing token; a bare
 # http://127.0.0.1:${T3_PORT} is rejected. Sets PAIRING_URL.
 t3_mint_pairing_url() {
-    pair_out="$(guest_ssh 't3 pair --ttl 2m --label yo' 2>&1)" || true
+    pair_out="$(agent_ssh 't3 pair --ttl 2m --label yo' 2>&1)" || true
     PAIRING_URL="$(printf '%s\n' "${pair_out}" | tr -d '\r' |
         sed -n 's/^[[:space:]]*Pairing URL:[[:space:]]*//p' | head -n 1)"
     [ -n "${PAIRING_URL}" ] || {
@@ -1197,7 +1405,7 @@ t3_require_service() {
         exit 1
     }
     [ "${load_state}" = "loaded" ] || {
-        echo "yo: no t3 unit in the VM's current system — switch it: yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '$(yolobox_vmdir)#yolobox'" >&2
+        echo "yo: no t3 unit in the VM's current system — switch it: $(rebuild_hint)" >&2
         exit 1
     }
     [ "${active_state}" = "active" ] || {
@@ -1242,7 +1450,7 @@ cmd_pair() {
     # and the unit starts it with --host 127.0.0.1 — unreachable from any
     # other machine. `t3 auth pairing create` is the only form that takes
     # a --base-url to name this host instead.
-    pair_out="$(guest_ssh "t3 auth pairing create --ttl 5m --label $(printf '%q' "yo@${host_name}") --base-url $(printf '%q' "${base_url}")" 2>&1)" || {
+    pair_out="$(agent_ssh "t3 auth pairing create --ttl 5m --label $(printf '%q' "yo@${host_name}") --base-url $(printf '%q' "${base_url}")" 2>&1)" || {
         printf '%s\n' "${pair_out}" >&2
         exit 1
     }
@@ -1250,6 +1458,7 @@ cmd_pair() {
 }
 
 cmd_link() {
+    agent_require
     # --show-toplevel resolves symlinks; cdup + logical cd/pwd is what keeps
     # the user's own spelling of the path, which is what the mirror carries.
     cdup="$(git rev-parse --show-cdup 2>/dev/null)" || {
@@ -1274,16 +1483,19 @@ cmd_link() {
 
     guest_repo_ensure "${vmdir}"
 
-    git -C "${toplevel}" remote add yolobox "ssh://${VM_HOST}${vmdir}"
-    git -C "${toplevel}" config remote.yolobox.sshCommand "ssh -F ${SSH_CFG}"
+    # The remote names the agent and refuses multiplexing on purpose: a push
+    # over the operator's master would run git-receive-pack as the operator,
+    # and receive.denyCurrentBranch=updateInstead would then check the tree
+    # out under the wrong ownership.
+    git -C "${toplevel}" remote add yolobox "ssh://${VM_AGENT_USER}@${VM_HOST}${vmdir}"
+    git -C "${toplevel}" config remote.yolobox.sshCommand "ssh -F ${SSH_CFG} -o ControlPath=none"
 }
 
 guest_repo_ensure() {
-    vmdir="$1"
-    ssh_args
-    # shellcheck disable=SC2029 # vmdir must expand client-side to embed the guest path literally
-    ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
-        "mkdir -p '${vmdir}' && { git -C '${vmdir}' rev-parse --git-dir >/dev/null 2>&1 || { git -C '${vmdir}' init -b main && git -C '${vmdir}' config receive.denyCurrentBranch updateInstead; }; }"
+    vmdir_q="$(printf '%q' "$1")"
+    # shellcheck disable=SC2029 # vmdir_q must expand client-side to embed the guest path literally
+    agent_ssh \
+        "mkdir -p ${vmdir_q} && { git -C ${vmdir_q} rev-parse --git-dir >/dev/null 2>&1 || { git -C ${vmdir_q} init -b main && git -C ${vmdir_q} config receive.denyCurrentBranch updateInstead; }; }"
 }
 
 # The guest's ~/.gitconfig and the rest of the user layer come from
@@ -1291,6 +1503,7 @@ guest_repo_ensure() {
 # the host-only files below: they are personal, so they live on the Mac and
 # are copied in, never committed here.
 cmd_seed() {
+    agent_require
     seed_ssh
     seed_gitconfig
 }
@@ -1307,7 +1520,7 @@ cmd_seed() {
 # `git@github.com` and `git@github-iurii-tech` stay two GitHub accounts and
 # not whichever key the agent happens to offer first.
 seed_ssh() {
-    ssh_args
+    agent_ssh_args
     if [ -r "$HOME/.ssh/config" ]; then
         sed -E '/^[[:space:]]*(Include|IdentityAgent)[[:space:]]/d' "$HOME/.ssh/config" |
             ssh "${SSH_ARGS[@]}" "${VM_HOST}" \
@@ -1333,7 +1546,8 @@ seed_ssh() {
 # also exists on the Mac gets its <group>/.gitconfig files copied at the
 # same $HOME-relative paths, so nothing here hardcodes either side's layout.
 seed_gitconfig() {
-    roots="$(guest_ssh 'find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\n"')"
+    # shellcheck disable=SC2016 # $HOME must reach the guest unexpanded
+    roots="$(agent_ssh 'find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\n"')"
     identities=()
     while IFS= read -r root; do
         [ -n "${root}" ] || continue
@@ -1344,7 +1558,7 @@ seed_gitconfig() {
         done
     done <<<"${roots}"
     [ "${#identities[@]}" -gt 0 ] || return 0
-    ssh_args
+    agent_ssh_args
     tar -C "$HOME" --no-xattrs -cf - "${identities[@]}" |
         ssh "${SSH_ARGS[@]}" "${VM_HOST}" 'tar -C "$HOME" -xf -'
 }
@@ -1361,6 +1575,15 @@ main() {
             usage
             exit 0
             ;;
+        --version | -V)
+            printf 'yolobox %s\n' "${YO_VERSION}"
+            exit 0
+            ;;
+    esac
+
+    require_limactl
+
+    case "${sub}" in
         up) cmd_up ;;
         down) cmd_down ;;
         status) cmd_status ;;

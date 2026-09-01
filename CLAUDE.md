@@ -29,24 +29,105 @@ rules this file justifies.
 - `nix/pkgs/` — packages nixpkgs lacks or lags on.
 - `lima/yolobox.yaml` — read once, when the instance is created.
 - `templates/default` — `devbox.json` and `.envrc` for a new project.
+- `homebrew/yolobox.rb` — the brew formula, with `@URL@`/`@SHA256@` holes;
+  `release.yml` renders it into `aka-rider/homebrew-tap` on every tag.
 - `TODO.md` — known problems, including the upstream reports still owed.
 
-## The guest account mirrors the host
+## Two accounts: the operator mirrors the host, the agent does not
+
+Until now this VM had one human-and-agent account. It now has two, split
+so that every AI coding session runs with no path to root.
 
 Lima creates a guest account named and uid-matched after the Mac account
-that started the VM. `flake.nix` declares that same account as
-`users.users.${username}` rather than inventing one, and since Nix has no
-pure way to learn the name, `YOLOBOX_USERNAME=$(id -un)` plus `--impure`
-carries it in on every `nixos-rebuild`.
+that started the VM — that account is the **operator's**, and only the
+operator's. `flake.nix` declares it as `users.users.${username}` rather
+than inventing one, and since Nix has no pure way to learn the name,
+`YOLOBOX_USERNAME=$(id -un)` plus `--impure` carries it in on every
+`nixos-rebuild`. The operator is the only account in `wheel`, so it is the
+only one `security.sudo.wheelNeedsPassword = false` covers, and it is the
+account behind `yo ssh`, `yo disk-grow`, `yo bootstrap`, `yo gc`'s machine tier, and any
+manual `nixos-rebuild`.
 
-An earlier revision hardcoded `xiii`, an old Mac account name. When the
-Mac account changed, `xiii` lived on as a second account with the same uid
-but its own `/home/xiii.guest`, and every module storing state under
+Every AI coding session runs as a second account instead: `agent`, a
+constant in `flake.nix`, never threaded in from the host. Its uid is 1000,
+its home is `/home/agent`, its groups are `users` and `systemd-journal`,
+and it is in neither `wheel` nor any sudoers rule — it has no `sudo` at
+all. `yo enter`, `yo code`, `yo zed`, and every t3-spawned session land
+there.
+
+The agent's uid is 1000, not 501, because of an outage this box already
+lived through once. An earlier revision hardcoded `xiii`, an old Mac
+account name, as the box's *only* guest account. When the Mac account
+changed, `xiii` lived on as a second account with the same uid but its own
+`/home/xiii.guest`, and every module storing state under
 `config.users.users.xiii.home` wrote there instead of the real home.
 `whoami` and `SUDO_USER` could not show it, because they resolve a uid to
 whichever passwd entry comes first. Retiring `xiii` from every module in
 one switch was enough: `nixos-rebuild` removes a user it once declared and
-no longer does.
+no longer does. uid 501 is lima's own cidata uid, reserved for the
+operator; giving `agent` that same uid would reopen exactly that failure
+mode, silently splitting state across two homes the way `xiii` once did —
+which is why `agent` gets uid 1000 instead, an ordinary unprivileged uid
+lima has no opinion about.
+
+Splitting the account was not optional once "the agent cannot reach root"
+was the goal, because of one lima behaviour verified directly in the
+running VM: `lima-init`'s start script runs
+`usermod -a -G wheel $LIMA_CIDATA_USER` unconditionally on line 22 — only
+the `useradd` above it is guarded by a conditional — inside a
+`Type=oneshot` unit with no `Condition=` anywhere, and it runs *after*
+NixOS activation has already applied that switch's group list. So stripping
+`wheel` from lima's own account is silently reverted at the very next
+boot: the box would look hardened in the config and would not be hardened
+in fact. That is exactly why the agent is a brand-new account lima has
+never heard of, rather than the pre-existing account with its privileges
+stripped — lima can only re-grant `wheel` to the account it created, and
+it has never created `agent`. The design fails closed from here: if
+anything about the agent account is set up wrong, the agent cannot log in
+at all (loud), rather than silently landing with root anyway.
+
+The system journal turned out to gate on the same group. `getfacl` on
+`/var/log/journal/*/system.journal` shows `group:wheel:r--`,
+`group:adm:r--`, `other::---` — readable only through `wheel`'s ACL, with
+no other route in. `xvfb`, `openbox` and `t3` are system units that run
+*as* the agent, so their logs land in the system journal, not some user
+journal the agent already owns by default. Hence the agent carries
+`extraGroups = [ "systemd-journal" ]` on top of dropping `wheel` — without
+it, `journalctl -u t3` silently narrows to only the agent's own messages,
+which is also what the remedy `yo` itself prints when t3 looks missing, so
+the diagnostic advice would have quietly stopped working too.
+
+Two accounts sharing one VM also exposed a trap in lima's ssh
+multiplexing. Lima's `ControlPath` carries no `%r` in its template, and
+OpenSSH's mux client never re-checks the login user of a new connection
+against the master's — it just reuses whatever session the master already
+authenticated. So `-o User=agent` issued over a `ControlMaster` the
+operator's session already opened silently runs as the **operator**, not
+the agent, with no error from ssh at all. Recognise it by a session that
+looks separated — the shell prompt names `agent`, the command line said
+`-o User=agent` — but `id` still reports uid 501 and every file it touches
+lands under `/home/${username}.guest` rather than `/home/agent`. The fix
+is structural, not a flag: an ssh role owns the `ControlPath` itself (a
+distinct socket per role, e.g. `~/.lima/yolobox/ssh-agent.sock`), so the
+two accounts never share a multiplexed master to begin with.
+
+This narrows what an agent can do, but it does not "isolate" or "contain"
+it, and this file would be lying if it said otherwise. Left untouched by
+the split: the forwarded 1Password agent still lets an agent session
+authenticate to GitHub as the operator during any `yo enter`; the AWS
+broker still hands out real credentials whenever `YOLOBOX_AWS_PROFILE` is
+set, by design; every commit an agent makes still rides the git push
+channel back to the Mac, where the operator is the one who builds and
+runs what it wrote; rootless podman's containment still rests on the
+kernel's unprivileged user-namespace support holding, so a kernel exploit
+reaches exactly as far as it did before; anything an agent leaves under
+`/home/agent` persists across sessions with no clean state short of
+recreating the VM outright; and `/etc/yolobox/local.nix` can put `wheel`
+back in one line, because nothing inside the box enforces this separation
+at runtime — only the discipline `CONSTITUTION.md` writes down does. The
+honest summary: the agent no longer has root by construction and cannot
+obtain it without a kernel exploit. That is a real narrowing. It is not
+"the agent is contained".
 
 Lima >= 2.1.0 names the guest home `/home/<user>.guest` (it was
 `/home/<user>.linux` before; lima-vm/lima#4578). This box was brought up on
@@ -57,10 +138,13 @@ limactl 2.2.0. v1 of yolobox, the Docker-based predecessor, lives at commit
 
 `ForwardAgent yes` forwards `$SSH_AUTH_SOCK`, which on this Mac is Apple's
 launchd agent holding nothing; the real keys live in 1Password. So `yo`
-hands `ForwardAgent` the 1Password socket path itself. The forward belongs
-to whichever session opened lima's shared `ControlMaster`, so a change here
-is invisible until that master is closed:
-`ssh -F ~/.lima/yolobox/ssh.config -O exit lima-yolobox`.
+hands `ForwardAgent` the 1Password socket path itself, and only `yo enter`
+and `yo ssh` ever request it — each over its own `ControlPath=none`
+connection, never a shared, persistent `ControlMaster`. So the forward is
+scoped to that one interactive session: it dies with the pane, `yo
+code`/`yo zed`/a bare `ssh lima-yolobox` never inherit it, and the old `-O
+exit` dance to un-stick a forward stuck on a shared master no longer
+applies — the forward never rides a shared master to begin with.
 
 Two GitHub accounts share `github.com`, so the account is chosen by which
 key is offered. The Mac does that with a `Host github-iurii-tech` alias
@@ -102,9 +186,10 @@ lands at the guest home. Both cases print exactly
 `path "%s" does not exist in the yolobox you are in "%s"` to stderr, and
 no `yo` command can target a guest path outside the guest `$HOME`. The
 fzf picker behind `yo enter <fuzzy>` lists git repos anywhere under the
-guest home, hidden directories pruned. `yo bootstrap` finds this repo's
-guest checkout through its recorded `yolobox` remote, falling back to
-mirroring the script's own logical location.
+guest home, hidden directories pruned. `yo bootstrap` needs no mirrored
+path at all any more: it builds the VM straight from a flake ref
+(`github:aka-rider/yolobox/v<version>`), so there is nothing of yolobox's
+own to locate inside the guest.
 
 ## Per-project dev shells
 
@@ -125,8 +210,12 @@ gitignored. direnv trusts every `.envrc` under the guest home through
 so a `~/.config/direnv/direnv.toml` is silently ignored — never put the
 whitelist there.
 
-The yolobox repo itself is still a flake, and there a file git has never
-seen does not exist to Nix. `git add` before `nixos-rebuild`.
+That `git add`-before-Nix discipline still applies to yolobox's own repo,
+but only on a local clone someone is hacking on directly — the VM itself
+no longer holds a checkout to run `nixos-rebuild` against. It builds from
+a published flake ref instead (see "Distribution: the flake ref replaces
+the guest checkout" below), so a file the VM has never seen is simply a
+file the flake ref does not contain, not an untracked file Nix skips over.
 
 `yo bootstrap` decides whether the VM needs a reboot by comparing `readlink
 /nix/var/nix/profiles/system` against `readlink /run/current-system` — the
@@ -148,6 +237,60 @@ the failure by its shape: a cap surfaces as fzf reporting "no project matches"
 for a repo that plainly exists, so what to check is the list handed to fzf, not
 fzf. `yo gc`'s `project_targets` carried the same cap, which made `--deep`
 blind to build directories inside monorepo projects.
+
+## Distribution: the flake ref replaces the guest checkout
+
+Earlier, `yo bootstrap` pushed this repo into the VM over git
+(`guest_repo_ensure`, a `yolobox` git remote, `git push`) and then ran
+`nixos-rebuild --flake '<guest path>#yolobox'` against that pushed-in
+checkout. Now `yo` itself is a distributed package —
+`brew install aka-rider/tap/yolobox` (tap `aka-rider/tap`) or `nix run
+github:aka-rider/yolobox` — and `yo bootstrap` builds the VM directly from
+a pinned flake ref, `nixos-rebuild boot --impure --flake
+'github:aka-rider/yolobox/v<version>#yolobox'`, with no push and no guest
+checkout at all. The version is baked into `yo` at package build time;
+`VERSION` at the repo root is the single source of truth for it, and the
+brew and nix release for a given tag both read the same file, so the two
+channels never drift from each other. The formula itself lives here too,
+at `homebrew/yolobox.rb`: the release job renders it into the tap from a
+`git archive` asset it uploaded itself, so the tap never holds a hand-edited
+formula and the hash never rests on GitHub's non-stable auto-tarballs. `YOLOBOX_FLAKE` overrides the ref
+for anyone running their own fork wholesale, e.g.
+`YOLOBOX_FLAKE=github:you/yolobox/your-branch yo bootstrap`. Customising
+the box now means dropping a `/etc/yolobox/local.nix` inside the VM, which
+`nix/base.nix` imports when present, then `sudo nixos-rebuild switch
+--impure --flake '<same ref>#yolobox'` — no clone, no push, nothing for
+Nix to have "never seen".
+
+This shape introduces failures with no analogue in the old push-based one,
+each recognisable on its own:
+
+- **The repo goes private.** `nixos-rebuild` fetches the flake ref over an
+  anonymous `git+https`/`github:` fetch with no credentials configured, so
+  a private `aka-rider/yolobox` makes every `yo bootstrap` (and every
+  customisation rebuild) fail with a fetch/auth error. The repo staying
+  public is now load-bearing for every box in the field, not just a
+  publishing preference.
+- **`YO_VERSION` is still `dev`.** Running `./yo` straight out of an
+  unreleased clone has no version to pin a flake ref from — `flake_ref()`
+  refuses outright rather than guess at a ref that may not exist yet, and
+  says so on stderr, naming `YOLOBOX_FLAKE` as the way out. Recognise this
+  by the exact wording of that refusal, not by a bare Nix fetch error.
+- **The guest's own `yo` is inert.** The flake puts the `yolobox` package
+  in the guest's `environment.systemPackages` so `yo --version` inside the
+  VM can report which release built the box — that is the entire reason
+  it is there. Every other subcommand needs `limactl` and `~/.lima`,
+  neither of which exists in the guest, so `yo`'s `main()` carries an explicit
+  `limactl` preflight guard that runs once per subcommand except `--help` and `--version`: expect a named, loud failure from any
+  guest-side `yo` invocation beyond those two, never a bare `command not
+  found`.
+- **`nix flake check` throws with no explanation.** `flake.nix` reads
+  `YOLOBOX_USERNAME` from the environment and `throw`s when it is unset,
+  because it has no pure way to learn the host username otherwise (see
+  "Two accounts: the operator mirrors the host, the agent does not" above). A bare `nix flake check`
+  hits that throw immediately; it needs `--impure` with
+  `YOLOBOX_USERNAME=$(id -un)` set, same as every `nixos-rebuild` in this
+  repo.
 
 ## tmpfiles rules apply on `switch`
 
@@ -200,10 +343,12 @@ not a tmpfs. So a full disk first shows up as the agent harness dying with
 `ENOSPC ... mkdir '/tmp/claude-501/...'` before any command runs.
 
 Two facts make it survivable. ext4 reserves 1,057,641 blocks x 4 KiB = 4.3
-GB for root that `df`'s "Avail" column does not count, so every `sudo`
-command still works while every unprivileged one dies. And `yo ssh` reaches
-in from the Mac, which the full disk cannot hurt — hence the remedy,
-`yo gc`, lives on the Mac.
+GB for root that `df`'s "Avail" column does not count, so the operator's
+`sudo`, over `yo ssh`, still works while every unprivileged command dies —
+the agent has no `sudo` at all, so an agent session dying is not evidence
+either way about how full the disk actually is. And `yo ssh` reaches in
+from the Mac, which the full disk cannot hurt — hence the remedy, `yo gc`,
+lives on the Mac.
 
 In the one incident so far, the `rune` project's `target/` under the
 guest home held 41 GiB, 43% of the disk: `rune/Cargo.toml` had no
@@ -213,14 +358,21 @@ never prunes old hashes. The fix belongs in that repo (see `TODO.md`).
 Runners-up: 32 GiB of dead nix store paths, 4.7 GiB podman, 2.9 GiB
 `/root/.cache/nix`, 2.5 GiB `~/.npm`.
 
-`yo gc` reports; `--yes` cleans the machine tier (journald, nix garbage,
-root's nix cache, npm cache, podman); `--deep --yes` also deletes `target`,
-`node_modules` and `.next` anywhere under the guest home, hidden
-directories pruned. Root-only steps run first on purpose: they free the
-space the unprivileged steps need, since npm writes
-a log before it clears anything. `.venv` and `.devbox/virtenv` are
-excluded — `nix/lsp.nix` points basedpyright at `.venv`, and `virtenv` is
-devbox's toolchain, not build output.
+`yo gc` reports, and `--yes` now runs two ordered ssh sessions, one per
+account, not one session doing everything. The machine tier runs as the
+**operator** — journald, `nix-collect-garbage`, root's nix cache — and it
+runs first on purpose: ext4's root reserve is what makes the rest of the
+cleanup possible at all on a genuinely full disk. The user tier then runs
+as the **agent** — npm cache, rootless podman, and under `--deep --yes`
+the project tier: `target`, `node_modules` and `.next` deleted anywhere
+under the agent's home, hidden directories pruned. The split is not
+cosmetic: npm's cache, podman's storage and every project checkout live
+under the agent's home now, not the operator's, so a `yo gc` that only ran
+as the operator would measure and clean an empty home and still report
+success — a silent no-op that never touches the account actually holding
+the state. `.venv` and `.devbox/virtenv` are excluded — `nix/lsp.nix`
+points basedpyright at `.venv`, and `virtenv` is devbox's toolchain, not
+build output.
 
 Two traps. Deleting a build directory the project's `.gitignore` does not
 match dirties the checkout, and every later `git push yolobox` is refused
