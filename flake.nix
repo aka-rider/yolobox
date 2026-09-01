@@ -11,10 +11,12 @@
 
   outputs = { self, nixpkgs, nixos-lima }:
     let
-      # VERSION is the single source of truth for the release version; CI
-      # asserts the git tag matches it. fileContents strips the trailing
-      # newline, which is what YO_VERSION wants.
-      version = nixpkgs.lib.fileContents ./VERSION;
+      # The release tag is the single source of truth for the version.
+      # The release workflow writes .version from the tag and moves the
+      # tag onto that commit, so this reads the version straight out of
+      # the tagged tree. fileContents strips the trailing newline, which
+      # is what YO_VERSION wants.
+      version = nixpkgs.lib.fileContents ./.version;
       forAllSystems = nixpkgs.lib.genAttrs [ "aarch64-darwin" "aarch64-linux" ];
       # The guest account must mirror whichever host user provisioned it
       # (lima's cidata names it after the Mac account, uid-matched to that
