@@ -52,11 +52,16 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 
 ## Distribution
 
-- ALWAYS keep a released tag and `VERSION` in agreement. `yo` bakes
-  `VERSION` in at package build time and derives its flake ref straight
-  from it (`github:aka-rider/yolobox/v<version>`), so a tag that
-  disagrees with `VERSION` ships a `yo` that builds the wrong system with
-  no error anywhere.
+- NEVER hand-edit `.version` — the release workflow writes it from the
+  release tag. `yo` bakes the version in at package build time and derives
+  its flake ref straight from it (`github:aka-rider/yolobox/v<version>`),
+  so a wrong version ships a `yo` that builds the wrong system with no
+  error anywhere.
+- ALWAYS publish a release from a commit that is the tip of `main`. The
+  release workflow force-moves the tag onto its stamp commit, so it refuses
+  any release whose tag sits anywhere else — a release cut from a feature
+  branch fails at that guard rather than republishing different content
+  under a tag someone may already have fetched.
 - NEVER let a VM hold a checkout of yolobox's own repo. `yo bootstrap`
   builds from a flake ref now, not a push; a guest checkout would reopen
   the exact push-to-checkout hazard this repo already carries for user
