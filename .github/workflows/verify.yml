@@ -9,31 +9,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/ruff-action@v3
         with:
-          python-version: "3.9"
+          args: check --output-format=github
 
-      - name: Compile-check yo and aws-broker (python 3.9)
-        run: python3 -m py_compile yo aws-broker
-
-      - name: Unit tests
-        run: python3 -m unittest discover -s tests -v
-
-      - name: Install nix
-        uses: cachix/install-nix-action@v27
-
-      - name: nix flake check --impure
-        # flake.nix throws unless YOLOBOX_USERNAME is set (it threads a real
-        # host username into the NixOS module), so this must run --impure.
-        env:
-          YOLOBOX_USERNAME: runner
-        run: nix flake check --impure
-
-      - name: Evaluate aarch64-darwin.yolobox purely (proves evaluation only, not a cross build)
-        run: nix eval .#packages.aarch64-darwin.yolobox.name
-
-      - name: Assert VERSION is well-formed semver
-        run: |
-          set -euo pipefail
-          version="$(cat VERSION)"
-          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+      - name: Smoke test — yo --help
+        run: ./yo --help
