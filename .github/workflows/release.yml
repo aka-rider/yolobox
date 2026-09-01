@@ -1,67 +1,93 @@
 name: Release
 
 on:
-  push:
-    tags: ['v*']
+  release:
+    types: [published]
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+
 jobs:
-  check-tag:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Assert tag matches VERSION
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          tag_version="${TAG#v}"
-          file_version="$(cat VERSION)"
-          if [ "$tag_version" != "$file_version" ]; then
-            echo "::error::tag ${TAG} does not match VERSION file (${file_version})"
-            exit 1
-          fi
-
   verify:
     uses: ./.github/workflows/verify.yml
 
   release:
-    needs: [check-tag, verify]
+    needs: verify
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+      sha256: ${{ steps.build.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: Build source tarball
-        env:
-          TAG: ${{ github.ref_name }}
+      - name: Assert the release tag is the tip of main
         run: |
           set -euo pipefail
-          git archive --format=tar.gz --prefix="yolobox-${TAG#v}/" -o "yolobox-${TAG#v}.tar.gz" HEAD
+          # The next steps force-move this tag. A tag cut from an older commit
+          # or another branch would then silently republish different content
+          # under the same name, so refuse rather than move it.
+          git fetch --force --tags origin
+          tag_sha="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          head_sha="$(git rev-parse HEAD)"
+          if [ "$tag_sha" != "$head_sha" ]; then
+              echo "::error::${TAG} points at ${tag_sha}, not the tip of main (${head_sha}); refusing to move it"
+              exit 1
+          fi
 
-      - name: Create GitHub release
+      - name: Stamp .version from the tag and commit it
+        run: |
+          set -euo pipefail
+          # The diff guard makes a re-run a no-op instead of a "nothing to
+          # commit" failure. [skip ci] because ci.yml fires on push to main.
+          printf '%s\n' "${TAG#v}" > .version
+          if ! git diff --quiet -- .version; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git commit -m "release: ${TAG#v} [skip ci]" -- .version
+              git push origin HEAD:main
+          fi
+
+      - name: Move the tag onto the stamped commit
+        run: |
+          set -euo pipefail
+          # Nix reads .version out of the tag's tree at fetch time, so the stamp
+          # must be inside the tag. A tag push does not fire a release event, so
+          # this does not loop.
+          git tag -f "$TAG"
+          git push --force origin "refs/tags/${TAG}"
+
+      - id: build
+        name: Build source tarball and hash it
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          tarball="yolobox-${version}.tar.gz"
+          git archive --format=tar.gz --prefix="yolobox-${version}/" -o "$tarball" HEAD
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$tarball" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the tarball to the published release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --generate-notes "yolobox-${TAG#v}.tar.gz"
+        run: |
+          set -euo pipefail
+          # upload, not create — a human already published the release.
+          # --clobber keeps a re-run idempotent.
+          gh release upload "$TAG" "yolobox-${TAG#v}.tar.gz" --clobber
 
   bump-tap:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - name: Compute release-asset sha256
-        id: tarball
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          url="https://github.com/aka-rider/yolobox/releases/download/${TAG}/yolobox-${TAG#v}.tar.gz"
-          sha256="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
-          echo "url=${url}" >> "$GITHUB_OUTPUT"
-          echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v6
 
       - uses: actions/checkout@v6
@@ -73,25 +99,26 @@ jobs:
 
       - name: Render homebrew/yolobox.rb into the tap
         env:
-          URL: ${{ steps.tarball.outputs.url }}
-          SHA256: ${{ steps.tarball.outputs.sha256 }}
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA256: ${{ needs.release.outputs.sha256 }}
         run: |
           set -euo pipefail
+          url="https://github.com/aka-rider/yolobox/releases/download/v${VERSION}/yolobox-${VERSION}.tar.gz"
           mkdir -p homebrew-tap/Formula
-          sed -e "s#@URL@#${URL}#" -e "s#@SHA256@#${SHA256}#" homebrew/yolobox.rb > homebrew-tap/Formula/yolobox.rb
+          sed -e "s#@URL@#${url}#" -e "s#@SHA256@#${SHA256}#" homebrew/yolobox.rb > homebrew-tap/Formula/yolobox.rb
           if [ -z "$(git -C homebrew-tap status --porcelain -- Formula/yolobox.rb)" ]; then
-            echo "::error::Formula/yolobox.rb did not change; refusing to push a no-op commit"
-            exit 1
+              echo "::error::Formula/yolobox.rb did not change; refusing to push a no-op commit"
+              exit 1
           fi
 
       - name: Commit and push
-        env:
-          TAG: ${{ github.ref_name }}
         working-directory: homebrew-tap
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/yolobox.rb
-          git commit -m "bump(yolobox): ${TAG#v} [skip ci]"
+          git commit -m "bump(yolobox): ${VERSION} [skip ci]"
           git push

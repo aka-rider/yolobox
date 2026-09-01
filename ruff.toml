@@ -1,0 +1,11 @@
+target-version = "py39"
+# yo and aws-broker carry no .py suffix, so a bare `ruff check` skips both and
+# the workflow would pass while linting nothing.
+extend-include = ["yo", "aws-broker"]
+
+[lint]
+# Pinned rather than inherited: ruff's default set grows across releases, and an
+# unpinned CI turns red on a ruff upgrade that changed no code of ours. This is
+# ruff's long-standing default — pyflakes plus the pycodestyle errors that catch
+# real defects, not formatting opinions.
+select = ["E4", "E7", "E9", "F"]
