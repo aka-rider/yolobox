@@ -13,5 +13,8 @@ jobs:
         with:
           args: check --output-format=github
 
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
+
       - name: Smoke test — yo --help
         run: ./yo --help
