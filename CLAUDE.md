@@ -360,6 +360,31 @@ each recognisable on its own:
   older commit would silently republish different content. Recognise this by
   a workflow failure on a release created from a feature branch, with an
   explicit refusal message before any tag move or archive happens.
+- **`bump-tap` fails on the tag `release` just moved.** The v0.9.0 release
+  (2026-09-02) showed it: `verify` and `release` both succeeded, then
+  `bump-tap`'s bare `actions/checkout@v6` died with `The ref
+  'refs/tags/v0.9.0' does not point to the expected commit '4069fe0…'. The
+  ref may have been updated after the workflow was triggered.` With no
+  `ref:`, checkout resolves `github.ref` (the release tag) and then asserts
+  that tag still points at `github.sha` — where it pointed when the release
+  was published (`testRef` in `src/ref-helper.ts`). Two jobs earlier,
+  `release` had force-moved the tag onto its own stamp commit, so the
+  assertion fails by construction. This is a behaviour change in
+  actions/checkout v6.0.2 (`actions/checkout#2356`, "Fix tag handling"): a
+  tag used to be fetched by sha, so a moved tag went unnoticed; now it is
+  fetched by name and compared, and no input turns the comparison off. The
+  check is skipped only when `ref:` names an explicit branch or tag, because
+  `commit` is then never assigned — which is why `release`'s own `ref: main`
+  checkout was never at risk, and why `bump-tap` now pins
+  `ref: ${{ github.event.release.tag_name }}`, the moved tag, whose tree is
+  exactly what the tarball was built from. Two rules follow from the same
+  mechanism: after a release failure, re-run only the failed jobs, never the
+  whole run, because `verify.yml` (shared with `ci.yml`, so its checkout
+  stays bare on purpose) would replay against the already-moved tag; and a
+  re-run always executes the workflow file from the triggering commit, so a
+  fix to the workflow itself can only be proven by cutting a new release —
+  v0.9.0 shipped with a tarball and no tap formula, and v0.9.1 was the
+  first release to carry both.
 
 ## tmpfiles rules apply on `switch`
 
