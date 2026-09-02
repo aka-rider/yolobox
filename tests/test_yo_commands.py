@@ -165,7 +165,7 @@ class TestGcSkipsCollectionOnHalfFailedSwitch(unittest.TestCase):
         ) + fragment
         env = dict(os.environ, BOOTED_VALUE=booted, PROFILE_VALUE=profile)
         result = subprocess.run(
-            ["sh", "-c", script], capture_output=True, text=True, env=env
+            ["bash", "-c", script], capture_output=True, text=True, env=env
         )
         return result.stdout
 
