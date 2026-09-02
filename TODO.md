@@ -24,3 +24,14 @@
 - nixos-lima: `lima-init` and `lima-guestagent` should carry
   `restartIfChanged = false` themselves, since their unit text rehashes on
   every nixpkgs bump and a restart triggers the lima bug above.
+
+# yo
+
+- `yo link` refuses with `remote 'yolobox' already exists` when the Mac repo
+  still carries a remote from a previous box, e.g.
+  `ssh://lima-yolobox/home/xiii.guest/wrk/rune` after the operator/agent
+  split moved projects to `/home/agent`. Recreating the VM leaves every
+  linked repo in that state, so each one needs a manual `git remote remove
+  yolobox` first. Least surprise would be to update a stale remote in place
+  and say so on stderr, refusing only when the existing URL points somewhere
+  that is not a yolobox guest path.
