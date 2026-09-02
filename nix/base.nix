@@ -141,10 +141,26 @@
   };
   # The default (~agent/.ssh/authorized_keys) must not be honoured: it is
   # agent-writable, so the agent could mint its own persistent login.
-  # lima-init writes this root-owned file every boot instead.
+  # lima-init writes /etc/ssh/authorized_keys.d/${username} every boot
+  # instead, root-owned 0600 in a root-owned 0700 directory. sshd opens an
+  # AuthorizedKeysFile with the *target user's* privileges, so pointing the
+  # agent at that file denies every login; only a command run as root can
+  # read it. The command must live outside /nix/store: sshd's safe_path
+  # rejects any path with a group-writable component and the store is 1775,
+  # which is why this is a copied /etc file (a non-symlink mode makes
+  # environment.etc copy it) and not a store path.
+  environment.etc."ssh/agent-authorized-keys" = {
+    mode = "0555";
+    text = ''
+      #!${pkgs.runtimeShell}
+      exec ${pkgs.coreutils}/bin/cat /etc/ssh/authorized_keys.d/${username}
+    '';
+  };
   services.openssh.extraConfig = ''
     Match User ${agentUser}
-      AuthorizedKeysFile /etc/ssh/authorized_keys.d/${username}
+      AuthorizedKeysFile none
+      AuthorizedKeysCommand /etc/ssh/agent-authorized-keys
+      AuthorizedKeysCommandUser root
   '';
 
   # Forwarded herdr sockets (see cmd_enter in yo) land under /run, not
