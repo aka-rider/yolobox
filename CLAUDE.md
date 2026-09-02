@@ -90,6 +90,24 @@ it has never created `agent`. The design fails closed from here: if
 anything about the agent account is set up wrong, the agent cannot log in
 at all (loud), rather than silently landing with root anyway.
 
+That fail-closed shape fired on the very first box built from a release
+(v0.9.1, 2026-09-02): `yo bootstrap` built and rebooted fine and then
+died at `yo: cannot ssh into yolobox as 'agent'`, with `Permission denied
+(publickey)` and nothing in the sshd journal. `nix/base.nix` had pointed
+the agent's `AuthorizedKeysFile` at `/etc/ssh/authorized_keys.d/<operator>`,
+the file lima-init rewrites every boot, on the theory that a root-owned
+file is one the agent cannot tamper with. True, and also the reason it
+could never work: lima-init writes it 0600 root inside a 0700 root
+directory, and sshd opens an `AuthorizedKeysFile` with the *target user's*
+uid, so `agent` gets `EACCES` and no key is ever offered a match
+(`sudo -u agent cat` on the file reproduces it). The operator never hit
+this because lima-init also writes the same key into
+`~/.ssh/authorized_keys`, and sshd's default list checks that first. The
+box now reads the file through an `AuthorizedKeysCommand` run as root; the
+command is a copied `/etc/ssh/agent-authorized-keys` rather than a store
+path because sshd's `safe_path` refuses any command whose canonical path
+has a group-writable component, and `/nix/store` is `1775`.
+
 The system journal turned out to gate on the same group. `getfacl` on
 `/var/log/journal/*/system.journal` shows `group:wheel:r--`,
 `group:adm:r--`, `other::---` — readable only through `wheel`'s ACL, with
