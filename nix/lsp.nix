@@ -7,23 +7,16 @@
 # store paths: resolution happens in the per-project environment, unlike
 # MCP servers (nix/mcp.nix), which are system-wide and must be absolute.
 #
-# opencode reads its LSP entries from a per-project config file
-# (opencode.json, committed to each project) because its global config file
-# lives in nix/mcp.nix, which carries unrelated parallel work at the time of
-# writing — lifting the LSP section into that render is tracked in TODO.md.
+# opencode reads its LSP entries from the same global config as its MCP
+# servers (nix/mcp.nix's opencodeConfig, /etc/yolobox/mcp/opencode.json),
+# box-wide rather than per project; nix/lib/basedpyright.nix is the shared
+# constant both that render and this module build from.
 { config, agentUser, ... }:
 let
   homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
 
-  basedpyrightLsp = {
-    command = "basedpyright-langserver";
-    args = [ "--stdio" ];
-    extensionToLanguage = {
-      ".py" = "python";
-      ".pyi" = "python";
-    };
-  };
+  basedpyrightLsp = import ./lib/basedpyright.nix;
 in
 {
   # Zed spawns a language server from the project environment only when it

