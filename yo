@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -47,6 +48,15 @@ FORWARDED_ENV = frozenset(
     }
 )
 
+EDITOR_SSH_BLOCK = "Match host %s user %s\n  ControlPath ~/.lima/%s/ssh-agent.sock" % (
+    VM_HOST,
+    AGENT_USER,
+    INSTANCE,
+)
+
+AGENT_SSH_CONFIG_MARKER = "# yolobox: re-applied by yo; lima rewrites this file on every start"
+AGENT_SSH_CONFIG_HEAD = AGENT_SSH_CONFIG_MARKER + "\n" + EDITOR_SSH_BLOCK + "\n\n"
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
@@ -64,6 +74,33 @@ def ssh_cfg() -> str:
 
 def agent_control_path() -> str:
     return os.path.join(lima_dir(), "ssh-agent.sock")
+
+
+def atomic_write(path: str, content: str, mode: int) -> None:
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(content)
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+
+
+def ensure_agent_ssh_config() -> None:
+    path = ssh_cfg()
+    try:
+        with open(path, "r") as handle:
+            current = handle.read()
+    except OSError:
+        return
+    if current.startswith(AGENT_SSH_CONFIG_HEAD):
+        return
+    rest = current
+    if rest.startswith(AGENT_SSH_CONFIG_MARKER):
+        _, _, rest = rest.partition("\n\n")
+    atomic_write(path, AGENT_SSH_CONFIG_HEAD + rest, 0o600)
 
 
 def op_sock() -> str:
@@ -146,9 +183,9 @@ USAGE = r"""Usage: yo <command> [args]
   code [project]
   zed [project]
       Open VS Code Remote-SSH or Zed in the VM, as the agent account. Needs
-      "Include ~/.lima/yolobox/ssh.config" in ~/.ssh/config, plus the agent
-      Match block above it (yo code refuses and prints it otherwise); VS Code
-      also needs the ms-vscode-remote.remote-ssh extension.
+      "Include ~/.lima/yolobox/ssh.config" in ~/.ssh/config (yo code offers to
+      add it otherwise); VS Code also needs the ms-vscode-remote.remote-ssh
+      extension.
 
   t3
       Open t3code's web UI, served by the VM, in this Mac's browser with a
@@ -215,6 +252,7 @@ def run(
     stdin: Optional[bytes] = None,
     env: Optional[Dict[str, str]] = None,
     merge_stderr: bool = False,
+    binary: bool = False,
 ) -> subprocess.CompletedProcess:
     proc = subprocess.run(
         list(argv),
@@ -224,11 +262,17 @@ def run(
         env=env,
     )
     if capture:
-        proc.stdout = (proc.stdout or b"").decode("utf-8", "replace").replace("\r", "")
+        proc.stdout = proc.stdout or b""
+        if not binary:
+            proc.stdout = proc.stdout.decode("utf-8", "replace").replace("\r", "")
         if proc.stderr is not None:
             proc.stderr = proc.stderr.decode("utf-8", "replace").replace("\r", "")
     if check and proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip() if capture else ""
+        if capture:
+            stdout_text = proc.stdout.decode("utf-8", "replace") if binary else proc.stdout
+            detail = (proc.stderr or stdout_text or "").strip()
+        else:
+            detail = ""
         raise YoError(
             "%s failed (exit %d)%s" % (shlex.join(argv), proc.returncode, ": " + detail if detail else "")
         )
@@ -254,6 +298,7 @@ AGENT = SshRole(AGENT_USER, True)
 
 
 def ssh_base(role: SshRole, mux: bool = False) -> List[str]:
+    ensure_agent_ssh_config()
     argv = ["ssh", "-F", ssh_cfg()]
     if role.user is not None:
         argv += ["-o", "User=%s" % role.user]
@@ -295,12 +340,21 @@ def ssh_run(
     check: bool = False,
     merge_stderr: bool = False,
     inherit_stdin: bool = False,
+    binary: bool = False,
 ) -> subprocess.CompletedProcess:
     cmd = ssh_base(role, mux=mux) + list(extra_opts)
     if stdin is None and not inherit_stdin:
         cmd.append("-n")
     cmd += [VM_HOST, remote(argv)]
-    return run(cmd, capture=capture, check=check, stdin=stdin, env=env, merge_stderr=merge_stderr)
+    return run(
+        cmd,
+        capture=capture,
+        check=check,
+        stdin=stdin,
+        env=env,
+        merge_stderr=merge_stderr,
+        binary=binary,
+    )
 
 
 def guest_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> str:
@@ -309,6 +363,12 @@ def guest_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> 
 
 def agent_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> str:
     return ssh_run(AGENT, argv, mux=mux, check=check).stdout
+
+
+def agent_paths(argv: Sequence[str]) -> List[str]:
+    proc = ssh_run(AGENT, argv, check=True, binary=True)
+    decoded = proc.stdout.decode("utf-8", "replace")
+    return [entry for entry in decoded.split("\0") if entry]
 
 
 def require_agent_account() -> None:
@@ -363,10 +423,10 @@ while [ -n "$d" ] && [ ! -d "$d" ]; do d="${d%/*}"; done
 printf '%s\n' "${d:-$HOME}"
 """
 
-PROJECT_FIND = r"""find "$HOME" -mindepth 2 -maxdepth 5 \( -name ".*" ! -name .git \) -prune -o -name .git \( -type d -o -type f \) -printf "%h\n"
+PROJECT_FIND = r"""find "$HOME" -mindepth 2 -maxdepth 5 \( -name ".*" ! -name .git \) -prune -o -name .git \( -type d -o -type f \) -printf "%h\0"
 """
 
-GITCONFIG_ROOTS_FIND = r"""find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\n"
+GITCONFIG_ROOTS_FIND = r"""find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\0"
 """
 
 ENSURE_REPO = r"""mkdir -p "$1" && { git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || { git -C "$1" init -b main && git -C "$1" config receive.denyCurrentBranch updateInstead; }; }
@@ -394,23 +454,23 @@ def dir_for_cwd() -> str:
 
 def pick_project(query: str) -> str:
     require_tool("fzf", "brew install fzf")
-    listing = agent_out(["sh", "-c", PROJECT_FIND])
+    listing = agent_paths(["sh", "-c", PROJECT_FIND])
     prefix = AGENT_HOME + "/"
     projects = sorted(
-        line[len(prefix) :] for line in listing.splitlines() if line.startswith(prefix)
+        entry[len(prefix) :] for entry in listing if entry.startswith(prefix)
     )
     if not projects:
         raise YoError("no projects in the VM")
     picker = subprocess.run(
-        ["fzf", "--select-1", "--exit-0", "--query=" + query],
-        input="\n".join(projects).encode(),
+        ["fzf", "--read0", "--print0", "--select-1", "--exit-0", "--query=" + query],
+        input="\0".join(projects).encode(),
         stdout=subprocess.PIPE,
     )
     if picker.returncode != 0:
         if picker.returncode != 130:
             err("yo: no project matches '%s'" % query)
         raise YoError(None, code=picker.returncode)
-    choice = picker.stdout.decode("utf-8", "replace").strip("\n")
+    choice = picker.stdout.decode("utf-8", "replace").rstrip("\0")
     return guest_path(AGENT_HOME + "/" + choice)
 
 
@@ -876,6 +936,7 @@ def cmd_up(args: Sequence[str]) -> None:
             capture=False,
             check=True,
         )
+    ensure_agent_ssh_config()
 
 
 def cmd_down(args: Sequence[str]) -> None:
@@ -916,6 +977,23 @@ def cmd_status(args: Sequence[str]) -> None:
         )
 
     check_herd_drift(refuse=False)
+
+    guest_version_raw = guest_out(["cat", "/etc/yolobox/version"], check=False).strip()
+    guest_version = guest_version_raw or None
+    unknown_note = "unknown (box built before /etc/yolobox/version existed)"
+    out("yolobox: host yo %s, box built by %s" % (YO_VERSION, guest_version or unknown_note))
+    drift = version_drift(YO_VERSION, guest_version)
+    if drift:
+        err(drift)
+
+
+def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
+    if guest is None or host == "dev" or host == guest:
+        return None
+    return (
+        "yo: this Mac's yo is %s but the box was built by %s — rebuild it: yo bootstrap"
+        % (host, guest)
+    )
 
 
 def flake_ref() -> str:
@@ -1007,15 +1085,7 @@ def cmd_bootstrap(args: Sequence[str]) -> None:
     cmd_seed([])
     report.ok("seeded")
 
-    config = editor_ssh_config()
-    if config.include_line is None:
-        err("yo: add this line to ~/.ssh/config so ssh lima-yolobox, Zed and VS Code can find the VM:")
-        err("    Include ~/.lima/yolobox/ssh.config")
-    if config.problem is not None:
-        err("yo: and this block ABOVE that Include line, so Zed and VS Code open the VM as")
-        err("    the %s account instead of reusing the operator's ssh master:" % AGENT_USER)
-        for line in EDITOR_SSH_BLOCK.splitlines():
-            err("    " + line)
+    ensure_ssh_config_include(refuse=False)
 
 
 def cmd_gc(args: Sequence[str]) -> None:
@@ -1158,86 +1228,58 @@ def cmd_enter(args: Sequence[str]) -> None:
     exec_process(argv, env)
 
 
-EDITOR_SSH_BLOCK = "Match host %s user %s\n  ControlPath ~/.lima/%s/ssh-agent.sock" % (
-    VM_HOST,
-    AGENT_USER,
-    INSTANCE,
-)
+INCLUDE_LINE = "Include ~/.lima/%s/ssh.config" % INSTANCE
 
-MATCH_RE = re.compile(
-    r"^\s*Match\s+host\s+%s\s+user\s+%s(\s|$)" % (re.escape(VM_HOST), re.escape(AGENT_USER)),
-    re.IGNORECASE,
-)
 INCLUDE_RE = re.compile(
     r"^\s*Include\s+.*\.lima/%s/ssh\.config" % re.escape(INSTANCE), re.IGNORECASE
 )
-BLOCK_END_RE = re.compile(r"^\s*(Host|Match)\s", re.IGNORECASE)
-CONTROL_PATH_RE = re.compile(r'ssh-agent\.sock"?$')
 
 
-@dataclass(frozen=True)
-class EditorSshConfig:
-    problem: Optional[str]
-    match_line: Optional[int]
-    include_line: Optional[int]
-
-
-def editor_ssh_config() -> EditorSshConfig:
+def ssh_config_include_line() -> Optional[int]:
     path = os.path.join(home(), ".ssh", "config")
     try:
         with open(path, "r", errors="replace") as handle:
             lines = handle.read().splitlines()
     except OSError:
-        return EditorSshConfig("missing", None, None)
-
-    match_line = None
-    include_line = None
+        return None
     for number, line in enumerate(lines, 1):
-        if match_line is None and MATCH_RE.search(line):
-            match_line = number
-        if include_line is None and INCLUDE_RE.search(line):
-            include_line = number
-
-    if match_line is None:
-        return EditorSshConfig("missing", None, include_line)
-
-    block_ok = False
-    for line in lines[match_line:]:
-        if BLOCK_END_RE.search(line):
-            break
-        fields = line.split()
-        if len(fields) > 1 and fields[0].lower() == "controlpath" and CONTROL_PATH_RE.search(fields[1]):
-            block_ok = True
-            break
-
-    if not block_ok:
-        return EditorSshConfig("incomplete", match_line, include_line)
-    if include_line is not None and match_line > include_line:
-        return EditorSshConfig("below", match_line, include_line)
-    return EditorSshConfig(None, match_line, include_line)
+        if INCLUDE_RE.search(line):
+            return number
+    return None
 
 
-def require_editor_ssh_config() -> None:
-    config = editor_ssh_config()
-    if config.problem is None:
+def add_ssh_config_include() -> None:
+    ssh_dir = os.path.join(home(), ".ssh")
+    if not os.path.isdir(ssh_dir):
+        os.mkdir(ssh_dir, 0o700)
+        os.chmod(ssh_dir, 0o700)
+    config_path = os.path.join(ssh_dir, "config")
+    try:
+        with open(config_path, "r") as handle:
+            current = handle.read()
+    except OSError:
+        current = ""
+    atomic_write(config_path, INCLUDE_LINE + "\n" + current, 0o600)
+
+
+def ensure_ssh_config_include(refuse: bool) -> None:
+    if ssh_config_include_line() is not None:
         return
-    if config.problem == "missing":
-        err("yo: ~/.ssh/config has no ssh block for the %s account, so the editor" % AGENT_USER)
-        err("    would reuse the operator's ssh master and silently open the project as the")
-        err("    operator. Add this block ABOVE the 'Include ~/.lima/%s/ssh.config'" % INSTANCE)
-        err("    line — ssh keeps the first value it sees for each keyword:")
-    elif config.problem == "incomplete":
-        err("yo: ~/.ssh/config has the %s block on line %d, but it names no" % (AGENT_USER, config.match_line))
-        err("    ControlPath of its own, so the editor would still land on the operator's")
-        err("    shared master. Make it read:")
-    else:
-        err("yo: ~/.ssh/config has the %s block on line %d, below the lima" % (AGENT_USER, config.match_line))
-        err("    Include on line %d. ssh keeps the first value it sees for each" % config.include_line)
-        err("    keyword, so the Include's shared ControlPath wins and the editor would open")
-        err("    the project as the operator. Move this block above that Include line:")
-    for line in EDITOR_SSH_BLOCK.splitlines():
-        err("    " + line)
-    raise YoError(None, code=1)
+
+    if sys.stdin.isatty():
+        err("yo: ~/.ssh/config does not include the VM's ssh config, so Zed, VS Code and a")
+        err("    bare `ssh %s` cannot resolve the host. yo can add one line:" % VM_HOST)
+        err("        %s" % INCLUDE_LINE)
+        answer = input("    Add it to ~/.ssh/config now? [y/N] ").strip().lower()
+        if answer in ("y", "yes"):
+            add_ssh_config_include()
+            out("yo: added '%s' to ~/.ssh/config" % INCLUDE_LINE)
+            return
+
+    err("yo: add this line to ~/.ssh/config so ssh %s, Zed and VS Code can find the VM:" % VM_HOST)
+    err("    %s" % INCLUDE_LINE)
+    if refuse:
+        raise YoError(None, code=1)
 
 
 def cmd_code(args: Sequence[str]) -> None:
@@ -1248,7 +1290,7 @@ def cmd_code(args: Sequence[str]) -> None:
         code_cli = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
     if not os.access(code_cli, os.X_OK):
         raise YoError("VS Code CLI not found")
-    require_editor_ssh_config()
+    ensure_ssh_config_include(refuse=True)
     require_agent_account()
     target = target_dir(args)
     exec_process(
@@ -1261,7 +1303,7 @@ def cmd_zed(args: Sequence[str]) -> None:
         raise usage_error("zed takes at most one project argument")
     if shutil.which("zed") is None:
         raise YoError("zed CLI not found")
-    require_editor_ssh_config()
+    ensure_ssh_config_include(refuse=True)
     require_agent_account()
     target = target_dir(args)
     exec_process(["zed", "ssh://%s@%s%s" % (AGENT_USER, VM_HOST, target)])
@@ -1429,7 +1471,7 @@ def seed_ssh(report: Report) -> None:
 
 
 def seed_gitconfig() -> None:
-    roots = agent_out(["sh", "-c", GITCONFIG_ROOTS_FIND]).splitlines()
+    roots = agent_paths(["sh", "-c", GITCONFIG_ROOTS_FIND])
     members = []
     for root in roots:
         if not root or "/" in root or root in (".", ".."):

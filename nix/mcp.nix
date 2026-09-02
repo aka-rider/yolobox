@@ -4,6 +4,7 @@ let
   homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
   claudeMcpFile = import ./lib/claude-mcp-file.nix;
+  basedpyrightLsp = import ./lib/basedpyright.nix;
 
   serverType = lib.types.submodule {
     options = {
@@ -34,6 +35,10 @@ let
         enabled = true;
       })
       cfg;
+    lsp.basedpyright = {
+      command = [ basedpyrightLsp.command ] ++ basedpyrightLsp.args;
+      extensions = builtins.attrNames basedpyrightLsp.extensionToLanguage;
+    };
   };
 
   manifest = [

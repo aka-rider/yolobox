@@ -1,89 +1,26 @@
-- Commit 6ea55d0 message carries a leftover "# Conflicts:" template block; scrub with a history rewrite (e.g. `git rebase -r 6ea55d0^` reword) before any publication
-- Lift the opencode LSP entries (basedpyright, currently per-project in
-  PortHub's `opencode.json`) into the global render in `nix/mcp.nix` once the
-  parallel MCP/display work there is committed — the shape is schema-checked
-  against https://opencode.ai/config.json (command array + extensions with
-  dots; LSP commands stay bare names resolved from the project devbox PATH,
-  unlike MCP servers).
-- crush was dropped from the box (`nix/harnesses.nix`, plus its MCP render in
-  `nix/mcp.nix`) because nixpkgs builds it with `doCheck = true` and its
-  `TestE2E_PermissionFlowCrossClient` e2e test fails in the nix sandbox —
-  the suite wants network (`catwalk.charm.land`) and the test times out. It
-  gated the whole system closure. Re-add it if upstream fixes the test or
-  nixpkgs disables the check; it never had herdr integration anyway.
-- Report upstream (pingdotgg/t3code): the Claude capability probe hardcodes
-  `strictMcpConfig: true`, which Claude Code refuses whenever an enterprise MCP
-  config is present, and t3 swallows the failure so its Claude provider silently
-  ends up unauthenticated with no slash commands. Affects any enterprise MCP
-  deployment, not just yolobox. Carried as a `substituteInPlace` in
-  `nix/pkgs/t3.nix`; drop it once upstream fixes it.
-- Report upstream (lima-vm/lima): on guest-agent restart the host agent
-  replaces its grpc.ClientConn but `pkg/portfwd/listener.go`'s `forwardTCP`
-  never refreshes the dialer captured by an existing listener, so all
-  dynamically forwarded ports are dead until the host agent restarts. Confirmed
-  in v2.2.0 source, still present on master. Nearest existing report is issue
-  #4558 (open, no root cause assigned). Workaround is `restartIfChanged = false`
-  on the guest-agent units to prevent `nixos-rebuild switch` from triggering
-  the restart.
-- Report to nixos-lima: `lima-init` and `lima-guestagent` units should carry
-  `restartIfChanged = false`, since restarting the guest agent breaks the host's
-  port forwarding and their unit text churns textually (store-path rehashing)
-  on every nixpkgs bump even when semantics are identical. The consequence is
-  that a `nixos-rebuild switch` with a nixpkgs version bump silently breaks all
-  dynamic port forwarding until a host-agent restart.
-- rune/Cargo.toml declares only `[profile.dist]` and no `[profile.dev]`, so dev
-  builds carry full unstripped DWARF and each integration test links its own
-  ~230M binary; cargo never prunes old hashes. This caused 41G of bloat in a
-  five-day run. The fix is a `[profile.dev]` with `debug = "line-tables-only"`
-  plus `[profile.dev.package."*"] debug = false` in the rune repo. Without it,
-  `yo gc --deep` becomes a recurring chore rather than a one-off cleanup.
-- Revisit whether the `strictMcpConfig` flip in `nix/pkgs/t3.nix` can now be
-  dropped entirely: the enterprise MCP config that motivated it is gone (see
-  `nix/mcp.nix`), so the guard it worked around no longer fires. Left in place
-  here because testing removal needs a t3 rebuild, which was out of scope for
-  the change that dropped the enterprise config.
-- The VM had no swap, so memory pressure ended in a global OOM with no warning
-  stage. On 2026-08-27 a `nixos-rebuild switch` run against a box already at
-  ~2.1G available of 12G (ten agent sessions, a five-container podman stack, a
-  Rust link job) tipped it over: the kernel killed the uid-501 systemd manager,
-  `user@501.service` failed with result 'signal', and every rootless podman
-  container died with exit 137. The ssh session scopes sit under `user.slice`
-  directly rather than under `user@501.service`, so the agents themselves
-  survived — the blast radius of a user-manager OOM is exactly the rootless
-  containers. `nix/base.nix` now declares a 16GiB `/var/swapfile` via
-  `swapDevices`, giving reclaim somewhere to go before the killer runs. Still
-  open: `OOMScoreAdjust` on `user@.service` so the manager is not a preferred
-  victim while its own children are. The box was also raised to 16GiB/8cpu in
-  `lima/yolobox.yaml`, which further widens the margin.
-- Verify `aka-rider/yolobox` is public before cutting a release, and on every
-  release after: `nixos-rebuild` fetches the flake ref anonymously, so a repo
-  that goes private (even by accident, e.g. an org default) breaks every
-  `yo bootstrap` and every `/etc/yolobox/local.nix` rebuild in the field with
-  an auth error, not a graceful degrade.
-- Create the `HOMEBREW_TAP_TOKEN` secret in the yolobox repo: a PAT scoped
-  `repo`, used to push the formula update to `aka-rider/homebrew-tap` on
-  release. Without it the brew side of a release has nothing to push with.
-- `yo` inside the guest is inert beyond `--version` — every other subcommand
-  needs `limactl` and `~/.lima`, neither of which exists in the guest.
-  Decide whether it still earns its place in `environment.systemPackages`
-  for that one command, or whether reporting the building release belongs
-  somewhere cheaper than shipping the whole CLI into every VM.
-- `seed_gitconfig` and `vm_project_pick` (`yo`) still split `find` output on
-  newlines, the same newline-in-dirname fragility just fixed in
-  `yo gc --deep`'s loops (`project_targets` now emits `-print0`, read with
-  `while IFS= read -r -d ''`). Neither can take that same mechanical fix:
-  both split the output of an `ssh` call captured into a bash variable, and
-  a bash variable cannot carry NUL, so fixing them means restructuring the
-  loop to stream from the `ssh` command directly rather than swapping in
-  `-print0`. Impact is low — top-level guest directory names for
-  `seed_gitconfig`, fzf picker paths for `vm_project_pick`.
-- `virtualisation.podman.autoPrune` (`nix/podman.nix`) runs `podman system
-  prune` as root, but this box is rootless-only by design — no
-  `dockerSocket.enable`, no `podman` group — so every container and image
-  actually lives under an unprivileged account's own storage instead of
-  root's. Root's prune therefore has nothing of its own to reclaim and
-  silently no-ops; the podman bloat `yo gc --deep` cleans up is real disk
-  use that `autoPrune` was never able to touch. Pre-existing, out of scope
-  for the two-account split; worth its own fix — most likely a user-level
-  systemd timer running `podman system prune` as the account that actually
-  owns the rootless storage.
+# Operator actions
+
+- Commit 6ea55d0 carries a leftover `# Conflicts:` block in its message. No
+  release tag exists yet, so a reword via `git rebase -r 6ea55d0^` followed
+  by a force-push of `main` is still possible; it rewrites every commit
+  after it, so it is the operator's call.
+
+# Upstream reports owed
+
+- pingdotgg/t3code: the Claude capability probe hardcodes
+  `strictMcpConfig: true`, which Claude Code refuses whenever an enterprise
+  MCP config exists, and t3 swallows the failure, so its Claude provider
+  silently ends up unauthenticated with no slash commands. Carried as a
+  `sed` in `nix/pkgs/t3.nix`; the enterprise config that triggered it is
+  gone from `nix/mcp.nix`, so the flip may now be droppable — proving that
+  needs a paired t3 session after a rebuild, and `~/.t3/caches/claudeAgent.json`
+  must show `auth.status` other than `unknown`.
+- lima-vm/lima: on guest-agent restart the host agent replaces its
+  `grpc.ClientConn`, but `pkg/portfwd/listener.go`'s `forwardTCP` keeps the
+  dialer an existing listener captured, so every forwarded port is dead
+  until the host agent restarts. Confirmed in v2.2.0 source, still present
+  on master; nearest report is issue #4558. Pinned shut here with
+  `restartIfChanged = false` on both lima units in `nix/base.nix`.
+- nixos-lima: `lima-init` and `lima-guestagent` should carry
+  `restartIfChanged = false` themselves, since their unit text rehashes on
+  every nixpkgs bump and a restart triggers the lima bug above.

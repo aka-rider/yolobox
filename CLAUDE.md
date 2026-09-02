@@ -115,6 +115,38 @@ is structural, not a flag: an ssh role owns the `ControlPath` itself (a
 distinct socket per role, e.g. `~/.lima/yolobox/ssh-agent.sock`), so the
 two accounts never share a multiplexed master to begin with.
 
+That block now lives in `~/.lima/yolobox/ssh.config` itself, written by
+`yo` above lima's own `Host lima-yolobox` block, rather than hand-written
+into `~/.ssh/config`. It is a safe place to put it because lima writes
+that file but never reads it back — its own header says so — so nothing
+lima does can be confused by a block lima did not author, and because ssh
+resolves `Include` recursively and keeps the first value it sees per
+keyword: the `Match` at the head of the included file still wins over
+lima's own `Host` block further down the same file, exactly as it won
+when it lived above the `Include` line in `~/.ssh/config`. What forces
+`yo` to keep re-applying it rather than writing it once is a fact verified
+directly against the running VM: lima rewrites `ssh.config` on every
+`limactl start` — its mtime tracks the last start, the same second as
+`ha.pid` and `cidata.iso`, while `lima.yaml` and `lima-version` stay older
+— so a one-shot write would be silently undone by the very next `yo up`.
+`yo` re-applies the block idempotently from two places instead: `ssh_base()`,
+which every ssh `yo` spawns funnels through, so the file is repaired
+before any connection, `yo code`/`yo zed` included; and the end of
+`cmd_up()`, because `limactl start` is what clobbers the file and `cmd_up`
+opens no ssh of its own to trigger the `ssh_base()` repair. `~/.ssh/config`
+itself now needs only one line, `Include ~/.lima/yolobox/ssh.config`, and
+`yo bootstrap`/`yo code`/`yo zed` offer to add it when it is missing and
+stdin is a tty.
+
+This still leaves a gap, and it is worth stating plainly rather than
+papering over: nothing in lima or ssh enforces the split at the moment a
+connection is made. `limactl start yolobox` run by hand, followed by
+launching Zed directly with no `yo` command in between, still opens the
+project as the operator, because nothing has re-applied the `Match` block
+or even required it to exist. Any `yo` command that touches the VM heals
+this the next time it runs, but the box can sit in the unhealed state
+until then.
+
 This narrows what an agent can do, but it does not "isolate" or "contain"
 it, and this file would be lying if it said otherwise. Left untouched by
 the split: the forwarded 1Password agent still lets an agent session
@@ -149,6 +181,19 @@ scoped to that one interactive session: it dies with the pane, `yo
 code`/`yo zed`/a bare `ssh lima-yolobox` never inherit it, and the old `-O
 exit` dance to un-stick a forward stuck on a shared master no longer
 applies — the forward never rides a shared master to begin with.
+
+That scoping is also why `ForwardAgent` deliberately does not go into
+`~/.lima/yolobox/ssh.config`, the file `yo` writes and re-applies (see
+"Two accounts" above). `yo` runs all of its own ssh with `-F
+~/.lima/yolobox/ssh.config`, so a `ForwardAgent yes` sitting in that file
+would hand the 1Password agent to `yo code`, `yo zed` and every
+t3-spawned session too — exactly the scoping this section just described
+as deliberate. A `Host lima-yolobox` / `ForwardAgent yes` block sitting in
+`~/.ssh/config` instead is in any case a no-op on this Mac: `SSH_AUTH_SOCK`
+points at Apple's launchd agent, and `ssh-add -l` against it reports "The
+agent has no identities" — the real keys live in 1Password, which is why
+`yo enter` and `yo ssh` pass `-o ForwardAgent="<1Password socket>"` per
+connection instead of relying on any config file to carry it.
 
 Two GitHub accounts share `github.com`, so the account is chosen by which
 key is offered. The Mac does that with a `Host github-iurii-tech` alias
@@ -291,14 +336,17 @@ each recognisable on its own:
   function refuses outright rather than guess at a ref that may not exist yet, and
   says so on stderr, naming `YOLOBOX_FLAKE` as the way out. Recognise this
   by the exact wording of that refusal, not by a bare Nix fetch error.
-- **The guest's own `yo` is inert.** The flake puts the `yolobox` package
-  in the guest's `environment.systemPackages` so `yo --version` inside the
-  VM can report which release built the box — that is the entire reason
-  it is there. Every other subcommand needs `limactl` and `~/.lima`,
-  neither of which exists in the guest, so `yo`'s `main()` carries an explicit
-  `limactl` preflight guard that runs once per subcommand except `--help` and `--version`: expect a named, loud failure from any
-  guest-side `yo` invocation beyond those two, never a bare `command not
-  found`.
+- **The box and the Mac's `yo` come from different releases.** The guest
+  no longer ships `yo` at all — it used to, only so `yo --version` could
+  say which release built the box, and every other subcommand needs
+  `limactl` and `~/.lima`, neither of which exists in the guest. Instead
+  `nix/base.nix` writes the release into `/etc/yolobox/version`, and `yo
+  status` prints both versions and warns on stderr when they differ,
+  naming `yo bootstrap` as the fix. A box built before that file existed
+  reports `unknown`. `yo`'s `main()` still carries a `limactl` preflight
+  guard for every subcommand except `--help` and `--version`, so `nix run
+  github:aka-rider/yolobox` inside a guest fails loudly, never with a bare
+  `command not found`.
 - **`nix flake check` throws with no explanation.** `flake.nix` reads
   `YOLOBOX_USERNAME` from the environment and `throw`s when it is unset,
   because it has no pure way to learn the host username otherwise (see
@@ -375,9 +423,27 @@ In the one incident so far, the `rune` project's `target/` under the
 guest home held 41 GiB, 43% of the disk: `rune/Cargo.toml` had no
 `[profile.dev]`, so every dev build and
 every integration test linked its own unstripped ~230 MiB binary, and cargo
-never prunes old hashes. The fix belongs in that repo (see `TODO.md`).
+never prunes old hashes. Fixing `Cargo.toml` per repo would leave the next
+Rust project exposed, so `nix/base.nix` exports
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only` box-wide: cargo ranks the
+environment above both `Cargo.toml` and `.cargo/config.toml`, and the
+`test` profile inherits `dev`, so every dev build and test binary in the
+box keeps line tables and drops the rest of the DWARF, whatever the repo
+declares. Backtraces still carry file and line; stepping through variables
+in a debugger does not.
 Runners-up: 32 GiB of dead nix store paths, 4.7 GiB podman, 2.9 GiB
 `/root/.cache/nix`, 2.5 GiB `~/.npm`.
+
+The podman share had a second cause: `virtualisation.podman.autoPrune`
+renders a *system* `podman-prune.timer` that runs as root, and this box is
+rootless-only, so root owned nothing and the weekly prune no-op'd silently
+for as long as it existed. `nix/podman.nix` now declares a *user* timer
+instead, `podman-prune.timer` under `systemd.user`, gated with
+`ConditionUser=agent` so the operator's user manager skips it, running
+`podman system prune -f` as the account that owns the storage. It fires
+weekly with `Persistent=true`, so a week missed because no agent session
+was open runs at the next login. `systemctl --user list-timers` as the
+agent must show it; `systemctl list-timers` as the operator must not.
 
 `yo gc` reports, and `--yes` now runs two ordered ssh sessions, one per
 account, not one session doing everything. The machine tier runs as the
@@ -403,6 +469,33 @@ directory. And `nix-collect-garbage -d` deletes the running generation
 when a switch half-failed (see the ESP section); `yo gc` compares the two
 readlinks and reports a skip, which means the box needs a repaired switch
 before it needs a garbage collection.
+
+## Memory pressure: swap first, then the right victim
+
+The VM once had no swap, so memory pressure went straight to the kernel's
+global OOM killer with no warning stage. On 2026-08-26 a `nixos-rebuild
+switch` on a box already at ~2.1 GiB available of 12 GiB (ten agent
+sessions, a five-container podman stack, a Rust link job) tipped it over.
+The journal shows the kernel killer, not `systemd-oomd`, picking
+`.chrome-wrapped` and gunicorn workers first, and eventually the uid-501
+user manager: `user@501.service` failed with result `signal` and every
+rootless container died with exit 137. The agents themselves survived,
+because ssh session scopes hang off `user.slice` directly, not under
+`user@.service` — the blast radius of a user-manager kill is exactly the
+rootless containers.
+
+Two changes in `nix/base.nix` address the two halves. `swapDevices`
+declares a 16 GiB `/var/swapfile`, so reclaim has somewhere to go before
+the killer runs, and `lima/yolobox.yaml` raised the box to 16 GiB and 8
+cpus. And systemd's upstream `user@.service` ships `OOMScoreAdjust=100`
+(verified with `systemctl show user@1000.service -p OOMScoreAdjust`),
+which makes the per-user manager a *preferred* victim over every system
+service at 0. A drop-in (`overrideStrategy = "asDropin"`, so upstream's
+unit text is kept, not replaced) sets it to -500. Podman sets its own
+`oom_score_adj` on containers (200 in the incident), so they stay
+individually killable; what the drop-in changes is that the kernel takes
+one container worker, or the agent's own link job, before it takes the
+manager that holds all of them.
 
 ## The root disk grows; the ESP cannot
 
@@ -608,12 +701,16 @@ vendor the lock; build with a wrong `npmDepsHash` and pin what nix reports.
 ### Why dist/bin.mjs is patched
 
 t3's Claude probe hardcodes `strictMcpConfig: true`, which Claude Code
-refuses when an enterprise MCP config exists — and `nix/mcp.nix` renders
-one at `/etc/claude-code/managed-mcp.json`. t3 swallows the failure
-completely; nothing reaches journald. The evidence is
+refuses when an enterprise MCP config exists — and `nix/mcp.nix` once
+rendered one at `/etc/claude-code/managed-mcp.json`. t3 swallows the
+failure completely; nothing reaches journald. The evidence is
 `~/.t3/caches/claudeAgent.json`: `status: "warning"`, `auth: {"status":
-"unknown"}`, no slash commands. `postPatch` flips the flag to `false`. The
-cache survives rebuilds — delete it, restart the unit, read it back.
+"unknown"}`, no slash commands. `postPatch` flips the flag to `false` with
+`sed` (`substituteInPlace` rejects the NUL bytes in `bin.mjs`), guarded by
+a `grep -q` so an upstream change fails the build loudly. The enterprise
+config is gone, so the flip may be droppable; proving it needs a paired
+t3 session after a rebuild (see `TODO.md`). The cache survives rebuilds —
+delete it, restart the unit, read it back.
 
 ### Why nix builds it
 

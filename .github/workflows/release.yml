@@ -23,6 +23,20 @@ jobs:
       version: ${{ steps.build.outputs.version }}
       sha256: ${{ steps.build.outputs.sha256 }}
     steps:
+      - name: Refuse before anything irreversible happens
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.repository.private }}" = "true" ]; then
+              echo "::error::repository is private — every yo bootstrap fetches the flake ref anonymously and would break"
+              exit 1
+          fi
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+              echo "::error::HOMEBREW_TAP_TOKEN is empty — the brew half of this release would have nothing to push with"
+              exit 1
+          fi
+
       - uses: actions/checkout@v6
         with:
           ref: main

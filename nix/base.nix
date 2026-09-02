@@ -1,4 +1,4 @@
-{ config, pkgs, modulesPath, username, agentUser, lib, yolobox, ... }:
+{ config, pkgs, modulesPath, username, agentUser, lib, version, ... }:
 {
   # Lets someone drop a package or setting into the running box without a
   # checkout or push: the guest no longer carries a copy of this repo, so
@@ -70,6 +70,15 @@
   # the next boot, which is when the host agent is recreated anyway.
   systemd.services.lima-guestagent.restartIfChanged = false;
   systemd.services.lima-init.restartIfChanged = lib.mkForce false;
+
+  # Upstream's user@.service ships OOMScoreAdjust=100, making the per-user
+  # manager a preferred kernel-OOM victim over every system service; killing
+  # it takes down every rootless podman container at once.
+  systemd.services."user@" = {
+    overrideStrategy = "asDropin";
+    serviceConfig.OOMScoreAdjust = -500;
+  };
+
   networking.hostName = "yolobox";
   users.mutableUsers = true;
   system.stateVersion = "25.11";
@@ -179,6 +188,9 @@
   # to hold the no-creds-at-rest invariant even though telemetry itself
   # carries no credentials.
   environment.variables.AWS_CLI_SESSION_ID_DISABLED = "true";
+  # Cargo reads profile settings from the environment above both Cargo.toml
+  # and .cargo/config.toml, so this caps dev/test DWARF for every project.
+  environment.variables.CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
 
   virtualisation.rosetta = {
     enable = true;
@@ -207,8 +219,9 @@
     unzip
     devbox
     awscli2
-    yolobox
   ];
+
+  environment.etc."yolobox/version".text = version + "\n";
 
   nix.settings.experimental-features = [ "nix-command" "flakes" "fetch-closure" "ca-derivations" ];
 }

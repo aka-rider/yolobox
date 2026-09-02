@@ -46,8 +46,7 @@
       nixosConfigurations.yolobox = nixpkgs.lib.nixosSystem {
         system = "aarch64-linux";
         specialArgs = {
-          inherit username agentUser;
-          yolobox = self.packages.aarch64-linux.yolobox;
+          inherit username agentUser version;
         };
         modules = [
           nixos-lima.nixosModules.lima
