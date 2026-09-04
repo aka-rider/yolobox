@@ -200,7 +200,7 @@
   };
 
   programs.nix-ld.enable = true;
-  programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl alsa-lib ];
+  programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl ];
 
   programs.git = {
     enable = true;

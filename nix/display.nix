@@ -149,7 +149,7 @@ in
     PLAYWRIGHT_MCP_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
     PLAYWRIGHT_MCP_ISOLATED = "1";
     PLAYWRIGHT_MCP_OUTPUT_DIR = "$HOME/artifacts";
-    PLAYWRIGHT_MCP_CAPS = "vision,pdf";
+    PLAYWRIGHT_MCP_CAPS = "vision,pdf,devtools";
     PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
   };
 

@@ -605,13 +605,17 @@ runs headed on the display because `DISPLAY` is set; agent-browser is
 headless unless told `--headed`.
 
 The one thing the box must supply is the browser binary itself, because
-Playwright's own browser downloads do not run on NixOS. So both
-`PLAYWRIGHT_MCP_EXECUTABLE_PATH` and `AGENT_BROWSER_EXECUTABLE_PATH` point
-at nixpkgs' `chromium` (151, cached for aarch64), and `agent-browser
-install` must never be run: it downloads a glibc Chrome for Testing that
-cannot execute here, and having run it leaves a binary that looks
-installed and is not. `PLAYWRIGHT_MCP_CAPS=vision,pdf` turns on the two
-capabilities that are off by default.
+Playwright's own browser downloads do not run on NixOS. So
+`PLAYWRIGHT_MCP_EXECUTABLE_PATH` points at nixpkgs' `chromium` (151, cached
+for aarch64); agent-browser finds the same chromium on PATH and through
+the extension's own config file (see "MCP" below), and
+`AGENT_BROWSER_EXECUTABLE_PATH` is deliberately not set, because
+pi-agent-browser-native disables its managed session restore whenever that
+variable is present. `agent-browser install` must never be run: it
+downloads a glibc Chrome for Testing that cannot execute here, and having
+run it leaves a binary that looks installed and is not.
+`PLAYWRIGHT_MCP_CAPS=vision,pdf,devtools` turns on the three capabilities
+that are off by default.
 
 `PLAYWRIGHT_MCP_ISOLATED=1` is set box-wide, and isolated mode and a
 user-data-dir are mutually exclusive — the server throws when both are
@@ -623,11 +627,14 @@ it. `PLAYWRIGHT_MCP_USER_DATA_DIR` must never be set alongside it.
 What the box's claude launcher (see "The harnesses come from their
 vendors; the box owns `~/.local/bin/claude`" below) does compute per
 project is the *output* directory, not a profile. Before `exec`, it
-derives the project — `git rev-parse --show-toplevel` relative to
-`$HOME`, slashes turned into `--`, falling back to the bare cwd when that
-fails — and exports
-`PLAYWRIGHT_MCP_OUTPUT_DIR=$HOME/artifacts/<project>`, creating the
-directory first. Snapshots and unnamed screenshots land there because
+derives the project from the logical cwd — `git rev-parse --show-cdup`
+against `$PWD`, never git's physical toplevel, because `~/wrk` is a
+symlink to `~/Developer` and the mirror rule (see "The mirror" above)
+spells paths logically — relative to `$HOME`, slashes turned into `--`,
+and exports `PLAYWRIGHT_MCP_OUTPUT_DIR=$HOME/artifacts/<project>`,
+creating the directory first; a cwd at or outside `$HOME` leaves the
+variable at its box default instead. Snapshots and unnamed screenshots
+land there because
 Playwright honours that variable directly. A screenshot given an explicit
 `filename` does not: Playwright resolves an explicit name against the MCP
 workspace root — the first root the client advertised, else the server's
@@ -800,9 +807,12 @@ https://claude.ai/install.sh | bash -s latest` when `versions/` is empty,
 then the marketplace and plugins (below); pi via `npm install -g
 --ignore-scripts @earendil-works/pi-coding-agent` — the package nixpkgs
 tracked, `@mariozechner/pi-coding-agent`, was deprecated in May 2026;
-agent-browser via `npm install -g agent-browser` **with** scripts, because
-its postinstall is what downloads the binary, followed by a hard `agent-browser
---version` check, because that download fails silently; opencode via its
+agent-browser via `npm install -g agent-browser@0.34.0` **with** scripts,
+pinned because pi-agent-browser-native 0.5.0 refuses browser-backed calls
+against any other agent-browser version, at call time; scripts run because
+its postinstall is what downloads the binary, followed by a hard
+`agent-browser --version` check, because that download fails silently;
+opencode via its
 own installer with `--no-modify-path`, into `~/.opencode/bin`, which a
 tmpfiles link from `~/.local/bin/opencode` makes reachable (the installer
 has no install-dir override). No vendor installer is ever allowed to edit
@@ -867,8 +877,10 @@ pi gets no MCP at all. `@upstash/context7-pi` is Upstash's own pi package,
 pure JS, exposing native pi tools; `pi-agent-browser-native` drives
 Vercel's `agent-browser` CLI the same way. Both go in with `pi install`,
 never by editing pi's settings file. The extension does not read
-`AGENT_BROWSER_EXECUTABLE_PATH` itself, so the install service points it
-at the browser explicitly with `pi-agent-browser-config`.
+`AGENT_BROWSER_EXECUTABLE_PATH` itself, so the install service writes
+`~/.pi/config/pi-agent-browser-native/config.json`
+(`browser.executablePath`) with `jq`, because `pi install` does not put
+the extension's own `pi-agent-browser-config` helper on PATH.
 
 opencode keeps only its LSP entry, which `nix/lsp.nix` now renders to
 `/etc/yolobox/lsp/opencode.json` and names through `OPENCODE_CONFIG`.
