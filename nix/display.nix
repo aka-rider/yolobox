@@ -135,11 +135,23 @@ in
     links = [ ];
   };
 
-  environment.variables.DISPLAY = ":0";
+  # Playwright's own browser downloads do not run on NixOS, and Vercel's
+  # agent-browser ships no browser at all, so both are pointed at the same nix
+  # chromium. PLAYWRIGHT_MCP_BROWSER is deliberately unset: the executable
+  # path overrides the channel anyway, and @playwright/mcp's README lists no
+  # `chromium` value for it.
+  environment.variables = {
+    DISPLAY = ":0";
+    PLAYWRIGHT_MCP_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
+    AGENT_BROWSER_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
+    PLAYWRIGHT_MCP_OUTPUT_DIR = "$HOME/artifacts";
+    PLAYWRIGHT_MCP_CAPS = "vision,pdf";
+    PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
+  };
 
   fonts.packages = with pkgs; [ dejavu_fonts liberation_ttf noto-fonts noto-fonts-color-emoji ];
 
   # ffmpeg-full, not the default ffmpeg: nixpkgs' default build is
   # --disable-xlib/--disable-libxcb*, so x11grab doesn't exist in it.
-  environment.systemPackages = [ pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord ];
+  environment.systemPackages = [ pkgs.chromium pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord ];
 }
