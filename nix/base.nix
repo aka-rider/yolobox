@@ -123,6 +123,9 @@
     shell = pkgs.zsh;
     autoSubUidGidRange = true;
     extraGroups = [ "systemd-journal" ];
+    # The agent's user manager must run from boot, not from the first login:
+    # it is what installs the harnesses, and nothing may wait for `yo enter`.
+    linger = true;
   };
 
   services.openssh.enable = true;
@@ -172,20 +175,15 @@
   # Owned by the agent, not the operator: sshd binds the -R herd forward as
   # the agent, and an operator-owned 0700 directory would break every
   # `yo enter`.
-  #
-  # The two claude rules are the boot-and-switch backstop for the user path
-  # unit in nix/harnesses.nix: a `claude update` run while no user manager of
-  # the agent's was up leaves ~/.local/bin/claude behind, and because the
-  # agent's dotfiles prepend that directory it would shadow the wrapped
-  # claude — and its herd hooks — in every later shell. `R` on the install
-  # root, not just the launcher, because the versions directory under it is
-  # what the launcher points into and is ~216 MB per version with nothing to
-  # prune it.
   systemd.tmpfiles.rules = [
     "d /run/yolobox 0700 ${agentUser} users -"
-    "r ${config.users.users.${agentUser}.home}/.local/bin/claude"
-    "R ${config.users.users.${agentUser}.home}/.local/share/claude"
   ];
+
+  # The harnesses install themselves into the agent's ~/.local/bin (see
+  # nix/harnesses.nix). The dotfiles prepend it for interactive shells only,
+  # and t3 and `yo herd-check`'s ssh_run spawn neither a login nor an
+  # interactive shell.
+  environment.localBinInPath = true;
 
   security.sudo.wheelNeedsPassword = false;
   programs.zsh.enable = true;
@@ -202,7 +200,7 @@
   };
 
   programs.nix-ld.enable = true;
-  programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl ];
+  programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl alsa-lib ];
 
   programs.git = {
     enable = true;

@@ -3,62 +3,127 @@ let
   cfg = config.yolobox.harness;
 
   claudeHooksFile = import ./lib/claude-hooks-file.nix;
-  claudeMcpFile = import ./lib/claude-mcp-file.nix;
+  homeDir = config.users.users.${agentUser}.home;
+  homeTmpfiles = import ./lib/home-tmpfiles.nix;
 
-  # The herd hook map reaches claude only as `--settings <file>`; see the long
-  # note in nix/herd-report.nix for why /etc/claude-code/managed-settings.json
-  # is silently voided by a single unrelated key in the account's
-  # server-fetched remote settings. A wrapper — rather than an argument added
-  # by `yo enter` — is the only chokepoint that also covers sessions nobody
-  # types: nix/t3.nix runs `t3 serve`, which spawns claude itself out of
-  # /run/current-system/sw.
+  launcherPath = "/etc/yolobox/bin/claude";
+  launcherLink = "${homeDir}/.local/bin/claude";
+  claudeVersionsDir = "${homeDir}/.local/share/claude/versions";
+
+  # Claude Code >= 2.1.207 documents that a custom ~/.local/bin/claude is left
+  # alone: `claude update` and the background updater only drop new binaries
+  # into ~/.local/share/claude/versions/. That guarantee is the whole delivery
+  # channel for the herd hooks, which reach claude as `--settings <file>` and
+  # nowhere else (see nix/herd-report.nix for why the enterprise settings tier
+  # is silently voided here). The box therefore OWNS that path with a launcher
+  # of its own rather than putting a wrapper on the system PATH and racing it:
+  # the agent's dotfiles prepend $HOME/.local/bin, so any wrapper behind it
+  # loses in every interactive shell, silently, which is exactly how 657fc21
+  # ended herd reporting box-wide within a day.
   #
-  # The same reasoning carries the MCP config: `--mcp-config <file>` rides
-  # this wrapper rather than any per-session invocation, for the identical
-  # reason — t3-spawned claude never goes through `yo enter` or a typed
-  # command line, so a wrapper is the only place that reaches it. See
-  # nix/mcp.nix for why this file, not the enterprise tier, is where MCP
-  # servers are delivered: claude refuses any dynamic `--mcp-config` when an
-  # enterprise config is present, and t3 itself passes `--mcp-config` at turn
-  # time for its own bridge server, so the enterprise tier and t3 are
-  # mutually exclusive.
-  #
-  # --add-flags puts the flags BEFORE the user's arguments, so a user's own
-  # `--settings` or `--mcp-config` later on the command line still wins.
-  #
-  # The order of the two is load-bearing: `--mcp-config` is variadic
-  # (`<configs...>`), so it keeps consuming arguments until the next one
-  # starting with `-`. Left last it would eat the user's positional prompt —
-  # `claude 'say hi'` dies with "MCP config file not found: .../say hi".
-  # Naming `--settings` after it bounds the variadic before user arguments
-  # are reached.
-  #
-  # symlinkJoin + wrapProgram wraps the wrapper: upstream's bin/claude is
-  # already a makeCWrapper that sets DISABLE_AUTOUPDATER,
-  # FORCE_AUTOUPDATE_PLUGINS, DISABLE_INSTALLATION_CHECKS,
-  # USE_BUILTIN_RIPGREP, LD_LIBRARY_PATH and PATH. Wrapping the symlink to it
-  # leaves all of that intact and untouched. No meta is inherited on purpose:
-  # meta.license would drag the unfree check onto this derivation's own name,
-  # which allowUnfreePredicate below does not (and should not) list.
-  #
-  # The box must therefore be the ONLY claude installation on it, and the
-  # reaper below enforces that. A wrapper delivers the hooks by being the
-  # `claude` that PATH resolves to, and it cannot win a PATH race against a
-  # directory the box does not own: the agent's own dotfiles PREPEND
-  # $HOME/.local/bin, and `yo enter` ends in an interactive login zsh, so the
-  # moment `claude update` writes a launcher there, every typed `claude` is
-  # the bare upstream one — no --settings, no hooks, no herd reporting, and
-  # no trace anywhere, because a reporter that never runs logs nothing.
-  # A self-updating home install is thus not a nicer delivery channel for the
-  # same binary; it is a second installation that silently outranks this one.
-  claudeCodePkg = pkgs.symlinkJoin {
-    name = "claude-code-herd-hooks-${pkgs.claude-code.version}";
-    paths = [ pkgs.claude-code ];
-    nativeBuildInputs = [ pkgs.makeWrapper ];
-    postBuild = ''
-      wrapProgram "$out/bin/claude" --add-flags "--mcp-config ${claudeMcpFile.path} --settings ${claudeHooksFile.path}"
+  # --settings sits before "$@" so a user's own later --settings still wins.
+  claudeLauncher = pkgs.writeShellApplication {
+    name = "claude";
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils ];
+    text = ''
+      versions="${claudeVersionsDir}"
+      newest="$(find "$versions" -maxdepth 1 -type f -perm -u+x -printf '%f\n' 2>/dev/null | sort -V | tail -n 1 || true)"
+
+      if [ -z "$newest" ]; then
+        echo "claude: no installed version under $versions" >&2
+        echo "  the vendor install runs as a user unit: systemctl --user status yolobox-harness-install" >&2
+        echo "  its output: journalctl --user -u yolobox-harness-install" >&2
+        exit 127
+      fi
+
+      exec "$versions/$newest" --settings ${claudeHooksFile.path} "$@"
     '';
-    meta.mainProgram = "claude";
+  };
+
+  claudeLauncherKeeper = pkgs.writeShellApplication {
+    name = "yolobox-claude-launcher-keep";
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils ];
+    text = ''
+      if [ "$(readlink "${launcherLink}" || true)" != "${launcherPath}" ]; then
+        mkdir -p "$(dirname "${launcherLink}")"
+        ln -sfn "${launcherPath}" "${launcherLink}.tmp"
+        mv -T "${launcherLink}.tmp" "${launcherLink}"
+        echo "relinked ${launcherLink} -> ${launcherPath}"
+      fi
+
+      # Only versions the updater finished with more than ten minutes ago are
+      # candidates, so a download in flight is never a pruning target. Nothing
+      # else prunes them: keeping every version is precisely what the custom
+      # launcher buys, at ~330 MB each.
+      stale="$(find "${claudeVersionsDir}" -maxdepth 1 -type f -mmin +10 -printf '%f\n' 2>/dev/null | sort -V | head -n -2 || true)"
+      if [ -n "$stale" ]; then
+        while IFS= read -r version; do
+          rm -f "${claudeVersionsDir}/$version"
+          echo "pruned ${claudeVersionsDir}/$version"
+        done <<< "$stale"
+      fi
+    '';
+  };
+
+  harnessInstall = pkgs.writeShellApplication {
+    name = "yolobox-harness-install";
+    text = ''
+      cd "$HOME"
+      mkdir -p "$HOME/.local/bin"
+
+      if [ -z "$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null || true)" ]; then
+        curl -fsSL https://claude.ai/install.sh | bash -s latest
+      fi
+      # Unconditional: the guarantee upstream documents covers updates, not the
+      # initial `claude install` the installer script runs.
+      ln -sfn "${launcherPath}" "${launcherLink}"
+
+      claude plugin marketplace list 2>/dev/null | grep -q claude-plugins-official \
+        || claude plugin marketplace add anthropics/claude-plugins-official
+      for plugin in context7 playwright; do
+        claude plugin list 2>/dev/null | grep -q "$plugin@claude-plugins-official" \
+          || claude plugin install "$plugin@claude-plugins-official" --scope user
+      done
+
+      command -v pi >/dev/null || npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+      # Scripts ON, unlike pi: agent-browser's postinstall IS the download of
+      # its prebuilt binary. That download fails silently, so the version call
+      # below is the hard check rather than a courtesy.
+      command -v agent-browser >/dev/null || npm install -g agent-browser
+      agent-browser --version
+
+      for package in @upstash/context7-pi pi-agent-browser-native; do
+        pi list 2>/dev/null | grep -q "$package" || pi install "npm:$package"
+      done
+
+      # pi-agent-browser-native ships a `pi-agent-browser-config` helper, but
+      # its own README states that `pi install npm:...` does not put it on
+      # PATH and names writing this file as the equivalent route. The shape is
+      # the helper's own: {version:1, browser:{executablePath}}. Merged with
+      # jq rather than overwritten, because the same file also holds the
+      # extension's webSearch settings.
+      browser_config_dir="$HOME/.pi/config/pi-agent-browser-native"
+      browser_config="$browser_config_dir/config.json"
+      mkdir -p "$browser_config_dir"
+      [ -f "$browser_config" ] || echo '{}' > "$browser_config"
+      jq --arg path "$AGENT_BROWSER_EXECUTABLE_PATH" \
+        '.version = 1 | .browser.executablePath = $path' \
+        "$browser_config" > "$browser_config.tmp"
+      mv -f "$browser_config.tmp" "$browser_config"
+
+      # --no-modify-path: no installer may edit the agent's rc files. The
+      # opencode installer has no install-dir override, hence the fixed link.
+      [ -x "$HOME/.opencode/bin/opencode" ] \
+        || curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
+      ln -sfn "$HOME/.opencode/bin/opencode" "${homeDir}/.local/bin/opencode"
+
+      claude --version
+      pi --version
+      opencode --version
+      agent-browser --version
+      node --version
+    '';
   };
 
   herdrPkg = import ./lib/herdr-pkg.nix { inherit pkgs; cfg = cfg.herdr; };
@@ -96,54 +161,94 @@ in
   };
 
   config = {
-    # The ONLY definition site for this predicate (Gotcha 11) — claude-code
-    # is nixpkgs' unfree harness.
-    nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "claude-code" ];
-
-    # Upstream's own wrapper already sets this for the process it starts; the
-    # box-wide variable also reaches a claude started any other way, so no
-    # background updater can quietly grow the home install the reaper below
-    # exists to remove.
-    environment.variables.DISABLE_AUTOUPDATER = "1";
-
     environment.systemPackages = [
-      claudeCodePkg
-      pkgs.opencode
-      pkgs.pi-coding-agent
       # pi shells out to npm to install the packages listed in its settings.
       pkgs.nodejs
       herdrPkg
     ];
 
-    # A hand-run `claude update` writes ~/.local/bin/claude and, because the
-    # agent's dotfiles prepend that directory, from then on shadows the
-    # wrapper above in every interactive shell — silently, since the herd
-    # reporter that never runs logs nothing. This path unit closes that
-    # window as it opens: the launcher's appearance triggers the removal of
-    # it and of the versions directory it points into. It cannot loop,
-    # because the service deletes exactly the path that armed it and the path
-    # unit only rearms if the file comes back. ConditionUser keeps it out of
-    # the operator's user manager, which owns no such install.
-    #
-    # The tmpfiles rules in nix/base.nix cover the same two paths for the
-    # case this unit cannot see: an update run while no user manager of the
-    # agent's was up. Boot and switch are the only moments those fire, which
-    # is exactly why they are a backstop and not the mechanism.
-    systemd.user.paths.claude-home-install-reap = {
-      description = "Watch for a self-updating claude install shadowing the wrapped one";
+    # A copy, not a store symlink: the link in the agent's home must point at a
+    # path that survives every rebuild, so that the keeper below can compare
+    # `readlink` against one constant.
+    environment.etc."yolobox/bin/claude" = {
+      source = lib.getExe claudeLauncher;
+      mode = "0555";
+    };
+
+    systemd.tmpfiles.rules = homeTmpfiles {
+      home = homeDir;
+      dirUser = agentUser;
+      dirs = [ ".local" ".local/bin" ];
+      links = [
+        { path = ".local/bin/claude"; argument = launcherPath; }
+        { path = ".local/bin/opencode"; argument = "${homeDir}/.opencode/bin/opencode"; }
+      ];
+    };
+
+    # tmpfiles only fires at boot and on switch, which is a window wide enough
+    # for a self-updating claude to install its own launcher over ours and go
+    # unnoticed until the next rebuild. This closes it at the moment it opens.
+    # The service writes only when something is actually wrong, so the write it
+    # makes retriggers the watch exactly once and then settles.
+    systemd.user.paths.yolobox-claude-launcher = {
+      description = "Watch the agent's claude launcher and version store";
       unitConfig.ConditionUser = agentUser;
       wantedBy = [ "paths.target" ];
-      pathConfig.PathExists = "%h/.local/bin/claude";
+      pathConfig.PathModified = [ "%h/.local/bin" "%h/.local/share/claude/versions" ];
     };
-    systemd.user.services.claude-home-install-reap = {
-      description = "Remove the self-updating claude install shadowing the wrapped one";
+    systemd.user.services.yolobox-claude-launcher = {
+      description = "Re-assert the box's claude launcher and prune old versions";
       unitConfig.ConditionUser = agentUser;
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = [
-          "${pkgs.coreutils}/bin/rm -rf %h/.local/bin/claude %h/.local/share/claude/versions"
-          "${pkgs.coreutils}/bin/echo 'removed ~/.local/bin/claude and ~/.local/share/claude/versions: a home claude install shadows the wrapped one on PATH and would run with no herd hooks'"
-        ];
+        ExecStart = lib.getExe claudeLauncherKeeper;
+      };
+    };
+
+    # The harnesses install themselves from their vendors, so the box needs no
+    # nixpkgs version of any of them — and gets their self-updates for free.
+    # StartLimitIntervalSec = 0 because the only expected failure is "no
+    # network yet", which Restart must keep retrying past systemd's default
+    # burst limit.
+    systemd.user.services.yolobox-harness-install = {
+      description = "Install claude, pi, opencode and their plugins from their vendors";
+      unitConfig = {
+        ConditionUser = agentUser;
+        StartLimitIntervalSec = 0;
+      };
+      wantedBy = [ "default.target" ];
+      after = [ "yolobox-claude-launcher.path" ];
+      # "${homeDir}/.local" first so `claude` here is the launcher, and so the
+      # npm-installed pi and agent-browser resolve as soon as they land.
+      path = [
+        "${homeDir}/.local"
+        pkgs.bash
+        pkgs.coreutils
+        pkgs.curl
+        pkgs.gnutar
+        pkgs.gzip
+        pkgs.zstd
+        pkgs.git
+        pkgs.nodejs
+        pkgs.findutils
+        pkgs.gnugrep
+        pkgs.jq
+      ];
+      environment = {
+        NPM_CONFIG_PREFIX = "${homeDir}/.local";
+        # Spelled out rather than inherited: this unit must not depend on PAM
+        # having reached the user manager with a login environment.
+        NIX_LD = "/run/current-system/sw/share/nix-ld/lib/ld.so";
+        NIX_LD_LIBRARY_PATH = "/run/current-system/sw/share/nix-ld/lib";
+        AGENT_BROWSER_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        Restart = "on-failure";
+        RestartSec = 20;
+        TimeoutStartSec = "20min";
+        ExecStart = lib.getExe harnessInstall;
       };
     };
 

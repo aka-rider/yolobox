@@ -30,11 +30,11 @@ buildNpmPackage rec {
   #
   # The second edit is unrelated to npm. t3's Claude capability probe used to
   # hardcode strictMcpConfig, and Claude Code refuses --strict-mcp-config
-  # whenever an enterprise MCP config is present — nix/mcp.nix used to render
-  # one at /etc/claude-code/managed-mcp.json. The probe then exited 1, t3
-  # swallowed the error, and its Claude provider silently reported no auth and
-  # no slash commands. nix/mcp.nix no longer ships an enterprise config (see
-  # that file), so the guard this sed works around no longer fires either way
+  # whenever an enterprise MCP config is present — a deleted nix/mcp.nix used
+  # to render one at /etc/claude-code/managed-mcp.json. The probe then exited
+  # 1, t3 swallowed the error, and its Claude provider silently reported no
+  # auth and no slash commands. Nothing renders an enterprise config any more,
+  # so the guard this sed works around no longer fires either way
   # — but the flip is left in place rather than reverted, because reverting it
   # buys nothing functionally and would rebuild t3 for no gain. The grep still
   # earns its keep as a canary: it turns a t3 bump that renames this field
