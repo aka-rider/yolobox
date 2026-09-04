@@ -240,6 +240,19 @@ git@github-iurii-tech` in the VM must greet two different names. "Could
 not resolve hostname" means the ssh config never arrived; the wrong name
 means the public keys did not.
 
+`SendEnv` is another value that must never ride a shared `ControlMaster`.
+Measured 2026-09-04 against the running box, same connection, only the
+`ControlPath` differing: over `~/.lima/yolobox/ssh-agent.sock` the guest
+saw none of the forwarded variables (`YOLOBOX_HERD`, `HERDR_PANE_ID`,
+`HERDR_SOCKET_PATH` in that test); with `ControlPath=none` all three
+arrived. The mux drops it with no error anywhere — the `-R` socket forward
+still works over the same shared connection, so the session looks wired:
+the socket appears in `/run/yolobox`, the reporter runs, sees none of its
+env, and exits 0 without logging. `ssh_run` now refuses to combine
+`mux=True` with any `SendEnv` option, rather than let the next caller who
+adds one to a multiplexed call rediscover this by watching a report vanish
+silently.
+
 ## The mirror: how a Mac path becomes a guest path
 
 `yo enter`, `yo code` and `yo zed` land in the guest twin of the Mac's
@@ -258,6 +271,19 @@ guest home, hidden directories pruned. `yo bootstrap` needs no mirrored
 path at all any more: it builds the VM straight from a flake ref
 (`github:aka-rider/yolobox/v<version>`), so there is nothing of yolobox's
 own to locate inside the guest.
+
+`yo link` no longer refuses outright the moment a Mac repo already carries
+a `yolobox` remote. It reads the existing URL first: an unrelated remote —
+one whose host is not `lima-yolobox` — is still refused, but a `yolobox`
+remote whose host is `lima-yolobox` and whose path is merely stale is
+updated in place with `git remote set-url`, and `yo` prints both the old
+and the new URL to stderr so the change is visible rather than silent.
+This is exactly the shape a recreated box leaves behind: every repo linked
+against a previous instance carries something like
+`ssh://lima-yolobox/home/xiii.guest/wrk/rune`, from before the
+operator/agent split moved projects to `/home/agent`, and before this fix
+the remedy was a manual `git remote remove yolobox` per repo before the
+next `yo link` would run at all.
 
 ## Per-project dev shells
 
@@ -585,17 +611,39 @@ at nixpkgs' `chromium` (151, cached for aarch64), and `agent-browser
 install` must never be run: it downloads a glibc Chrome for Testing that
 cannot execute here, and having run it leaves a binary that looks
 installed and is not. `PLAYWRIGHT_MCP_CAPS=vision,pdf` turns on the two
-capabilities that are off by default, and `PLAYWRIGHT_MCP_OUTPUT_DIR` is a
-flat `$HOME/artifacts`.
+capabilities that are off by default.
 
-Flat, because per-project artifact directories and per-project browser
-profiles are both gone with the wrappers that computed them. The plugin
-runs whatever `npx` gives it; nothing in the chain knows which project the
-session started in, and a `.mcp.json` cannot compute a directory. So one
-profile and one output directory for the box, and the firefox engine is
-gone too — the wrappers were what made two engines a thing at all. The old
-guard that refused loudly when the X socket was missing is gone with them;
-upstream's silent fall back to headless is what happens now.
+`PLAYWRIGHT_MCP_ISOLATED=1` is set box-wide, and isolated mode and a
+user-data-dir are mutually exclusive — the server throws when both are
+set. That is a deliberate choice: run every Playwright launch isolated,
+with no persistent profile at all, rather than maintain one, so no browser
+state — cookies, logins, anything — survives past the launch that created
+it. `PLAYWRIGHT_MCP_USER_DATA_DIR` must never be set alongside it.
+
+What the box's claude launcher (see "The harnesses come from their
+vendors; the box owns `~/.local/bin/claude`" below) does compute per
+project is the *output* directory, not a profile. Before `exec`, it
+derives the project — `git rev-parse --show-toplevel` relative to
+`$HOME`, slashes turned into `--`, falling back to the bare cwd when that
+fails — and exports
+`PLAYWRIGHT_MCP_OUTPUT_DIR=$HOME/artifacts/<project>`, creating the
+directory first. Snapshots and unnamed screenshots land there because
+Playwright honours that variable directly. A screenshot given an explicit
+`filename` does not: Playwright resolves an explicit name against the MCP
+workspace root — the first root the client advertised, else the server's
+own cwd — by upstream design (microsoft/playwright#42487, #42494), and
+Claude Code has advertised its own launch directory as MCP root #1 since
+2.1.203. Left alone, a named screenshot would therefore land inside
+whatever project checkout the session started in, exactly what keeping
+output under `~/artifacts` exists to prevent. `nix/herd-report.nix`'s
+second `PreToolUse` hook, `yolobox-playwright-artifacts`, catches this
+before the tool runs: it rewrites `filename` in the tool input, keeping a
+relative name's subpath under the output dir and reducing an absolute
+name to its basename there.
+
+The old guard that refused loudly when the X socket was missing is gone
+with the per-engine wrappers that used to carry it; upstream's silent
+fall back to headless is what happens now.
 
 Things learned the hard way, each one line:
 
@@ -649,7 +697,10 @@ box-owned `~/.local/bin/claude` launcher, which puts `--settings
 /etc/claude-code/herd-hooks.json` in front of every invocation (see "The
 harnesses come from their vendors; the box owns `~/.local/bin/claude`"
 below); that channel is always honoured and was verified to survive the
-mid-session refresh.
+mid-session refresh. That same file also carries the Playwright
+artifact-reroute hook (see "Browsers and the virtual display" above) —
+one settings file, two unrelated `PreToolUse` entries, both riding the one
+channel proven to survive the refresh.
 
 The absence of `~/.local/state/yolobox/herd-report.log` proves nothing: a
 hook that never runs writes nothing. When an agent is missing from the
@@ -889,21 +940,28 @@ from the stripped file. Version bump: pin the tarball hash; unpack, `jq
 'del(.overrides)'`, `npm install --package-lock-only --ignore-scripts`,
 vendor the lock; build with a wrong `npmDepsHash` and pin what nix reports.
 
-### Why dist/bin.mjs is patched
+### dist/bin.mjs is no longer patched
 
 t3's Claude probe hardcodes `strictMcpConfig: true`, which Claude Code
-refuses when an enterprise MCP config exists — and `nix/mcp.nix` once
-rendered one at `/etc/claude-code/managed-mcp.json`. t3 swallows the
-failure completely; nothing reaches journald. The evidence is
-`~/.t3/caches/claudeAgent.json`: `status: "warning"`, `auth: {"status":
-"unknown"}`, no slash commands. `postPatch` flips the flag to `false` with
-`sed` (`substituteInPlace` rejects the NUL bytes in `bin.mjs`), guarded by
-a `grep -q` so an upstream change fails the build loudly. The box now
-renders no enterprise config at all — `nix/mcp.nix` is gone — and passes
-claude no `--mcp-config` from anywhere, so the flip is very likely
-droppable; proving it needs a paired t3 session after a rebuild (see
-`TODO.md`). The cache survives rebuilds —
-delete it, restart the unit, read it back.
+refuses whenever an enterprise MCP config exists. That used to bite here:
+`nix/mcp.nix` once rendered one at `/etc/claude-code/managed-mcp.json`, t3
+swallowed the resulting failure completely with nothing reaching journald,
+and the only evidence was `~/.t3/caches/claudeAgent.json` reading
+`status: "warning"`, `auth: {"status": "unknown"}`, no slash commands.
+`postPatch` used to flip the flag to `false` with `sed`
+(`substituteInPlace` rejects the NUL bytes in `bin.mjs`), guarded by a
+`grep -q` so an upstream change to the probe would have failed the build
+loudly rather than silently stop patching it.
+
+`nix/mcp.nix` is gone entirely now, and the box passes claude no
+`--mcp-config` from anywhere, so there was nothing left for
+`strictMcpConfig` to trip over — the flip bought nothing here any more.
+Dropping it was verified against a rebuilt box the same way the flip's
+absence would have shown up as a regression: `rm
+~/.t3/caches/claudeAgent.json`, restart the unit, and the cache came back
+`status: "ready"`, `auth.status: "authenticated"`. The underlying bug is
+still real upstream — pingdotgg/t3code#5392 (2026-08-05) already reports
+it — so nothing is owed from this box.
 
 ### Why nix builds it
 

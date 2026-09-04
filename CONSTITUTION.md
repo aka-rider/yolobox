@@ -126,6 +126,8 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   spelled on the Mac. `yo` mirrors the logical spelling into the VM
   verbatim, so any other spelling matches nothing there.
 - NEVER copy a private key into the VM.
+- NEVER pass `SendEnv` over a multiplexed connection (`mux=True`). The mux
+  silently drops it, and `ssh_run` now refuses the combination.
 
 ## AWS credentials
 
@@ -172,6 +174,9 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 - NEVER add age-based tmpfiles cleanup for sockets in `/run/yolobox`. A
   live connection never touches the file, so an age would reap a working
   pane's socket.
+- NEVER set `PLAYWRIGHT_MCP_USER_DATA_DIR`. The box runs Playwright
+  isolated per launch, and the server throws when both an isolated launch
+  and a user-data-dir are set.
 
 ## Paths
 
@@ -193,7 +198,9 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   again, or the push lands on a diverged branch and is refused. That pull
   is also the sandbox's trust boundary: review the agent-authored commits
   before running anything they contain.
-- ALWAYS keep Playwright output in `~/artifacts/`, never inside the
-  project checkout, so the push channel never sees stray binaries. It is
-  flat, not per project: the official plugin runs `npx @playwright/mcp`
-  with nothing in the chain that knows which project a session is in.
+- ALWAYS keep Playwright output in `~/artifacts/<project>/`, never inside
+  the project checkout, so the push channel never sees stray binaries. The
+  box's claude launcher exports a per-project `PLAYWRIGHT_MCP_OUTPUT_DIR`
+  before exec, and a PreToolUse hook reroutes an explicit `filename` into
+  that same directory, because Playwright resolves an explicit name
+  against the checkout by design.
