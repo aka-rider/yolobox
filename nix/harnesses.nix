@@ -45,16 +45,18 @@ let
       cdup="$(git rev-parse --show-cdup 2>/dev/null || true)"
       top="$(cd "$PWD/$cdup" 2>/dev/null && pwd -L || printf '%s' "$PWD")"
       default_output_dir="$HOME/artifacts"
+      output_dir="''${PLAYWRIGHT_MCP_OUTPUT_DIR:-$default_output_dir}"
       case "$top" in
         "$HOME"/*)
           project="''${top#"$HOME/"}"
           project="''${project//\//--}"
-          if [ -z "''${PLAYWRIGHT_MCP_OUTPUT_DIR:-}" ] || [ "$PLAYWRIGHT_MCP_OUTPUT_DIR" = "$default_output_dir" ]; then
-            export PLAYWRIGHT_MCP_OUTPUT_DIR="$default_output_dir/$project"
+          if [ "$output_dir" = "$default_output_dir" ]; then
+            output_dir="$default_output_dir/$project"
           fi
           ;;
       esac
-      mkdir -p "$PLAYWRIGHT_MCP_OUTPUT_DIR"
+      export PLAYWRIGHT_MCP_OUTPUT_DIR="$output_dir"
+      mkdir -p "$output_dir"
 
       exec "$versions/$newest" --settings ${claudeHooksFile.path} "$@"
     '';
