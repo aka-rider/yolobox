@@ -140,8 +140,6 @@ let
       (builtins.readFile ./checks/herd-check.sh);
   };
 
-  piMcpAdapter = pkgs.callPackage ./pkgs/pi-mcp-adapter.nix { };
-
   piExtension = ''
     // yolobox pi herd-report extension — plain JavaScript. pi's extension
     // loader resolves TypeScript via jiti, but Node's `node --check`, which
@@ -221,8 +219,6 @@ let
     ${lib.getExe' pkgs.nodejs "node"} --check "$out"
   '';
 
-  piAdapterDir = "${piMcpAdapter}/lib/node_modules/pi-mcp-adapter";
-
   hookCmd = state: {
     hooks = [{ type = "command"; command = "${herdReport}/bin/yolobox-herd-report ${state} claude"; }];
   };
@@ -274,16 +270,11 @@ in
     };
 
     environment.etc."yolobox/pi/yolobox-agent-state.js".source = piExtensionChecked;
-    environment.etc."yolobox/pi/pi-mcp-adapter".source = piAdapterDir;
-    environment.etc."yolobox/pi/mcp-scripting".source = "${piAdapterDir}/skills/mcp-scripting";
 
     # ~/.pi/agent/settings.json belongs to ~/.dotfiles, so nothing VM-specific
     # may live in it. pi auto-discovers ~/.pi/agent/extensions (a .js file, or
-    # a directory whose package.json carries a "pi" manifest) and
-    # ~/.pi/agent/skills, and follows symlinks, so both entries ride L+ links
-    # instead. The adapter's manifest declares extensions AND skills;
-    # extension auto-discovery honours only the first, hence the separate
-    # link for its one skill.
+    # a directory whose package.json carries a "pi" manifest) and follows
+    # symlinks, so the extension rides an L+ link instead.
     #
     # Every link targets /etc, never a store path directly: a link is
     # rewritten only when the tmpfiles services run, whereas /etc flips on
@@ -295,7 +286,9 @@ in
     # which the server reserves for its own screen/session detection and
     # clears for a boxed agent — knocking pi out of the herd. The `r` rule
     # below deletes that file on every boot and switch (resetup), keeping
-    # yolobox:pi the only reporter.
+    # yolobox:pi the only reporter. The three `r` rules after it clear the
+    # links a retired MCP layer left behind: a dropped L+ link is not removed
+    # by the rebuild that drops it.
     systemd.tmpfiles.rules = homeTmpfiles {
       home = homeDir;
       dirUser = agentUser;
@@ -305,17 +298,12 @@ in
           path = ".pi/agent/extensions/yolobox-agent-state.js";
           argument = "/etc/yolobox/pi/yolobox-agent-state.js";
         }
-        {
-          path = ".pi/agent/extensions/pi-mcp-adapter";
-          argument = "/etc/yolobox/pi/pi-mcp-adapter";
-        }
-        {
-          path = ".pi/agent/skills/mcp-scripting";
-          argument = "/etc/yolobox/pi/mcp-scripting";
-        }
       ];
     } ++ [
       "r ${homeDir}/.pi/agent/extensions/herdr-agent-state.ts"
+      "r ${homeDir}/.pi/agent/extensions/pi-mcp-adapter"
+      "r ${homeDir}/.pi/agent/skills/mcp-scripting"
+      "r ${homeDir}/.config/mcp/mcp.json"
     ];
   };
 }
