@@ -126,6 +126,53 @@ let
     '';
   };
 
+  # Claude Code advertises its launch directory as MCP root #1, so
+  # @playwright/mcp resolves an explicit `filename` against the checkout by
+  # design (microsoft/playwright#42487). This hook rewrites that name into
+  # PLAYWRIGHT_MCP_OUTPUT_DIR before the tool runs.
+  #
+  # Every fallible command is guarded, so this can only ever exit 0 and print
+  # either nothing or one JSON line: writeShellApplication's `set -euo
+  # pipefail` would otherwise turn a missed guard into a hook failure on a
+  # tool call. It never emits `permissionDecision` — see the contract note at
+  # the jq call below.
+  playwrightArtifacts = pkgs.writeShellApplication {
+    name = "yolobox-playwright-artifacts";
+    runtimeInputs = [ pkgs.jq pkgs.coreutils ];
+    text = ''
+      input="$(timeout 2 cat 2>/dev/null || true)"
+
+      out="''${PLAYWRIGHT_MCP_OUTPUT_DIR:-}"
+      out="''${out%/}"
+
+      case "''${out}" in /*) ;; *) exit 0 ;; esac
+      [ -n "''${input}" ] || exit 0
+
+      tool_input="$(jq -c '.tool_input // empty' <<< "''${input}" 2>/dev/null || true)"
+      [ -n "''${tool_input}" ] || exit 0
+
+      filename="$(jq -r '.filename // empty' <<< "''${tool_input}" 2>/dev/null || true)"
+      [ -n "''${filename}" ] || exit 0
+
+      case "''${filename}" in
+          "''${out}"/*) exit 0 ;;
+          /*)           target="''${out}/$(basename -- "''${filename}")" ;;
+          *)            target="''${out}/''${filename#./}" ;;
+      esac
+
+      mkdir -p "$(dirname -- "''${target}")" 2>/dev/null || exit 0
+
+      # Claude Code's PreToolUse contract: `updatedInput` rewrites the tool's
+      # input, and with no `permissionDecision` alongside it decides nothing
+      # about permission.
+      jq -cn --argjson tool_input "''${tool_input}" --arg target "''${target}" \
+          '{hookSpecificOutput:{hookEventName:"PreToolUse",updatedInput:($tool_input + {filename:$target})}}' \
+          || exit 0
+
+      exit 0
+    '';
+  };
+
   # The guest half of `yo herd-check`. It lives here rather than in a checks
   # module of its own because it exercises exactly what this file renders:
   # the reporter, the hook map, and the forwarded socket they both depend on.
@@ -229,7 +276,7 @@ let
 in
 {
   config = {
-    environment.systemPackages = [ herdReport herdCheck ];
+    environment.systemPackages = [ herdReport herdCheck playwrightArtifacts ];
 
     # Hook map ported from tools/20-claude-code.sh:38-65 at 4c154fc
     # (SessionStart/UserPromptSubmit/PreToolUse/PermissionRequest/Stop/
@@ -262,11 +309,29 @@ in
     # `flagSettings` — what `--settings` produces — is added to the allowed
     # sources unconditionally and was verified to SURVIVE that mid-session
     # refresh. It is the only durable channel.
+    #
+    # The same file also carries the playwright reroute, for the same reason:
+    # it is the one hook channel that reaches claude. Claude Code advertises
+    # its launch directory as MCP root #1, so @playwright/mcp resolves an
+    # explicit `filename` into the checkout by design
+    # (microsoft/playwright#42487); the second PreToolUse entry rewrites that
+    # name into PLAYWRIGHT_MCP_OUTPUT_DIR through `updatedInput`, which
+    # changes the tool's input without deciding permission.
     environment.etc.${claudeHooksFile.etcPath}.text = builtins.toJSON {
       hooks = {
         SessionStart = [ (hookCmd "start") ];
         UserPromptSubmit = [ (hookCmd "working") ];
-        PreToolUse = [ ((hookCmd "working") // { matcher = "*"; }) ];
+        PreToolUse = [
+          ((hookCmd "working") // { matcher = "*"; })
+          {
+            matcher = "^mcp__plugin_playwright_playwright__browser_(take_screenshot|pdf_save|start_video)$";
+            hooks = [{
+              type = "command";
+              command = "${playwrightArtifacts}/bin/yolobox-playwright-artifacts";
+              timeout = 5;
+            }];
+          }
+        ];
         PermissionRequest = [ (hookCmd "blocked") ];
         Stop = [ (hookCmd "idle") ];
         SessionEnd = [ (hookCmd "release") ];
