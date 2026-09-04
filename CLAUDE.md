@@ -19,9 +19,10 @@ rules this file justifies.
 - `nix/base.nix` — filesystems, boot, sshd, tmpfiles, git defaults, the
   lima units, core packages.
 - `nix/podman.nix` — rootless podman with a docker-compatible socket.
-- `nix/harnesses.nix`, `nix/agentic.nix` — the coding agents and their
-  version overrides.
-- `nix/mcp.nix` — MCP servers declared once, rendered per harness.
+- `nix/harnesses.nix`, `nix/agentic.nix` — the coding agents: the
+  box-owned `claude` launcher, the user service that installs claude, pi,
+  opencode and agent-browser from their vendors, the user path unit that
+  re-asserts the launcher, and nix-built herdr.
 - `nix/herd-report.nix` — how in-VM agents report to the Mac's herd.
 - `nix/display.nix` — the virtual X display, browsers, screen recording.
 - `nix/lsp.nix` — the Python language-server wiring for every editor.
@@ -569,18 +570,32 @@ generation carries the option, so the switch must land before the resize —
 
 ## Browsers and the virtual display
 
-The nixpkgs `playwright-mcp` wrapper sets `PLAYWRIGHT_BROWSERS_PATH`
-unconditionally, so setting it in config is a no-op. It also exports
-`PLAYWRIGHT_MCP_ISOLATED=1` unless `PLAYWRIGHT_MCP_USER_DATA_DIR` is set,
-and passing both throws; the per-engine wrappers export the user-data-dir
-before `exec`.
+The display is still `:0`, 1920x1080, Xvfb with openbox on it, and
+`DISPLAY=:0` is still set box-wide — but nothing in this repo wraps a
+browser any more. Two vendor tools reach it instead: claude's official
+`playwright` plugin (`npx @playwright/mcp@latest`) and, for pi,
+`pi-agent-browser-native` over Vercel's `agent-browser` CLI. Playwright
+runs headed on the display because `DISPLAY` is set; agent-browser is
+headless unless told `--headed`.
 
-Upstream picks headless whenever `DISPLAY` is unset, silently. The wrapper
-checks the X socket itself and refuses loudly instead.
+The one thing the box must supply is the browser binary itself, because
+Playwright's own browser downloads do not run on NixOS. So both
+`PLAYWRIGHT_MCP_EXECUTABLE_PATH` and `AGENT_BROWSER_EXECUTABLE_PATH` point
+at nixpkgs' `chromium` (151, cached for aarch64), and `agent-browser
+install` must never be run: it downloads a glibc Chrome for Testing that
+cannot execute here, and having run it leaves a binary that looks
+installed and is not. `PLAYWRIGHT_MCP_CAPS=vision,pdf` turns on the two
+capabilities that are off by default, and `PLAYWRIGHT_MCP_OUTPUT_DIR` is a
+flat `$HOME/artifacts`.
 
-A browser profile is named after the git toplevel relative to the guest
-`$HOME`, slashes turned into `--`. A basename would merge `a/web` with
-`b/web` and split sessions started from a subdirectory.
+Flat, because per-project artifact directories and per-project browser
+profiles are both gone with the wrappers that computed them. The plugin
+runs whatever `npx` gives it; nothing in the chain knows which project the
+session started in, and a `.mcp.json` cannot compute a directory. So one
+profile and one output directory for the box, and the firefox engine is
+gone too — the wrappers were what made two engines a thing at all. The old
+guard that refused loudly when the X socket was missing is gone with them;
+upstream's silent fall back to headless is what happens now.
 
 Things learned the hard way, each one line:
 
@@ -594,13 +609,10 @@ Things learned the hard way, each one line:
   `SIGINT` finalizes the mp4; `SIGKILL` corrupts it.
 - Headed screenshots without `fonts.packages` render as tofu.
 - Default ffmpeg has no x11grab; `nix/display.nix` uses `ffmpeg-full`.
-- Two same-project sessions on one engine share one browser: Chromium's
-  singleton lock forwards the second launch (~8 s). Not isolation, not a
-  failure.
+- Two sessions share one browser: Chromium's singleton lock forwards the
+  second launch (~8 s). Not isolation, not a failure.
 - Chromium's storage flushes lazily; a session killed without
   `browser_close` can lose its last write.
-- `yolobox-mcp-smoke` creates a stray profile named after its own cwd.
-  Harmless.
 
 ## Herd reporting: recognising a silent failure
 
@@ -632,10 +644,12 @@ only the first non-empty one, no merge. `~/.claude/remote-settings.json`
 holds `{"channelsEnabled": true}`, which is enough to make the remote tier
 win and drop the `/etc` file whole, with no log line. The remote payload is
 re-applied about 180 ms into every session, so even an empty cache would
-not help. The policy channel is therefore unusable. The fix is a `claude`
-wrapper on the VM's PATH that prepends `--settings
-/etc/claude-code/herd-hooks.json`; that channel is always honoured and was
-verified to survive the mid-session refresh.
+not help. The policy channel is therefore unusable. The fix is the
+box-owned `~/.local/bin/claude` launcher, which puts `--settings
+/etc/claude-code/herd-hooks.json` in front of every invocation (see "The
+harnesses come from their vendors; the box owns `~/.local/bin/claude`"
+below); that channel is always honoured and was verified to survive the
+mid-session refresh.
 
 The absence of `~/.local/state/yolobox/herd-report.log` proves nothing: a
 hook that never runs writes nothing. When an agent is missing from the
@@ -677,88 +691,136 @@ Grep gotcha: filtering `/proc/<pid>/environ` needs
 `grep -E '^(YOLOBOX_HERD|HERDR_)'`. Writing `'^(HOME|HERDR_|PATH)='` binds
 the `=` after the alternation and matches nothing.
 
-## claude comes from nixpkgs, and must be the only claude in the box
+## The harnesses come from their vendors; the box owns `~/.local/bin/claude`
 
-The herd hook map reaches claude as `--settings <file>`, and nothing else
-delivers it (see "Herd reporting" above for why the policy channel cannot).
-That flag rides a wrapper — `symlinkJoin` + `wrapProgram` over nixpkgs'
-`claude-code` in `nix/harnesses.nix` — which works only for as long as the
-wrapper is the `claude` that PATH resolves to. So the version is nixpkgs'
-(`flake.nix` tracks the `nixos-unstable` *branch*, so `nix flake update`
-moves it; there is no per-version pin), and a second claude installation
-anywhere in the box is not a nicer delivery channel for the same binary, it
-is an installation that silently outranks this one.
+claude, pi, opencode and agent-browser are not nixpkgs packages any more.
+They install into the agent's home from their own vendors and self-update
+there, and the box gives up on owning their versions. What the box owns
+instead is one path: `~/.local/bin/claude`. That inversion is the whole
+design, and the reason for it is an outage this file used to describe from
+the other side.
 
-That last sentence was learned the expensive way. `657fc21` moved the version
-to upstream's self-updating install: `claude update` writes a ~216 MB binary
-to `~/.local/share/claude/versions/<version>` and points
-`~/.local/bin/claude` at it, and the wrapper was rewritten to exec that
-launcher when it exists, appending — never prepending — `~/.local/bin` to
-PATH so the wrapper still shadowed the launcher. The reasoning held that only
-`environment.localBinInPath` could prepend that directory. It was wrong
-within a day: the agent's own dotfiles do it too (`~/.dotfiles/zshrc:187`,
-`[[ -d "$HOME/.local/bin" ]] && export PATH="$HOME/.local/bin:$PATH"`), and
-`yo enter` ends with `exec "$SHELL" -l` (`yo:1227`) — an interactive login
-zsh, which sources them. The first `claude update` (2026-09-04 14:42,
-2.1.259 → 2.1.260) therefore ended herd reporting for every typed `claude`,
-box-wide. The general rule the box now follows: a wrapper cannot win a PATH
-race against a directory the box does not own.
+The herd hook map reaches claude only as `--settings <file>` — see "Herd
+reporting" above for why the `/etc/claude-code/managed-settings.json` tier
+cannot carry it — so whatever puts that flag on the command line has to be
+the `claude` a human session actually runs. Until now that was a nix
+wrapper on the system PATH. `657fc21` pointed the wrapper at upstream's
+self-updating install and appended, never prepended, `~/.local/bin` to
+PATH, on the theory that only `environment.localBinInPath` could prepend
+that directory. That was wrong within a day: the agent's own dotfiles
+prepend it too (`~/.dotfiles/zshrc:187`), and `yo enter` ends with `exec
+"$SHELL" -l`, an interactive login zsh that sources them. The first
+`claude update` (2026-09-04 14:42, 2.1.259 → 2.1.260) put a bare launcher
+ahead of the wrapper and ended herd reporting for every typed `claude`,
+box-wide. `d8db855` answered by making the box the only claude
+installation: DISABLE_AUTOUPDATER, a reaper that deleted any home install
+within a second, and a rule saying no second claude may exist.
 
-Recognise this class by the disagreement, not by an error, because there is
-no error anywhere. An unwrapped claude works perfectly and simply carries no
-hooks; the reporter that never runs logs nothing, so
-`~/.local/state/yolobox/herd-report.log` does not record a failure, it just
-stops. The one honest probe is to ask the two shells and compare:
+Both attempts were the same mistake in opposite directions — racing a
+directory the box does not own, then forbidding anything from living in
+it. The box now owns the path itself. `~/.local/bin/claude` is a tmpfiles
+`L+` link to `/etc/yolobox/bin/claude`, a launcher script that picks the
+newest binary under `~/.local/share/claude/versions/` and execs it with
+`--settings /etc/claude-code/herd-hooks.json` ahead of `"$@"`, so a user's
+own later `--settings` still wins. Anthropic documents (setup docs, since
+2.1.207) that a custom launcher at that path is left alone by `claude
+update` and by auto-update, which only drop new binaries into
+`versions/`. So the dotfiles may prepend `~/.local/bin` all they like: the
+first `claude` on PATH is the box's launcher either way, and `claude
+update` now works and is welcome. DISABLE_AUTOUPDATER and the reaper are
+gone.
+
+The custom launcher costs one thing: claude prunes old versions only when
+it owns the launcher, and each version is about 330 MB. So the same user
+path unit that guards the link, `yolobox-claude-launcher`, also prunes
+`versions/` to the two newest. It watches both `~/.local/bin` and
+`versions/`, re-links within a second when `readlink` disagrees, writes
+only when something is actually wrong (so the modification it causes
+settles rather than looping), and logs the one line saying it did. The
+tmpfiles rules at boot and on `switch` are the backstop for the window the
+path unit cannot see — an install made while no user manager of the
+agent's was running.
+
+The installs themselves come from `yolobox-harness-install`, a user
+oneshot gated `ConditionUser=agent` and wanted by `default.target`, so it
+runs at boot rather than at the first `yo enter`. Each phase is
+idempotent and checks before it acts: claude via `curl -fsSL
+https://claude.ai/install.sh | bash -s latest` when `versions/` is empty,
+then the marketplace and plugins (below); pi via `npm install -g
+--ignore-scripts @earendil-works/pi-coding-agent` — the package nixpkgs
+tracked, `@mariozechner/pi-coding-agent`, was deprecated in May 2026;
+agent-browser via `npm install -g agent-browser` **with** scripts, because
+its postinstall is what downloads the binary, followed by a hard `agent-browser
+--version` check, because that download fails silently; opencode via its
+own installer with `--no-modify-path`, into `~/.opencode/bin`, which a
+tmpfiles link from `~/.local/bin/opencode` makes reachable (the installer
+has no install-dir override). No vendor installer is ever allowed to edit
+an rc file. `NPM_CONFIG_PREFIX=$HOME/.local` puts every `npm -g` binary in
+`~/.local/bin` alongside the launcher, and `environment.localBinInPath`
+puts that directory on PATH for non-login shells too — `yo herd-check`'s
+`ssh_run` and t3 both run in one. t3's own unit carries
+`${homeDir}/.local` in its `path`, so a t3-spawned claude goes through the
+launcher and carries the hooks like any other.
+
+The agent account now lingers (`users.users.agent.linger`). That is what
+makes "at boot" true: without it the agent's user manager starts at the
+first login and stops at the last logout, so the install service, the
+launcher path unit and the podman prune timer would all wait for a
+session, and `/run/user/1000` would come and go underneath anything that
+kept a socket there. With lingering, all three run from boot and that
+runtime directory persists.
+
+Recognise a broken hook chain by the disagreement, not by an error,
+because there is no error anywhere: an unwrapped claude works perfectly
+and simply carries no hooks, and a reporter that never runs logs nothing
+— `~/.local/state/yolobox/herd-report.log` does not record a failure, it
+just stops. The honest probe is to ask the two shells and follow the link:
 
 ```sh
-zsh -lic 'command -v claude'   # what a human session gets
-bash -lc 'command -v claude'   # what an ssh command gets
+zsh -lic 'command -v claude'         # what a human session gets
+bash -lc 'command -v claude'         # what an ssh command gets
+readlink -f ~/.local/bin/claude      # where the link actually ends
 ```
 
-They must both answer `/run/current-system/sw/bin/claude`. During the
-incident the first answered `/home/agent/.local/bin/claude` and the second
-the wrapper — which is also why `yo herd-check` passed throughout: its guest
-half runs over `ssh_run(AGENT, ...)`, a non-interactive, non-login shell that
-never sources `~/.zshrc`, so stage 6 was measuring a shell nobody uses. Stage
-6 now resolves claude through the account's login shell instead, so the check
-fails where the human fails.
+The first two must both answer `/home/agent/.local/bin/claude`, and the
+third must be `/etc/yolobox/bin/claude`. During the 2026-09-04 incident
+the two shells disagreed, which is also why `yo herd-check` passed
+throughout: its guest half ran over a non-interactive, non-login shell
+that never sources `~/.zshrc`, so stage 6 was measuring a shell nobody
+uses. Stage 6 now resolves claude through the account's login shell and
+asserts the link target as well.
 
-Three things keep the box single-installation, in the order they act:
+## MCP: the vendors' own plugins, not files this repo renders
 
-- `environment.variables.DISABLE_AUTOUPDATER = "1"`, so nothing grows a home
-  install on its own. (nixpkgs' own `bin/claude` is a `makeCWrapper` that
-  already sets this for the process it starts; the box-wide variable covers a
-  claude started any other way.)
-- `systemd.user.paths.claude-home-install-reap`, gated `ConditionUser=agent`
-  like the podman prune timer: a hand-run `claude update` still writes the
-  launcher, and the path unit's `PathExists` fires within a second and
-  removes it along with the versions directory it points into. The reason is
-  in `journalctl --user -u claude-home-install-reap`. This is the mechanism,
-  because a window that closes only at the next `switch` is exactly how this
-  bug stayed invisible.
-- `r` and `R` tmpfiles rules in `nix/base.nix` as the backstop for the case
-  the path unit cannot see — an install made while no user manager of the
-  agent's was up. They fire at boot and on `switch` (see "tmpfiles rules
-  apply on `switch`").
+`nix/mcp.nix` is gone, and with it the three per-harness config files it
+rendered, `yolobox-mcp-smoke`, the per-engine playwright wrappers, the
+nixpkgs `playwright-mcp` and `context7-mcp` packages, the nix-built
+`pi-mcp-adapter` with its `mcp-scripting` skill, and `~/.config/mcp/mcp.json`.
+Declaring servers once and rendering them per harness was correct while
+every harness needed a file; it stopped being correct once each vendor
+grew its own registry, because the rendered files then compete with the
+registry rather than feed it.
 
-The cost, stated plainly: the box's claude moves only when `flake.lock` moves
-and someone runs `yo bootstrap`, and it lags upstream by whatever
-nixos-unstable lags — measured 2026-09-03, unstable carried 2.1.257 and
-master 2.1.258 against upstream's own 2.1.259, with upstream shipping about
-nine releases a week. That lag is the price of the hooks being guaranteed
-rather than usually present, and `claude update` inside the box now buys
-nothing: it downloads, installs, and has its launcher reaped before the next
-shell can find it.
+claude gets two plugins from the official marketplace, installed by
+`yolobox-harness-install` with `--scope user` after registering
+`anthropics/claude-plugins-official` (registration is required first on a
+non-interactive box) and recorded in `~/.claude/settings.json` under
+`enabledPlugins`: `context7@claude-plugins-official`, a remote HTTP MCP
+with no local runtime at all, and `playwright@claude-plugins-official`,
+which runs `npx @playwright/mcp@latest` and therefore wants network the
+first time each version is used. Because that file is where the installs
+are recorded, `~/.claude/settings.json` must not be a symlink into the
+dotfiles checkout, or plugin installs write there instead.
 
-Do not reintroduce a version pin to work around the lag. The old
-`yolobox.harness.claude-code.version`/`hash` escape hatch was deleted rather
-than repaired because nixpkgs rewrote
-`pkgs/by-name/cl/claude-code/package.nix` on 2026-08-26 ("claude-code: fetch
-zstd-compressed distribution") to fetch through an injectable `manifest`
-attribute carrying a per-platform checksum set, replacing the single scalar
-hash that hatch's `overrideAttrs` fed to a `fetchurl` of the raw binary. It
-would break at the next nixpkgs bump regardless. To move claude, move
-`flake.lock`.
+pi gets no MCP at all. `@upstash/context7-pi` is Upstash's own pi package,
+pure JS, exposing native pi tools; `pi-agent-browser-native` drives
+Vercel's `agent-browser` CLI the same way. Both go in with `pi install`,
+never by editing pi's settings file. The extension does not read
+`AGENT_BROWSER_EXECUTABLE_PATH` itself, so the install service points it
+at the browser explicitly with `pi-agent-browser-config`.
+
+opencode keeps only its LSP entry, which `nix/lsp.nix` now renders to
+`/etc/yolobox/lsp/opencode.json` and names through `OPENCODE_CONFIG`.
 
 ## pi's settings.json belongs to pi
 
@@ -780,10 +842,13 @@ module without an aarch64 prebuild cannot install. That dropped
 `@plannotator/pi-extension` (`node-pty` prebuilds darwin and win32 only).
 Prebuilt glibc packages like `@ast-grep/napi` are fine.
 
-Ownership: the flake owns `pi-mcp-adapter`, the herd-report extension and
-the `mcp-scripting` skill. Skills, agents, prompts, `cc-compat` and
-packages come from `~/.dotfiles/_do_install.sh`, re-run after a dotfiles
-pull. Two extensions registering the same tool name kill pi at startup —
+Ownership: the flake owns exactly one thing in pi's tree now, the
+herd-report extension. `pi-mcp-adapter` and the `mcp-scripting` skill went
+with `nix/mcp.nix`; their `L+` links are removed by `r` rules, because a
+dropped link is not removed by the rebuild that drops it. The context7 and
+agent-browser packages are installed with `pi install`, so pi owns them.
+Skills, agents, prompts, `cc-compat` and the rest of the packages come
+from `~/.dotfiles/_do_install.sh`, re-run after a dotfiles pull. Two extensions registering the same tool name kill pi at startup —
 that retired the flake's pi-lsp extension in favour of pi-lens. A retired
 `L+` link is not removed by the rebuild that drops it; delete it by hand.
 
@@ -833,9 +898,11 @@ failure completely; nothing reaches journald. The evidence is
 `~/.t3/caches/claudeAgent.json`: `status: "warning"`, `auth: {"status":
 "unknown"}`, no slash commands. `postPatch` flips the flag to `false` with
 `sed` (`substituteInPlace` rejects the NUL bytes in `bin.mjs`), guarded by
-a `grep -q` so an upstream change fails the build loudly. The enterprise
-config is gone, so the flip may be droppable; proving it needs a paired
-t3 session after a rebuild (see `TODO.md`). The cache survives rebuilds —
+a `grep -q` so an upstream change fails the build loudly. The box now
+renders no enterprise config at all — `nix/mcp.nix` is gone — and passes
+claude no `--mcp-config` from anywhere, so the flip is very likely
+droppable; proving it needs a paired t3 session after a rebuild (see
+`TODO.md`). The cache survives rebuilds —
 delete it, restart the unit, read it back.
 
 ### Why nix builds it
