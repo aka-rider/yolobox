@@ -38,14 +38,22 @@ let
 
       # The playwright plugin's stdio server inherits this process's
       # environment and reads PLAYWRIGHT_MCP_OUTPUT_DIR once at start, so the
-      # launcher is the only place left that can make it per project.
-      top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-      project="''${top#"$HOME/"}"
-      project="''${project//\//--}"
+      # launcher is the only place left that can make it per project. The
+      # project comes from the logical cwd, not git's physical toplevel:
+      # ~/wrk is a symlink to ~/Developer, and the repo mirrors logical
+      # paths, so show-toplevel would resolve the symlink away.
+      cdup="$(git rev-parse --show-cdup 2>/dev/null || true)"
+      top="$(cd "$PWD/$cdup" 2>/dev/null && pwd -L || printf '%s' "$PWD")"
       default_output_dir="$HOME/artifacts"
-      if [ -z "''${PLAYWRIGHT_MCP_OUTPUT_DIR:-}" ] || [ "$PLAYWRIGHT_MCP_OUTPUT_DIR" = "$default_output_dir" ]; then
-        export PLAYWRIGHT_MCP_OUTPUT_DIR="$default_output_dir/$project"
-      fi
+      case "$top" in
+        "$HOME"/*)
+          project="''${top#"$HOME/"}"
+          project="''${project//\//--}"
+          if [ -z "''${PLAYWRIGHT_MCP_OUTPUT_DIR:-}" ] || [ "$PLAYWRIGHT_MCP_OUTPUT_DIR" = "$default_output_dir" ]; then
+            export PLAYWRIGHT_MCP_OUTPUT_DIR="$default_output_dir/$project"
+          fi
+          ;;
+      esac
       mkdir -p "$PLAYWRIGHT_MCP_OUTPUT_DIR"
 
       exec "$versions/$newest" --settings ${claudeHooksFile.path} "$@"
@@ -56,6 +64,9 @@ let
     name = "yolobox-claude-launcher-keep";
     runtimeInputs = [ pkgs.coreutils pkgs.findutils ];
     text = ''
+      keep_versions=2
+      settle_minutes=10
+
       if [ "$(readlink "${launcherLink}" || true)" != "${launcherPath}" ]; then
         mkdir -p "$(dirname "${launcherLink}")"
         ln -sfn "${launcherPath}" "${launcherLink}.tmp"
@@ -63,11 +74,11 @@ let
         echo "relinked ${launcherLink} -> ${launcherPath}"
       fi
 
-      # Only versions the updater finished with more than ten minutes ago are
-      # candidates, so a download in flight is never a pruning target. Nothing
-      # else prunes them: keeping every version is precisely what the custom
-      # launcher buys, at ~330 MB each.
-      stale="$(find "${claudeVersionsDir}" -maxdepth 1 -type f -mmin +10 -printf '%f\n' 2>/dev/null | sort -V | head -n -2 || true)"
+      # Only versions the updater finished with more than $settle_minutes
+      # minutes ago are candidates, so a download in flight is never a
+      # pruning target. Nothing else prunes them: keeping every version is
+      # precisely what the custom launcher buys, at ~330 MB each.
+      stale="$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -mmin "+$settle_minutes" -printf '%f\n' 2>/dev/null | sort -V | head -n "-$keep_versions" || true)"
       if [ -n "$stale" ]; then
         while IFS= read -r version; do
           rm -f "${claudeVersionsDir}/$version"
@@ -88,7 +99,7 @@ let
       fi
       # Unconditional: the guarantee upstream documents covers updates, not the
       # initial `claude install` the installer script runs.
-      ln -sfn "${launcherPath}" "${launcherLink}"
+      ${lib.getExe claudeLauncherKeeper}
 
       claude plugin marketplace list 2>/dev/null | grep -q claude-plugins-official \
         || claude plugin marketplace add anthropics/claude-plugins-official
@@ -130,7 +141,8 @@ let
       # opencode installer has no install-dir override, hence the fixed link.
       [ -x "$HOME/.opencode/bin/opencode" ] \
         || curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
-      ln -sfn "$HOME/.opencode/bin/opencode" "${homeDir}/.local/bin/opencode"
+      ln -sfn "$HOME/.opencode/bin/opencode" "${homeDir}/.local/bin/opencode.tmp"
+      mv -T "${homeDir}/.local/bin/opencode.tmp" "${homeDir}/.local/bin/opencode"
 
       claude --version
       pi --version
