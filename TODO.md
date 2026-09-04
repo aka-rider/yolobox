@@ -70,3 +70,16 @@ directory from the cwd's repo toplevel and exports
 `PLAYWRIGHT_MCP_USER_DATA_DIR` / `PLAYWRIGHT_MCP_OUTPUT_DIR` before exec, with
 the plugin pointed at the wrapper. That reintroduces exactly the wrapper this
 change deleted, so it is worth waiting for real evidence first.
+
+## A named Playwright screenshot lands in the cwd, not in `~/artifacts`
+
+Measured 2026-09-04 against `@playwright/mcp` 1.63.0-alpha-2026-08-31 with
+`PLAYWRIGHT_MCP_OUTPUT_DIR=/home/agent/artifacts`: `browser_navigate`'s
+snapshot went to `~/artifacts/page-<ts>.yml` as configured, but
+`browser_take_screenshot` with `filename: "pw-smoke.png"` wrote
+`./pw-smoke.png` relative to the server's cwd. A session started inside a
+project checkout therefore puts a named screenshot into the repo, which is
+what the `~/artifacts` rule exists to prevent. Unnamed screenshots were not
+measured. Either instruct agents never to pass `filename`, or wrap `npx
+@playwright/mcp` to `cd` into `~/artifacts` before exec, which is the same
+wrapper the item above says to wait for.
