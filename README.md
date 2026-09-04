@@ -122,10 +122,13 @@ limactl stop yolobox && limactl edit yolobox --memory 16 --cpus 8 --start
 
 ## Browser & Virtual Display
 
-The VM runs a virtual display (`:0`, 1920x1080) with two Playwright MCP servers, `playwright-chromium` and `playwright-firefox`, so an agent can drive a real browser and take screenshots. Each project keeps its own
-browser profile, so logins survive between sessions.
+The VM runs a virtual display (`:0`, 1920x1080), so an agent can drive a real browser and take screenshots.
 
-Playwright MCP output — screenshots, PDFs, videos — stored in `~/artifacts/<project>/`, outside the git checkout. `yolobox-screen-record start|stop` records the whole display and writes flat into `~/artifacts/`, not per project.
+claude reaches it through the official `playwright` plugin, installed for you from Anthropic's marketplace; pi reaches it through `agent-browser`. Both drive the same Chromium the VM ships — Playwright's own browser downloads do not run on NixOS, so the box points them at it — headed on the display for Playwright, headless by default for `agent-browser`.
+
+Browser output — screenshots, PDFs, videos — is written to `~/artifacts/`, outside the project checkout, so the push channel never carries stray binaries. `yolobox-screen-record start|stop` records the whole display into the same place.
+
+The agents themselves (`claude`, `pi`, `opencode`) are installed from their vendors into the VM and update themselves; `claude update` works as usual.
 
 
 ## Credits
