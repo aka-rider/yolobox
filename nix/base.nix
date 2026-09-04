@@ -172,7 +172,20 @@
   # Owned by the agent, not the operator: sshd binds the -R herd forward as
   # the agent, and an operator-owned 0700 directory would break every
   # `yo enter`.
-  systemd.tmpfiles.rules = [ "d /run/yolobox 0700 ${agentUser} users -" ];
+  #
+  # The two claude rules are the boot-and-switch backstop for the user path
+  # unit in nix/harnesses.nix: a `claude update` run while no user manager of
+  # the agent's was up leaves ~/.local/bin/claude behind, and because the
+  # agent's dotfiles prepend that directory it would shadow the wrapped
+  # claude — and its herd hooks — in every later shell. `R` on the install
+  # root, not just the launcher, because the versions directory under it is
+  # what the launcher points into and is ~216 MB per version with nothing to
+  # prune it.
+  systemd.tmpfiles.rules = [
+    "d /run/yolobox 0700 ${agentUser} users -"
+    "r ${config.users.users.${agentUser}.home}/.local/bin/claude"
+    "R ${config.users.users.${agentUser}.home}/.local/share/claude"
+  ];
 
   security.sudo.wheelNeedsPassword = false;
   programs.zsh.enable = true;

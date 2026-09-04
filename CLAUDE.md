@@ -677,132 +677,88 @@ Grep gotcha: filtering `/proc/<pid>/environ` needs
 `grep -E '^(YOLOBOX_HERD|HERDR_)'`. Writing `'^(HOME|HERDR_|PATH)='` binds
 the `=` after the alternation and matches nothing.
 
-## claude's version belongs to itself now, not the flake pin
+## claude comes from nixpkgs, and must be the only claude in the box
 
-nixpkgs was never the bottleneck for how current the box's claude was:
-measured on 2026-09-03, nixos-unstable already carried 2.1.257 and
-nixpkgs master 2.1.258 against upstream's own 2.1.259, and upstream ships
-about nine releases a week (38 releases between 2.1.221 on 2026-08-03 and
-2.1.259 on 2026-09-02). The box itself still ran 2.1.238, because the only
-way its claude ever moved was a yolobox release bumping `flake.lock` and
-the operator running `yo bootstrap` — delivery was rebuild-bound, not
-nixpkgs-bound. So the version now belongs to upstream's own installer
-running inside `/home/agent`, exactly as it would on a laptop install:
-`claude update` and the background auto-updater manage a versions
-directory and a launcher symlink there, and the `claude` this box puts on
-PATH defers to that launcher whenever it exists.
+The herd hook map reaches claude as `--settings <file>`, and nothing else
+delivers it (see "Herd reporting" above for why the policy channel cannot).
+That flag rides a wrapper — `symlinkJoin` + `wrapProgram` over nixpkgs'
+`claude-code` in `nix/harnesses.nix` — which works only for as long as the
+wrapper is the `claude` that PATH resolves to. So the version is nixpkgs'
+(`flake.nix` tracks the `nixos-unstable` *branch*, so `nix flake update`
+moves it; there is no per-version pin), and a second claude installation
+anywhere in the box is not a nicer delivery channel for the same binary, it
+is an installation that silently outranks this one.
 
-The defect this replaces was subtle enough to be worth stating precisely.
-Measured directly in the running VM as the `agent` user, `claude update`
-run against the old nix store copy **already worked**: it wrote
-`/home/agent/.local/share/claude/versions/2.1.259` (a single ~216 MB
-native binary named by version) and pointed `~/.local/bin/claude` at it,
-and printed "Warning: Native installation exists but ~/.local/bin is not
-in your PATH". Nothing ever ran that copy. The `claude` on PATH resolved
-from `/run/current-system/sw/bin`, and `~/.local/bin` was never on the
-box's PATH at all, so a perfectly successful update produced an install
-every later session ignored — not an update that failed, but one whose
-result nothing ever reached.
+That last sentence was learned the expensive way. `657fc21` moved the version
+to upstream's self-updating install: `claude update` writes a ~216 MB binary
+to `~/.local/share/claude/versions/<version>` and points
+`~/.local/bin/claude` at it, and the wrapper was rewritten to exec that
+launcher when it exists, appending — never prepending — `~/.local/bin` to
+PATH so the wrapper still shadowed the launcher. The reasoning held that only
+`environment.localBinInPath` could prepend that directory. It was wrong
+within a day: the agent's own dotfiles do it too (`~/.dotfiles/zshrc:187`,
+`[[ -d "$HOME/.local/bin" ]] && export PATH="$HOME/.local/bin:$PATH"`), and
+`yo enter` ends with `exec "$SHELL" -l` (`yo:1227`) — an interactive login
+zsh, which sources them. The first `claude update` (2026-09-04 14:42,
+2.1.259 → 2.1.260) therefore ended herd reporting for every typed `claude`,
+box-wide. The general rule the box now follows: a wrapper cannot win a PATH
+race against a directory the box does not own.
 
-The new wrapper is a `writeShellScriptBin` script that appends
-`$HOME/.local/bin` to PATH and, when `$HOME/.local/bin/claude` is
-executable, execs it with `--mcp-config <file> --settings <file>` ahead of
-the user's own arguments. The PATH append is there for upstream's own
-check: `claude update` prints "Native installation exists but ~/.local/bin
-is not in your PATH" on every run until that directory is on PATH, and
-`DISABLE_INSTALLATION_CHECKS=1`, which upstream documents for "manually
-managing the installation location", was tried first and does not silence
-that particular warning. Appending rather than prepending is deliberate:
-`environment.localBinInPath` prepends, and with the bare launcher ahead of
-the wrapper every interactive shell would run an unwrapped claude that
-works perfectly and silently carries no herd hooks — the exact regression
-`nix/checks/herd-check.sh` stage 6 exists to catch. Appended, the wrapper
-keeps shadowing the launcher for `claude` while the check still sees its
-directory, and `claude doctor` reports "No installation issues found".
+Recognise this class by the disagreement, not by an error, because there is
+no error anywhere. An unwrapped claude works perfectly and simply carries no
+hooks; the reporter that never runs logs nothing, so
+`~/.local/state/yolobox/herd-report.log` does not record a failure, it just
+stops. The one honest probe is to ask the two shells and compare:
 
-The order of the two flags is load-bearing: `--mcp-config` is variadic
-and keeps consuming arguments until the next flag, so left last it would
-swallow a positional prompt (`claude 'say hi'` would die "MCP config file
-not found: .../say hi"); `--settings` after it bounds the variadic before
-the user's own arguments are reached. The wrapper execs the stock
-launcher rather than becoming it
-on purpose: since Claude Code 2.1.207, `claude update` manages
-`~/.local/bin/claude` only when nothing else put a launcher there. A
-custom launcher left sitting at that path is never replaced — every
-update since keeps landing another ~216 MB version beside it with nothing
-to prune the old ones, and `claude doctor` reports a launcher it did not
-create (https://code.claude.com/docs/en/setup). So the wrapper's whole
-job is to route to whichever launcher already exists, never to be that
-launcher itself.
+```sh
+zsh -lic 'command -v claude'   # what a human session gets
+bash -lc 'command -v claude'   # what an ssh command gets
+```
 
-On every fresh box, `$HOME/.local/bin/claude` does not exist yet, so the
-wrapper falls back to the pinned nix store copy and prints one line to
-stderr first: `claude: running the nix store copy <version>; run 'claude
-update' once to switch to the self-updating install under
-~/.local/share/claude`. That line is the only place anywhere that says
-which claude a given session is actually running — there is no `claude
---version`-in-a-banner or log line doing the same job, so recognise a
-box still on the store copy by that stderr notice, and treat its absence
-(once `~/.local/bin/claude` exists) as the signal that a session picked
-up the home install instead.
+They must both answer `/run/current-system/sw/bin/claude`. During the
+incident the first answered `/home/agent/.local/bin/claude` and the second
+the wrapper — which is also why `yo herd-check` passed throughout: its guest
+half runs over `ssh_run(AGENT, ...)`, a non-interactive, non-login shell that
+never sources `~/.zshrc`, so stage 6 was measuring a shell nobody uses. Stage
+6 now resolves claude through the account's login shell instead, so the check
+fails where the human fails.
 
-The home-directory binary runs unpatched because `programs.nix-ld.enable
-= true` was already set for unrelated reasons (`nix/base.nix:191`, with
-`programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl
-]`). Upstream's linux-arm64 binary sets its ELF interpreter to
-`/lib/ld-linux-aarch64.so.1`; NixOS ships no `/lib` of its own, so nothing
-would ordinarily be there to exec against. nix-ld is what creates that
-directory here, installs its shim at exactly that path, and resolves the
-binary's dynamic libraries against `NIX_LD_LIBRARY_PATH`, which is why
-this worked with no dedicated wiring of its own — verified directly with
-`/home/agent/.local/bin/claude --version` answering 2.1.259.
+Three things keep the box single-installation, in the order they act:
 
-Pinning and channel selection are upstream settings now, not nix options:
-`claude install <stable|latest|x.y.z>` (the channel named at install time
-becomes the default for later background updates), the `autoUpdatesChannel`
-setting, and a `minimumVersion` floor that both background updates and a
-manual `claude update` refuse to go below. Measured the same day as
-everything else here, upstream's own `stable` pointer sat at 2.1.236 —
-*older* than what the box had already been running before this change —
-so nothing in this box defaults anyone onto `stable`; `latest` is the
-sensible default given that. The release stream itself lives at
-https://downloads.claude.ai/claude-code-releases/, each version's
-manifest.json carrying a per-platform sha256 plus a detached
-manifest.json.sig signed by a key at
-https://downloads.claude.ai/keys/claude-code.asc (fingerprint 31DD DE24
-DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE); the installer verifies the
-sha256 but does not check the signature.
+- `environment.variables.DISABLE_AUTOUPDATER = "1"`, so nothing grows a home
+  install on its own. (nixpkgs' own `bin/claude` is a `makeCWrapper` that
+  already sets this for the process it starts; the box-wide variable covers a
+  claude started any other way.)
+- `systemd.user.paths.claude-home-install-reap`, gated `ConditionUser=agent`
+  like the podman prune timer: a hand-run `claude update` still writes the
+  launcher, and the path unit's `PathExists` fires within a second and
+  removes it along with the versions directory it points into. The reason is
+  in `journalctl --user -u claude-home-install-reap`. This is the mechanism,
+  because a window that closes only at the next `switch` is exactly how this
+  bug stayed invisible.
+- `r` and `R` tmpfiles rules in `nix/base.nix` as the backstop for the case
+  the path unit cannot see — an install made while no user manager of the
+  agent's was up. They fire at boot and on `switch` (see "tmpfiles rules
+  apply on `switch`").
 
-The `yolobox.harness.claude-code.version`/`hash` escape hatch this
-replaced was not merely unused — it was already broken. nixpkgs rewrote
-`pkgs/by-name/cl/claude-code/package.nix` on 2026-08-26 ("claude-code:
-fetch zstd-compressed distribution") to fetch a zstd-compressed binary
-through an injectable `manifest` attribute carrying the version plus a
-per-platform checksum set, replacing the single scalar hash the old
-hatch's `overrideAttrs` had fed to a `fetchurl` of the raw uncompressed
-binary. That override would have broken at the next nixpkgs bump whether
-or not this change happened; upstream pinning replaces the need for it
-entirely, so it was deleted rather than repaired. `DISABLE_AUTOUPDATER`,
-which used to sit box-wide in `environment.variables`, is gone with it —
-with the version no longer flake-pinned there is nothing left for it to
-hold still against.
+The cost, stated plainly: the box's claude moves only when `flake.lock` moves
+and someone runs `yo bootstrap`, and it lags upstream by whatever
+nixos-unstable lags — measured 2026-09-03, unstable carried 2.1.257 and
+master 2.1.258 against upstream's own 2.1.259, with upstream shipping about
+nine releases a week. That lag is the price of the hooks being guaranteed
+rather than usually present, and `claude update` inside the box now buys
+nothing: it downloads, installs, and has its launcher reaped before the next
+shell can find it.
 
-What this does not accomplish, stated plainly: the ~216 MB binary under
-`/home/agent` is agent-writable like everything else there, so the
-version an agent session actually runs is no longer fixed by the box's
-Nix closure. An agent — or anything running as it — can install any
-upstream version, bounded only by a `minimumVersion` someone bothers to
-set, and that install persists across sessions exactly like every other
-file under `/home/agent`, with no clean state short of recreating the VM
-outright. The nix store copy remains the fallback and is what a fresh box
-runs until someone runs `claude update` once. What still rides the
-wrapper unchanged, regardless of which binary it ends up exec'ing: the
-herd hook map and the MCP config, delivered as `--settings`/`--mcp-config`
-in that load-bearing order, ahead of the user's own arguments. t3
-(`nix/t3.nix`) spawns claude itself from `/run/current-system/sw` with
-`HOME=/home/agent`, so t3-spawned sessions go through the same wrapper and
-now pick up the home install too — which is exactly why those flags have
-to ride a wrapper rather than `yo enter`.
+Do not reintroduce a version pin to work around the lag. The old
+`yolobox.harness.claude-code.version`/`hash` escape hatch was deleted rather
+than repaired because nixpkgs rewrote
+`pkgs/by-name/cl/claude-code/package.nix` on 2026-08-26 ("claude-code: fetch
+zstd-compressed distribution") to fetch through an injectable `manifest`
+attribute carrying a per-platform checksum set, replacing the single scalar
+hash that hatch's `overrideAttrs` fed to a `fetchurl` of the raw binary. It
+would break at the next nixpkgs bump regardless. To move claude, move
+`flake.lock`.
 
 ## pi's settings.json belongs to pi
 
