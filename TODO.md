@@ -35,3 +35,19 @@
   yolobox` first. Least surprise would be to update a stale remote in place
   and say so on stderr, refusing only when the existing URL points somewhere
   that is not a yolobox guest path.
+
+## `SendEnv` is silently dropped over a shared `ControlMaster`
+
+Measured 2026-09-04 against the running box, same connection, only the
+`ControlPath` differing: over `~/.lima/yolobox/ssh-agent.sock` the guest saw
+none of `YOLOBOX_HERD` / `HERDR_PANE_ID` / `HERDR_SOCKET_PATH`; with
+`ControlPath=none` all three arrived. The `-R` socket forward still works over
+the mux, so the session looks wired: the socket appears in `/run/yolobox`, the
+reporter runs, sees no `YOLOBOX_HERD`, and exits 0 without logging — invisible
+in every direction.
+
+Nothing reaches this today, because `ssh_base()` defaults to
+`ControlPath=none` (`yo:305-306`) and only `guest_herd_version` passes
+`mux=True`, which carries no `SendEnv`. It is a trap for the next person who
+adds `SendEnv` to a multiplexed call: assert `ControlPath=none` wherever
+`send_env` is used, or have `send_env` refuse a mux argv outright.
