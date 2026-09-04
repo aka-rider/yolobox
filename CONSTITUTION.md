@@ -144,6 +144,10 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 - ALWAYS deliver hooks through the `claude` wrapper's `--settings` file.
   The `/etc/claude-code/managed-settings.json` tier is discarded whole
   whenever the remote-settings tier is non-empty, and it always is here.
+- NEVER let a second claude installation exist in the box. The wrapper
+  delivers the hooks only by being the `claude` that PATH resolves to, and
+  it cannot win a PATH race against `$HOME/.local/bin`, which the agent's
+  own dotfiles prepend. nixpkgs owns the version; a home install is reaped.
 - ALWAYS start agents that must appear in the herd with `yo enter`. Only
   it forwards the socket and sets the herd env; `yo ssh`, `yo code` and
   `yo zed` do not.

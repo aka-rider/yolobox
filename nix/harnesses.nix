@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, agentUser, ... }:
 let
   cfg = config.yolobox.harness;
 
@@ -23,8 +23,8 @@ let
   # time for its own bridge server, so the enterprise tier and t3 are
   # mutually exclusive.
   #
-  # The flags are added BEFORE "$@", so a user's own `--settings` or
-  # `--mcp-config` later on the command line still wins.
+  # --add-flags puts the flags BEFORE the user's arguments, so a user's own
+  # `--settings` or `--mcp-config` later on the command line still wins.
   #
   # The order of the two is load-bearing: `--mcp-config` is variadic
   # (`<configs...>`), so it keeps consuming arguments until the next one
@@ -33,31 +33,33 @@ let
   # Naming `--settings` after it bounds the variadic before user arguments
   # are reached.
   #
-  # This execs the stock launcher rather than replacing it: since Claude Code
-  # 2.1.207, `claude update` installs the real binary under
-  # ~/.local/share/claude/versions and points ~/.local/bin/claude at it, but
-  # only when that path was left alone. A custom launcher placed there stops
-  # version pruning (every update keeps piling up ~216MB files) and makes
-  # `claude doctor` report a launcher it did not create. So this wrapper
-  # stays on PATH as a nix store script and execs whichever install is
-  # current — the self-updating home copy once `claude update` has run once,
-  # the pinned nix store copy on a fresh box that has not run it yet.
+  # symlinkJoin + wrapProgram wraps the wrapper: upstream's bin/claude is
+  # already a makeCWrapper that sets DISABLE_AUTOUPDATER,
+  # FORCE_AUTOUPDATE_PLUGINS, DISABLE_INSTALLATION_CHECKS,
+  # USE_BUILTIN_RIPGREP, LD_LIBRARY_PATH and PATH. Wrapping the symlink to it
+  # leaves all of that intact and untouched. No meta is inherited on purpose:
+  # meta.license would drag the unfree check onto this derivation's own name,
+  # which allowUnfreePredicate below does not (and should not) list.
   #
-  # ~/.local/bin is appended to PATH, never prepended: `claude update` warns
-  # on every run when the launcher's directory is not on PATH at all, and
-  # DISABLE_INSTALLATION_CHECKS does not silence that particular warning.
-  # Appending satisfies the check while this wrapper still shadows the bare
-  # launcher. environment.localBinInPath would prepend instead, and the
-  # unwrapped launcher would then win in every interactive shell — claude
-  # keeps working and silently stops carrying the herd hooks.
-  claudeCodePkg = pkgs.writeShellScriptBin "claude" ''
-    export PATH="''${PATH}:''${HOME}/.local/bin"
-    if [ -x "''${HOME}/.local/bin/claude" ]; then
-      exec "''${HOME}/.local/bin/claude" --mcp-config ${claudeMcpFile.path} --settings ${claudeHooksFile.path} "''$@"
-    fi
-    echo "claude: running the nix store copy ${pkgs.claude-code.version}; run 'claude update' once to switch to the self-updating install under ~/.local/share/claude" >&2
-    exec ${pkgs.claude-code}/bin/claude --mcp-config ${claudeMcpFile.path} --settings ${claudeHooksFile.path} "''$@"
-  '';
+  # The box must therefore be the ONLY claude installation on it, and the
+  # reaper below enforces that. A wrapper delivers the hooks by being the
+  # `claude` that PATH resolves to, and it cannot win a PATH race against a
+  # directory the box does not own: the agent's own dotfiles PREPEND
+  # $HOME/.local/bin, and `yo enter` ends in an interactive login zsh, so the
+  # moment `claude update` writes a launcher there, every typed `claude` is
+  # the bare upstream one — no --settings, no hooks, no herd reporting, and
+  # no trace anywhere, because a reporter that never runs logs nothing.
+  # A self-updating home install is thus not a nicer delivery channel for the
+  # same binary; it is a second installation that silently outranks this one.
+  claudeCodePkg = pkgs.symlinkJoin {
+    name = "claude-code-herd-hooks-${pkgs.claude-code.version}";
+    paths = [ pkgs.claude-code ];
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    postBuild = ''
+      wrapProgram "$out/bin/claude" --add-flags "--mcp-config ${claudeMcpFile.path} --settings ${claudeHooksFile.path}"
+    '';
+    meta.mainProgram = "claude";
+  };
 
   herdrPkg = import ./lib/herdr-pkg.nix { inherit pkgs; cfg = cfg.herdr; };
 in
@@ -98,6 +100,12 @@ in
     # is nixpkgs' unfree harness.
     nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "claude-code" ];
 
+    # Upstream's own wrapper already sets this for the process it starts; the
+    # box-wide variable also reaches a claude started any other way, so no
+    # background updater can quietly grow the home install the reaper below
+    # exists to remove.
+    environment.variables.DISABLE_AUTOUPDATER = "1";
+
     environment.systemPackages = [
       claudeCodePkg
       pkgs.opencode
@@ -106,6 +114,38 @@ in
       pkgs.nodejs
       herdrPkg
     ];
+
+    # A hand-run `claude update` writes ~/.local/bin/claude and, because the
+    # agent's dotfiles prepend that directory, from then on shadows the
+    # wrapper above in every interactive shell — silently, since the herd
+    # reporter that never runs logs nothing. This path unit closes that
+    # window as it opens: the launcher's appearance triggers the removal of
+    # it and of the versions directory it points into. It cannot loop,
+    # because the service deletes exactly the path that armed it and the path
+    # unit only rearms if the file comes back. ConditionUser keeps it out of
+    # the operator's user manager, which owns no such install.
+    #
+    # The tmpfiles rules in nix/base.nix cover the same two paths for the
+    # case this unit cannot see: an update run while no user manager of the
+    # agent's was up. Boot and switch are the only moments those fire, which
+    # is exactly why they are a backstop and not the mechanism.
+    systemd.user.paths.claude-home-install-reap = {
+      description = "Watch for a self-updating claude install shadowing the wrapped one";
+      unitConfig.ConditionUser = agentUser;
+      wantedBy = [ "paths.target" ];
+      pathConfig.PathExists = "%h/.local/bin/claude";
+    };
+    systemd.user.services.claude-home-install-reap = {
+      description = "Remove the self-updating claude install shadowing the wrapped one";
+      unitConfig.ConditionUser = agentUser;
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = [
+          "${pkgs.coreutils}/bin/rm -rf %h/.local/bin/claude %h/.local/share/claude/versions"
+          "${pkgs.coreutils}/bin/echo 'removed ~/.local/bin/claude and ~/.local/share/claude/versions: a home claude install shadows the wrapped one on PATH and would run with no herd hooks'"
+        ];
+      };
+    };
 
     assertions = [
       {

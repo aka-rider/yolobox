@@ -24,6 +24,7 @@ HERD_HOOKS=@HERD_HOOKS@
 REPORT_LOG="${HOME:-/nonexistent}/.local/state/yolobox/herd-report.log"
 HERDR_TIMEOUT_S=5
 CLAUDE_TIMEOUT_S=120
+LOGIN_SHELL_TIMEOUT_S=15
 
 failures=""
 inconclusive=""
@@ -198,25 +199,68 @@ else
     fi
 fi
 
-# ------------------------------------- 6. the claude on PATH injects the flag
+# ------------------------- 6. the claude a human session runs injects the flag
 
 # The regression this stage exists to catch: an unwrapped claude keeps working
 # perfectly and simply stops reporting, with nothing logged anywhere. That is
 # how the herd stayed silently broken for weeks.
+#
+# Resolving `claude` in *this* shell is what let that regression through a
+# second time. `yo herd-check` runs this script over a non-interactive,
+# non-login ssh command, which sources no rc file at all, so PATH here is the
+# system one and `claude` resolves to the nix wrapper every time. A human
+# session is a different shell entirely: `yo enter` ends with `exec "$SHELL"
+# -l`, the agent's rc files prepend $HOME/.local/bin, and a launcher `claude
+# update` left there shadows the wrapper. Measured in the box, the two shells
+# genuinely disagreed — `bash -lc` answered /run/current-system/sw/bin/claude
+# while `zsh -lic` answered /home/agent/.local/bin/claude. So this stage asks
+# the agent's own login shell, interactively, and tests whatever *that*
+# answers.
+#
+# The shell comes from passwd field 7, not from $SHELL: $SHELL is whatever
+# sshd exported for this connection, which is exactly the value that would
+# hide the disagreement again.
 
-claude_bin=$(command -v claude 2>/dev/null || true)
+login_shell=$(getent passwd "$(id -un)" | cut -d: -f7)
+claude_bin=""
 claude_resolved=""
-if [ -n "${claude_bin}" ]; then
-    claude_resolved=$(readlink -f "${claude_bin}")
+resolve_rc=0
+
+if [ -n "${login_shell}" ] && [ -x "${login_shell}" ]; then
+    # stderr discarded: an interactive login shell sources the user's rc files
+    # and they are chatty. Their chatter can reach stdout too, so the last
+    # non-empty line is taken — `command -v` prints its answer last.
+    resolve_out=$(timeout "${LOGIN_SHELL_TIMEOUT_S}" "${login_shell}" -lic 'command -v claude' 2>/dev/null) || resolve_rc=$?
+    if [ "${resolve_rc}" -ne 124 ]; then
+        claude_bin=$(grep -v '^[[:space:]]*$' <<< "${resolve_out}" | tail -n 1) || true
+    fi
+    # `|| true`, because `command -v` need not answer with a path at all: zsh
+    # answers an aliased name with the alias definition, and `readlink -f` on
+    # that exits nonzero, which under errexit would kill this script outright
+    # instead of reporting the alias. The -x branch below is what reports it.
+    if [ -n "${claude_bin}" ]; then
+        claude_resolved=$(readlink -f "${claude_bin}" 2>/dev/null || true)
+        [ -n "${claude_resolved}" ] || claude_resolved="${claude_bin}"
+    fi
 fi
 
-if [ -z "${claude_bin}" ]; then
-    skip "claude --settings flag" "claude is not on PATH in this shell."
+if [ -z "${login_shell}" ] || [ ! -x "${login_shell}" ]; then
+    skip "claude --settings flag" \
+         "cannot determine the agent's login shell (passwd field 7 reads '${login_shell:-<empty>}'), so there is no way to resolve claude the way a human session does. Stages 6 and 7 prove nothing until that is fixed."
+elif [ "${resolve_rc}" -eq 124 ]; then
+    skip "claude --settings flag" \
+         "\`${login_shell} -lic 'command -v claude'\` did not finish within ${LOGIN_SHELL_TIMEOUT_S}s. An rc file that blocks on input hangs every \`yo enter\` the same way, so fix that first; until then this stage and stage 7 prove nothing."
+elif [ -z "${claude_bin}" ]; then
+    skip "claude --settings flag" \
+         "\`${login_shell} -lic 'command -v claude'\` (rc=${resolve_rc}) printed nothing — claude is not on PATH in an interactive login shell, which is the shell every \`yo enter\` lands in."
+elif [ ! -x "${claude_resolved}" ]; then
+    fail "claude --settings flag" \
+         "the login shell resolves claude to '${claude_bin}' (-> '${claude_resolved}'), which is not an executable file — a shell function or alias, most likely. Anything that is not the wrapper nix/harnesses.nix builds carries no hook map."
 elif grep -qaF "${HERD_HOOKS}" "${claude_resolved}"; then
-    ok "claude --settings flag — ${claude_bin} carries ${HERD_HOOKS}"
+    ok "claude --settings flag — the login shell resolves ${claude_bin}, which carries ${HERD_HOOKS}"
 else
     fail "claude --settings flag" \
-         "${claude_resolved} never mentions ${HERD_HOOKS}, so this claude is not the wrapper nix/harnesses.nix builds and no hook map reaches it at all. Do not paper over this by rendering /etc/claude-code/managed-settings.json instead: claude takes only the first non-empty of its three policy tiers, and this account's server-fetched remote settings are permanently non-empty, so that file is discarded wholesale and re-clobbered mid-session. Restore the writeShellScriptBin wrapper in nix/harnesses.nix and \`nixos-rebuild switch\`."
+         "${claude_resolved} never mentions ${HERD_HOOKS}, so the claude a human session runs is not the wrapper nix/harnesses.nix builds and no hook map reaches it at all. The usual cause is a launcher at \$HOME/.local/bin/claude, written by \`claude update\`: the login shell's rc prepends that directory, so it shadows the wrapper for every \`yo enter\` while a non-login shell still resolves the wrapper and looks fine. The box reaps such an install with a systemd user path unit; if one is still there, remove it and \`nixos-rebuild switch\`. Do not paper over this by rendering /etc/claude-code/managed-settings.json instead: claude takes only the first non-empty of its three policy tiers, and this account's server-fetched remote settings are permanently non-empty, so that file is discarded wholesale and re-clobbered mid-session."
 fi
 
 # --------------------------------------------- 7. claude actually fires the hooks
@@ -234,13 +278,15 @@ echo "--- the next stage starts claude with a one-word prompt: it makes one smal
 hook_marker="yolobox-herd-report"
 
 if [ -z "${claude_bin}" ]; then
-    skip "claude hook execution" "claude is not on PATH in this shell."
+    skip "claude hook execution" "stage 6 could not resolve a claude for the agent's login shell, so there is nothing to exercise here."
 else
     debug_dir=$(mktemp -d)
     debug_log="${debug_dir}/claude-debug.log"
     output_log="${debug_dir}/claude-output.log"
     claude_rc=0
-    timeout "${CLAUDE_TIMEOUT_S}" claude --debug --debug-file "${debug_log}" -p 'ok' > "${output_log}" 2>&1 &
+    # ${claude_bin}, not a bare `claude`: this stage must fire the hooks of the
+    # very binary a human session runs, which is the one stage 6 resolved.
+    timeout "${CLAUDE_TIMEOUT_S}" "${claude_bin}" --debug --debug-file "${debug_log}" -p 'ok' > "${output_log}" 2>&1 &
     claude_pid=$!
     reported=yes
 
