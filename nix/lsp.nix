@@ -4,13 +4,12 @@
 # servers (nixpkgs builds — Zed's/opencode's own npm downloads are
 # glibc-linked and do not run on NixOS), and direnv puts them on the
 # project PATH. Every consumer below therefore names bare binaries, never
-# store paths: resolution happens in the per-project environment, unlike
-# MCP servers (nix/mcp.nix), which are system-wide and must be absolute.
+# store paths: resolution happens in the per-project environment.
 #
-# opencode reads its LSP entries from the same global config as its MCP
-# servers (nix/mcp.nix's opencodeConfig, /etc/yolobox/mcp/opencode.json),
-# box-wide rather than per project; nix/lib/basedpyright.nix is the shared
-# constant both that render and this module build from.
+# opencode takes its LSP entries from one box-wide config rather than per
+# project, so this module owns /etc/yolobox/lsp/opencode.json and the
+# OPENCODE_CONFIG that points at it. nix/lib/basedpyright.nix is the shared
+# constant every render here builds from.
 { config, agentUser, ... }:
 let
   homeDir = config.users.users.${agentUser}.home;
@@ -39,6 +38,15 @@ in
     };
   environment.etc."yolobox/lsp/claude-basedpyright/.lsp.json".text =
     builtins.toJSON { basedpyright = basedpyrightLsp; };
+
+  environment.etc."yolobox/lsp/opencode.json".text = builtins.toJSON {
+    "$schema" = "https://opencode.ai/config.json";
+    lsp.basedpyright = {
+      command = [ basedpyrightLsp.command ] ++ basedpyrightLsp.args;
+      extensions = builtins.attrNames basedpyrightLsp.extensionToLanguage;
+    };
+  };
+  environment.variables.OPENCODE_CONFIG = "/etc/yolobox/lsp/opencode.json";
 
   # pi is absent from this module on purpose. It gains LSP from pi-lens, an
   # npm extension in the user layer (~/.dotfiles/pi/packages.json), which
