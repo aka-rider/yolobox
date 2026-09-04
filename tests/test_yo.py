@@ -1,5 +1,7 @@
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import os
 import socket
 import stat
@@ -118,7 +120,7 @@ class TestHerdForward(FakeHome):
 
 
 class TestSshRunArgv(FakeHome):
-    def capture_argv(self, **kwargs):
+    def capture_argv(self, role=None, **kwargs):
         seen = {}
 
         def fake_run(argv, **rest):
@@ -126,7 +128,7 @@ class TestSshRunArgv(FakeHome):
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         with mock.patch.object(yo, "run", fake_run):
-            yo.ssh_run(yo.OPERATOR, ["true"], **kwargs)
+            yo.ssh_run(role or yo.OPERATOR, ["true"], **kwargs)
         return seen["argv"]
 
     def test_no_stdin_closes_it_with_dash_n(self):
@@ -139,6 +141,100 @@ class TestSshRunArgv(FakeHome):
         argv = yo.ssh_base(yo.AGENT, mux=True)
         self.assertIn("User=agent", argv)
         self.assertIn("ControlPath=%s/.lima/yolobox/ssh-agent.sock" % self.home, argv)
+
+    def test_send_env_over_a_shared_control_master_is_refused(self):
+        opts = yo.send_env({"HERDR_PANE_ID": "x"})[0]
+        with self.assertRaises(yo.YoError):
+            self.capture_argv(yo.AGENT, extra_opts=opts, mux=True)
+
+    def test_send_env_on_an_unshared_connection_reaches_argv(self):
+        opts = yo.send_env({"HERDR_PANE_ID": "x"})[0]
+        argv = self.capture_argv(yo.AGENT, extra_opts=opts, mux=False)
+        self.assertIn("ControlPath=none", argv)
+        self.assertIn("SendEnv=HERDR_PANE_ID", argv)
+
+
+STALE_REMOTE = "ssh://lima-yolobox/home/xiii.guest/wrk/rune"
+
+
+class TestLinkRemoteAction(unittest.TestCase):
+    def setUp(self):
+        self.wanted = "ssh://agent@lima-yolobox/home/agent/wrk/rune"
+
+    def test_no_remote_is_added(self):
+        self.assertEqual(yo.link_remote_action(None, self.wanted), "add")
+        self.assertEqual(yo.link_remote_action("", self.wanted), "add")
+
+    def test_matching_remote_is_kept(self):
+        self.assertEqual(yo.link_remote_action(self.wanted, self.wanted), "keep")
+
+    def test_stale_yolobox_remote_is_updated(self):
+        self.assertEqual(yo.link_remote_action(STALE_REMOTE, self.wanted), "update")
+
+    def test_foreign_remote_is_refused(self):
+        with self.assertRaises(yo.YoError) as caught:
+            yo.link_remote_action("git@github.com:x/y.git", self.wanted)
+        self.assertIn("git@github.com:x/y.git", caught.exception.message)
+        self.assertIn("git remote remove yolobox", caught.exception.message)
+
+
+class TestLink(FakeHome):
+    def setUp(self):
+        super().setUp()
+        self.project = os.path.join(self.home, "wrk", "rune")
+        os.makedirs(self.project)
+        self.wanted = "ssh://agent@lima-yolobox%s/wrk/rune" % yo.AGENT_HOME
+        patcher = mock.patch.object(yo, "logical_cwd", lambda: self.project)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("require_agent_account", "agent_out"):
+            patcher = mock.patch.object(yo, name, mock.Mock(return_value=""))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def link(self, get_url):
+        calls = []
+
+        def fake_run(argv, **rest):
+            argv = list(argv)
+            calls.append(argv)
+            if "get-url" in argv:
+                return get_url
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        stderr = io.StringIO()
+        with mock.patch.object(yo, "run", fake_run):
+            with contextlib.redirect_stderr(stderr):
+                yo.cmd_link([])
+        return calls, stderr.getvalue()
+
+    def remote_subcommands(self, calls):
+        return [argv[3:] for argv in calls if argv[3:4] == ["remote"]]
+
+    def test_stale_remote_is_updated_in_place(self):
+        calls, stderr = self.link(
+            mock.Mock(returncode=0, stdout=STALE_REMOTE + "\n", stderr="")
+        )
+        subcommands = self.remote_subcommands(calls)
+        self.assertIn(["remote", "set-url", "yolobox", self.wanted], subcommands)
+        self.assertNotIn("add", [argv[1] for argv in subcommands])
+        self.assertIn("pointed at " + STALE_REMOTE, stderr)
+        self.assertIn("updated to " + self.wanted, stderr)
+
+    def test_missing_remote_is_added(self):
+        calls, stderr = self.link(mock.Mock(returncode=128, stdout="", stderr=""))
+        subcommands = self.remote_subcommands(calls)
+        self.assertIn(["remote", "add", "yolobox", self.wanted], subcommands)
+        self.assertNotIn("set-url", [argv[1] for argv in subcommands])
+        self.assertEqual(stderr, "")
+
+    def test_matching_remote_is_reported_and_left_alone(self):
+        calls, stderr = self.link(
+            mock.Mock(returncode=0, stdout=self.wanted, stderr="")
+        )
+        subcommands = self.remote_subcommands(calls)
+        self.assertEqual([argv[1] for argv in subcommands], ["get-url"])
+        self.assertIn("already points at " + self.wanted, stderr)
 
 
 INCLUDE = "Include ~/.lima/yolobox/ssh.config\n"

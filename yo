@@ -170,7 +170,8 @@ USAGE = r"""Usage: yo <command> [args]
 
   link
       Add a "yolobox" git remote to the current repo, pointing at the same
-      $HOME-relative path in the VM (created there if missing). Then
+      $HOME-relative path in the VM (created there if missing). A stale
+      yolobox remote left by a previous box is updated in place. Then
       "git push yolobox main" carries the project in.
 
   seed
@@ -342,6 +343,11 @@ def ssh_run(
     inherit_stdin: bool = False,
     binary: bool = False,
 ) -> subprocess.CompletedProcess:
+    if mux and any(opt.startswith("SendEnv=") for opt in extra_opts):
+        raise YoError(
+            "internal error: SendEnv is silently dropped over a shared ControlMaster; "
+            "run this call with mux=False (ControlPath=none)"
+        )
     cmd = ssh_base(role, mux=mux) + list(extra_opts)
     if stdin is None and not inherit_stdin:
         cmd.append("-n")
@@ -1389,6 +1395,19 @@ def cmd_pair(args: Sequence[str]) -> None:
     out(pair.stdout.rstrip("\n"))
 
 
+def link_remote_action(existing_url: Optional[str], wanted_url: str) -> str:
+    if not existing_url:
+        return "add"
+    if existing_url == wanted_url:
+        return "keep"
+    if urllib.parse.urlsplit(existing_url).hostname == VM_HOST:
+        return "update"
+    raise YoError(
+        "remote 'yolobox' points at %s, which is not this VM — "
+        "run \"git remote remove yolobox\" or fix it by hand" % existing_url
+    )
+
+
 def cmd_link(args: Sequence[str]) -> None:
     if args:
         raise usage_error("link takes no arguments")
@@ -1398,21 +1417,27 @@ def cmd_link(args: Sequence[str]) -> None:
         raise YoError("link must run inside a git repo")
     toplevel = os.path.normpath(os.path.join(logical_cwd(), cdup.stdout.strip()))
 
-    if run(["git", "-C", toplevel, "remote", "get-url", "yolobox"]).returncode == 0:
-        raise YoError("remote 'yolobox' already exists")
     if toplevel == home():
         raise YoError("refusing to link $HOME itself")
     vmdir = mirror(toplevel)
     if vmdir is None:
         raise YoError("repo must be under $HOME (it is at %s)" % toplevel)
     vmdir = guest_path(vmdir)
+    url = "ssh://%s@%s%s" % (AGENT_USER, VM_HOST, vmdir)
+
+    probe = run(["git", "-C", toplevel, "remote", "get-url", "yolobox"])
+    existing = probe.stdout.strip() if probe.returncode == 0 else None
+    action = link_remote_action(existing, url)
 
     agent_out(["sh", "-c", ENSURE_REPO, "sh", vmdir], check=True)
 
-    run(
-        ["git", "-C", toplevel, "remote", "add", "yolobox", "ssh://%s@%s%s" % (AGENT_USER, VM_HOST, vmdir)],
-        check=True,
-    )
+    if action == "add":
+        run(["git", "-C", toplevel, "remote", "add", "yolobox", url], check=True)
+    elif action == "update":
+        run(["git", "-C", toplevel, "remote", "set-url", "yolobox", url], check=True)
+        err("yo: remote 'yolobox' pointed at %s; updated to %s" % (existing, url))
+    else:
+        err("yo: remote 'yolobox' already points at %s" % url)
     run(
         [
             "git",
