@@ -24,7 +24,7 @@ let
   # --settings sits before "$@" so a user's own later --settings still wins.
   claudeLauncher = pkgs.writeShellApplication {
     name = "claude";
-    runtimeInputs = [ pkgs.coreutils pkgs.findutils ];
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.git ];
     text = ''
       versions="${claudeVersionsDir}"
       newest="$(find "$versions" -maxdepth 1 -type f -perm -u+x -printf '%f\n' 2>/dev/null | sort -V | tail -n 1 || true)"
@@ -35,6 +35,18 @@ let
         echo "  its output: journalctl --user -u yolobox-harness-install" >&2
         exit 127
       fi
+
+      # The playwright plugin's stdio server inherits this process's
+      # environment and reads PLAYWRIGHT_MCP_OUTPUT_DIR once at start, so the
+      # launcher is the only place left that can make it per project.
+      top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      project="''${top#"$HOME/"}"
+      project="''${project//\//--}"
+      default_output_dir="$HOME/artifacts"
+      if [ -z "''${PLAYWRIGHT_MCP_OUTPUT_DIR:-}" ] || [ "$PLAYWRIGHT_MCP_OUTPUT_DIR" = "$default_output_dir" ]; then
+        export PLAYWRIGHT_MCP_OUTPUT_DIR="$default_output_dir/$project"
+      fi
+      mkdir -p "$PLAYWRIGHT_MCP_OUTPUT_DIR"
 
       exec "$versions/$newest" --settings ${claudeHooksFile.path} "$@"
     '';

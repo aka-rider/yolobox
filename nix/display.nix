@@ -141,10 +141,13 @@ in
   # lists no `chromium` value for it. agent-browser finds the same chromium on
   # PATH; AGENT_BROWSER_EXECUTABLE_PATH is deliberately NOT set, because
   # pi-agent-browser-native disables its managed session restore whenever that
-  # variable is present.
+  # variable is present. Isolated mode and a user-data-dir are mutually
+  # exclusive — the server throws — so PLAYWRIGHT_MCP_USER_DATA_DIR must never
+  # be set alongside PLAYWRIGHT_MCP_ISOLATED.
   environment.variables = {
     DISPLAY = ":0";
     PLAYWRIGHT_MCP_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
+    PLAYWRIGHT_MCP_ISOLATED = "1";
     PLAYWRIGHT_MCP_OUTPUT_DIR = "$HOME/artifacts";
     PLAYWRIGHT_MCP_CAPS = "vision,pdf";
     PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
