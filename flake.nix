@@ -7,9 +7,16 @@
       url = "git+https://github.com/nixos-lima/nixos-lima.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Pinned to a release tag, not a branch: `nix flake update` moves a
+    # branch input onto whatever main happens to hold, which for a tool
+    # the box ships is an unreleased commit. Bump the tag to upgrade.
+    rune = {
+      url = "github:aka-rider/rune/v1.4.0";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, nixos-lima }:
+  outputs = { self, nixpkgs, nixos-lima, rune }:
     let
       # The release tag is the single source of truth for the version.
       # The release workflow writes .version from the tag and moves the
@@ -49,6 +56,7 @@
           inherit username agentUser version;
         };
         modules = [
+          { nixpkgs.overlays = [ (final: prev: { rune = rune.packages.aarch64-linux.rune; }) ]; }
           nixos-lima.nixosModules.lima
           ./nix/base.nix
           ./nix/podman.nix

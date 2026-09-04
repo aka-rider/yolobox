@@ -5,22 +5,6 @@ let
   claudeHooksFile = import ./lib/claude-hooks-file.nix;
   claudeMcpFile = import ./lib/claude-mcp-file.nix;
 
-  claudeCodeUnwrapped =
-    if cfg.claude-code.hash != null then
-      pkgs.claude-code.overrideAttrs (_: rec {
-        version = cfg.claude-code.version;
-        # Mirrors the fetchurl pattern in nixpkgs' own claude-code
-        # derivation (pkgs/by-name/cl/claude-code/package.nix): binaries are
-        # served per-platform from downloads.claude.ai, keyed by node's
-        # platform-arch pair, not by nixpkgs' own triple naming.
-        src = pkgs.fetchurl {
-          url = "https://downloads.claude.ai/claude-code-releases/${version}/${pkgs.stdenv.hostPlatform.node.platform}-${pkgs.stdenv.hostPlatform.node.arch}/claude";
-          hash = cfg.claude-code.hash;
-        };
-      })
-    else
-      pkgs.claude-code;
-
   # The herd hook map reaches claude only as `--settings <file>`; see the long
   # note in nix/herd-report.nix for why /etc/claude-code/managed-settings.json
   # is silently voided by a single unrelated key in the account's
@@ -39,8 +23,8 @@ let
   # time for its own bridge server, so the enterprise tier and t3 are
   # mutually exclusive.
   #
-  # --add-flags puts the flags BEFORE the user's arguments, so a user's own
-  # `--settings` or `--mcp-config` later on the command line still wins.
+  # The flags are added BEFORE "$@", so a user's own `--settings` or
+  # `--mcp-config` later on the command line still wins.
   #
   # The order of the two is load-bearing: `--mcp-config` is variadic
   # (`<configs...>`), so it keeps consuming arguments until the next one
@@ -49,40 +33,36 @@ let
   # Naming `--settings` after it bounds the variadic before user arguments
   # are reached.
   #
-  # symlinkJoin + wrapProgram wraps the wrapper: upstream's bin/claude is
-  # already a makeCWrapper that sets DISABLE_AUTOUPDATER,
-  # FORCE_AUTOUPDATE_PLUGINS, DISABLE_INSTALLATION_CHECKS,
-  # USE_BUILTIN_RIPGREP, LD_LIBRARY_PATH and PATH. Wrapping the symlink to it
-  # leaves all of that intact and untouched. No meta is inherited on purpose:
-  # meta.license would drag the unfree check onto this derivation's own name,
-  # which allowUnfreePredicate below does not (and should not) list.
-  claudeCodePkg = pkgs.symlinkJoin {
-    name = "claude-code-herd-hooks-${claudeCodeUnwrapped.version}";
-    paths = [ claudeCodeUnwrapped ];
-    nativeBuildInputs = [ pkgs.makeWrapper ];
-    postBuild = ''
-      wrapProgram "$out/bin/claude" --add-flags "--mcp-config ${claudeMcpFile.path} --settings ${claudeHooksFile.path}"
-    '';
-    meta.mainProgram = "claude";
-  };
+  # This execs the stock launcher rather than replacing it: since Claude Code
+  # 2.1.207, `claude update` installs the real binary under
+  # ~/.local/share/claude/versions and points ~/.local/bin/claude at it, but
+  # only when that path was left alone. A custom launcher placed there stops
+  # version pruning (every update keeps piling up ~216MB files) and makes
+  # `claude doctor` report a launcher it did not create. So this wrapper
+  # stays on PATH as a nix store script and execs whichever install is
+  # current — the self-updating home copy once `claude update` has run once,
+  # the pinned nix store copy on a fresh box that has not run it yet.
+  #
+  # ~/.local/bin is appended to PATH, never prepended: `claude update` warns
+  # on every run when the launcher's directory is not on PATH at all, and
+  # DISABLE_INSTALLATION_CHECKS does not silence that particular warning.
+  # Appending satisfies the check while this wrapper still shadows the bare
+  # launcher. environment.localBinInPath would prepend instead, and the
+  # unwrapped launcher would then win in every interactive shell — claude
+  # keeps working and silently stops carrying the herd hooks.
+  claudeCodePkg = pkgs.writeShellScriptBin "claude" ''
+    export PATH="''${PATH}:''${HOME}/.local/bin"
+    if [ -x "''${HOME}/.local/bin/claude" ]; then
+      exec "''${HOME}/.local/bin/claude" --mcp-config ${claudeMcpFile.path} --settings ${claudeHooksFile.path} "''$@"
+    fi
+    echo "claude: running the nix store copy ${pkgs.claude-code.version}; run 'claude update' once to switch to the self-updating install under ~/.local/share/claude" >&2
+    exec ${pkgs.claude-code}/bin/claude --mcp-config ${claudeMcpFile.path} --settings ${claudeHooksFile.path} "''$@"
+  '';
 
   herdrPkg = import ./lib/herdr-pkg.nix { inherit pkgs; cfg = cfg.herdr; };
 in
 {
   options.yolobox.harness = {
-    claude-code = {
-      version = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "Override claude-code's release version, bypassing nixpkgs' pin.";
-      };
-      hash = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "SRI hash of the overridden claude-code release binary. Setting this activates the override.";
-      };
-    };
-
     herdr = {
       # Defaulting to null means the guest tracks nixpkgs' herdr, so the
       # version is no longer a hand-copied duplicate of a host fact that
@@ -118,8 +98,6 @@ in
     # is nixpkgs' unfree harness.
     nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "claude-code" ];
 
-    environment.variables.DISABLE_AUTOUPDATER = "1";
-
     environment.systemPackages = [
       claudeCodePkg
       pkgs.opencode
@@ -130,10 +108,6 @@ in
     ];
 
     assertions = [
-      {
-        assertion = (cfg.claude-code.version == null) == (cfg.claude-code.hash == null);
-        message = "yolobox.harness.claude-code: version and hash must both be null or both be set.";
-      }
       {
         assertion = (cfg.herdr.version == null) == (cfg.herdr.hash == null);
         message = "yolobox.harness.herdr: version and hash must both be null or both be set.";
