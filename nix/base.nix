@@ -193,6 +193,11 @@
 
   programs.git = {
     enable = true;
+    # Not merely the git-lfs package: this also writes the filter.lfs
+    # clean/smudge/process entries into /etc/gitconfig, and without them a
+    # clone of an LFS repo silently checks out pointer files instead of
+    # content.
+    lfs.enable = true;
     config = {
       receive.denyCurrentBranch = "updateInstead";
       init.defaultBranch = "main";
@@ -229,6 +234,8 @@
     gh
     shellcheck
     shfmt
+    cloc
+    rune
     sqlite
     curl
     wget

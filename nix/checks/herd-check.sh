@@ -216,7 +216,7 @@ elif grep -qaF "${HERD_HOOKS}" "${claude_resolved}"; then
     ok "claude --settings flag — ${claude_bin} carries ${HERD_HOOKS}"
 else
     fail "claude --settings flag" \
-         "${claude_resolved} never mentions ${HERD_HOOKS}, so this claude is not the wrapper nix/harnesses.nix builds and no hook map reaches it at all. Do not paper over this by rendering /etc/claude-code/managed-settings.json instead: claude takes only the first non-empty of its three policy tiers, and this account's server-fetched remote settings are permanently non-empty, so that file is discarded wholesale and re-clobbered mid-session. Restore the symlinkJoin/wrapProgram wrapper and \`nixos-rebuild switch\`."
+         "${claude_resolved} never mentions ${HERD_HOOKS}, so this claude is not the wrapper nix/harnesses.nix builds and no hook map reaches it at all. Do not paper over this by rendering /etc/claude-code/managed-settings.json instead: claude takes only the first non-empty of its three policy tiers, and this account's server-fetched remote settings are permanently non-empty, so that file is discarded wholesale and re-clobbered mid-session. Restore the writeShellScriptBin wrapper in nix/harnesses.nix and \`nixos-rebuild switch\`."
 fi
 
 # --------------------------------------------- 7. claude actually fires the hooks

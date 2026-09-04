@@ -77,7 +77,29 @@
     "root": {
       "inputs": {
         "nixos-lima": "nixos-lima",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "rune": "rune"
+      }
+    },
+    "rune": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788164020,
+        "narHash": "sha256-Yr7BhZMyHcs4NsWgYv0do7FSz4g4/92po+YzBhdVR6s=",
+        "owner": "aka-rider",
+        "repo": "rune",
+        "rev": "4187dff138c4cdd9d4260b04690ebe0a1dd0eab2",
+        "type": "github"
+      },
+      "original": {
+        "owner": "aka-rider",
+        "ref": "v1.4.0",
+        "repo": "rune",
+        "type": "github"
       }
     }
   },
