@@ -135,15 +135,16 @@ in
     links = [ ];
   };
 
-  # Playwright's own browser downloads do not run on NixOS, and Vercel's
-  # agent-browser ships no browser at all, so both are pointed at the same nix
-  # chromium. PLAYWRIGHT_MCP_BROWSER is deliberately unset: the executable
-  # path overrides the channel anyway, and @playwright/mcp's README lists no
-  # `chromium` value for it.
+  # Playwright's own browser downloads do not run on NixOS, so the plugin is
+  # pointed at nix chromium. PLAYWRIGHT_MCP_BROWSER is deliberately unset: the
+  # executable path overrides the channel anyway, and @playwright/mcp's README
+  # lists no `chromium` value for it. agent-browser finds the same chromium on
+  # PATH; AGENT_BROWSER_EXECUTABLE_PATH is deliberately NOT set, because
+  # pi-agent-browser-native disables its managed session restore whenever that
+  # variable is present.
   environment.variables = {
     DISPLAY = ":0";
     PLAYWRIGHT_MCP_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
-    AGENT_BROWSER_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
     PLAYWRIGHT_MCP_OUTPUT_DIR = "$HOME/artifacts";
     PLAYWRIGHT_MCP_CAPS = "vision,pdf";
     PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";

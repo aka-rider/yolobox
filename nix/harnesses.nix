@@ -89,8 +89,10 @@ let
 
       # Scripts ON, unlike pi: agent-browser's postinstall IS the download of
       # its prebuilt binary. That download fails silently, so the version call
-      # below is the hard check rather than a courtesy.
-      command -v agent-browser >/dev/null || npm install -g agent-browser
+      # below is the hard check rather than a courtesy. Pinned because
+      # pi-agent-browser-native 0.5.0 refuses every browser-backed call
+      # against any agent-browser but exactly 0.34.0, at call time, not here.
+      command -v agent-browser >/dev/null || npm install -g agent-browser@0.34.0
       agent-browser --version
 
       for package in @upstash/context7-pi pi-agent-browser-native; do
@@ -107,7 +109,7 @@ let
       browser_config="$browser_config_dir/config.json"
       mkdir -p "$browser_config_dir"
       [ -f "$browser_config" ] || echo '{}' > "$browser_config"
-      jq --arg path "$AGENT_BROWSER_EXECUTABLE_PATH" \
+      jq --arg path "${lib.getExe pkgs.chromium}" \
         '.version = 1 | .browser.executablePath = $path' \
         "$browser_config" > "$browser_config.tmp"
       mv -f "$browser_config.tmp" "$browser_config"
@@ -240,7 +242,6 @@ in
         # having reached the user manager with a login environment.
         NIX_LD = "/run/current-system/sw/share/nix-ld/lib/ld.so";
         NIX_LD_LIBRARY_PATH = "/run/current-system/sw/share/nix-ld/lib";
-        AGENT_BROWSER_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
       };
       serviceConfig = {
         Type = "oneshot";
