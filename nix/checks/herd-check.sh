@@ -18,8 +18,9 @@
 # non-empty of its three policy tiers, and this account's server-fetched
 # remote settings are permanently non-empty, so the /etc managed file is
 # discarded wholesale. nix/herd-report.nix carries the full account; the hook
-# map therefore rides `--settings`, injected by the claude wrapper built in
-# nix/harnesses.nix, and stage 6 below is what keeps that wrapper honest.
+# map therefore rides `--settings`, injected by the box-owned launcher at
+# ~/.local/bin/claude (a symlink to /etc/yolobox/bin/claude), and stage 6
+# below is what keeps that launcher link honest.
 HERD_HOOKS=@HERD_HOOKS@
 REPORT_LOG="${HOME:-/nonexistent}/.local/state/yolobox/herd-report.log"
 HERDR_TIMEOUT_S=5
@@ -201,21 +202,24 @@ fi
 
 # ------------------------- 6. the claude a human session runs injects the flag
 
-# The regression this stage exists to catch: an unwrapped claude keeps working
-# perfectly and simply stops reporting, with nothing logged anywhere. That is
-# how the herd stayed silently broken for weeks.
+# The regression this stage exists to catch: a claude that does not run
+# through the box's launcher link (~/.local/bin/claude -> /etc/yolobox/bin/claude)
+# keeps working perfectly and simply stops reporting, with nothing logged
+# anywhere. That is how the herd stayed silently broken for weeks.
 #
 # Resolving `claude` in *this* shell is what let that regression through a
 # second time. `yo herd-check` runs this script over a non-interactive,
-# non-login ssh command, which sources no rc file at all, so PATH here is the
-# system one and `claude` resolves to the nix wrapper every time. A human
-# session is a different shell entirely: `yo enter` ends with `exec "$SHELL"
-# -l`, the agent's rc files prepend $HOME/.local/bin, and a launcher `claude
-# update` left there shadows the wrapper. Measured in the box, the two shells
-# genuinely disagreed — `bash -lc` answered /run/current-system/sw/bin/claude
-# while `zsh -lic` answered /home/agent/.local/bin/claude. So this stage asks
-# the agent's own login shell, interactively, and tests whatever *that*
-# answers.
+# non-login ssh command, which sources no rc file at all, so PATH here is
+# whatever the system sets, not necessarily what an interactive login shell
+# resolves once its rc files and PATH ordering run. A human session is a
+# different shell entirely: `yo enter` ends with `exec "$SHELL" -l`, and it is
+# exactly that shell's PATH and rc files that decide whether the launcher link
+# or something else answers first. Measured in the box during an earlier
+# defect (before the launcher link existed, when claude rode a nix wrapper),
+# the two shells genuinely disagreed — `bash -lc` answered one claude while
+# `zsh -lic` answered another. So this stage asks the agent's own login shell,
+# interactively, and tests whatever *that* answers, because that is the shell
+# every `yo enter` lands in.
 #
 # The shell comes from passwd field 7, not from $SHELL: $SHELL is whatever
 # sshd exported for this connection, which is exactly the value that would
@@ -244,6 +248,9 @@ if [ -n "${login_shell}" ] && [ -x "${login_shell}" ]; then
     fi
 fi
 
+claude_launcher_link=$(readlink "${HOME}/.local/bin/claude" 2>/dev/null) || claude_launcher_link=""
+claude_launcher_display=${claude_launcher_link:-<not a symlink>}
+
 if [ -z "${login_shell}" ] || [ ! -x "${login_shell}" ]; then
     skip "claude --settings flag" \
          "cannot determine the agent's login shell (passwd field 7 reads '${login_shell:-<empty>}'), so there is no way to resolve claude the way a human session does. Stages 6 and 7 prove nothing until that is fixed."
@@ -255,12 +262,15 @@ elif [ -z "${claude_bin}" ]; then
          "\`${login_shell} -lic 'command -v claude'\` (rc=${resolve_rc}) printed nothing — claude is not on PATH in an interactive login shell, which is the shell every \`yo enter\` lands in."
 elif [ ! -x "${claude_resolved}" ]; then
     fail "claude --settings flag" \
-         "the login shell resolves claude to '${claude_bin}' (-> '${claude_resolved}'), which is not an executable file — a shell function or alias, most likely. Anything that is not the wrapper nix/harnesses.nix builds carries no hook map."
+         "the login shell resolves claude to '${claude_bin}' (-> '${claude_resolved}'), which is not an executable file — a shell function or alias, most likely. Anything that is not the box's launcher link at \$HOME/.local/bin/claude (-> /etc/yolobox/bin/claude) carries no hook map."
+elif [ "${claude_launcher_link}" != "/etc/yolobox/bin/claude" ]; then
+    fail "claude launcher link" \
+         "\$HOME/.local/bin/claude resolves to '${claude_launcher_display}', not /etc/yolobox/bin/claude. yolobox-claude-launcher.path should have re-linked it within seconds of the mismatch appearing — check \`systemctl --user status yolobox-claude-launcher.path\` and \`journalctl --user -u yolobox-claude-launcher\`; if the unit itself never ran, a \`nixos-rebuild switch\` re-applies the tmpfiles link that seeds it."
 elif grep -qaF "${HERD_HOOKS}" "${claude_resolved}"; then
     ok "claude --settings flag — the login shell resolves ${claude_bin}, which carries ${HERD_HOOKS}"
 else
     fail "claude --settings flag" \
-         "${claude_resolved} never mentions ${HERD_HOOKS}, so the claude a human session runs is not the wrapper nix/harnesses.nix builds and no hook map reaches it at all. The usual cause is a launcher at \$HOME/.local/bin/claude, written by \`claude update\`: the login shell's rc prepends that directory, so it shadows the wrapper for every \`yo enter\` while a non-login shell still resolves the wrapper and looks fine. The box reaps such an install with a systemd user path unit; if one is still there, remove it and \`nixos-rebuild switch\`. Do not paper over this by rendering /etc/claude-code/managed-settings.json instead: claude takes only the first non-empty of its three policy tiers, and this account's server-fetched remote settings are permanently non-empty, so that file is discarded wholesale and re-clobbered mid-session."
+         "${claude_resolved} never mentions ${HERD_HOOKS}, so the claude a human session runs is not the box's launcher link (\$HOME/.local/bin/claude -> /etc/yolobox/bin/claude) and no hook map reaches it at all. yolobox-claude-launcher is what keeps that link in place — check \`systemctl --user status yolobox-claude-launcher.path\` and \`journalctl --user -u yolobox-claude-launcher\`, and confirm \$HOME/.local/bin/claude actually points where it should before treating this as anything else. Do not paper over this by rendering /etc/claude-code/managed-settings.json instead: claude takes only the first non-empty of its three policy tiers, and this account's server-fetched remote settings are permanently non-empty, so that file is discarded wholesale and re-clobbered mid-session."
 fi
 
 # --------------------------------------------- 7. claude actually fires the hooks
