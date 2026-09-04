@@ -141,13 +141,20 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 - ALWAYS keep the VM's herdr version equal to the Mac's Homebrew herdr.
   The wire protocol moved across a patch release; a mismatch rejects every
   report silently.
-- ALWAYS deliver hooks through the `claude` wrapper's `--settings` file.
-  The `/etc/claude-code/managed-settings.json` tier is discarded whole
+- ALWAYS deliver hooks through the box-owned `~/.local/bin/claude`
+  launcher's `--settings` file. The
+  `/etc/claude-code/managed-settings.json` tier is discarded whole
   whenever the remote-settings tier is non-empty, and it always is here.
-- NEVER let a second claude installation exist in the box. The wrapper
-  delivers the hooks only by being the `claude` that PATH resolves to, and
-  it cannot win a PATH race against `$HOME/.local/bin`, which the agent's
-  own dotfiles prepend. nixpkgs owns the version; a home install is reaped.
+- NEVER let anything but the box own `~/.local/bin/claude`. That path is
+  the only hook channel, and the agent's own dotfiles prepend the
+  directory to PATH, so nothing on the system PATH can win the race
+  against it. It is a tmpfiles `L+` link to `/etc/yolobox/bin/claude`,
+  re-asserted by `yolobox-claude-launcher`; `claude update` leaves a
+  custom launcher alone and is welcome.
+- NEVER run `agent-browser install`, and NEVER let a vendor installer edit
+  an rc file (`--no-modify-path`). The install downloads a glibc Chrome
+  for Testing that cannot execute on NixOS, and an installer-written rc
+  line changes PATH behind the box's back on the very path it owns.
 - ALWAYS start agents that must appear in the herd with `yo enter`. Only
   it forwards the socket and sets the herd env; `yo ssh`, `yo code` and
   `yo zed` do not.
@@ -186,5 +193,7 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   again, or the push lands on a diverged branch and is refused. That pull
   is also the sandbox's trust boundary: review the agent-authored commits
   before running anything they contain.
-- ALWAYS keep Playwright output in `~/artifacts/<project>/`, never inside
-  the project checkout, so the push channel never sees stray binaries.
+- ALWAYS keep Playwright output in `~/artifacts/`, never inside the
+  project checkout, so the push channel never sees stray binaries. It is
+  flat, not per project: the official plugin runs `npx @playwright/mcp`
+  with nothing in the chain that knows which project a session is in.
