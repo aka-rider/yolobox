@@ -721,6 +721,9 @@ herd, work down this ladder:
    `ptrace_scope=1`.
 3. `claude --debug` grepped for `Hook output` / `policySettings` — which
    channel won.
+4. `herdr pane report-agent <pane> --source yolobox:x --agent claude-vm
+   --state idle` landing while the same call with `--agent claude` does not
+   proves the process-exit latch below (release both afterwards).
 
 A measurement trap that fooled this twice: `claude -p '<prompt>'` runs the
 whole lifecycle in two seconds — `SessionStart`, `UserPromptSubmit`,
@@ -730,6 +733,45 @@ like hooks that never ran. Use an interactive `claude`, read the log, or
 watch the herd while the run is in flight. A leftover socket from a dead
 `yo enter` answers `server_not_running` and is harmless;
 `StreamLocalBindUnlink` lets the next `yo enter` rebind it.
+
+**The process-exit latch.** A third shape shows up per-pane rather than
+box-wide: `yo enter` then `claude` in the guest, and that one session never
+appears in herdr's agents list, while a second pane started the normal way
+works fine. Both launches are identical — same launcher, the same
+`YOLOBOX_HERD`/`HERDR_PANE_ID`/`HERDR_SOCKET_PATH`, the same forwarded
+socket answering `herdr status`, and no rejection anywhere in
+`~/.local/state/yolobox/herd-report.log` — because there is none to log:
+herdr's `report-agent` answers `ok` regardless. The discriminator is the
+pane, not the agent or the box: only a pane in which a *host-side* claude
+process had run and exited stays blind; a fresh split pane works, and pi
+in that same blind pane still reports fine. It first looked like "the
+first agent anywhere", because the box usually has no agent running yet
+right when a host-side claude has just quit — coincidence, not cause:
+herdr's detection is per pane (`src/pane.rs:2156-2178`), with no notion of
+a global agent count anywhere. The mechanism is a latch:
+`TerminalState::set_hook_authority_at` (`state.rs:633-652`) discards the
+report — returns `None`, while `report-agent` still answers `ok`
+(`src/app/api/panes.rs:1231-1257`) — whenever `recent_agent_process_exit`
+names the same agent kind the report carries, and that latch is armed by
+host-side process detection (`state.rs:399-405`) with no expiry: the only
+time-windowed check, `agent_process_exited_within` (`state.rs:249`), is
+compiled only for Windows and tests. It clears solely when detection sees
+that agent kind again or the pane's shell respawns — never on an `ssh`
+foreground process, which is exactly what a guest session leaves in place
+for as long as the pane lives. Six full-lifecycle hook sources
+(`herdr:pi` among them) are exempt by name; a hook-reported `claude` is
+not. Full writeup, with the repro and every file:line:
+`upstream/herdr-process-exit-latch.md`.
+
+Short of the upstream fix, `yo enter` now works around it: it reports a
+throwaway `claude` probe into the pane before connecting, reads it back,
+releases it, and warns on stderr naming the cause and the remedy (open a
+fresh pane or tab) when the read-back disagrees — then continues, because
+pi is unaffected. The guest reporter's `SessionStart` does the same
+read-back after its real report and fails loudly in claude's own UI when
+it was dropped, rather than leaving silence for the next person to misread
+as "the hooks never ran". `yo herd-check` stage 3 names this cause
+specifically, rather than stopping at "which channel won".
 
 The reporter always exits 0, with one exception: `SessionStart` exits 1 on
 a failed report and writes the diagnostic to stderr, where Claude Code

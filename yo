@@ -166,7 +166,10 @@ USAGE = r"""Usage: yo <command> [args]
       Shell in the VM as the unprivileged agent account, with the herd socket
       forwarded and the herd env set, so agents started there report to this
       Mac's herd. Exits 3 when this Mac's herdr version differs from the VM's;
-      YOLOBOX_SKIP_HERD_CHECK=1 overrides.
+      YOLOBOX_SKIP_HERD_CHECK=1 overrides. Also probes this pane for herdr's
+      per-pane claude latch (a host-side claude that ran and exited here
+      earlier silently drops every later claude report) and warns on stderr
+      rather than refusing when it finds one.
 
   link
       Add a "yolobox" git remote to the current repo, pointing at the same
@@ -601,6 +604,52 @@ def check_herd_drift(refuse: bool) -> None:
     herd_drift_report(host_version, guest.version)
     if refuse:
         raise YoError(None, code=3)
+
+
+def herd_probe_argv(pane_id: str) -> List[str]:
+    return ["herdr", "pane", "report-agent", pane_id, "--source", "yolobox:probe", "--agent", "claude", "--state", "idle"]
+
+
+def herd_probe_release_argv(pane_id: str) -> List[str]:
+    return ["herdr", "pane", "release-agent", pane_id, "--source", "yolobox:probe", "--agent", "claude"]
+
+
+def herd_pane_latch_warning() -> None:
+    err("yo: herdr will not show a claude started in this pane. A host-side claude ran and")
+    err("    exited here earlier, and herdr 0.8.x keeps a per-pane latch that silently drops")
+    err("    every later claude report (herdr src/terminal/state.rs:646, no expiry). Open a")
+    err("    fresh pane or tab and run yo enter there; other agent kinds in this pane are")
+    err("    unaffected.")
+
+
+def check_herd_pane_latch() -> None:
+    if shutil.which("herdr") is None:
+        return
+    if os.environ.get("HERDR_ENV") != "1":
+        return
+    pane_id = os.environ.get("HERDR_PANE_ID", "")
+    if not pane_id:
+        return
+
+    report = Report()
+    try:
+        if herdr_pane_agent(pane_id, report):
+            return
+        probe = run(herd_probe_argv(pane_id), merge_stderr=True)
+        if probe.returncode != 0:
+            err("yo: herdr pane latch probe failed: %s" % probe.stdout.strip())
+            return
+        try:
+            probed_agent = herdr_pane_agent(pane_id, report)
+        finally:
+            release = run(herd_probe_release_argv(pane_id), merge_stderr=True)
+            if release.returncode != 0:
+                err("yo: herdr pane latch probe release failed: %s" % release.stdout.strip())
+    except YoError:
+        return
+
+    if probed_agent != "claude":
+        herd_pane_latch_warning()
 
 
 @dataclass
@@ -1229,6 +1278,7 @@ def cmd_enter(args: Sequence[str]) -> None:
         env.update(broker.env)
 
     check_herd_drift(refuse=True)
+    check_herd_pane_latch()
 
     argv += ["-t", VM_HOST, remote(["cd", target]) + ' && exec "$SHELL" -l']
     exec_process(argv, env)

@@ -119,6 +119,20 @@ class TestHerdForward(FakeHome):
         self.assertEqual(forward.guest_sock, "/run/yolobox/herd-host.___x.sock")
 
 
+class TestHerdPaneProbeArgv(unittest.TestCase):
+    def test_probe_reports_claude_idle_under_the_probe_source(self):
+        self.assertEqual(
+            yo.herd_probe_argv("w1:p2"),
+            ["herdr", "pane", "report-agent", "w1:p2", "--source", "yolobox:probe", "--agent", "claude", "--state", "idle"],
+        )
+
+    def test_release_matches_the_probe_source_and_agent(self):
+        self.assertEqual(
+            yo.herd_probe_release_argv("w1:p2"),
+            ["herdr", "pane", "release-agent", "w1:p2", "--source", "yolobox:probe", "--agent", "claude"],
+        )
+
+
 class TestSshRunArgv(FakeHome):
     def capture_argv(self, role=None, **kwargs):
         seen = {}

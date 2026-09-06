@@ -148,7 +148,7 @@ if [ "${pane_rc}" -eq 0 ] && [ "${pane_agent}" = "claude" ] && [ "${pane_state}"
     ok "reporter round trip — pane ${HERDR_PANE_ID} reads back agent=claude state=idle"
 else
     fail "reporter round trip" \
-         "\`yolobox-herd-report idle claude\` (rc=${report_rc}${report_out:+, output: ${report_out}}) did not land: the pane reads agent=${pane_agent} state=${pane_state}. If stage 2 passed, the report reached a compatible server and was still dropped — check the source label (reports must use yolobox:<agent>, never herdr:<agent>, which the server reserves and clears for boxed agents)."
+         "\`yolobox-herd-report idle claude\` (rc=${report_rc}${report_out:+, output: ${report_out}}) did not land: the pane reads agent=${pane_agent} state=${pane_state}. If stage 2 passed, the report reached a compatible server and was still dropped — check the source label (reports must use yolobox:<agent>, never herdr:<agent>, which the server reserves and clears for boxed agents), or the pane carries herdr's process-exit latch: a host-side claude ran and exited in this pane, so herdr 0.8.x silently drops every claude report here (src/terminal/state.rs:646); rerun ./yo herd-check from a fresh pane."
     dump_diagnostics "${pane_json}"
 fi
 

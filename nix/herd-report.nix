@@ -7,7 +7,7 @@ let
 
   herdReport = pkgs.writeShellApplication {
     name = "yolobox-herd-report";
-    runtimeInputs = [ herdrPkg pkgs.coreutils ];
+    runtimeInputs = [ herdrPkg pkgs.coreutils pkgs.jq ];
     # Ported from herd-report.sh at 4c154fc, with its guards restructured for
     # set -e. CRITICAL: reports use the `yolobox:<agent>` source, NOT
     # `herdr:<agent>` — the server reserves herdr:* sources for its own
@@ -44,6 +44,18 @@ let
     # answers (reproduced by pointing HERDR_SOCKET_PATH at any non-herdr
     # socket), and these run as blocking Claude Code hooks, so every call is
     # capped by `timeout`.
+    #
+    # `start` also reads its own report back with `herdr pane get`, because
+    # the herdr API answers `ok` even when a report is accepted and then
+    # silently discarded. herdr 0.8.2 keeps a per-pane, per-agent-kind latch
+    # (TerminalState.recent_agent_process_exit, herdr src/terminal/
+    # state.rs:399-405) set whenever its own host-side process detection saw
+    # a native agent of that kind exit in this pane — a host `claude` quit
+    # earlier in the same pane, say — and while it is set every later
+    # `report-agent` for that kind is dropped (state.rs:646-652) with no
+    # error anywhere. It has no expiry and clears only when process
+    # detection sees that agent kind again or the pane's shell respawns, so
+    # only reading the pane back proves the report actually landed.
     text = ''
       state="''${1:-}"
       agent="''${2:-}"
@@ -119,6 +131,26 @@ let
               out=$(timeout "''${report_timeout}" herdr pane report-agent "''${HERDR_PANE_ID}" \
                   --source "yolobox:''${agent}" --agent "''${agent}" --state "''${report_state}" 2>&1) || rc=$?
               [ "''${rc}" -eq 0 ] || report_failed "''${report_state} ''${agent} (rc=''${rc}): ''${out}"
+
+              if [ "''${state}" = "start" ]; then
+                  pane_rc=0
+                  pane_json=$(timeout "''${report_timeout}" herdr pane get "''${HERDR_PANE_ID}" 2>&1) || pane_rc=$?
+                  if [ "''${pane_rc}" -ne 0 ]; then
+                      report_failed "start ''${agent} report-agent succeeded but the read-back \`herdr pane get ''${HERDR_PANE_ID}\` failed (rc=''${pane_rc}): ''${pane_json}"
+                  fi
+                  # Sentinels rather than jq's `null`, so a shape change (or a
+                  # server error object where a pane was expected) fails the
+                  # comparison loudly and names what actually came back,
+                  # instead of silently matching nothing. Same approach as
+                  # pane_field in nix/checks/herd-check.sh.
+                  pane_agent=$(jq -r 'if (.result.pane | type) != "object" then "<no-pane>"
+                                      elif (.result.pane | has("agent")) then (.result.pane.agent | tostring)
+                                      else "<missing>" end' <<< "''${pane_json}" 2>/dev/null) \
+                      || pane_agent="<unparseable>"
+                  if [ "''${pane_agent}" != "''${agent}" ]; then
+                      report_failed "herdr accepted the ''${agent} report for pane ''${HERDR_PANE_ID} and dropped it (pane reads agent=''${pane_agent}): a host-side ''${agent} ran and exited in this pane earlier, and herdr 0.8.x keeps a per-pane latch that discards every later ''${agent} report here (herdr src/terminal/state.rs:646, no expiry). Open a fresh pane or tab and rerun yo enter there; other agent kinds in this pane are unaffected."
+                  fi
+              fi
               ;;
       esac
 
