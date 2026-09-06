@@ -1,24 +1,16 @@
 # Upstream reports owed
 
-- lima-vm/lima: on guest-agent restart the host agent replaces its
-  `grpc.ClientConn`, but `pkg/portfwd/listener.go`'s `forwardTCP` keeps the
-  dialer an existing listener captured, so every forwarded port is dead
-  until the host agent restarts. Confirmed in v2.2.0 source, still present
-  on master as of 2026-09-05; nearest existing report is issue #4558, which
-  shows the same symptom with no diagnosis. Drafted, ready to post:
-  `/private/tmp/claude-501/-Users-xiii-Developer-yolobox/bed689c2-6eda-4ba5-957a-1bf6f878ef3e/scratchpad/lima-portfwd-issue.md`
-  — names the mechanism (`hostagent.go`'s `processGuestAgentEvents`,
-  `listener.go`'s `forwardTCP`, `client.go`'s `HandleTCPConnection`,
-  `getOrCreateClient`), gives the repro from a NixOS `switch` restarting
-  `lima-guestagent`, and suggests closing and re-registering listeners on
-  client replacement (or resolving the dialer through the current client
-  instead of capturing it once). Pinned shut here with
-  `restartIfChanged = false` on both lima units in `nix/base.nix`.
-- nixos-lima: `lima-init` and `lima-guestagent` should carry
-  `restartIfChanged = false` themselves, and `lima-init` also needs
-  `stopIfChanged = false` so its `Requires=` cannot drag the guestagent
-  down, since their unit text rehashes on every nixpkgs bump and a restart
-  triggers the lima bug above. Drafted, ready to post:
-  `/private/tmp/claude-501/-Users-xiii-Developer-yolobox/bed689c2-6eda-4ba5-957a-1bf6f878ef3e/scratchpad/nixos-lima-restartIfChanged.md`
-  — a two-hunk diff against `lima-init.nix` plus a PR description pointing
-  at the lima issue above for why the restart matters.
+Texts, diffs and the posting runbook live in `upstream/`; see `upstream/POST.md`.
+
+- lima-vm/lima issue: port forwards stay dead once the guest agent has been unreachable for more than 10 s, a regression from PR #4889 (v2.1.2). `upstream/lima-portfwd-issue.md`.
+- lima-vm/lima PR: resolve the guest agent client per dial instead of capturing it per listener. `upstream/lima-portfwd-pr.md`; the commit sits in the guest at `~/wrk/lima-vm/lima`.
+- nixos-lima PR: `restartIfChanged = false` on both lima units, because a nixpkgs bump alone restarts them and that triggers the bug above. `upstream/nixos-lima-no-restart-on-switch.md`, commit in the guest at `~/wrk/nixos-lima/nixos-lima`.
+
+# Known problems
+
+- `limactl stop` hung once on a throwaway instance whose forwards were in
+  the dead state above: three minutes, then `did not receive an event
+  with the "exiting" status`, host agent never exited, `limactl delete -f`
+  was the only way out. The recovery this repo documents for yolobox,
+  `limactl stop yolobox && ./yo up`, has worked so far; if it ever hangs,
+  that is the shape. Seen once on 2026-09-05, not isolated.

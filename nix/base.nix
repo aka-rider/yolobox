@@ -63,9 +63,10 @@
   # grpc.ClientConn, and on reconnect it replaces that conn but never
   # refreshes the dialer an existing listener already captured, so every
   # forwarded port accepts and then resets until the host agent itself is
-  # restarted. Both units must be pinned, not just the guestagent:
-  # stopIfChanged defaults to true, and a stopped lima-init drags the
-  # guestagent down through its Requires=. mkForce only on lima-init,
+  # restarted. That behaviour began with lima PR #4889 in v2.1.2, which
+  # closes the stale conn on reconnect. Both units must be pinned, not just
+  # the guestagent: systemd propagates a restart of lima-init to the
+  # guestagent through its Requires=. mkForce only on lima-init,
   # which upstream already assigns explicitly. New guestagent code lands on
   # the next boot, which is when the host agent is recreated anyway.
   systemd.services.lima-guestagent.restartIfChanged = false;

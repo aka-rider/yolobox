@@ -1010,8 +1010,15 @@ That asymmetry is the diagnosis. `~/.lima/yolobox/ha.stderr.log` repeats
 Lima 2.2.0 carries the guest-agent streams and the TCP tunnel on one grpc
 connection. When the guest agent restarts, the host agent dials a new
 connection, but an existing listener keeps its old dialer, so every
-forwarded port accepts and then resets, permanently. Unreported upstream
-(see `TODO.md`).
+forwarded port accepts and then resets, permanently. It is a regression
+from lima PR #4889, first shipped in v2.1.2, which closes the stale grpc
+connection on reconnect; before that the stale connection leaked but still
+carried traffic, so a box on lima older than v2.1.2 never showed this.
+The host agent replaces the connection only when the guest agent is
+still down 10 s after the event stream ended; a quick `systemctl restart
+lima-guestagent` stays inside that window and is harmless, a `switch`
+that re-runs `lima-init` first is not. Unreported upstream (see
+`TODO.md`).
 
 Why it bites here: `services.lima.enable` makes `lima-init` and
 `lima-guestagent` ordinary units whose text embeds store paths, so a
