@@ -2,11 +2,11 @@
 
 buildNpmPackage rec {
   pname = "t3";
-  version = "0.0.33";
+  version = "0.0.38";
 
   src = fetchurl {
     url = "https://registry.npmjs.org/t3/-/t3-${version}.tgz";
-    hash = "sha256-pgvwhuSi3oG32WrSXW0R/zcBxVXOR9AkbQ7271eMg2c=";
+    hash = "sha256-YLpXJXb8wGQllH59P71ve0+KoNQw/hxcTCTLVW4HQY8=";
   };
 
   # node-pty 1.1.0 publishes prebuilds for darwin and win32 only, so its
@@ -35,7 +35,7 @@ buildNpmPackage rec {
   '';
 
   npmDepsFetcherVersion = 2;
-  npmDepsHash = "sha256-7AlDllcn0LQs9+FaJWQ3PTlfLTlVuAYPqExCyyi9l3U=";
+  npmDepsHash = "sha256-S4uLWVZHi5oTWvP4av7oS9JNeESmKai0BjWX8DCtu0k=";
 
   # No "scripts" field at all — the tarball ships a prebuilt dist/.
   dontNpmBuild = true;
