@@ -215,6 +215,7 @@
       init.defaultBranch = "main";
     };
   };
+  programs.git-lfs.enable = true;
 
   # The AWS CLI's telemetry sqlite db lives under ~/.aws/cli/cache by default
   # — the one thing here that must never write anything under guest ~/.aws,
