@@ -432,7 +432,7 @@ while [ -n "$d" ] && [ ! -d "$d" ]; do d="${d%/*}"; done
 printf '%s\n' "${d:-$HOME}"
 """
 
-PROJECT_FIND = r"""find "$HOME" -mindepth 2 -maxdepth 5 \( -name ".*" ! -name .git \) -prune -o -name .git \( -type d -o -type f \) -printf "%h\0"
+PROJECT_FIND = r"""find "$HOME" -mindepth 2 \( -name ".*" ! -name .git \) -prune -o -name .git \( -type d -o -type f \) -printf "%h\0"
 """
 
 GITCONFIG_ROOTS_FIND = r"""find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\0"
