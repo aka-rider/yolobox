@@ -13,7 +13,8 @@ rules this file justifies.
 
 - `yo` — the Mac-side CLI, a single Python 3.9 file with no dependencies
   beyond the stdlib. Everything the Mac does to the VM goes through it;
-  `yo --help` describes each command.
+  `yo --help` lists each command, and `yo <command> --help` gives that
+  command's fuller prose.
 - `flake.nix` — wires the modules together and threads the host username
   in.
 - `nix/base.nix` — filesystems, boot, sshd, tmpfiles, git defaults, the
@@ -28,6 +29,9 @@ rules this file justifies.
 - `nix/lsp.nix` — the Python language-server wiring for every editor.
 - `nix/t3.nix`, `nix/pkgs/t3.nix` — t3code built from npm and run as a
   service.
+- `nix/guest.nix`, `nix/guest/yolobox-guest.sh` — the guest-side half of
+  `yo`'s shell (project walk, gc tiers, AWS probe and the rest), built and
+  shellchecked as one package, `yolobox-guest`, on both accounts' PATH.
 - `nix/pkgs/` — packages nixpkgs lacks or lags on.
 - `lima/yolobox.yaml` — read once, when the instance is created.
 - `templates/default` — `devbox.json` and `.envrc` for a new project.
@@ -322,15 +326,154 @@ still disagree (the half-failed bootloader install from the ESP section
 below).
 
 A project is any git repo at any depth under the guest home, not only
-`<group>/<repo>` — a monorepo puts one at depth 7. So the walk in
-`vm_project_pick` is bounded by pruning `node_modules`, `target`, `.next`
-and every hidden directory (`.git` itself included), not by a depth cap,
-because a depth cap has to be re-guessed every time a monorepo nests one
-level deeper. Recognise
-the failure by its shape: a cap surfaces as fzf reporting "no project matches"
-for a repo that plainly exists, so what to check is the list handed to fzf, not
-fzf. `yo gc`'s `project_targets` carried the same cap, which made `--deep`
-blind to build directories inside monorepo projects.
+`<group>/<repo>` — a monorepo puts one at depth 7. So the walk —
+`yolobox-guest projects`, reached from `pick_project` in `yo` — is bounded
+by pruning `BUILD_DIRS` (`node_modules`, `target`, `.next`) and every
+hidden directory (`.git` itself included), not by a depth cap, because a
+depth cap has to be re-guessed every time a monorepo nests one level
+deeper. That pruning is real today; it was not always, and the gap between
+the two is worth recognising on its own. `a1c8c9b` ("fix: remove maxdepth
+from fuzzy project search") deleted the `-maxdepth 5` the walk used to
+carry — a regression, because nothing replaced the depth bound it was also
+accidentally providing — but the defect it exposed was already there
+before that commit, just masked. `-mindepth` is a *global* find option: it
+suppresses evaluation of the whole expression — `-prune` is a test, so it
+is suppressed too — for every entry above the given depth. The walk ran at
+`-mindepth 2`, so every top-level dotdir, `~/.local` included, was never
+tested against `-name '.*'` and never pruned; find walked straight into
+whatever it held, which in the incident that surfaced this was podman's
+0700 volume storage. GNU find exits 1 on any unreadable directory, and the
+walk's exit code used to be checked unconditionally, so the whole command
+aborted and the project list already gathered was thrown away with it.
+Recognise that shape: `yo enter <fuzzy>` used to die with a find
+`Permission denied` and no project list at all, even though the walk had
+already found real projects before it ever reached the unreadable one.
+`-maxdepth 5` had hidden the `-mindepth` hole for as long as the podman
+volume sat below depth 5, which is exactly what made `a1c8c9b` look like a
+clean fix and not a regression at the time. The walk is now `-mindepth 1`,
+prunes every top-level dotdir explicitly rather than leaning on a maxdepth
+to keep it out of reach, and an unreadable directory now warns — via `yo`
+printing find's own stderr — and continues with the partial list rather
+than discarding it; only an empty list still refuses with "no projects in
+the VM".
+
+Pruning `BUILD_DIRS` is new behaviour, and it opens a failure shape that
+looks exactly like the old maxdepth-cap symptom: a repo literally named
+`target`, `node_modules` or `.next` is now invisible to the picker, and
+fzf says "no project matches" for a repo that plainly exists — the same
+wording the maxdepth cap used to produce for an unrelated reason. Do not
+assume "no project matches" means the cap is back; check first whether the
+repo's own directory name collides with `BUILD_DIRS`.
+
+## The guest helper: yo's shell moved into the box
+
+`nix/guest/yolobox-guest.sh`, built by `nix/guest.nix` into the
+`yolobox-guest` package and put on both accounts' `PATH`, is where `yo`'s
+guest-side logic lives now: the project walk, the gitconfig-root walk, the
+landing-dir ancestor walk, `ensure-repo`, `generations`, both `gc` tiers,
+and the AWS probe. Before this it was ~200 lines of bash trapped inside
+Python string constants (`PROJECT_FIND`, `GC_MACHINE`, and the rest), and
+nothing checked any of it — no shellcheck, no `bash -n`, no test that ever
+exercised a single find expression. `writeShellApplication` buys three
+things a Python string literal never could: a build-time shellcheck pass,
+so a bad find expression is now a *build* error rather than a runtime one
+(this file's own "fail at the earliest stage" rule, finally reaching this
+bash); `set -euo pipefail`; and a pinned `runtimeInputs` PATH. `yo` reaches
+every subcommand the same way, `ssh ... yolobox-guest <sub> [args]`, one
+account per subcommand: `projects`, `home-roots`, `landing-dir`,
+`ensure-repo`, `gc-user` and `aws-check` run as the agent; `generations`
+and `gc-machine` run as the operator, because ext4's root reserve — the
+thing that makes any of this recoverable on a genuinely full disk — is the
+operator's alone.
+
+`BUILD_DIRS` (`node_modules`, `target`, `.next`) is the single place
+build-output directory names are spelled, inside the guest script. The
+project walk prunes them, because a repo living inside `node_modules` is
+not a project a person would pick; `gc --deep` matches them, because there
+they are the thing being deleted. One list serves both on purpose — before
+the move there were two, `PROJECT_FIND` and `GC_USER`'s `project_targets`,
+and neither knew the other existed.
+
+The Mac side never guesses what a box supports; it reads the exit code.
+A subcommand `yo` was built to call after `yolobox-guest` shipped it exits
+**64**, with `yolobox-guest: unknown subcommand '<sub>'` on stderr — the
+box is older than this Mac's `yo`. A box with no `yolobox-guest` at all
+exits **127**, with the shell's own "command not found" on stderr — it
+predates the helper entirely. Both route through `guest_helper()` and
+`helper_skew()` in `yo` into the same message: which version this Mac's
+`yo` is, which version built the box, and `yo bootstrap` as the fix. The
+exit code alone is never enough in either direction, because a
+subcommand's own child process — `podman`, `npm` — can legitimately exit
+127 or 64 for reasons that have nothing to do with the helper; both
+branches require the stderr marker too before reinterpreting the exit,
+and the corollary is load-bearing: no subcommand's own stderr may ever
+contain the literal string `unknown subcommand`. It follows that adding a
+subcommand to the guest script is not enough on its own to make it
+callable — the box has to be rebuilt (`yo bootstrap`, or a plain
+`nixos-rebuild switch` for someone iterating inside the VM) before that
+subcommand exists on the box's `PATH` at all; calling it against an
+un-rebuilt box hits exactly the 64 path above, correctly, because from the
+box's point of view the subcommand really is unknown.
+
+## `yo`'s own CLI: one parser, not two lists and 13 copies of a check
+
+`build_parser()` is the single declaration of `yo`'s command line:
+`add_subparsers` plus `set_defaults(func=cmd_x)` per subcommand, and
+`main()` collapses to parse, run the `limactl` preflight, then
+`args.func(args)` — every command function takes the parsed
+`argparse.Namespace` now, not a raw `Sequence[str]`. Before this there were
+two lists nothing kept in agreement, a hand-written `USAGE` string and a
+`COMMANDS` dict, plus 13 separate copies of the same arity check scattered
+through the command bodies. That duplication had already drifted: `up`,
+`down` and `status` silently accepted and ignored extra arguments while
+the other nine zero-argument commands rejected them, because someone
+copied the check to nine bodies and not the other three. `yo up bogus`
+used to succeed; it now fails, like every other command with no positional
+arguments. The same class of fix reaches `disk-grow`: its bespoke
+`.isdigit()` check used to reject `disk-grow -1` with "must be a whole
+number of GiB" before ever reaching the "greater than 0" check; argparse's
+`type=` callable reaches `int()` first, so a negative value now reports
+"must be greater than 0 GiB" instead — a wording change, not a behaviour
+change, worth recognising rather than mistaking for a new bug.
+
+`yo ssh`'s trailing arguments are declared `nargs=argparse.REMAINDER`, and
+that choice is load-bearing rather than a default reached for out of
+laziness: `rebuild_hint()` prints
+`yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '…'`
+as the documented remedy for a stale generation (see "Distribution" below),
+so if argparse ever parsed `--impure` as its own flag instead of passing it
+through, the tool's own printed advice would stop working. Verified against
+real argparse: every invocation whose first token is not option-like
+passes through untouched, `yo ssh sudo … --impure --flake …` included. The
+one shape that changes is a leading-dash *first* token — `yo ssh -v`,
+`yo ssh --help` — which now exits 2 from argparse itself rather than
+reaching the VM. That is not a regression: both forms were already broken,
+because REMAINDER (like the old hand-rolled passthrough) only ever hands
+the tokens to ssh as a *remote command* after the hostname, so `--help`
+used to fail inside the VM as `bash: --help: command not found`. `yo ssh
+-h` is the one case that actually improves: it now prints `yo`'s own ssh
+help instead of failing the same way.
+
+`allow_abbrev` is on by default and nothing in `build_parser()` turns it
+off, so `yo gc --de` and `yo gc --y` now parse as `--deep` and `--yes`
+where the old hand-rolled flag loop rejected any prefix outright. Worth
+carrying in your head for a command whose job is deleting things.
+
+`YO_VERSION = "dev"` (line ~32) must survive as that exact literal
+assignment, unreformatted. `nix/pkgs/yolobox.nix` overwrites it with
+`--replace-fail` and `homebrew/yolobox.rb` with `inreplace`, both matching
+the literal text; either patch is how a release build gets its real
+version number baked in. Reformat that line — reflow it, requote it,
+anything that changes its exact text — and the Nix build fails loudly at
+`--replace-fail` (the safer failure) while the brew formula's `inreplace`
+can silently no-op and ship a binary that still reports `dev`.
+
+`enter`, `code` and `zed` take `project` as `nargs="?"`, so `yo enter ""`
+and `yo enter` produce different values — `project=''` against
+`project=None` — and are different invocations: an empty fzf query against
+mirroring the guest twin of the current directory. `target_dir` branches
+on `project is not None`, never on truthiness, precisely so the empty
+string does not collapse into the no-argument case.
 
 ## Distribution: the flake ref replaces the guest checkout
 
@@ -389,9 +532,15 @@ each recognisable on its own:
   status` prints both versions and warns on stderr when they differ,
   naming `yo bootstrap` as the fix. A box built before that file existed
   reports `unknown`. `yo`'s `main()` still carries a `limactl` preflight
-  guard for every subcommand except `--help` and `--version`, so `nix run
-  github:aka-rider/yolobox` inside a guest fails loudly, never with a bare
-  `command not found`.
+  guard, and `--help`/`--version` still never reach it — but the exemption
+  is no longer two hand-written early returns remembering to skip it.
+  `build_parser()` declares `--version` as `action="version"` and argparse
+  raises `SystemExit` for both `--help` and `--version` inside
+  `parse_args()`, before `main()` ever gets to the
+  `require_tool("limactl", ...)` line below it, so the exemption holds by
+  construction rather than by two branches someone could forget to update
+  together. `nix run github:aka-rider/yolobox` inside a guest still fails
+  loudly on that preflight, never with a bare `command not found`.
 - **`nix flake check` throws with no explanation.** `flake.nix` reads
   `YOLOBOX_USERNAME` from the environment and `throw`s when it is unset,
   because it has no pure way to learn the host username otherwise (see

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """yo — thin Mac-side CLI for the NixOS-VM yolobox (lima/vz).
 
-Run `yo --help` for the command reference (USAGE below).
+Run `yo --help` for the command reference.
 """
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import os
@@ -36,6 +37,9 @@ AGENT_USER = "agent"
 AGENT_HOME = "/home/agent"
 GUEST_SOCK_DIR = "/run/yolobox"
 T3_PORT = 3773
+HELPER = "yolobox-guest"
+HELPER_NO_SUBCOMMAND = 64
+HELPER_MARKER = "unknown subcommand"
 
 FORWARDED_ENV = frozenset(
     {
@@ -118,101 +122,10 @@ def herd_version_cache() -> str:
 
 
 class YoError(Exception):
-    def __init__(self, message: Optional[str] = None, code: int = 1, show_usage: bool = False):
+    def __init__(self, message: Optional[str] = None, code: int = 1):
         super().__init__(message or "")
         self.message = message
         self.code = code
-        self.show_usage = show_usage
-
-
-def usage_error(message: str) -> YoError:
-    return YoError(message, code=2, show_usage=True)
-
-
-USAGE = r"""Usage: yo <command> [args]
-
-  --version | -V
-      Print yo's version and exit.
-
-  up | down | status
-      Start, stop, or describe the VM. status also reports disk usage on
-      both sides and warns when this Mac's herdr version differs from the VM's.
-
-  bootstrap
-      Create the VM and build/(if needed) reboot it into the NixOS
-      configuration from the pinned yolobox flake ref, then seed
-      identities. Safe to run again: every step checks before it acts.
-      YOLOBOX_FLAKE overrides which flake ref to build from (e.g. a
-      branch), and is required on an unreleased ("dev") build.
-
-  gc [--deep] [--yes]
-      Report what is using the VM's disk. --yes reclaims the machine's own
-      caches (journald, nix garbage, npm, podman). --deep adds per-project
-      build output (target, node_modules, .next) under the guest home, each
-      deleted only if git ignores it. Run this from the Mac; in-VM tools die
-      first.
-
-  disk-grow <GiB>
-      Raise the VM's disk ceiling (grow-only; the backing file is sparse, so
-      a large ceiling costs nothing until used). Stops and restarts the VM.
-      Refuses unless the VM already runs a generation with boot.growPartition.
-
-  ssh [cmd...]
-      Plain interactive shell in the VM as the operator account (the one with
-      sudo), or run one command there. No herd wiring; agents started here
-      show as "unknown" in the herd.
-
-  enter [project]
-      Shell in the VM as the unprivileged agent account, with the herd socket
-      forwarded and the herd env set, so agents started there report to this
-      Mac's herd. Exits 3 when this Mac's herdr version differs from the VM's;
-      YOLOBOX_SKIP_HERD_CHECK=1 overrides. Also probes this pane for herdr's
-      per-pane claude latch (a host-side claude that ran and exited here
-      earlier silently drops every later claude report) and warns on stderr
-      rather than refusing when it finds one.
-
-  link
-      Add a "yolobox" git remote to the current repo, pointing at the same
-      $HOME-relative path in the VM (created there if missing). A stale
-      yolobox remote left by a previous box is updated in place. Then
-      "git push yolobox main" carries the project in.
-
-  seed
-      Copy into the VM what it cannot do without: ~/.ssh/config (minus lima's
-      Include and IdentityAgent), every ~/.ssh/*.pub, and each
-      <group>/.gitconfig under the top-level trees the VM's home shares with
-      this Mac's. Never a private key. Re-run after the first link on a
-      fresh VM.
-
-  code [project]
-  zed [project]
-      Open VS Code Remote-SSH or Zed in the VM, as the agent account. Needs
-      "Include ~/.lima/yolobox/ssh.config" in ~/.ssh/config (yo code offers to
-      add it otherwise); VS Code also needs the ms-vscode-remote.remote-ssh
-      extension.
-
-  t3
-      Open t3code's web UI, served by the VM, in this Mac's browser with a
-      fresh pairing token. A bookmarked URL fails auth; run this again.
-
-  pair [base-url]
-      Print a t3 pairing URL that names this Mac (default
-      http://<hostname>.local:3773) for a browser on another device.
-
-  herd-check
-      Prove end to end that an agent in the VM can report to this Mac's
-      herd. Run from a herdr pane with no agent on it; it releases that pane.
-
-  aws-check
-      Prove end to end that YOLOBOX_AWS_PROFILE's credentials reach the VM:
-      host export-credentials, a throwaway broker and forward, the guest's
-      /health and /creds, and a guest sts get-caller-identity.
-
-enter, code and zed resolve the directory the same way: with a project
-argument, pick among the VM's git repos with fzf; without one, the guest
-mirror of the current directory (its deepest existing ancestor when the
-mirror is missing, the guest home when the cwd is outside $HOME).
-"""
 
 
 def out(line: str = "") -> None:
@@ -239,6 +152,18 @@ class Report:
     def abort(self, message: str, *remedies: str) -> "YoError":
         self.fail(message, *remedies)
         return YoError(None, code=1)
+
+
+def guest_helper_check(
+    proc: subprocess.CompletedProcess, what: str
+) -> subprocess.CompletedProcess:
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise YoError(
+            "%s failed (exit %d)%s"
+            % (what, proc.returncode, ": " + detail if detail else "")
+        )
+    return proc
 
 
 def require_tool(name: str, hint: str) -> str:
@@ -374,8 +299,50 @@ def agent_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> 
     return ssh_run(AGENT, argv, mux=mux, check=check).stdout
 
 
-def agent_paths(argv: Sequence[str]) -> List[str]:
-    proc = ssh_run(AGENT, argv, check=True, binary=True)
+def helper_missing(role: SshRole) -> bool:
+    return ssh_run(role, ["command", "-v", HELPER]).returncode != 0
+
+
+def guest_helper(
+    role: SshRole, sub: str, args: Sequence[str] = (), *, stream: bool = False, **kwargs
+) -> subprocess.CompletedProcess:
+    if stream:
+        kwargs["capture"] = False
+    proc = ssh_run(role, [HELPER, sub, *args], **kwargs)
+    if proc.returncode not in (127, HELPER_NO_SUBCOMMAND):
+        return proc
+    # A streamed run has no captured stderr to match the marker against, so the
+    # two skews are told apart by asking the box directly instead.
+    if stream:
+        if helper_missing(role):
+            raise YoError(helper_skew("the box has no %s" % HELPER))
+        if proc.returncode == HELPER_NO_SUBCOMMAND:
+            raise YoError(helper_skew("the box's %s has no '%s' subcommand" % (HELPER, sub)))
+        return proc
+    if proc.returncode == 127 and "not found" in (proc.stderr or ""):
+        raise YoError(helper_skew("the box has no %s" % HELPER))
+    if proc.returncode == HELPER_NO_SUBCOMMAND and HELPER_MARKER in (proc.stderr or ""):
+        raise YoError(helper_skew("the box's %s has no '%s' subcommand" % (HELPER, sub)))
+    return proc
+
+
+def agent_paths(sub: str, args: Sequence[str] = (), *, check: bool = True) -> List[str]:
+    proc = guest_helper(AGENT, sub, args, binary=True)
+    if proc.returncode != 0:
+        if check:
+            guest_helper_check(proc, sub)
+        else:
+            stderr = proc.stderr
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", "replace")
+            err(
+                "yo: the project walk could not read every directory under %s (find exit %d)."
+                % (AGENT_HOME, proc.returncode)
+            )
+            err(
+                "    The list below is what was readable; a project under an unreadable "
+                "directory is missing from it."
+            )
     decoded = proc.stdout.decode("utf-8", "replace")
     return [entry for entry in decoded.split("\0") if entry]
 
@@ -427,20 +394,6 @@ def mirror(mac_path: str) -> Optional[str]:
     return None
 
 
-ANCESTOR_WALK = r"""d="$1"
-while [ -n "$d" ] && [ ! -d "$d" ]; do d="${d%/*}"; done
-printf '%s\n' "${d:-$HOME}"
-"""
-
-PROJECT_FIND = r"""find "$HOME" -mindepth 2 \( -name ".*" ! -name .git \) -prune -o -name .git \( -type d -o -type f \) -printf "%h\0"
-"""
-
-GITCONFIG_ROOTS_FIND = r"""find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\0"
-"""
-
-ENSURE_REPO = r"""mkdir -p "$1" && { git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || { git -C "$1" init -b main && git -C "$1" config receive.denyCurrentBranch updateInstead; }; }
-"""
-
 SEED_SSH_CONFIG = r"""mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >~/.ssh/config && chmod 600 ~/.ssh/config"""
 
 SEED_UNTAR_SSH = r"""tar -C "$HOME/.ssh" -xf -"""
@@ -455,7 +408,9 @@ def dir_for_cwd() -> str:
     if desired is None:
         err(MISSING_PATH_NOTE % (logical_cwd(), AGENT_HOME))
         return AGENT_HOME
-    landing = agent_out(["sh", "-c", ANCESTOR_WALK, "sh", desired]).strip("\n")
+    landing = guest_helper_check(
+        guest_helper(AGENT, "landing-dir", [desired]), "landing-dir"
+    ).stdout.strip("\n")
     if landing != desired:
         err(MISSING_PATH_NOTE % (desired, landing))
     return guest_path(landing)
@@ -463,7 +418,7 @@ def dir_for_cwd() -> str:
 
 def pick_project(query: str) -> str:
     require_tool("fzf", "brew install fzf")
-    listing = agent_paths(["sh", "-c", PROJECT_FIND])
+    listing = agent_paths("projects", check=False)
     prefix = AGENT_HOME + "/"
     projects = sorted(
         entry[len(prefix) :] for entry in listing if entry.startswith(prefix)
@@ -483,9 +438,9 @@ def pick_project(query: str) -> str:
     return guest_path(AGENT_HOME + "/" + choice)
 
 
-def target_dir(args: Sequence[str]) -> str:
-    if len(args) == 1:
-        return pick_project(args[0])
+def target_dir(project: Optional[str]) -> str:
+    if project is not None:
+        return pick_project(project)
     return dir_for_cwd()
 
 
@@ -739,11 +694,11 @@ def start_aws_broker(profile: str) -> AwsBroker:
         if line.startswith("ERROR="):
             proc.terminate()
             proc.wait()
-            raise YoError("aws-broker failed: %s" % line[len("ERROR=") :])
+            raise YoError("aws-broker failed: %s" % line.removeprefix("ERROR="))
         if line.startswith("TOKEN="):
-            token = line[len("TOKEN=") :]
+            token = line.removeprefix("TOKEN=")
         elif line.startswith("PORT="):
-            port = line[len("PORT=") :]
+            port = line.removeprefix("PORT=")
     if not token or not port:
         proc.terminate()
         proc.wait()
@@ -786,195 +741,7 @@ def start_aws_broker(profile: str) -> AwsBroker:
     return AwsBroker(proc, host_port, guest_port, token, ssh_opts, env)
 
 
-GC_COMMON = r"""set -uo pipefail
-
-GC_FAILED=0
-
-ok() {
-    printf 'ok:   %s\n' "$1"
-}
-
-fail() {
-    GC_FAILED=1
-    printf 'FAIL: %s\n' "$1" >&2
-    shift
-    for remedy in "$@"; do
-        printf '      %s\n' "${remedy}" >&2
-    done
-}
-
-# A cleanup step that legitimately finds nothing to do still exits nonzero
-# (podman does), and that must not cancel the steps after it — so no `set -e`
-# here. Nothing is hidden either: a failure prints, and decides the final exit.
-# stdin comes from /dev/null because this whole script is being read from the
-# ssh channel's stdin, which a curious child would otherwise eat.
-step() {
-    label="$1"
-    shift
-    if "$@" </dev/null; then
-        ok "${label}"
-    else
-        rc=$?
-        fail "${label} (exit ${rc})"
-    fi
-}
-
-# MEASURE_AS is set by the tier script below before this is ever called:
-# "sudo" in the machine tier, empty in the user tier.
-measure() {
-    # -x, because a bind mount of the same device would otherwise be counted
-    # twice.
-    if [ -n "${MEASURE_AS}" ]; then
-        # sudo also for the existence test: /root is mode 700, so an
-        # unprivileged -e on /root/.cache/nix says "absent" about a path
-        # that is really there.
-        sudo test -e "$1" || return 0
-        size="$(sudo du -x -s -h "$1" 2>/dev/null | awk '{print $1}')"
-    else
-        test -e "$1" || return 0
-        size="$(du -x -s -h "$1" 2>/dev/null | awk '{print $1}')"
-    fi
-    printf '  %-7s %s\n' "${size:-?}" "$1"
-}
-"""
-
-GC_MACHINE = GC_COMMON + r"""
-MEASURE_AS=sudo
-MACHINE_PATHS="/var/log/journal /nix/store /root/.cache/nix"
-
-if [ "${YO_GC_APPLY}" != 1 ]; then
-    printf 'yo gc: report only, nothing is deleted. Add --yes to act.\n\n'
-    df -h /
-    printf '\nmachine tier (current size of each target):\n'
-    for path in ${MACHINE_PATHS}; do
-        measure "${path}"
-    done
-    exit 0
-fi
-
-printf 'before:\n'
-df -h /
-printf '\n'
-
-# Root-only steps first, and that ordering is the point: ext4's reserve is
-# root's alone, so on a full disk the agent's unprivileged steps cannot even
-# write their own logs until these have freed something. --rotate before
-# --vacuum-size because vacuuming only ever unlinks archived journals; without
-# the rotation the active file — usually most of the 630M — is untouchable.
-step 'journalctl --rotate --vacuum-size=50M' sudo journalctl --rotate --vacuum-size=50M
-
-# A nixos-rebuild that ran out of space on the ESP advances the system profile
-# and then dies installing the bootloader, leaving the booted generation and
-# the profile pointing at different closures (see CLAUDE.md). `-d` deletes
-# every generation but the profile's, which in that state is the one that is
-# *not* running — the box would lose its own booted system.
-booted="$(readlink -f /run/current-system)"
-profile="$(readlink -f /nix/var/nix/profiles/system)"
-if [ -n "${booted}" ] && [ "${booted}" = "${profile}" ]; then
-    step 'nix-collect-garbage -d' sudo nix-collect-garbage -d
-else
-    fail "skipped nix-collect-garbage -d: booted and profile generations disagree" \
-        "booted:  ${booted:-<unreadable>}" \
-        "profile: ${profile:-<unreadable>}" \
-        "A nixos-rebuild switch half-failed (check df /boot). Re-run the switch" \
-        "until both agree, then ./yo gc --yes again."
-fi
-
-# Outside that guard on purpose: this is nix's download cache, tied to no
-# generation, so it is safe to drop even when the profile is in the broken
-# state above — and that is exactly when the space is most needed.
-step 'rm -rf /root/.cache/nix' sudo rm -rf /root/.cache/nix
-
-[ "${GC_FAILED}" = 0 ] || exit 1
-"""
-
-GC_USER = GC_COMMON + r"""
-MEASURE_AS=
-
-# Hidden directories are pruned in the first branch — except .next, which
-# is itself a wanted match — so the walk cannot reach a target/ or
-# node_modules/ living inside .git, .devbox or .venv: .venv backs the
-# per-project basedpyright (nix/lsp.nix) and .devbox holds devbox's
-# toolchain state — neither is build output. Matching directories are
-# pruned in turn, so nothing nested inside a hit is walked or reported
-# twice.
-project_targets() {
-    find "$HOME" -mindepth 1 \
-        \( -name ".*" ! -name .next \) -prune -o \
-        \( -name target -o -name node_modules -o -name .next \) \
-        -type d -prune -print0 2>/dev/null
-}
-
-USER_PATHS="$HOME/.npm $HOME/.local/share/containers/storage"
-
-if [ "${YO_GC_APPLY}" != 1 ]; then
-    printf 'user tier (current size of each target):\n'
-    for path in ${USER_PATHS}; do
-        measure "${path}"
-    done
-    if [ "${YO_GC_DEEP}" = 1 ]; then
-        printf '\nproject tier (--deep):\n'
-        found=0
-        while IFS= read -r -d '' target; do
-            found=1
-            measure "${target}"
-        done < <(project_targets)
-        [ "${found}" = 1 ] || printf '  (none)\n'
-    else
-        printf '\nproject tier not measured; add --deep to include it.\n'
-    fi
-    exit 0
-fi
-
-step 'npm cache clean --force' npm cache clean --force
-# -f only: dangling containers, networks and build cache. Unused *images* need
-# a registry pull to come back, which is not regenerable offline, so they wait
-# for --deep. nix/podman.nix already runs a periodic autoPrune besides.
-step 'podman system prune -f' podman system prune -f
-
-if [ "${YO_GC_DEEP}" = 1 ]; then
-    step 'podman system prune -af' podman system prune -af
-    while IFS= read -r -d '' target; do
-        # Deleting a path git does not ignore dirties the VM worktree, and
-        # receive.denyCurrentBranch=updateInstead then refuses every later
-        # `git push yolobox` — a breakage that surfaces much later with no
-        # link back to here. The name alone does not settle it: an anchored
-        # /node_modules in .gitignore leaves a nested one tracked.
-        if git -C "$(dirname "${target}")" check-ignore -q "${target}" 2>/dev/null; then
-            step "rm -rf ${target}" rm -rf "${target}"
-        else
-            fail "kept ${target}: git does not ignore it" \
-                "Deleting it would dirty the worktree and block every later" \
-                "push to the yolobox remote. Add it to that repo's .gitignore" \
-                "(or remove it by hand and commit) if it really is build output."
-        fi
-    done < <(project_targets)
-fi
-
-printf '\nafter:\n'
-df -h /
-
-[ "${GC_FAILED}" = 0 ] || exit 1
-"""
-
-GUEST_AWS_CHECK = r"""set -u
-url="${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}"
-token="${AWS_CONTAINER_AUTHORIZATION_TOKEN:-}"
-if [ -z "${url}" ] || [ -z "${token}" ]; then
-    printf 'ENV_MISSING=1\n'
-    exit 0
-fi
-health_url="${url%/creds}/health"
-health="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${health_url}")"
-printf 'HEALTH=%s\n' "${health}"
-creds="$(curl -sS -H "Authorization: ${token}" --max-time 5 "${url}")"
-printf 'CREDS=%s\n' "${creds}"
-sts="$(aws sts get-caller-identity 2>&1)"
-printf 'STS=%s\n' "${sts}"
-"""
-
-
-def cmd_up(args: Sequence[str]) -> None:
+def vm_up() -> None:
     listing = run(["limactl", "list", "-q"]).stdout.splitlines()
     if INSTANCE in listing:
         run(["limactl", "start", "--yes", INSTANCE], capture=False, check=True)
@@ -994,7 +761,11 @@ def cmd_up(args: Sequence[str]) -> None:
     ensure_agent_ssh_config()
 
 
-def cmd_down(args: Sequence[str]) -> None:
+def cmd_up(args: argparse.Namespace) -> None:
+    vm_up()
+
+
+def cmd_down(args: argparse.Namespace) -> None:
     run(["limactl", "stop", INSTANCE], capture=False, check=True)
 
 
@@ -1004,14 +775,13 @@ def second_line(text: str) -> str:
 
 
 def du_kib(path: str) -> Optional[int]:
-    probe = run(["du", "-k", path])
-    if probe.returncode != 0:
+    try:
+        return os.stat(path).st_blocks * 512 // 1024
+    except OSError:
         return None
-    fields = probe.stdout.split()
-    return int(fields[0]) if fields and fields[0].isdigit() else None
 
 
-def cmd_status(args: Sequence[str]) -> None:
+def cmd_status(args: argparse.Namespace) -> None:
     run(["limactl", "list", INSTANCE], capture=False)
 
     guest_df = second_line(guest_out(["df", "-h", "/"], check=False))
@@ -1074,29 +844,28 @@ def rebuild_hint() -> str:
     )
 
 
+def helper_skew(what: str) -> str:
+    guest_version = guest_out(["cat", "/etc/yolobox/version"], check=False).strip() or None
+    drift = version_drift(YO_VERSION, guest_version)
+    if drift:
+        return "%s.\n    %s" % (what, drift[len("yo: ") :])
+    return "%s.\n    rebuild it: %s" % (what, rebuild_hint())
+
+
 def host_user() -> str:
     return pwd.getpwuid(os.getuid()).pw_name
 
 
 def guest_generations() -> Tuple[str, str]:
-    probe = guest_out(
-        ["sh", "-c", "readlink -f /nix/var/nix/profiles/system && readlink -f /run/current-system"],
-        check=False,
-    )
-    lines = probe.splitlines()
-    profile = lines[0] if lines else ""
-    booted = lines[1] if len(lines) > 1 else ""
-    return profile, booted
+    proc = guest_helper(OPERATOR, "generations")
+    return guest_field(proc.stdout, "profile"), guest_field(proc.stdout, "booted")
 
 
-def cmd_bootstrap(args: Sequence[str]) -> None:
-    if args:
-        raise usage_error("bootstrap takes no arguments")
-
+def cmd_bootstrap(args: argparse.Namespace) -> None:
     report = Report()
     ref = flake_ref()
 
-    cmd_up([])
+    vm_up()
     report.ok("VM up")
 
     ssh_run(
@@ -1137,49 +906,30 @@ def cmd_bootstrap(args: Sequence[str]) -> None:
             )
         report.ok("rebooted into the built generation")
 
-    cmd_seed([])
+    seed_all()
     report.ok("seeded")
 
     ensure_ssh_config_include(refuse=False)
 
 
-def cmd_gc(args: Sequence[str]) -> None:
-    deep = 0
-    apply_now = 0
-    for arg in args:
-        if arg == "--deep":
-            deep = 1
-        elif arg == "--yes":
-            apply_now = 1
-        else:
-            raise usage_error("unknown gc option '%s'" % arg)
-
-    env_prefix = ["env", "YO_GC_DEEP=%d" % deep, "YO_GC_APPLY=%d" % apply_now, "bash", "-s"]
+def cmd_gc(args: argparse.Namespace) -> None:
+    apply_flag = ["--apply"] if args.yes else []
+    deep_flag = ["--deep"] if args.deep else []
     failed = False
 
-    machine = ssh_run(
-        OPERATOR, env_prefix, stdin=GC_MACHINE.encode(), mux=True, capture=False
-    )
+    machine = guest_helper(OPERATOR, "gc-machine", apply_flag, mux=True, stream=True)
     failed = failed or machine.returncode != 0
 
     require_agent_account()
-    user = ssh_run(AGENT, env_prefix, stdin=GC_USER.encode(), mux=True, capture=False)
+    user = guest_helper(AGENT, "gc-user", apply_flag + deep_flag, mux=True, stream=True)
     failed = failed or user.returncode != 0
 
     if failed:
         raise YoError(None, code=1)
 
 
-def cmd_disk_grow(args: Sequence[str]) -> None:
-    if len(args) != 1:
-        raise usage_error("disk-grow takes one argument, the new size in GiB")
-    if not args[0].isdigit():
-        raise YoError(
-            "disk-grow size must be a whole number of GiB, got '%s'" % args[0], code=2
-        )
-    wanted = int(args[0])
-    if wanted <= 0:
-        raise YoError("disk-grow size must be greater than 0 GiB", code=2)
+def cmd_disk_grow(args: argparse.Namespace) -> None:
+    wanted = args.size
 
     probe = run(["limactl", "list", INSTANCE, "--format", "{{.Disk}}"])
     current_bytes = probe.stdout.strip() if probe.returncode == 0 else ""
@@ -1210,11 +960,11 @@ def cmd_disk_grow(args: Sequence[str]) -> None:
     df_before = second_line(guest_out(["df", "-h", "/"], check=False))
     blocks_before = df_blocks(guest_out(["df", "-k", "/"], check=False))
 
-    free_kib = df_blocks(run(["df", "-k", os.path.join(home(), ".lima")]).stdout, field=3)
+    free_kib = shutil.disk_usage(os.path.join(home(), ".lima")).free // 1024
     image_kib = du_kib(os.path.join(lima_dir(), "disk")) or 0
     out(
         "host: ~/.lima has %dGiB free; the disk image allocates %dGiB today"
-        % ((free_kib or 0) // 1024 // 1024, image_kib // 1024 // 1024)
+        % (free_kib // 1024 // 1024, image_kib // 1024 // 1024)
     )
     out("lima: raising %s from %dGiB to %dGiB" % (INSTANCE, current_gib, wanted))
 
@@ -1225,7 +975,7 @@ def cmd_disk_grow(args: Sequence[str]) -> None:
             "limactl refused the resize and %s is left stopped — start it again with: yo up"
             % INSTANCE
         )
-    cmd_up([])
+    vm_up()
 
     df_after = second_line(guest_out(["df", "-h", "/"], check=False))
     blocks_after = df_blocks(guest_out(["df", "-k", "/"], check=False))
@@ -1248,16 +998,14 @@ def df_blocks(text: str, field: int = 1) -> Optional[int]:
     return None
 
 
-def cmd_ssh(args: Sequence[str]) -> None:
-    argv = ssh_base(OPERATOR) + forward_agent_opts() + ["-t", VM_HOST] + list(args)
+def cmd_ssh(args: argparse.Namespace) -> None:
+    argv = ssh_base(OPERATOR) + forward_agent_opts() + ["-t", VM_HOST] + list(args.ssh_cmd)
     exec_process(argv)
 
 
-def cmd_enter(args: Sequence[str]) -> None:
-    if len(args) > 1:
-        raise usage_error("enter takes at most one project argument")
+def cmd_enter(args: argparse.Namespace) -> None:
     require_agent_account()
-    target = target_dir(args)
+    target = target_dir(args.project)
 
     argv = ssh_base(AGENT) + forward_agent_opts()
     env = dict(os.environ)
@@ -1338,9 +1086,7 @@ def ensure_ssh_config_include(refuse: bool) -> None:
         raise YoError(None, code=1)
 
 
-def cmd_code(args: Sequence[str]) -> None:
-    if len(args) > 1:
-        raise usage_error("code takes at most one project argument")
+def cmd_code(args: argparse.Namespace) -> None:
     code_cli = shutil.which("code")
     if code_cli is None:
         code_cli = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
@@ -1348,20 +1094,18 @@ def cmd_code(args: Sequence[str]) -> None:
         raise YoError("VS Code CLI not found")
     ensure_ssh_config_include(refuse=True)
     require_agent_account()
-    target = target_dir(args)
+    target = target_dir(args.project)
     exec_process(
         [code_cli, "--folder-uri", "vscode-remote://ssh-remote+%s@%s%s" % (AGENT_USER, VM_HOST, target)]
     )
 
 
-def cmd_zed(args: Sequence[str]) -> None:
-    if len(args) > 1:
-        raise usage_error("zed takes at most one project argument")
+def cmd_zed(args: argparse.Namespace) -> None:
     if shutil.which("zed") is None:
         raise YoError("zed CLI not found")
     ensure_ssh_config_include(refuse=True)
     require_agent_account()
-    target = target_dir(args)
+    target = target_dir(args.project)
     exec_process(["zed", "ssh://%s@%s%s" % (AGENT_USER, VM_HOST, target)])
 
 
@@ -1404,9 +1148,7 @@ def parse_pairing_url(text: str) -> Optional[str]:
     return url
 
 
-def cmd_t3(args: Sequence[str]) -> None:
-    if args:
-        raise usage_error("t3 takes no arguments")
+def cmd_t3(args: argparse.Namespace) -> None:
     t3_require_service()
     pair_out = ssh_run(AGENT, ["t3", "pair", "--ttl", "2m", "--label", "yo"], merge_stderr=True).stdout
     url = parse_pairing_url(pair_out)
@@ -1417,12 +1159,10 @@ def cmd_t3(args: Sequence[str]) -> None:
     exec_process(["open", url])
 
 
-def cmd_pair(args: Sequence[str]) -> None:
-    if len(args) > 1:
-        raise usage_error("pair takes at most one base-url argument")
+def cmd_pair(args: argparse.Namespace) -> None:
     t3_require_service()
     host_name = run(["scutil", "--get", "LocalHostName"], check=True).stdout.strip()
-    base_url = args[0] if args else "http://%s.local:%d" % (host_name, T3_PORT)
+    base_url = args.base_url if args.base_url is not None else "http://%s.local:%d" % (host_name, T3_PORT)
     pair = ssh_run(
         AGENT,
         [
@@ -1458,9 +1198,7 @@ def link_remote_action(existing_url: Optional[str], wanted_url: str) -> str:
     )
 
 
-def cmd_link(args: Sequence[str]) -> None:
-    if args:
-        raise usage_error("link takes no arguments")
+def cmd_link(args: argparse.Namespace) -> None:
     require_agent_account()
     cdup = run(["git", "rev-parse", "--show-cdup"])
     if cdup.returncode != 0:
@@ -1479,7 +1217,7 @@ def cmd_link(args: Sequence[str]) -> None:
     existing = probe.stdout.strip() if probe.returncode == 0 else None
     action = link_remote_action(existing, url)
 
-    agent_out(["sh", "-c", ENSURE_REPO, "sh", vmdir], check=True)
+    guest_helper_check(guest_helper(AGENT, "ensure-repo", [vmdir]), "ensure-repo")
 
     if action == "add":
         run(["git", "-C", toplevel, "remote", "add", "yolobox", url], check=True)
@@ -1546,7 +1284,7 @@ def seed_ssh(report: Report) -> None:
 
 
 def seed_gitconfig() -> None:
-    roots = agent_paths(["sh", "-c", GITCONFIG_ROOTS_FIND])
+    roots = agent_paths("home-roots")
     members = []
     for root in roots:
         if not root or "/" in root or root in (".", ".."):
@@ -1569,12 +1307,14 @@ def seed_gitconfig() -> None:
     )
 
 
-def cmd_seed(args: Sequence[str]) -> None:
-    if args:
-        raise usage_error("seed takes no arguments")
+def seed_all() -> None:
     require_agent_account()
     seed_ssh(Report())
     seed_gitconfig()
+
+
+def cmd_seed(args: argparse.Namespace) -> None:
+    seed_all()
 
 
 def herdr_pane_agent(pane_id: str, report: Report, when: str = "") -> str:
@@ -1612,9 +1352,7 @@ def herdr_server_field(status_text: str, field: str) -> str:
     return ""
 
 
-def cmd_herd_check(args: Sequence[str]) -> None:
-    if args:
-        raise usage_error("herd-check takes no arguments")
+def cmd_herd_check(args: argparse.Namespace) -> None:
     report = Report()
 
     if shutil.which("herdr") is None:
@@ -1698,7 +1436,7 @@ def cmd_herd_check(args: Sequence[str]) -> None:
     )
     guest_rc = guest_run.returncode
     if guest_rc == 127:
-        report.fail("the box has no yolobox-herd-check", "rebuild it: %s" % rebuild_hint())
+        report.fail(helper_skew("the box has no yolobox-herd-check"))
     elif guest_rc != 0:
         report.fail("the guest half failed (exit %d) — see its output above" % guest_rc)
 
@@ -1719,16 +1457,11 @@ def cmd_herd_check(args: Sequence[str]) -> None:
 
 
 def guest_field(text: str, key: str) -> str:
-    prefix = key + "="
-    for line in text.splitlines():
-        if line.startswith(prefix):
-            return line[len(prefix) :]
-    return ""
+    fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    return fields.get(key, "")
 
 
-def cmd_aws_check(args: Sequence[str]) -> None:
-    if args:
-        raise usage_error("aws-check takes no arguments")
+def cmd_aws_check(args: argparse.Namespace) -> None:
     report = Report()
 
     profile = os.environ.get("YOLOBOX_AWS_PROFILE", "")
@@ -1777,14 +1510,13 @@ def cmd_aws_check(args: Sequence[str]) -> None:
         env = dict(os.environ)
         env.update(region_env)
         env.update(broker.env)
-        guest_out_text = ssh_run(
+        guest_proc = guest_helper(
             AGENT,
-            ["bash", "-s"],
-            stdin=GUEST_AWS_CHECK.encode(),
+            "aws-check",
             extra_opts=list(broker.ssh_opts) + region_opts,
             env=env,
-            merge_stderr=True,
-        ).stdout
+        )
+        guest_out_text = guest_proc.stdout + (guest_proc.stderr or "")
 
         if guest_field(guest_out_text, "ENV_MISSING"):
             report.fail(
@@ -1828,46 +1560,198 @@ def cmd_aws_check(args: Sequence[str]) -> None:
         raise YoError(None, code=1)
 
 
-COMMANDS = {
-    "up": cmd_up,
-    "down": cmd_down,
-    "status": cmd_status,
-    "bootstrap": cmd_bootstrap,
-    "gc": cmd_gc,
-    "disk-grow": cmd_disk_grow,
-    "ssh": cmd_ssh,
-    "enter": cmd_enter,
-    "link": cmd_link,
-    "seed": cmd_seed,
-    "code": cmd_code,
-    "zed": cmd_zed,
-    "t3": cmd_t3,
-    "pair": cmd_pair,
-    "herd-check": cmd_herd_check,
-    "aws-check": cmd_aws_check,
-}
+def disk_grow_size(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "disk-grow size must be a whole number of GiB, got '%s'" % value
+        )
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("disk-grow size must be greater than 0 GiB")
+    return parsed
+
+
+DIRECTORY_RESOLUTION_EPILOG = (
+    "enter, code and zed resolve the directory the same way: with a project\n"
+    "argument, pick among the VM's git repos with fzf; without one, the guest\n"
+    "mirror of the current directory (its deepest existing ancestor when the\n"
+    "mirror is missing, the guest home when the cwd is outside $HOME)."
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="yo",
+        description="yo — thin Mac-side CLI for the NixOS-VM yolobox (lima/vz).",
+        epilog=DIRECTORY_RESOLUTION_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", "-V", action="version", version="yolobox %s" % YO_VERSION)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add(name: str, help_text: str, description: str) -> argparse.ArgumentParser:
+        return subparsers.add_parser(
+            name,
+            help=help_text,
+            description=description,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+
+    up = add("up", "Start the VM.", "Start the VM.")
+    up.set_defaults(func=cmd_up)
+
+    down = add("down", "Stop the VM.", "Stop the VM.")
+    down.set_defaults(func=cmd_down)
+
+    status = add(
+        "status",
+        "Describe the VM.",
+        "Describe the VM. Also reports disk usage on both sides and warns\n"
+        "when this Mac's herdr version differs from the VM's.",
+    )
+    status.set_defaults(func=cmd_status)
+
+    bootstrap = add(
+        "bootstrap",
+        "Create and build the VM from the pinned flake ref.",
+        "Create the VM and build/(if needed) reboot it into the NixOS\n"
+        "configuration from the pinned yolobox flake ref, then seed\n"
+        "identities. Safe to run again: every step checks before it acts.\n"
+        "YOLOBOX_FLAKE overrides which flake ref to build from (e.g. a\n"
+        "branch), and is required on an unreleased (\"dev\") build.",
+    )
+    bootstrap.set_defaults(func=cmd_bootstrap)
+
+    gc = add(
+        "gc",
+        "Report and reclaim the VM's disk usage.",
+        "Report what is using the VM's disk. --yes reclaims the machine's own\n"
+        "caches (journald, nix garbage, npm, podman). --deep adds per-project\n"
+        "build output (target, node_modules, .next) under the guest home, each\n"
+        "deleted only if git ignores it. Run this from the Mac; in-VM tools die\n"
+        "first.",
+    )
+    gc.add_argument("--deep", action="store_true", help="also reclaim per-project build output")
+    gc.add_argument("--yes", action="store_true", help="apply the reclaim instead of only reporting")
+    gc.set_defaults(func=cmd_gc)
+
+    disk_grow = add(
+        "disk-grow",
+        "Raise the VM's disk ceiling.",
+        "Raise the VM's disk ceiling (grow-only; the backing file is sparse, so\n"
+        "a large ceiling costs nothing until used). Stops and restarts the VM.\n"
+        "Refuses unless the VM already runs a generation with boot.growPartition.",
+    )
+    disk_grow.add_argument("size", type=disk_grow_size, metavar="GiB")
+    disk_grow.set_defaults(func=cmd_disk_grow)
+
+    ssh = add(
+        "ssh",
+        "Plain shell in the VM as the operator account.",
+        "Plain interactive shell in the VM as the operator account (the one with\n"
+        "sudo), or run one command there. No herd wiring; agents started here\n"
+        "show as \"unknown\" in the herd.",
+    )
+    ssh.add_argument("ssh_cmd", nargs=argparse.REMAINDER, metavar="cmd...")
+    ssh.set_defaults(func=cmd_ssh)
+
+    enter = add(
+        "enter",
+        "Shell in the VM as the agent account, herd-wired.",
+        "Shell in the VM as the unprivileged agent account, with the herd socket\n"
+        "forwarded and the herd env set, so agents started there report to this\n"
+        "Mac's herd. Exits 3 when this Mac's herdr version differs from the VM's;\n"
+        "YOLOBOX_SKIP_HERD_CHECK=1 overrides. Also probes this pane for herdr's\n"
+        "per-pane claude latch (a host-side claude that ran and exited here\n"
+        "earlier silently drops every later claude report) and warns on stderr\n"
+        "rather than refusing when it finds one.",
+    )
+    enter.add_argument("project", nargs="?")
+    enter.set_defaults(func=cmd_enter)
+
+    link = add(
+        "link",
+        "Add a yolobox git remote to the current repo.",
+        "Add a \"yolobox\" git remote to the current repo, pointing at the same\n"
+        "$HOME-relative path in the VM (created there if missing). A stale\n"
+        "yolobox remote left by a previous box is updated in place. Then\n"
+        "\"git push yolobox main\" carries the project in.",
+    )
+    link.set_defaults(func=cmd_link)
+
+    seed = add(
+        "seed",
+        "Copy identities the VM needs into it.",
+        "Copy into the VM what it cannot do without: ~/.ssh/config (minus lima's\n"
+        "Include and IdentityAgent), every ~/.ssh/*.pub, and each\n"
+        "<group>/.gitconfig under the top-level trees the VM's home shares with\n"
+        "this Mac's. Never a private key. Re-run after the first link on a\n"
+        "fresh VM.",
+    )
+    seed.set_defaults(func=cmd_seed)
+
+    code = add(
+        "code",
+        "Open VS Code Remote-SSH in the VM.",
+        "Open VS Code Remote-SSH in the VM, as the agent account. Needs\n"
+        "\"Include ~/.lima/yolobox/ssh.config\" in ~/.ssh/config (yo code offers to\n"
+        "add it otherwise); also needs the ms-vscode-remote.remote-ssh extension.",
+    )
+    code.add_argument("project", nargs="?")
+    code.set_defaults(func=cmd_code)
+
+    zed = add(
+        "zed",
+        "Open Zed in the VM.",
+        "Open Zed in the VM, as the agent account. Needs\n"
+        "\"Include ~/.lima/yolobox/ssh.config\" in ~/.ssh/config (yo zed offers to\n"
+        "add it otherwise).",
+    )
+    zed.add_argument("project", nargs="?")
+    zed.set_defaults(func=cmd_zed)
+
+    t3 = add(
+        "t3",
+        "Open t3code's web UI in this Mac's browser.",
+        "Open t3code's web UI, served by the VM, in this Mac's browser with a\n"
+        "fresh pairing token. A bookmarked URL fails auth; run this again.",
+    )
+    t3.set_defaults(func=cmd_t3)
+
+    pair = add(
+        "pair",
+        "Print a t3 pairing URL for a browser on another device.",
+        "Print a t3 pairing URL that names this Mac (default\n"
+        "http://<hostname>.local:3773) for a browser on another device.",
+    )
+    pair.add_argument("base_url", nargs="?", metavar="base-url")
+    pair.set_defaults(func=cmd_pair)
+
+    herd_check = add(
+        "herd-check",
+        "Prove end to end that an agent can report to this Mac's herd.",
+        "Prove end to end that an agent in the VM can report to this Mac's\n"
+        "herd. Run from a herdr pane with no agent on it; it releases that pane.",
+    )
+    herd_check.set_defaults(func=cmd_herd_check)
+
+    aws_check = add(
+        "aws-check",
+        "Prove end to end that YOLOBOX_AWS_PROFILE's credentials reach the VM.",
+        "Prove end to end that YOLOBOX_AWS_PROFILE's credentials reach the VM:\n"
+        "host export-credentials, a throwaway broker and forward, the guest's\n"
+        "/health and /creds, and a guest sts get-caller-identity.",
+    )
+    aws_check.set_defaults(func=cmd_aws_check)
+
+    return parser
 
 
 def main(argv: Sequence[str]) -> int:
-    if not argv:
-        err(USAGE.rstrip("\n"))
-        return 2
-    sub, rest = argv[0], list(argv[1:])
-
-    if sub in ("--help", "-h", "help"):
-        out(USAGE.rstrip("\n"))
-        return 0
-    if sub in ("--version", "-V"):
-        out("yolobox %s" % YO_VERSION)
-        return 0
-
-    command = COMMANDS.get(sub)
-    if command is None:
-        err(USAGE.rstrip("\n"))
-        return 2
-
+    args = build_parser().parse_args(argv)
     require_tool("limactl", "brew install lima")
-    command(rest)
+    args.func(args)
     return 0
 
 
@@ -1877,8 +1761,6 @@ if __name__ == "__main__":
     except YoError as failure:
         if failure.message:
             err("yo: %s" % failure.message)
-        if failure.show_usage:
-            err(USAGE.rstrip("\n"))
         sys.exit(failure.code)
     except KeyboardInterrupt:
         sys.exit(130)
