@@ -7,20 +7,56 @@ from test_yo import FakeHome, yo
 
 class TestAgentPaths(unittest.TestCase):
     def test_splits_on_nul_and_drops_empty_entries(self):
-        proc = mock.Mock(stdout=b"/a/b\0/c/d\0\0")
+        proc = mock.Mock(returncode=0, stdout=b"/a/b\0/c/d\0\0", stderr="")
         with mock.patch.object(yo, "ssh_run", return_value=proc) as fake_ssh_run:
-            result = yo.agent_paths(["find"])
+            result = yo.agent_paths("projects")
         self.assertEqual(result, ["/a/b", "/c/d"])
-        fake_ssh_run.assert_called_once_with(yo.AGENT, ["find"], check=True, binary=True)
+        fake_ssh_run.assert_called_once_with(yo.AGENT, [yo.HELPER, "projects"], binary=True)
 
     def test_a_newline_inside_one_entry_stays_in_that_entry(self):
-        proc = mock.Mock(stdout=b"a/b\nwith-newline\0c/d\0")
+        proc = mock.Mock(returncode=0, stdout=b"a/b\nwith-newline\0c/d\0", stderr="")
         with mock.patch.object(yo, "ssh_run", return_value=proc):
-            result = yo.agent_paths(["find"])
+            result = yo.agent_paths("projects")
         self.assertEqual(result, ["a/b\nwith-newline", "c/d"])
 
 
 class TestPickProject(FakeHome):
+    def test_agent_paths_is_reached_with_the_projects_subcommand(self):
+        proc = mock.Mock(
+            returncode=0, stdout=(yo.AGENT_HOME + "/a/normal\0").encode(), stderr=""
+        )
+        with mock.patch.object(yo, "require_tool"):
+            with mock.patch.object(yo, "ssh_run", return_value=proc) as fake_ssh_run:
+                with mock.patch.object(
+                    yo.subprocess,
+                    "run",
+                    return_value=mock.Mock(returncode=0, stdout=b"a/normal\0"),
+                ):
+                    yo.pick_project("normal")
+        fake_ssh_run.assert_called_once_with(yo.AGENT, [yo.HELPER, "projects"], binary=True)
+
+    def test_a_partial_listing_still_reaches_fzf_and_warns_via_err(self):
+        proc = mock.Mock(
+            returncode=1,
+            stdout=(yo.AGENT_HOME + "/a/normal\0").encode(),
+            stderr="find: '/home/agent/.local/foo': Permission denied\n",
+        )
+        picker_calls = []
+
+        def fake_picker_run(argv, **kwargs):
+            picker_calls.append(argv)
+            return mock.Mock(returncode=0, stdout=b"a/normal\0")
+
+        with mock.patch.object(yo, "require_tool"):
+            with mock.patch.object(yo, "ssh_run", return_value=proc):
+                with mock.patch.object(yo, "err") as fake_err:
+                    with mock.patch.object(yo.subprocess, "run", side_effect=fake_picker_run):
+                        result = yo.pick_project("normal")
+
+        self.assertEqual(len(picker_calls), 1)
+        self.assertTrue(fake_err.called)
+        self.assertEqual(result, yo.AGENT_HOME + "/a/normal")
+
     def test_fzf_argv_carries_nul_framing_and_a_newline_survives_round_trip(self):
         projects = [
             yo.AGENT_HOME + "/a/normal",

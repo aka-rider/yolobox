@@ -217,9 +217,10 @@ class TestLink(FakeHome):
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         stderr = io.StringIO()
+        args = yo.build_parser().parse_args(["link"])
         with mock.patch.object(yo, "run", fake_run):
             with contextlib.redirect_stderr(stderr):
-                yo.cmd_link([])
+                yo.cmd_link(args)
         return calls, stderr.getvalue()
 
     def remote_subcommands(self, calls):
@@ -453,27 +454,41 @@ class TestDiskGrowSize(unittest.TestCase):
             raise Reached()
 
         with mock.patch.object(yo, "run", fake_run):
-            yo.cmd_disk_grow([arg])
+            args = yo.build_parser().parse_args(["disk-grow", arg])
+            yo.cmd_disk_grow(args)
+
+    def parse_error(self, arg):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                self.parse(arg)
+        self.assertEqual(caught.exception.code, 2)
+        return stderr.getvalue()
 
     def test_whole_number_passes_validation(self):
         with self.assertRaises(Reached):
             self.parse("10")
 
+    def test_unicode_digit_passes_validation(self):
+        with self.assertRaises(Reached):
+            self.parse("٥")  # Arabic-indic digit five
+
     def test_rejects_non_whole_number(self):
-        for arg in ["1e3", "-1"]:
-            with self.subTest(arg=arg):
-                with self.assertRaises(yo.YoError) as caught:
-                    self.parse(arg)
-                self.assertIn("whole number of GiB", caught.exception.message)
+        self.assertIn("whole number of GiB", self.parse_error("1e3"))
 
     def test_rejects_zero(self):
-        with self.assertRaises(yo.YoError) as caught:
-            self.parse("0")
-        self.assertIn("greater than 0 GiB", caught.exception.message)
+        self.assertIn("greater than 0 GiB", self.parse_error("0"))
+
+    def test_rejects_negative(self):
+        # int("-1") parses cleanly, so this is caught by the positivity check,
+        # not the whole-number check — see the deviation note in the report.
+        self.assertIn("greater than 0 GiB", self.parse_error("-1"))
 
     def test_requires_exactly_one_argument(self):
-        with self.assertRaises(yo.YoError) as caught:
-            yo.cmd_disk_grow([])
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                yo.build_parser().parse_args(["disk-grow"])
         self.assertEqual(caught.exception.code, 2)
 
 

@@ -62,6 +62,7 @@
           ./nix/podman.nix
           ./nix/agentic.nix
           ./nix/lsp.nix
+          ./nix/guest.nix
         ];
       };
     };
