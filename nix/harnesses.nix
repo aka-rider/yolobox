@@ -13,13 +13,13 @@ let
   # Claude Code >= 2.1.207 documents that a custom ~/.local/bin/claude is left
   # alone: `claude update` and the background updater only drop new binaries
   # into ~/.local/share/claude/versions/. That guarantee is the whole delivery
-  # channel for the herd hooks, which reach claude as `--settings <file>` and
-  # nowhere else (see nix/herd-report.nix for why the enterprise settings tier
-  # is silently voided here). The box therefore OWNS that path with a launcher
-  # of its own rather than putting a wrapper on the system PATH and racing it:
-  # the agent's dotfiles prepend $HOME/.local/bin, so any wrapper behind it
-  # loses in every interactive shell, silently, which is exactly how 657fc21
-  # ended herd reporting box-wide within a day.
+  # channel for claude's settings file (nix/display.nix), which reaches
+  # claude as `--settings <file>` and nowhere else (see nix/display.nix for
+  # why the enterprise settings tier can't carry it). The box therefore OWNS
+  # that path with a launcher of its own rather than putting a wrapper on the
+  # system PATH and racing it: the agent's dotfiles prepend $HOME/.local/bin,
+  # so any wrapper behind it loses in every interactive shell, silently,
+  # which is exactly how 657fc21 ended herd reporting box-wide within a day.
   #
   # --settings sits before "$@" so a user's own later --settings still wins.
   claudeLauncher = pkgs.writeShellApplication {
@@ -58,6 +58,10 @@ let
       export PLAYWRIGHT_MCP_OUTPUT_DIR="$output_dir"
       mkdir -p "$output_dir"
 
+      # herdr's classification keys off the foreground process name, but the
+      # exec'd binary here is named after its version directory (e.g.
+      # "2.1.268"), not "claude" - so herdr never recognises it without help.
+      export HERDR_AGENT=claude
       exec "$versions/$newest" --settings ${claudeHooksFile.path} "$@"
     '';
   };
@@ -124,6 +128,8 @@ let
         pi list 2>/dev/null | grep -q "$package" || pi install "npm:$package"
       done
 
+      [ -f "$HOME/.pi/agent/extensions/herdr-agent-state.ts" ] || herdr integration install pi
+
       # pi-agent-browser-native ships a `pi-agent-browser-config` helper, but
       # its own README states that `pi install npm:...` does not put it on
       # PATH and names writing this file as the equivalent route. The shape is
@@ -163,14 +169,12 @@ in
       # version is no longer a hand-copied duplicate of a host fact that
       # nobody remembers to re-copy.
       #
-      # The invariant it has to satisfy: the box's herdr must be the SAME
-      # version as the Mac's Homebrew herdr, because herdr's wire protocol
-      # changes across patch bumps — 0.8.0 to 0.8.2 went from protocol 19 to
-      # 20. On drift the host server answers every report with
-      # protocol_mismatch and boxed agents show as `unknown`, with nothing
-      # printed anywhere. That is why the drift is now enforced rather than
-      # documented: `yo enter` refuses on a version mismatch, and
-      # `yo herd-check` proves compatibility end to end.
+      # The invariant it has to satisfy: `herdr machine add` gates a saved
+      # connection on capability, not exact version equality — the guest
+      # server's endpoint_protocol_generation has to match the Mac
+      # client's own constant exactly, coarser than the version string
+      # (see CLAUDE.md, "herdr: the VM runs its own server, panes are real
+      # ptys").
       #
       # Setting version+hash here re-pins the guest to a GitHub release
       # (nix/pkgs/herdr-bin.nix) — the escape hatch for when nixpkgs lags a
@@ -203,6 +207,8 @@ in
       mode = "0555";
     };
 
+    # The trailing "r" rules clear the links a retired MCP layer left behind:
+    # a dropped L+ link is not removed by the rebuild that drops it.
     systemd.tmpfiles.rules = homeTmpfiles {
       home = homeDir;
       dirUser = agentUser;
@@ -211,7 +217,12 @@ in
         { path = ".local/bin/claude"; argument = launcherPath; }
         { path = ".local/bin/opencode"; argument = "${homeDir}/.opencode/bin/opencode"; }
       ];
-    };
+    } ++ [
+      "r ${homeDir}/.pi/agent/extensions/pi-mcp-adapter"
+      "r ${homeDir}/.pi/agent/skills/mcp-scripting"
+      "r ${homeDir}/.config/mcp/mcp.json"
+      "r ${homeDir}/.pi/agent/extensions/yolobox-agent-state.js"
+    ];
 
     # tmpfiles only fires at boot and on switch, which is a window wide enough
     # for a self-updating claude to install its own launcher over ours and go
@@ -261,6 +272,7 @@ in
         pkgs.findutils
         pkgs.gnugrep
         pkgs.jq
+        herdrPkg
       ];
       environment = {
         NPM_CONFIG_PREFIX = "${homeDir}/.local";

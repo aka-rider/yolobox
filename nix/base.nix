@@ -132,14 +132,10 @@
   services.openssh.enable = true;
   services.openssh.settings = {
     AcceptEnv = [
-      "YOLOBOX_HERD"
-      "HERDR_PANE_ID"
-      "HERDR_SOCKET_PATH"
       "AWS_CONTAINER_CREDENTIALS_FULL_URI"
       "AWS_CONTAINER_AUTHORIZATION_TOKEN"
       "AWS_REGION"
     ];
-    StreamLocalBindUnlink = "yes";
     PasswordAuthentication = false;
     PermitRootLogin = "prohibit-password";
   };
@@ -167,23 +163,9 @@
       AuthorizedKeysCommandUser root
   '';
 
-  # Forwarded herdr sockets (see cmd_enter in yo) land under /run, not
-  # $HOME: a unix socket anywhere under a Nix source root makes evaluation of
-  # that root fail with "file ... has an unsupported type", and /run is tmpfs
-  # so an orphaned socket dies at reboot instead of accumulating. This is safe
-  # ahead of any ssh connection because systemd-tmpfiles-setup.service runs
-  # Before=sysinit.target, while sshd only arrives with multi-user.target.
-  # Owned by the agent, not the operator: sshd binds the -R herd forward as
-  # the agent, and an operator-owned 0700 directory would break every
-  # `yo enter`.
-  systemd.tmpfiles.rules = [
-    "d /run/yolobox 0700 ${agentUser} users -"
-  ];
-
   # The harnesses install themselves into the agent's ~/.local/bin (see
   # nix/harnesses.nix). The dotfiles prepend it for interactive shells only,
-  # and t3 and `yo herd-check`'s ssh_run spawn neither a login nor an
-  # interactive shell.
+  # and t3 spawns neither a login nor an interactive shell.
   environment.localBinInPath = true;
 
   security.sudo.wheelNeedsPassword = false;

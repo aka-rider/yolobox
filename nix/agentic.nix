@@ -2,7 +2,7 @@
 {
   imports = [
     ./harnesses.nix
-    ./herd-report.nix
+    ./herd-server.nix
     ./display.nix
     ./t3.nix
   ];

@@ -15,7 +15,6 @@ in
 {
   # environment.systemPackages, not a user-scoped package: both accounts run
   # subcommands from this helper (gc-machine as the operator, everything
-  # else as the agent), the same pattern nix/herd-report.nix uses for
-  # yolobox-herd-check.
+  # else as the agent).
   environment.systemPackages = [ yoloboxGuest ];
 }

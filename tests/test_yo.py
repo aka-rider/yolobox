@@ -3,7 +3,6 @@ import importlib.machinery
 import importlib.util
 import io
 import os
-import socket
 import stat
 import sys
 import tempfile
@@ -79,58 +78,10 @@ class TestGuestPath(unittest.TestCase):
 
 class TestSendEnv(unittest.TestCase):
     def test_only_names_reach_argv(self):
-        opts, env = yo.send_env({"HERDR_PANE_ID": "w1:p2 x"})
-        self.assertEqual(opts, ["-o", "SendEnv=HERDR_PANE_ID"])
-        self.assertEqual(env["HERDR_PANE_ID"], "w1:p2 x")
+        opts, env = yo.send_env({"AWS_REGION": "w1:p2 x"})
+        self.assertEqual(opts, ["-o", "SendEnv=AWS_REGION"])
+        self.assertEqual(env["AWS_REGION"], "w1:p2 x")
         self.assertNotIn("w1:p2 x", " ".join(opts))
-
-
-class TestHerdForward(FakeHome):
-    def setUp(self):
-        super().setUp()
-        self.sock_path = os.path.join(self.home, "herdr.sock")
-        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.server.bind(self.sock_path)
-        self.addCleanup(self.server.close)
-
-    def herd_env(self, **overrides):
-        values = {
-            "HERDR_ENV": "1",
-            "HERDR_PANE_ID": "w1:p2",
-            "HERDR_SOCKET_PATH": self.sock_path,
-        }
-        values.update(overrides)
-        return mock.patch.dict(os.environ, values, clear=False)
-
-    def test_builds_guest_socket_and_env(self):
-        with self.herd_env():
-            forward = yo.herd_forward()
-        guest_sock = "/run/yolobox/herd-host.w1_p2.sock"
-        self.assertEqual(forward.guest_sock, guest_sock)
-        self.assertEqual(forward.env["YOLOBOX_HERD"], "1")
-        self.assertEqual(forward.env["HERDR_SOCKET_PATH"], guest_sock)
-        self.assertEqual(forward.env["HERDR_PANE_ID"], "w1:p2")
-        self.assertIn("-R", forward.ssh_opts)
-        self.assertIn("%s:%s" % (guest_sock, self.sock_path), forward.ssh_opts)
-
-    def test_pane_id_is_sanitised_not_refused(self):
-        with self.herd_env(HERDR_PANE_ID="../x"):
-            forward = yo.herd_forward()
-        self.assertEqual(forward.guest_sock, "/run/yolobox/herd-host.___x.sock")
-
-
-class TestHerdPaneProbeArgv(unittest.TestCase):
-    def test_probe_reports_claude_idle_under_the_probe_source(self):
-        self.assertEqual(
-            yo.herd_probe_argv("w1:p2"),
-            ["herdr", "pane", "report-agent", "w1:p2", "--source", "yolobox:probe", "--agent", "claude", "--state", "idle"],
-        )
-
-    def test_release_matches_the_probe_source_and_agent(self):
-        self.assertEqual(
-            yo.herd_probe_release_argv("w1:p2"),
-            ["herdr", "pane", "release-agent", "w1:p2", "--source", "yolobox:probe", "--agent", "claude"],
-        )
 
 
 class TestSshRunArgv(FakeHome):
@@ -157,15 +108,15 @@ class TestSshRunArgv(FakeHome):
         self.assertIn("ControlPath=%s/.lima/yolobox/ssh-agent.sock" % self.home, argv)
 
     def test_send_env_over_a_shared_control_master_is_refused(self):
-        opts = yo.send_env({"HERDR_PANE_ID": "x"})[0]
+        opts = yo.send_env({"AWS_REGION": "x"})[0]
         with self.assertRaises(yo.YoError):
             self.capture_argv(yo.AGENT, extra_opts=opts, mux=True)
 
     def test_send_env_on_an_unshared_connection_reaches_argv(self):
-        opts = yo.send_env({"HERDR_PANE_ID": "x"})[0]
+        opts = yo.send_env({"AWS_REGION": "x"})[0]
         argv = self.capture_argv(yo.AGENT, extra_opts=opts, mux=False)
         self.assertIn("ControlPath=none", argv)
-        self.assertIn("SendEnv=HERDR_PANE_ID", argv)
+        self.assertIn("SendEnv=AWS_REGION", argv)
 
 
 STALE_REMOTE = "ssh://lima-yolobox/home/xiii.guest/wrk/rune"
@@ -369,14 +320,38 @@ class TestEnsureSshConfigInclude(FakeHome):
         self.assertEqual(self.read_config(), original)
 
 
-LIMA_BLOCK = "Host lima-yolobox\n  ControlPath ~/.lima/yolobox/ssh.sock\n  User agent\n"
+LIMA_BLOCK = (
+    "Host lima-yolobox\n"
+    '  IdentityFile "/Users/xiii/.lima/_config/user"\n'
+    "  StrictHostKeyChecking no\n"
+    "  User xiii\n"
+    "  ControlMaster auto\n"
+    '  ControlPath "/Users/xiii/.lima/yolobox/ssh.sock"\n'
+    "  ControlPersist yes\n"
+    "  Hostname 127.0.0.1\n"
+    "  Port 60022\n"
+)
+
+LIMA_BLOCK_MISSING_ALIAS_FIELDS = "Host lima-yolobox\n  ControlPath ~/.lima/yolobox/ssh.sock\n  User agent\n"
 
 
 class TestEnsureAgentSshConfig(FakeHome):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(yo, "err")
+        self.err = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def config_path(self):
         ssh_dir = os.path.join(self.home, ".lima", "yolobox")
         os.makedirs(ssh_dir, exist_ok=True)
         return os.path.join(ssh_dir, "ssh.config")
+
+    def write_config(self, text):
+        path = self.config_path()
+        with open(path, "w") as handle:
+            handle.write(text)
+        return path
 
     def read_config(self):
         with open(self.config_path(), "r") as handle:
@@ -384,11 +359,10 @@ class TestEnsureAgentSshConfig(FakeHome):
 
     def test_missing_file_is_not_an_error(self):
         yo.ensure_agent_ssh_config()
+        self.err.assert_not_called()
 
     def test_yolobox_block_precedes_limas_own_control_path(self):
-        path = self.config_path()
-        with open(path, "w") as handle:
-            handle.write(LIMA_BLOCK)
+        path = self.write_config(LIMA_BLOCK)
 
         yo.ensure_agent_ssh_config()
 
@@ -399,9 +373,7 @@ class TestEnsureAgentSshConfig(FakeHome):
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
     def test_second_call_is_byte_identical(self):
-        path = self.config_path()
-        with open(path, "w") as handle:
-            handle.write(LIMA_BLOCK)
+        self.write_config(LIMA_BLOCK)
         yo.ensure_agent_ssh_config()
         first = self.read_config()
 
@@ -410,9 +382,7 @@ class TestEnsureAgentSshConfig(FakeHome):
         self.assertEqual(self.read_config(), first)
 
     def test_lima_regenerated_file_is_repaired_without_duplicating(self):
-        path = self.config_path()
-        with open(path, "w") as handle:
-            handle.write(LIMA_BLOCK)
+        path = self.write_config(LIMA_BLOCK)
         yo.ensure_agent_ssh_config()
 
         with open(path, "w") as handle:
@@ -422,6 +392,60 @@ class TestEnsureAgentSshConfig(FakeHome):
         content = self.read_config()
         self.assertEqual(content.count("ssh-agent.sock"), 1)
         self.assertLess(content.index("ssh-agent.sock"), content.index("ssh.sock"))
+
+    def test_herdr_alias_is_present_as_agent_with_no_shared_control_path(self):
+        self.write_config(LIMA_BLOCK)
+
+        yo.ensure_agent_ssh_config()
+
+        content = self.read_config()
+        self.assertIn("Host yolobox\n", content)
+        alias = content.split("Host yolobox\n", 1)[1]
+        self.assertIn("  User agent\n", alias)
+        self.assertIn("  ControlPath none\n", alias)
+        self.assertNotIn("ForwardAgent", alias)
+
+    def test_herdr_alias_takes_hostname_port_identityfile_from_lima(self):
+        self.write_config(LIMA_BLOCK)
+
+        yo.ensure_agent_ssh_config()
+
+        alias = self.read_config().split("Host yolobox\n", 1)[1]
+        self.assertIn("  Hostname 127.0.0.1\n", alias)
+        self.assertIn("  Port 60022\n", alias)
+        self.assertIn('  IdentityFile "/Users/xiii/.lima/_config/user"\n', alias)
+
+    def test_herdr_alias_is_idempotent_across_reapplication(self):
+        path = self.write_config(LIMA_BLOCK)
+        yo.ensure_agent_ssh_config()
+        first = self.read_config()
+
+        with open(path, "w") as handle:
+            handle.write(LIMA_BLOCK)
+        yo.ensure_agent_ssh_config()
+
+        content = self.read_config()
+        self.assertEqual(content, first)
+        self.assertEqual(content.count("Host yolobox\n"), 1)
+
+    def test_unparseable_lima_block_skips_alias_without_writing_broken_block(self):
+        self.write_config(LIMA_BLOCK_MISSING_ALIAS_FIELDS)
+
+        yo.ensure_agent_ssh_config()
+
+        content = self.read_config()
+        self.assertNotIn("Host yolobox\n", content)
+        self.err.assert_called_once()
+        self.assertIn("yolobox", self.err.call_args[0][0])
+
+    def test_missing_lima_block_entirely_skips_alias(self):
+        self.write_config("Host somewhere-else\n  Hostname 1.2.3.4\n  Port 22\n  IdentityFile x\n")
+
+        yo.ensure_agent_ssh_config()
+
+        content = self.read_config()
+        self.assertNotIn("Host yolobox\n", content)
+        self.err.assert_called_once()
 
 
 class TestParsePairingUrl(unittest.TestCase):

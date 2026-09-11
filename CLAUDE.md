@@ -23,8 +23,10 @@ rules this file justifies.
 - `nix/harnesses.nix`, `nix/agentic.nix` — the coding agents: the
   box-owned `claude` launcher, the user service that installs claude, pi,
   opencode and agent-browser from their vendors, the user path unit that
-  re-asserts the launcher, and nix-built herdr.
-- `nix/herd-report.nix` — how in-VM agents report to the Mac's herd.
+  re-asserts the launcher, and the herdr package selection this file
+  shares with `nix/herd-server.nix`.
+- `nix/herd-server.nix` — the VM's own herdr server, run as the agent
+  account from boot.
 - `nix/display.nix` — the virtual X display, browsers, screen recording.
 - `nix/lsp.nix` — the Python language-server wiring for every editor.
 - `nix/t3.nix`, `nix/pkgs/t3.nix` — t3code built from npm and run as a
@@ -585,8 +587,10 @@ each recognisable on its own:
 The VM carries `systemd-tmpfiles-resetup.service`, the switch-time twin of
 the boot-only setup unit, so a new tmpfiles rule takes effect on `switch`
 with no reboot. It re-runs every rule, including force-replacing `L+`
-links, which `nix/herd-report.nix` relies on to fill pi's auto-discovery
-directories.
+links, which `nix/harnesses.nix` relies on to hold `~/.local/bin/claude`
+and `~/.local/bin/opencode` at the box's own paths across the one window
+the launcher path unit cannot see on its own — an install made while no
+user manager of the agent's was running.
 
 ## The ESP is 249 MiB and holds one kernel
 
@@ -791,9 +795,9 @@ own cwd — by upstream design (microsoft/playwright#42487, #42494), and
 Claude Code has advertised its own launch directory as MCP root #1 since
 2.1.203. Left alone, a named screenshot would therefore land inside
 whatever project checkout the session started in, exactly what keeping
-output under `~/artifacts` exists to prevent. `nix/herd-report.nix`'s
-second `PreToolUse` hook, `yolobox-playwright-artifacts`, catches this
-before the tool runs: it rewrites `filename` in the tool input, keeping a
+output under `~/artifacts` exists to prevent. `nix/display.nix`'s
+`PreToolUse` hook, `yolobox-playwright-artifacts`, catches this before
+the tool runs: it rewrites `filename` in the tool input, keeping a
 relative name's subpath under the output dir and reducing an absolute
 name to its basename there.
 
@@ -818,127 +822,115 @@ Things learned the hard way, each one line:
 - Chromium's storage flushes lazily; a session killed without
   `browser_close` can lose its last write.
 
-## Herd reporting: recognising a silent failure
+## herdr: the VM runs its own server, panes are real ptys
 
-Only claude (a hook map) and pi (a bundled extension) report into the
-herd; see `nix/herd-report.nix`. An unreported agent runs fine and shows as
-`unknown`. Reporting rides `yo enter` only — it forwards the herdr socket
-to `/run/yolobox/herd-host.<pane>.sock` and sets the herd env. `yo ssh`,
-`yo code`, `yo zed` and t3-spawned agents carry neither, so they show as
-`unknown` by design.
+The Mac used to run the only herdr server, and `yo enter` forwarded that
+server's unix socket into the guest over `ssh -R`, to
+`/run/yolobox/herd-host.<pane>.sock`, setting `YOLOBOX_HERD` /
+`HERDR_PANE_ID` / `HERDR_SOCKET_PATH` for guest-side hooks to report
+through. That existed for one reason: a host pane's foreground process
+was `ssh`, not the agent, so herdr had nothing of its own to detect.
 
-A herdr-installed `~/.pi/agent/extensions/herdr-agent-state.ts` reports
-under `herdr:pi`, a source the server reserves for itself, and knocks pi
-out of the herd. A tmpfiles `r` rule deletes it on every boot and switch.
+The VM now runs its own herdr server as the `agent` account —
+`nix/herd-server.nix`, a `systemd.user` service wanted by
+`default.target` and gated `ConditionUser = agent` — up from boot on the
+account's existing lingering (see "The harnesses come from their
+vendors" below for why lingering matters there too). Panes opened
+against that server are real ptys, so herdr detects an agent inside them
+natively, the same way it detects one on the Mac. `yo enter` forwards no
+socket and sets no herd env any more; landing in the guest is now the
+whole of what it does for herdr. Reporting no longer rides `yo enter`
+alone either: any session that is a real pty on the guest server is
+visible — `yo ssh`, `yo code`, `yo zed` and t3-spawned agents still show
+as `unknown`, because none of them opens a pty on the herdr server
+itself.
 
-Two defects once made every in-VM claude session invisible.
+The Mac attaches to the guest server as a saved SSH **machine**, adopted
+rather than started: `herdr machine add <alias> --label yolobox` checks
+the running server's capabilities, never its process ancestry, so the
+systemd unit and `machine add` never fight over who owns the process.
+Adoption is also why keeping `herdrPkg` in `environment.systemPackages`
+(`nix/harnesses.nix`) is load-bearing rather than incidental: `machine
+add` installs its own binary into `~/.local/bin/herdr` only when no
+compatible binary turns up on its probe list, and that list includes
+`/run/current-system/sw/bin/herdr` — drop the package from
+`systemPackages` and a fresh `machine add` would try to install its own
+binary instead of adopting the system one, and a non-interactive install
+is refused outright rather than done silently.
 
-**Version drift.** Homebrew herdr moved to 0.8.2 (protocol 20) while the
-box was pinned at 0.8.0 (protocol 19), and every report was rejected with
-`protocol_mismatch`. The protocol moved across a patch bump, so only exact
-version equality is an honest proxy. The pin is gone: the box tracks
-nixpkgs' `pkgs.herdr`, with `yolobox.harness.herdr.version`/`hash` as an
-escape hatch for when nixpkgs lags. `yo enter` refuses on drift (exit 3;
-`YOLOBOX_SKIP_HERD_CHECK=1` overrides, needed when nixpkgs has no matching
-version yet), `yo status` warns, `yo herd-check` proves the chain.
+Compatibility is gated by capability now, not by the version-equality
+rule this file used to carry. The guest reports `version 0.9.0, protocol
+22, endpoint_protocol_generation: 1, surface_interest: true, health_check:
+true, detached_server_daemon: true`; herdr's `remote_server_restart_reason`
+gates a saved machine on four of those — `endpoint_protocol_generation`,
+`surface_interest`, `health_check`, `detached_server_daemon` — and
+`endpoint_protocol_generation` has to equal the client's own constant
+exactly. It is coarser than the version string, so the VM's herdr and the
+Mac's herdr may run different versions as long as the generation agrees;
+the old rule, exact version equality between the two, was strictly finer
+than what compatibility actually needs.
 
-**The hooks never ran.** Claude Code assembles policy settings from three
-tiers — remote, MDM, `/etc/claude-code/managed-settings.json` — and takes
-only the first non-empty one, no merge. `~/.claude/remote-settings.json`
-holds `{"channelsEnabled": true}`, which is enough to make the remote tier
-win and drop the `/etc` file whole, with no log line. The remote payload is
-re-applied about 180 ms into every session, so even an empty cache would
-not help. The policy channel is therefore unusable. The fix is the
-box-owned `~/.local/bin/claude` launcher, which puts `--settings
-/etc/claude-code/herd-hooks.json` in front of every invocation (see "The
-harnesses come from their vendors; the box owns `~/.local/bin/claude`"
-below); that channel is always honoured and was verified to survive the
-mid-session refresh. That same file also carries the Playwright
-artifact-reroute hook (see "Browsers and the virtual display" above) —
-one settings file, two unrelated `PreToolUse` entries, both riding the one
-channel proven to survive the refresh.
+The VM's herdr is pinned regardless, through the existing
+`yolobox.harness.herdr.version`/`.hash` valve in `flake.nix` — to 0.9.0,
+because the pinned nixpkgs still carries 0.8.2, and taking 0.9.0 from
+nixpkgs would have dragged a whole nixpkgs move, a new kernel included,
+onto a 249 MiB ESP that already holds exactly one kernel set (see "The
+ESP is 249 MiB" below). The pin fetches the published
+`herdr-linux-aarch64` release asset directly (`nix/pkgs/herdr-bin.nix`);
+it carries no `PT_INTERP` and no `PT_DYNAMIC` — statically linked — so it
+runs on NixOS unpatched, with none of the nix-ld dance a dynamically
+linked upstream binary would otherwise need.
 
-The absence of `~/.local/state/yolobox/herd-report.log` proves nothing: a
-hook that never runs writes nothing. When an agent is missing from the
-herd, work down this ladder:
+Two failure shapes are worth recognising, because neither one produces an
+error anywhere.
 
-1. `ls -l /run/yolobox/` — no socket means the `-R` forward failed to bind,
-   and ssh said so at connect time; usually `/run/yolobox` missing after a
-   switch with no reboot.
-2. `sudo strace -f -qq -e trace=execve -p <claude pid>` grepped for
-   `herd-report` — do the hooks run at all. `sudo`, because
-   `ptrace_scope=1`.
-3. `claude --debug` grepped for `Hook output` / `policySettings` — which
-   channel won.
-4. `herdr pane report-agent <pane> --source yolobox:x --agent claude-vm
-   --state idle` landing while the same call with `--agent claude` does not
-   proves the process-exit latch below (release both afterwards).
+**`herdr agent list` comes back empty for a session that is plainly
+running claude.** herdr classifies a pane's agent by the name of its
+foreground process, and the box's claude launcher `exec`s
+`~/.local/share/claude/versions/<version>` directly, so the process herdr
+actually sees is named after a version directory (`2.1.268`, say), never
+`claude` — classification never reaches herdr's screen manifest at all.
+The manifest itself is fine throughout, which is the proof the gap is in
+classification and not detection: `herdr agent explain --file <pane
+dump> --agent claude` matches rule `live_prompt_box` and returns `idle`
+even while `herdr agent list` shows nothing. The fix is one line in the
+launcher ahead of its `exec`: `export HERDR_AGENT=claude` — herdr reads
+the hint from the process environment rather than the process name.
+herdr's own docs warn that `HERDR_AGENT` "cannot be seen if you set it
+only inside a VM"; that warning describes a different topology, a
+host-side herdr watching into a VM from outside, and does not apply here,
+because the server reading the hint now runs inside the VM with the
+process rather than watching it from outside. With the hint in place, all
+three states were observed live through `herdr agent get`: `idle` (rule
+`live_prompt_box`), `working` (during a real turn), and `blocked` (rule
+`bash_permission_prompt`, held steady while a real permission dialog was
+up — plan mode intercepts a destructive command before the permission UI
+ever appears, so re-testing `blocked` needs the pane in manual mode
+first).
 
-A measurement trap that fooled this twice: `claude -p '<prompt>'` runs the
-whole lifecycle in two seconds — `SessionStart`, `UserPromptSubmit`,
-`Stop`, `SessionEnd` — and `SessionEnd` releases the agent from the herd.
-So a headless run followed by a look at the herd shows nothing, exactly
-like hooks that never ran. Use an interactive `claude`, read the log, or
-watch the herd while the run is in flight. A leftover socket from a dead
-`yo enter` answers `server_not_running` and is harmless;
-`StreamLocalBindUnlink` lets the next `yo enter` rebind it.
+**A saved machine sits stuck rather than connecting.** That is
+`remote_server_restart_reason` refusing one of the four capabilities
+above, almost always `endpoint_protocol_generation`, because that is the
+one that actually gates compatibility — a Mac herdr and a VM herdr that
+both look like "0.9.x" in `herdr status` can still disagree on
+generation, so read the generation, not the version string sitting next
+to it. The remedy is the same escape hatch as the pin itself: bump
+`yolobox.harness.herdr.version`/`.hash` to whatever generation the Mac's
+herdr now speaks.
 
-**The process-exit latch.** A third shape shows up per-pane rather than
-box-wide: `yo enter` then `claude` in the guest, and that one session never
-appears in herdr's agents list, while a second pane started the normal way
-works fine. Both launches are identical — same launcher, the same
-`YOLOBOX_HERD`/`HERDR_PANE_ID`/`HERDR_SOCKET_PATH`, the same forwarded
-socket answering `herdr status`, and no rejection anywhere in
-`~/.local/state/yolobox/herd-report.log` — because there is none to log:
-herdr's `report-agent` answers `ok` regardless. The discriminator is the
-pane, not the agent or the box: only a pane in which a *host-side* claude
-process had run and exited stays blind; a fresh split pane works, and pi
-in that same blind pane still reports fine. It first looked like "the
-first agent anywhere", because the box usually has no agent running yet
-right when a host-side claude has just quit — coincidence, not cause:
-herdr's detection is per pane (`src/pane.rs:2156-2178`), with no notion of
-a global agent count anywhere. The mechanism is a latch:
-`TerminalState::set_hook_authority_at` (`state.rs:633-652`) discards the
-report — returns `None`, while `report-agent` still answers `ok`
-(`src/app/api/panes.rs:1231-1257`) — whenever `recent_agent_process_exit`
-names the same agent kind the report carries, and that latch is armed by
-host-side process detection (`state.rs:399-405`) with no expiry: the only
-time-windowed check, `agent_process_exited_within` (`state.rs:249`), is
-compiled only for Windows and tests. It clears solely when detection sees
-that agent kind again or the pane's shell respawns — never on an `ssh`
-foreground process, which is exactly what a guest session leaves in place
-for as long as the pane lives. Six full-lifecycle hook sources
-(`herdr:pi` among them) are exempt by name; a hook-reported `claude` is
-not. Full writeup, with the repro and every file:line:
-`upstream/herdr-process-exit-latch.md`.
-
-Short of the upstream fix, `yo enter` now works around it: it reports a
-throwaway `claude` probe into the pane before connecting, reads it back,
-releases it, and warns on stderr naming the cause and the remedy (open a
-fresh pane or tab) when the read-back disagrees — then continues, because
-pi is unaffected. The guest reporter's `SessionStart` does the same
-read-back after its real report and fails loudly in claude's own UI when
-it was dropped, rather than leaving silence for the next person to misread
-as "the hooks never ran". `yo herd-check` stage 3 names this cause
-specifically, rather than stopping at "which channel won".
-
-The reporter always exits 0, with one exception: `SessionStart` exits 1 on
-a failed report and writes the diagnostic to stderr, where Claude Code
-surfaces it. It is off the work path, so it cannot interrupt anything;
-`PreToolUse` fires on every tool call and would turn one broken socket
-into a wall of warnings. Each log line carries the guest herdr version and
-socket path.
-
-`yo herd-check` proves the chain end to end. Run it from a herdr pane with
-no agent on it: it reports and then releases that pane.
-
-Do not add age-based tmpfiles cleanup for stale sockets: `relatime` caps
-the atime refresh at about a day and an established connection touches
-nothing, so an age would reap a live pane's socket.
-
-Grep gotcha: filtering `/proc/<pid>/environ` needs
-`grep -E '^(YOLOBOX_HERD|HERDR_)'`. Writing `'^(HOME|HERDR_|PATH)='` binds
-the `=` after the alternation and matches nothing.
+A third shape is less a herdr bug to diagnose than a trap to avoid
+recreating. pi's own herdr integration writes
+`~/.pi/agent/extensions/herdr-agent-state.ts` (`herdr integration install
+pi`, run by `yolobox-harness-install`) — a vendor-owned file, not one the
+flake renders. An earlier design needed `yolobox:pi` to be pi's one and
+only source into a Mac-side herd, so a tmpfiles `r` rule deleted that
+exact path on every boot and switch; that need is gone, and so is the
+rule. Never re-add a tmpfiles rule deleting a herdr-installed integration
+file: `systemd-tmpfiles-resetup.service` (see "tmpfiles rules apply on
+switch" below) reapplies `r` rules on every switch, not just once, so the
+rule would silently un-install the integration on the very next switch —
+and the symptom, pi missing from the herd with no error anywhere, would
+look exactly like the integration never having installed at all.
 
 ## The harnesses come from their vendors; the box owns `~/.local/bin/claude`
 
@@ -949,10 +941,17 @@ instead is one path: `~/.local/bin/claude`. That inversion is the whole
 design, and the reason for it is an outage this file used to describe from
 the other side.
 
-The herd hook map reaches claude only as `--settings <file>` — see "Herd
-reporting" above for why the `/etc/claude-code/managed-settings.json` tier
-cannot carry it — so whatever puts that flag on the command line has to be
-the `claude` a human session actually runs. Until now that was a nix
+Claude's settings reach it only as `--settings <file>`: Claude Code
+assembles `policySettings` from three tiers — remote, MDM,
+`/etc/claude-code/managed-settings.json` — and takes only the first
+non-empty one, no merge, and this account's `~/.claude/remote-settings.json`
+holds `{"channelsEnabled": true}`, which is always non-empty, so the
+`/etc` tier is discarded whole with nothing logged. `--settings` is the
+one channel proven to survive that (see "Browsers and the virtual
+display" above, where the same file carries the Playwright
+artifact-reroute hook this box actually needs delivered), so whatever
+puts that flag on the command line has to be the `claude` a human
+session actually runs. Until now that was a nix
 wrapper on the system PATH. `657fc21` pointed the wrapper at upstream's
 self-updating install and appended, never prepended, `~/.local/bin` to
 PATH, on the theory that only `environment.localBinInPath` could prepend
@@ -970,7 +969,7 @@ directory the box does not own, then forbidding anything from living in
 it. The box now owns the path itself. `~/.local/bin/claude` is a tmpfiles
 `L+` link to `/etc/yolobox/bin/claude`, a launcher script that picks the
 newest binary under `~/.local/share/claude/versions/` and execs it with
-`--settings /etc/claude-code/herd-hooks.json` ahead of `"$@"`, so a user's
+`--settings /etc/claude-code/claude-hooks.json` ahead of `"$@"`, so a user's
 own later `--settings` still wins. Anthropic documents (setup docs, since
 2.1.207) that a custom launcher at that path is left alone by `claude
 update` and by auto-update, which only drop new binaries into
@@ -1009,8 +1008,9 @@ tmpfiles link from `~/.local/bin/opencode` makes reachable (the installer
 has no install-dir override). No vendor installer is ever allowed to edit
 an rc file. `NPM_CONFIG_PREFIX=$HOME/.local` puts every `npm -g` binary in
 `~/.local/bin` alongside the launcher, and `environment.localBinInPath`
-puts that directory on PATH for non-login shells too — `yo herd-check`'s
-`ssh_run` and t3 both run in one. t3's own unit carries
+puts that directory on PATH for non-login shells too — every
+non-interactive `yo` guest call (`ssh_run`, behind `yo gc`, `yo status`
+and the rest) and t3 both run in one. t3's own unit carries
 `${homeDir}/.local` in its `path`, so a t3-spawned claude goes through the
 launcher and carries the hooks like any other.
 
@@ -1022,11 +1022,10 @@ session, and `/run/user/1000` would come and go underneath anything that
 kept a socket there. With lingering, all three run from boot and that
 runtime directory persists.
 
-Recognise a broken hook chain by the disagreement, not by an error,
-because there is no error anywhere: an unwrapped claude works perfectly
-and simply carries no hooks, and a reporter that never runs logs nothing
-— `~/.local/state/yolobox/herd-report.log` does not record a failure, it
-just stops. The honest probe is to ask the two shells and follow the link:
+Recognise a broken launcher by the disagreement, not by an error, because
+there is no error anywhere: an unwrapped claude works perfectly and
+simply carries neither `HERDR_AGENT` nor the Playwright hook, silently.
+The honest probe is to ask the two shells and follow the link:
 
 ```sh
 zsh -lic 'command -v claude'         # what a human session gets
@@ -1036,11 +1035,13 @@ readlink -f ~/.local/bin/claude      # where the link actually ends
 
 The first two must both answer `/home/agent/.local/bin/claude`, and the
 third must be `/etc/yolobox/bin/claude`. During the 2026-09-04 incident
-the two shells disagreed, which is also why `yo herd-check` passed
-throughout: its guest half ran over a non-interactive, non-login shell
-that never sources `~/.zshrc`, so stage 6 was measuring a shell nobody
-uses. Stage 6 now resolves claude through the account's login shell and
-asserts the link target as well.
+the two shells disagreed. The old `yo herd-check` — removed along with
+the rest of the host-forwarded herd wiring, see "herdr: the VM runs its
+own server, panes are real ptys" above — missed it throughout for the
+same reason this probe exists: its guest half ran over a
+non-interactive, non-login shell that never sources `~/.zshrc`, so the
+check was measuring a shell nobody uses. This probe does not depend on
+any herd wiring to run, which is why it is the one worth keeping.
 
 ## MCP: the vendors' own plugins, not files this repo renders
 
@@ -1096,15 +1097,26 @@ module without an aarch64 prebuild cannot install. That dropped
 `@plannotator/pi-extension` (`node-pty` prebuilds darwin and win32 only).
 Prebuilt glibc packages like `@ast-grep/napi` are fine.
 
-Ownership: the flake owns exactly one thing in pi's tree now, the
-herd-report extension. `pi-mcp-adapter` and the `mcp-scripting` skill went
-with `nix/mcp.nix`; their `L+` links are removed by `r` rules, because a
-dropped link is not removed by the rebuild that drops it. The context7 and
-agent-browser packages are installed with `pi install`, so pi owns them.
-Skills, agents, prompts, `cc-compat` and the rest of the packages come
-from `~/.dotfiles/_do_install.sh`, re-run after a dotfiles pull. Two extensions registering the same tool name kill pi at startup —
-that retired the flake's pi-lsp extension in favour of pi-lens. A retired
-`L+` link is not removed by the rebuild that drops it; delete it by hand.
+Ownership: the flake owns nothing in pi's extensions tree any more. It
+used to render one, `yolobox-agent-state.js`, pi's herd-report source
+under the old design; pi's own herdr integration
+(`~/.pi/agent/extensions/herdr-agent-state.ts`) replaces it now, and it
+is vendor-installed with `herdr integration install pi`, not rendered by
+the flake at all. `pi-mcp-adapter` and the `mcp-scripting` skill went
+earlier, with `nix/mcp.nix`. Every one of these retirements needed
+pairing with an `r` rule, and one didn't get it the first time: dropping
+`yolobox-agent-state.js`'s `environment.etc` entry without an `r` rule
+alongside it left the file a dangling symlink — a dropped `L+` link is
+not removed by the rebuild that drops it, exactly the shape `pi-lsp`
+below leaves behind, and exactly the shape this section already
+documents for pi's own `settings.json`. Recognise it the same way, with
+`ls -l`. The context7 and agent-browser packages are installed with `pi
+install`, so pi owns them. Skills, agents, prompts, `cc-compat` and the
+rest of the packages come from `~/.dotfiles/_do_install.sh`, re-run after
+a dotfiles pull. Two extensions registering the same tool name kill pi at
+startup — that retired the flake's pi-lsp extension in favour of
+pi-lens. A retired `L+` link is not removed by the rebuild that drops it;
+delete it by hand.
 
 ## t3: a nix-built npm CLI, run as a service
 
@@ -1283,10 +1295,11 @@ process in place rather than forking a child, so the pid the broker's
 watch-pid thread polls (`kill -0` every 5s; gone → `os._exit(0)`) is the
 exact pid that names the log file, with no second handshake field needed to
 tell `yo` where to look. That same `os.execvpe` is what makes watch-pid
-correct at all: an early exit after the broker starts (`check_herd_drift`'s exit 3,
-for instance) leaves no orphan, because the watched pid disappears within
-5s of `yo enter` itself exiting — there is no lingering parent shell to
-keep it alive. A broker that somehow outlives its watched pid despite this
+correct at all: any exit from `yo enter` after the broker starts but
+before `exec_process` ever replaces the process leaves no orphan, because
+the watched pid disappears within 5s of `yo enter` itself exiting — there
+is no lingering parent shell to keep it alive. A broker that somehow
+outlives its watched pid despite this
 (pane killed hard enough that even `os._exit` housekeeping never runs) is
 still bounded by `--idle-timeout` (4h default): no authenticated `/creds`
 hit in that window and it exits on its own. That backstop is not currently
@@ -1294,9 +1307,9 @@ wired to anything log-visible beyond the broker's own stderr — a genuinely
 orphaned broker is a leaked process, not a leaked credential, since its
 bearer token dies with it and nothing else ever learns that token.
 
-The forward itself is TCP `-R`, not the unix-socket forward the herd wiring
-uses — a container-credentials URL has no `unix://` form botocore accepts
-— and TCP `-R` has no `StreamLocalBindUnlink` equivalent to atomically
+The forward itself is TCP `-R`, not a unix-socket forward — a
+container-credentials URL has no `unix://` form botocore accepts — and
+TCP `-R` has no `StreamLocalBindUnlink` equivalent to atomically
 reclaim a stale guest-side listener. So claiming a guest port is
 probe-and-retry: up to 5 candidates in `41000 + RANDOM % 1000`, each proved
 with a throwaway `ssh -o ExitOnForwardFailure=yes -R <candidate>:...
@@ -1306,15 +1319,14 @@ not a bug to fix — a collision in that window is vanishingly unlikely, and
 a real one just fails the real forward exactly as a failed probe would
 have. Once a port is claimed, `AWS_CONTAINER_CREDENTIALS_FULL_URI=http://
 127.0.0.1:<guest-port>/creds` and `AWS_CONTAINER_AUTHORIZATION_TOKEN=<token>`
-cross via `-o SendEnv=...` plus host-side exported env. Every forwarded
-variable, herd and AWS alike, crosses by `SendEnv`, so no value ever appears
-in ssh's argv. Nothing is written under guest `~/.aws`: the container credential
+cross via `-o SendEnv=...` plus host-side exported env, so no value ever
+appears in ssh's argv. Nothing is written under guest `~/.aws`: the container credential
 provider talks HTTP, not disk, and `AWS_CLI_SESSION_ID_DISABLED = "true"`
 keeps the CLI's telemetry sqlite out of `~/.aws/cli/cache` too.
 
 `yo ssh` and editor sessions (`yo code`, `yo zed`) deliberately carry no AWS
-env or broker at all — same opt-in-and-silent posture as the herd wiring,
-since most sessions have no need for AWS. `yo aws-check` is the doctor:
+env or broker at all, opt-in and silent, since most sessions have no need
+for AWS. `yo aws-check` is the doctor:
 it proves the host prerequisites, starts a real throwaway broker and
 forward (through `start_aws_broker` itself, not a reimplementation), then
 from the guest curls `/health`, curls `/creds` and asserts all four keys

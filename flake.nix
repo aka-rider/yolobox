@@ -57,6 +57,16 @@
         };
         modules = [
           { nixpkgs.overlays = [ (final: prev: { rune = rune.packages.aarch64-linux.rune; }) ]; }
+          # nixpkgs' pin still carries herdr 0.8.2 while the Mac is on 0.9.0,
+          # and a saved SSH machine needs the guest server's
+          # endpoint_protocol_generation to equal the client's exactly. The
+          # published linux-aarch64 asset is statically linked (no PT_INTERP,
+          # no PT_DYNAMIC), so it runs here unpatched.
+          { yolobox.harness.herdr = {
+              version = "0.9.0";
+              hash = "sha256-nI2yD7fnQnsTjVNnET8WIf/TGfL2XW8AniWUApEV8NI=";
+            };
+          }
           nixos-lima.nixosModules.lima
           ./nix/base.nix
           ./nix/podman.nix
