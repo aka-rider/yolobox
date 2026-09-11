@@ -140,9 +140,30 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 
 ## Agents and the herd
 
-- ALWAYS keep the VM's herdr version equal to the Mac's Homebrew herdr.
-  The wire protocol moved across a patch release; a mismatch rejects every
-  report silently.
+- ALWAYS treat herdr compatibility as capability-gated, not
+  version-equal. `herdr machine add` accepts a saved connection only when
+  the guest's `endpoint_protocol_generation` matches the client's own
+  constant exactly — coarser than the version string, so the VM and the
+  Mac may run different herdr versions as long as the generation agrees.
+  Bump `yolobox.harness.herdr.version`/`.hash` when it does not.
+- ALWAYS keep `herdrPkg` in `environment.systemPackages`. `herdr machine
+  add` adopts a running, compatible server rather than starting its own,
+  and installs its own binary only when none turns up on its probe list —
+  a list that includes `/run/current-system/sw/bin/herdr`. Drop the
+  package and a fresh `machine add` tries to install over the system one
+  instead of adopting it, and a non-interactive install is refused
+  outright.
+- ALWAYS keep `HERDR_AGENT=claude` exported in the claude launcher ahead
+  of its `exec`. herdr classifies a pane's agent by its foreground
+  process name, and the launcher execs a binary named after its version
+  directory, not `claude` — without the hint, classification never
+  reaches herdr's screen manifest and the session reports nothing, with
+  no error anywhere.
+- NEVER add a tmpfiles rule that deletes a herdr-installed integration
+  file (`~/.pi/agent/extensions/herdr-agent-state.ts`, for one).
+  `systemd-tmpfiles-resetup.service` reapplies `r` rules on every switch,
+  not once, so the rule would silently un-install the integration on the
+  very next switch.
 - ALWAYS deliver hooks through the box-owned `~/.local/bin/claude`
   launcher's `--settings` file. The
   `/etc/claude-code/managed-settings.json` tier is discarded whole
@@ -157,12 +178,6 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   an rc file (`--no-modify-path`). The install downloads a glibc Chrome
   for Testing that cannot execute on NixOS, and an installer-written rc
   line changes PATH behind the box's back on the very path it owns.
-- ALWAYS start agents that must appear in the herd with `yo enter`. Only
-  it forwards the socket and sets the herd env; `yo ssh`, `yo code` and
-  `yo zed` do not.
-- ALWAYS prove herd reporting with an interactive session or `yo
-  herd-check`. A headless `claude -p` registers and releases within two
-  seconds, which looks identical to hooks that never ran.
 - ALWAYS let pi own `~/.pi/agent/settings.json`. pi rewrites it and only
   logs a failed write, so a symlink there silently drops every installed
   package.
@@ -171,9 +186,6 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 - ALWAYS keep the VM free of a C and Python toolchain. It keeps native npm
   modules from compiling at install time; packages that need it are built
   by nix (`nix/pkgs/t3.nix`) instead.
-- NEVER add age-based tmpfiles cleanup for sockets in `/run/yolobox`. A
-  live connection never touches the file, so an age would reap a working
-  pane's socket.
 - NEVER set `PLAYWRIGHT_MCP_USER_DATA_DIR`. The box runs Playwright
   isolated per launch, and the server throws when both an isolated launch
   and a user-data-dir are set.

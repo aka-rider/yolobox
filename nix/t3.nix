@@ -13,8 +13,9 @@ in
     # its state under $HOME/.t3 — the same $HOME an interactive `yo enter`
     # session gets, or `t3 pair` (run interactively to mint a pairing token)
     # can't find this server's runtime file. The agent's ~/.local comes first
-    # so a t3-spawned claude goes through the launcher that carries the herd
-    # hooks (nix/harnesses.nix), and opencode resolves at all.
+    # so a t3-spawned claude goes through the launcher that sets HERDR_AGENT
+    # and the Playwright settings file (nix/harnesses.nix), and opencode
+    # resolves at all.
     path = [ "${homeDir}/.local" "/run/current-system/sw" ];
     environment.HOME = homeDir;
     serviceConfig = {

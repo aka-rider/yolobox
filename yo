@@ -17,7 +17,6 @@ import select
 import shlex
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tarfile
@@ -33,9 +32,9 @@ YO_VERSION = "dev"
 
 INSTANCE = "yolobox"
 VM_HOST = "lima-yolobox"
+HERDR_SSH_ALIAS = "yolobox"
 AGENT_USER = "agent"
 AGENT_HOME = "/home/agent"
-GUEST_SOCK_DIR = "/run/yolobox"
 T3_PORT = 3773
 HELPER = "yolobox-guest"
 HELPER_NO_SUBCOMMAND = 64
@@ -43,9 +42,6 @@ HELPER_MARKER = "unknown subcommand"
 
 FORWARDED_ENV = frozenset(
     {
-        "YOLOBOX_HERD",
-        "HERDR_PANE_ID",
-        "HERDR_SOCKET_PATH",
         "AWS_CONTAINER_CREDENTIALS_FULL_URI",
         "AWS_CONTAINER_AUTHORIZATION_TOKEN",
         "AWS_REGION",
@@ -59,7 +55,7 @@ EDITOR_SSH_BLOCK = "Match host %s user %s\n  ControlPath ~/.lima/%s/ssh-agent.so
 )
 
 AGENT_SSH_CONFIG_MARKER = "# yolobox: re-applied by yo; lima rewrites this file on every start"
-AGENT_SSH_CONFIG_HEAD = AGENT_SSH_CONFIG_MARKER + "\n" + EDITOR_SSH_BLOCK + "\n\n"
+LIMA_SSH_ALIAS_FIELDS = ("Hostname", "Port", "IdentityFile")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -92,6 +88,46 @@ def atomic_write(path: str, content: str, mode: int) -> None:
         raise
 
 
+def parse_lima_ssh_block(text: str, host: str) -> Optional[Dict[str, str]]:
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == "Host %s" % host:
+            start = i + 1
+            break
+    if start is None:
+        return None
+    values: Dict[str, str] = {}
+    for line in lines[start:]:
+        if line and not line[0].isspace():
+            break
+        key, _, value = line.strip().partition(" ")
+        if key in LIMA_SSH_ALIAS_FIELDS:
+            values[key] = value.strip().strip('"')
+    if not all(values.get(field) for field in LIMA_SSH_ALIAS_FIELDS):
+        return None
+    return values
+
+
+def herdr_alias_block(lima_values: Dict[str, str]) -> str:
+    return "\n".join(
+        [
+            "Host %s" % HERDR_SSH_ALIAS,
+            "  User %s" % AGENT_USER,
+            # Never share yo's own multiplexed master: OpenSSH's mux client
+            # does not re-check a new connection's login user against the
+            # master's, so herdr would silently ride an operator session.
+            "  ControlPath none",
+            "  Hostname %s" % lima_values["Hostname"],
+            "  Port %s" % lima_values["Port"],
+            '  IdentityFile "%s"' % lima_values["IdentityFile"],
+            "  StrictHostKeyChecking no",
+            "  UserKnownHostsFile /dev/null",
+            "  IdentitiesOnly yes",
+        ]
+    )
+
+
 def ensure_agent_ssh_config() -> None:
     path = ssh_cfg()
     try:
@@ -99,12 +135,27 @@ def ensure_agent_ssh_config() -> None:
             current = handle.read()
     except OSError:
         return
-    if current.startswith(AGENT_SSH_CONFIG_HEAD):
+
+    if current.startswith(AGENT_SSH_CONFIG_MARKER):
+        _, _, rest = current.partition("\n\n")
+    else:
+        rest = current
+
+    owned = [AGENT_SSH_CONFIG_MARKER, EDITOR_SSH_BLOCK]
+    lima_values = parse_lima_ssh_block(rest, VM_HOST)
+    if lima_values is None:
+        err(
+            "yo: %s has no parseable 'Host %s' block (Hostname/Port/IdentityFile) — "
+            "skipping the %r ssh alias herdr needs; run yo up to let lima regenerate it"
+            % (path, VM_HOST, HERDR_SSH_ALIAS)
+        )
+    else:
+        owned.append(herdr_alias_block(lima_values))
+
+    new_content = "\n".join(owned) + "\n\n" + rest
+    if new_content == current:
         return
-    rest = current
-    if rest.startswith(AGENT_SSH_CONFIG_MARKER):
-        _, _, rest = rest.partition("\n\n")
-    atomic_write(path, AGENT_SSH_CONFIG_HEAD + rest, 0o600)
+    atomic_write(path, new_content, 0o600)
 
 
 def op_sock() -> str:
@@ -115,10 +166,6 @@ def op_sock() -> str:
 
 def state_dir() -> str:
     return os.path.join(home(), ".local/state/yolobox")
-
-
-def herd_version_cache() -> str:
-    return os.path.join(state_dir(), "herd-guest-version")
 
 
 class YoError(Exception):
@@ -444,169 +491,6 @@ def target_dir(project: Optional[str]) -> str:
     return dir_for_cwd()
 
 
-@dataclass(frozen=True)
-class HerdForward:
-    guest_sock: str
-    ssh_opts: List[str]
-    env: Dict[str, str]
-
-
-def herd_forward() -> Optional[HerdForward]:
-    if os.environ.get("HERDR_ENV") != "1":
-        return None
-    pane_id = os.environ.get("HERDR_PANE_ID", "")
-    host_sock = os.environ.get("HERDR_SOCKET_PATH", "")
-    if not pane_id or not host_sock:
-        return None
-    try:
-        if not stat.S_ISSOCK(os.stat(host_sock).st_mode):
-            return None
-    except OSError:
-        return None
-    if ":" in host_sock:
-        raise YoError(
-            "HERDR_SOCKET_PATH \"%s\" contains a colon, which ssh's -R syntax splits on"
-            % host_sock
-        )
-    guest_sock = "%s/herd-host.%s.sock" % (
-        GUEST_SOCK_DIR,
-        re.sub(r"[^A-Za-z0-9]", "_", pane_id),
-    )
-    opts, env = send_env(
-        {
-            "YOLOBOX_HERD": "1",
-            "HERDR_PANE_ID": pane_id,
-            "HERDR_SOCKET_PATH": guest_sock,
-        }
-    )
-    return HerdForward(guest_sock, ["-R", "%s:%s" % (guest_sock, host_sock)] + opts, env)
-
-
-def parse_herd_version(text: str) -> Optional[str]:
-    match = re.search(r"(\d+\.\d+\.\d+)", text.replace("\r", ""))
-    return match.group(1) if match else None
-
-
-@dataclass(frozen=True)
-class GuestHerd:
-    generation: str
-    version: str
-    prev_generation: str
-    prev_version: str
-
-
-def guest_herd_version() -> Optional[GuestHerd]:
-    prev_generation = ""
-    prev_version = ""
-    try:
-        with open(herd_version_cache(), "r") as handle:
-            fields = handle.readline().split()
-        if len(fields) >= 2:
-            prev_generation, prev_version = fields[0], fields[1]
-    except OSError:
-        pass
-
-    probe = ssh_run(
-        OPERATOR, ["sh", "-c", "readlink /run/current-system && herdr --version"], mux=True
-    )
-    if probe.returncode != 0:
-        return None
-    lines = probe.stdout.splitlines()
-    if not lines:
-        return None
-    generation = lines[0]
-    version = parse_herd_version(lines[1]) if len(lines) > 1 else None
-    if not version:
-        return None
-    os.makedirs(state_dir(), exist_ok=True)
-    with open(herd_version_cache(), "w") as handle:
-        handle.write("%s %s\n" % (generation, version))
-    return GuestHerd(generation, version, prev_generation, prev_version)
-
-
-def host_herd_version() -> Optional[str]:
-    if shutil.which("herdr") is None:
-        return None
-    probe = run(["herdr", "--version"])
-    if probe.returncode != 0:
-        return None
-    return parse_herd_version(probe.stdout)
-
-
-def herd_drift_report(host_version: str, guest_version: str) -> None:
-    err("yo: herd version drift — this Mac runs herdr %s, the box has %s." % (host_version, guest_version))
-    err("    If the wire protocol differs, every in-box agent report is rejected and")
-    err("    the box's agents show as unknown in the herd.")
-    err("    Fix:  updating nixpkgs now means releasing a new yolobox version (or pointing YOLOBOX_FLAKE at a branch that has one), then nixos-rebuild switch; finally ./yo herd-check")
-    err("    Skip: YOLOBOX_SKIP_HERD_CHECK=1 ./yo enter")
-
-
-def check_herd_drift(refuse: bool) -> None:
-    if os.environ.get("YOLOBOX_SKIP_HERD_CHECK") == "1":
-        return
-    if shutil.which("herdr") is None:
-        return
-    if os.environ.get("HERDR_ENV") != "1":
-        return
-    if not os.environ.get("HERDR_PANE_ID"):
-        return
-    host_version = host_herd_version()
-    if not host_version:
-        return
-    guest = guest_herd_version()
-    if guest is None or host_version == guest.version:
-        return
-    herd_drift_report(host_version, guest.version)
-    if refuse:
-        raise YoError(None, code=3)
-
-
-def herd_probe_argv(pane_id: str) -> List[str]:
-    return ["herdr", "pane", "report-agent", pane_id, "--source", "yolobox:probe", "--agent", "claude", "--state", "idle"]
-
-
-def herd_probe_release_argv(pane_id: str) -> List[str]:
-    return ["herdr", "pane", "release-agent", pane_id, "--source", "yolobox:probe", "--agent", "claude"]
-
-
-def herd_pane_latch_warning() -> None:
-    err("yo: herdr will not show a claude started in this pane. A host-side claude ran and")
-    err("    exited here earlier, and herdr 0.8.x keeps a per-pane latch that silently drops")
-    err("    every later claude report (herdr src/terminal/state.rs:646, no expiry). Open a")
-    err("    fresh pane or tab and run yo enter there; other agent kinds in this pane are")
-    err("    unaffected.")
-
-
-def check_herd_pane_latch() -> None:
-    if shutil.which("herdr") is None:
-        return
-    if os.environ.get("HERDR_ENV") != "1":
-        return
-    pane_id = os.environ.get("HERDR_PANE_ID", "")
-    if not pane_id:
-        return
-
-    report = Report()
-    try:
-        if herdr_pane_agent(pane_id, report):
-            return
-        probe = run(herd_probe_argv(pane_id), merge_stderr=True)
-        if probe.returncode != 0:
-            err("yo: herdr pane latch probe failed: %s" % probe.stdout.strip())
-            return
-        try:
-            probed_agent = herdr_pane_agent(pane_id, report)
-        finally:
-            release = run(herd_probe_release_argv(pane_id), merge_stderr=True)
-            if release.returncode != 0:
-                err("yo: herdr pane latch probe release failed: %s" % release.stdout.strip())
-    except YoError:
-        return
-
-    if probed_agent != "claude":
-        herd_pane_latch_warning()
-
-
 @dataclass
 class AwsBroker:
     proc: subprocess.Popen
@@ -800,8 +684,6 @@ def cmd_status(args: argparse.Namespace) -> None:
             "disk: image ~/.lima/%s/disk allocates %dGiB on this Mac"
             % (INSTANCE, image_kib // 1024 // 1024)
         )
-
-    check_herd_drift(refuse=False)
 
     guest_version_raw = guest_out(["cat", "/etc/yolobox/version"], check=False).strip()
     guest_version = guest_version_raw or None
@@ -1010,11 +892,6 @@ def cmd_enter(args: argparse.Namespace) -> None:
     argv = ssh_base(AGENT) + forward_agent_opts()
     env = dict(os.environ)
 
-    forward = herd_forward()
-    if forward is not None:
-        argv += forward.ssh_opts
-        env.update(forward.env)
-
     profile = os.environ.get("YOLOBOX_AWS_PROFILE", "")
     broker = None
     if profile:
@@ -1024,9 +901,6 @@ def cmd_enter(args: argparse.Namespace) -> None:
         broker = start_aws_broker(profile)
         argv += broker.ssh_opts
         env.update(broker.env)
-
-    check_herd_drift(refuse=True)
-    check_herd_pane_latch()
 
     argv += ["-t", VM_HOST, remote(["cd", target]) + ' && exec "$SHELL" -l']
     exec_process(argv, env)
@@ -1317,145 +1191,6 @@ def cmd_seed(args: argparse.Namespace) -> None:
     seed_all()
 
 
-def herdr_pane_agent(pane_id: str, report: Report, when: str = "") -> str:
-    probe = run(["herdr", "pane", "get", pane_id], merge_stderr=True)
-    if probe.returncode != 0:
-        raise report.abort(
-            "'herdr pane get %s' failed%s: %s" % (pane_id, when, probe.stdout.strip()),
-            *(
-                ["The pane id does not exist on this server — rerun from a live herdr pane."]
-                if not when
-                else []
-            )
-        )
-    try:
-        return json.loads(probe.stdout)["result"]["pane"].get("agent") or ""
-    except (ValueError, KeyError, TypeError):
-        raise report.abort(
-            "could not parse 'herdr pane get' output: %s" % probe.stdout.strip(),
-            "Check that the host herdr version still emits JSON from pane get.",
-        )
-
-
-def herdr_server_field(status_text: str, field: str) -> str:
-    inside = False
-    for line in status_text.splitlines():
-        if line.startswith("server:"):
-            inside = True
-            continue
-        if inside:
-            if not line.strip():
-                break
-            match = re.match(r"^\s*%s:\s*(.*)$" % re.escape(field), line)
-            if match:
-                return match.group(1).strip()
-    return ""
-
-
-def cmd_herd_check(args: argparse.Namespace) -> None:
-    report = Report()
-
-    if shutil.which("herdr") is None:
-        raise report.abort(
-            "herdr is not on this Mac's PATH",
-            "Install it (brew install herdr) — the box reports into this Mac's herdr server.",
-        )
-
-    status = run(["herdr", "status"], merge_stderr=True)
-    if status.returncode != 0:
-        raise report.abort(
-            "'herdr status' failed: %s" % status.stdout.strip(),
-            "Start the herdr server on this Mac, then rerun ./yo herd-check.",
-        )
-    server_status = herdr_server_field(status.stdout, "status")
-    server_compatible = herdr_server_field(status.stdout, "compatible")
-    if server_status != "running":
-        raise report.abort(
-            "this Mac's herdr server is not running (status: %s)" % (server_status or "unknown"),
-            "Start it and rerun ./yo herd-check — no report from anywhere lands while it is down.",
-        )
-    if server_compatible != "yes":
-        raise report.abort(
-            "this Mac's herdr client and server are incompatible (compatible: %s)"
-            % (server_compatible or "unknown"),
-            "brew upgrade herdr, then restart the herdr server.",
-            "Nothing in the box can work until the Mac's own two halves agree.",
-        )
-    report.ok("host herdr server running and compatible")
-
-    pane_id = os.environ.get("HERDR_PANE_ID", "")
-    if not pane_id:
-        raise report.abort(
-            "HERDR_PANE_ID is empty — this is not a herdr pane",
-            "Run ./yo herd-check from a pane inside herdr's terminal.",
-        )
-
-    pane_agent = herdr_pane_agent(pane_id, report)
-    if pane_agent:
-        raise report.abort(
-            "pane %s already holds an agent (%s)" % (pane_id, pane_agent),
-            "This check reports an agent into the pane and then releases it, so running",
-            "it here would drop %s out of the herd. Open a plain pane and" % pane_agent,
-            "rerun ./yo herd-check there.",
-        )
-    report.ok("pane %s is free" % pane_id)
-
-    host_version = host_herd_version()
-    guest = guest_herd_version()
-    if guest is None:
-        report.fail("cannot ask the box for its herdr version", "Is the VM up? ./yo status")
-    elif host_version == guest.version:
-        report.ok("herdr %s on both sides" % host_version)
-    else:
-        report.fail(
-            "herd version drift: this Mac runs herdr %s, the box has %s"
-            % (host_version, guest.version)
-        )
-        herd_drift_report(host_version or "", guest.version)
-        if (
-            guest.prev_version
-            and guest.prev_generation != guest.generation
-            and guest.prev_version == guest.version
-        ):
-            err("      The box has been switched since the last check and its herdr did not")
-            err("      move: nixpkgs carries no newer one yet. Skip until it does.")
-
-    forward = herd_forward()
-    if forward is None:
-        raise report.abort(
-            "this pane exports no live herdr socket (HERDR_SOCKET_PATH)",
-            "The forward yo enter builds cannot exist without it — rerun from a herdr pane.",
-        )
-
-    guest_run = ssh_run(
-        AGENT,
-        ["yolobox-herd-check"],
-        extra_opts=forward.ssh_opts,
-        env=forward.env,
-        capture=False,
-    )
-    guest_rc = guest_run.returncode
-    if guest_rc == 127:
-        report.fail(helper_skew("the box has no yolobox-herd-check"))
-    elif guest_rc != 0:
-        report.fail("the guest half failed (exit %d) — see its output above" % guest_rc)
-
-    pane_agent = herdr_pane_agent(pane_id, report, when=" after the guest run")
-    if not pane_agent:
-        report.ok("pane %s released again" % pane_id)
-    else:
-        report.fail(
-            "pane %s still holds an agent (%s) after the check" % (pane_id, pane_agent),
-            "The guest's release path is broken; clear it by hand with:",
-            "herdr pane release-agent %s" % pane_id,
-        )
-
-    if report.failed:
-        raise YoError(None, code=1)
-    if guest_rc != 0:
-        raise YoError(None, code=guest_rc)
-
-
 def guest_field(text: str, key: str) -> str:
     fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     return fields.get(key, "")
@@ -1608,7 +1343,7 @@ def build_parser() -> argparse.ArgumentParser:
         "status",
         "Describe the VM.",
         "Describe the VM. Also reports disk usage on both sides and warns\n"
-        "when this Mac's herdr version differs from the VM's.",
+        "when this Mac's yo version differs from the box's.",
     )
     status.set_defaults(func=cmd_status)
 
@@ -1650,22 +1385,18 @@ def build_parser() -> argparse.ArgumentParser:
         "ssh",
         "Plain shell in the VM as the operator account.",
         "Plain interactive shell in the VM as the operator account (the one with\n"
-        "sudo), or run one command there. No herd wiring; agents started here\n"
-        "show as \"unknown\" in the herd.",
+        "sudo), or run one command there.",
     )
     ssh.add_argument("ssh_cmd", nargs=argparse.REMAINDER, metavar="cmd...")
     ssh.set_defaults(func=cmd_ssh)
 
     enter = add(
         "enter",
-        "Shell in the VM as the agent account, herd-wired.",
-        "Shell in the VM as the unprivileged agent account, with the herd socket\n"
-        "forwarded and the herd env set, so agents started there report to this\n"
-        "Mac's herd. Exits 3 when this Mac's herdr version differs from the VM's;\n"
-        "YOLOBOX_SKIP_HERD_CHECK=1 overrides. Also probes this pane for herdr's\n"
-        "per-pane claude latch (a host-side claude that ran and exited here\n"
-        "earlier silently drops every later claude report) and warns on stderr\n"
-        "rather than refusing when it finds one.",
+        "Shell in the VM as the agent account.",
+        "Shell in the VM as the unprivileged agent account, landing in the guest\n"
+        "twin of the current project. Forwards the 1Password ssh-agent socket,\n"
+        "and, when YOLOBOX_AWS_PROFILE is set, starts a host-side credentials\n"
+        "broker for the session.",
     )
     enter.add_argument("project", nargs="?")
     enter.set_defaults(func=cmd_enter)
@@ -1727,14 +1458,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pair.add_argument("base_url", nargs="?", metavar="base-url")
     pair.set_defaults(func=cmd_pair)
-
-    herd_check = add(
-        "herd-check",
-        "Prove end to end that an agent can report to this Mac's herd.",
-        "Prove end to end that an agent in the VM can report to this Mac's\n"
-        "herd. Run from a herdr pane with no agent on it; it releases that pane.",
-    )
-    herd_check.set_defaults(func=cmd_herd_check)
 
     aws_check = add(
         "aws-check",

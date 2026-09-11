@@ -2,6 +2,7 @@
 let
   homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
+  claudeHooksFile = import ./lib/claude-hooks-file.nix;
 
   waitForX = pkgs.writeShellScript "wait-for-x" ''
     for _ in $(seq 1 150); do
@@ -96,6 +97,53 @@ let
       esac
     '';
   };
+
+  # Claude Code advertises its launch directory as MCP root #1, so
+  # @playwright/mcp resolves an explicit `filename` against the checkout by
+  # design (microsoft/playwright#42487). This hook rewrites that name into
+  # PLAYWRIGHT_MCP_OUTPUT_DIR before the tool runs.
+  #
+  # Every fallible command is guarded, so this can only ever exit 0 and print
+  # either nothing or one JSON line: writeShellApplication's `set -euo
+  # pipefail` would otherwise turn a missed guard into a hook failure on a
+  # tool call. It never emits `permissionDecision` — see the contract note at
+  # the jq call below.
+  playwrightArtifacts = pkgs.writeShellApplication {
+    name = "yolobox-playwright-artifacts";
+    runtimeInputs = [ pkgs.jq pkgs.coreutils ];
+    text = ''
+      input="$(timeout 2 cat 2>/dev/null || true)"
+
+      out="''${PLAYWRIGHT_MCP_OUTPUT_DIR:-}"
+      out="''${out%/}"
+
+      case "''${out}" in /*) ;; *) exit 0 ;; esac
+      [ -n "''${input}" ] || exit 0
+
+      tool_input="$(jq -c '.tool_input // empty' <<< "''${input}" 2>/dev/null || true)"
+      [ -n "''${tool_input}" ] || exit 0
+
+      filename="$(jq -r '.filename // empty' <<< "''${tool_input}" 2>/dev/null || true)"
+      [ -n "''${filename}" ] || exit 0
+
+      case "''${filename}" in
+          "''${out}"/*) exit 0 ;;
+          /*)           target="''${out}/$(basename -- "''${filename}")" ;;
+          *)            target="''${out}/''${filename#./}" ;;
+      esac
+
+      mkdir -p "$(dirname -- "''${target}")" 2>/dev/null || exit 0
+
+      # Claude Code's PreToolUse contract: `updatedInput` rewrites the tool's
+      # input, and with no `permissionDecision` alongside it decides nothing
+      # about permission.
+      jq -cn --argjson tool_input "''${tool_input}" --arg target "''${target}" \
+          '{hookSpecificOutput:{hookEventName:"PreToolUse",updatedInput:($tool_input + {filename:$target})}}' \
+          || exit 0
+
+      exit 0
+    '';
+  };
 in
 {
   systemd.services.xvfb = {
@@ -155,7 +203,30 @@ in
 
   fonts.packages = with pkgs; [ dejavu_fonts liberation_ttf noto-fonts noto-fonts-color-emoji ];
 
+  # This file is delivered to claude by `--settings <this file>` (the wrapper
+  # in nix/harnesses.nix), never by /etc/claude-code/managed-settings.json:
+  # Claude Code builds its policySettings from three tiers — remote
+  # server-fetched settings, MDM, and that /etc file — and takes only the
+  # first non-empty tier, no merge. This account's
+  # ~/.claude/remote-settings.json is always non-empty
+  # (`{"channelsEnabled": true}`), so the /etc tier is discarded wholesale
+  # with nothing logged; `--settings` (flagSettings) is added unconditionally
+  # and was verified to survive that. The only entry left here is the
+  # playwright reroute above.
+  environment.etc.${claudeHooksFile.etcPath}.text = builtins.toJSON {
+    hooks.PreToolUse = [
+      {
+        matcher = "^mcp__plugin_playwright_playwright__browser_(take_screenshot|pdf_save|start_video)$";
+        hooks = [{
+          type = "command";
+          command = "${playwrightArtifacts}/bin/yolobox-playwright-artifacts";
+          timeout = 5;
+        }];
+      }
+    ];
+  };
+
   # ffmpeg-full, not the default ffmpeg: nixpkgs' default build is
   # --disable-xlib/--disable-libxcb*, so x11grab doesn't exist in it.
-  environment.systemPackages = [ pkgs.chromium pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord ];
+  environment.systemPackages = [ pkgs.chromium pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord playwrightArtifacts ];
 }
