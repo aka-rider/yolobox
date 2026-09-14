@@ -119,6 +119,139 @@ class TestSshRunArgv(FakeHome):
         self.assertIn("SendEnv=AWS_REGION", argv)
 
 
+class TestResolveCpOperands(unittest.TestCase):
+    MIRROR = "/home/agent/wrk/proj"
+
+    def test_requires_a_source_and_a_destination(self):
+        with self.assertRaises(yo.YoError):
+            yo.resolve_cp_operands([":a"], self.MIRROR)
+
+    def test_all_local_is_refused_and_names_cp(self):
+        with self.assertRaises(yo.YoError) as caught:
+            yo.resolve_cp_operands(["a.txt", "b.txt"], self.MIRROR)
+        self.assertIn("cp", caught.exception.message)
+
+    def test_mixed_side_sources_are_refused(self):
+        with self.assertRaises(yo.YoError):
+            yo.resolve_cp_operands(["a.txt", ":b.txt", ":dest"], self.MIRROR)
+
+    def test_guest_to_guest_is_refused(self):
+        with self.assertRaises(yo.YoError) as caught:
+            yo.resolve_cp_operands([":a", ":b"], self.MIRROR)
+        self.assertIn("yo enter", caught.exception.message)
+
+    def test_bare_colon_destination_resolves_to_the_mirror(self):
+        plan = yo.resolve_cp_operands(["a.txt", ":"], self.MIRROR)
+        self.assertEqual(plan.direction, "to_guest")
+        self.assertEqual(plan.local_paths, ["a.txt"])
+        self.assertEqual(plan.guest_paths, [self.MIRROR])
+
+    def test_relative_guest_spelling_extends_the_mirror(self):
+        plan = yo.resolve_cp_operands(["a.txt", ":sub/dir"], self.MIRROR)
+        self.assertEqual(plan.guest_paths, [self.MIRROR + "/sub/dir"])
+
+    def test_tilde_slash_is_under_agent_home(self):
+        plan = yo.resolve_cp_operands(["a.txt", ":~/x"], self.MIRROR)
+        self.assertEqual(plan.guest_paths, [yo.AGENT_HOME + "/x"])
+
+    def test_bare_tilde_is_agent_home(self):
+        plan = yo.resolve_cp_operands(["a.txt", ":~"], self.MIRROR)
+        self.assertEqual(plan.guest_paths, [yo.AGENT_HOME])
+
+    def test_absolute_guest_path_under_home_is_accepted(self):
+        plan = yo.resolve_cp_operands(["a.txt", ":/home/agent/x"], self.MIRROR)
+        self.assertEqual(plan.guest_paths, ["/home/agent/x"])
+
+    def test_absolute_guest_path_outside_home_is_refused(self):
+        with self.assertRaises(yo.YoError):
+            yo.resolve_cp_operands(["a.txt", ":/etc/passwd"], self.MIRROR)
+
+    def test_guest_traversal_outside_home_is_refused(self):
+        with self.assertRaises(yo.YoError):
+            yo.resolve_cp_operands(["a.txt", ":../../../etc"], self.MIRROR)
+
+    def test_relative_spelling_with_no_mirror_is_refused_and_names_tilde(self):
+        with self.assertRaises(yo.YoError) as caught:
+            yo.resolve_cp_operands(["a.txt", ":"], None)
+        self.assertIn("~", caught.exception.message)
+
+    def test_multiple_local_sources_preserve_order(self):
+        plan = yo.resolve_cp_operands(["a.txt", "b.txt", ":dump"], self.MIRROR)
+        self.assertEqual(plan.local_paths, ["a.txt", "b.txt"])
+
+    def test_multiple_guest_sources_preserve_order_and_direction(self):
+        plan = yo.resolve_cp_operands([":a", ":b", "dest"], self.MIRROR)
+        self.assertEqual(plan.direction, "from_guest")
+        self.assertEqual(plan.guest_paths, [self.MIRROR + "/a", self.MIRROR + "/b"])
+        self.assertEqual(plan.local_paths, ["dest"])
+
+
+class TestCpMkdirTarget(unittest.TestCase):
+    def test_colon_dest_uses_resolved_dest_itself(self):
+        self.assertEqual(
+            yo.cp_mkdir_target(":", "/home/agent/wrk/proj", 1), "/home/agent/wrk/proj"
+        )
+
+    def test_trailing_slash_uses_resolved_dest_itself(self):
+        self.assertEqual(
+            yo.cp_mkdir_target(":dump/", "/home/agent/dump", 1), "/home/agent/dump"
+        )
+
+    def test_multiple_sources_use_resolved_dest_itself(self):
+        self.assertEqual(
+            yo.cp_mkdir_target(":dump", "/home/agent/dump", 2), "/home/agent/dump"
+        )
+
+    def test_single_plain_dest_uses_its_dirname(self):
+        self.assertEqual(
+            yo.cp_mkdir_target(":file.txt", "/home/agent/wrk/proj/file.txt", 1),
+            "/home/agent/wrk/proj",
+        )
+
+
+class TestCpArgv(FakeHome):
+    def run_cp(self, paths):
+        calls = {"run": None, "ssh_run": []}
+
+        def fake_run(argv, **kwargs):
+            calls["run"] = list(argv)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def fake_ssh_run(role, argv, **kwargs):
+            calls["ssh_run"].append(list(argv))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(yo, "run", fake_run), mock.patch.object(
+            yo, "ssh_run", fake_ssh_run
+        ):
+            args = yo.build_parser().parse_args(["cp"] + paths)
+            yo.cmd_cp(args)
+        return calls
+
+    def test_to_guest_argv_carries_scp_flags_and_no_forward_agent(self):
+        argv = self.run_cp(["a.txt", ":~/x"])["run"]
+        self.assertIn("-r", argv)
+        self.assertIn("-p", argv)
+        self.assertIn("-F", argv)
+        self.assertIn("User=agent", argv)
+        self.assertIn("ControlPath=none", argv)
+        self.assertNotIn("ForwardAgent", " ".join(argv))
+
+    def test_to_guest_remote_operand_is_prefixed_with_vm_host(self):
+        argv = self.run_cp(["a.txt", ":~/x"])["run"]
+        self.assertIn("lima-yolobox:/home/agent/x", argv)
+
+    def test_mkdir_runs_before_scp_for_to_guest(self):
+        calls = self.run_cp(["a.txt", ":~/x"])
+        self.assertEqual(calls["ssh_run"], [["true"], ["mkdir", "-p", "/home/agent"]])
+
+    def test_no_mkdir_for_from_guest(self):
+        calls = self.run_cp([":~/x", "dest.txt"])
+        self.assertEqual(calls["ssh_run"], [["true"]])
+        self.assertIn("lima-yolobox:/home/agent/x", calls["run"])
+        self.assertIn("dest.txt", calls["run"])
+
+
 STALE_REMOTE = "ssh://lima-yolobox/home/xiii.guest/wrk/rune"
 
 
