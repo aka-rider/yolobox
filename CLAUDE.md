@@ -291,6 +291,57 @@ operator/agent split moved projects to `/home/agent`, and before this fix
 the remedy was a manual `git remote remove yolobox` per repo before the
 next `yo link` would run at all.
 
+## `yo cp`: scp, not `limactl cp`
+
+`limactl cp` cannot move a file into a project the agent then has to
+write to. It copies as the **operator** (uid 501), so a file it writes
+lands owned by an account `agent` cannot write as, and the operator's
+shell on this box is unconfigured — its default zsh prompt writes onto
+the same channel the copy's own rsync/scp handshake reads, which breaks
+the transfer before a byte moves. `rsync` is not installed in the guest
+at all, so that was never a fallback either. `yo cp SRC... DST` replaces
+both: scp, run as the agent over the same `ssh_base` every other `yo` ssh
+spawn goes through, so the ownership problem never arises, and no guest
+shell of any kind runs, so the prompt problem cannot either.
+
+scp gets that "no shell runs" property for free rather than `yo` having
+to arrange it. The Mac ships OpenSSH 10.3, whose `scp` speaks the sftp
+protocol by default, so sshd answers a `yo cp` connection by spawning
+`sftp-server` directly — no login shell, agent's or operator's, runs at
+any point. `nix/base.nix` leaves NixOS's default `allowSFTP = true`
+untouched, and that default is the whole reason this works; turning sftp
+off would break `yo cp` with no other symptom to point at. The command
+also carries no `yolobox-guest` subcommand — unlike every subcommand
+routed through the guest helper (see "The guest helper" above), it needs
+no box rebuild first and works against a box of any version.
+
+The guest side of an operand always starts with `:`, and `yo` never
+guesses which side is which. `:` alone is the guest twin of the Mac's
+logical current directory, the same mirror `yo enter` uses; `:rel/path`
+extends that twin; `:~` and `:~/x` are the agent's home outright;
+`:/abs/path` is an absolute guest path. Every one of these, relative or
+absolute, is checked against the guest home the same way every other
+`yo` command's guest path is (see "The mirror" above): a path that
+resolves outside `/home/agent` is refused rather than silently placed
+there. A copy has no existing-ancestor fallback the way a missing
+mirrored directory does, so `yo` requires every source on one side and
+the destination on the other and refuses anything else outright — no
+colon anywhere, sources on both sides, or a copy entirely inside the
+guest — each with a message naming the remedy, plain `cp` or `yo enter`.
+
+Two refusals are worth recognising on sight. A relative guest spelling —
+`:` or `:x` — issued from a Mac cwd outside `$HOME` has no mirror to
+extend, so it is refused with `:~/...` named as the fix, the same
+outside-`$HOME` case "The mirror" above describes for `yo enter`. And a
+guest path that resolves outside `/home/agent`, absolute or relative, is
+refused the same way `guest_path` refuses it everywhere else in `yo`.
+The multi-source case is scp's own rule surfacing through `yo`, not a
+rule `yo` invented: scp itself requires the destination to be a
+directory once more than one source is given, which is why `yo cp` runs
+`mkdir -p` against the destination itself — rather than its parent, the
+single-source rule — whenever there is more than one source, DST is `:`,
+or DST ends in `/`.
+
 ## Per-project dev shells
 
 A project must be a git repo for one reason: the push channel. `yo link`

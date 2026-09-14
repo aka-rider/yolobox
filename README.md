@@ -34,6 +34,33 @@ Add this to your `~/.ssh/config`
 Include ~/.lima/yolobox/ssh.config
 ```
 
+## Basic shell operation
+
+The VM has two accounts: you, the **operator** (`${username}`, matched to your Mac account, the only one with sudo), and `agent`, the account every AI coding session runs as, with no sudo at all.
+
+- `yo ssh` to enter the bare **operator** session (for VM maintenance)
+- `yo enter` for daily usage
+
+`yo enter` (and other commands: `yo code`, `yo zed`) try to match the current directory in the VM, so `cd ~/code/project && yo enter` should land you into `~/code/project` on the VM guest, if the directory does exist in the VM.
+
+You can use many commands with fuzzy project name. The search is done among directories with `.git`
+
+If you have `~/code/some-project`, then `yo enter proj`, `yo code proj`, `yo zed proj` will all get you there.
+
+
+### Copying between host and guest
+
+`yo cp SRC... DST` copies files between the Host and the Guest, scp-style. Leading `:` colon symbol means guest (like in scp). This commands tries to mirror the current directory as well.
+
+```sh
+cd <project> && yo cp README.md :  # host -> guest
+yo cp :notes.md ~/Desktop/         # guest -> host
+yo cp a.txt b.txt :dump/           # multiple sources -> one guest directory
+```
+
+
+Run `yo --help` for the rest of the commands.
+
 ### herdr terminal multiplexer
 
 [https://herdr.dev/](https://herdr.dev/)
@@ -77,21 +104,6 @@ yo code myproj  # you don't need to be precise
 
 Note: Zed's own downloaded language servers do not work on NixOS: Zed strips the environment when spawning them, and nix-ld cannot rescue that.
 Add LSPs to `devbox.json` instead, so they run through devbox's own environment rather than Zed's.
-
-## How To
-
-The VM has two accounts: you, the **operator** (`${username}`, matched to your Mac account, the only one with sudo), and `agent`, the account every AI coding session runs as, with no sudo at all.
-
-- `yo ssh` to enter the bare **operator** session (for VM maintenance)
-- `yo enter` for daily usage
-
-`yo enter` (and `yo code`, `yo zed`) try to mirror the current directory in the VM, so `cd ~/code/project && yo enter` should land you into `~/code/project` on the VM guest, provided the project does exist.
-
-You can use these commands with fuzzy project name. The search is done among directories with `.git`
-
-If you have `~/code/some-project`, then `yo enter proj`, `yo code proj`, `yo zed proj` will all get you there.
-
-Run `yo --help` for the rest of the commands.
 
 ### Devbox
 

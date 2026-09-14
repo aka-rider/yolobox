@@ -441,6 +441,62 @@ def mirror(mac_path: str) -> Optional[str]:
     return None
 
 
+@dataclass(frozen=True)
+class CpPlan:
+    direction: str
+    local_paths: List[str]
+    guest_paths: List[str]
+
+
+def operand_is_guest(operand: str) -> bool:
+    return operand.startswith(":")
+
+
+def resolve_guest_operand(operand: str, cwd_mirror: Optional[str]) -> str:
+    spelling = operand[1:]
+    if spelling == "~" or spelling.startswith("~/"):
+        return guest_path(AGENT_HOME + spelling[1:])
+    if spelling.startswith("/"):
+        return guest_path(spelling)
+    if cwd_mirror is None:
+        raise YoError(
+            'guest path "%s" is relative, and the Mac cwd is outside $HOME; '
+            'spell it as ":~/..." instead' % operand
+        )
+    if spelling == "":
+        return guest_path(cwd_mirror)
+    return guest_path(cwd_mirror + "/" + spelling)
+
+
+def resolve_cp_operands(operands: List[str], cwd_mirror: Optional[str]) -> CpPlan:
+    if len(operands) < 2:
+        raise YoError("yo cp needs at least one source and a destination")
+    sources = operands[:-1]
+    dest = operands[-1]
+    if not any(operand_is_guest(operand) for operand in operands):
+        raise YoError(
+            'no guest path given (an operand must start with ":"); use plain "cp" for a local copy'
+        )
+    source_guest_flags = [operand_is_guest(source) for source in sources]
+    dest_is_guest = operand_is_guest(dest)
+    if len(set(source_guest_flags)) > 1:
+        raise YoError("sources are split between the Mac and the guest; every source must be on one side")
+    sources_are_guest = source_guest_flags[0]
+    if sources_are_guest and dest_is_guest:
+        raise YoError('sources and destination are both in the guest; use "yo enter" and a plain cp there')
+    if sources_are_guest:
+        guest_paths = [resolve_guest_operand(source, cwd_mirror) for source in sources]
+        return CpPlan(direction="from_guest", local_paths=[dest], guest_paths=guest_paths)
+    guest_paths = [resolve_guest_operand(dest, cwd_mirror)]
+    return CpPlan(direction="to_guest", local_paths=list(sources), guest_paths=guest_paths)
+
+
+def cp_mkdir_target(dest_operand: str, resolved_dest: str, source_count: int) -> str:
+    if dest_operand == ":" or dest_operand.endswith("/") or source_count > 1:
+        return resolved_dest
+    return os.path.dirname(resolved_dest) or AGENT_HOME
+
+
 SEED_SSH_CONFIG = r"""mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >~/.ssh/config && chmod 600 ~/.ssh/config"""
 
 SEED_UNTAR_SSH = r"""tar -C "$HOME/.ssh" -xf -"""
@@ -904,6 +960,25 @@ def cmd_enter(args: argparse.Namespace) -> None:
 
     argv += ["-t", VM_HOST, remote(["cd", target]) + ' && exec "$SHELL" -l']
     exec_process(argv, env)
+
+
+def cmd_cp(args: argparse.Namespace) -> None:
+    require_agent_account()
+    cwd_mirror = mirror(logical_cwd())
+    plan = resolve_cp_operands(args.paths, cwd_mirror)
+    guest_operands = [operand for operand in args.paths if operand_is_guest(operand)]
+    for operand, resolved in zip(guest_operands, plan.guest_paths):
+        err("yo: guest path %s -> %s" % (operand, resolved))
+    if plan.direction == "to_guest":
+        target = cp_mkdir_target(args.paths[-1], plan.guest_paths[0], len(plan.local_paths))
+        ssh_run(AGENT, ["mkdir", "-p", target], check=True)
+        sources = plan.local_paths
+        dest = "%s:%s" % (VM_HOST, plan.guest_paths[0])
+    else:
+        sources = ["%s:%s" % (VM_HOST, guest) for guest in plan.guest_paths]
+        dest = plan.local_paths[0]
+    argv = ["scp", "-r", "-p"] + ssh_base(AGENT)[1:] + sources + [dest]
+    run(argv, capture=False, check=True)
 
 
 INCLUDE_LINE = "Include ~/.lima/%s/ssh.config" % INSTANCE
@@ -1400,6 +1475,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enter.add_argument("project", nargs="?")
     enter.set_defaults(func=cmd_enter)
+
+    cp = add(
+        "cp",
+        "Copy files between the Mac and the agent account.",
+        "Copy files between the Mac and the VM's agent account, as scp. A guest\n"
+        "path is any operand starting with \":\": \":\" alone is the guest twin of\n"
+        "the current directory, \":rel/path\" extends it, \":~\" and \":~/x\" are the\n"
+        "guest home and a path under it, and \":/abs\" is an absolute guest path\n"
+        "(refused if it falls outside the guest home). Every source must be on\n"
+        "the Mac or every source must be in the guest, never mixed, and the\n"
+        "destination must be on the other side.",
+    )
+    cp.add_argument("paths", nargs="+", metavar="path")
+    cp.set_defaults(func=cmd_cp)
 
     link = add(
         "link",
