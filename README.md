@@ -1,6 +1,6 @@
 # yolobox
 
-A Linux VM on your Mac where AI coding agents do their work.
+A Linux VM on your host where AI coding agents do their work.
 
 NixOS machine, run by Lima, devbox, batteries included.
 
@@ -8,9 +8,11 @@ NixOS machine, run by Lima, devbox, batteries included.
 
 - Agents blast radius (protects against `rm -rf ~`, `curl http://H4x0r-malware.sh | sh`)
 - Supply chain attacks
-- Slow MacOS disk due to `systempolicyd` scans
+- Slow macOS disk due to `systempolicyd` scans (macOS only)
 
 ### Prerequisites
+
+#### macOS
 
 [1Password](https://1password.com/) with its SSH agent enabled (it holds your keys).
 
@@ -18,9 +20,23 @@ NixOS machine, run by Lima, devbox, batteries included.
 brew install aka-rider/tap/yolobox
 ```
 
-## Quickstart
+#### Linux
 
-On Nix, `nix run github:aka-rider/yolobox` runs the same release without a `brew` install at all.
+[Nix](https://nixos.org/download/) with flakes enabled. KVM access: `/dev/kvm` must be readable and writable (check permissions or load the kvm kernel module). [1Password](https://1password.com/) CLI with its SSH agent enabled at `~/.1password/agent.sock`.
+
+```bash
+nix run github:aka-rider/yolobox
+```
+
+The Linux path works from the first release that includes Linux host support. Earlier releases pin an aarch64-only NixOS image; until then use `YOLOBOX_FLAKE=github:aka-rider/yolobox/<branch> yo bootstrap` to build from a development branch.
+
+For `yo pair` on Linux with firewalld enabled, ensure port 3773/tcp is open:
+
+```bash
+firewall-cmd --add-port 3773/tcp
+```
+
+## Quickstart
 
 Create and build the VM once:
 
