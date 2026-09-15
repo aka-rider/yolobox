@@ -22,7 +22,13 @@ brew install aka-rider/tap/yolobox
 
 #### Linux
 
-[Nix](https://nixos.org/download/) with flakes enabled; it brings Lima and QEMU. KVM: `/dev/kvm` must exist and be readable and writable by your user (enable virtualization in firmware, load the `kvm` module, join the `kvm` group). [1Password](https://1password.com/) for Linux with its SSH agent enabled, which listens at `~/.1password/agent.sock`.
+Git, OpenSSH and curl come from your distro, e.g. on Fedora:
+
+```bash
+sudo dnf install git openssh-clients curl
+```
+
+[Nix](https://nixos.org/download/) with flakes enabled brings Lima, QEMU and fzf. KVM: `/dev/kvm` must exist and be readable and writable by your user (enable virtualization in firmware, load the `kvm` module, join the `kvm` group). [1Password](https://1password.com/) for Linux with its SSH agent enabled, which listens at `~/.1password/agent.sock`.
 
 ```bash
 nix run github:aka-rider/yolobox -- --help
