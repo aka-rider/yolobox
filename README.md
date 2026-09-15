@@ -22,19 +22,25 @@ brew install aka-rider/tap/yolobox
 
 #### Linux
 
-[Nix](https://nixos.org/download/) with flakes enabled. KVM access: `/dev/kvm` must be readable and writable (check permissions or load the kvm kernel module). [1Password](https://1password.com/) CLI with its SSH agent enabled at `~/.1password/agent.sock`.
+[Nix](https://nixos.org/download/) with flakes enabled; it brings Lima and QEMU. KVM: `/dev/kvm` must exist and be readable and writable by your user (enable virtualization in firmware, load the `kvm` module, join the `kvm` group). [1Password](https://1password.com/) for Linux with its SSH agent enabled, which listens at `~/.1password/agent.sock`.
 
 ```bash
-nix run github:aka-rider/yolobox
+nix run github:aka-rider/yolobox -- --help
 ```
 
-The Linux path works from the first release that includes Linux host support. Earlier releases pin an aarch64-only NixOS image; until then use `YOLOBOX_FLAKE=github:aka-rider/yolobox/<branch> yo bootstrap` to build from a development branch.
-
-For `yo pair` on Linux with firewalld enabled, ensure port 3773/tcp is open:
+`yo` from a release older than the first one with Linux support pins an aarch64-only flake ref, so until such a release exists, bootstrap from a branch instead:
 
 ```bash
-firewall-cmd --add-port 3773/tcp
+YOLOBOX_FLAKE=github:aka-rider/yolobox/<branch> yo bootstrap
 ```
+
+`yo pair` prints a URL on this host's LAN IP. With firewalld running, other devices reach it only once the port is open:
+
+```bash
+sudo firewall-cmd --add-port=3773/tcp
+```
+
+On a Mac, `nix run github:aka-rider/yolobox` runs the same release without a `brew` install at all.
 
 ## Quickstart
 
