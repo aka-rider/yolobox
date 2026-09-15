@@ -271,6 +271,45 @@ not necessarily the LAN. When firewalld is running and no active zone
 opens `3773/tcp`, `yo pair` warns on stderr with the `--add-port` command
 and never mutates firewall state itself.
 
+**What the first x86_64 boot proved, 2026-09-15.** The x86_64 nixos-lima
+image carries the same 249 MiB ESP as the aarch64 one (`df /boot` reports
+254,684 KiB), so `configurationLimit = 1` and everything in "The ESP is 249
+MiB" apply unchanged. `nix/pkgs/t3.nix`'s `npmDepsHash` is platform
+independent: the x86_64 guest build fetched with the existing pin. The
+bootstrap built, installed GRUB and rebooted onto `x86_64-linux` with no
+change to `nix/base.nix`'s boot config. What did not survive the run were
+two `yo` bugs, both fixed the same day and both worth recognising.
+
+The first was a bootstrap that could never reboot a brand-new box. After
+`nixos-rebuild boot`, `cmd_bootstrap` asked `yolobox-guest generations`
+whether the profile and the booted generation agree, but on a box still
+running the stock image that helper does not exist until the reboot it was
+supposed to decide on, so `yo bootstrap` died with `the box has no
+yolobox-guest` and a rebuild hint that would not have helped. A Mac never
+showed it because every Mac box was first built by the old push-based
+bootstrap, before the helper existed as a gate. `cmd_bootstrap` now asks
+`helper_missing` first: no helper after a successful build means the first
+yolobox generation on this box, and the reboot is unconditional.
+
+The second was a firewalld warning that fired on an open port.
+`firewall-cmd --get-active-zones` prints `FedoraWorkstation (default)`,
+and `yo` queried that whole line as a zone name, which firewalld refuses,
+so `--query-port` failed on every zone and the advisory claimed 3773/tcp
+was closed while `curl` from the LAN got a 200. The zone is the first
+whitespace-delimited token of the line; `firewalld_advisory` takes only
+that now. Recognise the class by a warning that survives `--query-port`
+answering `yes` by hand.
+
+Two things the run could not prove. The host's herdr was 0.8.0, which has
+no `machine` subcommand at all, so adoption of the guest server was not
+exercised on Linux; a host herdr at or above the guest's generation is a
+prerequisite there, exactly as on a Mac. And `ssh -T git@github.com`
+through the forwarded Linux 1Password socket listed both keys via
+`ssh-add -l` but failed at signing with `communication with agent
+failed`, which is 1Password's approval dialog waiting for a click nobody
+was there to give in a non-interactive run; an interactive `yo enter`
+raises the dialog on the host as usual.
+
 **The host layer reads `sys.platform` at call time.** `op_sock`,
 `open_url`, `code_cli`, `pair_base_url`, `tool_hint` and `require_kvm`
 branch inside the function, never through a module-level constant. Tests

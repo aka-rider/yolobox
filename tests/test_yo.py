@@ -805,3 +805,46 @@ class TestRequireKvm(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+ACTIVE_ZONES = "FedoraWorkstation (default)\n  interfaces: wlp5s0\ndocker\n  interfaces: docker0\n"
+
+
+class TestFirewalldAdvisory(unittest.TestCase):
+    def run_advisory(self, open_zones):
+        queried = []
+
+        def fake_run(argv, **kwargs):
+            if argv[1] == "--state":
+                return mock.Mock(returncode=0, stdout="running\n", stderr="")
+            if argv[1] == "--get-active-zones":
+                return mock.Mock(returncode=0, stdout=ACTIVE_ZONES, stderr="")
+            zone = argv[1][len("--zone="):]
+            queried.append(zone)
+            return mock.Mock(returncode=0 if zone in open_zones else 1, stdout="", stderr="")
+
+        with with_platform("linux"):
+            with mock.patch.object(yo.shutil, "which", return_value="/usr/bin/firewall-cmd"):
+                with mock.patch.object(yo, "run", side_effect=fake_run):
+                    with mock.patch.object(yo, "err") as fake_err:
+                        yo.firewalld_advisory()
+        return queried, fake_err.call_args_list
+
+    def test_queries_zone_names_without_their_annotations(self):
+        queried, _ = self.run_advisory(open_zones=["FedoraWorkstation"])
+        self.assertEqual(queried, ["FedoraWorkstation"])
+
+    def test_silent_when_an_active_zone_opens_the_port(self):
+        _, warnings = self.run_advisory(open_zones=["FedoraWorkstation"])
+        self.assertEqual(warnings, [])
+
+    def test_warns_naming_add_port_when_no_zone_opens_the_port(self):
+        queried, warnings = self.run_advisory(open_zones=[])
+        self.assertEqual(queried, ["FedoraWorkstation", "docker"])
+        self.assertIn("--add-port=3773/tcp", " ".join(call.args[0] for call in warnings))
+
+    def test_no_op_on_darwin(self):
+        with with_platform("darwin"):
+            with mock.patch.object(yo, "run") as fake_run:
+                yo.firewalld_advisory()
+        fake_run.assert_not_called()

@@ -208,6 +208,11 @@ class TestBootstrapRebootDecision(unittest.TestCase):
                 yo.cmd_bootstrap(args)
         return calls
 
+    def test_first_generation_on_a_fresh_box_restarts_without_reading_generations(self):
+        with mock.patch.object(yo, "helper_missing", return_value=True):
+            calls = self.run_bootstrap([("g1", "g1")])
+        self.assertEqual(calls, [["limactl", "restart", "yolobox"]])
+
     def test_no_restart_when_already_running_the_built_generation(self):
         calls = self.run_bootstrap([("g1", "g1")])
         self.assertNotIn(["limactl", "restart", "yolobox"], calls)

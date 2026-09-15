@@ -242,7 +242,7 @@ def firewalld_advisory() -> None:
     if state.stdout.strip() != "running":
         return
     zones = [
-        line
+        line.split()[0]
         for line in run(["firewall-cmd", "--get-active-zones"]).stdout.splitlines()
         if line and not line[0].isspace()
     ]
@@ -906,6 +906,22 @@ def guest_generations() -> Tuple[str, str]:
     return guest_field(proc.stdout, "profile"), guest_field(proc.stdout, "booted")
 
 
+def bootstrap_reboot(report: Report) -> None:
+    run(["limactl", "restart", INSTANCE], capture=False, check=True)
+    profile, booted = guest_generations()
+    if not booted:
+        raise report.abort("cannot read the VM's generations — is it up? (yo status)")
+    if profile != booted:
+        raise report.abort(
+            "the VM rebooted but is still not running the built generation",
+            "profile: %s" % profile,
+            "booted:  %s" % booted,
+            "Check df /boot in the VM — a half-failed bootloader install leaves the two",
+            "generations disagreeing (see CLAUDE.md).",
+        )
+    report.ok("rebooted into the built generation")
+
+
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     report = Report()
     ref = flake_ref()
@@ -934,25 +950,17 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     )
     report.ok("built from %s" % ref)
 
-    profile, booted = guest_generations()
-    if not booted:
-        raise report.abort("cannot read the VM's generations — is it up? (yo status)")
-    if profile == booted:
-        report.ok("already running the built generation")
+    if helper_missing(OPERATOR):
+        report.ok("first yolobox generation on this box")
+        bootstrap_reboot(report)
     else:
-        run(["limactl", "restart", INSTANCE], capture=False, check=True)
         profile, booted = guest_generations()
         if not booted:
             raise report.abort("cannot read the VM's generations — is it up? (yo status)")
-        if profile != booted:
-            raise report.abort(
-                "the VM rebooted but is still not running the built generation",
-                "profile: %s" % profile,
-                "booted:  %s" % booted,
-                "Check df /boot in the VM — a half-failed bootloader install leaves the two",
-                "generations disagreeing (see CLAUDE.md).",
-            )
-        report.ok("rebooted into the built generation")
+        if profile == booted:
+            report.ok("already running the built generation")
+        else:
+            bootstrap_reboot(report)
 
     seed_all()
     report.ok("seeded")
