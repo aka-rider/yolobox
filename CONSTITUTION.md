@@ -6,7 +6,7 @@ story behind each lives in `CLAUDE.md`.
 
 ## Before you start
 
-Identify whether you are running on the host (MacOS) or Guest (Linux).
+Identify whether you are running on the host (macOS or Linux) or Guest (Linux).
 
 ## The VM
 
@@ -23,9 +23,10 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   `lima-guestagent`. Restarting the guest agent kills every port lima
   forwards until the VM is stopped and started again.
 - ALWAYS declare the operator's account as `users.users.${username}`, fed
-  by `YOLOBOX_USERNAME=$(id -un)` and `--impure` — uid 501 (lima's own),
-  home `/home/${username}.guest`, in `wheel`. A hardcoded name creates a
-  second account with the same uid and splits state across two homes.
+  by `YOLOBOX_USERNAME=$(id -un)` and `--impure` — uid 501 (lima's own,
+  pinned by `lima/yolobox.yaml`'s `user.uid`), home `/home/${username}.guest`,
+  in `wheel`. A hardcoded name creates a second account with the same uid and
+  splits state across two homes.
 - ALWAYS treat `lima/yolobox.yaml` as read once, at creation. An existing
   instance is changed with `limactl edit` while stopped, and `portForwards`
   must be restated in full because lima's yq cannot read the file.
@@ -96,8 +97,8 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 
 ## Disk
 
-- ALWAYS diagnose a full disk from the Mac with `yo gc`. In-VM tools die
-  first, while `yo ssh` still works because it reaches in from the Mac, and
+- ALWAYS diagnose a full disk from the host with `yo gc`. In-VM tools die
+  first, while `yo ssh` still works because it reaches in from the host, and
   the operator's `sudo` still works there because ext4 reserves 4.3 GB for
   root — the agent has no `sudo` at all, so a stuck agent session proves
   nothing about disk space either way.

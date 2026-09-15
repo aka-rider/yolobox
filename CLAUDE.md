@@ -11,8 +11,8 @@ rules this file justifies.
 
 ## Where things live
 
-- `yo` — the Mac-side CLI, a single Python 3.9 file with no dependencies
-  beyond the stdlib. Everything the Mac does to the VM goes through it;
+- `yo` — the host-side CLI, a single Python 3.9 file with no dependencies
+  beyond the stdlib. Everything the host does to the VM goes through it;
   `yo --help` lists each command, and `yo <command> --help` gives that
   command's fuller prose.
 - `flake.nix` — wires the modules together and threads the host username
@@ -194,6 +194,86 @@ Lima >= 2.1.0 names the guest home `/home/<user>.guest` (it was
 `/home/<user>.linux` before; lima-vm/lima#4578). This box was brought up on
 limactl 2.2.0. v1 of yolobox, the Docker-based predecessor, lives at commit
 `4c154fc`.
+
+## Linux hosts: the same box under QEMU/KVM
+
+The same NixOS configuration runs on a Linux host with Lima driving QEMU/KVM.
+The guest is identical to the macOS one; what changes is the host layer and
+the flake's system derivation. Each difference below was discovered in early
+runs and has a remedy to handle it automatically or refuse loudly rather than
+silently fail.
+
+Lima reads `lima/yolobox.yaml` once, when the instance is created, and
+resolves the `arch:` field to the host machine's architecture. Every image
+whose arch differs is skipped during resolution; a missing match fails with
+`unsupported arch` (Linux on an aarch64 host, for example, would need a
+separate image entry). The `vmOpts.vz` block at the top level exists only for
+documentation and macOS performance: Lima reads `vz` only inside `_darwin.go`
+files, never during yaml parsing or driver selection, so the block is silently
+inert on Linux and needs no `vmType:` field to override it. The yaml's
+`user.uid` field pins the operator's uid to 501 on every host. Lima's built-in
+default is the host user's uid; on Fedora, `id -u` is 1000, which is the agent's
+uid by design. Without the pin, the first rebuild would either fail NixOS
+activation (the operator already existed at uid 1000, the agent cannot exist at
+that same uid) or leave two passwd entries sharing uid 1000, silent until later
+when both accounts try to access the same files, exactly the split-home outage
+this file already describes for the `xiii` hardcoded account. The pin makes the
+guest identical on every host.
+
+The flake configuration derives the guest system from the evaluating machine's
+cpu, via `builtins.currentSystem` — an impure value, requiring the same
+`--impure` flag every `nixos-rebuild` already needs. On a macOS host, a bare
+`nix flake check --impure` still evaluates the system as `aarch64-linux`
+(Nix's cpu detection on macOS is the host cpu, aarch64). This keeps the
+distribution channel unified: one flake ref, `github:aka-rider/yolobox/vX`,
+builds the right system on the right host with no version branching.
+
+`nix/base.nix` conditionally enables rosetta, the x86 translator, only on
+aarch64 hosts: `virtualisation.rosetta` carries a nixpkgs assertion that
+`pkgs.stdenv.hostPlatform.isAarch64` is true, and mounts a `vz-rosetta` virtiofs
+tag with no `nofail` option. An x86_64 evaluation fails the assertion outright,
+and an aarch64 QEMU guest would hang at boot when it tries to mount a virtiofs
+tag the vz driver cannot provide — neither is the wrong guest type for the host,
+each is the correct host needing its own image. The conditional gating prevents
+both.
+
+Herdr releases publish per-architecture assets: `herdr-linux-aarch64` and
+`herdr-linux-x86_64`, both verified static-pie ELF at build time with a
+readelf check that neither has a `PT_INTERP` header. The flake lists a hash
+per system, and the build-time check that the asset is static fails the
+derivation loudly if an upstream release ships a dynamic binary by accident.
+
+KVM availability is load-bearing on Linux only. Lima on Linux defaults to the
+QEMU TCG (translating-code generator) when `/dev/kvm` is absent, logging only a
+warning, so a system without virtualization support boots fine, slowly. `yo`
+refuses both cases: `/dev/kvm` missing or present but not readable and writable,
+refusing loudly before any `limactl start` so the remedy is clear. Unreadable
+is a permissions issue (fix the device's mode or group); absent is a
+virtualization-support issue (enable in firmware, load the kvm module).
+
+Privileged ports on Linux are not available to unprivileged users, unlike
+macOS where a non-root process can bind `0.0.0.0:80` and 443. The "lsof shows
+lima on 80 and 443" section below describes that macOS shape; Linux has no
+equivalent.
+
+`yo pair` on Linux uses the primary-route IP instead of a `.local` mDNS name,
+because mDNS is off by default on Fedora and `--base-url` overrides it. Finding
+the primary route involves a UDP socket `connect`ed to `1.1.1.1:53` (no packet
+is sent) and `getsockname()`. `yo pair` prints which IP was chosen and that
+`--base-url` overrides it, because on a VPN or multi-homed host the default
+route is not necessarily the LAN.
+
+Firewalld advisory: `cmd_pair` on Linux checks whether firewalld is running and
+has an active zone that opens port 3773/tcp. When the check fails (firewalld
+running, port closed), `yo pair` prints a warning that peers may not reach the
+server, with the `firewall-cmd --add-port` command. The warning is advisory
+only; `yo pair` never mutates firewall state.
+
+At `yo bootstrap` time, before any rebuild, `yo` runs `id -u` as the operator
+and refuses unless it returns 501. This is the earliest stage that can detect
+a mis-created instance (one created from a yaml without the uid pin) before the
+config activates and the ambiguity takes root. The remedy is explicit: delete
+the instance and recreate it with a pinned-uid yaml.
 
 ## SSH identities and the two GitHub accounts
 
@@ -597,10 +677,12 @@ each recognisable on its own:
 - **`nix flake check` throws with no explanation.** `flake.nix` reads
   `YOLOBOX_USERNAME` from the environment and `throw`s when it is unset,
   because it has no pure way to learn the host username otherwise (see
-  "Two accounts: the operator mirrors the host, the agent does not" above). A bare `nix flake check`
-  hits that throw immediately; it needs `--impure` with
-  `YOLOBOX_USERNAME=$(id -un)` set, same as every `nixos-rebuild` in this
-  repo.
+  "Two accounts: the operator mirrors the host, the agent does not" above). The
+  guest system now follows the evaluating machine's cpu, derived from
+  `builtins.currentSystem`; on a macOS host, `nix flake check --impure` still
+  evaluates the system as `aarch64-linux`. A bare `nix flake check` hits the
+  username throw immediately; it needs `--impure` with `YOLOBOX_USERNAME=$(id
+  -un)` set, same as every `nixos-rebuild` in this repo.
 - **Release published from a non-main commit.** The release workflow refuses
   to run unless the release tag is already the tip of `main`, because the
   workflow force-moves the tag onto its stamp commit — moving a tag from an
