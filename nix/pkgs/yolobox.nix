@@ -4,11 +4,7 @@
 , src
 , version
 , fzf
-, git
-, openssh
-, curl
 , python3
-, coreutils
 , lima
 }:
 
@@ -16,7 +12,7 @@ stdenvNoCC.mkDerivation {
   pname = "yolobox";
   inherit version src;
 
-  nativeBuildInputs = [ makeWrapper ];
+  nativeBuildInputs = [ makeWrapper python3 ];
 
   dontBuild = true;
   dontConfigure = true;
@@ -34,13 +30,13 @@ stdenvNoCC.mkDerivation {
     patchShebangs "$out/libexec/yolobox/yo" "$out/libexec/yolobox/aws-broker"
 
     makeWrapper "$out/libexec/yolobox/yo" "$out/bin/yo" \
-      --prefix PATH : ${lib.makeBinPath [ fzf git openssh curl python3 coreutils lima ]}
+      --prefix PATH : ${lib.makeBinPath [ fzf lima ]}
 
     runHook postInstall
   '';
 
   meta = {
-    description = "yolobox — NixOS VM devbox for AI agents, run by Lima on a Mac";
+    description = "yolobox — NixOS VM devbox for AI agents, run by Lima";
     homepage = "https://github.com/aka-rider/yolobox";
     license = lib.licenses.mit;
     mainProgram = "yo";
