@@ -185,9 +185,9 @@ in
         description = "herdr release fetched via nix/pkgs/herdr-bin.nix, bypassing nixpkgs' pin.";
       };
       hash = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
+        type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
         default = null;
-        description = "SRI hash of the herdr release binary at yolobox.harness.herdr.version. Setting this activates the override.";
+        description = "SRI hash of the herdr release binary at yolobox.harness.herdr.version, keyed by nix system (e.g. \"x86_64-linux\"). Setting this activates the override.";
       };
     };
   };
@@ -295,6 +295,10 @@ in
       {
         assertion = (cfg.herdr.version == null) == (cfg.herdr.hash == null);
         message = "yolobox.harness.herdr: version and hash must both be null or both be set.";
+      }
+      {
+        assertion = cfg.herdr.hash == null || lib.hasAttr pkgs.stdenv.hostPlatform.system cfg.herdr.hash;
+        message = "yolobox.harness.herdr.hash has no entry for ${pkgs.stdenv.hostPlatform.system}.";
       }
     ];
   };

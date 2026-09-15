@@ -207,7 +207,7 @@
   # and .cargo/config.toml, so this caps dev/test DWARF for every project.
   environment.variables.CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
 
-  virtualisation.rosetta = {
+  virtualisation.rosetta = lib.mkIf pkgs.stdenv.hostPlatform.isAarch64 {
     enable = true;
     mountTag = "vz-rosetta";
   };
