@@ -94,7 +94,7 @@ class TestMainPreflight(unittest.TestCase):
 class TestSshRemainderPassthrough(unittest.TestCase):
     # rebuild_hint() prints "yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild
     # switch --impure --flake '<ref>#yolobox'" as the documented remedy for a
-    # box that has drifted from this Mac's yo. If argparse ever ate --impure or
+    # box that has drifted from this host's yo. If argparse ever ate --impure or
     # --flake off that line, the tool's own printed advice would silently stop
     # working.
     def parse(self, argv):
@@ -182,7 +182,7 @@ class TestBootstrapRebootDecision(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
         ssh_run_patcher = mock.patch.object(
-            yo, "ssh_run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
+            yo, "ssh_run", return_value=mock.Mock(returncode=0, stdout="501", stderr="")
         )
         ssh_run_patcher.start()
         self.addCleanup(ssh_run_patcher.stop)
@@ -229,6 +229,44 @@ class TestBootstrapRebootDecision(unittest.TestCase):
                 self.run_bootstrap([("g1", "")])
         messages = " ".join(call.args[0] for call in fake_err.call_args_list)
         self.assertIn("yo status", messages)
+
+    def test_aborts_before_the_rebuild_when_the_operator_is_a_foreign_uid(self):
+        rebuild_argv = []
+
+        def fake_ssh_run(role, argv, **kwargs):
+            if list(argv) == ["id", "-u"]:
+                return mock.Mock(returncode=0, stdout="1000", stderr="")
+            rebuild_argv.append(list(argv))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        args = yo.build_parser().parse_args(["bootstrap"])
+        with mock.patch.object(yo, "ssh_run", side_effect=fake_ssh_run):
+            with mock.patch.object(yo, "err") as fake_err:
+                with self.assertRaises(yo.YoError):
+                    yo.cmd_bootstrap(args)
+        self.assertEqual(rebuild_argv, [])
+        messages = " ".join(call.args[0] for call in fake_err.call_args_list)
+        self.assertIn("limactl delete", messages)
+        self.assertIn("yo bootstrap", messages)
+
+
+class TestRequireOperatorUid(unittest.TestCase):
+    def test_refuses_on_a_foreign_uid_naming_cause_and_remedy(self):
+        with mock.patch.object(
+            yo, "ssh_run", return_value=mock.Mock(returncode=0, stdout="1000\n", stderr="")
+        ):
+            with mock.patch.object(yo, "err") as fake_err:
+                with self.assertRaises(yo.YoError):
+                    yo.require_operator_uid()
+        messages = " ".join(call.args[0] for call in fake_err.call_args_list)
+        self.assertIn("user.uid", messages)
+        self.assertIn("limactl delete yolobox && yo bootstrap", messages)
+
+    def test_passes_on_the_pinned_uid(self):
+        with mock.patch.object(
+            yo, "ssh_run", return_value=mock.Mock(returncode=0, stdout="501\n", stderr="")
+        ):
+            yo.require_operator_uid()
 
 
 class TestGcSkipsCollectionOnHalfFailedSwitch(unittest.TestCase):

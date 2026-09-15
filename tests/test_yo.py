@@ -649,5 +649,160 @@ class TestDiskGrowSize(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
 
 
+def with_platform(name):
+    return mock.patch.object(yo.sys, "platform", name)
+
+
+class TestOpSock(FakeHome):
+    def test_darwin_uses_the_1password_group_container(self):
+        with with_platform("darwin"):
+            sock = yo.op_sock()
+        self.assertEqual(
+            sock, os.path.join(self.home, "Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock")
+        )
+
+    def test_linux_uses_the_dotfile_socket(self):
+        with with_platform("linux"):
+            sock = yo.op_sock()
+        self.assertEqual(sock, os.path.join(self.home, ".1password/agent.sock"))
+
+
+class TestOpenUrl(unittest.TestCase):
+    def test_darwin_execs_open(self):
+        with with_platform("darwin"):
+            with mock.patch.object(yo, "exec_process") as fake_exec:
+                yo.open_url("http://127.0.0.1:3773/?t=1")
+        fake_exec.assert_called_once_with(["open", "http://127.0.0.1:3773/?t=1"])
+
+    def test_linux_execs_xdg_open(self):
+        with with_platform("linux"):
+            with mock.patch.object(yo, "exec_process") as fake_exec:
+                yo.open_url("http://127.0.0.1:3773/?t=1")
+        fake_exec.assert_called_once_with(["xdg-open", "http://127.0.0.1:3773/?t=1"])
+
+
+class TestCodeCli(unittest.TestCase):
+    def test_prefers_whatever_is_on_path_regardless_of_platform(self):
+        with with_platform("linux"):
+            with mock.patch.object(yo.shutil, "which", return_value="/usr/bin/code"):
+                self.assertEqual(yo.code_cli(), "/usr/bin/code")
+
+    def test_darwin_falls_back_to_the_app_bundle(self):
+        with with_platform("darwin"):
+            with mock.patch.object(yo.shutil, "which", return_value=None):
+                with mock.patch.object(yo.os, "access", return_value=True):
+                    cli = yo.code_cli()
+        self.assertEqual(cli, "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code")
+
+    def test_darwin_refuses_when_neither_path_nor_the_app_bundle_has_it(self):
+        with with_platform("darwin"):
+            with mock.patch.object(yo.shutil, "which", return_value=None):
+                with mock.patch.object(yo.os, "access", return_value=False):
+                    with self.assertRaises(yo.YoError):
+                        yo.code_cli()
+
+    def test_linux_refuses_naming_path_as_the_remedy(self):
+        with with_platform("linux"):
+            with mock.patch.object(yo.shutil, "which", return_value=None):
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.code_cli()
+        self.assertIn("PATH", caught.exception.message)
+
+
+class TestToolHint(unittest.TestCase):
+    def test_darwin_names_the_brew_formula(self):
+        with with_platform("darwin"):
+            self.assertEqual(yo.tool_hint("limactl"), "brew install lima")
+            self.assertEqual(yo.tool_hint("fzf"), "brew install fzf")
+            self.assertEqual(yo.tool_hint("aws"), "brew install awscli")
+
+    def test_linux_names_the_flake_for_limactl_and_fzf(self):
+        with with_platform("linux"):
+            self.assertEqual(yo.tool_hint("limactl"), "nix run github:aka-rider/yolobox")
+            self.assertEqual(yo.tool_hint("fzf"), "nix run github:aka-rider/yolobox")
+
+    def test_linux_points_aws_at_the_distro_package(self):
+        with with_platform("linux"):
+            hint = yo.tool_hint("aws")
+        self.assertIn("aws", hint)
+        self.assertIn("distro", hint)
+
+
+class FakeRouteSocket:
+    def __init__(self, ip=None, connect_error=None):
+        self.ip = ip
+        self.connect_error = connect_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def connect(self, address):
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    def getsockname(self):
+        return (self.ip, 51413)
+
+
+class TestPairBaseUrl(unittest.TestCase):
+    def test_darwin_uses_scutil_and_the_local_domain(self):
+        with with_platform("darwin"):
+            with mock.patch.object(yo, "run", return_value=mock.Mock(stdout="mymac\n")):
+                url = yo.pair_base_url()
+        self.assertEqual(url, "http://mymac.local:3773")
+
+    def test_linux_uses_the_primary_route_ip(self):
+        with with_platform("linux"):
+            with mock.patch.object(
+                yo.socket, "socket", return_value=FakeRouteSocket(ip="192.168.1.42")
+            ):
+                with mock.patch.object(yo, "err") as fake_err:
+                    url = yo.pair_base_url()
+        self.assertEqual(url, "http://192.168.1.42:3773")
+        fake_err.assert_called_once()
+
+    def test_linux_refuses_naming_base_url_as_the_override_when_there_is_no_route(self):
+        with with_platform("linux"):
+            with mock.patch.object(
+                yo.socket, "socket", return_value=FakeRouteSocket(connect_error=OSError("no route"))
+            ):
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.pair_base_url()
+        self.assertIn("--base-url", caught.exception.message)
+
+
+class TestRequireKvm(unittest.TestCase):
+    def test_darwin_is_a_no_op(self):
+        with with_platform("darwin"):
+            with mock.patch.object(yo.os.path, "exists", return_value=False) as fake_exists:
+                yo.require_kvm()
+        fake_exists.assert_not_called()
+
+    def test_linux_refuses_when_the_device_is_absent(self):
+        with with_platform("linux"):
+            with mock.patch.object(yo.os.path, "exists", return_value=False):
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.require_kvm()
+        self.assertIn("/dev/kvm", caught.exception.message)
+
+    def test_linux_refuses_when_the_device_is_not_readable_or_writable(self):
+        with with_platform("linux"):
+            with mock.patch.object(yo.os.path, "exists", return_value=True):
+                with mock.patch.object(yo.os, "access", return_value=False) as fake_access:
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.require_kvm()
+        self.assertIn("permissions", caught.exception.message)
+        fake_access.assert_called_once_with("/dev/kvm", os.R_OK | os.W_OK)
+
+    def test_linux_passes_when_the_device_is_present_and_accessible(self):
+        with with_platform("linux"):
+            with mock.patch.object(yo.os.path, "exists", return_value=True):
+                with mock.patch.object(yo.os, "access", return_value=True):
+                    yo.require_kvm()
+
+
 if __name__ == "__main__":
     unittest.main()
