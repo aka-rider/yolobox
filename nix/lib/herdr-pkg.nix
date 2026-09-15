@@ -5,7 +5,8 @@
 { pkgs, cfg }:
 if cfg.hash != null then
   pkgs.callPackage ../pkgs/herdr-bin.nix {
-    inherit (cfg) version hash;
+    inherit (cfg) version;
+    hash = cfg.hash.${pkgs.stdenv.hostPlatform.system};
   }
 else
   pkgs.herdr

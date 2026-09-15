@@ -34,8 +34,7 @@ stdenvNoCC.mkDerivation {
     patchShebangs "$out/libexec/yolobox/yo" "$out/libexec/yolobox/aws-broker"
 
     makeWrapper "$out/libexec/yolobox/yo" "$out/bin/yo" \
-      --prefix PATH : ${lib.makeBinPath ([ fzf git openssh curl python3 coreutils ]
-        ++ lib.optional stdenvNoCC.hostPlatform.isDarwin lima)}
+      --prefix PATH : ${lib.makeBinPath [ fzf git openssh curl python3 coreutils lima ]}
 
     runHook postInstall
   '';
@@ -45,6 +44,6 @@ stdenvNoCC.mkDerivation {
     homepage = "https://github.com/aka-rider/yolobox";
     license = lib.licenses.mit;
     mainProgram = "yo";
-    platforms = [ "aarch64-darwin" "aarch64-linux" ];
+    platforms = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
   };
 }
