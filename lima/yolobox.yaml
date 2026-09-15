@@ -6,12 +6,11 @@
 # active driver, so it sits here inert, not conditional, on Linux.
 #
 # `user.uid` is pinned to 501 rather than left at Lima's default (the host
-# user's own uid) because nix/base.nix, CONSTITUTION.md and CLAUDE.md all
-# hard-code the operator at uid 501 and the agent at uid 1000 — on a Linux
-# host, where `id -u` is typically 1000, leaving this unset would create
-# the operator at the same uid CLAUDE.md's "Where things live" section
-# already documents as an outage waiting to happen (see "Two accounts" in
-# CLAUDE.md for the xiii/agent uid collision this is built to avoid).
+# user's own uid) because nix/base.nix hard-codes the operator at uid 501
+# and the agent at uid 1000. On a Linux host `id -u` is typically 1000, so
+# leaving this unset would create the operator on the agent's uid — the
+# split-uid outage CLAUDE.md's "Two accounts" and "Linux hosts" sections
+# describe.
 user:
   uid: 501
 
