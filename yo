@@ -190,9 +190,9 @@ def pairing_label() -> str:
     return socket.gethostname()
 
 
-def pair_base_url() -> str:
+def pair_base_url(label: str) -> str:
     if sys.platform == "darwin":
-        return "http://%s.local:%d" % (pairing_label(), T3_PORT)
+        return "http://%s.local:%d" % (label, T3_PORT)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
         try:
             probe.connect(("1.1.1.1", 53))
@@ -1217,7 +1217,7 @@ def cmd_t3(args: argparse.Namespace) -> None:
 def cmd_pair(args: argparse.Namespace) -> None:
     t3_require_service()
     label = pairing_label()
-    base_url = args.base_url if args.base_url is not None else pair_base_url()
+    base_url = args.base_url if args.base_url is not None else pair_base_url(label)
     firewalld_advisory()
     pair = ssh_run(
         AGENT,

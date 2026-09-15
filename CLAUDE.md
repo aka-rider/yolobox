@@ -197,83 +197,92 @@ limactl 2.2.0. v1 of yolobox, the Docker-based predecessor, lives at commit
 
 ## Linux hosts: the same box under QEMU/KVM
 
-The same NixOS configuration runs on a Linux host with Lima driving QEMU/KVM.
-The guest is identical to the macOS one; what changes is the host layer and
-the flake's system derivation. Each difference below was discovered in early
-runs and has a remedy to handle it automatically or refuse loudly rather than
-silently fail.
+The box was a Mac-only design until 2026-09-15, when the same VM was
+brought up on a Fedora 44 x86_64 host. The guest did not change at all;
+what changed is a short list of places where the repo had quietly assumed
+macOS, each with a failure shape that would have been silent or misleading
+without the fix.
 
-Lima reads `lima/yolobox.yaml` once, when the instance is created, and
-resolves the `arch:` field to the host machine's architecture. Every image
-whose arch differs is skipped during resolution; a missing match fails with
-`unsupported arch` (Linux on an aarch64 host, for example, would need a
-separate image entry). The `vmOpts.vz` block at the top level exists only for
-documentation and macOS performance: Lima reads `vz` only inside `_darwin.go`
-files, never during yaml parsing or driver selection, so the block is silently
-inert on Linux and needs no `vmType:` field to override it. The yaml's
-`user.uid` field pins the operator's uid to 501 on every host. Lima's built-in
-default is the host user's uid; on Fedora, `id -u` is 1000, which is the agent's
-uid by design. Without the pin, the first rebuild would either fail NixOS
-activation (the operator already existed at uid 1000, the agent cannot exist at
-that same uid) or leave two passwd entries sharing uid 1000, silent until later
-when both accounts try to access the same files, exactly the split-home outage
-this file already describes for the `xiii` hardcoded account. The pin makes the
-guest identical on every host.
+**Lima is the runtime on both hosts, and the yaml needs no `vmType`.**
+Lima on Linux defaults to QEMU with KVM. The `vmOpts.vz` block in
+`lima/yolobox.yaml` stays as it is because Lima reads it only from
+`_darwin.go` files and never validates it against the chosen driver, so it
+is inert on Linux rather than an error. Lima resolves `arch` to the host's
+cpu and skips every image whose arch differs, failing with `unsupported
+arch` when none is left, which is why the yaml lists nixos-lima's x86_64
+image next to the aarch64 one. Nothing selects between them; the host does.
 
-The flake configuration derives the guest system from the evaluating machine's
-cpu, via `builtins.currentSystem` — an impure value, requiring the same
-`--impure` flag every `nixos-rebuild` already needs. On a macOS host, a bare
-`nix flake check --impure` still evaluates the system as `aarch64-linux`
-(Nix's cpu detection on macOS is the host cpu, aarch64). This keeps the
-distribution channel unified: one flake ref, `github:aka-rider/yolobox/vX`,
-builds the right system on the right host with no version branching.
+**The operator uid is pinned to 501 by the yaml, not by luck.** Lima's
+`user.uid` default is the host user's uid. On a Mac that is 501, which
+`nix/base.nix` hard-codes for the operator; on this Fedora host `id -u` is
+1000, the uid `nix/base.nix` gives to `agent`. An instance created without
+the pin puts the operator on uid 1000 in `wheel`, and the first rebuild
+then either fails activation or leaves two passwd entries on uid 1000, so
+the agent inherits the operator's sudo. That is the split-home outage
+"Two accounts" above already describes, with root at the end of it. The
+yaml therefore carries `user: { uid: 501 }`, and because the yaml is read
+only at instance creation, `yo bootstrap` runs `id -u` as the operator
+before its first `nixos-rebuild` and refuses on anything but 501, naming
+`limactl delete yolobox` as the remedy. That check is the earliest stage
+that can see a mis-created instance; the flake never can. Existing Mac
+instances already sit on 501, so the pin moves nothing there.
 
-`nix/base.nix` conditionally enables rosetta, the x86 translator, only on
-aarch64 hosts: `virtualisation.rosetta` carries a nixpkgs assertion that
-`pkgs.stdenv.hostPlatform.isAarch64` is true, and mounts a `vz-rosetta` virtiofs
-tag with no `nofail` option. An x86_64 evaluation fails the assertion outright,
-and an aarch64 QEMU guest would hang at boot when it tries to mount a virtiofs
-tag the vz driver cannot provide — neither is the wrong guest type for the host,
-each is the correct host needing its own image. The conditional gating prevents
-both.
+**The flake builds the evaluating machine's cpu.** `flake.nix` derives the
+NixOS system from `builtins.currentSystem`'s cpu plus `-linux`, so the one
+ref `github:aka-rider/yolobox/vX#yolobox` builds `x86_64-linux` inside an
+x86_64 guest and `aarch64-linux` inside an aarch64 one. It is impure, and
+that costs nothing new: every rebuild already runs `--impure` for
+`YOLOBOX_USERNAME`. On a Mac running the documented `nix flake check
+--impure`, the cpu is still aarch64, so the recipe keeps evaluating
+`aarch64-linux`; a bare `builtins.currentSystem` there would have asked
+for `aarch64-darwin` instead, which is why the cpu is taken and the
+`-linux` suffix re-added.
 
-Herdr releases publish per-architecture assets: `herdr-linux-aarch64` and
-`herdr-linux-x86_64`, both verified static-pie ELF at build time with a
-readelf check that neither has a `PT_INTERP` header. The flake lists a hash
-per system, and the build-time check that the asset is static fails the
-derivation loudly if an upstream release ships a dynamic binary by accident.
+**Rosetta only where it can exist.** nixpkgs' `virtualisation.rosetta`
+module asserts `isAarch64` and mounts a `vz-rosetta` virtiofs tag with no
+`nofail`, so an x86_64 evaluation fails the assertion and an aarch64 QEMU
+guest would hang at boot waiting for a tag only the vz driver provides.
+`nix/base.nix` wraps the option in `lib.mkIf
+pkgs.stdenv.hostPlatform.isAarch64`. aarch64 Linux hosts are out of scope
+and untested; the gating merely keeps them evaluating.
 
-KVM availability is load-bearing on Linux only. Lima on Linux defaults to the
-QEMU TCG (translating-code generator) when `/dev/kvm` is absent, logging only a
-warning, so a system without virtualization support boots fine, slowly. `yo`
-refuses both cases: `/dev/kvm` missing or present but not readable and writable,
-refusing loudly before any `limactl start` so the remedy is clear. Unreadable
-is a permissions issue (fix the device's mode or group); absent is a
-virtualization-support issue (enable in firmware, load the kvm module).
+**herdr ships one static asset per cpu.** The pin in `flake.nix` now
+carries a hash per system, `nix/lib/herdr-pkg.nix` is the one place that
+indexes it, and `nix/pkgs/herdr-bin.nix` names the release asset after
+`hostPlatform.uname.processor`. The whole design rests on the asset being
+static, so the package's `installPhase` runs `readelf` and fails the build
+if a `PT_INTERP` header appears. Without that check a dynamically linked
+upstream release would only fail at unit start with "No such file or
+directory", which on NixOS points at nothing.
 
-Privileged ports on Linux are not available to unprivileged users, unlike
-macOS where a non-root process can bind `0.0.0.0:80` and 443. The "lsof shows
-lima on 80 and 443" section below describes that macOS shape; Linux has no
-equivalent.
+**`yo` refuses a KVM-less box itself.** Lima on Linux falls back to QEMU's
+TCG with only a log warning when `/dev/kvm` is absent, and passes `-accel
+kvm` regardless when the device exists but is not writable, so QEMU fails
+later. `vm_up` checks both before any `limactl start`, with two distinct
+messages: absent means enable virtualization in firmware or load the
+module; present but unwritable means fix the device's permissions.
 
-`yo pair` on Linux uses the primary-route IP instead of a `.local` mDNS name,
-because mDNS is off by default on Fedora and `--base-url` overrides it. Finding
-the primary route involves a UDP socket `connect`ed to `1.1.1.1:53` (no packet
-is sent) and `getsockname()`. `yo pair` prints which IP was chosen and that
-`--base-url` overrides it, because on a VPN or multi-homed host the default
-route is not necessarily the LAN.
+**`yo pair` on Linux names an IP, not `.local`.** mDNS is off by default
+on Fedora, so the Linux default is the host's primary-route IP, found by
+connecting a UDP socket to `1.1.1.1:53` (no packet is sent) and reading
+`getsockname`. `yo` prints which IP it chose and that `--base-url`
+overrides it, because on a VPN or a multi-homed host the default route is
+not necessarily the LAN. When firewalld is running and no active zone
+opens `3773/tcp`, `yo pair` warns on stderr with the `--add-port` command
+and never mutates firewall state itself.
 
-Firewalld advisory: `cmd_pair` on Linux checks whether firewalld is running and
-has an active zone that opens port 3773/tcp. When the check fails (firewalld
-running, port closed), `yo pair` prints a warning that peers may not reach the
-server, with the `firewall-cmd --add-port` command. The warning is advisory
-only; `yo pair` never mutates firewall state.
+**The host layer reads `sys.platform` at call time.** `op_sock`,
+`open_url`, `code_cli`, `pair_base_url`, `tool_hint` and `require_kvm`
+branch inside the function, never through a module-level constant. Tests
+patch `yo.sys.platform` per case, and CI runs on Linux only, so a constant
+would make every macOS assertion pass vacuously.
 
-At `yo bootstrap` time, before any rebuild, `yo` runs `id -u` as the operator
-and refuses unless it returns 501. This is the earliest stage that can detect
-a mis-created instance (one created from a yaml without the uid pin) before the
-config activates and the ambiguity takes root. The remedy is explicit: delete
-the instance and recreate it with a pinned-uid yaml.
+Out of scope and deliberately not claimed: aarch64 Linux hosts and Intel
+Macs. The macOS-specific facts elsewhere in this file, the 1Password
+socket path, OpenSSH 10.3's sftp-mode scp, lima on `*:80`, the DNS
+sinkhole, remain true on a Mac and are left as written. On Linux a
+non-root process cannot bind a port below 1024 at all, so the `*:80`
+listener does not exist there.
 
 ## SSH identities and the two GitHub accounts
 

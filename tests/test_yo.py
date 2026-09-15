@@ -748,10 +748,9 @@ class FakeRouteSocket:
 
 
 class TestPairBaseUrl(unittest.TestCase):
-    def test_darwin_uses_scutil_and_the_local_domain(self):
+    def test_darwin_names_the_label_in_the_local_domain(self):
         with with_platform("darwin"):
-            with mock.patch.object(yo, "run", return_value=mock.Mock(stdout="mymac\n")):
-                url = yo.pair_base_url()
+            url = yo.pair_base_url("mymac")
         self.assertEqual(url, "http://mymac.local:3773")
 
     def test_linux_uses_the_primary_route_ip(self):
@@ -760,7 +759,7 @@ class TestPairBaseUrl(unittest.TestCase):
                 yo.socket, "socket", return_value=FakeRouteSocket(ip="192.168.1.42")
             ):
                 with mock.patch.object(yo, "err") as fake_err:
-                    url = yo.pair_base_url()
+                    url = yo.pair_base_url("box")
         self.assertEqual(url, "http://192.168.1.42:3773")
         fake_err.assert_called_once()
 
@@ -770,7 +769,7 @@ class TestPairBaseUrl(unittest.TestCase):
                 yo.socket, "socket", return_value=FakeRouteSocket(connect_error=OSError("no route"))
             ):
                 with self.assertRaises(yo.YoError) as caught:
-                    yo.pair_base_url()
+                    yo.pair_base_url("box")
         self.assertIn("--base-url", caught.exception.message)
 
 
