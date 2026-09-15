@@ -284,6 +284,22 @@ sinkhole, remain true on a Mac and are left as written. On Linux a
 non-root process cannot bind a port below 1024 at all, so the `*:80`
 listener does not exist there.
 
+**The `yo` wrapper carries two dependencies, not seven.** `nix/pkgs/yolobox.nix`
+deliberately matches `homebrew/yolobox.rb`'s `depends_on`: `fzf` and `lima`,
+nothing else. An audit of `yo` shows it shells out on the host only to
+`limactl`, `git`, `ssh`, `scp`, `curl`, `fzf`, `aws`, `firewall-cmd`,
+`xdg-open`, `scutil`, `zed` and `code`, with disk sizes read through
+`os.stat` rather than any coreutils flavour, so no coreutils dependency was
+ever real either. `git`, `ssh`, `scp` and `curl` come from the host exactly
+as they do on a Mac, which is why the wrapper's old `--prefix PATH` carried
+`git`, `openssh`, `curl`, `python3` and `coreutils` for nothing: none of
+those five ever did work the host's own copies were not already doing.
+`python3` stays in the derivation, but as a `nativeBuildInputs` entry that
+lets `patchShebangs` rewrite `yo` and `aws-broker`'s `#!/usr/bin/env
+python3` shebangs to an absolute store path at build time, not as a
+runtime `PATH` entry. `tool_hint("fzf")` still names `nix run` because fzf
+is the one dependency that stays in the wrapper.
+
 ## SSH identities and the two GitHub accounts
 
 `ForwardAgent yes` forwards `$SSH_AUTH_SOCK`, which on this Mac is Apple's
