@@ -59,3 +59,36 @@ Texts, diffs and the posting runbook live in `upstream/`; see `upstream/POST.md`
   real ptys"), so the collision the report describes has no path to occur
   here any more. Withdraw it, or re-scope it as a herdr issue independent
   of yolobox, before it is ever posted (see `upstream/POST.md`).
+- Published releases up to and including v1.0.1 cannot be rebuilt at all.
+  `nix/base.nix` carried a stray `programs.git-lfs.enable = true`
+  (introduced by `13eae86`, "enable git-lfs globally") two lines below the
+  correct `programs.git.lfs.enable`, and `programs.git-lfs` is not a
+  NixOS option in any nixpkgs branch — checked against nixos-unstable,
+  nixos-25.11 and nixos-25.05, where `nixos/modules/programs/git-lfs.nix`
+  is 404 and `module-list.nix` has no git-lfs entry. So every
+  `nixos-rebuild --flake 'github:aka-rider/yolobox/v1.0.1#yolobox'` dies
+  in evaluation with "The option `programs.git-lfs' does not exist",
+  Mullvad or any other `/etc/yolobox/local.nix` customisation or not —
+  which also means the box running 1.0.1 was never built from the
+  published v1.0.1 tree as-is. `ede89be` removed the line, so v1.1.0 and
+  later are clean (verified by reading both tags' trees); v1.0.0 and
+  v1.0.2 were not checked and any tree between `13eae86` and `ede89be`
+  carries it. Two things are owed: a release-time check that the flake
+  evaluates at all before a tag is published — CI's `nix flake check`
+  would have caught this if it ran against the release tree — and a
+  decision whether to yank or re-point the broken tags, since a box in
+  the field at that version cannot apply a single local customisation
+  until its operator picks a newer ref.
+- Guest egress dies completely whenever a WireGuard tunnel on the Mac
+  owns the default route (seen 2026-09-16 with the `nl-ams-wg-006`
+  profile in WireGuard.app). lima NATs the VM's traffic out through the
+  host's default route, the tunnel does not carry those forwarded
+  packets, and they are blackholed: from the guest every destination
+  fails on every port — GitHub on 443 and 80, 1.1.1.1 on 53, even the
+  LAN router — while `192.168.5.2:53`, lima's own resolver, keeps
+  answering because the host process serves it. The Mac itself is fine
+  throughout, so it looks like a guest-only fault. `nixos-rebuild` fails
+  with GitHub fetch timeouts. Recognise it by that pattern and check
+  `scutil --nc list` on the Mac before debugging anything in the VM;
+  disconnecting the tunnel restores egress immediately. Worth a `yo`
+  doctor check, and worth a note in `CLAUDE.md`.
