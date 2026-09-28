@@ -2,8 +2,8 @@
 # The guest-side half of `yo`: subcommands over ssh, one per account, so the
 # find expressions, the gc tiers and the AWS probe are shellchecked at build
 # time instead of living in yo's Python string literals where nothing checks
-# them. Subcommands: projects, home-roots, landing-dir, ensure-repo,
-# generations, gc-machine, gc-user, aws-check.
+# them. Subcommands: projects, pick-project, home-roots, landing-dir,
+# ensure-repo, generations, gc-machine, gc-user, aws-creds, aws-check.
 #
 # writeShellApplication prepends `set -o errexit -o nounset -o pipefail`. The
 # gc tiers below were written for a shell with none of that — a cleanup step
@@ -119,6 +119,48 @@ cmd_projects() {
         "${EXPR[@]}" -prune -o \
         -name .git \( -type d -o -type f \) -printf '%h\0' -prune -o \
         -name '.*' -prune
+}
+
+# The guest-side half of `yo enter [fuzzy]`, called from the agent-only `yo`
+# shell function (nix/guest.nix): picks a project the same way the Mac's own
+# pick_project does, over the same walk, so the two never drift apart. A find
+# permission error is cmd_projects' own problem to report (its stderr is
+# never redirected below), not this function's to re-derive.
+cmd_pick_project() {
+    local query="${1:-}"
+    local list_file entry
+    list_file="$(mktemp)"
+    cmd_projects >"${list_file}" || true
+
+    local -a projects=()
+    while IFS= read -r -d '' entry; do
+        case "${entry}" in
+        "$HOME"/*) projects+=("${entry#"$HOME"/}") ;;
+        esac
+    done <"${list_file}"
+    rm -f "${list_file}"
+
+    if [ "${#projects[@]}" -eq 0 ]; then
+        printf 'yo: no projects in the VM\n' >&2
+        exit 1
+    fi
+
+    # Newline-terminated, not --read0/--print0: fzf only ever hands back one
+    # picked line here, and a NUL in that line would survive the round trip
+    # through find but not through this $(...) capture — bash drops it with
+    # a "warning: command substitution: ignored null byte in input" logged
+    # on every single pick, which is worse than the (pathological) case of a
+    # project directory whose name contains a literal newline.
+    local choice rc=0
+    choice="$(printf '%s\n' "${projects[@]}" | sort | fzf --select-1 --exit-0 --query="${query}")" || rc=$?
+    if [ "${rc}" != 0 ]; then
+        if [ "${rc}" != 130 ]; then
+            printf 'yo: no project matches "%s"\n' "${query}" >&2
+        fi
+        exit "${rc}"
+    fi
+
+    printf '%s\n' "${HOME}/${choice}"
 }
 
 cmd_home_roots() {
@@ -283,23 +325,71 @@ cmd_gc_user() {
     [ "${GC_FAILED}" = 0 ] || exit 1
 }
 
-cmd_aws_check() {
-    local url="${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}"
-    local token="${AWS_CONTAINER_AUTHORIZATION_TOKEN:-}"
-    if [ -z "${url}" ] || [ -z "${token}" ]; then
-        printf 'ENV_MISSING=1\n'
+cmd_aws_creds() {
+    local profile="${1:?aws-creds requires a profile argument}"
+
+    local response rc=0
+    response="$(curl -sS --fail-with-body --unix-socket "${YOLOBOX_AWS_BROKER_SOCK}" "http://broker/creds/${profile}" 2>&1)" || rc=$?
+
+    if [ "${rc}" = 0 ]; then
+        printf '%s\n' "${response}"
         return 0
     fi
-    local health_url="${url%/creds}/health"
-    local health
-    health="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${health_url}" || true)"
-    printf 'HEALTH=%s\n' "${health}"
-    local creds
-    creds="$(curl -sS -H "Authorization: ${token}" --max-time 5 "${url}" || true)"
-    printf 'CREDS=%s\n' "${creds}"
-    local sts
-    sts="$(aws sts get-caller-identity 2>&1 || true)"
-    printf 'STS=%s\n' "${sts}"
+
+    # systemd always accepts a connection on the agent-side socket, even
+    # with no proxy or Mac broker behind it, so a dead forward shows up as
+    # curl 52/56 (empty reply / connection reset), not 7 (couldn't connect).
+    # 7 still covers the case where the socket unit itself is absent.
+    case "${rc}" in
+    7 | 52 | 56)
+        # shellcheck disable=SC2016
+        printf 'yolobox-guest: AWS broker socket %s not answering; run `yo up` on the Mac\n' "${YOLOBOX_AWS_BROKER_SOCK}" >&2
+        exit 1
+        ;;
+    esac
+
+    printf '%s\n' "${response}" >&2
+    exit 1
+}
+
+cmd_aws_check() {
+    local config_file="${AWS_CONFIG_FILE:-}"
+
+    if [ -z "${config_file}" ]; then
+        printf 'yolobox-guest: AWS_CONFIG_FILE is not set\n' >&2
+        exit 1
+    fi
+
+    if [ ! -f "${config_file}" ]; then
+        printf 'yolobox-guest: AWS_CONFIG_FILE does not exist: %s\n' "${config_file}" >&2
+        exit 1
+    fi
+
+    local failed=0
+    local profile
+
+    while IFS= read -r profile; do
+        local arn error_msg rc=0
+        arn="$(AWS_PROFILE="${profile}" aws sts get-caller-identity --query Arn --output text 2>&1)" || rc=$?
+
+        if [ "${rc}" = 0 ]; then
+            printf 'OK %s %s\n' "${profile}" "${arn}"
+        else
+            error_msg="$(printf '%s\n' "${arn}" | head -1)"
+            printf 'FAIL %s %s\n' "${profile}" "${error_msg}"
+            failed=1
+        fi
+    done < <(awk '/^\[profile / {
+        s = $0;
+        sub(/^\[profile /, "", s);
+        sub(/\].*/, "", s);
+        print s;
+    }
+    /^\[default\]/ {
+        print "default";
+    }' "${config_file}")
+
+    [ "${failed}" = 0 ] || exit 1
 }
 
 main() {
@@ -307,12 +397,14 @@ main() {
     [ "$#" -ge 1 ] && shift
     case "${sub}" in
     projects) cmd_projects ;;
+    pick-project) cmd_pick_project "$@" ;;
     home-roots) cmd_home_roots ;;
     landing-dir) cmd_landing_dir "$@" ;;
     ensure-repo) cmd_ensure_repo "$@" ;;
     generations) generations ;;
     gc-machine) cmd_gc_machine "$@" ;;
     gc-user) cmd_gc_user "$@" ;;
+    aws-creds) cmd_aws_creds "$@" ;;
     aws-check) cmd_aws_check ;;
     *)
         printf "yolobox-guest: unknown subcommand '%s'\n" "${sub}" >&2

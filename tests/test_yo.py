@@ -2,6 +2,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import stat
 import sys
@@ -76,14 +77,6 @@ class TestGuestPath(unittest.TestCase):
             yo.guest_path(yo.AGENT_HOME + "/a\nb")
 
 
-class TestSendEnv(unittest.TestCase):
-    def test_only_names_reach_argv(self):
-        opts, env = yo.send_env({"AWS_REGION": "w1:p2 x"})
-        self.assertEqual(opts, ["-o", "SendEnv=AWS_REGION"])
-        self.assertEqual(env["AWS_REGION"], "w1:p2 x")
-        self.assertNotIn("w1:p2 x", " ".join(opts))
-
-
 class TestSshRunArgv(FakeHome):
     def capture_argv(self, role=None, **kwargs):
         seen = {}
@@ -106,17 +99,6 @@ class TestSshRunArgv(FakeHome):
         argv = yo.ssh_base(yo.AGENT, mux=True)
         self.assertIn("User=agent", argv)
         self.assertIn("ControlPath=%s/.lima/yolobox/ssh-agent.sock" % self.home, argv)
-
-    def test_send_env_over_a_shared_control_master_is_refused(self):
-        opts = yo.send_env({"AWS_REGION": "x"})[0]
-        with self.assertRaises(yo.YoError):
-            self.capture_argv(yo.AGENT, extra_opts=opts, mux=True)
-
-    def test_send_env_on_an_unshared_connection_reaches_argv(self):
-        opts = yo.send_env({"AWS_REGION": "x"})[0]
-        argv = self.capture_argv(yo.AGENT, extra_opts=opts, mux=False)
-        self.assertIn("ControlPath=none", argv)
-        self.assertIn("SendEnv=AWS_REGION", argv)
 
 
 class TestResolveCpOperands(unittest.TestCase):
@@ -581,6 +563,109 @@ class TestEnsureAgentSshConfig(FakeHome):
         self.err.assert_called_once()
 
 
+class TestHerdrAliasBlock(FakeHome):
+    def block(self):
+        return yo.herdr_alias_block(
+            {"Hostname": "127.0.0.1", "Port": "60022", "IdentityFile": "/Users/xiii/.lima/_config/user"}
+        )
+
+    def test_pins_the_yo_owned_known_hosts_file(self):
+        self.assertIn('  UserKnownHostsFile "%s"' % yo.known_hosts_path(), self.block())
+
+    def test_never_disables_strict_checking(self):
+        block = self.block()
+        self.assertNotIn("StrictHostKeyChecking no", block)
+        self.assertNotIn("UserKnownHostsFile /dev/null", block)
+
+
+class TestKnownHostsLines(unittest.TestCase):
+    LIMA_VALUES = {"Hostname": "127.0.0.1", "Port": "60022", "IdentityFile": "x"}
+
+    def test_formats_host_port_type_and_key(self):
+        pubkeys = "ssh-ed25519 AAAAC3abc== root@yolobox\n"
+        lines = yo.known_hosts_lines(self.LIMA_VALUES, pubkeys)
+        self.assertEqual(lines, ["[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc=="])
+
+    def test_handles_multiple_key_types_and_drops_the_comment(self):
+        pubkeys = (
+            "ssh-ed25519 AAAAC3abc== root@yolobox\n"
+            "ecdsa-sha2-nistp256 AAAAE2abc== root@yolobox\n"
+        )
+        lines = yo.known_hosts_lines(self.LIMA_VALUES, pubkeys)
+        self.assertEqual(
+            lines,
+            [
+                "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==",
+                "[127.0.0.1]:60022 ecdsa-sha2-nistp256 AAAAE2abc==",
+            ],
+        )
+
+    def test_skips_blank_lines(self):
+        pubkeys = "ssh-ed25519 AAAAC3abc== root@yolobox\n\n"
+        lines = yo.known_hosts_lines(self.LIMA_VALUES, pubkeys)
+        self.assertEqual(len(lines), 1)
+
+    def test_ignores_a_line_with_no_key_field(self):
+        pubkeys = "not-a-key-line\n"
+        lines = yo.known_hosts_lines(self.LIMA_VALUES, pubkeys)
+        self.assertEqual(lines, [])
+
+
+class TestEnsureGuestKnownHosts(FakeHome):
+    def config_path(self):
+        ssh_dir = os.path.join(self.home, ".lima", "yolobox")
+        os.makedirs(ssh_dir, exist_ok=True)
+        return os.path.join(ssh_dir, "ssh.config")
+
+    def write_config(self, text):
+        path = self.config_path()
+        with open(path, "w") as handle:
+            handle.write(text)
+        return path
+
+    def test_missing_file_is_not_an_error(self):
+        with mock.patch.object(yo, "ssh_run") as fake_ssh_run:
+            yo.ensure_guest_known_hosts()
+        fake_ssh_run.assert_not_called()
+
+    def test_unparseable_lima_block_is_skipped_without_ssh(self):
+        self.write_config(LIMA_BLOCK_MISSING_ALIAS_FIELDS)
+        with mock.patch.object(yo, "ssh_run") as fake_ssh_run:
+            yo.ensure_guest_known_hosts()
+        fake_ssh_run.assert_not_called()
+
+    def test_fetches_via_operator_and_writes_the_known_hosts_file(self):
+        self.write_config(LIMA_BLOCK)
+        proc = mock.Mock(returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr="")
+        with mock.patch.object(yo, "ssh_run", return_value=proc) as fake_ssh_run:
+            yo.ensure_guest_known_hosts()
+
+        role, argv = fake_ssh_run.call_args[0]
+        self.assertIs(role, yo.OPERATOR)
+        self.assertEqual(argv[0], "sh")
+        self.assertIn(yo.HOST_KEY_GLOB, argv[-1])
+
+        with open(yo.known_hosts_path(), "r") as handle:
+            content = handle.read()
+        self.assertEqual(content, "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==\n")
+        self.assertEqual(stat.S_IMODE(os.stat(yo.known_hosts_path()).st_mode), 0o600)
+
+    def test_failed_fetch_raises_naming_the_cause(self):
+        self.write_config(LIMA_BLOCK)
+        proc = mock.Mock(returncode=255, stdout="", stderr="ssh: connect to host 127.0.0.1 port 60022: Connection refused\n")
+        with mock.patch.object(yo, "ssh_run", return_value=proc):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.ensure_guest_known_hosts()
+        self.assertIn("Connection refused", caught.exception.message)
+
+    def test_no_parseable_keys_raises(self):
+        self.write_config(LIMA_BLOCK)
+        proc = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(yo, "ssh_run", return_value=proc):
+            with self.assertRaises(yo.YoError):
+                yo.ensure_guest_known_hosts()
+
+
 class TestParsePairingUrl(unittest.TestCase):
     def test_accepts_loopback(self):
         url = "http://127.0.0.1:3773/?token=x"
@@ -647,6 +732,420 @@ class TestDiskGrowSize(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 yo.build_parser().parse_args(["disk-grow"])
         self.assertEqual(caught.exception.code, 2)
+
+
+AWS_CONFIG_TEXT = """[default]
+sso_start_url = https://example.awsapps.com/start
+region = eu-west-1
+
+[profile work]
+sso_session = my-sso
+region = us-east-1
+
+[profile legacy]
+aws_access_key_id = AKIA...
+
+[profile noregion]
+sso_start_url = https://example.awsapps.com/start
+
+[sso-session my-sso]
+sso_start_url = https://example.awsapps.com/start
+sso_region = us-east-1
+"""
+
+
+class TestAwsAllowlist(FakeHome):
+    def write_aws_config(self, text):
+        aws_dir = os.path.join(self.home, ".aws")
+        os.makedirs(aws_dir, exist_ok=True)
+        with open(os.path.join(aws_dir, "config"), "w") as handle:
+            handle.write(text)
+
+    def test_no_config_file_is_an_empty_allowlist(self):
+        self.assertEqual(yo.aws_allowlist(), [])
+
+    def test_default_and_sso_session_profiles_are_included(self):
+        self.write_aws_config(AWS_CONFIG_TEXT)
+        with mock.patch.object(yo, "err"):
+            allowed = yo.aws_allowlist()
+        self.assertIn(("default", "eu-west-1"), allowed)
+        self.assertIn(("work", "us-east-1"), allowed)
+
+    def test_sso_session_section_itself_is_excluded(self):
+        self.write_aws_config(AWS_CONFIG_TEXT)
+        with mock.patch.object(yo, "err"):
+            allowed = yo.aws_allowlist()
+        self.assertNotIn("my-sso", [name for name, _ in allowed])
+
+    def test_profile_without_sso_fields_is_excluded(self):
+        self.write_aws_config(AWS_CONFIG_TEXT)
+        with mock.patch.object(yo, "err"):
+            allowed = yo.aws_allowlist()
+        self.assertNotIn("legacy", [name for name, _ in allowed])
+
+    def test_profile_without_region_is_excluded_and_warned(self):
+        self.write_aws_config(AWS_CONFIG_TEXT)
+        with mock.patch.object(yo, "err") as fake_err:
+            allowed = yo.aws_allowlist()
+        self.assertNotIn("noregion", [name for name, _ in allowed])
+        messages = " ".join(call.args[0] for call in fake_err.call_args_list)
+        self.assertIn("noregion", messages)
+
+    def test_unparseable_config_raises_yoerror_naming_the_path(self):
+        config_path = os.path.join(self.home, ".aws", "config")
+        self.write_aws_config("[default]\n[default]\nregion = us-east-1\n")
+        with self.assertRaises(yo.YoError) as caught:
+            yo.aws_allowlist()
+        self.assertIn(config_path, caught.exception.message)
+
+    def test_unreadable_encoding_raises_yoerror_naming_the_path(self):
+        config_path = os.path.join(self.home, ".aws", "config")
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, "wb") as handle:
+            handle.write(b"[profile work]\nregion = \xff\xfe\nsso_start_url = x\n")
+        with self.assertRaises(yo.YoError) as caught:
+            yo.aws_allowlist()
+        self.assertIn(config_path, caught.exception.message)
+
+    def test_profile_name_with_shell_metacharacters_is_excluded_and_warned(self):
+        self.write_aws_config(
+            "[profile work; rm -rf /]\n"
+            "sso_start_url = https://example.awsapps.com/start\n"
+            "region = us-east-1\n"
+        )
+        with mock.patch.object(yo, "err") as fake_err:
+            allowed = yo.aws_allowlist()
+        self.assertEqual(allowed, [])
+        messages = " ".join(call.args[0] for call in fake_err.call_args_list)
+        self.assertIn("work; rm -rf /", messages)
+
+
+class TestOpProbeAlive(unittest.TestCase):
+    def proc(self, returncode, stdout=""):
+        return mock.Mock(returncode=returncode, stdout=stdout)
+
+    def test_exit_0_is_alive(self):
+        self.assertTrue(yo.op_probe_alive(self.proc(0, "2048 SHA256:... user@host (RSA)\n")))
+
+    def test_exit_1_no_identities_is_alive(self):
+        self.assertTrue(yo.op_probe_alive(self.proc(1, "The agent has no identities.\n")))
+
+    def test_exit_1_communication_failure_is_dead(self):
+        self.assertFalse(
+            yo.op_probe_alive(
+                self.proc(1, "error fetching identities: communication with agent failed\n")
+            )
+        )
+
+    def test_exit_2_is_dead(self):
+        self.assertFalse(yo.op_probe_alive(self.proc(2, "Could not open a connection to your authentication agent.\n")))
+
+
+class TestBrokerNeedsRestart(unittest.TestCase):
+    def test_no_health_needs_restart(self):
+        self.assertTrue(yo.broker_needs_restart(None, 123, ["work"]))
+
+    def test_matching_watch_pid_and_allowlist_does_not_restart(self):
+        health = {"pid": 1, "watch_pid": 123, "allow": ["work"]}
+        self.assertFalse(yo.broker_needs_restart(health, 123, ["work"]))
+
+    def test_stale_watch_pid_needs_restart(self):
+        health = {"pid": 1, "watch_pid": 999, "allow": ["work"]}
+        self.assertTrue(yo.broker_needs_restart(health, 123, ["work"]))
+
+    def test_allowlist_drift_needs_restart(self):
+        health = {"pid": 1, "watch_pid": 123, "allow": ["work"]}
+        self.assertTrue(yo.broker_needs_restart(health, 123, ["personal", "work"]))
+
+
+class TestEnsureAwsBrokerStaleBroker(FakeHome):
+    def test_kills_the_brokers_own_pid_not_the_watched_pid(self):
+        health = {"pid": 111, "watch_pid": 999, "allow": ["work"]}
+        killed = []
+        with mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"), mock.patch.object(
+            yo, "aws_allowlist", return_value=[("work", "us-east-1")]
+        ), mock.patch.object(yo, "ha_pid", return_value=555), mock.patch.object(
+            yo, "aws_broker_health", return_value=health
+        ), mock.patch.object(
+            yo, "wait_for_pid_exit"
+        ), mock.patch.object(
+            yo, "start_aws_broker"
+        ) as fake_start, mock.patch.object(
+            yo, "push_aws_guest_files"
+        ), mock.patch.object(
+            yo.os, "kill", side_effect=lambda pid, sig: killed.append(pid)
+        ):
+            result = yo.ensure_aws_broker()
+        self.assertTrue(result)
+        self.assertEqual(killed, [111])
+        fake_start.assert_called_once_with(555, ["work"])
+
+
+class TestEnsureAwsBrokerDisabling(FakeHome):
+    def test_no_aws_cli_stops_a_running_broker_and_clears_the_guest_config(self):
+        with mock.patch.object(yo.shutil, "which", return_value=None), mock.patch.object(
+            yo, "disable_aws_broker"
+        ) as fake_disable:
+            result = yo.ensure_aws_broker()
+        self.assertFalse(result)
+        fake_disable.assert_called_once_with()
+
+    def test_no_sso_profiles_stops_a_running_broker_and_clears_the_guest_config(self):
+        with mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"), mock.patch.object(
+            yo, "aws_allowlist", return_value=[]
+        ), mock.patch.object(yo, "disable_aws_broker") as fake_disable:
+            result = yo.ensure_aws_broker()
+        self.assertFalse(result)
+        fake_disable.assert_called_once_with()
+
+    def test_disable_kills_the_brokers_pid_and_removes_the_guest_config(self):
+        killed = []
+        removed = []
+
+        def fake_ssh_run(role, argv, **kwargs):
+            removed.append(list(argv))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(
+            yo, "aws_broker_health", return_value={"pid": 222, "watch_pid": 1, "allow": []}
+        ), mock.patch.object(
+            yo, "kill_stale_broker", side_effect=lambda pid: killed.append(pid)
+        ), mock.patch.object(
+            yo, "ssh_run", side_effect=fake_ssh_run
+        ):
+            yo.disable_aws_broker()
+        self.assertEqual(killed, [222])
+        self.assertEqual(removed, [["rm", "-f", yo.GUEST_AWS_CONFIG_PATH]])
+
+
+class TestGuestAwsConfigText(unittest.TestCase):
+    def test_renders_one_profile_section_per_entry(self):
+        text = yo.guest_aws_config_text([("work", "us-east-1")])
+        self.assertEqual(
+            text,
+            "[profile work]\n"
+            "region = us-east-1\n"
+            "credential_process = yolobox-guest aws-creds work\n",
+        )
+
+    def test_renders_every_entry_in_order(self):
+        text = yo.guest_aws_config_text([("a", "r1"), ("b", "r2")])
+        self.assertLess(text.index("[profile a]"), text.index("[profile b]"))
+
+
+class TestLimaConfigGaps(FakeHome):
+    def mock_lima_list(self, forwards, host_agent_pid=123):
+        payload = json.dumps({"hostAgentPID": host_agent_pid, "config": {"portForwards": forwards}})
+        return mock.patch.object(
+            yo, "run", return_value=mock.Mock(returncode=0, stdout=payload, stderr="")
+        )
+
+    def test_missing_instance_is_no_gaps(self):
+        with mock.patch.object(
+            yo, "run", return_value=mock.Mock(returncode=1, stdout="", stderr="no such instance")
+        ):
+            self.assertEqual(yo.lima_config_gaps(), [])
+
+    def test_present_reverse_rules_are_no_gaps(self):
+        forwards = [
+            {"guestSocket": yo.OP_GUEST_SOCK, "hostSocket": yo.op_sock(), "reverse": True},
+            {
+                "guestSocket": yo.AWS_BROKER_GUEST_SOCK,
+                "hostSocket": yo.aws_broker_sock(),
+                "reverse": True,
+            },
+        ]
+        with self.mock_lima_list(forwards):
+            self.assertEqual(yo.lima_config_gaps(), [])
+
+    def test_missing_reverse_rule_is_reported_not_raised(self):
+        with self.mock_lima_list([{"guestPort": 3773}]):
+            gaps = yo.lima_config_gaps()
+        self.assertEqual(set(gaps), {yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK})
+
+    def test_only_one_missing_rule_is_reported(self):
+        forwards = [{"guestSocket": yo.OP_GUEST_SOCK, "hostSocket": yo.op_sock(), "reverse": True}]
+        with self.mock_lima_list(forwards):
+            gaps = yo.lima_config_gaps()
+        self.assertEqual(gaps, [yo.AWS_BROKER_GUEST_SOCK])
+
+    def test_mismatched_host_socket_is_reported(self):
+        forwards = [
+            {"guestSocket": yo.OP_GUEST_SOCK, "hostSocket": "/somewhere/else.sock", "reverse": True},
+            {
+                "guestSocket": yo.AWS_BROKER_GUEST_SOCK,
+                "hostSocket": yo.aws_broker_sock(),
+                "reverse": True,
+            },
+        ]
+        with self.mock_lima_list(forwards):
+            gaps = yo.lima_config_gaps()
+        self.assertIn(yo.OP_GUEST_SOCK, gaps)
+
+    def test_reads_host_agent_pid_from_the_same_listing(self):
+        with self.mock_lima_list([], host_agent_pid=999):
+            self.assertEqual(yo.ha_pid(), 999)
+
+    def test_missing_instance_ha_pid_is_none(self):
+        with mock.patch.object(yo, "run", return_value=mock.Mock(returncode=1, stdout="", stderr="")):
+            self.assertIsNone(yo.ha_pid())
+
+
+class TestLimaConfigGapMessage(unittest.TestCase):
+    def test_names_the_full_array_migration_command(self):
+        message = yo.lima_config_gap_message([yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK])
+        self.assertIn(".portForwards = ", message)
+        self.assertIn(json.dumps(yo.LIMA_PORT_FORWARDS), message)
+        self.assertIn(yo.OP_GUEST_SOCK, message)
+        self.assertIn(yo.AWS_BROKER_GUEST_SOCK, message)
+
+
+class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
+    def test_a_gap_is_reported_on_stderr_and_the_vm_still_comes_up(self):
+        with mock.patch.object(yo, "lima_config_gaps", return_value=[yo.OP_GUEST_SOCK]), mock.patch.object(
+            yo, "run", return_value=mock.Mock(returncode=0, stdout="yolobox\n", stderr="")
+        ), mock.patch.object(yo, "ensure_agent_ssh_config"), mock.patch.object(
+            yo, "vm_services"
+        ) as fake_services, mock.patch.object(yo, "err") as fake_err:
+            yo.vm_up()
+        message = " ".join(call.args[0] for call in fake_err.call_args_list)
+        self.assertIn(yo.OP_GUEST_SOCK, message)
+        fake_services.assert_called_once_with()
+
+    def test_no_gaps_prints_nothing_about_lima_config(self):
+        with mock.patch.object(yo, "lima_config_gaps", return_value=[]), mock.patch.object(
+            yo, "run", return_value=mock.Mock(returncode=0, stdout="yolobox\n", stderr="")
+        ), mock.patch.object(yo, "ensure_agent_ssh_config"), mock.patch.object(
+            yo, "vm_services"
+        ), mock.patch.object(yo, "err") as fake_err:
+            yo.vm_up()
+        fake_err.assert_not_called()
+
+
+class TestHerdrMachineExists(unittest.TestCase):
+    def test_empty_listing_is_false(self):
+        self.assertFalse(yo.herdr_machine_exists("[]"))
+
+    def test_matching_target_field_is_true(self):
+        self.assertTrue(
+            yo.herdr_machine_exists(
+                '[{"id": "1", "label": "yolobox", "target": "yolobox", '
+                '"session": null, "enabled": true}]'
+            )
+        )
+
+    def test_unrelated_target_is_false(self):
+        self.assertFalse(yo.herdr_machine_exists('[{"target": "other-box"}]'))
+
+    def test_yolobox_value_outside_the_target_field_is_not_a_match(self):
+        # Locks in the fix for a hidden failure: the old implementation matched
+        # "yolobox" anywhere in an entry, so a machine merely *labelled*
+        # yolobox but pointed at a different ssh target read as already added.
+        self.assertFalse(yo.herdr_machine_exists('[{"label": "yolobox", "target": "other-box"}]'))
+
+    def test_unparseable_json_raises(self):
+        with self.assertRaises(yo.YoError):
+            yo.herdr_machine_exists("not json")
+
+    def test_non_array_json_raises(self):
+        with self.assertRaises(yo.YoError):
+            yo.herdr_machine_exists('{"target": "yolobox"}')
+
+
+def yaml_scalar(value):
+    value = value.strip().strip('"')
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if value.isdigit():
+        return int(value)
+    return value
+
+
+def portforwards_yaml_block(text):
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.rstrip() == "portForwards:":
+            start = i + 1
+            break
+    if start is None:
+        return []
+    end = len(lines)
+    for i in range(start, len(lines)):
+        line = lines[i]
+        if line.strip() and not line[0].isspace():
+            end = i
+            break
+    return lines[start:end]
+
+
+def parse_yaml_list_entries(lines):
+    entries = []
+    current = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            if current is not None:
+                entries.append(current)
+            current = {}
+            stripped = stripped[2:].strip()
+        if current is None or not stripped or ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        current[key.strip()] = yaml_scalar(value)
+    if current is not None:
+        entries.append(current)
+    return entries
+
+
+def canonical_forwards(entries):
+    return sorted(json.dumps(entry, sort_keys=True) for entry in entries)
+
+
+class TestLimaYamlMatchesPortForwardsConstant(unittest.TestCase):
+    def test_full_port_forwards_match_lima_port_forwards_constant(self):
+        yaml_path = Path(yo.__file__).parent / "lima" / "yolobox.yaml"
+        parsed = parse_yaml_list_entries(portforwards_yaml_block(yaml_path.read_text()))
+        self.assertEqual(canonical_forwards(parsed), canonical_forwards(yo.LIMA_PORT_FORWARDS))
+
+
+class TestAgentEnvMatchesYoSockets(unittest.TestCase):
+    def test_agent_side_aws_broker_socket_matches_agent_env_nix(self):
+        nix_path = Path(yo.__file__).parent / "nix" / "lib" / "agent-env.nix"
+        text = nix_path.read_text()
+        self.assertIn(yo.AGENT_AWS_BROKER_SOCK, text)
+
+    def test_guest_aws_config_path_matches_agent_env_nix(self):
+        nix_path = Path(yo.__file__).parent / "nix" / "lib" / "agent-env.nix"
+        text = nix_path.read_text()
+        suffix = yo.GUEST_AWS_CONFIG_PATH[len(yo.AGENT_HOME) :]
+        self.assertEqual(yo.AGENT_HOME, "/home/agent")
+        self.assertIn('"${agentHome}%s"' % suffix, text)
+
+
+class TestBaseNixMatchesYoConstants(unittest.TestCase):
+    def base_nix_text(self):
+        return (Path(yo.__file__).parent / "nix" / "base.nix").read_text()
+
+    def test_op_and_aws_broker_guest_sockets_compose_from_base_nix(self):
+        text = self.base_nix_text()
+        op_dir = "/run/yolobox-op"
+        self.assertIn(op_dir, text)
+        for guest_sock in (yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK):
+            self.assertTrue(guest_sock.startswith(op_dir + "/"))
+            target = guest_sock[len(op_dir + "/") :]
+            self.assertIn('"%s"' % target, text)
+
+    def test_proxy_socket_unit_names_appear_in_base_nix(self):
+        text = self.base_nix_text()
+        for unit in yo.PROXY_SOCKET_UNITS:
+            self.assertTrue(unit.endswith(".socket"))
+            name = unit[: -len(".socket")]
+            self.assertIn(name, text)
 
 
 if __name__ == "__main__":

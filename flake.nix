@@ -63,8 +63,8 @@
           # published linux-aarch64 asset is statically linked (no PT_INTERP,
           # no PT_DYNAMIC), so it runs here unpatched.
           { yolobox.harness.herdr = {
-              version = "0.9.0";
-              hash = "sha256-nI2yD7fnQnsTjVNnET8WIf/TGfL2XW8AniWUApEV8NI=";
+              version = "0.9.1";
+              hash = "sha256-9Mz03nRfLLmjmpg+m6NwPa1Q7CpY3qgwJs6rchu9jZ4=";
             };
           }
           nixos-lima.nixosModules.lima

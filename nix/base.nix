@@ -1,4 +1,37 @@
 { config, pkgs, modulesPath, username, agentUser, lib, version, ... }:
+let
+  agentEnv = import ./lib/agent-env.nix {
+    agentHome = config.users.users.${agentUser}.home;
+  };
+
+  opProxy = { name, listen, target }: {
+    systemd.sockets.${name} = {
+      description = "Agent-owned socket proxied to the operator's ${name} forward";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = listen;
+        SocketUser = agentUser;
+        SocketGroup = "users";
+        SocketMode = "0600";
+      };
+    };
+    systemd.services.${name} = {
+      description = "Proxy the ${name} socket to its operator-owned forward";
+      requires = [ "${name}.socket" ];
+      after = [ "${name}.socket" ];
+      serviceConfig = {
+        User = username;
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ExecStart = "${config.systemd.package}/lib/systemd/systemd-socket-proxyd /run/yolobox-op/${target}";
+      };
+    };
+  };
+  opProxies = map opProxy [
+    { name = "yolobox-op-agent"; listen = agentEnv.env.SSH_AUTH_SOCK; target = "agent.sock"; }
+    { name = "yolobox-aws-broker"; listen = agentEnv.awsBrokerSock; target = "aws-broker.sock"; }
+  ];
+in
 {
   # Lets someone drop a package or setting into the running box without a
   # checkout or push: the guest no longer carries a copy of this repo, so
@@ -6,7 +39,8 @@
   # replacement.
   imports = [
     (modulesPath + "/profiles/qemu-guest.nix")
-  ] ++ lib.optional (builtins.pathExists /etc/yolobox/local.nix) /etc/yolobox/local.nix;
+  ] ++ lib.optional (builtins.pathExists /etc/yolobox/local.nix) /etc/yolobox/local.nix
+    ++ opProxies;
 
   # /boot is the ESP itself, as the shipped nixos-lima image mounts it —
   # matching the image is what keeps the first `nixos-rebuild switch` on a
@@ -131,11 +165,6 @@
 
   services.openssh.enable = true;
   services.openssh.settings = {
-    AcceptEnv = [
-      "AWS_CONTAINER_CREDENTIALS_FULL_URI"
-      "AWS_CONTAINER_AUTHORIZATION_TOKEN"
-      "AWS_REGION"
-    ];
     PasswordAuthentication = false;
     PermitRootLogin = "prohibit-password";
   };
@@ -163,10 +192,19 @@
       AuthorizedKeysCommandUser root
   '';
 
-  # The harnesses install themselves into the agent's ~/.local/bin (see
-  # nix/harnesses.nix). The dotfiles prepend it for interactive shells only,
-  # and t3 spawns neither a login nor an interactive shell.
+  systemd.tmpfiles.rules = [
+    "d /run/yolobox-op 0700 ${username} users -"
+  ];
+
   environment.localBinInPath = true;
+
+  environment.extraInit = ''
+    if [ "$(id -un)" = ${lib.escapeShellArg agentUser} ]; then
+      ${lib.concatStringsSep "\n" (lib.mapAttrsToList
+        (name: value: "export ${name}=${lib.escapeShellArg value}")
+        agentEnv.env)}
+    fi
+  '';
 
   security.sudo.wheelNeedsPassword = false;
   programs.zsh.enable = true;

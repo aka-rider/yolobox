@@ -27,6 +27,9 @@ rules this file justifies.
   shares with `nix/herd-server.nix`.
 - `nix/herd-server.nix` — the VM's own herdr server, run as the agent
   account from boot.
+- `nix/lib/agent-env.nix` — the one attrset declaring the agent's
+  environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`), applied identically to
+  the herdr server, t3 and every agent login shell.
 - `nix/display.nix` — the virtual X display, browsers, screen recording.
 - `nix/lsp.nix` — the Python language-server wiring for every editor.
 - `nix/t3.nix`, `nix/pkgs/t3.nix` — t3code built from npm and run as a
@@ -174,11 +177,15 @@ until then.
 
 This narrows what an agent can do, but it does not "isolate" or "contain"
 it, and this file would be lying if it said otherwise. Left untouched by
-the split: the forwarded 1Password agent still lets an agent session
-authenticate to GitHub as the operator during any `yo enter`; the AWS
-broker still hands out real credentials whenever `YOLOBOX_AWS_PROFILE` is
-set, by design; every commit an agent makes still rides the git push
-channel back to the Mac, where the operator is the one who builds and
+the split: 1Password is reachable by every agent session for as long as
+the VM runs, not merely during one `yo enter` — the reverse socket forward
+lives with lima's hostagent, not with any one pane, so any process in the
+VM can authenticate to GitHub as the operator (see "SSH identities and the
+two GitHub accounts" below); the AWS broker likewise hands out real
+credentials for every allow-listed SSO profile to any process that asks,
+by design, not only for the duration of a session that opted in; every
+commit an agent makes still rides the git push channel back to the Mac,
+where the operator is the one who builds and
 runs what it wrote; rootless podman's containment still rests on the
 kernel's unprivileged user-namespace support holding, so a kernel exploit
 reaches exactly as far as it did before; anything an agent leaves under
@@ -197,28 +204,168 @@ limactl 2.2.0. v1 of yolobox, the Docker-based predecessor, lives at commit
 
 ## SSH identities and the two GitHub accounts
 
-`ForwardAgent yes` forwards `$SSH_AUTH_SOCK`, which on this Mac is Apple's
-launchd agent holding nothing; the real keys live in 1Password. So `yo`
-hands `ForwardAgent` the 1Password socket path itself, and only `yo enter`
-and `yo ssh` ever request it — each over its own `ControlPath=none`
-connection, never a shared, persistent `ControlMaster`. So the forward is
-scoped to that one interactive session: it dies with the pane, `yo
-code`/`yo zed`/a bare `ssh lima-yolobox` never inherit it, and the old `-O
-exit` dance to un-stick a forward stuck on a shared master no longer
-applies — the forward never rides a shared master to begin with.
+1Password is available to every agent session for as long as the VM
+runs, not only inside the one pane that happened to start it. Lima itself
+carries the forward now: `lima/yolobox.yaml`'s `portForwards` declares a
+reverse unix-socket rule, `{guestSocket: /run/yolobox-op/agent.sock,
+hostSocket: "<1Password's agent.sock>", reverse: true}`, alongside the t3
+and dhcp rules and a sibling reverse rule for the AWS broker's own socket
+(see "AWS credentials" below; `CONSTITUTION.md`'s "ALWAYS treat
+`lima/yolobox.yaml` as read once" already covers restating this array in
+full on an existing instance). Lima's hostagent dials that socket itself,
+once, at every `limactl start`/`yo up`, over its own ssh master, as the
+operator — no `yo` command has to be running, and no pane has to stay
+open, for the forward to exist.
 
-That scoping is also why `ForwardAgent` deliberately does not go into
-`~/.lima/yolobox/ssh.config`, the file `yo` writes and re-applies (see
-"Two accounts" above). `yo` runs all of its own ssh with `-F
-~/.lima/yolobox/ssh.config`, so a `ForwardAgent yes` sitting in that file
-would hand the 1Password agent to `yo code`, `yo zed` and every
-t3-spawned session too — exactly the scoping this section just described
-as deliberate. A `Host lima-yolobox` / `ForwardAgent yes` block sitting in
-`~/.ssh/config` instead is in any case a no-op on this Mac: `SSH_AUTH_SOCK`
-points at Apple's launchd agent, and `ssh-add -l` against it reports "The
-agent has no identities" — the real keys live in 1Password, which is why
-`yo enter` and `yo ssh` pass `-o ForwardAgent="<1Password socket>"` per
-connection instead of relying on any config file to carry it.
+`nix/base.nix` gives it somewhere to land before lima ever tries: a
+tmpfiles rule, `d /run/yolobox-op 0700 ${username} users -`, runs through
+`systemd-tmpfiles-setup` before `sysinit.target`, well ahead of sshd and
+lima's own forward, and `-resetup` recreates it on every `switch` too.
+Verified directly against the running VM: lima's hostagent runs `rm -f
+/run/yolobox-op/agent.sock` and then `ssh -O forward -R
+/run/yolobox-op/agent.sock:<1Password socket> lima-yolobox` over its own
+master exactly once, at hostagent start; a failure there is only logged,
+nothing retries it, and nixos-lima's `lima-init` never runs lima's own
+`/run/host-services` boot script, so — unlike a stock lima guest — nothing
+else creates that directory either. The socket lands owned by the
+operator, mode 0600 (`StreamLocalBindMask 0177`), because lima's hostagent
+connects as `${username}`.
+
+The agent cannot reach an operator-owned socket directly, so
+`nix/base.nix` proxies it: `systemd.sockets.yolobox-op-agent` listens on
+`/run/yolobox/op-agent.sock` with `SocketUser=agent`, `SocketMode=0600`,
+wanted by `sockets.target`, so the agent-facing socket exists from boot
+with no window where it is missing or wrongly permissioned; the matching
+service execs `systemd-socket-proxyd /run/yolobox-op/agent.sock` as the
+**operator** (`User=${username}`, never root), since the operator is the
+account that can already read the target. `nix/lib/agent-env.nix` is the
+one place that then points the agent at it —
+`SSH_AUTH_SOCK=/run/yolobox/op-agent.sock` — applied identically to the
+herdr server, t3, and every agent login shell (see "Where things live" and
+"AWS credentials" below), so a real 1Password socket is simply what
+`SSH_AUTH_SOCK` already resolves to everywhere an agent session starts.
+`cmd_enter` arranges no forward of its own any more; landing in the guest
+is the whole of what it does here.
+
+`ForwardAgent` itself never goes into `~/.lima/yolobox/ssh.config`, the
+file every `yo`-spawned ssh connection reads via `-F` (see "Two accounts"
+above): that file is shared by every ssh role `yo` spawns, so a
+`ForwardAgent` sitting there would reach `yo code`, `yo zed` and every
+t3-spawned session too, not only the one command that asked for it. `yo
+ssh`, the operator's own bare shell, is the one command left that still
+forwards `ForwardAgent` per session — the 1Password socket path itself,
+since the default forwards `$SSH_AUTH_SOCK`, Apple's launchd agent holding
+nothing on this Mac — and only over its own `ControlPath=none` connection,
+so that forward dies with the one pane that opened it rather than riding
+a shared master into a session that never asked to carry it.
+
+Because lima never re-establishes its side of a reverse forward — a
+failure is logged once, at hostagent start, and nothing about it retries
+— `yo` heals every reverse forward itself, 1Password's and the AWS
+broker's alike (see "AWS credentials" below), through one mechanism
+rather than one hand-written probe per socket. A `ReverseForward`
+dataclass names each one — a label, the guest path, the Mac-side path, a
+probe command run as the agent, and an `alive(proc)` callable — and two
+constructors build the two instances: `one_password_forward()` (`ssh-add
+-l`, judged by `op_probe_alive`) and `aws_broker_forward()` (`curl
+--unix-socket /run/yolobox/aws-broker.sock http://broker/health`, alive on
+exit 0 alone).
+
+`op_probe_alive` is not "alive on exit 0 or 1" — ssh-add exits 1 for two
+different reasons that must not be conflated. Alive is exit 0, or exit 1
+*with* "The agent has no identities" in stdout — a reachable agent that
+simply holds no keys yet. A **dead** forward also exits 1, but with
+"communication with agent failed" instead, because the agent-side systemd
+socket (`yolobox-op-agent.socket`) always accepts the connection whether
+or not lima's forward and the Mac's own agent are alive behind it — the
+`accept()` succeeds and only the SSH-agent protocol exchange after it
+fails, so the exit code alone cannot tell the two apart and the exact
+stdout wording is load-bearing. Recognise a dead 1Password forward by
+that wording, not by ssh-add's exit code. `yo status` runs this exact same
+`op_probe_alive` check on the same probe, not a re-implementation of it,
+so the two can never quietly disagree about what counts as "up".
+
+`heal_reverse_forward()` probes one entry as the agent first and, only on
+a dead probe, re-issues exactly what lima's hostagent would have, over
+the operator's own `ssh_base(OPERATOR, mux=True)` connection: `-O cancel`
+first (its failure tolerated — there may be no live master, or no forward
+registered on it yet, to cancel), then a plain `rm -f <guest path>` (not
+an `-O` control command, so — via `ControlMaster auto` in lima's own ssh
+config for `Host lima-yolobox` — issuing it is also what revives the
+master if it had died), then `-O forward -R <guest path>:<host path>` —
+before probing again and raising a `YoError` naming `limactl stop yolobox
+&& yo up` if it still refuses.
+
+`ensure_op_forward(aws_enabled)` runs this per forward through
+`heal_forward_collecting_errors()`, which also catches a `YoError` raised
+out of `heal_reverse_forward()` itself (e.g. the final `-O forward`
+failing outright) and appends it rather than letting it escape uncaught —
+one forward's hard failure must not abort the other's healing. The two
+services are independent and optional, not one bundled decision: a
+missing Mac-side 1Password socket (1Password simply not running) is only
+a stderr note, never an error, and 1Password's heal is skipped for that
+reason alone — never because AWS happens to be disabled. The AWS broker's
+heal runs only when `aws_enabled` is true, i.e. only once
+`ensure_aws_broker()` has itself started (or found already running) a
+broker that answered its handshake. Failures from `ensure_aws_broker()`
+and from either forward are collected into one list and raised together,
+once, at the end, naming `limactl stop yolobox && yo up` as the recreate.
+
+`vm_services()` decides whether any of this can even run before trying.
+`account_status()` runs first: a status of `"unreachable"` — the operator
+account itself cannot be ssh'd into, so the VM is not up at all — is a
+stderr note and a return, nothing further attempted. Being reachable as
+at least the operator is not enough on its own: `vm_units_present()` then
+runs `systemctl cat yolobox-op-agent.socket` in the VM, and a box that
+predates the proxy socket units answers with a nonzero exit — in which
+case `vm_services()` prints `UNITS_MISSING_NOTE` ("box predates the
+1Password/AWS forwards; run `yo bootstrap`") and returns. This replaces an
+earlier design that gated the same skip on whether the *agent account*
+itself was reachable yet: the real gate is the systemd units' presence,
+not the account, since an older box's agent account can be perfectly
+reachable while still lacking these units entirely. Past both checks,
+`ensure_aws_broker()` runs first and then `ensure_op_forward()`, as
+above.
+
+`vm_services()` runs at the end of `vm_up()` by default (reached by
+`cmd_up` and `cmd_disk_grow`). `cmd_bootstrap` does not take that default:
+it calls `vm_up(run_services=False)`, because at that point in a fresh
+bootstrap the proxy units may not exist yet and the nixos-rebuild that
+creates the agent account may not have landed — then, once the
+rebuild/reboot decision has fully settled (whether or not that needed a
+`limactl restart`), it calls `vm_services()` itself exactly once, never
+twice. `yo status` on a box with the proxy units prints the 1Password
+probe status and the proxy socket unit statuses; on an older box without
+them prints `UNITS_MISSING_NOTE`. It always prints a lima line from
+`lima_config_gaps()`, and catches `YoError` from `aws_allowlist()` to
+print "aws: config unreadable: ..." when the AWS config cannot be read.
+
+`lima_config_gaps()` is the other half of keeping the two in sync, and it
+no longer refuses anything. Before ever starting the VM, `vm_up()` asks
+`limactl list yolobox --json` for the running instance's own
+`config.portForwards` — never a text search of `lima/yolobox.yaml`
+itself, which is only ever read once, at creation (see "The VM" section
+of `CONSTITUTION.md`) — and looks, for each of `OP_GUEST_SOCK` and
+`AWS_BROKER_GUEST_SOCK`, for some entry whose `guestSocket`, `hostSocket`
+and `reverse: true` all match. A gap here used to abort `vm_up()`
+outright; now `lima_config_gap_message()` is only a stderr note, naming
+the full `LIMA_PORT_FORWARDS` array (the very constant `yo` renders for a
+brand-new instance) as the exact `limactl edit --set '.portForwards =
+...'` argument to restate, and `vm_up()` carries on regardless. It can
+afford to, because the gap this check reports is only that *lima itself*
+has no declared rule to re-establish the forward at the next hostagent
+start — `heal_reverse_forward()` (above) adds the forward over lima's own
+live ssh master with a bare `-O forward -R <guest>:<host>`, which needs no
+matching entry in lima's `portForwards` array at all, so the forward
+still comes up this session either way. The restated array is what makes
+that permanent — it survives the next hostagent restart with no `yo`
+needed to heal it again — not a precondition for the forward working
+right now. No instance at all (`limactl list` itself failing) prints
+nothing, since a brand-new box has no gap to report; the check exists for
+an instance created before a rule existed, exactly the migration
+README.md describes: a box whose forwards still carry only the t3, dhcp
+and 1Password rules because the AWS broker's rule did not exist yet when
+that instance was first created.
 
 Two GitHub accounts share `github.com`, so the account is chosen by which
 key is offered. The Mac does that with a `Host github-iurii-tech` alias
@@ -245,19 +392,6 @@ How to recognise the class: `ssh -T git@github.com` and `ssh -T
 git@github-iurii-tech` in the VM must greet two different names. "Could
 not resolve hostname" means the ssh config never arrived; the wrong name
 means the public keys did not.
-
-`SendEnv` is another value that must never ride a shared `ControlMaster`.
-Measured 2026-09-04 against the running box, same connection, only the
-`ControlPath` differing: over `~/.lima/yolobox/ssh-agent.sock` the guest
-saw none of the forwarded variables (`YOLOBOX_HERD`, `HERDR_PANE_ID`,
-`HERDR_SOCKET_PATH` in that test); with `ControlPath=none` all three
-arrived. The mux drops it with no error anywhere — the `-R` socket forward
-still works over the same shared connection, so the session looks wired:
-the socket appears in `/run/yolobox`, the reporter runs, sees none of its
-env, and exits 0 without logging. `ssh_run` now refuses to combine
-`mux=True` with any `SendEnv` option, rather than let the next caller who
-adds one to a multiplexed call rediscover this by watching a report vanish
-silently.
 
 ## The mirror: how a Mac path becomes a guest path
 
@@ -437,7 +571,11 @@ account per subcommand: `projects`, `home-roots`, `landing-dir`,
 `ensure-repo`, `gc-user` and `aws-check` run as the agent; `generations`
 and `gc-machine` run as the operator, because ext4's root reserve — the
 thing that makes any of this recoverable on a genuinely full disk — is the
-operator's alone.
+operator's alone. `pick-project` is the one subcommand nothing on the Mac
+ever calls: it backs the guest-only `yo enter [fuzzy]` shell function (see
+"herdr: the VM runs its own server, panes are real ptys" above), invoked
+locally from inside the VM, and it is deliberately layered on top of
+`projects` rather than re-walking `$HOME` itself.
 
 `BUILD_DIRS` (`node_modules`, `target`, `.next`) is the single place
 build-output directory names are spelled, inside the guest script. The
@@ -888,18 +1026,81 @@ The VM now runs its own herdr server as the `agent` account —
 account's existing lingering (see "The harnesses come from their
 vendors" below for why lingering matters there too). Panes opened
 against that server are real ptys, so herdr detects an agent inside them
-natively, the same way it detects one on the Mac. `yo enter` forwards no
-socket and sets no herd env any more; landing in the guest is now the
-whole of what it does for herdr. Reporting no longer rides `yo enter`
-alone either: any session that is a real pty on the guest server is
-visible — `yo ssh`, `yo code`, `yo zed` and t3-spawned agents still show
-as `unknown`, because none of them opens a pty on the herdr server
-itself.
+natively, the same way it detects one on the Mac.
+
+Agents run in herdr's own **machine panes**, not in `yo enter`. `yo
+enter` stays a plain landing shell — `ssh -t … exec $SHELL -l`, nothing
+herdr-aware about it at all — and a session started there is invisible to
+herdr, the same as `yo ssh`, `yo code`, `yo zed` and every t3-spawned
+agent: none of them opens a pty on the guest herdr server itself, so all
+of them show as `unknown` or nothing at all. The place to run an agent is
+a workspace opened on the saved `yolobox` machine (below), because that
+pane really is a pty on the VM's own server. `cmd_enter` knows this and
+says so: when `HERDR_ENV=1` — meaning the command itself is running
+inside a herdr pane already — it prints on stderr that an agent started
+here would be invisible, and names the `yolobox` machine as where to open
+a workspace, and to run `yo enter` there.
+
+That `yo enter` is a second, guest-side thing, strictly separate from the
+Mac's own `yo` — no cross-machine magic, nothing rides ssh back out to
+the Mac. Once inside a workspace on the `yolobox` machine, `yo enter
+[fuzzy]` is a shell function, defined only for the `agent` account
+(`environment.interactiveShellInit` in `nix/guest.nix`, guarded the same
+`[ "$(id -un)" = agent ]` way `environment.extraInit` already is in
+`nix/base.nix`; the operator's own shell never gets it, so `yo up` / `yo
+ssh` keep meaning "run this on the Mac" there). It has to be a function
+and not a script: `cd` only changes the process that runs it, so a script
+`exec`ing into a project directory would land the picked directory on a
+child process and lose it the moment that process exits — a shell
+function's `cd` is the caller's own. With no argument it lands at
+`$HOME`; with a query it hands off to a new guest-only subcommand,
+`yolobox-guest pick-project`, which runs the exact same walk `projects`
+already does — never a second, re-spelled `find` — and picks among the
+results with `fzf --select-1 --exit-0`, printing a "no project matches"
+notice on stderr the same way the Mac's own `pick_project` does when the
+query matches nothing. Any other `yo` invocation inside the guest —
+`yo status`, `yo up`, bare `yo` — refuses outright, naming `yo enter
+[fuzzy]` as the only thing that exists there and pointing at the Mac for
+everything else; nothing in the guest may grow a second Mac-only
+subcommand this way; reaching a real `yo` from inside the VM needs
+`limactl`, which the guest does not have. `pkgs.fzf` had to be added to
+`yolobox-guest`'s own `runtimeInputs` for this — `writeShellApplication`
+prefixes its script's `PATH` from that list rather than trusting whatever
+is already on the ambient one, the same reason `git` and `curl` are
+listed there despite already living in `environment.systemPackages`.
+
+One fzf-specific wart, already worked around: `yolobox-guest pick-project`
+captures fzf's picked line through a plain `$(...)`, which can never hold
+an embedded NUL byte — bash silently drops one, but logs "warning:
+command substitution: ignored null byte in input" doing it. The Mac's own
+`pick_project` needs `--read0`/`--print0` because it may hand back many
+NUL-safe entries at once to Python, which has no such limit; the guest
+picker only ever needs the one line fzf already chose, so it drops both
+flags entirely rather than eat that warning on every single pick.
+
+**The regression this design fixes, and how to recognise it if it comes
+back.** `d3fe9ff` ("herdr v0.9 supports cross-machine connections
+natively") removed `yo enter`'s old forwarding of the Mac pane's herdr
+socket, on the theory that native machine panes already made it
+unnecessary — but nothing yet moved agents into those panes, so the
+removal shipped with no replacement. The shape it produced: `herdr
+machine list` on the Mac came back empty, because nothing had ever run
+`herdr machine add` to adopt the VM's server; inside the VM, `herdr pane
+list` was empty too even with `pi` plainly running, because its
+foreground process sat directly under `sshd` — `yo enter`'s own session —
+never under a pty the guest herdr server had opened, and carried none of
+`HERDR_ENV`/`HERDR_PANE_ID`/`HERDR_SOCKET_PATH`, the env a real herdr pane
+gets for free. From the Mac side an agent running exactly this way just
+looked permanently idle, with no error anywhere to point at the cause.
 
 The Mac attaches to the guest server as a saved SSH **machine**, adopted
 rather than started: `herdr machine add <alias> --label yolobox` checks
 the running server's capabilities, never its process ancestry, so the
 systemd unit and `machine add` never fight over who owns the process.
+`yo bootstrap` does this for you now — `ensure_herdr_machine()`, run at
+its end, checks `herdr machine list --json` for an entry whose SSH target
+is `yolobox` and, finding none, runs `herdr machine add yolobox --label
+yolobox` itself, raising on a non-zero exit with herdr's own stderr.
 Adoption is also why keeping `herdrPkg` in `environment.systemPackages`
 (`nix/harnesses.nix`) is load-bearing rather than incidental: `machine
 add` installs its own binary into `~/.local/bin/herdr` only when no
@@ -922,8 +1123,8 @@ the old rule, exact version equality between the two, was strictly finer
 than what compatibility actually needs.
 
 The VM's herdr is pinned regardless, through the existing
-`yolobox.harness.herdr.version`/`.hash` valve in `flake.nix` — to 0.9.0,
-because the pinned nixpkgs still carries 0.8.2, and taking 0.9.0 from
+`yolobox.harness.herdr.version`/`.hash` valve in `flake.nix` — to 0.9.1,
+because the pinned nixpkgs still carries 0.8.2, and taking 0.9.1 from
 nixpkgs would have dragged a whole nixpkgs move, a new kernel included,
 onto a 249 MiB ESP that already holds exactly one kernel set (see "The
 ESP is 249 MiB" below). The pin fetches the published
@@ -982,6 +1183,40 @@ switch" below) reapplies `r` rules on every switch, not just once, so the
 rule would silently un-install the integration on the very next switch —
 and the symptom, pi missing from the herd with no error anywhere, would
 look exactly like the integration never having installed at all.
+
+`yolobox-harness-install` used to guard the install with
+`[ -f ~/.pi/agent/extensions/herdr-agent-state.ts ]`, so once the file
+existed it was never touched again — the herdr 0.9.0 → 0.9.1 bump moved
+the integration from v8 to v9, and a box installed before that bump kept
+running v8 forever, silently, with `herdr integration status` reporting
+`pi: outdated` the whole time and nothing reading that output. The guard
+is now `herdr integration status | grep -q '^pi: current' ||
+herdr integration install pi`, so a version bump is picked up on the next
+run of the install service rather than needing the extensions file
+deleted by hand.
+
+`herdr machine add yolobox --label yolobox` (`yo bootstrap`'s
+`ensure_herdr_machine`) can fail loudly with "No ED25519 host key is known
+for [127.0.0.1]:60022 and you have requested strict checking. Host key
+verification failed." herdr runs system ssh through its own generated
+config, which `Include`s `~/.ssh/config`, which `Include`s
+`~/.lima/yolobox/ssh.config` where yo's `Host yolobox` alias lives — but
+for every saved machine herdr also appends `-o StrictHostKeyChecking=yes`
+on the ssh command line itself
+(`apply_noninteractive_ssh_options` in herdr's `src/remote/attach.rs`),
+and a command-line option always outranks the same keyword set inside a
+`-F` config file. So the alias cannot fix this by relaxing checking: it
+used to carry `StrictHostKeyChecking no` paired with `UserKnownHostsFile
+/dev/null`, and herdr's own `yes` silently overrode the `no` while the
+`/dev/null` guaranteed no key could ever be known — strict checking could
+never pass, by construction. The alias now pins the real key instead:
+`UserKnownHostsFile` points at a yo-owned file,
+`~/.lima/yolobox/known_hosts`, which `ensure_guest_known_hosts` populates
+from the guest's own `/etc/ssh/ssh_host_*_key.pub`, fetched over the
+operator's already-trusted lima connection — never a channel that itself
+needs the key it is trying to learn. It runs from `vm_up` right after
+`limactl start` and again from `cmd_bootstrap` just before
+`ensure_herdr_machine`, since a recreated VM has new host keys.
 
 ## The harnesses come from their vendors; the box owns `~/.local/bin/claude`
 
@@ -1290,118 +1525,205 @@ On macOS a non-root process cannot bind `127.0.0.1:80` but can bind
 in a listener that drops any non-loopback peer after the handshake. Not
 exposure. The real cost: nothing else on the Mac can bind 80 or 443.
 
-## AWS credentials ride `yo enter` through a host-side broker, never guest disk
+## AWS credentials: a per-profile broker, selected per process by `AWS_PROFILE`
 
-AWS access is opt-in: set `YOLOBOX_AWS_PROFILE` to a host AWS CLI profile
-before `yo enter`. v1 minted STS creds once, at enter time, and froze them
-in the guest session's flat env (`AWS_ACCESS_KEY_ID` /
+AWS access is no longer opt-in per `yo enter`, and no longer one profile
+switched mid-session. v1 minted STS creds once, at enter time, and froze
+them in the guest session's flat env (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) — a session outliving the
-STS duration (an hour, for this SSO) needed a fresh `yo enter`. v2 replaces
-that with botocore's **container credential provider**: `start_aws_broker`
-in `yo` starts `aws-broker` (repo root, `#!/usr/bin/env python3`, stdlib
-only) on the Mac for that one pane, and the guest gets a loopback URL plus a
-bearer token instead of the credentials themselves. The guest CLI calls back
-to the broker for every request; the broker re-runs
-`aws configure export-credentials --profile "$YOLOBOX_AWS_PROFILE" --format
-process` shortly before the cached creds expire. An SSO re-auth on the Mac
-(`aws sso login`) heals a running guest session with no re-enter — the
-broker's next re-mint just succeeds again.
+STS duration needed a fresh `yo enter`. v2 kept a broker but still bound
+it to one profile per pane, forwarded in as botocore's container
+credential provider — a bearer token plus a URL, reached over a
+per-session TCP `-R` to the guest's gateway address. The current design
+makes every allow-listed profile available everywhere the VM runs
+instead, lets each process pick its own with an ordinary
+`AWS_PROFILE=<name>`, and — after a live test found the gateway-address
+TCP path itself fragile under a VPN (see "Why a reverse unix socket, not
+a forwarded TCP port" below) — reaches the broker the same way the agent
+already reaches 1Password: a reverse unix-socket forward that rides
+lima's own ssh connection, healed by the same mechanism (see "SSH
+identities and the two GitHub accounts" above), never a TCP port of its
+own.
 
-Flat env-var forwarding is gone from `yo` entirely, not merely unused:
-botocore's credential provider chain ranks explicit `AWS_ACCESS_KEY_ID` env
-vars above the container provider, so if `yo` still exported the frozen v1
-vars alongside the broker's URL, they would win and silently defeat every
-refresh — the guest would look wired up and would in fact be back to v1's
-one-hour cliff. So the region resolution in `yo` now forwards only `AWS_REGION` (see
-below); all credential minting and the no-long-lived-keys refusal moved
-into `aws-broker`'s startup.
+**Why not one switchable broker profile.** botocore fixes a process's
+credential source at first use, and only refreshes it 10–15 minutes
+before the cached credentials actually expire — it never re-reads which
+profile it should be using. A single global profile the operator flips
+mid-session races on that fact: a running terraform or boto3 process
+silently lands in the other account at its next refresh, tens of minutes
+after the switch; two panes started at different times disagree about
+"the current profile" for as long as that window lasts; the broker has to
+keep serving the old profile's cache until only minutes are left on it,
+rather than cutting over the instant the operator asks; and the region
+drifts out from under the account, reopening the DNS sinkhole shape
+described below. Fixing the profile at process start sidesteps all four —
+nothing is ever switched under a process that is still running.
 
-`aws-broker --profile P --watch-pid PID` runs `export-credentials`
-synchronously at startup — this **is** the fail-fast validation, moved
-here from v1's region resolution. A nonzero exit or a response with no
-`SessionToken` (long-lived IAM user keys, which must never enter the guest
-because they never expire) prints `ERROR=<one line>` to stdout and exits 1
-before any socket opens. On success it binds `127.0.0.1:0` (kernel-assigned
-port, so two concurrent `yo enter`s never collide on the host side),
-mints a bearer token with `secrets.token_urlsafe(32)`, and prints exactly
-`TOKEN=<t>\nPORT=<p>\n` — the only place a credential-adjacent value is
-ever written, anywhere, including logs. Immediately after, it
-`os.dup2`s `/dev/null` onto its own stdout, so nothing written later can
-block a reader that only ever reads those two lines. `GET /creds` (with the
-bearer token in `Authorization`, compared via `hmac.compare_digest`) serves
-the cache when it has ≥10 minutes left, re-mints first (throttled to at
-most one attempt per `--min-remint-interval`) when it doesn't, and keeps
-serving a not-yet-expired cache across a failed re-mint — a real 500
-`CredentialsNotAvailable` only happens once the cache is truly expired with
-no fresh mint to replace it. `GET /health` (no auth) is for `yo aws-check`'s
-guest-side forward probe.
+**The allowlist.** `aws_allowlist()` in `yo` reads the Mac's
+`~/.aws/config` with `configparser` and allow-lists every `[profile X]`
+and `[default]` section that carries `sso_session` or `sso_start_url`
+(`[sso-session …]` sections themselves are excluded — they describe a
+session, not an account to assume). A profile name is checked against
+`AWS_PROFILE_NAME_RE` (`^[A-Za-z0-9._-]+$`) first, and one that fails —
+anything with a space, a shell metacharacter, or other punctuation `yo`
+will not pass down to `credential_process P` unescaped — is excluded with
+a stderr line naming it, before the region is even looked at. A profile
+with no `region` is left out the same way, with a stderr line naming it,
+rather than reopening the DNS sinkhole below; a malformed config file
+(bad ini syntax, undecodable bytes) raises instead of allow-listing
+whatever partial read it got; no `aws` CLI or no SSO profiles at all means
+one stderr line and no broker started.
 
-`start_aws_broker` reads the broker's stdout as a pipe on its raw file
-descriptor under a single 30 s deadline with `select`: a broker that dies
-before handshaking fails `yo enter` loudly within 30s instead of hanging it
-forever. The broker's own stderr goes to
-`~/.local/state/yolobox/aws-broker/<pid>.log`, named by `os.getpid()` —
-`yo`'s own pid — because `os.execvpe` at the end of enter replaces that
-process in place rather than forking a child, so the pid the broker's
-watch-pid thread polls (`kill -0` every 5s; gone → `os._exit(0)`) is the
-exact pid that names the log file, with no second handshake field needed to
-tell `yo` where to look. That same `os.execvpe` is what makes watch-pid
-correct at all: any exit from `yo enter` after the broker starts but
-before `exec_process` ever replaces the process leaves no orphan, because
-the watched pid disappears within 5s of `yo enter` itself exiting — there
-is no lingering parent shell to keep it alive. A broker that somehow
-outlives its watched pid despite this
-(pane killed hard enough that even `os._exit` housekeeping never runs) is
-still bounded by `--idle-timeout` (4h default): no authenticated `/creds`
-hit in that window and it exits on its own. That backstop is not currently
-wired to anything log-visible beyond the broker's own stderr — a genuinely
-orphaned broker is a leaked process, not a leaked credential, since its
-bearer token dies with it and nothing else ever learns that token.
+**The guest config.** `yo` renders
+`/home/agent/.config/yolobox/aws-config` — the file
+`AWS_CONFIG_FILE` in `nix/lib/agent-env.nix` points every agent session
+at — with one section per allow-listed profile:
 
-The forward itself is TCP `-R`, not a unix-socket forward — a
-container-credentials URL has no `unix://` form botocore accepts — and
-TCP `-R` has no `StreamLocalBindUnlink` equivalent to atomically
-reclaim a stale guest-side listener. So claiming a guest port is
-probe-and-retry: up to 5 candidates in `41000 + RANDOM % 1000`, each proved
-with a throwaway `ssh -o ExitOnForwardFailure=yes -R <candidate>:...
-true` before the real forward reuses that same candidate. The gap between
-a successful probe and the real forward is an accepted, documented TOCTOU,
-not a bug to fix — a collision in that window is vanishingly unlikely, and
-a real one just fails the real forward exactly as a failed probe would
-have. Once a port is claimed, `AWS_CONTAINER_CREDENTIALS_FULL_URI=http://
-127.0.0.1:<guest-port>/creds` and `AWS_CONTAINER_AUTHORIZATION_TOKEN=<token>`
-cross via `-o SendEnv=...` plus host-side exported env, so no value ever
-appears in ssh's argv. Nothing is written under guest `~/.aws`: the container credential
-provider talks HTTP, not disk, and `AWS_CLI_SESSION_ID_DISABLED = "true"`
-keeps the CLI's telemetry sqlite out of `~/.aws/cli/cache` too.
+```
+[profile P]
+region = R
+credential_process = yolobox-guest aws-creds P
+```
 
-`yo ssh` and editor sessions (`yo code`, `yo zed`) deliberately carry no AWS
-env or broker at all, opt-in and silent, since most sessions have no need
-for AWS. `yo aws-check` is the doctor:
-it proves the host prerequisites, starts a real throwaway broker and
-forward (through `start_aws_broker` itself, not a reimplementation), then
-from the guest curls `/health`, curls `/creds` and asserts all four keys
-(`AccessKeyId`, `SecretAccessKey`, `Token` — not `SessionToken`, remapped —
-and `Expiration`), then runs `aws sts get-caller-identity` and asserts a
-role ARN comes back. It kills the throwaway broker on every exit path.
+`AWS_CONFIG_FILE` replacing the guest's own AWS config path means an
+agent-written `~/.aws/config` inside the VM is simply not read any more;
+`yo up` warns on stderr when one is found, so its presence is at least
+visible rather than silently ignored. `AWS_PROFILE=P aws ...` is then
+the whole of how a process picks an account. `push_aws_guest_files()`
+writes this file atomically — `mkdir -p` the config directory, `cat` the
+rendered text into a `mktemp` sibling, then `mv` it over the real path —
+so a `credential_process` invocation can never observe a half-written
+config. When the allowlist empties out entirely (no `aws` CLI on the Mac,
+or no SSO profiles left in `~/.aws/config`), `disable_aws_broker()` stops
+any broker still running and removes this file from the guest rather than
+leaving a stale one behind, and `yo status` reports `aws: disabled (...)`
+instead of checking a broker that no longer exists.
 
-**Migration note.** v2 needs one guest `nixos-rebuild switch` before it
-works — `nix/base.nix`'s `AcceptEnv` swapped the four flat `AWS_*` names for
-`AWS_CONTAINER_CREDENTIALS_FULL_URI`/`AWS_CONTAINER_AUTHORIZATION_TOKEN`.
-Until that switch lands, sshd silently drops both new vars (they are not
-yet in its whitelist) and the guest CLI says "Unable to locate credentials"
-with no error anywhere from `yo enter` — recognise it with
-`sudo sshd -T | grep -i acceptenv` in the guest.
+**Why `credential_process`, not the container credential provider.**
+v2 used botocore's container credential provider —
+`AWS_CONTAINER_CREDENTIALS_FULL_URI` plus a bearer token — which botocore
+only ever dials as an HTTP(S) URI; it has no unix-socket form at all, so
+once the broker moved to a unix socket (below) the container provider
+stopped being a candidate regardless of loopback or bearer-token
+questions. `credential_process` carries no such restriction: it runs an
+arbitrary command and reads its stdout as process-credential JSON, so
+`yolobox-guest aws-creds P` is free to `curl --unix-socket` a Mac-side
+broker exactly the way `ssh-add` already reaches a Mac-side 1Password
+over the same shape of forward.
 
-A DNS failure shape met on the very first v1 launch still applies unchanged:
-credentials arrive but `aws sts get-caller-identity` dies with `Could not
-connect to the endpoint URL: "https://sts.amazonaws.com/"`. That is DNS,
-not AWS: this Mac's DNS filter sinkholes the *global* `sts.amazonaws.com`
-name to 0.0.0.0, the guest inherits the Mac's resolver through lima's
-forwarder (192.168.5.2), and the CLI only targets global endpoints when it
-has no region. Regional endpoints (`sts.eu-west-1.amazonaws.com`) resolve
-fine on both sides. So `yo` still forwards `AWS_REGION` alongside the
-broker wiring — resolved from the profile's `region` key, falling back to
-the host's `AWS_REGION` / `AWS_DEFAULT_REGION`, refusing loudly when
-neither exists, because `export-credentials` never prints one and a
-region-less guest CLI is broken for most services anyway.
+**Why a reverse unix socket, not a forwarded TCP port.** A live test on
+2026-09-28 found ProtonVPN, connected on the Mac, blackholing every guest
+connection to `192.168.5.2:<port>` — gvproxy's NAT of lima's own gateway
+address to the Mac's loopback, the path v2's TCP `-R` and the address
+above both relied on — while the guest's general egress, and even `ssh
+git@github.com`, kept working throughout. Lima's reverse unix-socket
+forwards ride lima's own ssh connection instead of a second, separately
+NATed TCP path, and were unaffected by that same test. That is exactly
+the shape 1Password's own forward already used (see "SSH identities and
+the two GitHub accounts" above), so the AWS broker takes the same shape
+now rather than a second, VPN-fragile one of its own: `aws-broker` binds
+a Mac-side unix socket, `~/.local/state/yolobox/aws-broker.sock` (born
+`0600` by a tightened umask; a stale socket from a broker that died
+without cleaning up is unlinked, but a non-socket file at that path is
+refused outright, never removed), lima reverses it to
+`/run/yolobox-op/aws-broker.sock` in the guest — bound as the operator,
+lima's cidata account, exactly like 1Password's own reverse forward — and
+`nix/base.nix`'s `opProxy` (the same chokepoint that already proxied
+1Password's socket) bridges it through `systemd-socket-proxyd` to an
+agent-owned `/run/yolobox/aws-broker.sock`. No bearer token guards any of
+it: the filesystem permissions on that last socket are the entire
+authorization boundary, the same as 1Password's.
+
+**The broker's own lifetime rides lima's hostagent, never a per-session
+forward or an idle timeout.** `aws-broker --watch-pid <pid>` uses
+`select.kqueue` with `EVFILT_PROC`/`NOTE_EXIT` to notice the instant
+lima's hostagent process exits, rather than polling for it — the broker
+now outlives any one `yo enter` pane by design, since profiles are chosen
+per process rather than per session, and there is no session left to tie
+its life to. That pid comes from `ha_pid()`, which reads `hostAgentPID`
+out of `limactl list yolobox --json` — never by opening
+`~/.lima/yolobox/ha.pid` directly, the file whose mtime "Two accounts"
+above already flags as something lima itself rewrites on every start.
+`ensure_aws_broker()` in `yo` checks `GET /health` first, through
+`broker_needs_restart()`: a running broker is left alone only when
+*both* its reported `watch_pid` still matches today's hostagent pid *and*
+its reported `allow` list still equals today's sorted allow-listed profile
+names — either a hostagent restart (a new `yo up`) or an edited
+`~/.aws/config` between two `yo` invocations forces a fresh broker rather
+than serving a broker whose profile set is now wrong. A stale broker is
+SIGTERM'd and waited out with the same kqueue mechanism before the fresh
+one starts; its stderr is truncated and reopened at
+`state_dir()/aws-broker/broker.log` on every start (never appended to a
+growing file), and its stdout carries exactly one handshake line, now
+just `READY`, before it `os.dup2`s `/dev/null` onto itself — never write a
+secret to stdout after that line, or to any log. The bind itself refuses
+to steal a live socket: `reclaim_socket_path()` probes a connect before
+unlinking anything and fails outright, naming the collision, if something
+is genuinely still being served there; at shutdown (both the normal
+`finally` around `serve_forever()` and the watch-pid thread's exit path),
+`unlink_if_same_identity()` removes the socket file only when its
+`(st_dev, st_ino)` still match the pair this same broker recorded at
+bind time, so a superseded broker exiting late can never delete a newer
+broker's socket out from under it.
+
+Minting stays lazy and per-profile, each with its own lock, cache,
+throttle and last error, so one profile's expired SSO session never
+blocks another's `/creds/<P>` request; the long-lived-key refusal (an IAM
+user's keys, which never expire and must never enter the guest this way)
+stays a request-time 500 naming the fix. `aws sso login --profile P` on
+the Mac heals a running guest session with no re-enter, exactly as under
+v1 and v2 — the next `/creds/<P>` hit just re-mints successfully.
+
+**There is exactly one broker socket to reach now, not one URL per
+profile**, so there is no longer a port or a gateway address for `yo` and
+the guest side to keep in sync — `credential_process` takes only the
+profile name (above), and the guest script no longer hardcodes the socket
+path itself. `nix/lib/agent-env.nix`'s `awsBrokerSock` is the one place
+that names the agent-facing path, `/run/yolobox/aws-broker.sock`; it sits
+outside the `env` attrset the same file also exports, because it names a
+proxy target (`nix/base.nix`'s `opProxy`, `nix/guest.nix`'s guest script),
+not a variable an agent process should itself export. `nix/guest.nix`
+folds it into `YOLOBOX_AWS_BROKER_SOCK` through `writeShellApplication`'s
+`runtimeEnv`, so `nix/guest/yolobox-guest.sh`'s `cmd_aws_creds` reads it
+from the environment rather than spelling the path a second time. What
+still has to be kept in sync by hand — because it is the *Mac-side* half
+of the same path, not the guest-side half `agent-env.nix` already
+chokepoints — is: `yo` (`AWS_BROKER_GUEST_SOCK`, folded into
+`LIMA_PORT_FORWARDS`, and `AGENT_AWS_BROKER_SOCK`, its own health probe's
+target — checked against `agent-env.nix`'s text by a unit test,
+`TestAgentEnvMatchesYoSockets`, so the two constants can never drift
+silently) and `lima/yolobox.yaml` (the one-time seed for a brand-new
+instance, checked against `LIMA_PORT_FORWARDS` by another test,
+`TestLimaYamlMatchesPortForwardsConstant`). `lima_config_gaps()` (see
+"SSH identities and the two GitHub accounts" above) is what catches the
+lima side drifting at runtime, on every `vm_up()` — as a stderr note now,
+never a refusal, since `heal_reverse_forward()` adds the forward live
+regardless — rather than only at test time.
+
+**`aws-creds`, in `nix/guest/yolobox-guest.sh`:** `curl -sS
+--fail-with-body --unix-socket "${YOLOBOX_AWS_BROKER_SOCK}"
+"http://broker/creds/${profile}"`, printing the body and curl's own error
+to stderr on failure. Three of curl's own exit codes, not one, are
+treated as "the broker is unreachable" and given the `yo up`-on-the-Mac
+remedy rather than curl's generic message: 7 (connection refused, meaning
+the proxy *socket unit itself* is absent — an old box) and also 52 and 56
+(empty reply, connection reset). 52/56 are the common case here, not the
+rare one, for the same reason `op_probe_alive` above already has to
+distinguish two exit-1 shapes: the agent-side proxy socket
+(`yolobox-aws-broker.socket`) always accepts a connection whether or not
+anything real is listening behind lima's forward, so a dead forward or a
+dead Mac-side broker reads back as a broken connection mid-request, not a
+refused one. `yo aws-check` is the doctor now too: it runs
+`ensure_aws_broker()` for real, then for each profile section in the
+guest's `AWS_CONFIG_FILE` runs `AWS_PROFILE=P aws sts
+get-caller-identity` in the VM and asserts a role ARN comes back.
+
+A DNS failure shape met on the very first v1 launch still applies
+unchanged: credentials arrive but `aws sts get-caller-identity` dies with
+`Could not connect to the endpoint URL: "https://sts.amazonaws.com/"`.
+That is DNS, not AWS: this Mac's DNS filter sinkholes the *global*
+`sts.amazonaws.com` name to 0.0.0.0, the guest inherits the Mac's resolver
+through lima's forwarder, and the CLI only targets global endpoints when
+it has no region. Regional endpoints (`sts.eu-west-1.amazonaws.com`)
+resolve fine on both sides — which is exactly why a region-less profile
+is excluded from the allowlist above rather than shipped broken.

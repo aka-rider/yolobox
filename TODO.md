@@ -6,6 +6,17 @@ Texts, diffs and the posting runbook live in `upstream/`; see `upstream/POST.md`
 - lima-vm/lima PR: resolve the guest agent client per dial instead of capturing it per listener. `upstream/lima-portfwd-pr.md`; the commit sits in the guest at `~/wrk/lima-vm/lima`.
 - nixos-lima PR: `restartIfChanged = false` on both lima units, because a nixpkgs bump alone restarts them and that triggers the bug above. `upstream/nixos-lima-no-restart-on-switch.md`, commit in the guest at `~/wrk/nixos-lima/nixos-lima`.
 - herdrdev/herdr issue: `report-agent` answers `ok` but is silently dropped, with no expiry, once a pane's own native agent of that kind has exited — the cause of at least one invisible in-VM claude session. `upstream/herdr-process-exit-latch.md`. See "Known problems" below: this report may no longer describe a bug reachable from this box.
+- lima-vm/lima issue, not yet written up: on lima 2.2.0's `vz` driver, a
+  plain `limactl stop yolobox` — no dead-forward state involved, unlike
+  the bullet above — hung past lima's own three-minute deadline with `did
+  not receive an event with the "exiting" status`, and the guest-agent
+  grpc stream reset partway through. `ps` during the hang showed a
+  second, child `limactl hostagent` process (parent: the real hostagent),
+  spinning at ~98% CPU, that outlived `limactl stop -f` of its parent and
+  had to be `kill -9`'d by hand. Seen during the 2026-09-28 spike into the
+  AWS broker's transport (see CLAUDE.md, "AWS credentials"); not isolated
+  to a specific trigger yet, so not written up under `upstream/` until it
+  reproduces again with a narrower repro.
 
 # Known problems
 
@@ -34,16 +45,6 @@ Texts, diffs and the posting runbook live in `upstream/`; see `upstream/POST.md`
   ["sh","-c",X], stdin=...)` calls plus `seed_gitconfig`'s) could collapse
   into one `seed_push(script, payload)` helper. Six lines saved; marginal,
   so left alone when the guest-helper move went through.
-- A machine pane gets neither AWS credentials nor the forwarded 1Password
-  agent, whether it is opened by `herdr machine add`'s own connection or
-  by anything else that is not `yo enter`. Both still ride `yo enter`'s
-  own ssh connection specifically — `cmd_enter` is what sets up the AWS
-  broker's `-R` forward and passes `ForwardAgent` per invocation — and a
-  pane the guest herdr server spawns on its own inherits the server
-  unit's environment instead, which carries neither. A persistent forward
-  plus environment on the `herdr-server` unit, or a per-call `herdr
-  workspace create --env`, is still owed before AWS or GitHub-over-SSH
-  work is usable from a machine pane that did not come through `yo enter`.
 - `~/.local/share/claude/versions/` held three installed versions (~330 MB
   each) at one point during this session, though the launcher path unit
   (`yolobox-claude-launcher`, `nix/harnesses.nix`) is supposed to prune to
@@ -92,3 +93,16 @@ Texts, diffs and the posting runbook live in `upstream/`; see `upstream/POST.md`
   `scutil --nc list` on the Mac before debugging anything in the VM;
   disconnecting the tunnel restores egress immediately. Worth a `yo`
   doctor check, and worth a note in `CLAUDE.md`.
+- A narrower, opposite-looking shape from the WireGuard blackhole above:
+  with ProtonVPN connected on the Mac (verified live 2026-09-28), the
+  guest's general egress and even `ssh git@github.com` kept working, but
+  every guest connection to `192.168.5.2:<port>` — gvproxy's NAT of
+  lima's gateway address to the Mac's own loopback — was silently
+  blackholed. This is exactly the path a forwarded TCP port relies on
+  (not lima's own resolver on `:53`, which the WireGuard bullet above
+  found still answering through a different mechanism), so it is why the
+  AWS broker now reaches the guest over the same reverse unix-socket
+  forward 1Password already used, rather than the TCP port it used
+  before (see CLAUDE.md, "AWS credentials"). Worth a `yo` doctor check
+  that tells the two shapes apart, since neither produces an error
+  anywhere on its own.

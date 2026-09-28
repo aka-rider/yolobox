@@ -3,6 +3,7 @@ let
   t3 = pkgs.callPackage ./pkgs/t3.nix { };
   homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
+  agentEnv = import ./lib/agent-env.nix { agentHome = homeDir; };
 in
 {
   systemd.services.t3 = {
@@ -17,7 +18,7 @@ in
     # and the Playwright settings file (nix/harnesses.nix), and opencode
     # resolves at all.
     path = [ "${homeDir}/.local" "/run/current-system/sw" ];
-    environment.HOME = homeDir;
+    environment = agentEnv.env // { HOME = homeDir; };
     serviceConfig = {
       User = agentUser;
       Group = "users";

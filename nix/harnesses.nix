@@ -128,7 +128,7 @@ let
         pi list 2>/dev/null | grep -q "$package" || pi install "npm:$package"
       done
 
-      [ -f "$HOME/.pi/agent/extensions/herdr-agent-state.ts" ] || herdr integration install pi
+      herdr integration status | grep -q '^pi: current' || herdr integration install pi
 
       # pi-agent-browser-native ships a `pi-agent-browser-config` helper, but
       # its own README states that `pi install npm:...` does not put it on
