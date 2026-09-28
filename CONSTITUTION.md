@@ -28,7 +28,11 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   second account with the same uid and splits state across two homes.
 - ALWAYS treat `lima/yolobox.yaml` as read once, at creation. An existing
   instance is changed with `limactl edit` while stopped, and `portForwards`
-  must be restated in full because lima's yq cannot read the file.
+  must be restated in full because lima's yq cannot read the file. A unit
+  test (`TestLimaYamlMatchesPortForwardsConstant` in `tests/test_yo.py`)
+  keeps the checked-in file's socket-forward rules in sync with `yo`'s own
+  `LIMA_PORT_FORWARDS` constant — that constant, not the yaml, is what a
+  restate command is built from, so the two owe each other this check.
 
 ## Accounts
 
@@ -112,13 +116,20 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 
 ## Identities and SSH
 
-- ALWAYS give `ForwardAgent` the 1Password socket path itself. The default
-  forwards `$SSH_AUTH_SOCK`, which on this Mac is Apple's empty agent.
-- ALWAYS forward the 1Password agent only from the interactive `enter`/`ssh`
-  commands, each on its own `ControlPath=none` connection. No shared,
-  persistent `ControlMaster` may carry it, or `yo code`/`yo zed`/a bare
-  `ssh` inherit it, and a lingering `ControlPersist` master would leave the
-  agent socket alive in the VM after the session ends.
+- ALWAYS reach the agent's 1Password through the lima reverse socket
+  forward (`/run/yolobox-op/agent.sock`, operator-owned, proxied by
+  `systemd-socket-proxyd` to the agent-owned `/run/yolobox/op-agent.sock`),
+  never `ForwardAgent`. The reverse forward is set up once per hostagent
+  start and lives with the VM, not with any one pane.
+- NEVER put `ForwardAgent` in `~/.lima/yolobox/ssh.config`. That file is
+  shared by every ssh role `yo` spawns, so a forward declared there would
+  reach `yo code`, `yo zed` and every t3-spawned session, not only the one
+  interactive command that asked for it.
+- ALWAYS give `yo ssh`'s own `ForwardAgent` the 1Password socket path
+  itself, and only over its own `ControlPath=none` connection — the
+  operator's per-session forward, kept because the operator is not the
+  agent and carries no reverse forward of its own. The default forwards
+  `$SSH_AUTH_SOCK`, which on this Mac is Apple's empty agent.
 - ALWAYS strip `IdentityAgent` and lima's `Include` when copying
   `~/.ssh/config` into the VM. Both name paths that do not exist there and
   take the forwarded agent away.
@@ -126,20 +137,55 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   spelled on the Mac. `yo` mirrors the logical spelling into the VM
   verbatim, so any other spelling matches nothing there.
 - NEVER copy a private key into the VM.
-- NEVER pass `SendEnv` over a multiplexed connection (`mux=True`). The mux
-  silently drops it, and `ssh_run` now refuses the combination.
 
 ## AWS credentials
 
-- ALWAYS let the host-side broker (`aws-broker`), never a flat env var,
-  carry AWS secrets into the guest. Explicit env creds outrank the
-  container credential provider in botocore's chain, so a flat var sitting
-  alongside the broker's URL would win and silently defeat its refresh.
-- NEVER let the broker write a secret or the bearer token to stdout after
-  its two handshake lines, or to any log.
+- ALWAYS fix a process's AWS profile with `AWS_PROFILE` against the
+  guest's rendered `AWS_CONFIG_FILE`, never one global, switchable
+  profile. botocore fixes a process's credential source at first use and
+  only refreshes minutes before expiry, so flipping one shared profile
+  mid-session leaves an already-running process on the old account until
+  its next refresh, tens of minutes later.
+- ALWAYS tie the AWS broker's lifetime to lima's hostagent
+  (`--watch-pid <pid>`, that pid read from `limactl list yolobox --json`'s
+  `hostAgentPID`, never by opening lima's own `~/.lima/yolobox/ha.pid`
+  directly — lima rewrites that file on every start), never to a
+  per-session forward or an idle timeout. Profiles are chosen per process,
+  not per session, so there is no session left to bound the broker's life
+  by.
+- ALWAYS reach the AWS broker the same way as 1Password: a lima reverse
+  unix-socket forward (`/run/yolobox-op/aws-broker.sock`, operator-owned,
+  proxied by `systemd-socket-proxyd` to the agent-owned
+  `/run/yolobox/aws-broker.sock`), never a forwarded TCP port. A live test
+  showed a Mac-side VPN blackholing every guest connection to lima's
+  gateway address while general egress kept working; a reverse unix
+  socket rides lima's own ssh connection instead and is unaffected.
+- NEVER guard a reversed unix socket with a bearer token. Filesystem
+  permissions on the agent-owned socket are the entire authorization
+  boundary — anything more is a second mechanism to keep in sync with the
+  first for no added safety.
+- ALWAYS keep the agent's environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`)
+  declared once, in `nix/lib/agent-env.nix`, applied identically to the
+  herdr server, t3 and every agent login shell, rather than three copies
+  left to drift apart. The same file's `awsBrokerSock` is the one place
+  naming the guest-side broker socket path, read by `nix/base.nix`'s proxy
+  unit and folded into the guest script's `YOLOBOX_AWS_BROKER_SOCK`
+  (`nix/guest.nix`); a unit test (`TestAgentEnvMatchesYoSockets`) checks it
+  against `yo`'s own `AGENT_AWS_BROKER_SOCK` constant, the same discipline
+  as the `lima/yolobox.yaml` check above.
+- NEVER let the broker write a secret to stdout after its handshake line,
+  or to any log.
 
 ## Agents and the herd
 
+- ALWAYS start an agent in a herdr pane on the saved `yolobox` machine,
+  never expect `yo enter`'s plain landing shell to report to herdr. Only a
+  real pty opened against the VM's own herdr server reaches its manifest.
+- NEVER grow the guest-side `yo` shell function into anything but `yo enter
+  [fuzzy]`. It exists only to `cd` inside a herdr pane already running in
+  the VM; every other `yo` subcommand needs `limactl` and `~/.lima`, which
+  do not exist in the guest, so it refuses everything else outright and
+  names the Mac.
 - ALWAYS treat herdr compatibility as capability-gated, not
   version-equal. `herdr machine add` accepts a saved connection only when
   the guest's `endpoint_protocol_generation` matches the client's own

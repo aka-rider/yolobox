@@ -7,16 +7,18 @@ Run `yo --help` for the command reference.
 from __future__ import annotations
 
 import argparse
+import configparser
+import http.client
 import io
 import json
 import os
 import pwd
-import random
 import re
 import select
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
@@ -25,7 +27,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 # Rewritten at build time: nix substituteInPlace, Homebrew inreplace.
 YO_VERSION = "dev"
@@ -40,13 +42,28 @@ HELPER = "yolobox-guest"
 HELPER_NO_SUBCOMMAND = 64
 HELPER_MARKER = "unknown subcommand"
 
-FORWARDED_ENV = frozenset(
+OP_GUEST_SOCK = "/run/yolobox-op/agent.sock"
+AWS_BROKER_GUEST_SOCK = "/run/yolobox-op/aws-broker.sock"
+AGENT_AWS_BROKER_SOCK = "/run/yolobox/aws-broker.sock"
+
+LIMA_PORT_FORWARDS = [
+    {"guestPort": T3_PORT, "hostIP": "0.0.0.0"},
+    {"proto": "udp", "guestPort": 68, "guestIP": "0.0.0.0", "ignore": True},
     {
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-        "AWS_REGION",
-    }
-)
+        "guestSocket": OP_GUEST_SOCK,
+        "hostSocket": "{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+        "reverse": True,
+    },
+    {
+        "guestSocket": AWS_BROKER_GUEST_SOCK,
+        "hostSocket": "{{.Home}}/.local/state/yolobox/aws-broker.sock",
+        "reverse": True,
+    },
+]
+
+GUEST_AWS_CONFIG_PATH = AGENT_HOME + "/.config/yolobox/aws-config"
+
+PROXY_SOCKET_UNITS = ("yolobox-op-agent.socket", "yolobox-aws-broker.socket")
 
 EDITOR_SSH_BLOCK = "Match host %s user %s\n  ControlPath ~/.lima/%s/ssh-agent.sock" % (
     VM_HOST,
@@ -74,6 +91,10 @@ def ssh_cfg() -> str:
 
 def agent_control_path() -> str:
     return os.path.join(lima_dir(), "ssh-agent.sock")
+
+
+def known_hosts_path() -> str:
+    return os.path.join(lima_dir(), "known_hosts")
 
 
 def atomic_write(path: str, content: str, mode: int) -> None:
@@ -121,8 +142,7 @@ def herdr_alias_block(lima_values: Dict[str, str]) -> str:
             "  Hostname %s" % lima_values["Hostname"],
             "  Port %s" % lima_values["Port"],
             '  IdentityFile "%s"' % lima_values["IdentityFile"],
-            "  StrictHostKeyChecking no",
-            "  UserKnownHostsFile /dev/null",
+            '  UserKnownHostsFile "%s"' % known_hosts_path(),
             "  IdentitiesOnly yes",
         ]
     )
@@ -156,6 +176,54 @@ def ensure_agent_ssh_config() -> None:
     if new_content == current:
         return
     atomic_write(path, new_content, 0o600)
+
+
+HOST_KEY_GLOB = "/etc/ssh/ssh_host_*_key.pub"
+
+
+def known_hosts_lines(lima_values: Dict[str, str], pubkeys: str) -> List[str]:
+    host_port = "[%s]:%s" % (lima_values["Hostname"], lima_values["Port"])
+    lines = []
+    for raw in pubkeys.splitlines():
+        parts = raw.split(None, 2)
+        if len(parts) < 2:
+            continue
+        keytype, key = parts[0], parts[1]
+        lines.append("%s %s %s" % (host_port, keytype, key))
+    return lines
+
+
+def ensure_guest_known_hosts() -> None:
+    # The herdr_alias_block's UserKnownHostsFile has to be pre-populated with
+    # the guest's real key: herdr passes -o StrictHostKeyChecking=yes on the
+    # command line for every saved machine, which overrides anything weaker
+    # this alias sets, so "no known key yet" can never pass. Fetching it over
+    # the operator's own ssh (already trusted via lima's own config, not this
+    # alias) is what breaks that chicken-and-egg.
+    path = ssh_cfg()
+    try:
+        with open(path, "r") as handle:
+            current = handle.read()
+    except OSError:
+        return
+    lima_values = parse_lima_ssh_block(current, VM_HOST)
+    if lima_values is None:
+        return
+
+    proc = ssh_run(OPERATOR, ["sh", "-c", "cat %s" % HOST_KEY_GLOB], check=False)
+    if proc.returncode != 0:
+        raise YoError(
+            "yo: could not fetch the guest's ssh host keys (%s) to pin them for the %r ssh "
+            "alias: %s" % (HOST_KEY_GLOB, HERDR_SSH_ALIAS, (proc.stderr or proc.stdout or "").strip())
+        )
+
+    lines = known_hosts_lines(lima_values, proc.stdout)
+    if not lines:
+        raise YoError(
+            "yo: the guest reported no parseable ssh host keys at %s" % HOST_KEY_GLOB
+        )
+
+    atomic_write(known_hosts_path(), "\n".join(lines) + "\n", 0o600)
 
 
 def op_sock() -> str:
@@ -293,17 +361,6 @@ def forward_agent_opts() -> List[str]:
     return ["-o", 'ForwardAgent="%s"' % op_sock()]
 
 
-def send_env(values: Dict[str, str]) -> Tuple[List[str], Dict[str, str]]:
-    for name in values:
-        if name not in FORWARDED_ENV:
-            raise YoError(
-                "internal error: %s is not in the guest's AcceptEnv whitelist" % name
-            )
-    env = dict(os.environ)
-    env.update(values)
-    return ["-o", "SendEnv=" + " ".join(values)], env
-
-
 def ssh_run(
     role: SshRole,
     argv: Sequence[str],
@@ -318,11 +375,6 @@ def ssh_run(
     inherit_stdin: bool = False,
     binary: bool = False,
 ) -> subprocess.CompletedProcess:
-    if mux and any(opt.startswith("SendEnv=") for opt in extra_opts):
-        raise YoError(
-            "internal error: SendEnv is silently dropped over a shared ControlMaster; "
-            "run this call with mux=False (ControlPath=none)"
-        )
     cmd = ssh_base(role, mux=mux) + list(extra_opts)
     if stdin is None and not inherit_stdin:
         cmd.append("-n")
@@ -394,17 +446,27 @@ def agent_paths(sub: str, args: Sequence[str] = (), *, check: bool = True) -> Li
     return [entry for entry in decoded.split("\0") if entry]
 
 
-def require_agent_account() -> None:
-    probe = ssh_run(AGENT, ["true"])
-    if probe.returncode == 0:
-        return
+def account_status() -> Tuple[str, str]:
+    agent_probe = ssh_run(AGENT, ["true"])
+    if agent_probe.returncode == 0:
+        return "agent", ""
     if ssh_run(OPERATOR, ["true"]).returncode == 0:
+        return "operator_only", ""
+    return "unreachable", agent_probe.stderr.rstrip("\n")
+
+
+def require_agent_account() -> None:
+    status, detail = account_status()
+    if status == "agent":
+        return
+    if status == "operator_only":
         err("yo: cannot ssh into %s as '%s'." % (INSTANCE, AGENT_USER))
         err("    Every AI session runs as that account, and this VM has no working one —")
         err("    it predates the operator/agent split. Rebuild it:")
         err("        limactl delete %s && yo bootstrap" % INSTANCE)
     else:
-        err(probe.stderr.rstrip("\n"))
+        if detail:
+            err(detail)
         err("yo: cannot reach %s as operator either — is the VM up? yo status" % INSTANCE)
     raise YoError(None, code=1)
 
@@ -547,49 +609,10 @@ def target_dir(project: Optional[str]) -> str:
     return dir_for_cwd()
 
 
-@dataclass
-class AwsBroker:
-    proc: subprocess.Popen
-    host_port: int
-    guest_port: int
-    token: str
-    ssh_opts: List[str]
-    env: Dict[str, str]
-
-    def stop(self) -> None:
-        if self.proc.poll() is None:
-            self.proc.terminate()
-        try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-
-
-def require_aws_cli() -> None:
-    if shutil.which("aws") is None:
-        raise YoError("YOLOBOX_AWS_PROFILE is set but 'aws' is not on this Mac's PATH")
-
-
-def aws_region(profile: str) -> str:
-    require_aws_cli()
-    probe = run(["aws", "configure", "get", "region", "--profile", profile])
-    region = probe.stdout.strip() if probe.returncode == 0 else ""
-    if not region:
-        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or ""
-    if not region:
-        raise YoError(
-            "profile '%s' has no region and neither AWS_REGION nor\n"
-            "    AWS_DEFAULT_REGION is set on this Mac. The guest CLI would target\n"
-            "    global endpoints, which this Mac's DNS sinkholes. Add 'region = ...'\n"
-            "    to the profile in ~/.aws/config." % profile
-        )
-    return region
-
-
 def read_handshake(proc: subprocess.Popen, deadline: float) -> List[str]:
     fd = proc.stdout.fileno()
     buffer = b""
-    while buffer.count(b"\n") < 2:
+    while b"\n" not in buffer:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -600,88 +623,436 @@ def read_handshake(proc: subprocess.Popen, deadline: float) -> List[str]:
         if not chunk:
             break
         buffer += chunk
-        if buffer.startswith(b"ERROR=") and b"\n" in buffer:
-            break
     return buffer.decode("utf-8", "replace").splitlines()
 
 
-def start_aws_broker(profile: str) -> AwsBroker:
-    require_aws_cli()
+def aws_broker_sock() -> str:
+    return os.path.join(state_dir(), "aws-broker.sock")
+
+
+AWS_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def aws_allowlist() -> List[Tuple[str, str]]:
+    config_path = os.path.join(home(), ".aws", "config")
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        if not parser.read(config_path):
+            return []
+        allowed: List[Tuple[str, str]] = []
+        for section in parser.sections():
+            if section == "default":
+                name = "default"
+            elif section.startswith("profile "):
+                name = section[len("profile ") :]
+            else:
+                continue
+            if not AWS_PROFILE_NAME_RE.match(name):
+                err(
+                    "yo: profile '%s' has a name yo will not pass to the guest — excluded from the guest AWS config"
+                    % name
+                )
+                continue
+            if not (
+                parser.has_option(section, "sso_session")
+                or parser.has_option(section, "sso_start_url")
+            ):
+                continue
+            region = parser.get(section, "region", fallback="")
+            if not region:
+                err(
+                    "yo: profile '%s' has no region in ~/.aws/config — excluded from the guest AWS config"
+                    % name
+                )
+                continue
+            allowed.append((name, region))
+    except configparser.Error as failure:
+        raise YoError("cannot parse %s: %s" % (config_path, failure))
+    except UnicodeDecodeError as failure:
+        raise YoError("cannot read %s: %s" % (config_path, failure))
+    return allowed
+
+
+def guest_aws_config_text(allowed: Sequence[Tuple[str, str]]) -> str:
+    return "".join(
+        "[profile %s]\nregion = %s\ncredential_process = %s aws-creds %s\n"
+        % (name, region, HELPER, name)
+        for name, region in allowed
+    )
+
+
+class UnixSocketHTTPConnection(http.client.HTTPConnection):
+    # http.client has no unix-socket transport of its own; overriding connect()
+    # to dial an AF_UNIX socket instead of AF_INET is the documented way to add one.
+    def __init__(self, path: str, timeout: float) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self.unix_path = path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self.unix_path)
+        self.sock = sock
+
+
+def aws_broker_health(timeout: float = 2.0) -> Optional[dict]:
+    try:
+        conn = UnixSocketHTTPConnection(aws_broker_sock(), timeout)
+        try:
+            conn.request("GET", "/health")
+            response = conn.getresponse()
+            data = response.read()
+        finally:
+            conn.close()
+        return json.loads(data.decode())
+    except (OSError, http.client.HTTPException, ValueError):
+        return None
+
+
+def wait_for_pid_exit(pid: int, timeout: float) -> None:
+    try:
+        kq = select.kqueue()
+    except OSError as failure:
+        raise YoError("cannot create a kqueue to wait for pid %d to exit: %s" % (pid, failure))
+    try:
+        event = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        kq.control([event], 0)
+        if not kq.control(None, 1, timeout):
+            raise YoError("stale aws-broker (pid %d) did not exit within %gs" % (pid, timeout))
+    except ProcessLookupError:
+        pass
+    finally:
+        kq.close()
+
+
+def kill_stale_broker(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        raise YoError("cannot signal the stale aws-broker (pid %d): permission denied" % pid)
+    wait_for_pid_exit(pid, timeout=10.0)
+
+
+def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
     log_dir = os.path.join(state_dir(), "aws-broker")
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "%d.log" % os.getpid())
-
-    # --watch-pid must name the pid that exec becomes ssh, so the broker dies
-    # exactly when this session does; exec_process keeps that pid.
+    log_path = os.path.join(log_dir, "broker.log")
     with open(log_path, "wb") as log:
         proc = subprocess.Popen(
             [
                 str(SCRIPT_DIR / "aws-broker"),
-                "--profile",
-                profile,
+                "--socket",
+                aws_broker_sock(),
                 "--watch-pid",
-                str(os.getpid()),
+                str(watch_pid),
+                "--allow",
+                *allowed_names,
             ],
             stdout=subprocess.PIPE,
             stderr=log,
+            start_new_session=True,
             bufsize=0,
         )
 
     lines = read_handshake(proc, time.monotonic() + 30)
-    token = ""
-    port = ""
-    for line in lines:
-        if line.startswith("ERROR="):
-            proc.terminate()
-            proc.wait()
-            raise YoError("aws-broker failed: %s" % line.removeprefix("ERROR="))
-        if line.startswith("TOKEN="):
-            token = line.removeprefix("TOKEN=")
-        elif line.startswith("PORT="):
-            port = line.removeprefix("PORT=")
-    if not token or not port:
-        proc.terminate()
+    proc.stdout.close()
+    line = lines[0] if lines else ""
+    if line.startswith("ERROR="):
         proc.wait()
+        raise YoError("aws-broker failed: %s" % line.removeprefix("ERROR="))
+    if line == "READY":
+        return
+    proc.terminate()
+    proc.wait()
+    if not line:
         raise YoError("aws-broker produced no handshake within 30s — see %s" % log_path)
-    host_port = int(port)
+    raise YoError("aws-broker produced an unexpected handshake %r — see %s" % (line, log_path))
 
-    probe_err = ""
-    guest_port = 0
-    for _ in range(5):
-        candidate = random.randrange(41000, 42000)
-        probe = ssh_run(
-            AGENT,
-            ["true"],
-            extra_opts=[
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-R",
-                "127.0.0.1:%d:127.0.0.1:%d" % (candidate, host_port),
-            ],
-        )
-        if probe.returncode == 0:
-            guest_port = candidate
-            break
-        probe_err = probe.stderr
-    if not guest_port:
-        proc.terminate()
-        proc.wait()
-        raise YoError(
-            "could not claim a guest port for the aws-broker forward after 5 tries:\n%s"
-            % probe_err.rstrip("\n")
-        )
 
-    opts, env = send_env(
-        {
-            "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:%d/creds" % guest_port,
-            "AWS_CONTAINER_AUTHORIZATION_TOKEN": token,
-        }
+GUEST_AWS_CONFIG_DIR = os.path.dirname(GUEST_AWS_CONFIG_PATH)
+
+PUSH_AWS_CONFIG_SH = (
+    'mkdir -p %s && tmp=$(mktemp %s/.aws-config.XXXXXX) && cat >"$tmp" && mv "$tmp" %s'
+    % (GUEST_AWS_CONFIG_DIR, GUEST_AWS_CONFIG_DIR, GUEST_AWS_CONFIG_PATH)
+)
+
+
+def push_aws_guest_files(allowed: Sequence[Tuple[str, str]]) -> None:
+    ssh_run(
+        AGENT,
+        ["sh", "-c", PUSH_AWS_CONFIG_SH],
+        stdin=guest_aws_config_text(allowed).encode(),
+        check=True,
     )
-    ssh_opts = ["-R", "127.0.0.1:%d:127.0.0.1:%d" % (guest_port, host_port)] + opts
-    return AwsBroker(proc, host_port, guest_port, token, ssh_opts, env)
+    existing = ssh_run(AGENT, ["test", "-e", AGENT_HOME + "/.aws/config"])
+    if existing.returncode == 0:
+        err(
+            "yo: %s/.aws/config exists in the VM but AWS_CONFIG_FILE=%s hides it"
+            % (AGENT_HOME, GUEST_AWS_CONFIG_PATH)
+        )
 
 
-def vm_up() -> None:
+def disable_aws_broker() -> None:
+    health = aws_broker_health()
+    if health is not None:
+        stale_pid = health.get("pid")
+        if isinstance(stale_pid, int):
+            kill_stale_broker(stale_pid)
+    removal = ssh_run(AGENT, ["rm", "-f", GUEST_AWS_CONFIG_PATH], check=False)
+    if removal.returncode != 0:
+        err("yo: could not remove the stale %s in the VM" % GUEST_AWS_CONFIG_PATH)
+
+
+def broker_needs_restart(
+    health: Optional[dict], watch_pid: int, allowed_names: Sequence[str]
+) -> bool:
+    if health is None:
+        return True
+    if health.get("watch_pid") != watch_pid:
+        return True
+    if health.get("allow") != list(allowed_names):
+        return True
+    return False
+
+
+def ensure_aws_broker() -> bool:
+    if shutil.which("aws") is None:
+        err("yo: 'aws' is not on this Mac's PATH — no AWS credentials broker started")
+        disable_aws_broker()
+        return False
+    allowed = aws_allowlist()
+    if not allowed:
+        err("yo: no SSO profiles in ~/.aws/config — no AWS credentials broker started")
+        disable_aws_broker()
+        return False
+
+    pid = ha_pid()
+    if pid is None:
+        raise YoError(
+            "cannot read %s's host agent pid (limactl list %s --json) — is it up? yo status"
+            % (INSTANCE, INSTANCE)
+        )
+
+    allowed_names = sorted(name for name, _ in allowed)
+    health = aws_broker_health()
+    if broker_needs_restart(health, pid, allowed_names):
+        if health is not None:
+            stale_pid = health.get("pid")
+            if isinstance(stale_pid, int):
+                kill_stale_broker(stale_pid)
+        start_aws_broker(pid, allowed_names)
+
+    push_aws_guest_files(allowed)
+    return True
+
+
+def herdr_machine_exists(listing_json: str) -> bool:
+    try:
+        entries = json.loads(listing_json)
+    except ValueError:
+        raise YoError("herdr machine list --json produced unparseable output")
+    if not isinstance(entries, list):
+        raise YoError("herdr machine list --json did not print a JSON array")
+    return any(
+        isinstance(entry, dict) and entry.get("target") == HERDR_SSH_ALIAS for entry in entries
+    )
+
+
+def ensure_herdr_machine() -> None:
+    herdr = shutil.which("herdr")
+    if herdr is None:
+        err("yo: herdr not found on this Mac's PATH — skipping herdr machine registration")
+        return
+    listing = run([herdr, "machine", "list", "--json"], check=True)
+    if herdr_machine_exists(listing.stdout):
+        return
+    added = run([herdr, "machine", "add", HERDR_SSH_ALIAS, "--label", HERDR_SSH_ALIAS])
+    if added.returncode != 0:
+        raise YoError(
+            "herdr machine add %s failed: %s"
+            % (HERDR_SSH_ALIAS, (added.stderr or added.stdout).strip())
+        )
+
+
+@dataclass(frozen=True)
+class LimaInfo:
+    host_agent_pid: Optional[int]
+    port_forwards: List[dict]
+
+
+def lima_instance_info() -> Optional[LimaInfo]:
+    proc = run(["limactl", "list", INSTANCE, "--json"], check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout.strip())
+    except ValueError:
+        return None
+    pid = data.get("hostAgentPID")
+    forwards = data.get("config", {}).get("portForwards", [])
+    return LimaInfo(
+        host_agent_pid=pid if isinstance(pid, int) else None,
+        port_forwards=forwards if isinstance(forwards, list) else [],
+    )
+
+
+def ha_pid() -> Optional[int]:
+    info = lima_instance_info()
+    return info.host_agent_pid if info else None
+
+
+def lima_config_gaps() -> List[str]:
+    info = lima_instance_info()
+    if info is None:
+        return []
+    expected = {
+        OP_GUEST_SOCK: op_sock(),
+        AWS_BROKER_GUEST_SOCK: aws_broker_sock(),
+    }
+    return [
+        guest_sock
+        for guest_sock, host_sock in expected.items()
+        if not any(
+            isinstance(forward, dict)
+            and forward.get("reverse") is True
+            and forward.get("guestSocket") == guest_sock
+            and forward.get("hostSocket") == host_sock
+            for forward in info.port_forwards
+        )
+    ]
+
+
+def lima_config_gap_message(missing: Sequence[str]) -> str:
+    return (
+        "%s has no reverse forward for %s — restate the full array:\n"
+        "    limactl stop %s && limactl edit %s --set '.portForwards = %s' && yo up"
+        % (INSTANCE, " and ".join(missing), INSTANCE, INSTANCE, json.dumps(LIMA_PORT_FORWARDS))
+    )
+
+
+def op_probe_alive(proc: subprocess.CompletedProcess) -> bool:
+    if proc.returncode == 0:
+        return True
+    return proc.returncode == 1 and "The agent has no identities" in proc.stdout
+
+
+def aws_broker_probe_alive(proc: subprocess.CompletedProcess) -> bool:
+    return proc.returncode == 0
+
+
+@dataclass(frozen=True)
+class ReverseForward:
+    name: str
+    guest_path: str
+    host_path: str
+    probe: Tuple[str, ...]
+    alive: Callable[[subprocess.CompletedProcess], bool]
+
+
+def one_password_forward() -> ReverseForward:
+    return ReverseForward("1password", OP_GUEST_SOCK, op_sock(), ("ssh-add", "-l"), op_probe_alive)
+
+
+def aws_broker_forward() -> ReverseForward:
+    return ReverseForward(
+        "aws-broker",
+        AWS_BROKER_GUEST_SOCK,
+        aws_broker_sock(),
+        ("curl", "-sS", "--unix-socket", AGENT_AWS_BROKER_SOCK, "http://broker/health"),
+        aws_broker_probe_alive,
+    )
+
+
+def forward_control_cmd(action: str, forward: ReverseForward) -> List[str]:
+    return ssh_base(OPERATOR, mux=True) + [
+        "-O",
+        action,
+        "-R",
+        "%s:%s" % (forward.guest_path, forward.host_path),
+        VM_HOST,
+    ]
+
+
+def heal_reverse_forward(forward: ReverseForward) -> bool:
+    probe = ssh_run(AGENT, list(forward.probe))
+    if forward.alive(probe):
+        return True
+    run(forward_control_cmd("cancel", forward), check=False)
+    ssh_run(OPERATOR, ["rm", "-f", forward.guest_path], mux=True, check=True)
+    run(forward_control_cmd("forward", forward), check=True)
+    probe = ssh_run(AGENT, list(forward.probe))
+    return forward.alive(probe)
+
+
+def heal_forward_collecting_errors(forward: ReverseForward, errors: List[str]) -> None:
+    try:
+        healed = heal_reverse_forward(forward)
+    except YoError as failure:
+        errors.append(
+            "the %s forward into the VM failed while healing it: %s"
+            % (forward.name, failure.message or "unknown error")
+        )
+        return
+    if not healed:
+        errors.append("the %s forward into the VM is still dead after re-issuing it" % forward.name)
+
+
+def ensure_op_forward(aws_enabled: bool) -> List[str]:
+    errors: List[str] = []
+    if not os.path.exists(op_sock()):
+        err(
+            "yo: 1Password not running on this Mac (no socket at %s) — skipping its VM forward"
+            % op_sock()
+        )
+    else:
+        heal_forward_collecting_errors(one_password_forward(), errors)
+    if aws_enabled:
+        heal_forward_collecting_errors(aws_broker_forward(), errors)
+    return errors
+
+
+UNITS_MISSING_NOTE = "box predates the 1Password/AWS forwards; run `yo bootstrap`"
+
+
+def vm_units_present() -> bool:
+    return ssh_run(OPERATOR, ["systemctl", "cat", PROXY_SOCKET_UNITS[0]], check=False).returncode == 0
+
+
+def vm_services() -> None:
+    status, _ = account_status()
+    if status == "unreachable":
+        err("yo: cannot reach %s as operator — is the VM up? yo status" % INSTANCE)
+        return
+    if not vm_units_present():
+        err("yo: %s" % UNITS_MISSING_NOTE)
+        return
+
+    errors: List[str] = []
+    aws_enabled = False
+    try:
+        aws_enabled = ensure_aws_broker()
+    except YoError as failure:
+        errors.append(failure.message or "aws-broker failed")
+
+    errors += ensure_op_forward(aws_enabled)
+
+    if errors:
+        raise YoError(
+            "; ".join(errors) + " — recreate the master: limactl stop %s && yo up" % INSTANCE
+        )
+
+
+def vm_up(run_services: bool = True) -> None:
+    gaps = lima_config_gaps()
+    if gaps:
+        err("yo: %s" % lima_config_gap_message(gaps))
     listing = run(["limactl", "list", "-q"]).stdout.splitlines()
     if INSTANCE in listing:
         run(["limactl", "start", "--yes", INSTANCE], capture=False, check=True)
@@ -699,6 +1070,9 @@ def vm_up() -> None:
             check=True,
         )
     ensure_agent_ssh_config()
+    ensure_guest_known_hosts()
+    if run_services:
+        vm_services()
 
 
 def cmd_up(args: argparse.Namespace) -> None:
@@ -748,6 +1122,57 @@ def cmd_status(args: argparse.Namespace) -> None:
     drift = version_drift(YO_VERSION, guest_version)
     if drift:
         err(drift)
+
+    if vm_units_present():
+        op_probe = ssh_run(AGENT, ["ssh-add", "-l"], check=False)
+        out("1password: guest forward is %s" % ("up" if op_probe_alive(op_probe) else "down"))
+
+        for unit in PROXY_SOCKET_UNITS:
+            state = ssh_run(
+                OPERATOR, ["systemctl", "show", "-p", "ActiveState", "--value", unit], check=False
+            ).stdout.strip()
+            out("proxy: %s is %s" % (unit, state or "unknown"))
+    else:
+        out("yo: %s" % UNITS_MISSING_NOTE)
+
+    gaps = lima_config_gaps()
+    if gaps:
+        out("lima: %s" % lima_config_gap_message(gaps))
+    else:
+        out("lima: reverse forwards ok")
+
+    if shutil.which("aws") is None:
+        out("aws: disabled (no 'aws' CLI or no SSO profiles in ~/.aws/config)")
+    else:
+        try:
+            allowed = aws_allowlist()
+        except YoError as failure:
+            out("aws: config unreadable: %s" % failure.message)
+        else:
+            if not allowed:
+                out("aws: disabled (no 'aws' CLI or no SSO profiles in ~/.aws/config)")
+            else:
+                aws_forward_probe = ssh_run(
+                    AGENT,
+                    ["curl", "-sS", "--unix-socket", AGENT_AWS_BROKER_SOCK, "http://broker/health"],
+                    check=False,
+                )
+                out(
+                    "aws: guest forward is %s"
+                    % ("up" if aws_forward_probe.returncode == 0 else "down")
+                )
+
+                pid = ha_pid()
+                health = aws_broker_health()
+                if health is None:
+                    out("aws: broker not reachable on this Mac's %s" % aws_broker_sock())
+                elif pid is not None and health.get("watch_pid") == pid:
+                    out("aws: broker healthy (watching hostagent pid %s)" % pid)
+                else:
+                    out(
+                        "aws: broker running but stale (watching pid %s, current hostagent pid %s)"
+                        % (health.get("watch_pid"), pid)
+                    )
 
 
 def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
@@ -803,7 +1228,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     report = Report()
     ref = flake_ref()
 
-    vm_up()
+    vm_up(run_services=False)
     report.ok("VM up")
 
     ssh_run(
@@ -848,6 +1273,10 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     report.ok("seeded")
 
     ensure_ssh_config_include(refuse=False)
+    ensure_guest_known_hosts()
+    ensure_herdr_machine()
+
+    vm_services()
 
 
 def cmd_gc(args: argparse.Namespace) -> None:
@@ -943,23 +1372,15 @@ def cmd_ssh(args: argparse.Namespace) -> None:
 
 def cmd_enter(args: argparse.Namespace) -> None:
     require_agent_account()
+    if os.environ.get("HERDR_ENV") == "1":
+        err(
+            "yo: an agent started in this shell is invisible to herdr — "
+            "open a workspace on the yolobox herdr machine and run `yo enter` there"
+        )
     target = target_dir(args.project)
 
-    argv = ssh_base(AGENT) + forward_agent_opts()
-    env = dict(os.environ)
-
-    profile = os.environ.get("YOLOBOX_AWS_PROFILE", "")
-    broker = None
-    if profile:
-        region_opts, region_env = send_env({"AWS_REGION": aws_region(profile)})
-        argv += region_opts
-        env.update(region_env)
-        broker = start_aws_broker(profile)
-        argv += broker.ssh_opts
-        env.update(broker.env)
-
-    argv += ["-t", VM_HOST, remote(["cd", target]) + ' && exec "$SHELL" -l']
-    exec_process(argv, env)
+    argv = ssh_base(AGENT) + ["-t", VM_HOST, remote(["cd", target]) + ' && exec "$SHELL" -l']
+    exec_process(argv)
 
 
 def cmd_cp(args: argparse.Namespace) -> None:
@@ -1272,102 +1693,20 @@ def guest_field(text: str, key: str) -> str:
 
 
 def cmd_aws_check(args: argparse.Namespace) -> None:
-    report = Report()
-
-    profile = os.environ.get("YOLOBOX_AWS_PROFILE", "")
-    if not profile:
-        raise report.abort(
-            "YOLOBOX_AWS_PROFILE is not set",
-            "Set it to a host AWS CLI profile and rerun: YOLOBOX_AWS_PROFILE=<profile> ./yo aws-check",
+    if not vm_units_present():
+        raise YoError(UNITS_MISSING_NOTE)
+    if not ensure_aws_broker():
+        raise YoError(
+            "AWS is disabled on this Mac (no 'aws' CLI, or no SSO profiles in ~/.aws/config) — nothing to check"
         )
-    if shutil.which("aws") is None:
-        raise report.abort("'aws' is not on this Mac's PATH")
-    report.ok("aws is on this Mac's PATH")
-
-    creds = run(
-        ["aws", "configure", "export-credentials", "--profile", profile, "--format", "process"],
-        merge_stderr=True,
-    )
-    if creds.returncode != 0:
-        raise report.abort(
-            "'aws configure export-credentials --profile %s' failed:" % profile,
-            creds.stdout.strip(),
+    if not heal_reverse_forward(aws_broker_forward()):
+        raise YoError(
+            "the aws-broker forward into the VM is still dead after re-issuing it — "
+            "recreate the master: limactl stop %s && yo up" % INSTANCE
         )
-    try:
-        session_token = json.loads(creds.stdout).get("SessionToken") or ""
-    except ValueError:
-        session_token = ""
-    if not session_token:
-        raise report.abort(
-            "profile '%s' returned no SessionToken — these are long-lived keys" % profile,
-            "and must never enter the guest. Point YOLOBOX_AWS_PROFILE at a profile that",
-            "yields temporary credentials (role_arn or credential_process), not a static",
-            "IAM user profile.",
-        )
-    report.ok("host export-credentials succeeded for '%s', SessionToken present" % profile)
-
-    region = aws_region(profile)
-    report.ok("region resolves to %s" % region)
-
-    broker = start_aws_broker(profile)
-    try:
-        report.ok(
-            "broker started, host port %d forwarded to guest port %d"
-            % (broker.host_port, broker.guest_port)
-        )
-
-        region_opts, region_env = send_env({"AWS_REGION": region})
-        env = dict(os.environ)
-        env.update(region_env)
-        env.update(broker.env)
-        guest_proc = guest_helper(
-            AGENT,
-            "aws-check",
-            extra_opts=list(broker.ssh_opts) + region_opts,
-            env=env,
-        )
-        guest_out_text = guest_proc.stdout + (guest_proc.stderr or "")
-
-        if guest_field(guest_out_text, "ENV_MISSING"):
-            report.fail(
-                "the guest session never saw AWS_CONTAINER_CREDENTIALS_FULL_URI/AWS_CONTAINER_AUTHORIZATION_TOKEN",
-                "Check AcceptEnv in nix/base.nix and that the guest is running the switch that carries it.",
-            )
-
-        health = guest_field(guest_out_text, "HEALTH")
-        if health == "200":
-            report.ok("guest curl to the broker's /health returned 200")
-        else:
-            report.fail(
-                "guest curl to the broker's /health returned '%s', expected 200"
-                % (health or "<no response>")
-            )
-
-        creds_json = guest_field(guest_out_text, "CREDS")
-        try:
-            payload = json.loads(creds_json)
-        except ValueError:
-            payload = {}
-        expected = {"AccessKeyId", "SecretAccessKey", "Token", "Expiration"}
-        if isinstance(payload, dict) and expected <= set(payload):
-            report.ok("guest /creds answers with AccessKeyId, SecretAccessKey, Token and Expiration")
-        else:
-            report.fail("guest /creds did not answer with all four expected keys", creds_json)
-
-        sts_out = guest_field(guest_out_text, "STS")
-        try:
-            role_arn = json.loads(sts_out).get("Arn") or ""
-        except ValueError:
-            role_arn = ""
-        if role_arn:
-            report.ok("guest sts get-caller-identity answers with %s" % role_arn)
-        else:
-            report.fail("guest sts get-caller-identity did not return a role ARN:", sts_out)
-    finally:
-        broker.stop()
-
-    if report.failed:
-        raise YoError(None, code=1)
+    proc = guest_helper(AGENT, "aws-check", stream=True)
+    if proc.returncode != 0:
+        raise YoError(None, code=proc.returncode)
 
 
 def disk_grow_size(value: str) -> int:
@@ -1469,9 +1808,12 @@ def build_parser() -> argparse.ArgumentParser:
         "enter",
         "Shell in the VM as the agent account.",
         "Shell in the VM as the unprivileged agent account, landing in the guest\n"
-        "twin of the current project. Forwards the 1Password ssh-agent socket,\n"
-        "and, when YOLOBOX_AWS_PROFILE is set, starts a host-side credentials\n"
-        "broker for the session.",
+        "twin of the current project. 1Password and the AWS credentials broker\n"
+        "are wired into the VM permanently (yo up heals both), not per session;\n"
+        "set AWS_PROFILE in the shell to pick an allow-listed profile. Inside a\n"
+        "herdr pane, prints a note that an agent started here is invisible to\n"
+        "herdr — open a workspace on the yolobox herdr machine and run\n"
+        "`yo enter` there, the guest-side shell function of the same name.",
     )
     enter.add_argument("project", nargs="?")
     enter.set_defaults(func=cmd_enter)
@@ -1550,10 +1892,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     aws_check = add(
         "aws-check",
-        "Prove end to end that YOLOBOX_AWS_PROFILE's credentials reach the VM.",
-        "Prove end to end that YOLOBOX_AWS_PROFILE's credentials reach the VM:\n"
-        "host export-credentials, a throwaway broker and forward, the guest's\n"
-        "/health and /creds, and a guest sts get-caller-identity.",
+        "Heal the AWS broker and check every allow-listed profile from the guest.",
+        "Start (or heal) the host AWS credentials broker, push its per-profile\n"
+        "config into the VM, then run the guest's own check against every\n"
+        "allow-listed profile: AWS_PROFILE=<P> aws sts get-caller-identity.",
     )
     aws_check.set_defaults(func=cmd_aws_check)
 

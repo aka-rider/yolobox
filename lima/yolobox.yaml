@@ -27,6 +27,20 @@ portForwards:
   - guestPort: 3773
     hostIP: "0.0.0.0"
 
+  # Reverses the Mac's 1Password agent socket into the guest, so the VM
+  # never carries any 1Password credential of its own.
+  - guestSocket: "/run/yolobox-op/agent.sock"
+    hostSocket: "{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+    reverse: true
+
+  # Same shape, for the AWS broker: a VPN owning the Mac's default route
+  # blackholes the guest's TCP path to 192.168.5.2 (gvproxy's NAT to host
+  # loopback), so the broker is reached as a reversed unix socket instead of
+  # a forwarded port, exactly like 1Password above.
+  - guestSocket: "/run/yolobox-op/aws-broker.sock"
+    hostSocket: "{{.Home}}/.local/state/yolobox/aws-broker.sock"
+    reverse: true
+
   # Tell Lima's port-forwarding to ignore port 68 to prevent interception of host DHCP packets
   # Apparently this is an issue with NixOS that does not occur on other Linux distros
   # See: https://github.com/nixos-lima/nixos-lima/issues/50

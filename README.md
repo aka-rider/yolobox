@@ -65,15 +65,32 @@ Run `yo --help` for the rest of the commands.
 
 [https://herdr.dev/](https://herdr.dev/)
 
-The VM runs its own herdr server, as the `agent` account, up from boot.
+The VM runs its own herdr server, as the `agent` account, up from boot. `yo bootstrap` adds the `yolobox` machine to your Mac's herdr automatically, so there is nothing to run by hand.
+
+Open a workspace on the `yolobox` machine and run `pi` or `claude` there — that pane is where herdr can see the agent. `yo enter` (from the Mac), `yo ssh`, `yo code` and `yo zed` are plain shells outside herdr's own panes, so an agent started in one of them stays invisible to herdr. Once inside that workspace, a second, guest-only `yo enter [fuzzy]` shell function picks among the VM's projects with fzf and `cd`s there — strictly in-guest, no reach back to the Mac's own `yo`.
+
+herdr supports sharing clipboard images with a remote client over a machine connection.
+
+### 1Password and AWS credentials
+
+Both reach the VM the same way: a permanent lima reverse unix-socket forward, one per Mac-side socket, set up automatically for a VM created with this version of `yo`. Neither rides a forwarded TCP port, because a VPN on the Mac can blackhole those while leaving the guest's general egress and this same reverse-socket path untouched. An **existing** instance needs a one-time migration to pick up a forward it was created without — VM stopped first, and the array restated in full, because lima's own `yq` cannot read this repo's `lima/yolobox.yaml` back out of an existing instance:
 
 ```bash
-herdr machine add yolobox --label yolobox
+limactl stop yolobox
+limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"hostIP":"0.0.0.0"},{"proto":"udp","guestPort":68,"guestIP":"0.0.0.0","ignore":true},{"guestSocket":"/run/yolobox-op/agent.sock","hostSocket":"{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock","reverse":true},{"guestSocket":"/run/yolobox-op/aws-broker.sock","hostSocket":"{{.Home}}/.local/state/yolobox/aws-broker.sock","reverse":true}]'
+yo up
 ```
 
-Run `cd myproj && yo enter` or `yo enter <fuzzy search>`.
+`yo up` itself prints this same command on stderr, naming whichever socket is missing, so this is also the fix if `yo` ever tells you to run it — it is a note, not a refusal: `yo` still brings the forward up for the current session either way, this migration just makes it survive the VM's own restarts too.
 
-herdr documents sharing clipboard images to a remote client over a machine connection;
+Every SSO profile in your Mac's `~/.aws/config` becomes usable inside the VM, one broker for all of them. Pick a profile per shell:
+
+```bash
+export AWS_PROFILE=<profile>
+aws sts get-caller-identity
+```
+
+When a profile's session expires, `aws sso login --profile <profile>` on the Mac is enough — a guest process already using that profile heals on its own, no `yo enter` needed.
 
 ### T3 code web and mobile
 
