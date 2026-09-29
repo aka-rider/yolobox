@@ -1375,7 +1375,7 @@ def cmd_enter(args: argparse.Namespace) -> None:
     if os.environ.get("HERDR_ENV") == "1":
         err(
             "yo: an agent started in this shell is invisible to herdr — "
-            "open a workspace on the yolobox herdr machine and run `yo enter` there"
+            "run agents in a workspace on the yolobox herdr machine"
         )
     target = target_dir(args.project)
 
@@ -1480,20 +1480,32 @@ def cmd_zed(args: argparse.Namespace) -> None:
 
 
 def t3_require_service() -> None:
-    unit = guest_out(
-        ["systemctl", "show", "-p", "LoadState", "-p", "ActiveState", "--value", "t3"],
+    # t3code is a vendor-installed *user* unit now (nix/t3.nix), not a system
+    # one — installed and kept current by yolobox-harness-install, running
+    # as the agent from boot (see CLAUDE.md, "The harnesses come from their
+    # vendors"). Ask systemd the same question ssh_run(AGENT, ...) always
+    # asks it: as the agent, over its own login PAM session, which is what
+    # sets XDG_RUNTIME_DIR for a lingering user without a pty.
+    unit = ssh_run(
+        AGENT,
+        ["systemctl", "--user", "show", "-p", "LoadState", "-p", "ActiveState", "--value", "t3code.service"],
         check=False,
-    ).splitlines()
+    ).stdout.splitlines()
     load_state = unit[0] if unit else ""
     active_state = unit[1] if len(unit) > 1 else ""
     if not load_state:
-        raise YoError("cannot reach the VM to ask about t3 — is it up? (yo status)")
+        raise YoError("cannot reach the VM's agent account to ask about t3code — is it up? (yo status)")
     if load_state != "loaded":
-        raise YoError("no t3 unit in the VM's current system — switch it: %s" % rebuild_hint())
+        raise YoError(
+            "t3code is not installed for the agent yet — its install is a user service: "
+            "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 "
+            "systemctl --user restart yolobox-harness-install"
+        )
     if active_state != "active":
         raise YoError(
-            "t3 service is %s in the VM — diagnose with: yo ssh journalctl -u t3 -n 50"
-            % active_state
+            "t3code service is %s in the VM — diagnose with: "
+            "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 journalctl --user -u t3code -n 50, "
+            "or tail ~/.t3/userdata/logs/boot-service.log as the agent" % active_state
         )
     probe = run(["curl", "-sS", "-o", "/dev/null", "--max-time", "5", "http://127.0.0.1:%d/" % T3_PORT])
     if probe.returncode != 0:
@@ -1812,8 +1824,7 @@ def build_parser() -> argparse.ArgumentParser:
         "are wired into the VM permanently (yo up heals both), not per session;\n"
         "set AWS_PROFILE in the shell to pick an allow-listed profile. Inside a\n"
         "herdr pane, prints a note that an agent started here is invisible to\n"
-        "herdr — open a workspace on the yolobox herdr machine and run\n"
-        "`yo enter` there, the guest-side shell function of the same name.",
+        "herdr — run agents in a workspace on the yolobox herdr machine instead.",
     )
     enter.add_argument("project", nargs="?")
     enter.set_defaults(func=cmd_enter)

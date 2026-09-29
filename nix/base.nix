@@ -146,10 +146,10 @@ in
   # home. It is deliberately not lima's cidata account either, because
   # lima-init runs `usermod -a -G wheel $LIMA_CIDATA_USER` unconditionally on
   # every boot, after activation — removing wheel from that account here
-  # would not stick. systemd-journal is required, not cosmetic: xvfb,
-  # openbox and t3 are system units, so their logs go to the system journal,
-  # whose ACL grants read only to wheel and adm (other::---) — without this
-  # group `journalctl -u t3` silently narrows to the agent's own messages.
+  # would not stick. systemd-journal is required, not cosmetic: xvfb and
+  # openbox are system units, so their logs go to the system journal, whose
+  # ACL grants read only to wheel and adm (other::---) — without this group
+  # `journalctl -u openbox` silently narrows to the agent's own messages.
   users.users.${agentUser} = {
     isNormalUser = true;
     uid = 1000;
@@ -262,6 +262,7 @@ in
     zoxide
     eza
     btop
+    (callPackage ./pkgs/far2l.nix { })
     delta
     gh
     shellcheck

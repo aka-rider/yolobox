@@ -32,12 +32,21 @@ rules this file justifies.
   the herdr server, t3 and every agent login shell.
 - `nix/display.nix` — the virtual X display, browsers, screen recording.
 - `nix/lsp.nix` — the Python language-server wiring for every editor.
-- `nix/t3.nix`, `nix/pkgs/t3.nix` — t3code built from npm and run as a
-  service.
+- `nix/t3.nix` — t3code's environment: a drop-in onto the vendor-installed
+  user unit (`nix/lib/agent-env.nix`, nix-ld), and the path unit that prunes
+  old versions. Installed and updated by `yolobox-harness-install`
+  (`nix/harnesses.nix`), the same as claude and pi.
+- `nix/lib/nix-ld-env.nix` — the two nix-ld env vars a dynamically linked
+  glibc binary needs, shared between `nix/harnesses.nix`'s install script
+  and `nix/t3.nix`'s drop-in.
+- `nix/tailscale.nix` — the tailnet, and the oneshot that puts t3 on it
+  through `tailscale serve` instead of the firewall.
 - `nix/guest.nix`, `nix/guest/yolobox-guest.sh` — the guest-side half of
   `yo`'s shell (project walk, gc tiers, AWS probe and the rest), built and
   shellchecked as one package, `yolobox-guest`, on both accounts' PATH.
 - `nix/pkgs/` — packages nixpkgs lacks or lags on.
+- `nix/pkgs/far2l.nix` — far2l with every NetRocks backend, S3 included,
+  built TTY-only; see "far2l: TTY-only, S3 through the broker" below.
 - `lima/yolobox.yaml` — read once, when the instance is created.
 - `templates/default` — `devbox.json` and `.envrc` for a new project.
 - `homebrew/yolobox.rb` — the brew formula, with `@URL@`/`@SHA256@` holes;
@@ -121,13 +130,15 @@ has a group-writable component, and `/nix/store` is `1775`.
 The system journal turned out to gate on the same group. `getfacl` on
 `/var/log/journal/*/system.journal` shows `group:wheel:r--`,
 `group:adm:r--`, `other::---` — readable only through `wheel`'s ACL, with
-no other route in. `xvfb`, `openbox` and `t3` are system units that run
-*as* the agent, so their logs land in the system journal, not some user
-journal the agent already owns by default. Hence the agent carries
-`extraGroups = [ "systemd-journal" ]` on top of dropping `wheel` — without
-it, `journalctl -u t3` silently narrows to only the agent's own messages,
-which is also what the remedy `yo` itself prints when t3 looks missing, so
-the diagnostic advice would have quietly stopped working too.
+no other route in. `xvfb` and `openbox` are system units that run *as* the
+agent, so their logs land in the system journal, not some user journal the
+agent already owns by default. Hence the agent carries `extraGroups = [
+"systemd-journal" ]` on top of dropping `wheel` — without it, `journalctl
+-u openbox` silently narrows to only the agent's own messages. t3code is
+not part of this any more: it is a vendor-installed *user* unit (see "t3:
+vendor-installed and self-updating, like claude and pi" below), so its
+logs were never gated by this group to begin with — they sit in the
+agent's own user journal, which the agent already owns outright.
 
 Two accounts sharing one VM also exposed a trap in lima's ssh
 multiplexing. Lima's `ControlPath` carries no `%r` in its template, and
@@ -571,11 +582,7 @@ account per subcommand: `projects`, `home-roots`, `landing-dir`,
 `ensure-repo`, `gc-user` and `aws-check` run as the agent; `generations`
 and `gc-machine` run as the operator, because ext4's root reserve — the
 thing that makes any of this recoverable on a genuinely full disk — is the
-operator's alone. `pick-project` is the one subcommand nothing on the Mac
-ever calls: it backs the guest-only `yo enter [fuzzy]` shell function (see
-"herdr: the VM runs its own server, panes are real ptys" above), invoked
-locally from inside the VM, and it is deliberately layered on top of
-`projects` rather than re-walking `$HOME` itself.
+operator's alone.
 
 `BUILD_DIRS` (`node_modules`, `target`, `.next`) is the single place
 build-output directory names are spelled, inside the guest script. The
@@ -1038,45 +1045,10 @@ a workspace opened on the saved `yolobox` machine (below), because that
 pane really is a pty on the VM's own server. `cmd_enter` knows this and
 says so: when `HERDR_ENV=1` — meaning the command itself is running
 inside a herdr pane already — it prints on stderr that an agent started
-here would be invisible, and names the `yolobox` machine as where to open
-a workspace, and to run `yo enter` there.
-
-That `yo enter` is a second, guest-side thing, strictly separate from the
-Mac's own `yo` — no cross-machine magic, nothing rides ssh back out to
-the Mac. Once inside a workspace on the `yolobox` machine, `yo enter
-[fuzzy]` is a shell function, defined only for the `agent` account
-(`environment.interactiveShellInit` in `nix/guest.nix`, guarded the same
-`[ "$(id -un)" = agent ]` way `environment.extraInit` already is in
-`nix/base.nix`; the operator's own shell never gets it, so `yo up` / `yo
-ssh` keep meaning "run this on the Mac" there). It has to be a function
-and not a script: `cd` only changes the process that runs it, so a script
-`exec`ing into a project directory would land the picked directory on a
-child process and lose it the moment that process exits — a shell
-function's `cd` is the caller's own. With no argument it lands at
-`$HOME`; with a query it hands off to a new guest-only subcommand,
-`yolobox-guest pick-project`, which runs the exact same walk `projects`
-already does — never a second, re-spelled `find` — and picks among the
-results with `fzf --select-1 --exit-0`, printing a "no project matches"
-notice on stderr the same way the Mac's own `pick_project` does when the
-query matches nothing. Any other `yo` invocation inside the guest —
-`yo status`, `yo up`, bare `yo` — refuses outright, naming `yo enter
-[fuzzy]` as the only thing that exists there and pointing at the Mac for
-everything else; nothing in the guest may grow a second Mac-only
-subcommand this way; reaching a real `yo` from inside the VM needs
-`limactl`, which the guest does not have. `pkgs.fzf` had to be added to
-`yolobox-guest`'s own `runtimeInputs` for this — `writeShellApplication`
-prefixes its script's `PATH` from that list rather than trusting whatever
-is already on the ambient one, the same reason `git` and `curl` are
-listed there despite already living in `environment.systemPackages`.
-
-One fzf-specific wart, already worked around: `yolobox-guest pick-project`
-captures fzf's picked line through a plain `$(...)`, which can never hold
-an embedded NUL byte — bash silently drops one, but logs "warning:
-command substitution: ignored null byte in input" doing it. The Mac's own
-`pick_project` needs `--read0`/`--print0` because it may hand back many
-NUL-safe entries at once to Python, which has no such limit; the guest
-picker only ever needs the one line fzf already chose, so it drops both
-flags entirely rather than eat that warning on every single pick.
+here is invisible to herdr, naming the `yolobox` machine as where to run
+agents instead. Inside the guest itself, navigation is left entirely to
+the agent's own dotfiles (`z`, `fzf`) rather than to any `yo`-shaped
+wrapper — nothing named `yo` exists in the guest at all.
 
 **The regression this design fixes, and how to recognise it if it comes
 back.** `d3fe9ff` ("herdr v0.9 supports cross-machine connections
@@ -1404,19 +1376,94 @@ startup — that retired the flake's pi-lsp extension in favour of
 pi-lens. A retired `L+` link is not removed by the rebuild that drops it;
 delete it by hand.
 
-## t3: a nix-built npm CLI, run as a service
+## t3: vendor-installed and self-updating, like claude and pi
 
-`nix/pkgs/t3.nix` builds `t3` from its npm tarball; `nix/t3.nix` runs `t3
-serve --host 127.0.0.1 --port 3773` as the guest account. Loopback in the
-guest, but lima forwards 3773 with `hostIP: "0.0.0.0"`, dialing from
-inside the guest, so the guest firewall is never traversed.
+t3code no longer comes from nix at all — `nix/pkgs/t3.nix` is gone. It
+installs and updates itself from its own vendor script, into the agent's
+home, the same as claude and pi (see "The harnesses come from their
+vendors" above): the box owns only its environment, not the binary.
+`yolobox-harness-install` (`nix/harnesses.nix`) runs `curl -fsSL
+https://t3.codes/install.sh | bash` when `~/.local/bin/t3` is absent — the
+installer never edits an rc file — and then, once, `t3 service install`
+when `~/.config/systemd/user/t3code.service` does not yet exist. That
+vendor command writes the real unit itself: `ExecStart` pointing at
+whichever version the installer just unpacked under
+`~/.t3/runtime/versions/<version>/`, `WorkingDirectory=%h`, and both
+`StandardOutput`/`StandardError` appending to
+`~/.t3/userdata/logs/boot-service.log`. `t3 update -y` — run by hand, or by
+t3's own web UI once the boot service exists — downloads a new version the
+same way and rewrites that same unit file, so a vendor update is simply
+welcome, the same guarantee claude's own launcher already relies on for
+`claude update`.
+
+`nix/t3.nix` therefore owns nothing but a drop-in on top of that unit:
+`systemd.user.services.t3code` with `overrideStrategy = "asDropin"` writes
+only `/etc/systemd/user/t3code.service.d/overrides.conf` — there is no unit
+file of that name in the nix store, so systemd's unit search finds the
+vendor's own file under `~/.config/systemd/user` first and merges this
+drop-in onto it, the same way NixOS already overrides an upstream
+`systemd`-package unit like `user@.service` (see "Memory pressure" below).
+Verify it directly: `systemctl --user cat t3code.service` (as the agent)
+prints both fragments, vendor unit first, drop-in section second. The
+drop-in pins `T3CODE_HOST=127.0.0.1` and `T3CODE_PORT=3773` — lima still
+forwards 3773 the same way, so nothing downstream of the port changes —
+and carries the agent's `SSH_AUTH_SOCK`/`AWS_CONFIG_FILE`
+(`nix/lib/agent-env.nix`) plus `NIX_LD`/`NIX_LD_LIBRARY_PATH`
+(`nix/lib/nix-ld-env.nix`): t3's own binary is a dynamically linked glibc
+ELF, and nix-ld is what lets it run unpatched, the same reason the
+harness-install script's own environment already needed those two
+variables to run `t3 --version` at install time. `path` puts
+`${homeDir}/.local` ahead of `/run/current-system/sw`, same reason as
+before: a t3-spawned claude has to go through the box's own launcher to
+pick up `HERDR_AGENT` and the Playwright settings file. Because the drop-in
+carries `unitConfig.ConditionUser = agentUser` and no `wantedBy` of its
+own, it never has to enable or start the unit itself — the vendor's `t3
+service install` already did that, and re-enabling it is t3's job to do
+again on every update, not this drop-in's.
+
+Being a user unit, not a system one, changes where its logs and its status
+live. `journalctl -u t3code` (no `--user`) and `systemctl show -p
+ActiveState t3` as the operator now answer nothing at all — an empty
+load-state, not an error — because that unit was never declared in the
+system manager's namespace to begin with. `yo`'s own
+`t3_require_service()` asks the agent instead: `systemctl --user show -p
+LoadState -p ActiveState --value t3code.service`, over `ssh_run(AGENT,
+...)`. That needs no pty and no login shell to work, because the agent
+lingers (`users.users.agent.linger`, see "The harnesses come from their
+vendors" above): logind pre-creates `/run/user/1000` at boot regardless of
+any session, and sshd's PAM stack sets `XDG_RUNTIME_DIR` for the agent's
+login on every connection, interactive or not — verified directly with a
+bare `ssh -o User=agent ... systemctl --user show ...` and no env var set
+by hand. The three failure shapes `t3_require_service()` now distinguishes
+are: no answer at all (cannot reach the agent account — `yo status`); a
+`LoadState` other than `loaded` (t3 was never installed as a service for
+this agent — restart the install unit:
+`yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 systemctl --user
+restart yolobox-harness-install`); and an `ActiveState` other than
+`active` (diagnose with `journalctl --user -u t3code` as the agent, or
+tail `~/.t3/userdata/logs/boot-service.log` directly — the same file
+either way, since the unit's own log redirection is what actually captures
+t3's output).
 
 `t3 serve`'s `$HOME` must equal an interactive session's: `t3 pair` finds
 the server through `$HOME/.t3/*/server-runtime.json`, and a mismatch makes
 `yo t3` say "No running T3 Code server found" while the unit is active.
-The unit gets `HOME` and a `path` entry for `/run/current-system/sw`, using
-the `path` option because `environment.PATH` is already defined for every
-service.
+The drop-in's `environment.HOME` is what keeps that true, the same as the
+old system unit's did.
+
+Nothing prunes `~/.t3/runtime/versions/` on its own — install.sh and `t3
+update -y` both leave every version they ever downloaded behind, ~200 MB
+each. `nix/t3.nix`'s `yolobox-t3-prune`, a `systemd.user.paths` unit
+watching that directory the same way `yolobox-claude-launcher` watches
+claude's own version store, keeps the two newest and never deletes
+whichever version `~/.local/bin/t3` currently resolves to. A version in
+flight is never a pruning target for a structural reason, not just the
+10-minute settle window borrowed from claude's keeper: install.sh only
+ever stages a download under a hidden `.staging-XXXXXX` name and
+atomically `mv`s it to its real, non-hidden `<version>` name once the
+archive is verified, extracted and already carrying `.install-complete` —
+so any directory the prune's own `find` can see at all (it excludes
+dotdirs) is by construction a completed install, never a partial one.
 
 The forward is inert on an instance that already exists: lima copies
 `lima/yolobox.yaml` into `~/.lima/yolobox/lima.yaml` at creation and reads
@@ -1429,52 +1476,19 @@ limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"hostIP":"0.0.0.0
 ./yo up
 ```
 
-### Why package.json is patched
-
-The published `package.json` carries pnpm-style `overrides` with
-`parent>child` keys, which npm rejects with `EINVALIDPACKAGENAME` once the
-package is the install root. `postPatch` deletes the field with `jq`,
-called by store path, because the same `postPatch` runs inside the
-npm-deps fixed-output derivation, which does not inherit
-`nativeBuildInputs`. The vendored `t3-package-lock.json` must be generated
-from the stripped file. Version bump: pin the tarball hash; unpack, `jq
-'del(.overrides)'`, `npm install --package-lock-only --ignore-scripts`,
-vendor the lock; build with a wrong `npmDepsHash` and pin what nix reports.
-
-### dist/bin.mjs is no longer patched
-
-t3's Claude probe hardcodes `strictMcpConfig: true`, which Claude Code
-refuses whenever an enterprise MCP config exists. That used to bite here:
-`nix/mcp.nix` once rendered one at `/etc/claude-code/managed-mcp.json`, t3
-swallowed the resulting failure completely with nothing reaching journald,
-and the only evidence was `~/.t3/caches/claudeAgent.json` reading
-`status: "warning"`, `auth: {"status": "unknown"}`, no slash commands.
-`postPatch` used to flip the flag to `false` with `sed`
-(`substituteInPlace` rejects the NUL bytes in `bin.mjs`), guarded by a
-`grep -q` so an upstream change to the probe would have failed the build
-loudly rather than silently stop patching it.
-
-`nix/mcp.nix` is gone entirely now, and the box passes claude no
-`--mcp-config` from anywhere, so there was nothing left for
-`strictMcpConfig` to trip over — the flip bought nothing here any more.
-Dropping it was verified against a rebuilt box the same way the flip's
-absence would have shown up as a regression: `rm
-~/.t3/caches/claudeAgent.json`, restart the unit, and the cache came back
-`status: "ready"`, `auth.status: "authenticated"`. The underlying bug is
-still real upstream — pingdotgg/t3code#5392 (2026-08-05) already reports
-it — so nothing is owed from this box.
-
-### Why nix builds it
-
-`node-pty` compiles on aarch64-linux, so `python3` is in
-`nativeBuildInputs`. Building in nix is what keeps the VM's runtime free
-of a C and Python toolchain.
-
 ### Log noise that is not a failure
 
-No `linux-arm64` resource-monitor binary ships, so t3 reports monitoring
-unsupported. `Grok CLI health check failed` means no grok binary. `Failed
-to flush telemetry` repeats every second when the endpoint is unreachable.
+`Grok CLI health check failed` means no grok binary — still expected,
+untouched by this rewrite. `Failed to flush telemetry` repeats every
+second when the endpoint is unreachable — also untouched. The
+"`linux-arm64` resource-monitor binary" line this section used to
+describe no longer applies: the vendor's own release ships a
+`linux-arm64` resource-monitor binary now, running unpatched under nix-ld
+the same as `t3` itself, so the old "not supported on this platform"
+message this section warned about should not appear any more — verified
+by its absence from `journalctl --user -u t3code` (as the agent) across a
+full restart, though the journal carried no distinct "monitoring started"
+line either to confirm the positive case outright.
 
 ### Pairing
 
@@ -1524,6 +1538,128 @@ On macOS a non-root process cannot bind `127.0.0.1:80` but can bind
 `0.0.0.0:80`, so lima does that for any host port below 1024 and wraps it
 in a listener that drops any non-loopback peer after the handshake. Not
 exposure. The real cost: nothing else on the Mac can bind 80 or 443.
+
+## Tailscale: t3 on the tailnet
+
+`nix/tailscale.nix` puts the box on a tailnet so t3 (see "t3:
+vendor-installed and self-updating, like claude and pi" above) is
+reachable from outside the Mac's own
+LAN, without touching the NixOS firewall. `tailscale0` stays closed:
+`services.tailscale.openFirewall = true` opens only UDP 41641, the tunnel
+port, never a hole for 3773. What actually reaches t3 is `tailscale serve
+--bg --http=3773 http://127.0.0.1:3773`, run once at boot by the
+`yolobox-tailscale-serve` oneshot, which runs `tailscale serve reset`
+first so the unit owns the whole serve config: an entry left behind under
+an earlier tailnet name — a login made with a hand-typed `--hostname`,
+say — is dropped rather than served forever next to the current one. Serve is tailscaled's own reverse
+proxy, terminating on the tailnet interface and forwarding to the
+loopback port, so the request never needs a firewall rule to cross
+`tailscale0` at all. In TUN mode (the default; nothing here sets
+`interfaceName = "userspace-networking"`) tailscaled owns that traffic
+directly.
+
+`--accept-dns=false` in `extraSetFlags` stops MagicDNS from taking over
+`/etc/resolv.conf`. Left at tailscale's default, the guest's DNS would
+answer through the tailnet's resolver for every name, not only
+`*.ts.net` ones — silently changing what every other process in the box
+resolves, including the Mac's own DNS filter this repo's AWS section
+already relies on staying in place (see "AWS credentials" below). Setting
+it false keeps DNS exactly as every other section here assumes it is; the
+box's own name is still reachable as `yolobox.<tailnet>.ts.net` by MagicDNS
+running on the *client* end of a tailnet connection, never by this guest's
+own resolver.
+
+Login is interactive and happens once, by the operator, because there is
+no auth key anywhere in this repo: `yo ssh sudo tailscale up`. It takes
+no `--hostname`: `extraSetFlags` pins the tailnet name to
+`networking.hostName`, so every box joins as `yolobox`, and a hand-typed
+`--hostname` is overwritten by the next `tailscaled-set` run anyway.
+State from that login — the node key, the tailnet
+identity — persists under `/var/lib/tailscale`, ordinary VM-local state
+like everything else under "Two accounts" above: it does not survive
+recreating the VM, and a recreated box logs in again the same way.
+
+The failure shape has no ambiguity built into it on purpose: a box that
+has never logged in, or whose login has expired, makes
+`yolobox-tailscale-serve` fail rather than quietly serve nothing or retry
+forever. The unit reads `tailscale status --json | jq -r .BackendState`;
+anything other than `Running` is exit 1 with the exact remedy on stderr —
+`yo ssh sudo tailscale up`, then `yo ssh sudo
+systemctl restart yolobox-tailscale-serve` — never a sleep loop chasing a
+state that a `tailscale up` run once was always going to settle. `t3`
+itself never depends on any of this; it keeps listening on loopback
+whether or not the tailnet is up, so t3 reached from inside the VM or
+through lima's own Mac-side forward is unaffected by a tailscale login
+that has not happened yet.
+
+The first switch into a generation with this module restarts dhcpcd,
+because nixpkgs' tailscale module adds `tailscale0` to
+`networking.dhcpcd.denyInterfaces`, which changes dhcpcd's config. On stop
+dhcpcd removes the lease address, and the kernel flushes every route that
+hung off it — including any static route a `/etc/yolobox/local.nix`
+declared through `networking.interfaces.<if>.ipv4.routes`, whose
+`network-addresses-<if>` unit runs once and never re-adds it. The switch
+reports success and the route is simply gone. Any later dhcpcd restart (a
+nixpkgs bump) does the same, so a box-local route belongs in
+`networking.dhcpcd.runHook`, re-added with `ip route replace` on every
+`BOUND`/`REBOOT`/`RENEW`/`REBIND`, where its lifetime follows the lease
+it depends on.
+
+Once logged in, `yo pair http://yolobox.<tailnet>.ts.net:3773` mints a
+pairing URL against the tailnet name instead of the default
+`<LocalHostName>.local` one (see "Pairing" above) — the same command, the
+only difference is which base URL reaches the server. That address works
+from any device already joined to the tailnet, on any network, which is
+the entire point of putting t3 there rather than only on the Mac's LAN.
+
+## far2l: TTY-only, S3 through the broker
+
+far2l (FAR Manager's Linux port) is on both accounts' PATH from
+`nix/base.nix`'s `environment.systemPackages`, through `nix/pkgs/far2l.nix`,
+an override of nixpkgs' own `far2l`. Nixpkgs builds NetRocks with openssl,
+libssh, samba, libnfs and neon, but never passes `aws-sdk-cpp`, and far2l
+looks for it with `find_package(AWSSDK QUIET COMPONENTS s3)` — so the stock
+package ships with no S3 and says so only in a cmake warning. The override
+adds `aws-sdk-cpp.override { apis = [ "s3" ]; }`, only core and s3 rather
+than the SDK's hundreds of APIs.
+
+Every NetRocks backend is gated the same quiet way, so a nixpkgs bump that
+drops a dependency would ship a far2l missing that protocol with no error
+anywhere. That is why the override's `postInstall` checks that each broker
+exists under `lib/far2l/Plugins/NetRocks/plug/` — FILE, SHELL, FTP, SFTP,
+SMB, NFS, WebDAV, AWS — and that the FTP broker links OpenSSL, since FTPS
+is not a broker of its own but only OpenSSL linked into `NetRocks-FTP`.
+Recognise the failure by `far2l: NetRocks-<proto> missing` (or the FTPS
+message) in a `nixos-rebuild` log: the fix is restoring the dependency, not
+dropping the check.
+
+`withGUI = false` and `withTTYX = false`: `DISPLAY=:0` is set box-wide and
+points at an Xvfb nobody sees (see "Browsers and the virtual display"), so a
+wx GUI build would open its window there; TTYX would route the clipboard and
+X key-modifier detection through that same invisible X server, reading the
+Xvfb's keyboard state, not the Mac's. Plain TTY mode leaves the clipboard to
+the terminal through OSC52, which does reach the Mac.
+
+Cost: the override changes far2l's derivation hash, so far2l itself never
+comes from cache.nixos.org; the box compiles it locally, about 1m40s, and
+again after every nixpkgs bump. The s3-only SDK is not a local build:
+Hydra caches `aws-sdk-cpp` with `apis = [ "s3" ]` too, verified by the first
+build here fetching it rather than compiling it.
+
+`far2l --tty --help` run with no tty attached never prints help: it
+detaches, reparents to init, and sits there forever. Plain `far2l --help`
+prints and exits; use that as a smoke test.
+
+S3 usage: leave the NetRocks site's login and password both empty; far2l
+then uses the SDK's `DefaultAWSCredentialsProviderChain`, which reads
+`AWS_CONFIG_FILE` and `AWS_PROFILE` and runs `credential_process` — exactly
+the guest config the AWS broker already renders (see "AWS credentials"
+below). So `AWS_PROFILE=<P> far2l` gets that profile's broker credentials,
+fixed for the life of that far2l process, the same per-process rule as every
+other AWS client here. Filling in only one of login/password is refused by
+far2l itself. Set the site's Region field, or leave it empty to fall back to
+the SDK's default region resolution; the site's host doubles as a custom
+endpoint (MinIO and the like).
 
 ## AWS credentials: a per-profile broker, selected per process by `AWS_PROFILE`
 

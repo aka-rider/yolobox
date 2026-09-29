@@ -73,6 +73,7 @@
           ./nix/agentic.nix
           ./nix/lsp.nix
           ./nix/guest.nix
+          ./nix/tailscale.nix
         ];
       };
     };
