@@ -5,6 +5,7 @@ let
   claudeHooksFile = import ./lib/claude-hooks-file.nix;
   homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
+  nixLdEnv = import ./lib/nix-ld-env.nix;
 
   launcherPath = "/etc/yolobox/bin/claude";
   launcherLink = "${homeDir}/.local/bin/claude";
@@ -116,6 +117,12 @@ let
 
       command -v pi >/dev/null || npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 
+      # t3code's own vendor install; it never edits an rc file. Its installer
+      # unpacks straight into the layout `t3 service install` also uses, so
+      # this download is reused rather than repeated.
+      [ -x "$HOME/.local/bin/t3" ] || curl -fsSL https://t3.codes/install.sh | bash
+      [ -f "$HOME/.config/systemd/user/t3code.service" ] || t3 service install
+
       # Scripts ON, unlike pi: agent-browser's postinstall IS the download of
       # its prebuilt binary. That download fails silently, so the version call
       # below is the hard check rather than a courtesy. Pinned because
@@ -154,6 +161,7 @@ let
 
       claude --version
       pi --version
+      t3 --version
       opencode --version
       agent-browser --version
       node --version
@@ -274,13 +282,14 @@ in
         pkgs.jq
         herdrPkg
       ];
+      # NIX_LD/NIX_LD_LIBRARY_PATH are spelled out rather than inherited: this
+      # unit must not depend on PAM having reached the user manager with a
+      # login environment. t3's own downloaded binary needs them too, at
+      # install time (the vendor script runs `t3 --version` to verify the
+      # download) and every time t3code.service execs it (nix/t3.nix).
       environment = {
         NPM_CONFIG_PREFIX = "${homeDir}/.local";
-        # Spelled out rather than inherited: this unit must not depend on PAM
-        # having reached the user manager with a login environment.
-        NIX_LD = "/run/current-system/sw/share/nix-ld/lib/ld.so";
-        NIX_LD_LIBRARY_PATH = "/run/current-system/sw/share/nix-ld/lib";
-      };
+      } // nixLdEnv;
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;

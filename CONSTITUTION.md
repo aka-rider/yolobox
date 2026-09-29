@@ -181,11 +181,6 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 - ALWAYS start an agent in a herdr pane on the saved `yolobox` machine,
   never expect `yo enter`'s plain landing shell to report to herdr. Only a
   real pty opened against the VM's own herdr server reaches its manifest.
-- NEVER grow the guest-side `yo` shell function into anything but `yo enter
-  [fuzzy]`. It exists only to `cd` inside a herdr pane already running in
-  the VM; every other `yo` subcommand needs `limactl` and `~/.lima`, which
-  do not exist in the guest, so it refuses everything else outright and
-  names the Mac.
 - ALWAYS treat herdr compatibility as capability-gated, not
   version-equal. `herdr machine add` accepts a saved connection only when
   the guest's `endpoint_protocol_generation` matches the client's own
@@ -230,8 +225,9 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 - ALWAYS install pi packages with `pi install`, never by editing its
   settings file.
 - ALWAYS keep the VM free of a C and Python toolchain. It keeps native npm
-  modules from compiling at install time; packages that need it are built
-  by nix (`nix/pkgs/t3.nix`) instead.
+  modules from compiling at install time; every package that would
+  otherwise need one — t3, agent-browser — installs itself from a
+  vendor-shipped prebuilt binary instead of a source npm package.
 - NEVER set `PLAYWRIGHT_MCP_USER_DATA_DIR`. The box runs Playwright
   isolated per launch, and the server throws when both an isolated launch
   and a user-data-dir are set.

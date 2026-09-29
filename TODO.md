@@ -106,3 +106,16 @@ Texts, diffs and the posting runbook live in `upstream/`; see `upstream/POST.md`
   before (see CLAUDE.md, "AWS credentials"). Worth a `yo` doctor check
   that tells the two shapes apart, since neither produces an error
   anywhere on its own.
+- `yo status` says nothing about tailscale (see CLAUDE.md, "Tailscale: t3
+  on the tailnet"). It should report whether the box is logged in
+  (`tailscale status --json`'s `BackendState`) and whether
+  `yolobox-tailscale-serve` is active, the same way it already reports
+  the 1Password and AWS broker forwards, so a login that has expired or
+  never happened is visible from the Mac without an `ssh` round trip.
+- Now that t3 is reachable over the tailnet, decide whether lima's
+  `hostIP: "0.0.0.0"` forward of 3773 (see CLAUDE.md, "t3: a nix-built
+  npm CLI, run as a service") should be narrowed back to loopback. The
+  tailnet forward makes the `0.0.0.0` LAN exposure redundant for anyone
+  who has joined the tailnet; it is not redundant for a Mac-only setup
+  that never runs `tailscale up`, so this is a product decision, not a
+  bug.

@@ -1,29 +1,65 @@
 { config, lib, pkgs, agentUser, ... }:
 let
-  t3 = pkgs.callPackage ./pkgs/t3.nix { };
   homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
   agentEnv = import ./lib/agent-env.nix { agentHome = homeDir; };
+  nixLdEnv = import ./lib/nix-ld-env.nix;
+
+  t3VersionsDir = "${homeDir}/.t3/runtime/versions";
+  t3Link = "${homeDir}/.local/bin/t3";
+
+  # Mirrors claudeLauncherKeeper (nix/harnesses.nix): the vendor's own
+  # install.sh and `t3 update -y` both leave every downloaded version behind
+  # under runtime/versions, ~200 MB each, and nothing else prunes them. A
+  # completed version is a plain directory; install.sh only ever stages one
+  # under a hidden `.staging-XXXXXX` name and atomically `mv`s it into place
+  # already carrying `.install-complete`, so excluding dotdirs is enough to
+  # skip an install still in flight — no separate sentinel check needed.
+  t3PruneKeeper = pkgs.writeShellApplication {
+    name = "yolobox-t3-prune";
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils ];
+    text = ''
+      keep_versions=2
+      settle_minutes=10
+
+      current_dir="$(dirname "$(readlink -f "${t3Link}" 2>/dev/null || true)" 2>/dev/null || true)"
+
+      stale="$(find "${t3VersionsDir}" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -mmin "+$settle_minutes" -printf '%f\n' 2>/dev/null | sort -V | head -n "-$keep_versions" || true)"
+      if [ -n "$stale" ]; then
+        while IFS= read -r version; do
+          dir="${t3VersionsDir}/$version"
+          if [ "$dir" = "$current_dir" ]; then
+            continue
+          fi
+          rm -rf "$dir"
+          echo "pruned $dir"
+        done <<< "$stale"
+      fi
+    '';
+  };
 in
 {
-  systemd.services.t3 = {
-    wantedBy = [ "multi-user.target" ];
-    after = [ "network.target" ];
-    # A system service inherits neither a login PATH nor a HOME, and t3 shells
-    # out to the harnesses it drives (claude, opencode) and to git, then keeps
-    # its state under $HOME/.t3 — the same $HOME an interactive `yo enter`
-    # session gets, or `t3 pair` (run interactively to mint a pairing token)
-    # can't find this server's runtime file. The agent's ~/.local comes first
-    # so a t3-spawned claude goes through the launcher that sets HERDR_AGENT
-    # and the Playwright settings file (nix/harnesses.nix), and opencode
-    # resolves at all.
+  # t3code installs and updates itself from its own vendor script
+  # (nix/harnesses.nix), the same way claude does — the box owns only its
+  # environment. `t3 service install` writes the real unit,
+  # ~/.config/systemd/user/t3code.service, with its own ExecStart,
+  # WorkingDirectory and log redirection, and `t3 update -y` rewrites that
+  # same file on every update; this is a drop-in on top of it, never a
+  # replacement, so it survives every update unaffected. `overrideStrategy
+  # = "asDropin"` writes only /etc/systemd/user/t3code.service.d/overrides.conf
+  # — with no unit file of ours at that name, systemd finds the vendor's own
+  # unit under ~/.config/systemd/user first and merges this drop-in onto it.
+  systemd.user.services.t3code = {
+    overrideStrategy = "asDropin";
+    unitConfig.ConditionUser = agentUser;
+    # ~/.local first so a t3-spawned claude goes through the box launcher
+    # that sets HERDR_AGENT and the Playwright settings file
+    # (nix/harnesses.nix), and so opencode resolves at all.
     path = [ "${homeDir}/.local" "/run/current-system/sw" ];
-    environment = agentEnv.env // { HOME = homeDir; };
-    serviceConfig = {
-      User = agentUser;
-      Group = "users";
-      Restart = "always";
-      ExecStart = "${lib.getExe t3} serve --host 127.0.0.1 --port 3773";
+    environment = agentEnv.env // nixLdEnv // {
+      HOME = homeDir;
+      T3CODE_HOST = "127.0.0.1";
+      T3CODE_PORT = "3773";
     };
   };
 
@@ -34,5 +70,18 @@ in
     links = [ ];
   };
 
-  environment.systemPackages = [ t3 ];
+  systemd.user.paths.yolobox-t3-prune = {
+    description = "Watch t3code's version store";
+    unitConfig.ConditionUser = agentUser;
+    wantedBy = [ "paths.target" ];
+    pathConfig.PathModified = [ t3VersionsDir ];
+  };
+  systemd.user.services.yolobox-t3-prune = {
+    description = "Prune old t3code versions";
+    unitConfig.ConditionUser = agentUser;
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = lib.getExe t3PruneKeeper;
+    };
+  };
 }

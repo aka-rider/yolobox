@@ -106,8 +106,8 @@ class TestSshRemainderPassthrough(unittest.TestCase):
         )
 
     def test_a_plain_remote_command_round_trips_intact(self):
-        args = self.parse(["ssh", "journalctl", "-u", "t3", "-n", "50"])
-        self.assertEqual(args.ssh_cmd, ["journalctl", "-u", "t3", "-n", "50"])
+        args = self.parse(["ssh", "journalctl", "--user", "-u", "t3code", "-n", "50"])
+        self.assertEqual(args.ssh_cmd, ["journalctl", "--user", "-u", "t3code", "-n", "50"])
 
     def test_no_remote_command_is_an_empty_list(self):
         args = self.parse(["ssh"])
@@ -499,7 +499,7 @@ class TestCmdEnterArgv(FakeHome):
         fake_err.assert_called_once()
         message = fake_err.call_args[0][0]
         self.assertIn("yolobox herdr machine", message)
-        self.assertIn("`yo enter`", message)
+        self.assertIn("invisible to herdr", message)
 
     def test_no_herdr_env_prints_nothing(self):
         with env_without("HERDR_ENV"):

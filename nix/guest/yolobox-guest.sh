@@ -2,7 +2,7 @@
 # The guest-side half of `yo`: subcommands over ssh, one per account, so the
 # find expressions, the gc tiers and the AWS probe are shellchecked at build
 # time instead of living in yo's Python string literals where nothing checks
-# them. Subcommands: projects, pick-project, home-roots, landing-dir,
+# them. Subcommands: projects, home-roots, landing-dir,
 # ensure-repo, generations, gc-machine, gc-user, aws-creds, aws-check.
 #
 # writeShellApplication prepends `set -o errexit -o nounset -o pipefail`. The
@@ -119,48 +119,6 @@ cmd_projects() {
         "${EXPR[@]}" -prune -o \
         -name .git \( -type d -o -type f \) -printf '%h\0' -prune -o \
         -name '.*' -prune
-}
-
-# The guest-side half of `yo enter [fuzzy]`, called from the agent-only `yo`
-# shell function (nix/guest.nix): picks a project the same way the Mac's own
-# pick_project does, over the same walk, so the two never drift apart. A find
-# permission error is cmd_projects' own problem to report (its stderr is
-# never redirected below), not this function's to re-derive.
-cmd_pick_project() {
-    local query="${1:-}"
-    local list_file entry
-    list_file="$(mktemp)"
-    cmd_projects >"${list_file}" || true
-
-    local -a projects=()
-    while IFS= read -r -d '' entry; do
-        case "${entry}" in
-        "$HOME"/*) projects+=("${entry#"$HOME"/}") ;;
-        esac
-    done <"${list_file}"
-    rm -f "${list_file}"
-
-    if [ "${#projects[@]}" -eq 0 ]; then
-        printf 'yo: no projects in the VM\n' >&2
-        exit 1
-    fi
-
-    # Newline-terminated, not --read0/--print0: fzf only ever hands back one
-    # picked line here, and a NUL in that line would survive the round trip
-    # through find but not through this $(...) capture — bash drops it with
-    # a "warning: command substitution: ignored null byte in input" logged
-    # on every single pick, which is worse than the (pathological) case of a
-    # project directory whose name contains a literal newline.
-    local choice rc=0
-    choice="$(printf '%s\n' "${projects[@]}" | sort | fzf --select-1 --exit-0 --query="${query}")" || rc=$?
-    if [ "${rc}" != 0 ]; then
-        if [ "${rc}" != 130 ]; then
-            printf 'yo: no project matches "%s"\n' "${query}" >&2
-        fi
-        exit "${rc}"
-    fi
-
-    printf '%s\n' "${HOME}/${choice}"
 }
 
 cmd_home_roots() {
@@ -397,7 +355,6 @@ main() {
     [ "$#" -ge 1 ] && shift
     case "${sub}" in
     projects) cmd_projects ;;
-    pick-project) cmd_pick_project "$@" ;;
     home-roots) cmd_home_roots ;;
     landing-dir) cmd_landing_dir "$@" ;;
     ensure-repo) cmd_ensure_repo "$@" ;;

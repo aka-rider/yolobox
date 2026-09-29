@@ -67,7 +67,7 @@ Run `yo --help` for the rest of the commands.
 
 The VM runs its own herdr server, as the `agent` account, up from boot. `yo bootstrap` adds the `yolobox` machine to your Mac's herdr automatically, so there is nothing to run by hand.
 
-Open a workspace on the `yolobox` machine and run `pi` or `claude` there — that pane is where herdr can see the agent. `yo enter` (from the Mac), `yo ssh`, `yo code` and `yo zed` are plain shells outside herdr's own panes, so an agent started in one of them stays invisible to herdr. Once inside that workspace, a second, guest-only `yo enter [fuzzy]` shell function picks among the VM's projects with fzf and `cd`s there — strictly in-guest, no reach back to the Mac's own `yo`.
+Open a workspace on the `yolobox` machine and run `pi` or `claude` there — that pane is where herdr can see the agent. `yo enter` (from the Mac), `yo ssh`, `yo code` and `yo zed` are plain shells outside herdr's own panes, so an agent started in one of them stays invisible to herdr.
 
 herdr supports sharing clipboard images with a remote client over a machine connection.
 
@@ -102,6 +102,20 @@ yo t3
 
 T3 code can be paired remotely, so you could manage a fleet of VMs, servers, laptops using the same UI.
 T3 Code gives you a mobile app, as a bonus.
+
+#### T3 over Tailscale
+
+t3 is also reachable from any device on your [Tailscale](https://tailscale.com/) tailnet, not just your Mac's LAN. Log in once:
+
+```bash
+yo ssh sudo tailscale up
+```
+
+Then pair against the tailnet address instead of the default one:
+
+```bash
+yo pair http://yolobox.<tailnet>.ts.net:3773
+```
 
 ### Zed and Visual Studio Code
 
