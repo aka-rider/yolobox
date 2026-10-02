@@ -1095,26 +1095,37 @@ def du_kib(path: str) -> Optional[int]:
         return None
 
 
-def cmd_status(args: argparse.Namespace) -> None:
-    run(["limactl", "list", INSTANCE], capture=False)
+TAILSCALE_SERVE_UNIT = "yolobox-tailscale-serve"
+TAILSCALE_SERVE_RESTART = "yo ssh sudo systemctl restart %s" % TAILSCALE_SERVE_UNIT
+# One operator round trip: tailscale's own JSON, a separator line, then the
+# serve unit's state. `command -v` first, so a box predating nix/tailscale.nix
+# answers with a marker instead of a bare "not found".
+TAILSCALE_PROBE = (
+    "command -v tailscale >/dev/null 2>&1 || { echo %s; exit 0; }; "
+    "tailscale status --json; echo; echo %s; "
+    "systemctl show -p ActiveState --value %s"
+) % (shlex.quote("NO_TAILSCALE"), shlex.quote("---"), TAILSCALE_SERVE_UNIT)
 
-    guest_df = second_line(guest_out(["df", "-h", "/"], check=False))
-    if guest_df:
-        out("disk: guest %s" % guest_df)
-        fields = guest_df.split()
-        use_pct = fields[4].rstrip("%") if len(fields) > 4 else ""
-        if use_pct.isdigit() and int(use_pct) >= 90:
-            out(
-                "disk: WARNING guest / is %s%% full — reclaim with: yo gc --deep --yes, or raise the ceiling with: yo disk-grow <GiB>"
-                % use_pct
-            )
-    image_kib = du_kib(os.path.join(lima_dir(), "disk"))
-    if image_kib is not None:
-        out(
-            "disk: image ~/.lima/%s/disk allocates %dGiB on this Mac"
-            % (INSTANCE, image_kib // 1024 // 1024)
-        )
 
+def tailscale_status_line(stdout: str, stderr: str) -> str:
+    if stdout.strip() == "NO_TAILSCALE":
+        return "tailscale: box predates the tailnet module; run `yo bootstrap`"
+    status_json, _, serve_state = stdout.partition("\n---\n")
+    try:
+        backend = json.loads(status_json)["BackendState"]
+    except (ValueError, KeyError, TypeError):
+        detail = stderr.strip() or status_json.strip() or "no output"
+        return "tailscale: WARNING status unreadable: %s" % detail
+    serve = serve_state.strip() or "unknown"
+    if backend == "Running" and serve == "active":
+        return "tailscale: Running, serve active"
+    remedy = TAILSCALE_SERVE_RESTART
+    if backend != "Running":
+        remedy = "yo ssh sudo tailscale up, then: " + remedy
+    return "tailscale: WARNING %s, serve %s — fix with: %s" % (backend, serve, remedy)
+
+
+def status_guest_services() -> None:
     guest_version_raw = guest_out(["cat", "/etc/yolobox/version"], check=False).strip()
     guest_version = guest_version_raw or None
     unknown_note = "unknown (box built before /etc/yolobox/version existed)"
@@ -1135,6 +1146,45 @@ def cmd_status(args: argparse.Namespace) -> None:
     else:
         out("yo: %s" % UNITS_MISSING_NOTE)
 
+    tailscale_probe = ssh_run(OPERATOR, ["sh", "-c", TAILSCALE_PROBE], check=False)
+    out(tailscale_status_line(tailscale_probe.stdout, tailscale_probe.stderr))
+
+    t3_problem = t3_service_problem(*t3_unit_state())
+    out("t3: %s" % ("WARNING " + t3_problem if t3_problem else "active"))
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    run(["limactl", "list", INSTANCE], capture=False)
+
+    # Every guest probe below fails the same way on a VM that is down, so ask
+    # once and say it once instead of printing a warning per probe.
+    status, detail = account_status()
+    vm_reachable = status != "unreachable"
+    if not vm_reachable:
+        if detail:
+            err(detail)
+        out("vm: unreachable — is it up? start it with: yo up")
+
+    guest_df = second_line(guest_out(["df", "-h", "/"], check=False)) if vm_reachable else ""
+    if guest_df:
+        out("disk: guest %s" % guest_df)
+        fields = guest_df.split()
+        use_pct = fields[4].rstrip("%") if len(fields) > 4 else ""
+        if use_pct.isdigit() and int(use_pct) >= 90:
+            out(
+                "disk: WARNING guest / is %s%% full — reclaim with: yo gc --deep --yes, or raise the ceiling with: yo disk-grow <GiB>"
+                % use_pct
+            )
+    image_kib = du_kib(os.path.join(lima_dir(), "disk"))
+    if image_kib is not None:
+        out(
+            "disk: image ~/.lima/%s/disk allocates %dGiB on this Mac"
+            % (INSTANCE, image_kib // 1024 // 1024)
+        )
+
+    if vm_reachable:
+        status_guest_services()
+
     gaps = lima_config_gaps()
     if gaps:
         out("lima: %s" % lima_config_gap_message(gaps))
@@ -1151,6 +1201,8 @@ def cmd_status(args: argparse.Namespace) -> None:
         else:
             if not allowed:
                 out("aws: disabled (no 'aws' CLI or no SSO profiles in ~/.aws/config)")
+            elif not vm_reachable:
+                out("aws: guest forward not checked (VM unreachable)")
             else:
                 aws_forward_probe = ssh_run(
                     AGENT,
@@ -1479,7 +1531,7 @@ def cmd_zed(args: argparse.Namespace) -> None:
     exec_process(["zed", "ssh://%s@%s%s" % (AGENT_USER, VM_HOST, target)])
 
 
-def t3_require_service() -> None:
+def t3_unit_state() -> Tuple[str, str]:
     # t3code is a vendor-installed *user* unit now (nix/t3.nix), not a system
     # one — installed and kept current by yolobox-harness-install, running
     # as the agent from boot (see CLAUDE.md, "The harnesses come from their
@@ -1491,22 +1543,31 @@ def t3_require_service() -> None:
         ["systemctl", "--user", "show", "-p", "LoadState", "-p", "ActiveState", "--value", "t3code.service"],
         check=False,
     ).stdout.splitlines()
-    load_state = unit[0] if unit else ""
-    active_state = unit[1] if len(unit) > 1 else ""
+    return (unit[0] if unit else ""), (unit[1] if len(unit) > 1 else "")
+
+
+def t3_service_problem(load_state: str, active_state: str) -> Optional[str]:
     if not load_state:
-        raise YoError("cannot reach the VM's agent account to ask about t3code — is it up? (yo status)")
+        return "cannot reach the VM's agent account to ask about t3code — is it up? (yo status)"
     if load_state != "loaded":
-        raise YoError(
+        return (
             "t3code is not installed for the agent yet — its install is a user service: "
             "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 "
             "systemctl --user restart yolobox-harness-install"
         )
     if active_state != "active":
-        raise YoError(
+        return (
             "t3code service is %s in the VM — diagnose with: "
             "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 journalctl --user -u t3code -n 50, "
             "or tail ~/.t3/userdata/logs/boot-service.log as the agent" % active_state
         )
+    return None
+
+
+def t3_require_service() -> None:
+    problem = t3_service_problem(*t3_unit_state())
+    if problem:
+        raise YoError(problem)
     probe = run(["curl", "-sS", "-o", "/dev/null", "--max-time", "5", "http://127.0.0.1:%d/" % T3_PORT])
     if probe.returncode != 0:
         err("yo: t3 is healthy in the VM but 127.0.0.1:%d does not answer on this Mac —" % T3_PORT)
@@ -1632,6 +1693,10 @@ def tar_stream(members: Sequence[Tuple[str, str]]) -> bytes:
 SEED_STRIP_RE = re.compile(r"^\s*(Include|IdentityAgent)\s", re.IGNORECASE)
 
 
+def seed_push(script: str, payload: bytes) -> None:
+    ssh_run(AGENT, ["sh", "-c", script], stdin=payload, mux=True, capture=False, check=True)
+
+
 def seed_ssh(report: Report) -> None:
     config_path = os.path.join(home(), ".ssh", "config")
     try:
@@ -1641,28 +1706,14 @@ def seed_ssh(report: Report) -> None:
         report.ok("no ~/.ssh/config on this Mac — skipped")
     else:
         filtered = "".join(line for line in lines if not SEED_STRIP_RE.search(line))
-        ssh_run(
-            AGENT,
-            ["sh", "-c", SEED_SSH_CONFIG],
-            stdin=filtered.encode(),
-            mux=True,
-            capture=False,
-            check=True,
-        )
+        seed_push(SEED_SSH_CONFIG, filtered.encode())
 
     ssh_dir = Path(home()) / ".ssh"
     pubkeys = sorted(str(p) for p in ssh_dir.glob("*.pub") if p.is_file())
     if not pubkeys:
         return
     members = [(path, os.path.basename(path)) for path in pubkeys]
-    ssh_run(
-        AGENT,
-        ["sh", "-c", SEED_UNTAR_SSH],
-        stdin=tar_stream(members),
-        mux=True,
-        capture=False,
-        check=True,
-    )
+    seed_push(SEED_UNTAR_SSH, tar_stream(members))
 
 
 def seed_gitconfig() -> None:
@@ -1679,14 +1730,7 @@ def seed_gitconfig() -> None:
                 members.append((str(identity), str(identity.relative_to(home()))))
     if not members:
         return
-    ssh_run(
-        AGENT,
-        ["sh", "-c", SEED_UNTAR_HOME],
-        stdin=tar_stream(members),
-        mux=True,
-        capture=False,
-        check=True,
-    )
+    seed_push(SEED_UNTAR_HOME, tar_stream(members))
 
 
 def seed_all() -> None:

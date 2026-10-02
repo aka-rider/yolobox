@@ -81,16 +81,21 @@ let
         echo "relinked ${launcherLink} -> ${launcherPath}"
       fi
 
-      # Only versions the updater finished with more than $settle_minutes
-      # minutes ago are candidates, so a download in flight is never a
-      # pruning target. Nothing else prunes them: keeping every version is
-      # precisely what the custom launcher buys, at ~330 MB each.
-      stale="$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -mmin "+$settle_minutes" -printf '%f\n' 2>/dev/null | sort -V | head -n "-$keep_versions" || true)"
-      if [ -n "$stale" ]; then
+      # Rank every version first, so a fresh download counts toward the
+      # $keep_versions kept (the launcher runs the newest, which ranking
+      # always spares). Only then does settling filter the rest: one the
+      # updater finished with more than $settle_minutes minutes ago, so a
+      # download in flight is never a pruning target. Nothing else prunes
+      # them: keeping every version is precisely what the custom launcher
+      # buys, at ~330 MB each.
+      older="$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -printf '%f\n' 2>/dev/null | sort -V | head -n "-$keep_versions" || true)"
+      if [ -n "$older" ]; then
         while IFS= read -r version; do
-          rm -f "${claudeVersionsDir}/$version"
-          echo "pruned ${claudeVersionsDir}/$version"
-        done <<< "$stale"
+          if [ -n "$(find "${claudeVersionsDir}/$version" -maxdepth 0 -mmin "+$settle_minutes" -print)" ]; then
+            rm -f "${claudeVersionsDir}/$version"
+            echo "pruned ${claudeVersionsDir}/$version"
+          fi
+        done <<< "$older"
       fi
     '';
   };
@@ -125,10 +130,10 @@ let
 
       # Scripts ON, unlike pi: agent-browser's postinstall IS the download of
       # its prebuilt binary. That download fails silently, so the version call
-      # below is the hard check rather than a courtesy. Pinned because
-      # pi-agent-browser-native 0.5.0 refuses every browser-backed call
-      # against any agent-browser but exactly 0.34.0, at call time, not here.
-      command -v agent-browser >/dev/null || npm install -g agent-browser@0.34.0
+      # below is the hard check rather than a courtesy. Pinned to the version
+      # pi-agent-browser-native 0.8.2 recommends; it accepts 0.35.0 and newer,
+      # and refuses browser-backed calls below that floor, at call time, not here.
+      command -v agent-browser >/dev/null || npm install -g agent-browser@0.38.1
       agent-browser --version
 
       for package in @upstash/context7-pi pi-agent-browser-native; do
@@ -242,6 +247,18 @@ in
       unitConfig.ConditionUser = agentUser;
       wantedBy = [ "paths.target" ];
       pathConfig.PathModified = [ "%h/.local/bin" "%h/.local/share/claude/versions" ];
+    };
+    # The path unit only fires on a change, and a version too fresh to prune
+    # then becomes prunable with nothing left to change, so the same service
+    # also runs hourly.
+    systemd.user.timers.yolobox-claude-launcher = {
+      description = "Periodically prune the agent's old claude versions";
+      unitConfig.ConditionUser = agentUser;
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = "hourly";
+        Persistent = true;
+      };
     };
     systemd.user.services.yolobox-claude-launcher = {
       description = "Re-assert the box's claude launcher and prune old versions";
