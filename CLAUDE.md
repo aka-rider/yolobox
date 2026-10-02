@@ -54,7 +54,7 @@ rules this file justifies.
   release.
 - `tests/test_yo.py` — unit tests for yo's pure functions and argv builders;
   `python3 -m unittest discover -s tests`.
-- `TODO.md` — known problems, including the upstream reports still owed.
+- `TODO.md` — known problems and the upstream PRs still awaiting review.
 
 ## Two accounts: the operator mirrors the host, the agent does not
 
@@ -347,7 +347,11 @@ rebuild/reboot decision has fully settled (whether or not that needed a
 `limactl restart`), it calls `vm_services()` itself exactly once, never
 twice. `yo status` on a box with the proxy units prints the 1Password
 probe status and the proxy socket unit statuses; on an older box without
-them prints `UNITS_MISSING_NOTE`. It always prints a lima line from
+them prints `UNITS_MISSING_NOTE`. It always prints a `tailscale:` line
+(`BackendState` plus the state of `yolobox-tailscale-serve`, read in one
+operator ssh round trip; see "Tailscale: t3 on the tailnet" below), a
+`t3:` line (the agent-side `systemctl --user show` of `t3code.service`,
+see "t3: vendor-installed and self-updating" below), a lima line from
 `lima_config_gaps()`, and catches `YoError` from `aws_allowlist()` to
 print "aws: config unreadable: ..." when the AWS config cannot be read.
 
@@ -585,7 +589,10 @@ thing that makes any of this recoverable on a genuinely full disk — is the
 operator's alone.
 
 `BUILD_DIRS` (`node_modules`, `target`, `.next`) is the single place
-build-output directory names are spelled, inside the guest script. The
+build-output directory names are spelled, inside the guest script; the one
+other spelling, the prose of `yo gc`'s `--help` in `build_parser()`, is
+guarded by `TestGcHelpNamesEveryBuildDir`, which fails when the help stops
+naming a directory in the array. The
 project walk prunes them, because a repo living inside `node_modules` is
 not a project a person would pick; `gc --deep` matches them, because there
 they are the thing being deleted. One list serves both on purpose — before
@@ -752,6 +759,19 @@ each recognisable on its own:
   older commit would silently republish different content. Recognise this by
   a workflow failure on a release created from a feature branch, with an
   explicit refusal message before any tag move or archive happens.
+- **A tag that does not evaluate.** Published tags up to and including
+  v1.0.1 cannot be rebuilt: `nix/base.nix` carried a stray
+  `programs.git-lfs.enable = true` (introduced by `13eae86`, "enable
+  git-lfs globally") two lines below the correct `programs.git.lfs.enable`,
+  and `programs.git-lfs` is not a NixOS option in any nixpkgs branch, so
+  `nixos-rebuild --flake 'github:aka-rider/yolobox/v1.0.1#yolobox'` dies in
+  evaluation with "The option `programs.git-lfs' does not exist",
+  `/etc/yolobox/local.nix` or not. `ede89be` removed the line, so v1.1.0
+  and later evaluate (v1.0.0 and v1.0.2 were not checked; any tree between
+  `13eae86` and `ede89be` carries it). The tags were not moved or yanked,
+  because moving a published tag republishes different content under a
+  name someone may have fetched. A box on one of them, or built from a
+  ref in that range, must use a ref of v1.1.0 or newer.
 - **`bump-tap` fails on the tag `release` just moved.** The v0.9.0 release
   (2026-09-02) showed it: `verify` and `release` both succeeded, then
   `bump-tap`'s bare `actions/checkout@v6` died with `The ref
@@ -762,7 +782,8 @@ each recognisable on its own:
   was published (`testRef` in `src/ref-helper.ts`). Two jobs earlier,
   `release` had force-moved the tag onto its own stamp commit, so the
   assertion fails by construction. This is a behaviour change in
-  actions/checkout v6.0.2 (`actions/checkout#2356`, "Fix tag handling"): a
+  actions/checkout v6.0.2 and later (`actions/checkout#2356`, "Fix tag
+  handling"; v7.0.1 keeps it, and `bump-tap`'s pin still holds there): a
   tag used to be fetched by sha, so a moved tag went unnoticed; now it is
   fetched by name and compared, and no input turns the comparison off. The
   check is skipped only when `ref:` names an explicit branch or tag, because
@@ -777,6 +798,22 @@ each recognisable on its own:
   fix to the workflow itself can only be proven by cutting a new release —
   v0.9.0 shipped with a tarball and no tap formula, and v0.9.1 was the
   first release to carry both.
+
+`verify.yml` is the one workflow `ci.yml` and `release.yml` share, and
+`release` declares `needs: verify`, so whatever it checks gates a tag move.
+Besides ruff, the unit tests and the `yo --help` smoke test it has an
+`eval` job: `YOLOBOX_USERNAME=ci nix eval --impure --raw --option
+allow-import-from-derivation false
+.#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath`, on
+`cachix/install-nix-action@v31`. It evaluates the whole box configuration
+without building it, so an invalid option fails CI before a tag is moved
+instead of on a user's `yo bootstrap` (the v1.0.1 shape above). It needs no
+aarch64 builder, because the derivation path is computed and never realised,
+and forbidding import-from-derivation is what keeps it so. Proven the way a
+test should be: re-adding `programs.git-lfs` makes it fail. The actions are
+at `actions/checkout@v7` and `astral-sh/ruff-action@v4.1.0`; ruff-action v4
+has no floating major tag (its releases are immutable), so it is pinned to
+the exact tag.
 
 ## tmpfiles rules apply on `switch`
 
@@ -1095,11 +1132,10 @@ the old rule, exact version equality between the two, was strictly finer
 than what compatibility actually needs.
 
 The VM's herdr is pinned regardless, through the existing
-`yolobox.harness.herdr.version`/`.hash` valve in `flake.nix` — to 0.9.1,
-because the pinned nixpkgs still carries 0.8.2, and taking 0.9.1 from
-nixpkgs would have dragged a whole nixpkgs move, a new kernel included,
-onto a 249 MiB ESP that already holds exactly one kernel set (see "The
-ESP is 249 MiB" below). The pin fetches the published
+`yolobox.harness.herdr.version`/`.hash` valve in `flake.nix` — to 0.9.3,
+because the pinned nixpkgs lags the Mac's herdr (it carried 0.8.2, and
+carries 0.9.1 now), and the Mac's herdr, not nixpkgs, sets the generation
+the guest must speak. The pin fetches the published
 `herdr-linux-aarch64` release asset directly (`nix/pkgs/herdr-bin.nix`);
 it carries no `PT_INTERP` and no `PT_DYNAMIC` — statically linked — so it
 runs on NixOS unpatched, with none of the nix-ld dance a dynamically
@@ -1239,10 +1275,21 @@ gone.
 The custom launcher costs one thing: claude prunes old versions only when
 it owns the launcher, and each version is about 330 MB. So the same user
 path unit that guards the link, `yolobox-claude-launcher`, also prunes
-`versions/` to the two newest. It watches both `~/.local/bin` and
-`versions/`, re-links within a second when `readlink` disagrees, writes
-only when something is actually wrong (so the modification it causes
-settles rather than looping), and logs the one line saying it did. The
+`versions/` to the two newest. The keeper ranks *all* versions first, so a
+fresh download counts toward the two kept (the launcher runs the newest,
+which ranking always spares), and only then deletes the older ones that are
+settled, i.e. untouched for more than ten minutes, so a download in flight
+is never a pruning target. Filtering by settledness before ranking, as it
+once did, kept a third version around: the fresh one was not a candidate,
+so it did not displace anybody, and the settled ones were pruned down to
+two without it. The path unit fires only on a change and a version too
+fresh to prune becomes prunable with nothing left to change, so an hourly
+`yolobox-claude-launcher.timer` (`Persistent=true`, so a missed hour runs
+at the next login) runs the same service. The unit watches both
+`~/.local/bin` and `versions/`, re-links within a second when `readlink`
+disagrees, writes only when something is actually wrong (so the
+modification it causes settles rather than looping), and logs the one line
+saying it did. The
 tmpfiles rules at boot and on `switch` are the backstop for the window the
 path unit cannot see — an install made while no user manager of the
 agent's was running.
@@ -1255,9 +1302,10 @@ https://claude.ai/install.sh | bash -s latest` when `versions/` is empty,
 then the marketplace and plugins (below); pi via `npm install -g
 --ignore-scripts @earendil-works/pi-coding-agent` — the package nixpkgs
 tracked, `@mariozechner/pi-coding-agent`, was deprecated in May 2026;
-agent-browser via `npm install -g agent-browser@0.34.0` **with** scripts,
-pinned because pi-agent-browser-native 0.5.0 refuses browser-backed calls
-against any other agent-browser version, at call time; scripts run because
+agent-browser via `npm install -g agent-browser@0.38.1` **with** scripts,
+the version pi-agent-browser-native 0.8.2 recommends (it accepts 0.35.0 and
+newer, and refuses browser-backed calls below that floor, at call time; the
+0.5.0 release it replaced demanded exactly 0.34.0); scripts run because
 its postinstall is what downloads the binary, followed by a hard
 `agent-browser --version` check, because that download fails silently;
 opencode via its
@@ -1443,7 +1491,18 @@ restart yolobox-harness-install`); and an `ActiveState` other than
 `active` (diagnose with `journalctl --user -u t3code` as the agent, or
 tail `~/.t3/userdata/logs/boot-service.log` directly — the same file
 either way, since the unit's own log redirection is what actually captures
-t3's output).
+t3's output). Both `t3_require_service()` and `yo status`'s `t3:` line
+go through the same pair of helpers, `t3_unit_state()` and
+`t3_service_problem()`, so the two can never disagree about what counts as
+broken. That matters because a vendor update can break the unit without
+any error surfacing: `t3 update -y` (0.0.42 to 0.0.44, 2026-10-01) printed
+"Background service restarted", then t3code.service crash-looped on
+`[service-launcher] Service state is invalid or unsupported.` until
+systemd's start limit hit and stayed failed for about 80 minutes. A stale
+`~/.t3/runtime/.service-stopping` marker survived the update; `t3 service
+restart` does not clear it, `systemctl --user reset-failed t3code.service
+&& t3 service install` does. Nothing watched the unit then; `yo status`
+does now.
 
 `t3 serve`'s `$HOME` must equal an interactive session's: `t3 pair` finds
 the server through `$HOME/.t3/*/server-runtime.json`, and a mismatch makes
@@ -1520,14 +1579,19 @@ carried traffic, so a box on lima older than v2.1.2 never showed this.
 The host agent replaces the connection only when the guest agent is
 still down 10 s after the event stream ended; a quick `systemctl restart
 lima-guestagent` stays inside that window and is harmless, a `switch`
-that re-runs `lima-init` first is not. Unreported upstream (see
-`TODO.md`).
+that re-runs `lima-init` first is not. Reported upstream as
+lima-vm/lima#5557 with a fix in draft PR lima-vm/lima#5558 (dial through
+the current guest agent client), both awaiting review; `TODO.md` carries
+the follow-ups.
 
 Why it bites here: `services.lima.enable` makes `lima-init` and
 `lima-guestagent` ordinary units whose text embeds store paths, so a
 nixpkgs bump rehashes them and `switch` restarts both. Twenty switches on
 one pin never showed it; the first bump did. Pinned shut with
-`restartIfChanged = false` on both units. `yo` could not have caught it —
+`restartIfChanged = false` on both units, which nixos-lima draft PR
+nixos-lima/nixos-lima#125 proposes for every nixos-lima box; once it is
+merged and the flake's `nixos-lima` input is bumped, this box's own pin is
+redundant and goes. `yo` could not have caught it —
 every check ran on the healthy side of the hop, and a TCP-connect probe
 succeeds because the handshake completes before the reset. Recovery:
 `limactl stop yolobox && ./yo up`; nothing lighter restarts the host agent.
@@ -1538,6 +1602,32 @@ On macOS a non-root process cannot bind `127.0.0.1:80` but can bind
 `0.0.0.0:80`, so lima does that for any host port below 1024 and wraps it
 in a listener that drops any non-loopback peer after the handshake. Not
 exposure. The real cost: nothing else on the Mac can bind 80 or 443.
+
+### Mac VPN shapes that blackhole guest traffic
+
+lima NATs the guest's traffic out through the Mac's default route, so a VPN
+on the Mac can break the guest while the Mac itself stays fine, which makes
+it look like a guest-only fault. Two shapes met so far, opposite-looking,
+and neither raises an error anywhere on its own:
+
+- **A WireGuard tunnel owns the default route** (2026-09-16, the
+  `nl-ams-wg-006` profile in WireGuard.app). The tunnel does not carry the
+  forwarded packets, so they are blackholed: from the guest every
+  destination fails on every port — GitHub on 443 and 80, 1.1.1.1 on 53,
+  even the LAN router — while `192.168.5.2:53`, lima's own resolver, keeps
+  answering because the host process serves it. `nixos-rebuild` fails with
+  GitHub fetch timeouts. Disconnecting the tunnel restores egress at once.
+- **ProtonVPN connected** (verified live 2026-09-28). General guest egress
+  and even `ssh git@github.com` keep working, but every guest connection to
+  `192.168.5.2:<port>`, gvproxy's NAT of lima's gateway address to the
+  Mac's own loopback, is silently blackholed. That is exactly the path a
+  forwarded TCP port relies on, which is why the AWS broker reaches the
+  guest over a reverse unix-socket forward instead (see "AWS credentials"
+  below).
+
+Recognise them by those patterns, and check `scutil --nc list` on the Mac
+before debugging anything in the VM. `TODO.md` carries the owed `yo` doctor
+check that tells the two apart.
 
 ## Tailscale: t3 on the tailnet
 
@@ -1582,11 +1672,26 @@ recreating the VM, and a recreated box logs in again the same way.
 The failure shape has no ambiguity built into it on purpose: a box that
 has never logged in, or whose login has expired, makes
 `yolobox-tailscale-serve` fail rather than quietly serve nothing or retry
-forever. The unit reads `tailscale status --json | jq -r .BackendState`;
-anything other than `Running` is exit 1 with the exact remedy on stderr —
-`yo ssh sudo tailscale up`, then `yo ssh sudo
-systemctl restart yolobox-tailscale-serve` — never a sleep loop chasing a
-state that a `tailscale up` run once was always going to settle. `t3`
+forever. The unit runs `tailscale wait --timeout=60s`, which blocks until
+the backend is `Running` with a Tailscale IP, and only then serves
+(`TimeoutStartSec=90s`). The wait is there because tailscaled is "started"
+before it has loaded its state: on the first boot of the 2026-10-01
+generation the oneshot ran 13 ms after start, saw `BackendState` `NoState`
+on a node that was in fact logged in, failed, and left
+`systemctl is-system-running` at `degraded` until someone restarted it by
+hand. A node that is not logged in never reaches `Running`, so `wait` times
+out after 60 s and the unit fails with "tailscale did not reach Running
+within 60s (state: X)", where X is the `BackendState` it reads
+(`tailscale status --json | jq -r .BackendState`, or `unreadable` when that
+fails) only for that message, never as the readiness test, and never a
+sleep loop chasing a state that a `tailscale up` run once was always going
+to settle. The remedy follows the state: `NeedsLogin` gets `yo ssh sudo
+tailscale up`, then `yo ssh sudo systemctl restart yolobox-tailscale-serve`;
+`NeedsMachineAuth` means the tailnet admin console has to approve the node
+before that restart; anything else — a broken tailscaled included — points
+at `yo ssh journalctl -u tailscaled`. `yo
+status` shows the same pair, `BackendState` and the serve unit's state, on
+its `tailscale:` line, so an expired login is visible from the Mac. `t3`
 itself never depends on any of this; it keeps listening on loopback
 whether or not the tailnet is up, so t3 reached from inside the VM or
 through lima's own Mac-side forward is unaffected by a tailscale login
@@ -1611,6 +1716,12 @@ pairing URL against the tailnet name instead of the default
 only difference is which base URL reaches the server. That address works
 from any device already joined to the tailnet, on any network, which is
 the entire point of putting t3 there rather than only on the Mac's LAN.
+
+That does not make lima's `hostIP: "0.0.0.0"` forward of 3773 redundant,
+and it stays on purpose: a Mac-only setup that never runs `tailscale up`
+still reaches t3 from other devices on the LAN through `yo pair`'s default
+`http://<LocalHostName>.local:3773`, and narrowing the forward to loopback
+would break exactly that.
 
 ## far2l: TTY-only, S3 through the broker
 

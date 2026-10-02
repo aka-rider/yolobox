@@ -4,7 +4,9 @@ import importlib.util
 import io
 import json
 import os
+import re
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1146,6 +1148,143 @@ class TestBaseNixMatchesYoConstants(unittest.TestCase):
             self.assertTrue(unit.endswith(".socket"))
             name = unit[: -len(".socket")]
             self.assertIn(name, text)
+
+
+class TestGcHelpNamesEveryBuildDir(unittest.TestCase):
+    def test_gc_description_includes_every_build_dir(self):
+        # Parse BUILD_DIRS from the shell script
+        shell_path = Path(yo.__file__).parent / "nix" / "guest" / "yolobox-guest.sh"
+        shell_text = shell_path.read_text()
+
+        # Extract BUILD_DIRS array using regex: BUILD_DIRS=(node_modules target .next)
+        match = re.search(r'BUILD_DIRS=\(([^)]+)\)', shell_text)
+        self.assertIsNotNone(match, "BUILD_DIRS not found in shell script")
+
+        # Parse the directory names
+        build_dirs_str = match.group(1)
+        build_dirs = build_dirs_str.split()
+        self.assertTrue(build_dirs, "BUILD_DIRS appears to be empty")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            yo.build_parser().parse_args(["gc", "--help"])
+        self.assertEqual(cm.exception.code, 0)
+
+        for dir_name in build_dirs:
+            self.assertIn(
+                dir_name,
+                buf.getvalue(),
+                f"BUILD_DIRS entry '{dir_name}' not found in `yo gc --help`",
+            )
+
+
+class TestTailscaleStatusLine(unittest.TestCase):
+    def probe(self, backend, serve):
+        return json.dumps({"BackendState": backend}) + "\n\n---\n" + serve + "\n"
+
+    def test_running_with_active_serve_is_healthy(self):
+        line = yo.tailscale_status_line(self.probe("Running", "active"), "")
+        self.assertEqual(line, "tailscale: Running, serve active")
+
+    def test_not_logged_in_names_login_and_serve_restart(self):
+        line = yo.tailscale_status_line(self.probe("NeedsLogin", "failed"), "")
+        self.assertIn("WARNING NeedsLogin, serve failed", line)
+        self.assertIn("yo ssh sudo tailscale up", line)
+        self.assertIn("yo ssh sudo systemctl restart yolobox-tailscale-serve", line)
+
+    def test_running_with_dead_serve_only_asks_for_serve_restart(self):
+        line = yo.tailscale_status_line(self.probe("Running", "inactive"), "")
+        self.assertIn("serve inactive", line)
+        self.assertNotIn("tailscale up", line)
+
+    def test_unparseable_output_surfaces_stderr(self):
+        line = yo.tailscale_status_line("", "failed to connect to local tailscaled")
+        self.assertIn("status unreadable: failed to connect to local tailscaled", line)
+
+    def test_json_that_is_not_an_object_is_unreadable(self):
+        for payload in ("null", "[]"):
+            with self.subTest(payload=payload):
+                line = yo.tailscale_status_line(payload + "\n\n---\nactive\n", "")
+                self.assertIn("status unreadable: " + payload, line)
+
+    def test_silent_failure_says_no_output(self):
+        line = yo.tailscale_status_line("", "")
+        self.assertIn("status unreadable: no output", line)
+
+    def test_box_without_tailscale_says_to_bootstrap(self):
+        self.assertIn("yo bootstrap", yo.tailscale_status_line("NO_TAILSCALE\n", ""))
+
+
+class TestT3ServiceProblem(unittest.TestCase):
+    def test_loaded_and_active_is_no_problem(self):
+        self.assertIsNone(yo.t3_service_problem("loaded", "active"))
+
+    def test_empty_load_state_means_agent_unreachable(self):
+        self.assertIn("cannot reach", yo.t3_service_problem("", ""))
+
+    def test_missing_unit_names_the_install_restart(self):
+        self.assertIn("yolobox-harness-install", yo.t3_service_problem("not-found", "inactive"))
+
+    def test_failed_unit_names_its_state_and_journal(self):
+        problem = yo.t3_service_problem("loaded", "failed")
+        self.assertIn("service is failed", problem)
+        self.assertIn("journalctl --user -u t3code", problem)
+
+
+class TestT3RequireService(unittest.TestCase):
+    def require(self, unit_stdout, curl_returncode=0):
+        def ssh_run(role, argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, stdout=unit_stdout, stderr="")
+
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, curl_returncode, stdout="", stderr="")
+
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(
+            yo, "ssh_run", ssh_run
+        ), mock.patch.object(yo, "run", run):
+            yo.t3_require_service()
+
+    def test_unreachable_agent_is_refused(self):
+        with self.assertRaisesRegex(yo.YoError, "cannot reach"):
+            self.require("")
+
+    def test_uninstalled_service_is_refused(self):
+        with self.assertRaisesRegex(yo.YoError, "not installed"):
+            self.require("not-found\ninactive\n")
+
+    def test_failed_service_is_refused(self):
+        with self.assertRaisesRegex(yo.YoError, "service is failed"):
+            self.require("loaded\nfailed\n")
+
+    def test_active_service_answering_on_the_mac_passes(self):
+        self.require("loaded\nactive\n")
+
+    def test_active_service_unreachable_from_the_mac_is_refused(self):
+        with self.assertRaises(yo.YoError):
+            self.require("loaded\nactive\n", curl_returncode=7)
+
+
+class TestStatusWithVmDown(unittest.TestCase):
+    def test_unreachable_vm_is_reported_once_and_no_guest_probe_runs(self):
+        stdout = io.StringIO()
+        guest_calls = []
+
+        def ssh_run(role, argv, **kwargs):
+            guest_calls.append(argv)
+            return subprocess.CompletedProcess(argv, 255, stdout="", stderr="")
+
+        with contextlib.redirect_stdout(stdout), mock.patch.object(
+            yo, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0)
+        ), mock.patch.object(
+            yo, "account_status", lambda: ("unreachable", "")
+        ), mock.patch.object(yo, "ssh_run", ssh_run), mock.patch.object(
+            yo, "lima_config_gaps", lambda: []
+        ), mock.patch.object(yo.shutil, "which", lambda name: None):
+            yo.cmd_status(yo.build_parser().parse_args(["status"]))
+
+        self.assertEqual(guest_calls, [])
+        self.assertEqual(stdout.getvalue().count("unreachable"), 1)
+        self.assertIn("yo up", stdout.getvalue())
 
 
 if __name__ == "__main__":
