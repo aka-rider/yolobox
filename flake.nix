@@ -11,7 +11,7 @@
     # branch input onto whatever main happens to hold, which for a tool
     # the box ships is an unreleased commit. Bump the tag to upgrade.
     rune = {
-      url = "github:aka-rider/rune/v1.4.0";
+      url = "github:aka-rider/rune/v1.5.0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -57,14 +57,14 @@
         };
         modules = [
           { nixpkgs.overlays = [ (final: prev: { rune = rune.packages.aarch64-linux.rune; }) ]; }
-          # nixpkgs' pin still carries herdr 0.8.2 while the Mac is on 0.9.0,
+          # nixpkgs' pin still carries herdr 0.9.1 while the Mac is on 0.9.3,
           # and a saved SSH machine needs the guest server's
           # endpoint_protocol_generation to equal the client's exactly. The
           # published linux-aarch64 asset is statically linked (no PT_INTERP,
           # no PT_DYNAMIC), so it runs here unpatched.
           { yolobox.harness.herdr = {
-              version = "0.9.1";
-              hash = "sha256-9Mz03nRfLLmjmpg+m6NwPa1Q7CpY3qgwJs6rchu9jZ4=";
+              version = "0.9.3";
+              hash = "sha256-TeeqPiVniBLpKWDeZPfCqqG8ofD4CjxeVZg34jHh9cA=";
             };
           }
           nixos-lima.nixosModules.lima
