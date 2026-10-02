@@ -3,13 +3,16 @@ name: Verify
 on:
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/ruff-action@v3
+      - uses: astral-sh/ruff-action@v4.1.0
         with:
           args: check --output-format=github
 
@@ -18,3 +21,26 @@ jobs:
 
       - name: Smoke test — yo --help
         run: ./yo --help
+
+  # Evaluates the box's NixOS configuration without building it, so an
+  # invalid option (v1.0.1 shipped `programs.git-lfs`) fails here instead of
+  # on a user's `yo bootstrap`. Evaluation needs no aarch64 builder: the drv
+  # path is computed, never realised, and IFD is disallowed to keep it so.
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: experimental-features = nix-command flakes
+
+      - name: Evaluate nixosConfigurations.yolobox
+        env:
+          # flake.nix throws without it; any non-empty name evaluates the same.
+          YOLOBOX_USERNAME: ci
+        run: >
+          nix eval --impure --raw
+          --option allow-import-from-derivation false
+          .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
