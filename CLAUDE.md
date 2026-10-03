@@ -408,6 +408,27 @@ git@github-iurii-tech` in the VM must greet two different names. "Could
 not resolve hostname" means the ssh config never arrived; the wrong name
 means the public keys did not.
 
+A dotfile can take the forwarded agent away too, and it fails only in
+the first shell after boot. On 2026-10-01, `git pull` in a freshly
+restored herdr pane died with `Load key
+"/home/agent/.ssh/iurii.tech-github.pub": invalid format` and
+`Permission denied (publickey)`, while a newly opened pane worked.
+`~/.dotfiles/zshrc.d/ssh-agent.zsh` ran `eval "$(ssh-agent -s)"`
+whenever `pgrep -u $USER ssh-agent` found nothing — true only for the
+first shells after boot, and herdr restores several panes at once, so
+all of them lost that race. `/etc/zshenv` sets
+`SSH_AUTH_SOCK=/run/yolobox/op-agent.sock` before `~/.zshrc` runs, so
+the rc file's `eval` silently overwrote it with an empty agent; ssh then
+found no key matching the `IdentityFile *.pub` selector and fell back to
+reading the `.pub` as a private key, which is where "invalid format"
+comes from. Recognise it inside the failing pane: `echo $SSH_AUTH_SOCK`
+must print `/run/yolobox/op-agent.sock` (or herdr's
+`~/.config/herdr/herdr.sock.agent`, a symlink to it), and `pgrep -au
+agent ssh-agent` must print nothing. The rule: no rc file may replace an
+inherited `SSH_AUTH_SOCK`; the dotfile now starts an agent only when
+`SSH_AUTH_SOCK` is not a socket. The box cannot guard this itself,
+because nothing it owns runs after the user's `~/.zshrc`.
+
 ## The mirror: how a Mac path becomes a guest path
 
 `yo enter`, `yo code` and `yo zed` land in the guest twin of the Mac's
