@@ -311,5 +311,7 @@ in
     ];
   };
 
+  # ffmpeg-full, not the default ffmpeg: nixpkgs' default build is
+  # --disable-xlib/--disable-libxcb*, so x11grab doesn't exist in it.
   environment.systemPackages = [ pkgs.chromium pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord playwrightArtifacts osc52Clipboard ];
 }
