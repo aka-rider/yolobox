@@ -144,6 +144,91 @@ let
       exit 0
     '';
   };
+
+  # DISPLAY points at an Xvfb nobody sees, so a real xclip/xsel would fill a
+  # clipboard no one can paste from. These shims emit OSC 52 on the pane's tty
+  # instead: herdr forwards it to the Mac client, which runs pbcopy.
+  osc52Copy = pkgs.writeShellApplication {
+    name = "yolobox-osc52-copy";
+    runtimeInputs = [ pkgs.coreutils ];
+    text = ''
+      name="$(basename -- "$0")"
+      # herdr drops any decoded OSC 52 payload above 192 KiB, silently.
+      max_bytes=196608
+
+      fail() {
+        echo "$name (yolobox OSC 52 shim): $*" >&2
+        exit 1
+      }
+
+      unsupported() {
+        fail "unsupported argument '$1': the box clipboard is write-only, this shim only copies stdin to the Mac clipboard through OSC 52 (reading, clearing, appending and file arguments are impossible)"
+      }
+
+      parse_xclip() {
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            -selection|-sel|-se)
+              [ $# -ge 2 ] || fail "option '$1' needs a value"
+              case "$2" in
+                clipboard|primary|secondary) ;;
+                *) fail "unknown selection '$2' (expected clipboard, primary or secondary)" ;;
+              esac
+              shift 2 ;;
+            -i|-in|-quiet|-silent) shift ;;
+            *) unsupported "$1" ;;
+          esac
+        done
+      }
+
+      parse_xsel() {
+        local flags
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --clipboard|--primary|--secondary|--input) ;;
+            --*) unsupported "$1" ;;
+            -?*)
+              flags="''${1#-}"
+              while [ -n "$flags" ]; do
+                case "''${flags:0:1}" in
+                  b|p|s|i) ;;
+                  *) unsupported "-''${flags:0:1}" ;;
+                esac
+                flags="''${flags:1}"
+              done ;;
+            *) unsupported "$1" ;;
+          esac
+          shift
+        done
+      }
+
+      case "$name" in
+        xclip) parse_xclip "$@" ;;
+        xsel) parse_xsel "$@" ;;
+        *) fail "must be invoked as xclip or xsel" ;;
+      esac
+
+      tmp="$(mktemp)"
+      trap 'rm -f "$tmp"' EXIT
+      cat > "$tmp"
+
+      size="$(wc -c < "$tmp")"
+      [ "$size" -gt 0 ] || fail "nothing to copy (empty input)"
+      [ "$size" -le "$max_bytes" ] ||
+        fail "input is $size bytes, over the $max_bytes byte limit herdr forwards to the Mac clipboard"
+
+      if ! { exec 3>/dev/tty; } 2>/dev/null; then
+        fail "OSC 52 needs the pane's terminal and this process has no controlling terminal (non-interactive ssh command or service)"
+      fi
+      # Always selection "c": herdr forwards only the standard clipboard.
+      printf '\033]52;c;%s\a' "$(base64 -w0 < "$tmp")" >&3
+    '';
+  };
+  osc52Clipboard = pkgs.runCommand "yolobox-osc52-clipboard" { } ''
+    mkdir -p $out/bin
+    ln -s ${osc52Copy}/bin/yolobox-osc52-copy $out/bin/xclip
+    ln -s ${osc52Copy}/bin/yolobox-osc52-copy $out/bin/xsel
+  '';
 in
 {
   systemd.services.xvfb = {
@@ -226,7 +311,5 @@ in
     ];
   };
 
-  # ffmpeg-full, not the default ffmpeg: nixpkgs' default build is
-  # --disable-xlib/--disable-libxcb*, so x11grab doesn't exist in it.
-  environment.systemPackages = [ pkgs.chromium pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord playwrightArtifacts ];
+  environment.systemPackages = [ pkgs.chromium pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord playwrightArtifacts osc52Clipboard ];
 }
