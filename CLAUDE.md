@@ -30,7 +30,8 @@ rules this file justifies.
 - `nix/lib/agent-env.nix` — the one attrset declaring the agent's
   environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`), applied identically to
   the herdr server, t3 and every agent login shell.
-- `nix/display.nix` — the virtual X display, browsers, screen recording.
+- `nix/display.nix` — the virtual X display, browsers, screen recording, and
+  the `xclip`/`xsel` OSC 52 clipboard shim.
 - `nix/lsp.nix` — the Python language-server wiring for every editor.
 - `nix/t3.nix` — t3code's environment: a drop-in onto the vendor-installed
   user unit (`nix/lib/agent-env.nix`, nix-ld), and the path unit that prunes
@@ -1075,6 +1076,50 @@ Things learned the hard way, each one line:
   second launch (~8 s). Not isolation, not a failure.
 - Chromium's storage flushes lazily; a session killed without
   `browser_close` can lose its last write.
+
+### Clipboard: `xclip` and `xsel` are OSC 52 shims
+
+Copying inside pi in a herdr pane used to die with `Clipboard unavailable:
+install \`xclip\` or \`xsel\`, or check X11 access`. The string is pi's, not
+herdr's (`packages/coding-agent/src/utils/clipboard.ts` in
+earendil-works/pi), and every branch of pi's Linux logic failed here at
+once. It tries `wl-copy` when `WAYLAND_DISPLAY` is set, then `xclip
+-selection clipboard` or `xsel --clipboard --input` when `DISPLAY` is set,
+and it emits OSC 52 itself only when `SSH_CONNECTION`, `SSH_CLIENT` or
+`MOSH_CONNECTION` is set, or when there is no `DISPLAY` at all — deliberately
+(pi#9618): OSC 52 cannot be confirmed to have landed, so pi will not trust it
+when a display exists to try first. This box sets `DISPLAY=:0` everywhere,
+and herdr panes are children of the systemd herdr server, so they carry no
+`SSH_*` variable either. No wayland, no xclip, no OSC 52: pi throws.
+
+Installing a real `xclip` would be worse than the error, because it would
+succeed — into Xvfb's clipboard, which nobody ever sees, the same reasoning
+that keeps far2l at `withTTYX = false`. So `nix/display.nix` ships `xclip`
+and `xsel` as one `writeShellApplication` shim that dispatches on its
+invoked name. It reads stdin and writes `ESC]52;c;<base64>BEL` to `/dev/tty`,
+the pane's own pty; herdr 0.9.3's pane parser (libghostty-vt) turns that
+into `ServerMessage::Clipboard`, sends it to the foreground client, and the
+Mac client runs `pbcopy`. It always emits selection `c`, because herdr drops
+`p` and `s`. It refuses, with exit 1 and a stderr message, rather than
+pretending to be an X clipboard: the paste, read and clear forms (`xclip
+-o`, `xsel -o`, `--clear`) because there is nothing to read back, empty
+input, input over herdr's 192 KiB cap (196608 decoded bytes), which herdr
+would drop silently, and a missing controlling tty (non-interactive ssh,
+systemd units, t3-spawned processes), where there is no pane to receive it.
+
+Two limits are upstream's, and the shim cannot lift them. The Mac herdr
+client drops a Clipboard message from a machine that is not the active one,
+so a copy made in a background machine's pane is lost. And herdr's own
+selection and copy mode in machine panes copies server-side in 0.9.x
+(herdr#4833, open); the herdr server has no tty, so no shim reaches it.
+`TODO.md` carries both, plus the pi change that would make the shim
+unnecessary.
+
+Recognise a regression by the exact pi error string coming back, then
+`readlink -f "$(command -v xclip)"`, which must resolve into the shim's
+store path. The agent's dotfiles prepend `~/.local/bin` to `PATH`, so a
+real `xclip` installed there would shadow the shim and reintroduce the
+Xvfb-clipboard silent failure: the copy succeeds, nothing arrives on the Mac.
 
 ## herdr: the VM runs its own server, panes are real ptys
 
