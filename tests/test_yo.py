@@ -1482,6 +1482,14 @@ class TestRequireKvm(unittest.TestCase):
                     yo.require_kvm()
 
 
+class TestBootstrapRebuild(unittest.TestCase):
+    def test_build_never_re_executes_the_flake_built_nixos_rebuild(self):
+        argv = yo.bootstrap_rebuild_argv("xiii", "github:o/r/v")
+        self.assertIn("--no-reexec", argv)
+        self.assertEqual(argv[:3], ["sudo", "YOLOBOX_USERNAME=xiii", "nixos-rebuild"])
+        self.assertEqual(argv[-1], "github:o/r/v#yolobox")
+
+
 if __name__ == "__main__":
     unittest.main()
 
