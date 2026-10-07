@@ -257,6 +257,16 @@ that costs nothing new: every rebuild already runs `--impure` for
 for `aarch64-darwin` instead, which is why the cpu is taken and the
 `-linux` suffix re-added.
 
+**The 1Password reverse forward follows the host.** `lima/yolobox.yaml`
+spells the macOS group-container socket as the forward's `hostSocket`, and
+the yaml is static, but a Linux host's socket is `~/.1password/agent.sock`.
+`yo` therefore builds the array with `lima_port_forwards()` from
+`op_sock()`, and on any non-darwin host `vm_up` creates the instance with
+`--set '.portForwards = ...'` over the yaml. Without it a Linux box would
+reverse a path that does not exist and `lima_config_gaps()` would report a
+missing forward on every `yo up`. An existing Linux instance restates the
+array with the command `yo up` prints.
+
 **Rosetta only where it can exist.** nixpkgs' `virtualisation.rosetta`
 module asserts `isAarch64` and mounts a `vz-rosetta` virtiofs tag with no
 `nofail`, so an x86_64 evaluation fails the assertion and an aarch64 QEMU
@@ -293,9 +303,7 @@ and never mutates firewall state itself.
 **What the first x86_64 boot proved, 2026-09-15.** The x86_64 nixos-lima
 image carries the same 249 MiB ESP as the aarch64 one (`df /boot` reports
 254,684 KiB), so `configurationLimit = 1` and everything in "The ESP is 249
-MiB" apply unchanged. `nix/pkgs/t3.nix`'s `npmDepsHash` is platform
-independent: the x86_64 guest build fetched with the existing pin. The
-bootstrap built, installed GRUB and rebooted onto `x86_64-linux` with no
+MiB" apply unchanged. The bootstrap built, installed GRUB and rebooted onto `x86_64-linux` with no
 change to `nix/base.nix`'s boot config. What did not survive the run were
 two `yo` bugs, both fixed the same day and both worth recognising.
 
@@ -509,7 +517,7 @@ of `CONSTITUTION.md`) — and looks, for each of `OP_GUEST_SOCK` and
 `AWS_BROKER_GUEST_SOCK`, for some entry whose `guestSocket`, `hostSocket`
 and `reverse: true` all match. A gap here used to abort `vm_up()`
 outright; now `lima_config_gap_message()` is only a stderr note, naming
-the full `LIMA_PORT_FORWARDS` array (the very constant `yo` renders for a
+the full `lima_port_forwards()` array (the very list `yo` renders for a
 brand-new instance) as the exact `limactl edit --set '.portForwards =
 ...'` argument to restate, and `vm_up()` carries on regardless. It can
 afford to, because the gap this check reports is only that *lima itself*
@@ -1332,7 +1340,7 @@ binary instead of adopting the system one, and a non-interactive install
 is refused outright rather than done silently.
 
 Compatibility is gated by capability now, not by the version-equality
-rule this file used to carry. The guest reports `version 0.9.0, protocol
+rule this file used to carry. A 0.9.0 guest reported `version 0.9.0, protocol
 22, endpoint_protocol_generation: 1, surface_interest: true, health_check:
 true, detached_server_daemon: true`; herdr's `remote_server_restart_reason`
 gates a saved machine on four of those — `endpoint_protocol_generation`,
@@ -1348,9 +1356,9 @@ The VM's herdr is pinned regardless, through the existing
 because the pinned nixpkgs lags the Mac's herdr (it carried 0.8.2, and
 carries 0.9.1 now), and the Mac's herdr, not nixpkgs, sets the generation
 the guest must speak. The pin fetches the published
-`herdr-linux-aarch64` release asset directly (`nix/pkgs/herdr-bin.nix`);
-it carries no `PT_INTERP` and no `PT_DYNAMIC` — statically linked — so it
-runs on NixOS unpatched, with none of the nix-ld dance a dynamically
+`herdr-linux-<cpu>` release asset directly (`nix/pkgs/herdr-bin.nix`), one
+hash per system; both are statically linked (no `PT_INTERP`, no
+`PT_DYNAMIC`), so each runs on NixOS unpatched, with none of the nix-ld dance a dynamically
 linked upstream binary would otherwise need.
 
 Two failure shapes are worth recognising, because neither one produces an
@@ -2148,11 +2156,11 @@ from the environment rather than spelling the path a second time. What
 still has to be kept in sync by hand — because it is the *Mac-side* half
 of the same path, not the guest-side half `agent-env.nix` already
 chokepoints — is: `yo` (`AWS_BROKER_GUEST_SOCK`, folded into
-`LIMA_PORT_FORWARDS`, and `AGENT_AWS_BROKER_SOCK`, its own health probe's
+`lima_port_forwards()`, and `AGENT_AWS_BROKER_SOCK`, its own health probe's
 target — checked against `agent-env.nix`'s text by a unit test,
 `TestAgentEnvMatchesYoSockets`, so the two constants can never drift
 silently) and `lima/yolobox.yaml` (the one-time seed for a brand-new
-instance, checked against `LIMA_PORT_FORWARDS` by another test,
+instance, checked against `lima_port_forwards()` by another test,
 `TestLimaYamlMatchesPortForwardsConstant`). `lima_config_gaps()` (see
 "SSH identities and the two GitHub accounts" above) is what catches the
 lima side drifting at runtime, on every `vm_up()` — as a stderr note now,

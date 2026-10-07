@@ -32,7 +32,7 @@ Identify whether you are running on the host (macOS or Linux) or Guest (Linux).
   must be restated in full because lima's yq cannot read the file. A unit
   test (`TestLimaYamlMatchesPortForwardsConstant` in `tests/test_yo.py`)
   keeps the checked-in file's socket-forward rules in sync with `yo`'s own
-  `LIMA_PORT_FORWARDS` constant — that constant, not the yaml, is what a
+  `lima_port_forwards()` — that constant, not the yaml, is what a
   restate command is built from, so the two owe each other this check.
 
 ## Accounts
