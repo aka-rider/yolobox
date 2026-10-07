@@ -1402,6 +1402,23 @@ def bootstrap_reboot(report: Report) -> None:
     report.ok("rebooted into the built generation")
 
 
+def bootstrap_rebuild_argv(username: str, ref: str) -> List[str]:
+    # --no-reexec: by default nixos-rebuild-ng re-executes the copy built from
+    # the target flake, whose systemd-run flags (--output=cat) the stock
+    # image's older running systemd rejects, failing the very first
+    # switch-to-configuration after a full successful build.
+    return [
+        "sudo",
+        "YOLOBOX_USERNAME=%s" % username,
+        "nixos-rebuild",
+        "boot",
+        "--no-reexec",
+        "--impure",
+        "--flake",
+        "%s#yolobox" % ref,
+    ]
+
+
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     report = Report()
     ref = flake_ref()
@@ -1414,15 +1431,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
 
     ssh_run(
         OPERATOR,
-        [
-            "sudo",
-            "YOLOBOX_USERNAME=%s" % host_user(),
-            "nixos-rebuild",
-            "boot",
-            "--impure",
-            "--flake",
-            "%s#yolobox" % ref,
-        ],
+        bootstrap_rebuild_argv(host_user(), ref),
         mux=True,
         capture=False,
         check=True,
