@@ -109,6 +109,8 @@ limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"hostIP":"0.0.0.0
 yo up
 ```
 
+On a Linux host the 1Password entry's `hostSocket` is `{{.Home}}/.1password/agent.sock` instead; `yo` creates new Linux instances with that already substituted.
+
 `yo up` itself prints this same command on stderr, naming whichever socket is missing, so this is also the fix if `yo` ever tells you to run it — it is a note, not a refusal: `yo` still brings the forward up for the current session either way, this migration just makes it survive the VM's own restarts too.
 
 Every SSO profile in your Mac's `~/.aws/config` becomes usable inside the VM, one broker for all of them. Pick a profile per shell:

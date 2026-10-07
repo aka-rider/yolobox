@@ -997,7 +997,7 @@ class TestLimaConfigGapMessage(unittest.TestCase):
     def test_names_the_full_array_migration_command(self):
         message = yo.lima_config_gap_message([yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK])
         self.assertIn(".portForwards = ", message)
-        self.assertIn(json.dumps(yo.LIMA_PORT_FORWARDS), message)
+        self.assertIn(json.dumps(yo.lima_port_forwards()), message)
         self.assertIn(yo.OP_GUEST_SOCK, message)
         self.assertIn(yo.AWS_BROKER_GUEST_SOCK, message)
 
@@ -1112,7 +1112,48 @@ class TestLimaYamlMatchesPortForwardsConstant(unittest.TestCase):
     def test_full_port_forwards_match_lima_port_forwards_constant(self):
         yaml_path = Path(yo.__file__).parent / "lima" / "yolobox.yaml"
         parsed = parse_yaml_list_entries(portforwards_yaml_block(yaml_path.read_text()))
-        self.assertEqual(canonical_forwards(parsed), canonical_forwards(yo.LIMA_PORT_FORWARDS))
+        with with_platform("darwin"):
+            self.assertEqual(canonical_forwards(parsed), canonical_forwards(yo.lima_port_forwards()))
+
+
+class TestLimaPortForwardsFollowTheHost(FakeHome):
+    def op_host_sockets(self, platform):
+        with with_platform(platform):
+            forwards = yo.lima_port_forwards()
+        return [f["hostSocket"] for f in forwards if f.get("guestSocket") == yo.OP_GUEST_SOCK]
+
+    def test_darwin_reverses_the_group_container_socket(self):
+        self.assertEqual(
+            self.op_host_sockets("darwin"),
+            ["{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"],
+        )
+
+    def test_linux_reverses_the_dot_1password_socket(self):
+        self.assertEqual(self.op_host_sockets("linux"), ["{{.Home}}/.1password/agent.sock"])
+
+    def start_argv_creating_the_instance(self, platform):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with with_platform(platform), mock.patch.object(yo, "run", fake_run), mock.patch.object(
+            yo, "lima_config_gaps", lambda: []
+        ), mock.patch.object(yo, "require_kvm"), mock.patch.object(
+            yo, "ensure_agent_ssh_config"
+        ), mock.patch.object(yo, "ensure_guest_known_hosts"):
+            yo.vm_up(run_services=False)
+        return next(c for c in calls if c[:2] == ["limactl", "start"])
+
+    def test_linux_creation_restates_the_forwards_for_its_own_socket(self):
+        argv = self.start_argv_creating_the_instance("linux")
+        self.assertEqual(
+            argv[argv.index("--set") + 1], ".portForwards = %s" % json.dumps(yo.lima_port_forwards())
+        )
+
+    def test_darwin_creation_uses_the_yaml_untouched(self):
+        self.assertNotIn("--set", self.start_argv_creating_the_instance("darwin"))
 
 
 class TestAgentEnvMatchesYoSockets(unittest.TestCase):
