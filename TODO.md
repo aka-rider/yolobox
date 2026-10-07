@@ -20,3 +20,16 @@ Posted 2026-10-02, all awaiting review. The reasoning behind them is in CLAUDE.m
 
 - `t3 update -y` (0.0.42 -> 0.0.44, 2026-10-01) reported "Background service restarted" and `active`, then t3code.service crash-looped on `[service-launcher] Service state is invalid or unsupported.` until systemd's start limit hit, leaving it failed and t3 down for about 80 minutes. A stale `~/.t3/runtime/.service-stopping` marker survived the update; `t3 service restart` did not clear it, `systemctl --user reset-failed t3code.service && t3 service install` did. It is a vendor bug, and `yo status` now shows it in its `t3:` line, so it is visible from the Mac, but only the recovery above fixes it.
 - Two VPN shapes blackhole guest traffic differently (CLAUDE.md, "Mac VPN shapes that blackhole guest traffic"), and neither produces an error anywhere on its own. `yo` should carry a doctor check that tells them apart: all guest egress dead except `192.168.5.2:53` (a WireGuard default route) against only `192.168.5.2:<port>` dead (ProtonVPN).
+
+## First boot on a Linux/QEMU host (2026-10-08)
+
+- `yolobox-harness-install` fails once at first boot with `curl: (6) Could not
+  resolve host: claude.ai` (DNS not up yet), then succeeds on the unit's own
+  restart ~20s later. It self-heals but leaves a failed-start line in the
+  journal; order it after `network-online.target` in the user manager's terms
+  or retry inside the script.
+- `yolobox-tailscale-serve.service` shows up in `systemctl --failed` until
+  `tailscale up` is run (NeedsLogin). `yo status` explains it; the unit could
+  skip (ConditionPathExists on a logged-in state) instead of failing.
+- `yo status` prints `1password: guest forward is up` without checking that
+  the host socket exists; only the listener on the guest side is probed.
