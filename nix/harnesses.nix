@@ -106,6 +106,12 @@ let
       cd "$HOME"
       mkdir -p "$HOME/.local/bin"
 
+      # Atomic: a reader never sees the link missing.
+      link_bin() {
+        ln -sfn "$2" "${homeDir}/.local/bin/$1.tmp"
+        mv -T "${homeDir}/.local/bin/$1.tmp" "${homeDir}/.local/bin/$1"
+      }
+
       if [ -z "$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null || true)" ]; then
         curl -fsSL https://claude.ai/install.sh | bash -s latest
       fi
@@ -120,7 +126,15 @@ let
           || claude plugin install "$plugin@claude-plugins-official" --scope user
       done
 
-      command -v pi >/dev/null || npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+      # No tty under systemd, so pi's installer takes its defaults and never
+      # edits an rc file. `pi update` self-updates. The boot-time L+ link has
+      # already replaced an npm pi's bin link, so the installer cannot see it
+      # to migrate; the npm package is removed here instead.
+      [ -x "$HOME/.pi/agent/bin/pi" ] \
+        || curl -fsSL https://pi.dev/install.sh | bash
+      [ ! -d "$HOME/.local/lib/node_modules/@earendil-works/pi-coding-agent" ] \
+        || npm uninstall -g @earendil-works/pi-coding-agent
+      link_bin pi "$HOME/.pi/agent/bin/pi"
 
       # t3code's own vendor install; it never edits an rc file. Its installer
       # unpacks straight into the layout `t3 service install` also uses, so
@@ -128,7 +142,7 @@ let
       [ -x "$HOME/.local/bin/t3" ] || curl -fsSL https://t3.codes/install.sh | bash
       [ -f "$HOME/.config/systemd/user/t3code.service" ] || t3 service install
 
-      # Scripts ON, unlike pi: agent-browser's postinstall IS the download of
+      # Scripts ON: agent-browser's postinstall IS the download of
       # its prebuilt binary. That download fails silently, so the version call
       # below is the hard check rather than a courtesy. Pinned to the version
       # pi-agent-browser-native 0.8.2 recommends; it accepts 0.35.0 and newer,
@@ -161,8 +175,7 @@ let
       # opencode installer has no install-dir override, hence the fixed link.
       [ -x "$HOME/.opencode/bin/opencode" ] \
         || curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
-      ln -sfn "$HOME/.opencode/bin/opencode" "${homeDir}/.local/bin/opencode.tmp"
-      mv -T "${homeDir}/.local/bin/opencode.tmp" "${homeDir}/.local/bin/opencode"
+      link_bin opencode "$HOME/.opencode/bin/opencode"
 
       claude --version
       pi --version
@@ -229,6 +242,7 @@ in
       links = [
         { path = ".local/bin/claude"; argument = launcherPath; }
         { path = ".local/bin/opencode"; argument = "${homeDir}/.opencode/bin/opencode"; }
+        { path = ".local/bin/pi"; argument = "${homeDir}/.pi/agent/bin/pi"; }
       ];
     } ++ [
       "r ${homeDir}/.pi/agent/extensions/pi-mcp-adapter"
@@ -282,8 +296,9 @@ in
       };
       wantedBy = [ "default.target" ];
       after = [ "yolobox-claude-launcher.path" ];
-      # "${homeDir}/.local" first so `claude` here is the launcher, and so the
-      # npm-installed pi and agent-browser resolve as soon as they land.
+      # "${homeDir}/.local" first so `claude` here is the launcher, and so pi
+      # (through the box's ~/.local/bin/pi link) and the npm-installed
+      # agent-browser resolve as soon as they land.
       path = [
         "${homeDir}/.local"
         pkgs.bash
@@ -295,6 +310,7 @@ in
         pkgs.git
         pkgs.nodejs
         pkgs.findutils
+        pkgs.gawk
         pkgs.gnugrep
         pkgs.jq
         herdrPkg

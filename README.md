@@ -179,7 +179,7 @@ claude reaches it through the official `playwright` plugin, installed for you fr
 
 Browser output — screenshots, PDFs, videos — is written to `~/artifacts/`, outside the project checkout, so the push channel never carries stray binaries. `yolobox-screen-record start|stop` records the whole display into the same place.
 
-The agents themselves (`claude`, `pi`, `opencode`) are installed from their vendors into the VM and update themselves; `claude update` works as usual.
+The agents themselves (`claude`, `pi`, `opencode`) are installed from their vendors into the VM and update themselves; `claude update` and `pi update` work as usual.
 
 
 ## Credits

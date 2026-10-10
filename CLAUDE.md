@@ -842,10 +842,10 @@ the exact tag.
 The VM carries `systemd-tmpfiles-resetup.service`, the switch-time twin of
 the boot-only setup unit, so a new tmpfiles rule takes effect on `switch`
 with no reboot. It re-runs every rule, including force-replacing `L+`
-links, which `nix/harnesses.nix` relies on to hold `~/.local/bin/claude`
-and `~/.local/bin/opencode` at the box's own paths across the one window
-the launcher path unit cannot see on its own — an install made while no
-user manager of the agent's was running.
+links, which `nix/harnesses.nix` relies on to hold `~/.local/bin/claude`,
+`~/.local/bin/opencode` and `~/.local/bin/pi` at the box's own paths
+across the one window the launcher path unit cannot see on its own — an
+install made while no user manager of the agent's was running.
 
 ## The ESP is 249 MiB and holds one kernel
 
@@ -1365,12 +1365,14 @@ oneshot gated `ConditionUser=agent` and wanted by `default.target`, so it
 runs at boot rather than at the first `yo enter`. Each phase is
 idempotent and checks before it acts: claude via `curl -fsSL
 https://claude.ai/install.sh | bash -s latest` when `versions/` is empty,
-then the marketplace and plugins (below); pi via `npm install -g
---ignore-scripts @earendil-works/pi-coding-agent` — the package nixpkgs
-tracked, `@mariozechner/pi-coding-agent`, was deprecated in May 2026;
-agent-browser via `npm install -g agent-browser@0.38.1` **with** scripts,
-the version pi-agent-browser-native 0.8.2 recommends (it accepts 0.35.0 and
-newer, and refuses browser-backed calls below that floor, at call time; the
+then the marketplace and plugins (below); pi via its managed installer,
+`curl -fsSL https://pi.dev/install.sh | bash`, only when
+`~/.pi/agent/bin/pi` is not executable — the launcher's own path, not
+`command -v pi`, because an install that is off PATH would otherwise be
+reinstalled on every boot (that was the exact state after a hand-run
+migration on 2026-10-10); agent-browser via `npm install -g
+agent-browser@0.38.1` **with** scripts, the version
+pi-agent-browser-native 0.8.2 recommends (it accepts 0.35.0 and newer, and refuses browser-backed calls below that floor, at call time; the
 0.5.0 release it replaced demanded exactly 0.34.0); scripts run because
 its postinstall is what downloads the binary, followed by a hard
 `agent-browser --version` check, because that download fails silently;
@@ -1378,9 +1380,40 @@ opencode via its
 own installer with `--no-modify-path`, into `~/.opencode/bin`, which a
 tmpfiles link from `~/.local/bin/opencode` makes reachable (the installer
 has no install-dir override). No vendor installer is ever allowed to edit
-an rc file. `NPM_CONFIG_PREFIX=$HOME/.local` puts every `npm -g` binary in
-`~/.local/bin` alongside the launcher, and `environment.localBinInPath`
-puts that directory on PATH for non-login shells too — every
+an rc file.
+
+pi's installer deserves a paragraph, because it is the one phase that
+used to be `npm install -g` and is not any more. `~/.pi/agent/bin/pi` is a
+POSIX sh launcher that execs
+`~/.pi/agent/install/releases/<version>/node_modules/.bin/pi`, a
+`#!/usr/bin/env node` script, so the box's nixpkgs node runs it (pi needs
+node >= 22.19) and nix-ld is not involved. Every prompt in `install.sh`
+reads `/dev/tty`; under systemd there is none, so it takes the defaults
+and never edits an rc file. Its own npm-to-managed migration never fires
+here: by the time the install service runs, the boot-time `L+` rule below
+has already replaced an npm pi's `~/.local/bin/pi` with a link to the
+not-yet-installed launcher, so the installer sees no pi and installs
+fresh. The script therefore removes `@earendil-works/pi-coding-agent`
+with `npm uninstall -g` itself whenever its package directory is still
+under `~/.local/lib/node_modules`. It also needs `awk`, which the unit's
+`path` carries. The
+box makes pi reachable with a link, `~/.local/bin/pi` to
+`~/.pi/agent/bin/pi`, asserted by the install script on every run and by a
+tmpfiles `L+` rule at boot and on `switch`, the same pattern as opencode.
+`pi update` self-updates and keeps only two releases (since pi 1.1.0), so
+unlike claude and t3 nothing here prunes. Run by hand in a tty, the
+installer asks "Add /home/agent/.pi/agent/bin to your PATH in
+/home/agent/.zshrc now? [Y/n]": answer `n`, the box's link already puts pi
+on PATH, and a yes is the rc-file edit this section forbids. The
+migration text "This Pi was installed with npm. Pi now uses a managed
+installation..." comes from `install.sh`, not from pi; `pi update` on an
+npm install only recommends migrating.
+
+`NPM_CONFIG_PREFIX=$HOME/.local` stays for agent-browser: it puts every
+`npm -g` binary in `~/.local/bin` alongside the launcher (pi's own `pi
+install` packages live under `~/.pi/agent/npm/`, not there), and
+`environment.localBinInPath` puts that directory on PATH for non-login
+shells too — every
 non-interactive `yo` guest call (`ssh_run`, behind `yo gc`, `yo status`
 and the rest) and t3 both run in one. t3's own unit carries
 `${homeDir}/.local` in its `path`, so a t3-spawned claude goes through the

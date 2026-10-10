@@ -215,10 +215,12 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   against it. It is a tmpfiles `L+` link to `/etc/yolobox/bin/claude`,
   re-asserted by `yolobox-claude-launcher`; `claude update` leaves a
   custom launcher alone and is welcome.
-- NEVER run `agent-browser install`, and NEVER let a vendor installer edit
-  an rc file (`--no-modify-path`). The install downloads a glibc Chrome
-  for Testing that cannot execute on NixOS, and an installer-written rc
-  line changes PATH behind the box's back on the very path it owns.
+- NEVER run `agent-browser install`: it downloads a glibc Chrome for
+  Testing that cannot execute on NixOS. And NEVER let a vendor installer
+  edit an rc file: opencode's is told so with `--no-modify-path`, pi's
+  has no such flag and stays off the rc file only because its prompts
+  read `/dev/tty` and the install service has none. An installer-written
+  rc line changes PATH behind the box's back on the very path it owns.
 - ALWAYS let pi own `~/.pi/agent/settings.json`. pi rewrites it and only
   logs a failed write, so a symlink there silently drops every installed
   package.
