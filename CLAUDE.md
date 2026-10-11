@@ -1360,6 +1360,20 @@ tmpfiles rules at boot and on `switch` are the backstop for the window the
 path unit cannot see — an install made while no user manager of the
 agent's was running.
 
+Since about 2.1.29x, `claude update` and `claude upgrade` print "Warning:
+/home/agent/.local/bin/claude was not created by the native installer (it
+is not a symlink into the versions/ directory), so auto-update leaves it
+untouched.", followed by a "Fix:" line saying automatic version cleanup is
+disabled on this machine and that removing `~/.local/bin/claude` and
+running `claude update` lets Claude Code manage the launcher again. This
+is expected: it is the installer noticing the box's own launcher, and the
+cleanup it says it gave up is exactly what `yolobox-claude-launcher` does
+instead. Never follow its "Fix". Removing the link hands the path back to
+the installer, and the next `claude` runs unwrapped, with no `HERDR_AGENT`
+and no Playwright hook, until the path unit or tmpfiles re-links it.
+Check that pruning is alive with `ls ~/.local/share/claude/versions` as
+the agent: at most two entries, about 255 MB each.
+
 The installs themselves come from `yolobox-harness-install`, a user
 oneshot gated `ConditionUser=agent` and wanted by `default.target`, so it
 runs at boot rather than at the first `yo enter`. Each phase is
