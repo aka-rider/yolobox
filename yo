@@ -471,14 +471,19 @@ def require_agent_account() -> None:
     raise YoError(None, code=1)
 
 
-def guest_path(path: str) -> str:
+def guest_path(path: str, roots: Sequence[str] = (AGENT_HOME,)) -> str:
     if "\0" in path or "\n" in path:
         raise YoError("refusing a guest path with a newline or NUL byte")
     normalised = os.path.normpath(path)
-    if normalised != AGENT_HOME and not normalised.startswith(AGENT_HOME + "/"):
+    if not any(normalised == root or normalised.startswith(root + "/") for root in roots):
+        if tuple(roots) == (AGENT_HOME,):
+            raise YoError(
+                'refusing to target "%s": no yo command may leave the guest home "%s"'
+                % (path, AGENT_HOME)
+            )
         raise YoError(
-            'refusing to target "%s": no yo command may leave the guest home "%s"'
-            % (path, AGENT_HOME)
+            'refusing to target "%s": outside the guest paths this command may use (%s)'
+            % (path, " and ".join('"%s"' % root for root in roots))
         )
     return normalised
 
@@ -514,12 +519,15 @@ def operand_is_guest(operand: str) -> bool:
     return operand.startswith(":")
 
 
+CP_GUEST_ROOTS = (AGENT_HOME, "/tmp")
+
+
 def resolve_guest_operand(operand: str, cwd_mirror: Optional[str]) -> str:
     spelling = operand[1:]
     if spelling == "~" or spelling.startswith("~/"):
         return guest_path(AGENT_HOME + spelling[1:])
     if spelling.startswith("/"):
-        return guest_path(spelling)
+        return guest_path(spelling, CP_GUEST_ROOTS)
     if cwd_mirror is None:
         raise YoError(
             'guest path "%s" is relative, and the Mac cwd is outside $HOME; '
@@ -1880,7 +1888,8 @@ def build_parser() -> argparse.ArgumentParser:
         "path is any operand starting with \":\": \":\" alone is the guest twin of\n"
         "the current directory, \":rel/path\" extends it, \":~\" and \":~/x\" are the\n"
         "guest home and a path under it, and \":/abs\" is an absolute guest path\n"
-        "(refused if it falls outside the guest home). Every source must be on\n"
+        "(refused unless it is under the guest home or under /tmp, where agents'\n"
+        "scratch output lives). Every source must be on\n"
         "the Mac or every source must be in the guest, never mixed, and the\n"
         "destination must be on the other side.",
     )

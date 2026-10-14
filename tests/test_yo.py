@@ -78,6 +78,10 @@ class TestGuestPath(unittest.TestCase):
         with self.assertRaises(yo.YoError):
             yo.guest_path(yo.AGENT_HOME + "/a\nb")
 
+    def test_default_roots_refuse_tmp(self):
+        with self.assertRaises(yo.YoError):
+            yo.guest_path("/tmp/x")
+
 
 class TestSshRunArgv(FakeHome):
     def capture_argv(self, role=None, **kwargs):
@@ -149,6 +153,27 @@ class TestResolveCpOperands(unittest.TestCase):
     def test_absolute_guest_path_outside_home_is_refused(self):
         with self.assertRaises(yo.YoError):
             yo.resolve_cp_operands(["a.txt", ":/etc/passwd"], self.MIRROR)
+
+    def test_absolute_guest_source_under_tmp_is_accepted(self):
+        plan = yo.resolve_cp_operands([":/tmp/claude-1000/x", "dest"], self.MIRROR)
+        self.assertEqual(plan.direction, "from_guest")
+        self.assertEqual(plan.guest_paths, ["/tmp/claude-1000/x"])
+
+    def test_tmp_itself_is_accepted(self):
+        plan = yo.resolve_cp_operands(["a.txt", ":/tmp"], self.MIRROR)
+        self.assertEqual(plan.guest_paths, ["/tmp"])
+
+    def test_sibling_prefix_of_tmp_is_refused(self):
+        with self.assertRaises(yo.YoError):
+            yo.resolve_cp_operands([":/tmpx/y", "dest"], self.MIRROR)
+
+    def test_tmp_traversal_out_of_tmp_is_refused(self):
+        with self.assertRaises(yo.YoError):
+            yo.resolve_cp_operands([":/tmp/../etc", "dest"], self.MIRROR)
+
+    def test_relative_spelling_cannot_reach_tmp(self):
+        with self.assertRaises(yo.YoError):
+            yo.resolve_cp_operands([":../../../tmp", "dest"], self.MIRROR)
 
     def test_guest_traversal_outside_home_is_refused(self):
         with self.assertRaises(yo.YoError):

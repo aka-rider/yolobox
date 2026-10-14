@@ -6,6 +6,9 @@ in
   services.tailscale = {
     enable = true;
     openFirewall = true;
+    # TS_NO_LOGS_NO_SUPPORT=true: no log uploads to log.tailscale.com, and with
+    # them no Tailscale support for this node.
+    disableUpstreamLogging = true;
     extraSetFlags = [ "--accept-dns=false" "--hostname=${config.networking.hostName}" ];
   };
 
