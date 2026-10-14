@@ -244,6 +244,9 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
 - NEVER let a `yo` command target a guest path outside the guest `$HOME`.
   A path the mirror cannot place lands at the guest home with a loud
   stderr notification instead of a silent guess.
+  One exception: `yo cp` may also use an absolute guest path under `/tmp`,
+  because agents' scratch output lives there and scp runs as `agent`,
+  whose permissions are the real boundary.
 
 ## Project repos in the VM
 

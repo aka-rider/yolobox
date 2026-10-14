@@ -442,7 +442,9 @@ When the mirrored path does not exist in the VM, the session lands at
 the deepest existing ancestor; when the Mac cwd is outside `$HOME`, it
 lands at the guest home. Both cases print exactly
 `path "%s" does not exist in the yolobox you are in "%s"` to stderr, and
-no `yo` command can target a guest path outside the guest `$HOME`. The
+no `yo` command can target a guest path outside the guest `$HOME`, except
+that `yo cp` also accepts an absolute path under `/tmp` (see "`yo cp`"
+below). The
 fzf picker behind `yo enter <fuzzy>` lists git repos anywhere under the
 guest home, hidden directories pruned. `yo bootstrap` needs no mirrored
 path at all any more: it builds the VM straight from a flake ref
@@ -490,22 +492,36 @@ The guest side of an operand always starts with `:`, and `yo` never
 guesses which side is which. `:` alone is the guest twin of the Mac's
 logical current directory, the same mirror `yo enter` uses; `:rel/path`
 extends that twin; `:~` and `:~/x` are the agent's home outright;
-`:/abs/path` is an absolute guest path. Every one of these, relative or
-absolute, is checked against the guest home the same way every other
-`yo` command's guest path is (see "The mirror" above): a path that
-resolves outside `/home/agent` is refused rather than silently placed
-there. A copy has no existing-ancestor fallback the way a missing
+`:/abs/path` is an absolute guest path. Every one of these is checked
+the same way every other `yo` command's guest path is (see "The mirror"
+above): a path that resolves outside `/home/agent` is refused rather
+than silently placed there. The one widening is that an absolute
+spelling may also fall under `/tmp` (next paragraph). A copy has no existing-ancestor fallback the way a missing
 mirrored directory does, so `yo` requires every source on one side and
 the destination on the other and refuses anything else outright — no
 colon anywhere, sources on both sides, or a copy entirely inside the
 guest — each with a message naming the remedy, plain `cp` or `yo enter`.
 
+`/tmp` is accepted for absolute spellings only (`CP_GUEST_ROOTS` in `yo`),
+because Claude Code's scratchpad is `/tmp/claude-<uid>/...`, so an agent's
+scratch output, screenshots and exports are exactly what a person wants
+to pull to the Mac, and none of it is under the home. The relative, `:~`
+and bare `:` spellings keep the home-only check, so `:../../../tmp` is
+still refused. Moving `TMPDIR` under `~` instead was rejected because it
+changes the environment of every program in the box, and the two places
+differ in aging: `/tmp` has systemd's `q /tmp 1777 root root 10d`, which
+removes files untouched for ten days, while the home has no aging at all
+and would keep every scratch file until something deleted it. Letting scp
+reach `/tmp` widens nothing real, since scp runs as `agent` and that
+account's own permissions are the boundary, not `yo`'s path check.
+
 Two refusals are worth recognising on sight. A relative guest spelling —
 `:` or `:x` — issued from a Mac cwd outside `$HOME` has no mirror to
 extend, so it is refused with `:~/...` named as the fix, the same
 outside-`$HOME` case "The mirror" above describes for `yo enter`. And a
-guest path that resolves outside `/home/agent`, absolute or relative, is
-refused the same way `guest_path` refuses it everywhere else in `yo`.
+guest path that resolves outside `/home/agent` (or, for an absolute
+spelling, outside `/tmp`) is refused the same way `guest_path` refuses it
+everywhere else in `yo`.
 The multi-source case is scp's own rule surfacing through `yo`, not a
 rule `yo` invented: scp itself requires the destination to be a
 directory once more than one source is given, which is why `yo cp` runs
@@ -1771,6 +1787,14 @@ it false keeps DNS exactly as every other section here assumes it is; the
 box's own name is still reachable as `yolobox.<tailnet>.ts.net` by MagicDNS
 running on the *client* end of a tailnet connection, never by this guest's
 own resolver.
+
+`disableUpstreamLogging = true` sets `TS_NO_LOGS_NO_SUPPORT=true` on
+tailscaled, so the node uploads no logs to log.tailscale.com, and for the
+same reason Tailscale support will not help with this node. Recognise it
+working by the line `You have disabled logging` in `yo ssh journalctl -u
+tailscaled -b`. It takes effect on the next switch, because the module puts
+the variable in the unit's environment and a changed unit makes the switch
+restart tailscaled.
 
 Login is interactive and happens once, by the operator, because there is
 no auth key anywhere in this repo: `yo ssh sudo tailscale up`. It takes
