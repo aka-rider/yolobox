@@ -85,6 +85,9 @@ in
   # vda1 ends at the sector vda2 starts on, so the ESP above is unaffected.
   boot.growPartition = true;
   boot.kernelPackages = pkgs.linuxPackages_latest;
+  # Same-uid ptrace (py-spy, gdb, strace -p). The uid split, not Yama, is the
+  # boundary; see CLAUDE.md "Debuggers: same-uid ptrace".
+  boot.kernel.sysctl."kernel.yama.ptrace_scope" = 0;
 
   swapDevices = [{ device = "/var/swapfile"; size = 16384; }];
 
