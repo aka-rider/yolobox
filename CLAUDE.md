@@ -964,6 +964,57 @@ when a switch half-failed (see the ESP section); `yo gc` compares the two
 readlinks and reports a skip, which means the box needs a repaired switch
 before it needs a garbage collection.
 
+## Debuggers: same-uid ptrace
+
+On 2026-10-15 `py-spy dump --pid N` against an already-running agent
+process died with permission denied. Nothing in the repo set ptrace, so
+the kernel's Yama default applied: `kernel.yama.ptrace_scope = 1`, which
+lets a process ptrace only its own descendants, or a process that
+declared the tracer through `prctl(PR_SET_PTRACER)`, which py-spy cannot
+arrange from outside. That is why `py-spy record -- python app.py` worked
+all along (the target is py-spy's child) and attaching to a server
+started elsewhere did not.
+
+`nix/base.nix` now sets
+`boot.kernel.sysctl."kernel.yama.ptrace_scope" = 0`. NixOS renders it into `/etc/sysctl.d/60-nixos.conf`, and
+`systemd-sysctl` carries that file in its restartTriggers, so a `switch`
+applies it with no reboot. It is safe because the box's boundary is the
+uid split (see "Two accounts" above), and Yama does not touch that. The
+kernel's classic check in `__ptrace_may_access` runs at every scope and
+requires the tracer's ids to match the target's real, effective and saved
+ids, or `CAP_SYS_PTRACE` in the target's user namespace. So at scope 0
+the agent (uid 1000) can attach to its own processes — python servers,
+other claude sessions, herdr, t3 — and still cannot attach to the
+operator's (`systemd-socket-proxyd` for 1Password and the AWS broker, the
+`sshd-session` holding the reverse forwards) or to root's. What scope 1
+protected was one agent-uid process from another, and the agent already
+owns that uid entirely: it can rewrite `~/.zshrc`, set `LD_PRELOAD`,
+replace binaries under `~/.local`, and read every secret those processes
+hold on disk.
+
+The tempting alternative is forbidden by `CONSTITUTION.md`: a
+`security.wrappers` entry or `setcap` giving py-spy or gdb
+`cap_sys_ptrace`. That capability bypasses the uid comparison, so the
+agent could attach to a root process and become root. The only file
+capabilities on the box today are podman's `newuidmap` and `newgidmap`.
+
+A rootless container is a separate case that scope 0 does not fix. Its
+processes run under subuids (100069 for the postgres in one stack),
+which are a different uid to the kernel, so a plain attach is refused at
+any scope. `podman unshare py-spy dump --pid <host pid>` works: inside
+`podman unshare` the agent is root of the rootless user namespace, which
+holds `CAP_SYS_PTRACE` over every process in it and its children, and it
+keeps the host pid namespace, so host pids apply. Run it from the agent's
+home, because `podman unshare` fails to chdir into an unreadable cwd.
+`podman exec` with py-spy inside the container works too.
+
+Recognise a regression by `sysctl kernel.yama.ptrace_scope` printing `1`
+again. Two other causes of the same permission denied are not this: a
+non-dumpable target (a setuid exec, `PR_SET_DUMPABLE 0`, a credential
+change after start) and a target with file capabilities the tracer lacks.
+`strace` is on the box-wide PATH; py-spy and gdb are not, they come from a
+project's devbox or venv.
+
 ## Memory pressure: swap first, then the right victim
 
 The VM once had no swap, so memory pressure went straight to the kernel's

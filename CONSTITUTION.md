@@ -45,6 +45,11 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   `lima-init` runs `usermod -a -G wheel $LIMA_CIDATA_USER` unconditionally,
   after NixOS activation, with no `Condition=` guarding it — wheel
   stripped from that account is silently reinstated on the very next boot.
+- NEVER grant `CAP_SYS_PTRACE` — through `security.wrappers`, `setcap`, or
+  ambient capabilities — to any binary the agent can run. The capability
+  ignores uids, so it attaches to root's processes and hands the agent root.
+  Same-uid debugging comes from `kernel.yama.ptrace_scope = 0` in
+  `nix/base.nix` instead.
 - ALWAYS let an ssh role, not a bare `User=` override, own the
   `ControlPath`. Lima's `ControlPath` carries no `%r`, so OpenSSH's mux
   client never re-checks the login user against an already-open master's,
