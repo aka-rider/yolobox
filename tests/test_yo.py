@@ -1175,32 +1175,32 @@ class TestBaseNixMatchesYoConstants(unittest.TestCase):
             self.assertIn(name, text)
 
 
-class TestGcHelpNamesEveryBuildDir(unittest.TestCase):
-    def test_gc_description_includes_every_build_dir(self):
-        # Parse BUILD_DIRS from the shell script
+class TestGcHelpNamesEverythingItDeletes(unittest.TestCase):
+    def script_array(self, name):
         shell_path = Path(yo.__file__).parent / "nix" / "guest" / "yolobox-guest.sh"
-        shell_text = shell_path.read_text()
+        # e.g. BUILD_DIRS=(node_modules target .next)
+        match = re.search(name + r"=\(([^)]+)\)", shell_path.read_text())
+        self.assertIsNotNone(match, f"{name} not found in shell script")
+        entries = match.group(1).split()
+        self.assertTrue(entries, f"{name} appears to be empty")
+        return entries
 
-        # Extract BUILD_DIRS array using regex: BUILD_DIRS=(node_modules target .next)
-        match = re.search(r'BUILD_DIRS=\(([^)]+)\)', shell_text)
-        self.assertIsNotNone(match, "BUILD_DIRS not found in shell script")
-
-        # Parse the directory names
-        build_dirs_str = match.group(1)
-        build_dirs = build_dirs_str.split()
-        self.assertTrue(build_dirs, "BUILD_DIRS appears to be empty")
-
+    def gc_help(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
             yo.build_parser().parse_args(["gc", "--help"])
         self.assertEqual(cm.exception.code, 0)
+        return buf.getvalue()
 
-        for dir_name in build_dirs:
-            self.assertIn(
-                dir_name,
-                buf.getvalue(),
-                f"BUILD_DIRS entry '{dir_name}' not found in `yo gc --help`",
-            )
+    def test_gc_description_includes_every_build_dir_and_local_cache(self):
+        help_text = self.gc_help()
+        for array in ("BUILD_DIRS", "LOCAL_CACHES"):
+            for entry in self.script_array(array):
+                self.assertIn(
+                    entry,
+                    help_text,
+                    f"{array} entry '{entry}' not found in `yo gc --help`",
+                )
 
 
 class TestTailscaleStatusLine(unittest.TestCase):
