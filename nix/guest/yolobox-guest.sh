@@ -18,6 +18,14 @@
 # matches them (they are the thing being deleted).
 BUILD_DIRS=(node_modules target .next)
 
+# The one place cache names under ~/.cache are spelled; gc --yes deletes
+# them all. Only caches a tool rebuilds or refetches by itself belong here:
+# model weights and app data (huggingface, ms-playwright, ...) never do.
+LOCAL_CACHES=(go-build gopls goimports golangci-lint staticcheck uv pip pip-tools pnpm zig cargo-zigbuild opengrep nix)
+
+# What `go` writes as the first line of a build cache's README.
+GO_BUILD_CACHE_HEADER='This directory holds cached build artifacts from the Go build system.'
+
 build_expr() {
     EXPR=('(')
     local name
@@ -113,6 +121,76 @@ build_targets() {
     fi
 }
 
+# Fills CACHE_PATHS with every existing cache directory gc --yes reclaims: the
+# LOCAL_CACHES, cargo's downloaded sources, and the Go caches. GOPATH used to be
+# set only by interactive dotfiles, so a cache can sit at any old GOPATH;
+# Go's caches are found by signature, not by
+# path: a module cache is a `pkg/mod` holding `cache/download`, a build cache
+# is a directory whose README opens with GO_BUILD_CACHE_HEADER. The walk stops
+# at depth 5: that reaches a GOPATH three directories below $HOME (its
+# pkg/mod sits at depth 5) and a build cache four down (its README sits at
+# depth 5); ~/Developer/go is two down. Hidden directories are pruned, which
+# also keeps ~/.cache/go-build out of it (LOCAL_CACHES already names it).
+# A global rather than stdout, for the same reason as TARGETS_FILE.
+CACHE_PATHS=()
+
+add_cache() {
+    if [ -e "$1" ]; then
+        CACHE_PATHS+=("$1")
+    fi
+}
+
+cache_targets() {
+    CACHE_PATHS=()
+    local name path
+    for name in "${LOCAL_CACHES[@]}"; do
+        add_cache "$HOME/.cache/${name}"
+    done
+    add_cache "$HOME/.cargo/registry"
+    add_cache "$HOME/.cargo/git"
+
+    build_expr
+    local candidates rc=0
+    candidates="$(mktemp)"
+    find "$HOME" -mindepth 1 -maxdepth 5 \
+        "${EXPR[@]}" -type d -prune -o \
+        -name '.*' -prune -o \
+        -type d -path '*/pkg/mod' -print0 -prune -o \
+        -type f -name README -printf '%h\0' >"${candidates}" || rc=$?
+    if [ "${rc}" != 0 ]; then
+        fail "the Go cache walk under \$HOME could not read every directory (find exit ${rc})" \
+            "A Go cache under a directory it could not open is invisible to gc."
+    fi
+    while IFS= read -r -d '' path; do
+        case "${path}" in
+        */pkg/mod)
+            if [ -d "${path}/cache/download" ]; then
+                add_cache "${path}"
+            fi
+            ;;
+        *)
+            if [ "$(head -n 1 "${path}/README")" = "${GO_BUILD_CACHE_HEADER}" ]; then
+                add_cache "${path}"
+            fi
+            ;;
+        esac
+    done <"${candidates}"
+    rm -f "${candidates}"
+}
+
+# Go's module cache is read-only (directories 0555, files 0444), so a bare
+# rm -rf fails on it.
+remove_tree() {
+    chmod -R u+w "$1" && rm -rf "$1"
+}
+
+# Claude's scratchpads are live session output, not ours to delete. Reported
+# so a full disk can be traced to them.
+report_scratchpads() {
+    printf '\n/tmp scratchpads (reported only, never deleted; systemd ages /tmp after 10 days idle):\n'
+    measure "/tmp/claude-$(id -u)"
+}
+
 cmd_projects() {
     build_expr
     find "$HOME" -mindepth 1 \
@@ -190,6 +268,9 @@ cmd_gc_machine() {
     booted="${booted_line#booted=}"
     if [ -n "${booted}" ] && [ "${booted}" = "${profile}" ]; then
         step 'nix-collect-garbage -d' sudo nix-collect-garbage -d
+        # Hard-links identical store files; what auto-optimise-store does for
+        # new paths, this does for the ones already there.
+        step 'nix-store --optimise' sudo nix-store --optimise
     else
         fail "skipped nix-collect-garbage -d: booted and profile generations disagree" \
             "booted:  ${booted:-<unreadable>}" \
@@ -224,12 +305,19 @@ cmd_gc_user() {
     MEASURE_AS=
     local user_paths=("$HOME/.npm" "$HOME/.local/share/containers/storage")
 
+    local path
+    cache_targets
+
     if [ "${apply}" != 1 ]; then
         printf 'user tier (current size of each target):\n'
-        local path
         for path in "${user_paths[@]}"; do
             measure "${path}"
         done
+        printf '\ncache tier (rebuilt or refetched on demand; --yes reclaims it):\n'
+        for path in "${CACHE_PATHS[@]}"; do
+            measure "${path}"
+        done
+        report_scratchpads
         if [ "${deep}" = 1 ]; then
             printf '\nproject tier (--deep):\n'
             local found=0 target
@@ -253,6 +341,10 @@ cmd_gc_user() {
     # they wait for --deep. nix/podman.nix already runs a periodic autoPrune
     # besides.
     step 'podman system prune -f' podman system prune -f
+    for path in "${CACHE_PATHS[@]}"; do
+        step "rm -rf ${path}" remove_tree "${path}"
+    done
+    report_scratchpads
 
     if [ "${deep}" = 1 ]; then
         step 'podman system prune -af' podman system prune -af

@@ -28,7 +28,7 @@ rules this file justifies.
 - `nix/herd-server.nix` — the VM's own herdr server, run as the agent
   account from boot.
 - `nix/lib/agent-env.nix` — the one attrset declaring the agent's
-  environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`), applied identically to
+  environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`, `GOPATH`), applied identically to
   the herdr server, t3 and every agent login shell.
 - `nix/display.nix` — the virtual X display, browsers, screen recording, and
   the `xclip`/`xsel` OSC 52 clipboard shim.
@@ -629,13 +629,21 @@ operator's alone.
 `BUILD_DIRS` (`node_modules`, `target`, `.next`) is the single place
 build-output directory names are spelled, inside the guest script; the one
 other spelling, the prose of `yo gc`'s `--help` in `build_parser()`, is
-guarded by `TestGcHelpNamesEveryBuildDir`, which fails when the help stops
-naming a directory in the array. The
+guarded by `TestGcHelpNamesEverythingItDeletes`, which fails when the help
+stops naming a directory in the array. The
 project walk prunes them, because a repo living inside `node_modules` is
 not a project a person would pick; `gc --deep` matches them, because there
 they are the thing being deleted. One list serves both on purpose — before
 the move there were two, `PROJECT_FIND` and `GC_USER`'s `project_targets`,
 and neither knew the other existed.
+
+`BUILD_DIRS` is no longer the only list the script owns. `LOCAL_CACHES` is
+the single spelling of the cache names `gc --yes` deletes under `~/.cache`
+(see "A full disk" below for what belongs in it and what never does), and
+the same test parses it and fails when `yo gc --help` stops naming an entry.
+Cargo's `registry` and `git`, and the Go caches, are not in that array:
+cargo's two directories are fixed paths spelled once in `cache_targets`,
+and the Go caches have no fixed path at all.
 
 The Mac side never guesses what a box supports; it reads the exit code.
 A subcommand `yo` was built to call after `yolobox-guest` shipped it exits
@@ -928,6 +936,48 @@ in a debugger does not.
 Runners-up: 32 GiB of dead nix store paths, 4.7 GiB podman, 2.9 GiB
 `/root/.cache/nix`, 2.5 GiB `~/.npm`.
 
+The second incident (2026-10-15) had a different shape: the 400 GiB disk sat
+at 95-99% and `target/` was not the story. The biggest consumers were
+caches `yo gc` did not know about: `~/.cache/go-build` 22 GiB, `~/.cache/uv`
+10 GiB, `~/.cache/nix` (the agent's own, not root's) 3.2 GiB, the Go module
+caches (`~/go/pkg/mod` 518 MiB, `~/Developer/go/pkg/mod` 3.4 GiB, the build
+cache `~/Developer/go/cache` 106 MiB), `~/.cargo/registry` 1.2 GiB, and a
+tail of gopls, goimports, golangci-lint, staticcheck, pip, pip-tools, pnpm,
+zig, cargo-zigbuild and opengrep caches. npm deduplication was measured and
+rejected: all `node_modules` together hold 3.8 GiB, of which 0.9 GiB is
+duplicate, so a dedup tool buys less than one of the Go caches' rounding
+error. `/tmp/claude-1000`, Claude's scratchpads, held 49 GiB, and the
+`q /tmp 10d` aging rule is not broken: it removes a file only when its
+atime, mtime *and* ctime are all older than ten days, and every scratchpad
+had been touched recently. The data is simply fresh, so `yo gc` reports it
+and never deletes it.
+
+So `gc-user --apply` now has a cache tier, run without `--deep` because
+none of it is project state. Its rule is that only caches a tool rebuilds or
+refetches by itself go in `LOCAL_CACHES`. Model weights and app data never do
+(`~/.cache/huggingface`, `modelscope`, `ms-playwright`, and `~/.cache/rune`,
+which is a macOS SDK): losing them costs a download the box cannot
+necessarily repeat, or breaks a tool outright. Rust and Go caches are dropped
+by plain `--yes` even though a module cache needs the network to come back,
+because they are the bulk of the space. The Go caches are found by
+signature, not path. Until this incident GOPATH was set only by the
+agent's interactive dotfiles (`~/wrk/go`, physically `~/Developer/go`), so
+every other process — t3, a non-interactive ssh — fell back to Go's default
+`~/go` and the module cache existed twice. `nix/lib/agent-env.nix` now sets
+`GOPATH=~/Developer/go` for every agent process — the physical spelling, so
+it never depends on the `~/wrk` link existing first (`nix/base.nix` creates
+that link with a plain `L` tmpfiles rule; `L+` would delete a real `~/wrk`
+directory) — which stops the split, but the
+walk still finds a cache left at any other GOPATH: a module cache is a `pkg/mod` holding `cache/download`, a build cache is
+a directory whose `README` opens with the line `go` itself writes. The walk
+prunes hidden directories and `BUILD_DIRS`, and stops at depth 5. The module
+cache is written read-only (directories 0555, files 0444), so a bare `rm -rf`
+fails on it; `remove_tree` runs `chmod -R u+w` first. On the machine side
+`gc-machine --apply` follows `nix-collect-garbage -d` with `nix-store
+--optimise` inside the same booted-equals-profile guard, and `nix/base.nix`
+sets `nix.settings.auto-optimise-store = true` so new store paths are
+hard-linked as they land instead of waiting for the next gc.
+
 The podman share had a second cause: `virtualisation.podman.autoPrune`
 renders a *system* `podman-prune.timer` that runs as root, and this box is
 rootless-only, so root owned nothing and the weekly prune no-op'd silently
@@ -941,10 +991,11 @@ agent must show it; `systemctl list-timers` as the operator must not.
 
 `yo gc` reports, and `--yes` now runs two ordered ssh sessions, one per
 account, not one session doing everything. The machine tier runs as the
-**operator** — journald, `nix-collect-garbage`, root's nix cache — and it
+**operator** — journald, `nix-collect-garbage`, `nix-store --optimise`, root's
+nix cache — and it
 runs first on purpose: ext4's root reserve is what makes the rest of the
 cleanup possible at all on a genuinely full disk. The user tier then runs
-as the **agent** — npm cache, rootless podman, and under `--deep --yes`
+as the **agent** — npm cache, rootless podman, the cache tier below, and under `--deep --yes`
 the project tier: `target`, `node_modules` and `.next` deleted anywhere
 under the agent's home, hidden directories pruned. The split is not
 cosmetic: npm's cache, podman's storage and every project checkout live

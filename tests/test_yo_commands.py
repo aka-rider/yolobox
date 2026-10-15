@@ -320,6 +320,7 @@ class TestGcSkipsCollectionOnHalfFailedSwitch(unittest.TestCase):
     def test_runs_the_collection_when_booted_matches_the_profile(self):
         stdout = self.run_decision("/nix/store/aaa", "/nix/store/aaa")
         self.assertIn("STEP:nix-collect-garbage -d", stdout)
+        self.assertIn("STEP:nix-store --optimise", stdout)
 
     def test_skips_the_collection_when_the_generations_disagree(self):
         stdout = self.run_decision("/nix/store/aaa", "/nix/store/bbb")
@@ -327,6 +328,7 @@ class TestGcSkipsCollectionOnHalfFailedSwitch(unittest.TestCase):
             "FAIL:skipped nix-collect-garbage -d: booted and profile generations disagree",
             stdout,
         )
+        self.assertNotIn("STEP:", stdout)
 
 
 class TestDirForCwdLandsOnDeepestExistingAncestor(FakeHome):

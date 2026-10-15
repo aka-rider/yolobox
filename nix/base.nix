@@ -197,6 +197,10 @@ in
 
   systemd.tmpfiles.rules = [
     "d /run/yolobox-op 0700 ${username} users -"
+    # ~/wrk is the Mac's spelling of ~/Developer, and the mirror carries it
+    # verbatim. Plain L, never L+: L+ would delete a real ~/wrk directory.
+    "d ${config.users.users.${agentUser}.home}/Developer 0755 ${agentUser} users -"
+    "L ${config.users.users.${agentUser}.home}/wrk - - - - Developer"
   ];
 
   environment.localBinInPath = true;
@@ -283,4 +287,5 @@ in
   environment.etc."yolobox/version".text = version + "\n";
 
   nix.settings.experimental-features = [ "nix-command" "flakes" "fetch-closure" "ca-derivations" ];
+  nix.settings.auto-optimise-store = true;
 }
