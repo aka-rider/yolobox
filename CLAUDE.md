@@ -1132,7 +1132,7 @@ headless unless told `--headed`.
 
 The one thing the box must supply is the browser binary itself, because
 Playwright's own browser downloads do not run on NixOS. So
-`PLAYWRIGHT_MCP_EXECUTABLE_PATH` points at nixpkgs' `chromium` (151, cached
+`PLAYWRIGHT_MCP_EXECUTABLE_PATH` points at nixpkgs' `chromium` (155, cached
 for aarch64); agent-browser finds the same chromium on PATH and through
 the extension's own config file (see "MCP" below), and
 `AGENT_BROWSER_EXECUTABLE_PATH` is deliberately not set, because
@@ -1215,7 +1215,7 @@ succeed — into Xvfb's clipboard, which nobody ever sees, the same reasoning
 that keeps far2l at `withTTYX = false`. So `nix/display.nix` ships `xclip`
 and `xsel` as one `writeShellApplication` shim that dispatches on its
 invoked name. It reads stdin and writes `ESC]52;c;<base64>BEL` to `/dev/tty`,
-the pane's own pty; herdr 0.9.3's pane parser (libghostty-vt) turns that
+the pane's own pty; herdr 0.9.5's pane parser (libghostty-vt) turns that
 into `ServerMessage::Clipboard`, sends it to the foreground client, and the
 Mac client runs `pbcopy`. It always emits selection `c`, because herdr drops
 `p` and `s`. It refuses, with exit 1 and a stderr message, rather than
@@ -1316,10 +1316,10 @@ the old rule, exact version equality between the two, was strictly finer
 than what compatibility actually needs.
 
 The VM's herdr is pinned regardless, through the existing
-`yolobox.harness.herdr.version`/`.hash` valve in `flake.nix` — to 0.9.3,
-because the pinned nixpkgs lags the Mac's herdr (it carried 0.8.2, and
-carries 0.9.1 now), and the Mac's herdr, not nixpkgs, sets the generation
-the guest must speak. The pin fetches the published
+`yolobox.harness.herdr.version`/`.hash` valve in `flake.nix` — to 0.9.5,
+because the pinned nixpkgs lags the Mac's herdr (it carried 0.8.2, then
+0.9.1, and carries 0.9.3 now), and the Mac's herdr, not nixpkgs, sets the
+generation the guest must speak. The pin fetches the published
 `herdr-linux-aarch64` release asset directly (`nix/pkgs/herdr-bin.nix`);
 it carries no `PT_INTERP` and no `PT_DYNAMIC` — statically linked — so it
 runs on NixOS unpatched, with none of the nix-ld dance a dynamically
@@ -1800,9 +1800,9 @@ peer` with zero bytes, while inside the VM the same request returns 200.
 That asymmetry is the diagnosis. `~/.lima/yolobox/ha.stderr.log` repeats
 `tcpproxy: ... grpc: the client connection is closing`.
 
-Lima 2.2.0 carries the guest-agent streams and the TCP tunnel on one grpc
-connection. When the guest agent restarts, the host agent dials a new
-connection, but an existing listener keeps its old dialer, so every
+Lima v2.1.2 through v2.2.0 carry the guest-agent streams and the TCP tunnel
+on one grpc connection. When the guest agent restarts, the host agent dials
+a new connection, but an existing listener keeps its old dialer, so every
 forwarded port accepts and then resets, permanently. It is a regression
 from lima PR #4889, first shipped in v2.1.2, which closes the stale grpc
 connection on reconnect; before that the stale connection leaked but still
@@ -1811,21 +1811,24 @@ The host agent replaces the connection only when the guest agent is
 still down 10 s after the event stream ended; a quick `systemctl restart
 lima-guestagent` stays inside that window and is harmless, a `switch`
 that re-runs `lima-init` first is not. Reported upstream as
-lima-vm/lima#5557 with a fix in draft PR lima-vm/lima#5558 (dial through
-the current guest agent client), both awaiting review; `TODO.md` carries
-the follow-ups.
+lima-vm/lima#5557, fixed by lima-vm/lima#5558 (dial through the current
+guest agent client); both were closed and merged on 2026-10-03, and the fix
+shipped in lima v2.2.1 the same day. So only v2.1.2 through v2.2.0 is
+affected, and upgrading `limactl` on the Mac is the real cure.
 
 Why it bites here: `services.lima.enable` makes `lima-init` and
 `lima-guestagent` ordinary units whose text embeds store paths, so a
 nixpkgs bump rehashes them and `switch` restarts both. Twenty switches on
 one pin never showed it; the first bump did. Pinned shut with
 `restartIfChanged = false` on both units, which nixos-lima draft PR
-nixos-lima/nixos-lima#125 proposes for every nixos-lima box; once it is
-merged and the flake's `nixos-lima` input is bumped, this box's own pin is
-redundant and goes. `yo` could not have caught it —
+nixos-lima/nixos-lima#125 proposes for every nixos-lima box. The pin stays
+even though the lima fix has shipped, because it protects a Mac still on an
+affected lima; it goes once nixos-lima#125 is merged and the flake's
+`nixos-lima` input is bumped. `yo` could not have caught it —
 every check ran on the healthy side of the hop, and a TCP-connect probe
 succeeds because the handshake completes before the reset. Recovery:
 `limactl stop yolobox && ./yo up`; nothing lighter restarts the host agent.
+On an affected lima, upgrade `limactl` first so it does not come back.
 
 ### `lsof` shows lima on `*:80` and `*:443`
 
