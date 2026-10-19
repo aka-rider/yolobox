@@ -2,10 +2,10 @@ name: Release
 
 on:
   release:
-    types: [published]
+    types: [released]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.event.release.tag_name }}
@@ -17,12 +17,24 @@ jobs:
   release:
     needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       TAG: ${{ github.event.release.tag_name }}
     outputs:
       version: ${{ steps.build.outputs.version }}
       sha256: ${{ steps.build.outputs.sha256 }}
     steps:
+      - name: Refuse a tag that is not vMAJOR.MINOR.PATCH
+        run: |
+          set -euo pipefail
+          # The version is spliced into the tarball name, the formula URL and
+          # the tap commit message, so anything else is refused before a tag moves.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::tag '${TAG}' is not vMAJOR.MINOR.PATCH; refusing to release it"
+              exit 1
+          fi
+
       - name: Refuse before anything irreversible happens
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -37,11 +49,30 @@ jobs:
               exit 1
           fi
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: true
+
+      - name: Refuse before the tag moves unless the tap token can push
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Checked now, not in bump-tap, because bump-tap runs after the tag has
+          # moved. A dry-run push is the only probe that exercises the token's own
+          # write grant: the REST permissions field reports the token owner's role,
+          # which a fine-grained PAT does not share. The branch name is unique to
+          # this run, so nothing is created. The checkout above persisted its own
+          # GITHUB_TOKEN header; -c clears it, or git would authenticate with that
+          # header instead of the token in the URL.
+          if ! git -c http.https://github.com/.extraheader= push --dry-run \
+              "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/aka-rider/homebrew-tap.git" \
+              "HEAD:refs/heads/preflight-probe-${GITHUB_RUN_ID}"; then
+              echo "::error::HOMEBREW_TAP_TOKEN cannot push to aka-rider/homebrew-tap (git push --dry-run was refused, see above); refusing before the tag moves"
+              exit 1
+          fi
 
       - name: Assert the release tag is the tip of main
         run: |
@@ -52,10 +83,19 @@ jobs:
           git fetch --force --tags origin
           tag_sha="$(git rev-parse "refs/tags/${TAG}^{commit}")"
           head_sha="$(git rev-parse HEAD)"
-          if [ "$tag_sha" != "$head_sha" ]; then
-              echo "::error::${TAG} points at ${tag_sha}, not the tip of main (${head_sha}); refusing to move it"
-              exit 1
+          if [ "$tag_sha" = "$head_sha" ]; then
+              exit 0
           fi
+          # A run that pushed the stamp but died before moving the tag leaves the
+          # tag one commit behind, on the commit the stamp was made from. Accept
+          # exactly that shape: HEAD is our own stamp and changes nothing else.
+          if [ "$tag_sha" = "$(git rev-parse HEAD^)" ] \
+              && [ "$(git log -1 --format=%s HEAD)" = "release: ${TAG#v} [skip ci]" ] \
+              && [ "$(git diff-tree --no-commit-id --name-only -r HEAD)" = ".version" ]; then
+              exit 0
+          fi
+          echo "::error::${TAG} points at ${tag_sha}, not the tip of main (${head_sha}); refusing to move it"
+          exit 1
 
       - name: Stamp .version from the tag and commit it
         run: |
@@ -101,12 +141,15 @@ jobs:
   bump-tap:
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: true
           repository: aka-rider/homebrew-tap
@@ -122,6 +165,16 @@ jobs:
           url="https://github.com/aka-rider/yolobox/releases/download/v${VERSION}/yolobox-${VERSION}.tar.gz"
           mkdir -p homebrew-tap/Formula
           sed -e "s#@URL@#${url}#" -e "s#@SHA256@#${SHA256}#" homebrew/yolobox.rb > homebrew-tap/Formula/yolobox.rb
+          # grep exits 1 for "no hole left", the good case; any other status is a real error.
+          status=0
+          grep -q '@[A-Z0-9_]*@' homebrew-tap/Formula/yolobox.rb || status=$?
+          if [ "$status" -eq 0 ]; then
+              echo "::error::Formula/yolobox.rb still contains an unreplaced @HOLE@"
+              exit 1
+          elif [ "$status" -ne 1 ]; then
+              echo "::error::grep failed on Formula/yolobox.rb (exit ${status})"
+              exit "$status"
+          fi
           if [ -z "$(git -C homebrew-tap status --porcelain -- Formula/yolobox.rb)" ]; then
               echo "::error::Formula/yolobox.rb did not change; refusing to push a no-op commit"
               exit 1
