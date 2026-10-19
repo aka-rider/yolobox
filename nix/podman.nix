@@ -11,9 +11,10 @@
 
   # autoPrune.enable renders a system-scope timer running as root, which has
   # nothing to prune on a rootless-only box; prune as the account that owns
-  # the storage instead.
+  # the storage instead. `podman system prune -f` removes stopped containers,
+  # unused networks, dangling images and build cache; volumes are kept.
   systemd.user.services.podman-prune = {
-    description = "Prune unused rootless podman storage";
+    description = "Prune stopped containers and unused rootless podman storage";
     unitConfig.ConditionUser = agentUser;
     serviceConfig = {
       Type = "oneshot";

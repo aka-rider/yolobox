@@ -22,18 +22,27 @@ let
       keep_versions=2
       settle_minutes=10
 
-      current_dir="$(dirname "$(readlink -f "${t3Link}" 2>/dev/null || true)" 2>/dev/null || true)"
+      # Where ~/.local/bin/t3 really lands. The running version is whichever
+      # directory contains it, however deep the binary sits inside.
+      resolved="$(readlink -f "${t3Link}" 2>/dev/null || true)"
 
-      stale="$(find "${t3VersionsDir}" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -mmin "+$settle_minutes" -printf '%f\n' 2>/dev/null | sort -V | head -n "-$keep_versions" || true)"
-      if [ -n "$stale" ]; then
+      # Rank every version first, so a fresh download counts toward the
+      # $keep_versions kept (the link points at the newest, which ranking
+      # always spares). Only then does settling filter the rest, as the
+      # claude keeper does.
+      older="$(find "${t3VersionsDir}" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' 2>/dev/null | sort -V | head -n "-$keep_versions" || true)"
+      if [ -n "$older" ]; then
         while IFS= read -r version; do
           dir="${t3VersionsDir}/$version"
-          if [ "$dir" = "$current_dir" ]; then
+          case "$resolved" in
+            "$dir"/*) continue ;;
+          esac
+          if [ -z "$(find "$dir" -maxdepth 0 -mmin "+$settle_minutes" -print)" ]; then
             continue
           fi
           rm -rf "$dir"
           echo "pruned $dir"
-        done <<< "$stale"
+        done <<< "$older"
       fi
     '';
   };
