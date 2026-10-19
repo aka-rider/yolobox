@@ -10,6 +10,17 @@ NixOS machine, run by Lima, devbox, batteries included.
 - Supply chain attacks
 - Slow MacOS disk due to `systempolicyd` scans
 
+### What this does and does not protect
+
+It narrows what an agent can do. It does not contain it.
+
+- The agent runs as its own account with no `sudo` and no access to your Mac's files: nothing is mounted, and git is the only bridge.
+- Every process in the VM can use your Mac's 1Password SSH agent for as long as the VM runs, so it can authenticate to GitHub as you.
+- Every process in the VM can ask the AWS broker for real credentials for every SSO profile in your `~/.aws/config`.
+- The VM can reach your LAN and the internet, and it can reach services on your Mac's loopback through `192.168.5.2`.
+- Whatever the agent commits comes back through `git pull`, and you are the one who builds and runs it.
+- A kernel exploit is out of scope, and anything the agent leaves in its home stays until you recreate the VM.
+
 ### Prerequisites
 
 [1Password](https://1password.com/) with its SSH agent enabled (it holds your keys).
@@ -20,7 +31,7 @@ brew install aka-rider/tap/yolobox
 
 ## Quickstart
 
-On Nix, `nix run github:aka-rider/yolobox` runs the same release without a `brew` install at all.
+On Nix, `nix run github:aka-rider/yolobox/v<version>` runs that same release without a `brew` install at all (a bare `github:aka-rider/yolobox` runs `main`, not a release).
 
 Create and build the VM once:
 
@@ -47,6 +58,21 @@ You can use many commands with fuzzy project name. The search is done among dire
 
 If you have `~/code/some-project`, then `yo enter proj`, `yo code proj`, `yo zed proj` will all get you there.
 
+### Getting a project in, and its commits out
+
+The VM has no host mounts. Git is the only bridge: a project must be a git repo, and its VM twin is a repo at the same `$HOME`-relative path.
+
+```bash
+cd ~/code/project
+yo link                  # adds a "yolobox" remote and creates the repo in the VM
+git push yolobox main    # the project goes in
+git pull yolobox main    # what the agent committed comes back
+```
+
+The VM checkout accepts a push only while its worktree is clean, so pull the agent's commits before pushing again. That pull is also where you review what the agent wrote, before anything on the Mac runs it. `yo link` repoints a `yolobox` remote left by an older VM.
+
+`yo seed` copies what the VM cannot do without, and never a private key: `~/.ssh/config` (without lima's `Include` and any `IdentityAgent`), your `*.pub` files, and each `<group>/.gitconfig`, so work repos commit under the right email. `yo bootstrap` runs it; run it again after your first `yo link` on a new VM, because the group directories only exist in the VM once a project is linked.
+
 
 ### Copying between host and guest
 
@@ -57,6 +83,8 @@ cd <project> && yo cp README.md :  # host -> guest
 yo cp :notes.md ~/Desktop/         # guest -> host
 yo cp a.txt b.txt :dump/           # multiple sources -> one guest directory
 ```
+
+An upload refuses a symlink, or a directory containing one, naming it, because `scp -r` would copy what the link points at instead of the link. A source whose name starts with `-` needs `yo cp -- -odd.txt :`.
 
 
 Run `yo --help` for the rest of the commands.
@@ -77,7 +105,7 @@ Both reach the VM the same way: a permanent lima reverse unix-socket forward, on
 
 ```bash
 limactl stop yolobox
-limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"hostIP":"0.0.0.0"},{"proto":"udp","guestPort":68,"guestIP":"0.0.0.0","ignore":true},{"guestSocket":"/run/yolobox-op/agent.sock","hostSocket":"{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock","reverse":true},{"guestSocket":"/run/yolobox-op/aws-broker.sock","hostSocket":"{{.Home}}/.local/state/yolobox/aws-broker.sock","reverse":true}]'
+limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"proto":"tcp","hostIP":"0.0.0.0"},{"proto":"udp","guestPort":68,"guestIP":"0.0.0.0","ignore":true},{"guestSocket":"/run/yolobox-op/agent.sock","hostSocket":"{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock","reverse":true},{"guestSocket":"/run/yolobox-op/aws-broker.sock","hostSocket":"{{.Home}}/.local/state/yolobox/aws-broker.sock","reverse":true}]'
 yo up
 ```
 
@@ -164,7 +192,7 @@ sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake 'github:ak
 ```
 
 
-Four settings in `lima/yolobox.yaml` — `disk`, `portForwards`, `memory`, and `cpus` — are read once, when the VM is created. Changing the file later does nothing to an existing VM; stop it and use `limactl edit yolobox`.
+The settings in `lima/yolobox.yaml` — `disk`, `portForwards`, `memory`, `cpus`, `vmType`, `propagateProxyEnv` and `ssh.loadDotSSHPubKeys` among them — are read once, when the VM is created. Changing the file later does nothing to an existing VM; stop it and use `limactl edit yolobox`. A VM created before the last two existed still has lima's defaults for them (your Mac's proxy variables propagate, and every `~/.ssh/*.pub` is authorised in the VM); restate them with `limactl stop yolobox && limactl edit yolobox --set '.propagateProxyEnv = false | .ssh.loadDotSSHPubKeys = false'`.
 For memory and CPUs:
 
 ```bash

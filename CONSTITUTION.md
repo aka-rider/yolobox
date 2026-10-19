@@ -55,9 +55,17 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   client never re-checks the login user against an already-open master's,
   and `-o User=agent` layered onto the operator's live master silently
   runs as the operator.
-- ALWAYS point `homeTmpfiles`, every systemd `User=`, and the direnv
-  whitelist at `agentUser`, never at `${username}`. Review invariant:
-  `grep -rn 'username' nix/` must hit only `nix/base.nix`.
+- ALWAYS point `homeTmpfiles`, every systemd `User=` and `ConditionUser=`,
+  and the direnv whitelist at `agentUser`, never at `${username}`. Review
+  invariant: `grep -rn 'username' nix/` must hit only `nix/base.nix`.
+- NEVER add a whitelist to `/etc/direnv`, the config root root and the
+  operator read. It carries none, so they get "blocked" for an `.envrc` the
+  agent wrote; only `/etc/direnv-agent` (`DIRENV_CONFIG` in
+  `nix/lib/agent-env.nix`) trusts the agent's home.
+- NEVER put the agent in `systemd-journal`, `adm` or any other group that
+  reads the system journal. The operator's `sudo ... COMMAND=<argv>` lines
+  are in it. The display units are the agent's own user units for that
+  reason.
 
 ## Distribution
 
@@ -75,6 +83,9 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   builds from a flake ref now, not a push; a guest checkout would reopen
   the exact push-to-checkout hazard this repo already carries for user
   projects, for a repo nothing in the VM reads any more.
+- ALWAYS pin every GitHub Action in `.github/workflows/` to a full commit
+  SHA, with the tag in a comment. The release job holds a writable token and
+  the tap's.
 - ALWAYS keep `aka-rider/yolobox` public. `nixos-rebuild` fetches the
   flake ref anonymously, with no credentials configured anywhere in `yo`;
   a private repo fails every `yo bootstrap` and every
@@ -126,10 +137,22 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   `systemd-socket-proxyd` to the agent-owned `/run/yolobox/op-agent.sock`),
   never `ForwardAgent`. The reverse forward is set up once per hostagent
   start and lives with the VM, not with any one pane.
-- NEVER put `ForwardAgent` in `~/.lima/yolobox/ssh.config`. That file is
-  shared by every ssh role `yo` spawns, so a forward declared there would
-  reach `yo code`, `yo zed` and every t3-spawned session, not only the one
-  interactive command that asked for it.
+- NEVER put a `ForwardAgent` other than `no` in `~/.lima/yolobox/ssh.config`.
+  That file is shared by every ssh role `yo` spawns, so a forward declared
+  there would reach `yo code`, `yo zed` and every t3-spawned session, not
+  only the one interactive command that asked for it. The owned agent
+  `Match` block and the herdr alias say `ForwardAgent no` so that the
+  operator's own `Host lima-yolobox` / `ForwardAgent yes` cannot apply to
+  them.
+- ALWAYS verify the guest's host key from `~/.lima/yolobox/known_hosts`,
+  with `NoHostAuthenticationForLocalhost no` in the owned head block of
+  `~/.lima/yolobox/ssh.config`, so that every connection that reads that
+  file is pinned, `yo code`, `yo zed` and the git push channel included.
+  Lima's own Host block sets it to yes, which disables verification for
+  127.0.0.1 whatever else is configured; ssh keeps the first value, and the
+  owned block sits first. That block is the one place that pins. The one ssh
+  that fetches the keys to pin them (`OPERATOR_FIRST_CONTACT`) is the only
+  one allowed not to, and opts out explicitly on its command line.
 - ALWAYS give `yo ssh`'s own `ForwardAgent` the 1Password socket path
   itself, and only over its own `ControlPath=none` connection — the
   operator's per-session forward, kept because the operator is not the
