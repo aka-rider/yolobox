@@ -3,7 +3,8 @@
 # find expressions, the gc tiers and the AWS probe are shellchecked at build
 # time instead of living in yo's Python string literals where nothing checks
 # them. Subcommands: projects, home-roots, landing-dir,
-# ensure-repo, generations, gc-machine, gc-user, aws-creds, aws-check.
+# ensure-repo, generations, gc-machine, gc-user, aws-creds, aws-check,
+# net-check.
 #
 # writeShellApplication prepends `set -o errexit -o nounset -o pipefail`. The
 # gc tiers below were written for a shell with none of that — a cleanup step
@@ -465,6 +466,28 @@ cmd_aws_check() {
     [ "${failed}" = 0 ] || exit 1
 }
 
+# Tells apart the two Mac-VPN shapes CLAUDE.md describes: a WireGuard default
+# route kills egress while the gateway answers; ProtonVPN blackholes the
+# gateway while egress works. yo listens on the Mac's loopback at PORT, and
+# 192.168.5.2 is gvproxy's NAT of lima's gateway to that loopback. Both
+# probes only classify, so this exits 0 whatever the network state.
+cmd_net_check() {
+    local port="${1:-}"
+    if [ "$#" -ne 1 ] || ! [[ "${port}" =~ ^[0-9]+$ ]] || [ "${port}" -lt 1 ] || [ "${port}" -gt 65535 ]; then
+        printf 'yolobox-guest: net-check: usage: net-check PORT (1-65535)\n' >&2
+        exit 2
+    fi
+    local egress=dead gateway=dead
+    if curl -sS -o /dev/null --max-time 5 https://github.com 2>/dev/null; then
+        egress=ok
+    fi
+    # bash's /dev/tcp needs no extra dependency; timeout bounds a blackhole.
+    if timeout 3 "${BASH}" -c ': >/dev/tcp/192.168.5.2/'"${port}" 2>/dev/null; then
+        gateway=ok
+    fi
+    printf 'egress=%s\ngateway=%s\n' "${egress}" "${gateway}"
+}
+
 main() {
     local sub="${1:-}"
     [ "$#" -ge 1 ] && shift
@@ -478,6 +501,7 @@ main() {
     gc-user) cmd_gc_user "$@" ;;
     aws-creds) cmd_aws_creds "$@" ;;
     aws-check) cmd_aws_check ;;
+    net-check) cmd_net_check "$@" ;;
     *)
         printf "yolobox-guest: unknown subcommand '%s'\n" "${sub}" >&2
         exit 64

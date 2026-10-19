@@ -1192,6 +1192,51 @@ def tailscale_status_line(stdout: str, stderr: str) -> str:
     return "tailscale: WARNING %s, serve %s — fix with: %s" % (backend, serve, remedy)
 
 
+def network_status_line(egress_ok: bool, gateway_ok: bool) -> str:
+    if egress_ok and gateway_ok:
+        return "network: ok"
+    if gateway_ok:
+        return (
+            "network: WARNING guest egress is dead while lima's gateway answers — "
+            "a Mac VPN owns the default route; check scutil --nc list on the Mac"
+        )
+    if egress_ok:
+        return (
+            "network: WARNING 192.168.5.2 (the Mac, through lima's gateway) is blackholed "
+            "while egress works — a Mac VPN such as ProtonVPN; "
+            "forwarded TCP ports to the Mac will not answer"
+        )
+    return (
+        "network: WARNING the guest reaches neither the internet nor lima's gateway — "
+        "check yo status's lima line and the Mac's VPN (scutil --nc list)"
+    )
+
+
+def guest_network_line() -> str:
+    # The guest connects to a listener on the Mac's loopback through lima's
+    # gateway address, the same path a forwarded TCP port takes. The kernel
+    # completes the handshake from the backlog, so nothing needs to accept.
+    listener = socket.socket()
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            proc = guest_helper(OPERATOR, "net-check", [str(port)])
+        except YoError as e:
+            return "network: not checked — %s" % e.message
+    finally:
+        listener.close()
+    egress = guest_field(proc.stdout, "egress")
+    gateway = guest_field(proc.stdout, "gateway")
+    if egress not in ("ok", "dead") or gateway not in ("ok", "dead"):
+        return "network: not checked — net-check answered %r (exit %d)" % (
+            proc.stdout.strip(),
+            proc.returncode,
+        )
+    return network_status_line(egress == "ok", gateway == "ok")
+
+
 def status_guest_services() -> None:
     guest_version_raw = guest_out(["cat", "/etc/yolobox/version"], check=False).strip()
     guest_version = guest_version_raw or None
@@ -1226,6 +1271,8 @@ def status_guest_services() -> None:
 
     t3_problem = t3_service_problem(*t3_unit_state())
     out("t3: %s" % ("WARNING " + t3_problem if t3_problem else "active"))
+
+    out(guest_network_line())
 
 
 def cmd_status(args: argparse.Namespace) -> None:

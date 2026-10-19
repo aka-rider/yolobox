@@ -872,8 +872,27 @@ class TestCmdAwsCheck(unittest.TestCase):
 
 
 class TestCmdStatus(unittest.TestCase):
-    def run_status(self, *, units_present, gaps, aws_which, aws_allowlist_side_effect):
+    def run_status(
+        self,
+        *,
+        units_present,
+        gaps,
+        aws_which,
+        aws_allowlist_side_effect,
+        net_check=None,
+    ):
         outs = []
+        # net_check is either the net-check subprocess result or the YoError
+        # guest_helper raises on a box older than the subcommand.
+        if net_check is None:
+            net_check = mock.Mock(
+                returncode=0, stdout="egress=ok\ngateway=ok\n", stderr=""
+            )
+        helper = (
+            mock.Mock(side_effect=net_check)
+            if isinstance(net_check, Exception)
+            else mock.Mock(return_value=net_check)
+        )
 
         def fake_out(line=""):
             outs.append(line)
@@ -895,6 +914,7 @@ class TestCmdStatus(unittest.TestCase):
             ),
             mock.patch.object(yo, "out", side_effect=fake_out),
             mock.patch.object(yo, "err"),
+            mock.patch.object(yo, "guest_helper", helper),
         ):
             yo.cmd_status(yo.build_parser().parse_args(["status"]))
         return outs
@@ -952,6 +972,64 @@ class TestCmdStatus(unittest.TestCase):
             ),
         )
         self.assertTrue(any("aws: config unreadable:" in line for line in outs))
+
+    def test_network_line_reports_what_the_guest_net_check_answered(self):
+        outs = self.run_status(
+            units_present=True,
+            gaps=[],
+            aws_which=None,
+            aws_allowlist_side_effect=lambda: [],
+            net_check=mock.Mock(
+                returncode=0, stdout="egress=ok\ngateway=dead\n", stderr=""
+            ),
+        )
+        self.assertIn(yo.network_status_line(True, False), outs)
+
+    def test_old_box_without_net_check_reports_not_checked_instead_of_raising(self):
+        outs = self.run_status(
+            units_present=True,
+            gaps=[],
+            aws_which=None,
+            aws_allowlist_side_effect=lambda: [],
+            net_check=yo.YoError(
+                "the box's yolobox-guest has no 'net-check' subcommand"
+            ),
+        )
+        self.assertTrue(
+            any(line.startswith("network: not checked — ") for line in outs)
+        )
+        self.assertIn("lima: reverse forwards ok", outs)
+
+    def test_unparseable_net_check_output_reports_not_checked(self):
+        outs = self.run_status(
+            units_present=True,
+            gaps=[],
+            aws_which=None,
+            aws_allowlist_side_effect=lambda: [],
+            net_check=mock.Mock(returncode=1, stdout="", stderr="boom"),
+        )
+        self.assertTrue(
+            any(line.startswith("network: not checked — ") for line in outs)
+        )
+
+
+class TestNetworkStatusLine(unittest.TestCase):
+    def test_both_ok(self):
+        self.assertEqual(yo.network_status_line(True, True), "network: ok")
+
+    def test_dead_egress_with_answering_gateway_blames_a_default_route_vpn(self):
+        line = yo.network_status_line(False, True)
+        self.assertIn("WARNING guest egress is dead", line)
+        self.assertIn("scutil --nc list", line)
+
+    def test_blackholed_gateway_with_working_egress_blames_proton_style_vpn(self):
+        line = yo.network_status_line(True, False)
+        self.assertIn("WARNING 192.168.5.2", line)
+        self.assertIn("ProtonVPN", line)
+
+    def test_both_dead_points_at_the_lima_line(self):
+        line = yo.network_status_line(False, False)
+        self.assertIn("neither the internet nor lima's gateway", line)
 
 
 if __name__ == "__main__":
