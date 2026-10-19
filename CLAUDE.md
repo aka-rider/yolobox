@@ -989,10 +989,36 @@ weekly with `Persistent=true`, so a week missed because no agent session
 was open runs at the next login. `systemctl --user list-timers` as the
 agent must show it; `systemctl list-timers` as the operator must not.
 
+The third finding (2026-10-19, 259G used of 394G) was two more caches, both
+owned by the operator and so invisible to the agent tier. `/var/lib/systemd/coredump`
+held 2.1G, among it 259 `core.marksman.*.zst` of about 3.6M each, written
+between 2026-10-05 and 10-18, plus chromium and doveadm cores. marksman is
+the .NET Markdown LSP, and pi-lens 3.8.74 (a pi extension) downloads it to
+`~/.pi-lens/bin/marksman` and spawns `marksman server` whenever pi edits a
+`.md` file. Through nix-ld it aborted with SIGABRT, "Couldn't find a valid
+ICU package installed on the system", because .NET loads ICU at startup and
+nix-ld's library path had no `icu`; pi-lens retried on a timer, one core per
+attempt. `nix/base.nix` now adds `icu` to `programs.nix-ld.libraries`
+(verified: the binary with an ICU lib dir on `NIX_LD_LIBRARY_PATH` prints
+version `2026-02-08`), and the same holds for any downloaded .NET binary, so
+a new one that aborts the same way wants no new fix. Recognise the shape
+without the journal: `coredumpctl list` showed nothing, because the journal
+only held the current boot, but each core carries its origin in
+`user.coredump.*` xattrs (`getfattr -d <file>`), and
+`~/.pi-lens/sessionstart.log` shows the retries. The cores grew that far
+because systemd-coredump's default `MaxUse` is 10% of the filesystem, about
+40G here, so a crash loop can fill the disk before the cap bites;
+`nix/base.nix` now sets `systemd.coredump.settings.Coredump.MaxUse` to `1G`.
+The operator's own `~/.cache/nix`
+held 3.3G, of which `gitv3` was 3.2G: the flake-input git fetches every
+`nixos-rebuild --flake github:...` leaves behind. `gc-machine` only knew root's
+cache, so `yo gc --yes` now empties both. Neither is tied to a generation, which
+is why both run outside the booted-equals-profile guard.
+
 `yo gc` reports, and `--yes` now runs two ordered ssh sessions, one per
 account, not one session doing everything. The machine tier runs as the
 **operator** — journald, `nix-collect-garbage`, `nix-store --optimise`, root's
-nix cache — and it
+nix cache, systemd coredumps, the operator's own nix cache — and it
 runs first on purpose: ext4's root reserve is what makes the rest of the
 cleanup possible at all on a genuinely full disk. The user tier then runs
 as the **agent** — npm cache, rootless podman, the cache tier below, and under `--deep --yes`
