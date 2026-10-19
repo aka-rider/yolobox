@@ -5,6 +5,8 @@ class Yolobox < Formula
   sha256 "@SHA256@"
   license "MIT"
 
+  depends_on :macos
+  depends_on arch: :arm64
   depends_on "fzf"
   depends_on "lima"
 

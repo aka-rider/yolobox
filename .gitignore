@@ -1,1 +1,5 @@
-.*
+.ruff_cache/
+.claude/
+.direnv/
+.reconnect-mullvad.sh
+.DS_Store

@@ -4,6 +4,13 @@ images:
     arch: "aarch64"
     digest: "sha512:bfcb703cdbad28cfd27438dc009408a859f3c4f575d3598d9627ea712c66128e0fa015de2010ce42bb724abc49f45029a4fc81891fb1a04c567378a6fdf31903"
 
+# Apple's Virtualization.framework; the rosetta block below only applies to vz.
+vmType: vz
+
+# Keep the Mac's HTTP(S)_PROXY out of the guest: a proxy the VM cannot reach
+# would break every fetch the box makes.
+propagateProxyEnv: false
+
 mounts: []
 
 memory: 16GiB
@@ -12,6 +19,9 @@ disk: 100GiB
 
 ssh:
   localPort: 60022
+  # Lima would copy every ~/.ssh/*.pub into the guest's authorized keys. Only
+  # the key lima itself generates may enter the box.
+  loadDotSSHPubKeys: false
 
 vmOpts:
   vz:
@@ -25,6 +35,7 @@ portForwards:
   # rule; t3 itself keeps binding 127.0.0.1 guest-side, and lima's forwarder
   # dials it from inside the guest, so the guest firewall is never traversed.
   - guestPort: 3773
+    proto: tcp
     hostIP: "0.0.0.0"
 
   # Reverses the Mac's 1Password agent socket into the guest, so the VM
