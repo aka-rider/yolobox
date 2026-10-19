@@ -483,8 +483,7 @@ that permanent — it survives the next hostagent restart with no `yo`
 needed to heal it again — not a precondition for the forward working
 right now. No instance at all (`limactl list` itself failing) prints
 nothing, since a brand-new box has no gap to report; the check exists for
-an instance created before a rule existed, exactly the migration
-README.md describes: a box whose forwards still carry only the t3, dhcp
+an instance created before a rule existed: a box whose forwards still carry only the t3, dhcp
 and 1Password rules because the AWS broker's rule did not exist yet when
 that instance was first created. The check compares the socket rules only.
 The t3 rule now says `proto: tcp` explicitly (`LIMA_PORT_FORWARDS` and the
@@ -512,42 +511,39 @@ Two GitHub accounts share `github.com`, so the account is chosen by which
 key is offered. The Mac does that with a `Host github-iurii-tech` alias
 whose `IdentityFile` names a public key — a selector, not a key — and
 `~/.dotfiles/gitconfig` rewrites `git@github.com:brocc-ab/` to that alias.
-`yo seed` copies `~/.ssh/config` and every `*.pub` in, minus lima's
-`Include` and `IdentityAgent`, both of which name paths that do not exist
-in the VM and would take the forwarded agent away. The strip matches the
-keyword followed by whitespace *or* `=`, because ssh accepts
-`IdentityAgent=/path` and `Include=...` just as well, and a filter that
-knew only the space form let the `=` form through. A `*.pub` that is a
-symlink is shipped as the regular file it resolves to, never as a link:
-tar stores a symlink as a symlink, which arrives dangling in the guest.
-The same rule covers the group `.gitconfig` files below, and it has a
-bound: the target must be a regular file under the Mac `$HOME`, since a
-link can point anywhere on the Mac and the file would then be shipped into
-the agent's reach. A file that fails it is skipped with a stderr note
-(`yo: not seeding <path>: it does not resolve to a regular file under
-$HOME`), never silently.
+The guest gets that setup from the agent's own checkout of the private
+dotfiles repo, not from the Mac. `~/.dotfiles/_do_install.sh`, run as the
+agent in the VM after cloning the repo there, links `~/.ssh/config` and the
+`*.pub` selector files. The config picks the agent itself, at ssh runtime,
+with two `Match exec "test -S <socket>"` blocks: the macOS 1Password socket
+(`~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock`), then
+the Linux one (`~/.1password/agent.sock`, for a Linux desktop running
+1Password locally). Each sets `IdentityAgent` only when its socket exists.
+The VM has neither socket, so no `IdentityAgent` is set there. That absence
+is load-bearing. An `IdentityAgent` in the guest would name a path that does
+not exist there and take the forwarded agent away from ssh, so
+`SSH_AUTH_SOCK` (the proxy socket, see above) has to stay in charge. `yo bootstrap` prints a one-line stderr note saying so at
+the point a fresh box is set up; running the installer is the operator's
+step, since only the operator knows where the dotfiles live.
 
-`yo seed` also copies group `.gitconfig` files. It asks the guest which
-non-hidden top-level directories exist under its home. The guest is not
-trusted to name them sanely, so a name must match `SEED_ROOT_RE`
-(`[A-Za-z0-9][A-Za-z0-9._ -]*`, whole name) or it is skipped with a stderr
-note naming it; that keeps `..`, a leading dash and anything with a slash or
-a newline out of the Mac paths built from it. For each root that passes and
-also exists under the Mac `$HOME` (a symlink to a directory counts)
-it copies every `<root>/<group>/.gitconfig` with its `$HOME`-relative
-path preserved. Those files sit next to repos, not inside one, so no push
-ever carries them, and without them the `includeIf` in
-`~/.dotfiles/gitconfig` matches nothing and work repos commit under the
-personal email. That include must spell the path exactly as the project
-is spelled on the Mac, because the mirror carries the spelling into the
-VM verbatim. Seed creates no guest directory, so on a fresh box it copies
-nothing until the first `yo link` grows a tree — re-run `yo seed` after
-that first link.
+There used to be a `yo seed` that read `~/.ssh/config`, the `*.pub` files
+and group `.gitconfig` files on the Mac and tar-piped them into the guest.
+It is gone, and so is the `home-roots` helper subcommand it asked the guest
+for. It was the one place the Mac read files at paths the guest could
+influence, and that went wrong once: a `.gitconfig` committed into a repo
+the agent had pushed was a symlink to `~/.ssh/id_ed25519`, which resolved
+inside `$HOME` and would have been shipped into the agent's reach. With
+the copy gone there is no such path to guard. The group `.gitconfig` copy
+was dropped outright: no such file exists on the Mac. An `includeIf` in the
+dotfiles' gitconfig must still spell the path exactly as the project is
+spelled on the Mac, because the mirror carries the spelling into the VM
+verbatim.
 
 How to recognise the class: `ssh -T git@github.com` and `ssh -T
 git@github-iurii-tech` in the VM must greet two different names. "Could
-not resolve hostname" means the ssh config never arrived; the wrong name
-means the public keys did not.
+not resolve hostname" means the dotfiles' ssh config is not linked
+(`_do_install.sh` has not run); the wrong name means the `.pub` selectors
+are missing.
 
 A dotfile can take the forwarded agent away too, and it fails only in
 the first shell after boot. On 2026-10-01, `git pull` in a freshly
@@ -789,7 +785,7 @@ still disagree (the half-failed bootloader install from the ESP section
 below). The restart itself can hang: `limactl restart` stops the VM first,
 and lima's stop hang (2026-10-17, see `TODO.md`) leaves it failing after
 three minutes. Bootstrap then aborts saying the built generation is
-installed but not booted, and that seeding, the herdr machine and the
+installed but not booted, and that the herdr machine and the
 1Password/AWS forwards did not run. Recover with `limactl stop yolobox`; if
 that hangs too, `yo ssh sudo systemctl reboot` and `kill -9` the leftover
 hostagent; then re-run `yo bootstrap`, which sees the two generations agree
@@ -850,7 +846,7 @@ so a bad find expression is now a *build* error rather than a runtime one
 (this file's own "fail at the earliest stage" rule, finally reaching this
 bash); `set -euo pipefail`; and a pinned `runtimeInputs` PATH. `yo` reaches
 every subcommand the same way, `ssh ... yolobox-guest <sub> [args]`, one
-account per subcommand: `projects`, `home-roots`, `landing-dir`,
+account per subcommand: `projects`, `landing-dir`,
 `ensure-repo`, `gc-user` and `aws-check` run as the agent; `generations`
 and `gc-machine` run as the operator, because ext4's root reserve — the
 thing that makes any of this recoverable on a genuinely full disk — is the
@@ -988,7 +984,11 @@ chokepoint, instead of at each call site that happens to print guest text,
 is what keeps a new message from forgetting. It is a display filter only:
 what `yo` runs and writes to files is never altered by it, and a command
 that must hand bytes through untouched (`yo ssh`, `yo enter`) does not
-print them via `out()` at all.
+print them via `out()` at all. Output streamed live goes through it too:
+`yo gc` and `yo aws-check` show the guest tiers as they run, and the tiers
+print project paths and whatever a project's `make -n clean` or `make clean`
+recipe prints, so `run_filtered()` pumps their stdout and stderr line by line
+into `out()` and `err()` instead of handing ssh the terminal.
 
 `YO_VERSION = "dev"` (line ~32) must survive as that exact literal
 assignment, unreformatted. `nix/pkgs/yolobox.nix` overwrites it with
@@ -1400,10 +1400,16 @@ beside a `Cargo.toml` gets `cargo clean`, run in that directory. Only
 `package.json` beside it. A `target` with no `Cargo.toml` beside it, or a
 `.next` with no `package.json`, is kept, and the output says so with `kept
 <path>: no Cargo.toml beside it, so it is not cargo's build output`; that
-line is information, not a failure. Every directory the tier removes, or
+line is information, not a failure. So is `kept <path>: not inside a git
+repository`, for a directory that sits in no repo at all, which no project
+owns and no `.gitignore` vouches for. Every directory the tier removes, or
 leaves for cargo to remove, still passes the `git check-ignore` guard first,
-and a tracked one fails with `kept <path>: git does not ignore it` and exit
-1. `make clean` and `go clean` are not guarded, because they are the
+and one git does not ignore fails with `kept <path>: git does not ignore it`
+and exit 1. The guard also accepts a directory that ignores itself: uv and
+`python -m venv` write a `.gitignore` of `*` into the `.venv`, which git
+does not report as ignoring the directory, so the guard asks instead whether
+git tracks or sees anything inside it (`git ls-files` and `git status
+--untracked-files=all` both empty). `make clean` and `go clean` are not guarded, because they are the
 project's own definition of clean. `cargo clean` itself removes the whole
 `target` directory, the same as `rm -rf` would; the protection is the
 detection, a `Cargo.toml` beside the directory, not the tool. The guard runs
@@ -1616,10 +1622,13 @@ it. `PLAYWRIGHT_MCP_USER_DATA_DIR` must never be set alongside it.
 What the box's claude launcher (see "The harnesses come from their
 vendors; the box owns `~/.local/bin/claude`" below) does compute per
 project is the *output* directory, not a profile. Before `exec`, it
-derives the project from the logical cwd — `git rev-parse --show-cdup`
-against `$PWD`, never git's physical toplevel, because `~/wrk` is a
-symlink to `~/Developer` and the mirror rule (see "The mirror" above)
-spells paths logically — relative to `$HOME`, slashes turned into `--`,
+derives the project from the logical cwd — the nearest ancestor of `$PWD`,
+as spelled, whose `pwd -P` equals git's `--show-toplevel`, the same walk as
+`yo`'s `logical_toplevel()` and for the same reason (see "The mirror"
+above): `~/wrk` is a symlink to `~/Developer`, paths are spelled logically,
+and counting `--show-cdup`'s `../` up the logical path, which the launcher
+once did, climbs to the wrong directory when a symlink sits below the
+root — relative to `$HOME`, slashes turned into `--`,
 and exports `PLAYWRIGHT_MCP_OUTPUT_DIR=$HOME/artifacts/<project>`,
 creating the directory first; a cwd at or outside `$HOME` leaves the
 variable at its box default instead. Snapshots and unnamed screenshots
@@ -2306,8 +2315,9 @@ The forward is inert on an instance that already exists: lima copies
 only that afterwards. Migrating means stopping and restating the whole
 array, because lima's yq cannot read the repo file. The array is
 `LIMA_PORT_FORWARDS`, which also carries the two reverse socket rules, so
-the command to run is the one in `README.md`: a copy of it here went stale
-and, run as written, would have dropped the socket rules.
+the command to run is the one `yo up` prints (`lima_config_gap_message()`):
+a hand-written copy went stale and, run as written, would have dropped the
+socket rules. The README deliberately does not restate it.
 
 ### Log noise that is not a failure
 
@@ -2607,6 +2617,21 @@ and it stays on purpose: a Mac-only setup that never runs `tailscale up`
 still reaches t3 from other devices on the LAN through `yo pair`'s default
 `http://<LocalHostName>.local:3773`, and narrowing the forward to loopback
 would break exactly that.
+
+## forgejo-cli
+
+The box ships `fj`, forgejo-cli, as a plain package in
+`nix/base.nix`'s `environment.systemPackages`, next to `gh` and with the same
+lack of any config, token or wrapper. It is a client for whatever Forgejo
+instance the agent logs into with `fj auth`; the box runs no Forgejo server.
+
+An earlier revision did run one (`nix/forgejo.nix`, forgejo on loopback with a
+lima forward of guest port 3000). A box that ran it keeps `/var/lib/forgejo`
+and the agent's `~/.config/yolobox/forgejo-admin` after the switch that
+removes it; both can be deleted by hand. An instance created with the port-3000
+forward keeps that rule until its port forwards are restated, and that is
+harmless: `lima_config_gaps()` compares only the reverse socket rules, so an
+extra forward neither raises a note nor needs removing.
 
 ## far2l: TTY-only, S3 through the broker
 

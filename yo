@@ -22,8 +22,8 @@ import socket
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -50,13 +50,6 @@ HELPER_MARKER = "unknown subcommand"
 # socket: a setting on the instance that breaks the no-host-mounts promise.
 GAP_MOUNTS = "mounts"
 GAP_FORWARD_AGENT = "ssh.forwardAgent"
-LIMA_SETTING_GAPS = {
-    GAP_MOUNTS: ("mounts host directories into the VM", ".mounts = []"),
-    GAP_FORWARD_AGENT: (
-        "forwards the Mac's ssh agent to every lima ssh session",
-        ".ssh.forwardAgent = false",
-    ),
-}
 
 OP_GUEST_SOCK = "/run/yolobox-op/agent.sock"
 AWS_BROKER_GUEST_SOCK = "/run/yolobox-op/aws-broker.sock"
@@ -76,6 +69,14 @@ LIMA_PORT_FORWARDS = [
         "reverse": True,
     },
 ]
+
+LIMA_SETTING_GAPS = {
+    GAP_MOUNTS: ("mounts host directories into the VM", ".mounts = []"),
+    GAP_FORWARD_AGENT: (
+        "forwards the Mac's ssh agent to every lima ssh session",
+        ".ssh.forwardAgent = false",
+    ),
+}
 
 GUEST_AWS_CONFIG_PATH = AGENT_HOME + "/.config/yolobox/aws-config"
 
@@ -203,10 +204,12 @@ def host_key_pin_block() -> str:
 def ensure_agent_ssh_config() -> None:
     path = ssh_cfg()
     try:
-        with open(path, "r") as handle:
+        with open(path, "r", errors="surrogateescape") as handle:
             current = handle.read()
-    except OSError:
+    except FileNotFoundError:
         return
+    except OSError as failure:
+        raise YoError("cannot read %s: %s" % (path, failure.strerror))
 
     rest = lima_part_of(current)
 
@@ -359,17 +362,21 @@ def run(
     env: Optional[Dict[str, str]] = None,
     merge_stderr: bool = False,
     binary: bool = False,
+    filtered: bool = False,
 ) -> subprocess.CompletedProcess:
     try:
-        proc = subprocess.run(
-            list(argv),
-            input=stdin,
-            stdout=subprocess.PIPE if capture else None,
-            stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE)
-            if capture
-            else None,
-            env=env,
-        )
+        if filtered:
+            proc = run_filtered(argv)
+        else:
+            proc = subprocess.run(
+                list(argv),
+                input=stdin,
+                stdout=subprocess.PIPE if capture else None,
+                stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE)
+                if capture
+                else None,
+                env=env,
+            )
     except FileNotFoundError:
         raise YoError("%s not found on PATH" % argv[0])
     if capture:
@@ -391,6 +398,23 @@ def run(
             % (shlex.join(argv), proc.returncode, ": " + detail if detail else "")
         )
     return proc
+
+
+def run_filtered(argv: Sequence[str]) -> subprocess.CompletedProcess:
+    # Streams the output live, line by line, through out() and err(), so guest
+    # text (a project path, a Makefile's recipe) is filtered like any other.
+    def pump(source: io.BufferedReader, sink: Callable[[str], None]) -> None:
+        for raw in iter(source.readline, b""):
+            sink(raw.decode("utf-8", "replace").rstrip("\n"))
+
+    with subprocess.Popen(
+        list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    ) as proc:
+        errors = threading.Thread(target=pump, args=(proc.stderr, err))
+        errors.start()
+        pump(proc.stdout, out)
+        errors.join()
+    return subprocess.CompletedProcess(list(argv), proc.returncode)
 
 
 def exec_process(argv: Sequence[str], env: Optional[Dict[str, str]] = None) -> None:
@@ -464,6 +488,7 @@ def ssh_run(
     merge_stderr: bool = False,
     inherit_stdin: bool = False,
     binary: bool = False,
+    filtered: bool = False,
 ) -> subprocess.CompletedProcess:
     cmd = ssh_base(role, mux=mux)
     if stdin is None and not inherit_stdin:
@@ -477,6 +502,7 @@ def ssh_run(
         env=env,
         merge_stderr=merge_stderr,
         binary=binary,
+        filtered=filtered,
     )
 
 
@@ -493,6 +519,7 @@ def guest_helper(
 ) -> subprocess.CompletedProcess:
     if stream:
         kwargs["capture"] = False
+        kwargs["filtered"] = True
     proc = ssh_run(role, [HELPER, sub, *args], **kwargs)
     if proc.returncode not in (127, HELPER_NO_SUBCOMMAND):
         return proc
@@ -676,12 +703,6 @@ def cp_mkdir_target(dest_operand: str, resolved_dest: str, source_count: int) ->
         return resolved_dest
     return os.path.dirname(resolved_dest) or AGENT_HOME
 
-
-SEED_SSH_CONFIG = r"""mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >~/.ssh/config && chmod 600 ~/.ssh/config"""
-
-SEED_UNTAR_SSH = r"""tar -C "$HOME/.ssh" -xf -"""
-
-SEED_UNTAR_HOME = r"""tar -C "$HOME" -xf -"""
 
 MISSING_PATH_NOTE = 'path "%s" does not exist in the yolobox you are in "%s"'
 
@@ -1211,6 +1232,10 @@ def ensure_op_forward(aws_enabled: bool) -> List[str]:
 
 
 UNITS_MISSING_NOTE = "box predates the 1Password/AWS forwards; run `yo bootstrap`"
+BOOTSTRAP_IDENTITY_NOTE = (
+    "yo: the box's ssh identity comes from your dotfiles: after cloning them "
+    "in the VM, run ~/.dotfiles/_do_install.sh as the agent (yo enter)"
+)
 
 
 def vm_units_present() -> bool:
@@ -1577,7 +1602,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         except YoError as e:
             raise report.abort(
                 "limactl restart failed: %s" % e.message,
-                "The built generation is installed but not booted; seeding, the herdr machine",
+                "The built generation is installed but not booted; the herdr machine",
                 "and the 1Password/AWS forwards did not run.",
                 "Recover with: limactl stop %s" % INSTANCE,
                 "If the stop hangs too: yo ssh sudo systemctl reboot, and kill -9 any leftover",
@@ -1599,8 +1624,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
             )
         report.ok("rebooted into the built generation")
 
-    seed_all()
-    report.ok("seeded")
+    err(BOOTSTRAP_IDENTITY_NOTE)
 
     ensure_ssh_config_include(refuse=False)
     ensure_guest_known_hosts()
@@ -1943,6 +1967,8 @@ def add_ssh_config_include() -> None:
             )
         current = ""
         mode = 0o600
+    except OSError as failure:
+        raise YoError("cannot read %s: %s" % (config_path, failure.strerror))
     atomic_write(config_path, INCLUDE_LINE + "\n" + current, mode)
 
 
@@ -2241,96 +2267,6 @@ def cmd_link(args: argparse.Namespace) -> None:
     )
 
 
-def tar_stream(members: Sequence[Tuple[str, str]]) -> bytes:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w") as archive:
-        for path, arcname in members:
-            archive.add(path, arcname=arcname, recursive=False)
-    return buffer.getvalue()
-
-
-SEED_STRIP_RE = re.compile(r"^\s*(Include|IdentityAgent)[\s=]", re.IGNORECASE)
-SEED_ROOT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]*")
-
-
-def seedable_file(path: str) -> Optional[str]:
-    # tar stores a symlink as a symlink, which arrives dangling in the guest,
-    # and a link can point anywhere on the Mac. Send the file it resolves to,
-    # and only when that is a regular file inside $HOME.
-    real = os.path.realpath(path)
-    if not os.path.isfile(real) or not real.startswith(
-        os.path.realpath(home()) + os.sep
-    ):
-        err(
-            "yo: not seeding %s: it does not resolve to a regular file under $HOME"
-            % path
-        )
-        return None
-    return real
-
-
-def seed_push(script: str, payload: bytes) -> None:
-    ssh_run(
-        AGENT, ["sh", "-c", script], stdin=payload, mux=True, capture=False, check=True
-    )
-
-
-def seed_ssh(report: Report) -> None:
-    config_path = os.path.join(home(), ".ssh", "config")
-    try:
-        with open(config_path, "r", errors="replace") as handle:
-            lines = handle.read().splitlines(True)
-    except OSError:
-        report.ok("no ~/.ssh/config on this Mac — skipped")
-    else:
-        filtered = "".join(line for line in lines if not SEED_STRIP_RE.search(line))
-        seed_push(SEED_SSH_CONFIG, filtered.encode())
-
-    ssh_dir = Path(home()) / ".ssh"
-    members = []
-    for pubkey in sorted(ssh_dir.glob("*.pub")):
-        real = seedable_file(str(pubkey))
-        if real is not None:
-            members.append((real, pubkey.name))
-    if not members:
-        return
-    seed_push(SEED_UNTAR_SSH, tar_stream(members))
-
-
-def seed_gitconfig() -> None:
-    roots = agent_paths("home-roots")
-    members = []
-    for root in roots:
-        if not root:
-            continue
-        if not SEED_ROOT_RE.fullmatch(root):
-            err(
-                "yo: not seeding group gitconfigs under %r: unusual directory name"
-                % root
-            )
-            continue
-        root_path = Path(home()) / root
-        if not root_path.is_dir():
-            continue
-        for identity in sorted(root_path.glob("*/.gitconfig")):
-            real = seedable_file(str(identity))
-            if real is not None:
-                members.append((real, str(identity.relative_to(home()))))
-    if not members:
-        return
-    seed_push(SEED_UNTAR_HOME, tar_stream(members))
-
-
-def seed_all() -> None:
-    require_agent_account()
-    seed_ssh(Report())
-    seed_gitconfig()
-
-
-def cmd_seed(args: argparse.Namespace) -> None:
-    seed_all()
-
-
 def guest_field(text: str, key: str) -> str:
     fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     return fields.get(key, "")
@@ -2413,8 +2349,7 @@ def build_parser() -> argparse.ArgumentParser:
         "bootstrap",
         "Create and build the VM from the pinned flake ref.",
         "Create the VM and build/(if needed) reboot it into the NixOS\n"
-        "configuration from the pinned yolobox flake ref, then seed\n"
-        "identities. Safe to run again: every step checks before it acts.\n"
+        "configuration from the pinned yolobox flake ref. Safe to run again: every step checks before it acts.\n"
         "YOLOBOX_FLAKE overrides which flake ref to build from (e.g. a\n"
         'branch), and is required on an unreleased ("dev") build.',
     )
@@ -2510,17 +2445,6 @@ def build_parser() -> argparse.ArgumentParser:
         '"git push yolobox main" carries the project in.',
     )
     link.set_defaults(func=cmd_link)
-
-    seed = add(
-        "seed",
-        "Copy identities the VM needs into it.",
-        "Copy into the VM what it cannot do without: ~/.ssh/config (minus lima's\n"
-        "Include and IdentityAgent), every ~/.ssh/*.pub, and each\n"
-        "<group>/.gitconfig under the top-level trees the VM's home shares with\n"
-        "this Mac's. Never a private key. Re-run after the first link on a\n"
-        "fresh VM.",
-    )
-    seed.set_defaults(func=cmd_seed)
 
     code = add(
         "code",

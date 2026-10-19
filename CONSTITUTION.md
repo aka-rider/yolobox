@@ -57,7 +57,8 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   runs as the operator.
 - ALWAYS point `homeTmpfiles`, every systemd `User=` and `ConditionUser=`,
   and the direnv whitelist at `agentUser`, never at `${username}`. Review
-  invariant: `grep -rn 'username' nix/` must hit only `nix/base.nix`.
+  invariant, enforced by `TestOnlyBaseNixSeesTheOperator`: no module but
+  `nix/base.nix` names the `username` variable.
 - NEVER add a whitelist to `/etc/direnv`, the config root root and the
   operator read. It carries none, so they get "blocked" for an `.envrc` the
   agent wrote; only `/etc/direnv-agent` (`DIRENV_CONFIG` in
@@ -158,9 +159,14 @@ Identify whether you are running on the host (MacOS) or Guest (Linux).
   operator's per-session forward, kept because the operator is not the
   agent and carries no reverse forward of its own. The default forwards
   `$SSH_AUTH_SOCK`, which on this Mac is Apple's empty agent.
-- ALWAYS strip `IdentityAgent` and lima's `Include` when copying
-  `~/.ssh/config` into the VM. Both name paths that do not exist there and
-  take the forwarded agent away.
+- ALWAYS get the guest's ssh identity (`~/.ssh/config`, the `*.pub`
+  selectors) from the agent's own dotfiles checkout, never by the Mac
+  reading files and pushing them in. The Mac reading paths the guest can
+  influence is how a repo-held symlink once pointed at a private key.
+- NEVER set `IdentityAgent` unconditionally in the shared ssh config. It is
+  set only under `Match exec "test -S <1Password socket>"`, and the VM has no
+  such socket, so its forwarded `SSH_AUTH_SOCK` stays in charge. An
+  unconditional `IdentityAgent` would take that forwarded agent away.
 - ALWAYS spell git `includeIf` paths exactly as the project path is
   spelled on the Mac. `yo` mirrors the logical spelling into the VM
   verbatim, so any other spelling matches nothing there.

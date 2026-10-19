@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -197,7 +198,6 @@ class TestBootstrapRebootDecision(unittest.TestCase):
 
         for name in (
             "vm_up",
-            "seed_all",
             "vm_services",
             "ensure_herdr_machine",
             "ensure_guest_known_hosts",
@@ -222,6 +222,10 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         out_patcher.start()
         self.addCleanup(out_patcher.stop)
 
+        err_patcher = mock.patch.object(yo, "err")
+        err_patcher.start()
+        self.addCleanup(err_patcher.stop)
+
     def run_bootstrap(self, generations):
         calls = []
 
@@ -242,6 +246,11 @@ class TestBootstrapRebootDecision(unittest.TestCase):
     def test_restarts_exactly_once_when_the_second_read_agrees(self):
         calls = self.run_bootstrap([("g1", "g0"), ("g1", "g1")])
         self.assertEqual(calls, [["limactl", "restart", "yolobox"]])
+
+    def test_tells_the_operator_the_ssh_identity_comes_from_dotfiles(self):
+        self.run_bootstrap([("g1", "g1")])
+        messages = " ".join(call.args[0] for call in yo.err.call_args_list)
+        self.assertIn("_do_install.sh", messages)
 
     def test_vm_up_brings_the_vm_up_without_services(self):
         self.run_bootstrap([("g1", "g1")])
@@ -275,7 +284,7 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         messages = " ".join(call.args[0] for call in fake_err.call_args_list)
         self.assertIn("yo status", messages)
 
-    def test_failed_restart_aborts_naming_the_recovery_and_skips_seeding(self):
+    def test_failed_restart_aborts_naming_the_recovery(self):
         def fake_run(argv, **kwargs):
             if argv[:2] == ["limactl", "restart"]:
                 raise yo.YoError("limactl restart yolobox failed (exit 1)")
@@ -292,11 +301,10 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         messages = " ".join(call.args[0] for call in fake_err.call_args_list)
         self.assertIn("limactl stop", messages)
         self.assertIn("yo bootstrap", messages)
-        yo.seed_all.assert_not_called()
 
-    def test_seed_ssh_include_and_herdr_run_before_vm_services(self):
+    def test_ssh_include_and_herdr_run_before_vm_services(self):
         # M1: an optional-service failure in vm_services must never skip
-        # seeding identities, the ssh config include, or herdr registration —
+        # the ssh config include or herdr registration —
         # so vm_services has to be the very last thing cmd_bootstrap does.
         order = []
 
@@ -307,7 +315,6 @@ class TestBootstrapRebootDecision(unittest.TestCase):
             return side_effect
 
         for name in (
-            "seed_all",
             "ensure_ssh_config_include",
             "ensure_guest_known_hosts",
             "ensure_herdr_machine",
@@ -322,7 +329,6 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         self.assertEqual(
             order,
             [
-                "seed_all",
                 "ensure_ssh_config_include",
                 "ensure_guest_known_hosts",
                 "ensure_herdr_machine",
@@ -446,6 +452,22 @@ class TestTerminalSanitising(unittest.TestCase):
                 self.assertEqual(
                     self.printed(func, "a\tb\nc \u00a0é—"), "a\tb\nc \u00a0é—\n"
                 )
+
+
+class TestStreamedOutputIsFiltered(unittest.TestCase):
+    # yo gc streams the guest tiers live; a Makefile recipe they echo must not
+    # reach the terminal as an escape sequence.
+    def test_a_streamed_command_is_filtered_and_keeps_its_exit_code(self):
+        script = (
+            "import sys; sys.stdout.write('o\\x1b]52;c;eA==\\x07\\n');"
+            "sys.stderr.write('e\\x1b[2J\\n'); sys.exit(3)"
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            proc = yo.run([sys.executable, "-c", script], filtered=True)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(stdout.getvalue(), "o?]52;c;eA==?\n")
+        self.assertEqual(stderr.getvalue(), "e?[2J\n")
 
 
 class TestEditorUris(unittest.TestCase):
