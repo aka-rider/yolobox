@@ -624,7 +624,8 @@ account per subcommand: `projects`, `home-roots`, `landing-dir`,
 `ensure-repo`, `gc-user` and `aws-check` run as the agent; `generations`
 and `gc-machine` run as the operator, because ext4's root reserve — the
 thing that makes any of this recoverable on a genuinely full disk — is the
-operator's alone.
+operator's alone; `net-check` runs as the operator too, the one account
+every box has, however far its agent setup got.
 
 `BUILD_DIRS` (`node_modules`, `target`, `.next`) is the single place
 build-output directory names are spelled, inside the guest script; the one
@@ -1909,8 +1910,18 @@ and neither raises an error anywhere on its own:
   below).
 
 Recognise them by those patterns, and check `scutil --nc list` on the Mac
-before debugging anything in the VM. `TODO.md` carries the owed `yo` doctor
-check that tells the two apart.
+before debugging anything in the VM. `yo status` now tells the two apart on
+its `network:` line. It opens a temporary TCP listener on the Mac's
+`127.0.0.1:<random port>`, then runs `yolobox-guest net-check <port>` as the
+operator, which prints `egress=` (an HTTPS fetch of github.com) and
+`gateway=` (a TCP connect to `192.168.5.2:<port>` through bash `/dev/tcp`,
+the very NAT path above, so a pass means gvproxy really reaches the Mac's
+loopback). `network_status_line()` maps the pair: egress dead and gateway ok
+is the WireGuard shape, egress ok and gateway dead is the ProtonVPN shape,
+and both dead means the guest network itself is down, which is no VPN's
+doing. A box whose
+`yolobox-guest` predates `net-check` prints `network: not checked` with the
+reason, rather than failing the whole of `yo status`.
 
 ## Tailscale: t3 on the tailnet
 
