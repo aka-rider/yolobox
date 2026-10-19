@@ -2214,7 +2214,9 @@ one starts; its stderr is truncated and reopened at
 `state_dir()/aws-broker/broker.log` on every start (never appended to a
 growing file), and its stdout carries exactly one handshake line, now
 just `READY`, before it `os.dup2`s `/dev/null` onto itself — never write a
-secret to stdout after that line, or to any log. The bind itself refuses
+secret to stdout after that line, or to any log. Every line that reaches broker.log goes through
+`sanitize()`, which replaces C0/C1 control bytes with `?`, because request paths are guest-chosen
+and would otherwise plant terminal escape sequences in the log `yo` tells the user to read. The bind itself refuses
 to steal a live socket: `reclaim_socket_path()` probes a connect before
 unlinking anything and fails outright, naming the collision, if something
 is genuinely still being served there; at shutdown (both the normal
