@@ -170,7 +170,13 @@ cache_targets() {
             fi
             ;;
         *)
-            if [ "$(head -n 1 "${path}/README")" = "${GO_BUILD_CACHE_HEADER}" ]; then
+            # $HOME itself is never a cache: a README at the top of the home
+            # would otherwise nominate the whole home for deletion. Go also
+            # writes trim.txt beside the README, so a stray README that merely
+            # starts with the same line is not enough.
+            if [ "${path}" != "${HOME}" ] \
+                && [ -f "${path}/trim.txt" ] \
+                && [ "$(head -n 1 "${path}/README")" = "${GO_BUILD_CACHE_HEADER}" ]; then
                 add_cache "${path}"
             fi
             ;;
@@ -180,9 +186,14 @@ cache_targets() {
 }
 
 # Go's module cache is read-only (directories 0555, files 0444), so a bare
-# rm -rf fails on it.
+# rm -rf fails on it. A symlink is removed as the link: chmod -R through it
+# would rewrite permissions on whatever it points at.
 remove_tree() {
-    chmod -R u+w "$1" && rm -rf "$1"
+    if [ -L "$1" ]; then
+        rm -f -- "$1"
+    else
+        chmod -R u+w -- "$1" && rm -rf -- "$1"
+    fi
 }
 
 # Claude's scratchpads are live session output, not ours to delete. Reported
@@ -206,6 +217,13 @@ cmd_home_roots() {
 
 cmd_landing_dir() {
     local d="${1:?landing-dir requires a path argument}"
+    case "${d}" in
+    /*) ;;
+    *)
+        printf 'yolobox-guest: landing-dir: path must be absolute: %s\n' "${d}" >&2
+        exit 2
+        ;;
+    esac
     while [ -n "${d}" ] && [ ! -d "${d}" ]; do d="${d%/*}"; done
     printf '%s\n' "${d:-$HOME}"
 }
@@ -360,10 +378,10 @@ cmd_gc_user() {
     fi
 
     step 'npm cache clean --force' npm cache clean --force
-    # -f only: dangling containers, networks and build cache. Unused *images*
-    # need a registry pull to come back, which is not regenerable offline, so
-    # they wait for --deep. nix/podman.nix already runs a periodic autoPrune
-    # besides.
+    # -f only: stopped containers, unused networks and dangling images and
+    # build cache; volumes are kept. Images still tagged but unused need a
+    # registry pull to come back, which is not regenerable offline, so they
+    # wait for --deep. nix/podman.nix already runs a periodic prune besides.
     step 'podman system prune -f' podman system prune -f
     for path in "${CACHE_PATHS[@]}"; do
         step "rm -rf ${path}" remove_tree "${path}"
@@ -402,8 +420,20 @@ cmd_gc_user() {
 cmd_aws_creds() {
     local profile="${1:?aws-creds requires a profile argument}"
 
-    local response rc=0
-    response="$(curl -sS --fail-with-body --unix-socket "${YOLOBOX_AWS_BROKER_SOCK}" "http://broker/creds/${profile}" 2>&1)" || rc=$?
+    # The same shape yo's allowlist enforces; checked here too because the
+    # name goes into a URL path and this is the process that builds it.
+    if ! [[ "${profile}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        printf 'yolobox-guest: aws-creds: invalid profile name: %s\n' "${profile}" >&2
+        exit 2
+    fi
+
+    # stdout and stderr are kept apart: process-credential JSON is read from
+    # stdout, so curl's own progress or warnings must never join it.
+    local response errors errfile rc=0
+    errfile="$(mktemp)"
+    response="$(curl -sS -g --fail-with-body --unix-socket "${YOLOBOX_AWS_BROKER_SOCK}" "http://broker/creds/${profile}" 2>"${errfile}")" || rc=$?
+    errors="$(cat "${errfile}")"
+    rm -f "${errfile}"
 
     if [ "${rc}" = 0 ]; then
         printf '%s\n' "${response}"
@@ -422,7 +452,7 @@ cmd_aws_creds() {
         ;;
     esac
 
-    printf '%s\n' "${response}" >&2
+    printf '%s\n%s\n' "${errors}" "${response}" >&2
     exit 1
 }
 
