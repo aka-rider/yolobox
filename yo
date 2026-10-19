@@ -40,14 +40,29 @@ AGENT_HOME = "/home/agent"
 T3_PORT = 3773
 HELPER = "yolobox-guest"
 HELPER_NO_SUBCOMMAND = 64
+SSH_UNREACHABLE = 255
+FZF_NO_MATCH = 1
+FZF_CANCELLED = 130
 HELPER_MARKER = "unknown subcommand"
+
+# lima_config_gaps() entries that are not a missing reverse forward's guest
+# socket: a setting on the instance that breaks the no-host-mounts promise.
+GAP_MOUNTS = "mounts"
+GAP_FORWARD_AGENT = "ssh.forwardAgent"
+LIMA_SETTING_GAPS = {
+    GAP_MOUNTS: ("mounts host directories into the VM", ".mounts = []"),
+    GAP_FORWARD_AGENT: (
+        "forwards the Mac's ssh agent to every lima ssh session",
+        ".ssh.forwardAgent = false",
+    ),
+}
 
 OP_GUEST_SOCK = "/run/yolobox-op/agent.sock"
 AWS_BROKER_GUEST_SOCK = "/run/yolobox-op/aws-broker.sock"
 AGENT_AWS_BROKER_SOCK = "/run/yolobox/aws-broker.sock"
 
 LIMA_PORT_FORWARDS = [
-    {"guestPort": T3_PORT, "hostIP": "0.0.0.0"},
+    {"guestPort": T3_PORT, "proto": "tcp", "hostIP": "0.0.0.0"},
     {"proto": "udp", "guestPort": 68, "guestIP": "0.0.0.0", "ignore": True},
     {
         "guestSocket": OP_GUEST_SOCK,
@@ -215,7 +230,7 @@ def ensure_guest_known_hosts() -> None:
     proc = ssh_run(OPERATOR, ["sh", "-c", "cat %s" % HOST_KEY_GLOB], check=False)
     if proc.returncode != 0:
         raise YoError(
-            "yo: could not fetch the guest's ssh host keys (%s) to pin them for the %r ssh "
+            "could not fetch the guest's ssh host keys (%s) to pin them for the %r ssh "
             "alias: %s"
             % (
                 HOST_KEY_GLOB,
@@ -227,7 +242,7 @@ def ensure_guest_known_hosts() -> None:
     lines = known_hosts_lines(lima_values, proc.stdout)
     if not lines:
         raise YoError(
-            "yo: the guest reported no parseable ssh host keys at %s" % HOST_KEY_GLOB
+            "the guest reported no parseable ssh host keys at %s" % HOST_KEY_GLOB
         )
 
     atomic_write(known_hosts_path(), "\n".join(lines) + "\n", 0o600)
@@ -250,12 +265,18 @@ class YoError(Exception):
         self.code = code
 
 
+# Guest-controlled text reaches these two (ssh stderr, paths, helper output). A
+# terminal acts on escape sequences and C1 controls, so they are shown as "?".
+# Tab and newline stay.
+TERMINAL_CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
 def out(line: str = "") -> None:
-    print(line, flush=True)
+    print(TERMINAL_CONTROL_RE.sub("?", line), flush=True)
 
 
 def err(line: str = "") -> None:
-    print(line, file=sys.stderr, flush=True)
+    print(TERMINAL_CONTROL_RE.sub("?", line), file=sys.stderr, flush=True)
 
 
 class Report:
@@ -305,15 +326,18 @@ def run(
     merge_stderr: bool = False,
     binary: bool = False,
 ) -> subprocess.CompletedProcess:
-    proc = subprocess.run(
-        list(argv),
-        input=stdin,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE)
-        if capture
-        else None,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            list(argv),
+            input=stdin,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE)
+            if capture
+            else None,
+            env=env,
+        )
+    except FileNotFoundError:
+        raise YoError("%s not found on PATH" % argv[0])
     if capture:
         proc.stdout = proc.stdout or b""
         if not binary:
@@ -340,7 +364,10 @@ def exec_process(argv: Sequence[str], env: Optional[Dict[str, str]] = None) -> N
     # disposition, so a pipeline reader that exits would leave the exec'd
     # process seeing EPIPE instead of dying, unlike bash's `exec ssh`.
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    os.execvpe(argv[0], list(argv), env if env is not None else os.environ)
+    try:
+        os.execvpe(argv[0], list(argv), env if env is not None else os.environ)
+    except FileNotFoundError:
+        raise YoError("%s not found on PATH" % argv[0])
 
 
 @dataclass(frozen=True)
@@ -378,7 +405,6 @@ def ssh_run(
     argv: Sequence[str],
     *,
     stdin: Optional[bytes] = None,
-    extra_opts: Sequence[str] = (),
     env: Optional[Dict[str, str]] = None,
     mux: bool = False,
     capture: bool = True,
@@ -387,7 +413,7 @@ def ssh_run(
     inherit_stdin: bool = False,
     binary: bool = False,
 ) -> subprocess.CompletedProcess:
-    cmd = ssh_base(role, mux=mux) + list(extra_opts)
+    cmd = ssh_base(role, mux=mux)
     if stdin is None and not inherit_stdin:
         cmd.append("-n")
     cmd += [VM_HOST, remote(argv)]
@@ -404,10 +430,6 @@ def ssh_run(
 
 def guest_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> str:
     return ssh_run(OPERATOR, argv, mux=mux, check=check).stdout
-
-
-def agent_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> str:
-    return ssh_run(AGENT, argv, mux=mux, check=check).stdout
 
 
 def helper_missing(role: SshRole) -> bool:
@@ -446,10 +468,13 @@ def agent_paths(sub: str, args: Sequence[str] = (), *, check: bool = True) -> Li
     if proc.returncode != 0:
         if check:
             guest_helper_check(proc, sub)
+        elif proc.returncode == SSH_UNREACHABLE:
+            raise YoError(
+                "cannot reach the VM as %s — is it up? yo status" % AGENT_USER
+            )
         else:
-            stderr = proc.stderr
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode("utf-8", "replace")
+            if proc.stderr:
+                err(proc.stderr.rstrip("\n"))
             err(
                 "yo: the project walk could not read every directory under %s (find exit %d)."
                 % (AGENT_HOME, proc.returncode)
@@ -523,7 +548,7 @@ def logical_cwd() -> str:
 
 
 def mirror(mac_path: str) -> Optional[str]:
-    host = home()
+    host = home().rstrip("/")
     if mac_path == host:
         return AGENT_HOME
     if mac_path.startswith(host + "/"):
@@ -612,12 +637,13 @@ def dir_for_cwd() -> str:
     if desired is None:
         err(MISSING_PATH_NOTE % (logical_cwd(), AGENT_HOME))
         return AGENT_HOME
-    landing = guest_helper_check(
+    reported = guest_helper_check(
         guest_helper(AGENT, "landing-dir", [desired]), "landing-dir"
     ).stdout.strip("\n")
+    landing = guest_path(reported)
     if landing != desired:
         err(MISSING_PATH_NOTE % (desired, landing))
-    return guest_path(landing)
+    return landing
 
 
 def pick_project(query: str) -> str:
@@ -634,10 +660,13 @@ def pick_project(query: str) -> str:
         input="\0".join(projects).encode(),
         stdout=subprocess.PIPE,
     )
-    if picker.returncode != 0:
-        if picker.returncode != 130:
-            err("yo: no project matches '%s'" % query)
+    if picker.returncode == FZF_NO_MATCH:
+        err("yo: no project matches '%s'" % query)
         raise YoError(None, code=picker.returncode)
+    if picker.returncode == FZF_CANCELLED:
+        raise YoError(None, code=picker.returncode)
+    if picker.returncode != 0:
+        raise YoError("fzf failed (exit %d)" % picker.returncode)
     choice = picker.stdout.decode("utf-8", "replace").rstrip("\0")
     return guest_path(AGENT_HOME + "/" + choice)
 
@@ -665,11 +694,22 @@ def read_handshake(proc: subprocess.Popen, deadline: float) -> List[str]:
     return buffer.decode("utf-8", "replace").splitlines()
 
 
+def checked_pid(value: object) -> Optional[int]:
+    # JSON gives us whatever the other side wrote. pid 0 or 1 would make os.kill
+    # act on a process group or on init; True is an int equal to 1, so > 1 also
+    # refuses it.
+    if isinstance(value, int) and value > 1:
+        return value
+    return None
+
+
 def aws_broker_sock() -> str:
     return os.path.join(state_dir(), "aws-broker.sock")
 
 
-AWS_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# aws-broker carries a copy of this exact profile pattern; keep them identical.
+AWS_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+AWS_REGION_RE = re.compile(r"^[a-z]{2,4}(-[a-z]+)+-\d+$", re.ASCII)
 
 
 def aws_allowlist() -> List[Tuple[str, str]]:
@@ -686,7 +726,7 @@ def aws_allowlist() -> List[Tuple[str, str]]:
                 name = section[len("profile ") :]
             else:
                 continue
-            if not AWS_PROFILE_NAME_RE.match(name):
+            if not AWS_PROFILE_NAME_RE.fullmatch(name):
                 err(
                     "yo: profile '%s' has a name yo will not pass to the guest — excluded from the guest AWS config"
                     % name
@@ -702,6 +742,12 @@ def aws_allowlist() -> List[Tuple[str, str]]:
                 err(
                     "yo: profile '%s' has no region in ~/.aws/config — excluded from the guest AWS config"
                     % name
+                )
+                continue
+            if not AWS_REGION_RE.fullmatch(region):
+                err(
+                    "yo: profile '%s' has region %r in ~/.aws/config, which is not an AWS region name — excluded from the guest AWS config"
+                    % (name, region)
                 )
                 continue
             allowed.append((name, region))
@@ -785,11 +831,18 @@ def kill_stale_broker(pid: int) -> None:
     wait_for_pid_exit(pid, timeout=10.0)
 
 
+def private_dir(path: str) -> None:
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
 def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
     log_dir = os.path.join(state_dir(), "aws-broker")
-    os.makedirs(log_dir, exist_ok=True)
+    private_dir(state_dir())
+    private_dir(log_dir)
     log_path = os.path.join(log_dir, "broker.log")
-    with open(log_path, "wb") as log:
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(log_fd, "wb") as log:
         proc = subprocess.Popen(
             [
                 str(SCRIPT_DIR / "aws-broker"),
@@ -846,12 +899,16 @@ def push_aws_guest_files(allowed: Sequence[Tuple[str, str]]) -> None:
         )
 
 
+def kill_broker_in(health: Optional[dict]) -> None:
+    if health is None:
+        return
+    stale_pid = checked_pid(health.get("pid"))
+    if stale_pid is not None:
+        kill_stale_broker(stale_pid)
+
+
 def disable_aws_broker() -> None:
-    health = aws_broker_health()
-    if health is not None:
-        stale_pid = health.get("pid")
-        if isinstance(stale_pid, int):
-            kill_stale_broker(stale_pid)
+    kill_broker_in(aws_broker_health())
     removal = ssh_run(AGENT, ["rm", "-f", GUEST_AWS_CONFIG_PATH], check=False)
     if removal.returncode != 0:
         err("yo: could not remove the stale %s in the VM" % GUEST_AWS_CONFIG_PATH)
@@ -862,7 +919,7 @@ def broker_needs_restart(
 ) -> bool:
     if health is None:
         return True
-    if health.get("watch_pid") != watch_pid:
+    if checked_pid(health.get("watch_pid")) != watch_pid:
         return True
     if health.get("allow") != list(allowed_names):
         return True
@@ -890,10 +947,7 @@ def ensure_aws_broker() -> bool:
     allowed_names = sorted(name for name, _ in allowed)
     health = aws_broker_health()
     if broker_needs_restart(health, pid, allowed_names):
-        if health is not None:
-            stale_pid = health.get("pid")
-            if isinstance(stale_pid, int):
-                kill_stale_broker(stale_pid)
+        kill_broker_in(health)
         start_aws_broker(pid, allowed_names)
 
     push_aws_guest_files(allowed)
@@ -935,6 +989,8 @@ def ensure_herdr_machine() -> None:
 class LimaInfo:
     host_agent_pid: Optional[int]
     port_forwards: List[dict]
+    mounts: list
+    forward_agent: bool
 
 
 def lima_instance_info() -> Optional[LimaInfo]:
@@ -946,10 +1002,14 @@ def lima_instance_info() -> Optional[LimaInfo]:
     except ValueError:
         return None
     pid = data.get("hostAgentPID")
-    forwards = data.get("config", {}).get("portForwards", [])
+    config = data.get("config", {})
+    forwards = config.get("portForwards", [])
+    mounts = config.get("mounts", [])
     return LimaInfo(
-        host_agent_pid=pid if isinstance(pid, int) else None,
+        host_agent_pid=checked_pid(pid),
         port_forwards=forwards if isinstance(forwards, list) else [],
+        mounts=mounts if isinstance(mounts, list) else [],
+        forward_agent=config.get("ssh", {}).get("forwardAgent") is True,
     )
 
 
@@ -966,7 +1026,7 @@ def lima_config_gaps() -> List[str]:
         OP_GUEST_SOCK: op_sock(),
         AWS_BROKER_GUEST_SOCK: aws_broker_sock(),
     }
-    return [
+    gaps = [
         guest_sock
         for guest_sock, host_sock in expected.items()
         if not any(
@@ -977,20 +1037,37 @@ def lima_config_gaps() -> List[str]:
             for forward in info.port_forwards
         )
     ]
+    if info.mounts:
+        gaps.append(GAP_MOUNTS)
+    if info.forward_agent:
+        gaps.append(GAP_FORWARD_AGENT)
+    return gaps
 
 
-def lima_config_gap_message(missing: Sequence[str]) -> str:
-    return (
-        "%s has no reverse forward for %s — restate the full array:\n"
-        "    limactl stop %s && limactl edit %s --set '.portForwards = %s' && yo up"
-        % (
-            INSTANCE,
-            " and ".join(missing),
-            INSTANCE,
-            INSTANCE,
-            json.dumps(LIMA_PORT_FORWARDS),
-        )
+def lima_edit_command(expression: str) -> str:
+    return "limactl stop %s && limactl edit %s --set '%s' && yo up" % (
+        INSTANCE,
+        INSTANCE,
+        expression,
     )
+
+
+def lima_config_gap_message(gaps: Sequence[str]) -> str:
+    missing = [gap for gap in gaps if gap not in LIMA_SETTING_GAPS]
+    lines = []
+    if missing:
+        restate = ".portForwards = %s" % json.dumps(LIMA_PORT_FORWARDS)
+        lines.append(
+            "%s has no reverse forward for %s — restate the full array:\n    %s"
+            % (INSTANCE, " and ".join(missing), lima_edit_command(restate))
+        )
+    for gap in gaps:
+        if gap in LIMA_SETTING_GAPS:
+            problem, expression = LIMA_SETTING_GAPS[gap]
+            lines.append(
+                "%s %s:\n    %s" % (INSTANCE, problem, lima_edit_command(expression))
+            )
+    return "\n".join(lines)
 
 
 def op_probe_alive(proc: subprocess.CompletedProcess) -> bool:
@@ -1350,7 +1427,7 @@ def cmd_status(args: argparse.Namespace) -> None:
                     out(
                         "aws: broker not reachable on this Mac's %s" % aws_broker_sock()
                     )
-                elif pid is not None and health.get("watch_pid") == pid:
+                elif pid is not None and checked_pid(health.get("watch_pid")) == pid:
                     out("aws: broker healthy (watching hostagent pid %s)" % pid)
                 else:
                     out(
@@ -1386,8 +1463,8 @@ def rebuild_hint() -> str:
         err("yo: %s" % failure.message)
         return "set YOLOBOX_FLAKE to a flake ref the box should build from, then retry"
     return (
-        "yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake '%s#yolobox'"
-        % ref
+        "yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake %s"
+        % shlex.quote(ref + "#yolobox")
     )
 
 
@@ -1659,7 +1736,10 @@ def ensure_ssh_config_include(refuse: bool) -> None:
         )
         err("    bare `ssh %s` cannot resolve the host. yo can add one line:" % VM_HOST)
         err("        %s" % INCLUDE_LINE)
-        answer = input("    Add it to ~/.ssh/config now? [y/N] ").strip().lower()
+        try:
+            answer = input("    Add it to ~/.ssh/config now? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
         if answer in ("y", "yes"):
             add_ssh_config_include()
             out("yo: added '%s' to ~/.ssh/config" % INCLUDE_LINE)
@@ -1672,6 +1752,12 @@ def ensure_ssh_config_include(refuse: bool) -> None:
     err("    %s" % INCLUDE_LINE)
     if refuse:
         raise YoError(None, code=1)
+
+
+def editor_uri_path(guest_dir: str) -> str:
+    # The path goes into a URI: a space, "#" or "?" in a project name would
+    # otherwise end or split it.
+    return urllib.parse.quote(guest_dir, safe="/")
 
 
 def cmd_code(args: argparse.Namespace) -> None:
@@ -1689,7 +1775,8 @@ def cmd_code(args: argparse.Namespace) -> None:
         [
             code_cli,
             "--folder-uri",
-            "vscode-remote://ssh-remote+%s@%s%s" % (AGENT_USER, VM_HOST, target),
+            "vscode-remote://ssh-remote+%s@%s%s"
+            % (AGENT_USER, VM_HOST, editor_uri_path(target)),
         ]
     )
 
@@ -1700,7 +1787,9 @@ def cmd_zed(args: argparse.Namespace) -> None:
     ensure_ssh_config_include(refuse=True)
     require_agent_account()
     target = target_dir(args.project)
-    exec_process(["zed", "ssh://%s@%s%s" % (AGENT_USER, VM_HOST, target)])
+    exec_process(
+        ["zed", "ssh://%s@%s%s" % (AGENT_USER, VM_HOST, editor_uri_path(target))]
+    )
 
 
 def t3_unit_state() -> Tuple[str, str]:
@@ -1783,6 +1872,28 @@ def t3_require_service() -> None:
         raise YoError(None, code=1)
 
 
+PAIRING_NETLOCS = ("127.0.0.1:%d" % T3_PORT, "localhost:%d" % T3_PORT)
+PAIRING_FORBIDDEN_RE = re.compile(r"[\\@\s\x00-\x1f\x7f-\x9f]")
+
+
+def is_loopback_t3_url(url: str) -> bool:
+    # The URL comes from the guest and goes to `open`. Python's urlparse and a
+    # browser disagree about backslash and "@", so any URL carrying either (or
+    # whitespace or a control character) is refused instead of parsed.
+    if PAIRING_FORBIDDEN_RE.search(url):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        # An unmatched "[" or a NFKC-unstable netloc: not a URL we would open.
+        return False
+    return (
+        parsed.scheme in ("http", "https")
+        and parsed.netloc in PAIRING_NETLOCS
+        and parsed.path.startswith("/")
+    )
+
+
 def parse_pairing_url(text: str) -> Optional[str]:
     url = ""
     for line in text.replace("\r", "").splitlines():
@@ -1792,12 +1903,8 @@ def parse_pairing_url(text: str) -> Optional[str]:
             break
     if not url:
         return None
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https") or parsed.hostname not in (
-        "127.0.0.1",
-        "localhost",
-    ):
-        raise YoError("'t3 pair' printed a pairing URL yo will not open: %s" % url)
+    if not is_loopback_t3_url(url):
+        raise YoError("'t3 pair' printed a pairing URL yo will not open: %r" % url)
     return url
 
 
@@ -1857,12 +1964,28 @@ def link_remote_action(existing_url: Optional[str], wanted_url: str) -> str:
     )
 
 
+def logical_toplevel(physical_top: str, cwd: str) -> str:
+    # git reports the repo root with symlinks resolved, but the mirror rule
+    # spells paths as the shell does (~/wrk is a link to ~/Developer). The
+    # root is the nearest ancestor of the logical cwd that resolves to it;
+    # cwd's ".." count cannot be used, since a symlink below the root can
+    # make the physical and logical depths differ.
+    real_top = os.path.realpath(physical_top)
+    candidate = cwd
+    while os.path.realpath(candidate) != real_top:
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            return real_top
+        candidate = parent
+    return candidate
+
+
 def cmd_link(args: argparse.Namespace) -> None:
     require_agent_account()
-    cdup = run(["git", "rev-parse", "--show-cdup"])
-    if cdup.returncode != 0:
+    physical_top = run(["git", "rev-parse", "--show-toplevel"])
+    if physical_top.returncode != 0 or not physical_top.stdout.strip():
         raise YoError("link must run inside a git repo")
-    toplevel = os.path.normpath(os.path.join(logical_cwd(), cdup.stdout.strip()))
+    toplevel = logical_toplevel(physical_top.stdout.strip(), logical_cwd())
 
     if toplevel == home():
         raise YoError("refusing to link $HOME itself")
@@ -1906,7 +2029,24 @@ def tar_stream(members: Sequence[Tuple[str, str]]) -> bytes:
     return buffer.getvalue()
 
 
-SEED_STRIP_RE = re.compile(r"^\s*(Include|IdentityAgent)\s", re.IGNORECASE)
+SEED_STRIP_RE = re.compile(r"^\s*(Include|IdentityAgent)[\s=]", re.IGNORECASE)
+SEED_ROOT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]*")
+
+
+def seedable_file(path: str) -> Optional[str]:
+    # tar stores a symlink as a symlink, which arrives dangling in the guest,
+    # and a link can point anywhere on the Mac. Send the file it resolves to,
+    # and only when that is a regular file inside $HOME.
+    real = os.path.realpath(path)
+    if not os.path.isfile(real) or not real.startswith(
+        os.path.realpath(home()) + os.sep
+    ):
+        err(
+            "yo: not seeding %s: it does not resolve to a regular file under $HOME"
+            % path
+        )
+        return None
+    return real
 
 
 def seed_push(script: str, payload: bytes) -> None:
@@ -1927,10 +2067,13 @@ def seed_ssh(report: Report) -> None:
         seed_push(SEED_SSH_CONFIG, filtered.encode())
 
     ssh_dir = Path(home()) / ".ssh"
-    pubkeys = sorted(str(p) for p in ssh_dir.glob("*.pub") if p.is_file())
-    if not pubkeys:
+    members = []
+    for pubkey in sorted(ssh_dir.glob("*.pub")):
+        real = seedable_file(str(pubkey))
+        if real is not None:
+            members.append((real, pubkey.name))
+    if not members:
         return
-    members = [(path, os.path.basename(path)) for path in pubkeys]
     seed_push(SEED_UNTAR_SSH, tar_stream(members))
 
 
@@ -1938,14 +2081,21 @@ def seed_gitconfig() -> None:
     roots = agent_paths("home-roots")
     members = []
     for root in roots:
-        if not root or "/" in root or root in (".", ".."):
+        if not root:
+            continue
+        if not SEED_ROOT_RE.fullmatch(root):
+            err(
+                "yo: not seeding group gitconfigs under %r: unusual directory name"
+                % root
+            )
             continue
         root_path = Path(home()) / root
         if not root_path.is_dir():
             continue
         for identity in sorted(root_path.glob("*/.gitconfig")):
-            if identity.is_file():
-                members.append((str(identity), str(identity.relative_to(home()))))
+            real = seedable_file(str(identity))
+            if real is not None:
+                members.append((real, str(identity.relative_to(home()))))
     if not members:
         return
     seed_push(SEED_UNTAR_HOME, tar_stream(members))
@@ -2009,6 +2159,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="yo — thin Mac-side CLI for the NixOS-VM yolobox (lima/vz).",
         epilog=DIRECTORY_RESOLUTION_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--version", "-V", action="version", version="yolobox %s" % YO_VERSION
@@ -2021,6 +2172,7 @@ def build_parser() -> argparse.ArgumentParser:
             help=help_text,
             description=description,
             formatter_class=argparse.RawDescriptionHelpFormatter,
+            allow_abbrev=False,
         )
 
     up = add("up", "Start the VM.", "Start the VM.")
