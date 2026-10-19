@@ -259,6 +259,25 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         messages = " ".join(call.args[0] for call in fake_err.call_args_list)
         self.assertIn("yo status", messages)
 
+    def test_failed_restart_aborts_naming_the_recovery_and_skips_seeding(self):
+        def fake_run(argv, **kwargs):
+            if argv[:2] == ["limactl", "restart"]:
+                raise yo.YoError("limactl restart yolobox failed (exit 1)")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        args = yo.build_parser().parse_args(["bootstrap"])
+        with (
+            mock.patch.object(yo, "err") as fake_err,
+            mock.patch.object(yo, "run", side_effect=fake_run),
+            mock.patch.object(yo, "guest_generations", return_value=("g1", "g0")),
+        ):
+            with self.assertRaises(yo.YoError):
+                yo.cmd_bootstrap(args)
+        messages = " ".join(call.args[0] for call in fake_err.call_args_list)
+        self.assertIn("limactl stop", messages)
+        self.assertIn("yo bootstrap", messages)
+        yo.seed_all.assert_not_called()
+
     def test_seed_ssh_include_and_herdr_run_before_vm_services(self):
         # M1: an optional-service failure in vm_services must never skip
         # seeding identities, the ssh config include, or herdr registration —
