@@ -11,7 +11,9 @@ class TestAgentPaths(unittest.TestCase):
         with mock.patch.object(yo, "ssh_run", return_value=proc) as fake_ssh_run:
             result = yo.agent_paths("projects")
         self.assertEqual(result, ["/a/b", "/c/d"])
-        fake_ssh_run.assert_called_once_with(yo.AGENT, [yo.HELPER, "projects"], binary=True)
+        fake_ssh_run.assert_called_once_with(
+            yo.AGENT, [yo.HELPER, "projects"], binary=True
+        )
 
     def test_a_newline_inside_one_entry_stays_in_that_entry(self):
         proc = mock.Mock(returncode=0, stdout=b"a/b\nwith-newline\0c/d\0", stderr="")
@@ -33,7 +35,9 @@ class TestPickProject(FakeHome):
                     return_value=mock.Mock(returncode=0, stdout=b"a/normal\0"),
                 ):
                     yo.pick_project("normal")
-        fake_ssh_run.assert_called_once_with(yo.AGENT, [yo.HELPER, "projects"], binary=True)
+        fake_ssh_run.assert_called_once_with(
+            yo.AGENT, [yo.HELPER, "projects"], binary=True
+        )
 
     def test_a_partial_listing_still_reaches_fzf_and_warns_via_err(self):
         proc = mock.Mock(
@@ -50,7 +54,9 @@ class TestPickProject(FakeHome):
         with mock.patch.object(yo, "require_tool"):
             with mock.patch.object(yo, "ssh_run", return_value=proc):
                 with mock.patch.object(yo, "err") as fake_err:
-                    with mock.patch.object(yo.subprocess, "run", side_effect=fake_picker_run):
+                    with mock.patch.object(
+                        yo.subprocess, "run", side_effect=fake_picker_run
+                    ):
                         result = yo.pick_project("normal")
 
         self.assertEqual(len(picker_calls), 1)
@@ -72,8 +78,12 @@ class TestPickProject(FakeHome):
 
         with mock.patch.object(yo, "require_tool"):
             with mock.patch.object(yo, "agent_paths", return_value=projects):
-                with mock.patch.object(yo, "guest_path", side_effect=lambda p: p) as fake_guest_path:
-                    with mock.patch.object(yo.subprocess, "run", side_effect=fake_picker_run):
+                with mock.patch.object(
+                    yo, "guest_path", side_effect=lambda p: p
+                ) as fake_guest_path:
+                    with mock.patch.object(
+                        yo.subprocess, "run", side_effect=fake_picker_run
+                    ):
                         result = yo.pick_project("weird")
 
         self.assertIn("--read0", picker_calls[0])
@@ -92,7 +102,9 @@ class TestSeedGitconfig(FakeHome):
 
         with mock.patch.object(yo, "agent_paths", return_value=[weird_root]):
             with mock.patch.object(yo, "ssh_run") as fake_ssh_run:
-                with mock.patch.object(yo, "tar_stream", return_value=b"") as fake_tar_stream:
+                with mock.patch.object(
+                    yo, "tar_stream", return_value=b""
+                ) as fake_tar_stream:
                     yo.seed_gitconfig()
 
         fake_tar_stream.assert_called_once()
