@@ -989,6 +989,17 @@ weekly with `Persistent=true`, so a week missed because no agent session
 was open runs at the next login. `systemctl --user list-timers` as the
 agent must show it; `systemctl list-timers` as the operator must not.
 
+That prune leaves volumes alone on purpose: `podman system prune` without
+`--volumes` never touches them, and they hold database state. The gc report
+used to measure `~/.local/share/containers/storage` with `du` (19G, with
+the volumes on a separate line at 2.0G), but rootless podman stores files
+under subuids the agent cannot read, so `du` undercounted (19G against the
+25G `podman system df` reports: 18.7G of images, 6.3G of volumes) and
+printed 259 `du: cannot read directory` lines per measure. The report now
+prints `podman system df` instead, so images and volumes show separately
+and `--deep` visibly cannot reclaim the volumes; a failing `podman system
+df` is a `FAIL` line, not a silent gap.
+
 The third finding (2026-10-19, 259G used of 394G) was two more caches, both
 owned by the operator and so invisible to the agent tier. `/var/lib/systemd/coredump`
 held 2.1G, among it 259 `core.marksman.*.zst` of about 3.6M each, written

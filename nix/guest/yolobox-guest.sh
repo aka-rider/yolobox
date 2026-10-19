@@ -298,6 +298,18 @@ cmd_gc_machine() {
     [ "${GC_FAILED}" = 0 ] || exit 1
 }
 
+# Rootless podman keeps its files under subuids the agent cannot read, so `du`
+# undercounts them and floods stderr; podman's own accounting is the right one.
+report_podman() {
+    local out
+    printf '\npodman storage (podman system df; --deep prunes unused images, no tier ever prunes volumes):\n'
+    if out="$(podman system df 2>&1)"; then
+        printf '%s\n' "${out}" | sed 's/^/  /'
+    else
+        fail "podman system df" "${out}"
+    fi
+}
+
 cmd_gc_user() {
     local apply=0 deep=0 arg
     for arg in "$@"; do
@@ -313,7 +325,7 @@ cmd_gc_user() {
 
     GC_FAILED=0
     MEASURE_AS=
-    local user_paths=("$HOME/.npm" "$HOME/.local/share/containers/storage")
+    local user_paths=("$HOME/.npm")
 
     local path
     cache_targets
@@ -323,6 +335,7 @@ cmd_gc_user() {
         for path in "${user_paths[@]}"; do
             measure "${path}"
         done
+        report_podman
         printf '\ncache tier (rebuilt or refetched on demand; --yes reclaims it):\n'
         for path in "${CACHE_PATHS[@]}"; do
             measure "${path}"
