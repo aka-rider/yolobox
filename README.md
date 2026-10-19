@@ -105,7 +105,7 @@ Both reach the VM the same way: a permanent lima reverse unix-socket forward, on
 
 ```bash
 limactl stop yolobox
-limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"proto":"tcp","hostIP":"0.0.0.0"},{"proto":"udp","guestPort":68,"guestIP":"0.0.0.0","ignore":true},{"guestSocket":"/run/yolobox-op/agent.sock","hostSocket":"{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock","reverse":true},{"guestSocket":"/run/yolobox-op/aws-broker.sock","hostSocket":"{{.Home}}/.local/state/yolobox/aws-broker.sock","reverse":true}]'
+limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"proto":"tcp","hostIP":"0.0.0.0"},{"guestPort":3000,"proto":"tcp"},{"proto":"udp","guestPort":68,"guestIP":"0.0.0.0","ignore":true},{"guestSocket":"/run/yolobox-op/agent.sock","hostSocket":"{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock","reverse":true},{"guestSocket":"/run/yolobox-op/aws-broker.sock","hostSocket":"{{.Home}}/.local/state/yolobox/aws-broker.sock","reverse":true}]'
 yo up
 ```
 
@@ -144,6 +144,10 @@ Then pair against the tailnet address instead of the default one:
 ```bash
 yo pair http://yolobox.<tailnet>.ts.net:3773
 ```
+
+### Forgejo
+
+The VM runs its own [Forgejo](https://forgejo.org/) git forge, for repos, issues and pull requests that never leave the box. It listens on the VM's loopback only and lima forwards it to your Mac at <http://127.0.0.1:3000>. The agent has an admin account, `agent`, whose password and API token are in `~/.config/yolobox/forgejo-admin` inside the VM. As the operator, manage it with `yo ssh yolobox-forgejo admin …`. A VM created before this existed needs the `limactl edit` migration above to get the forward.
 
 ### Zed and Visual Studio Code
 

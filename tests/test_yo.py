@@ -961,8 +961,14 @@ class TestEnsureSshConfigInclude(FakeHome):
         self.addCleanup(os.chmod, path, 0o600)
         with isatty(True):
             with mock.patch("builtins.input", return_value="y"):
-                with self.assertRaises(PermissionError):
+                with self.assertRaises(yo.YoError) as raised:
                     yo.ensure_ssh_config_include(refuse=True)
+        self.assertIn(
+            "cannot read %s" % os.path.realpath(path), raised.exception.message
+        )
+        os.chmod(path, 0o600)
+        with open(path) as handle:
+            self.assertEqual(handle.read(), "Host other\n")
 
     def test_accepted_a_second_time_does_not_duplicate(self):
         self.write_config("Host other\n")
@@ -1849,38 +1855,14 @@ class TestLimaConfigGaps(FakeHome):
             self.assertEqual(yo.lima_config_gaps(), [])
 
     def test_present_reverse_rules_are_no_gaps(self):
-        forwards = [
-            {
-                "guestSocket": yo.OP_GUEST_SOCK,
-                "hostSocket": yo.op_sock(),
-                "reverse": True,
-            },
-            {
-                "guestSocket": yo.AWS_BROKER_GUEST_SOCK,
-                "hostSocket": yo.aws_broker_sock(),
-                "reverse": True,
-            },
-        ]
-        with self.mock_lima_list(forwards):
+        with self.mock_lima_list(self.both_forwards()):
             self.assertEqual(yo.lima_config_gaps(), [])
 
     def test_an_instance_whose_t3_rule_predates_proto_tcp_is_no_gap(self):
         # Only the reverse socket rules are checked; an older instance's
         # {"guestPort": 3773, "hostIP": "0.0.0.0"} must not trigger a note.
-        forwards = [
-            {"guestPort": yo.T3_PORT, "hostIP": "0.0.0.0"},
-            {
-                "guestSocket": yo.OP_GUEST_SOCK,
-                "hostSocket": yo.op_sock(),
-                "reverse": True,
-            },
-            {
-                "guestSocket": yo.AWS_BROKER_GUEST_SOCK,
-                "hostSocket": yo.aws_broker_sock(),
-                "reverse": True,
-            },
-        ]
-        with self.mock_lima_list(forwards):
+        forwards = [{"guestPort": yo.T3_PORT, "hostIP": "0.0.0.0"}]
+        with self.mock_lima_list(forwards + self.both_forwards()):
             self.assertEqual(yo.lima_config_gaps(), [])
 
     def test_missing_reverse_rule_is_reported_not_raised(self):
@@ -1890,11 +1872,9 @@ class TestLimaConfigGaps(FakeHome):
 
     def test_only_one_missing_rule_is_reported(self):
         forwards = [
-            {
-                "guestSocket": yo.OP_GUEST_SOCK,
-                "hostSocket": yo.op_sock(),
-                "reverse": True,
-            }
+            forward
+            for forward in self.both_forwards()
+            if forward.get("guestSocket") != yo.AWS_BROKER_GUEST_SOCK
         ]
         with self.mock_lima_list(forwards):
             gaps = yo.lima_config_gaps()
@@ -1907,11 +1887,7 @@ class TestLimaConfigGaps(FakeHome):
                 "hostSocket": "/somewhere/else.sock",
                 "reverse": True,
             },
-            {
-                "guestSocket": yo.AWS_BROKER_GUEST_SOCK,
-                "hostSocket": yo.aws_broker_sock(),
-                "reverse": True,
-            },
+            *self.both_forwards()[1:],
         ]
         with self.mock_lima_list(forwards):
             gaps = yo.lima_config_gaps()

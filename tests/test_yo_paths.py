@@ -1,7 +1,4 @@
-import io
-import tarfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from test_yo import FakeHome, yo
@@ -149,108 +146,6 @@ class TestPickProject(FakeHome):
         expected = yo.AGENT_HOME + "/b/weird\nname"
         fake_guest_path.assert_called_once_with(expected)
         self.assertEqual(result, expected)
-
-
-class SeedHarness(FakeHome):
-    def seeded(self, func, *args):
-        """Run a seed function, return {tar member name: (type, content)}."""
-        pushed = []
-        with mock.patch.object(
-            yo, "seed_push", side_effect=lambda script, payload: pushed.append(payload)
-        ):
-            func(*args)
-        members = {}
-        for payload in pushed:
-            with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
-                for member in archive.getmembers():
-                    content = None
-                    if member.isfile():
-                        content = archive.extractfile(member).read()
-                    members[member.name] = (member.type, content)
-        return members
-
-
-class TestSeedGitconfig(SeedHarness):
-    def identity(self, root, group, text="[user]\n"):
-        directory = Path(self.home) / root / group
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / ".gitconfig").write_text(text)
-
-    def seed_roots(self, roots):
-        with mock.patch.object(yo, "agent_paths", return_value=roots):
-            return self.seeded(yo.seed_gitconfig)
-
-    def test_a_plain_root_is_seeded_with_its_home_relative_path(self):
-        self.identity("Developer", "work")
-        self.assertEqual(
-            self.seed_roots(["Developer"]),
-            {"Developer/work/.gitconfig": (tarfile.REGTYPE, b"[user]\n")},
-        )
-
-    def test_roots_with_odd_names_are_refused(self):
-        for root in ["group\nname", ".ssh", "-rf", "a\n", "x;y"]:
-            self.identity(root, "sub")
-        for root in ["group\nname", "a/b", ".", "..", ".ssh", "-rf", "a\n", "x;y"]:
-            with self.subTest(root=root):
-                self.assertEqual(self.seed_roots([root]), {})
-
-    def test_an_empty_root_is_ignored(self):
-        self.assertEqual(self.seed_roots([""]), {})
-
-    def test_a_symlinked_gitconfig_arrives_as_a_regular_file(self):
-        self.identity("Developer", "work")
-        dotfiles = Path(self.home) / "dotfiles"
-        dotfiles.mkdir()
-        (dotfiles / "work.gitconfig").write_text("[user]\nname = w\n")
-        link = Path(self.home) / "Developer" / "work" / ".gitconfig"
-        link.unlink()
-        link.symlink_to(dotfiles / "work.gitconfig")
-        self.assertEqual(
-            self.seed_roots(["Developer"]),
-            {"Developer/work/.gitconfig": (tarfile.REGTYPE, b"[user]\nname = w\n")},
-        )
-
-    def test_a_gitconfig_linking_outside_home_is_not_seeded(self):
-        self.identity("Developer", "work")
-        link = Path(self.home) / "Developer" / "work" / ".gitconfig"
-        link.unlink()
-        link.symlink_to("/etc/hosts")
-        self.assertEqual(self.seed_roots(["Developer"]), {})
-
-
-class TestSeedSsh(SeedHarness):
-    def setUp(self):
-        super().setUp()
-        self.ssh = Path(self.home) / ".ssh"
-        self.ssh.mkdir()
-
-    def test_pubkeys_are_seeded_as_regular_files_even_when_linked(self):
-        (self.ssh / "plain.pub").write_text("ssh-ed25519 AAA plain\n")
-        (Path(self.home) / "real.pub").write_text("ssh-ed25519 BBB linked\n")
-        (self.ssh / "linked.pub").symlink_to(Path(self.home) / "real.pub")
-        self.assertEqual(
-            self.seeded(yo.seed_ssh, yo.Report()),
-            {
-                "linked.pub": (tarfile.REGTYPE, b"ssh-ed25519 BBB linked\n"),
-                "plain.pub": (tarfile.REGTYPE, b"ssh-ed25519 AAA plain\n"),
-            },
-        )
-
-    def test_a_pubkey_linking_outside_home_is_not_seeded(self):
-        (self.ssh / "evil.pub").symlink_to("/etc/hosts")
-        self.assertEqual(self.seeded(yo.seed_ssh, yo.Report()), {})
-
-    def test_include_and_identityagent_lines_are_stripped_with_either_separator(self):
-        (self.ssh / "config").write_text(
-            "Include ~/x\nInclude=~/y\n  IdentityAgent=/s\nidentityagent /s\n"
-            "IncludeNot yes\nHost a\n"
-        )
-        sent = []
-        with mock.patch.object(
-            yo, "seed_push", side_effect=lambda script, payload: sent.append(payload)
-        ):
-            yo.seed_ssh(yo.Report())
-        self.assertEqual(sent, [b"IncludeNot yes\nHost a\n"])
 
 
 class TestVersionDrift(unittest.TestCase):

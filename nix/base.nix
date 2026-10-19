@@ -334,6 +334,7 @@ in
     (callPackage ./pkgs/far2l.nix { })
     delta
     gh
+    forgejo-cli
     shellcheck
     shfmt
     cloc
