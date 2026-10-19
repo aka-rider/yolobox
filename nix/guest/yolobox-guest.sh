@@ -14,10 +14,21 @@
 # `if`; the few captures that are NOT already inside an `if` are guarded
 # individually with `|| true` or an explicit `rc=$?`, right where they are.
 
-# The one place build-output directory names are spelled. The project walk
-# prunes them (a repo inside node_modules is not a project); gc --deep
-# matches them (they are the thing being deleted).
+# The one place the project walk's and the Go-cache walk's pruned directory
+# names are spelled: a repo inside node_modules is not a project. gc --deep
+# walks these names too, plus REMOVED_OUTRIGHT.
 BUILD_DIRS=(node_modules target .next)
+
+# Directories gc --deep removes with remove_tree, each only if git ignores it.
+# They are dependency installs: the project's own tooling recreates them.
+REMOVED_OUTRIGHT=(node_modules .venv)
+
+# NAME:MANIFEST pairs: a directory called NAME is build output only when
+# MANIFEST sits beside it, because the name alone proves nothing (a `target`
+# can hold code or data). Without the manifest gc --deep keeps it and says so.
+# A `target` with its Cargo.toml is cleaned by `cargo clean`; a `.next` with
+# its package.json is removed outright.
+NEEDS_MANIFEST=(target:Cargo.toml .next:package.json)
 
 # The one place cache names under ~/.cache are spelled; gc --yes deletes
 # them all. Only caches a tool rebuilds or refetches by itself belong here:
@@ -27,10 +38,11 @@ LOCAL_CACHES=(go-build gopls goimports golangci-lint staticcheck uv pip pip-tool
 # What `go` writes as the first line of a build cache's README.
 GO_BUILD_CACHE_HEADER='This directory holds cached build artifacts from the Go build system.'
 
+# Sets EXPR to a find expression matching any of the given directory names.
 build_expr() {
     EXPR=('(')
     local name
-    for name in "${BUILD_DIRS[@]}"; do
+    for name in "$@"; do
         [ "${#EXPR[@]}" -gt 1 ] && EXPR+=(-o)
         EXPR+=(-name "${name}")
     done
@@ -39,6 +51,16 @@ build_expr() {
 
 GC_FAILED=0
 TARGETS_FILE=
+
+# What gc --deep decided to do, filled by deep_plan: roots to `make clean`
+# (each with its dry-run text at the same index), `target` directories to
+# `cargo clean` from their parent, roots to `go clean`, and directories to
+# remove outright.
+DEEP_MAKE_ROOTS=()
+DEEP_MAKE_DRYRUNS=()
+DEEP_CARGO_TARGETS=()
+DEEP_GO_ROOTS=()
+DEEP_REMOVALS=()
 
 ok() {
     printf 'ok:   %s\n' "$1"
@@ -85,7 +107,7 @@ measure() {
         test -e "$1" || return 0
         size="$(du -x -s -h "$1" | awk '{print $1}')" || true
     fi
-    printf '  %-7s %s\n' "${size:-?}" "$1"
+    printf '  %-7s %s%s\n' "${size:-?}" "$1" "${2:+  ($2)}"
 }
 
 # The ESP is small and GRUB copies the incoming kernel before pruning old
@@ -103,13 +125,14 @@ generations() {
     printf 'booted=%s\n' "${booted}"
 }
 
-# Sets TARGETS_FILE to a temp file holding the build-directory walk, so the
-# caller can read it with a plain `while read` loop. A process substitution
-# would hide the walk's exit status; returning the path through a global
-# rather than stdout is what keeps `fail` effective, because a command
-# substitution would run this in a subshell and discard GC_FAILED with it.
+# Sets TARGETS_FILE to a temp file holding the walk for every directory gc
+# --deep may act on, so the caller can read it with a plain `while read` loop.
+# A process substitution would hide the walk's exit status; returning the path
+# through a global rather than stdout is what keeps `fail` effective, because
+# a command substitution would run this in a subshell and discard GC_FAILED
+# with it.
 build_targets() {
-    build_expr
+    build_expr "${BUILD_DIRS[@]}" "${REMOVED_OUTRIGHT[@]}"
     local rc=0
     TARGETS_FILE="$(mktemp)"
     find "$HOME" -mindepth 1 \
@@ -150,7 +173,7 @@ cache_targets() {
     add_cache "$HOME/.cargo/registry"
     add_cache "$HOME/.cargo/git"
 
-    build_expr
+    build_expr "${BUILD_DIRS[@]}"
     local candidates rc=0
     candidates="$(mktemp)"
     find "$HOME" -mindepth 1 -maxdepth 5 \
@@ -196,6 +219,208 @@ remove_tree() {
     fi
 }
 
+# Runs CMD with cwd ROOT, in the environment the project itself declares:
+# through devbox when ROOT/devbox.json exists, else through direnv when
+# ROOT/.envrc exists, else directly. cargo, go and make are on no box-wide
+# PATH; each project's environment provides them. devbox joins its arguments
+# into one script string that its own bash runs, so a `$`, a quote or a
+# backtick in an argument is expanded or broken there, not passed on; every
+# caller passes plain words. -q drops devbox's own `Info:` lines while its
+# `Error:` lines and the command's stderr still show. stdin is /dev/null: the
+# callers sit inside `while read` loops over a file, and a tool that reads
+# stdin would otherwise eat the rest of the list.
+in_project_env() {
+    local root="$1"
+    shift
+    if [ -f "${root}/devbox.json" ]; then
+        (cd "${root}" && devbox run -q -- "$@") </dev/null
+    elif [ -f "${root}/.envrc" ]; then
+        (cd "${root}" && direnv exec "${root}" "$@") </dev/null
+    else
+        (cd "${root}" && "$@") </dev/null
+    fi
+}
+
+# Succeeds when TOOL resolves in ROOT's environment, otherwise reports why the
+# tool will not be run. TOOL is one of the fixed words make, cargo and go, so
+# spelling it into the script string is safe (devbox drops positional
+# parameters after `sh -c`, see in_project_env).
+require_tool() {
+    local root="$1" tool="$2" what="$3"
+    if in_project_env "${root}" sh -c "command -v ${tool} >/dev/null"; then
+        return 0
+    fi
+    fail "kept ${what}: ${tool} is not in ${root}'s environment" \
+        "Add ${tool} to the project's devbox.json (or its .envrc), or clean it by hand."
+    return 1
+}
+
+# The manifest NAME needs beside it to count as build output, from
+# NEEDS_MANIFEST; empty for a name that needs none.
+manifest_for() {
+    local entry
+    for entry in "${NEEDS_MANIFEST[@]}"; do
+        if [ "${entry%%:*}" = "$1" ]; then
+            printf '%s' "${entry#*:}"
+        fi
+    done
+}
+
+# Adds ROOT to the make-clean actions when its Makefile has a clean target.
+# `make -n clean` decides: exit 0 means there is one; make's own "No rule to
+# make target 'clean'" means there is none, which is no business of ours (GNU
+# make quotes with apostrophes, older versions with a backtick and an
+# apostrophe); anything else, "No rule to make target 'x', needed by 'clean'"
+# included, is a broken Makefile and is reported with make's output.
+plan_make() {
+    local root="$1" out rc=0
+    if ! require_tool "${root}" make "make clean in ${root}"; then
+        return 0
+    fi
+    out="$(in_project_env "${root}" make -n clean 2>&1)" || rc=$?
+    if [ "${rc}" = 0 ]; then
+        DEEP_MAKE_ROOTS+=("${root}")
+        DEEP_MAKE_DRYRUNS+=("${out}")
+        return 0
+    fi
+    case "${out}" in
+    *"No rule to make target 'clean'"* | *"No rule to make target \`clean'"*) ;;
+    *) fail "make -n clean failed in ${root} (exit ${rc})" "${out}" ;;
+    esac
+}
+
+# Decides what gc --deep would do, filling the DEEP_* globals, and prints a
+# line for every directory it leaves alone for want of its manifest. Nothing
+# is deleted or cleaned here; the only commands run are the tool lookups and
+# `make -n clean`.
+deep_plan() {
+    DEEP_MAKE_ROOTS=()
+    DEEP_MAKE_DRYRUNS=()
+    DEEP_CARGO_TARGETS=()
+    DEEP_GO_ROOTS=()
+    DEEP_REMOVALS=()
+
+    local roots_file rc=0 root
+    roots_file="$(mktemp)"
+    project_roots >"${roots_file}" || rc=$?
+    if [ "${rc}" != 0 ]; then
+        fail "the project walk under \$HOME could not read every directory (find exit ${rc})" \
+            "A project under a directory it could not open is invisible to --deep;" \
+            "no make clean or go clean runs for it."
+    fi
+    while IFS= read -r -d '' root; do
+        if [ -f "${root}/Makefile" ] || [ -f "${root}/GNUmakefile" ] || [ -f "${root}/makefile" ]; then
+            plan_make "${root}"
+        fi
+        if [ -f "${root}/go.mod" ] && require_tool "${root}" go "go clean in ${root}"; then
+            DEEP_GO_ROOTS+=("${root}")
+        fi
+    done <"${roots_file}"
+    rm -f "${roots_file}"
+
+    local dir name parent manifest
+    build_targets
+    while IFS= read -r -d '' dir; do
+        name="${dir##*/}"
+        parent="${dir%/*}"
+        manifest="$(manifest_for "${name}")"
+        if [ -n "${manifest}" ] && [ ! -f "${parent}/${manifest}" ]; then
+            case "${name}" in
+            target) printf "kept %s: no %s beside it, so it is not cargo's build output\n" "${dir}" "${manifest}" ;;
+            *) printf 'kept %s: no %s beside it\n' "${dir}" "${manifest}" ;;
+            esac
+            continue
+        fi
+        # A name build_targets learns must be given its action here; without
+        # one the tier stops loudly instead of removing it by default.
+        case "${name}" in
+        target)
+            if require_tool "${parent}" cargo "${dir}"; then
+                DEEP_CARGO_TARGETS+=("${dir}")
+            fi
+            ;;
+        node_modules | .venv | .next) DEEP_REMOVALS+=("${dir}") ;;
+        *) fail "gc --deep has no action for ${dir}" "Give '${name}' a case in deep_plan." ;;
+        esac
+    done <"${TARGETS_FILE}"
+    rm -f "${TARGETS_FILE}"
+}
+
+# Deleting or cleaning a path git does not ignore dirties the VM worktree,
+# and receive.denyCurrentBranch=updateInstead then refuses every later `git
+# push yolobox` — a breakage that surfaces much later with no link back to
+# here. The name alone does not settle it: an anchored /node_modules in
+# .gitignore leaves a nested one tracked.
+git_ignores() {
+    git -C "${1%/*}" check-ignore -q "$1"
+}
+
+fail_not_ignored() {
+    fail "kept $1: git does not ignore it" \
+        "Deleting it would dirty the worktree and block every later" \
+        "push to the yolobox remote. Add it to that repo's .gitignore" \
+        "(or remove it by hand and commit) if it really is build output."
+}
+
+report_deep_plan() {
+    local i dir root found=0
+    for ((i = 0; i < ${#DEEP_MAKE_ROOTS[@]}; i++)); do
+        found=1
+        printf '%s: make clean would run:\n' "${DEEP_MAKE_ROOTS[i]}"
+        printf '%s\n' "${DEEP_MAKE_DRYRUNS[i]}" | sed 's/^/    /'
+    done
+    for dir in "${DEEP_CARGO_TARGETS[@]}"; do
+        found=1
+        measure "${dir}" 'cargo clean'
+    done
+    for root in "${DEEP_GO_ROOTS[@]}"; do
+        found=1
+        printf '%s: go clean\n' "${root}"
+    done
+    for dir in "${DEEP_REMOVALS[@]}"; do
+        found=1
+        measure "${dir}" remove
+    done
+    [ "${found}" = 1 ] || printf '  (none)\n'
+}
+
+# Runs a step on DIR when git ignores DIR, fails it when git does not, and
+# does nothing when DIR is already gone: an earlier clean (a Makefile's
+# `rm -rf target`) can remove it after the plan was made, and git check-ignore
+# on a missing directory says "not ignored" for a dir-only pattern like
+# `target/`.
+step_if_ignored() {
+    local dir="$1"
+    shift
+    if [ ! -e "${dir}" ]; then
+        ok "already gone: ${dir}"
+    elif git_ignores "${dir}"; then
+        step "$@"
+    else
+        fail_not_ignored "${dir}"
+    fi
+}
+
+# Runs the plan: make clean, then cargo clean, then go clean, then the
+# outright removals, every one through `step`. A target or removal that git
+# does not ignore is kept and failed; make clean and go clean are the
+# project's own definition of clean and are not guarded.
+apply_deep_plan() {
+    local root dir
+    for root in "${DEEP_MAKE_ROOTS[@]}"; do
+        step "make clean in ${root}" in_project_env "${root}" make clean
+    done
+    for dir in "${DEEP_CARGO_TARGETS[@]}"; do
+        step_if_ignored "${dir}" "cargo clean in ${dir%/*}" in_project_env "${dir%/*}" cargo clean
+    done
+    for root in "${DEEP_GO_ROOTS[@]}"; do
+        step "go clean in ${root}" in_project_env "${root}" go clean
+    done
+    for dir in "${DEEP_REMOVALS[@]}"; do
+        step_if_ignored "${dir}" "rm -rf ${dir}" remove_tree "${dir}"
+    done
+}
+
 # Claude's scratchpads are live session output, not ours to delete. Reported
 # so a full disk can be traced to them.
 report_scratchpads() {
@@ -203,12 +428,18 @@ report_scratchpads() {
     measure "/tmp/claude-$(id -u)"
 }
 
-cmd_projects() {
-    build_expr
+# Every git repo under $HOME, NUL-separated. `projects` prints it as is; gc
+# --deep reads it to find the roots whose own tools clean them.
+project_roots() {
+    build_expr "${BUILD_DIRS[@]}"
     find "$HOME" -mindepth 1 \
         "${EXPR[@]}" -prune -o \
         -name .git \( -type d -o -type f \) -printf '%h\0' -prune -o \
         -name '.*' -prune
+}
+
+cmd_projects() {
+    project_roots
 }
 
 cmd_home_roots() {
@@ -362,14 +593,8 @@ cmd_gc_user() {
         report_scratchpads
         if [ "${deep}" = 1 ]; then
             printf '\nproject tier (--deep):\n'
-            local found=0 target
-            build_targets
-            while IFS= read -r -d '' target; do
-                found=1
-                measure "${target}"
-            done <"${TARGETS_FILE}"
-            rm -f "${TARGETS_FILE}"
-            [ "${found}" = 1 ] || printf '  (none)\n'
+            deep_plan
+            report_deep_plan
         else
             printf '\nproject tier not measured; add --deep to include it.\n'
         fi
@@ -390,25 +615,8 @@ cmd_gc_user() {
 
     if [ "${deep}" = 1 ]; then
         step 'podman system prune -af' podman system prune -af
-        local target
-        build_targets
-        while IFS= read -r -d '' target; do
-            # Deleting a path git does not ignore dirties the VM worktree,
-            # and receive.denyCurrentBranch=updateInstead then refuses every
-            # later `git push yolobox` — a breakage that surfaces much later
-            # with no link back to here. The name alone does not settle it:
-            # an anchored /node_modules in .gitignore leaves a nested one
-            # tracked.
-            if git -C "$(dirname "${target}")" check-ignore -q "${target}"; then
-                step "rm -rf ${target}" rm -rf "${target}"
-            else
-                fail "kept ${target}: git does not ignore it" \
-                    "Deleting it would dirty the worktree and block every later" \
-                    "push to the yolobox remote. Add it to that repo's .gitignore" \
-                    "(or remove it by hand and commit) if it really is build output."
-            fi
-        done <"${TARGETS_FILE}"
-        rm -f "${TARGETS_FILE}"
+        deep_plan
+        apply_deep_plan
     fi
 
     printf '\nafter:\n'

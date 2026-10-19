@@ -2433,9 +2433,18 @@ def build_parser() -> argparse.ArgumentParser:
         "those is rebuilt or refetched on demand, so the next build is slower\n"
         "and needs network. Model weights and other app data are never\n"
         "touched. /tmp scratchpads are reported only. --deep adds per-project\n"
-        "build output (target, node_modules, .next) under the guest home, each\n"
-        "deleted only if git ignores it. Run this from the Mac; in-VM tools die\n"
-        "first.",
+        "build output under the guest home, cleaned by the project's own tools\n"
+        "run in its devbox or direnv environment: make clean where the Makefile\n"
+        "has a clean target, cargo clean for a target beside a Cargo.toml, go\n"
+        "clean beside a go.mod. node_modules, .venv and a .next beside a\n"
+        "package.json are removed outright. Those removals and cargo clean\n"
+        "happen only where git ignores the directory; make clean and go clean\n"
+        "are the project's own definition of clean and run unguarded. A target\n"
+        "without its Cargo.toml or a .next without its package.json is kept and\n"
+        "named, because the name alone does not prove it is build\n"
+        "output. A removed .venv comes back with the project's own uv sync or\n"
+        "devbox, and until then basedpyright has no environment for it. Run this\n"
+        "from the Mac; in-VM tools die first.",
     )
     gc.add_argument(
         "--deep", action="store_true", help="also reclaim per-project build output"
