@@ -232,8 +232,11 @@ in
     settings.whitelist.prefix = [ config.users.users.${agentUser}.home ];
   };
 
+  # .NET binaries, such as pi-lens's downloaded marksman, abort without ICU
+  # ("Couldn't find a valid ICU package"); that crash-looped into 259
+  # coredumps 2026-10-05..18.
   programs.nix-ld.enable = true;
-  programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl ];
+  programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl icu ];
 
   programs.git = {
     enable = true;
