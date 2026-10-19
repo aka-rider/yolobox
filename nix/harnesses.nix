@@ -23,12 +23,30 @@ let
   # which is exactly how 657fc21 ended herd reporting box-wide within a day.
   #
   # --settings sits before "$@" so a user's own later --settings still wins.
+  #
+  # No runtimeInputs: that would prepend store paths to PATH, and this script
+  # execs claude, whose children (the project's own tools) must keep the PATH
+  # the project's shell gave them. The few external tools are named by store
+  # path instead.
   claudeLauncher = pkgs.writeShellApplication {
     name = "claude";
-    runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.git ];
+    runtimeInputs = [ ];
     text = ''
       versions="${claudeVersionsDir}"
-      newest="$(find "$versions" -maxdepth 1 -type f -perm -u+x -printf '%f\n' 2>/dev/null | sort -V | tail -n 1 || true)"
+
+      # Newest executable under $versions. Extra find tests go in "$@".
+      newest_version() {
+        ${pkgs.findutils}/bin/find "$versions" -maxdepth 1 -type f -perm -u+x "$@" -printf '%f\n' 2>/dev/null \
+          | ${pkgs.coreutils}/bin/sort -V | ${pkgs.coreutils}/bin/tail -n 1 || true
+      }
+
+      # A binary modified in the last minute may still be downloading; skip it
+      # unless it is all there is (a first install would otherwise have no
+      # claude for a minute).
+      newest="$(newest_version ! -mmin -1)"
+      if [ -z "$newest" ]; then
+        newest="$(newest_version)"
+      fi
 
       if [ -z "$newest" ]; then
         echo "claude: no installed version under $versions" >&2
@@ -43,7 +61,7 @@ let
       # project comes from the logical cwd, not git's physical toplevel:
       # ~/wrk is a symlink to ~/Developer, and the repo mirrors logical
       # paths, so show-toplevel would resolve the symlink away.
-      cdup="$(git rev-parse --show-cdup 2>/dev/null || true)"
+      cdup="$(${pkgs.git}/bin/git rev-parse --show-cdup 2>/dev/null || true)"
       top="$(cd "$PWD/$cdup" 2>/dev/null && pwd -L || printf '%s' "$PWD")"
       default_output_dir="$HOME/artifacts"
       output_dir="''${PLAYWRIGHT_MCP_OUTPUT_DIR:-$default_output_dir}"
@@ -57,7 +75,7 @@ let
           ;;
       esac
       export PLAYWRIGHT_MCP_OUTPUT_DIR="$output_dir"
-      mkdir -p "$output_dir"
+      ${pkgs.coreutils}/bin/mkdir -p "$output_dir"
 
       # herdr's classification keys off the foreground process name, but the
       # exec'd binary here is named after its version directory (e.g.
@@ -119,10 +137,20 @@ let
       # initial `claude install` the installer script runs.
       ${lib.getExe claudeLauncherKeeper}
 
-      claude plugin marketplace list 2>/dev/null | grep -q claude-plugins-official \
+      # grep -q exits at its first match, and a producer still writing then
+      # dies of SIGPIPE, which pipefail turns into a failed probe. So the
+      # producer's whole output is captured first.
+      probe_has() {
+        local pattern="$1" out
+        shift
+        out="$("$@" 2>/dev/null || true)"
+        grep -q -- "$pattern" <<<"$out"
+      }
+
+      probe_has claude-plugins-official claude plugin marketplace list \
         || claude plugin marketplace add anthropics/claude-plugins-official
       for plugin in context7 playwright; do
-        claude plugin list 2>/dev/null | grep -q "$plugin@claude-plugins-official" \
+        probe_has "$plugin@claude-plugins-official" claude plugin list \
           || claude plugin install "$plugin@claude-plugins-official" --scope user
       done
 
@@ -147,29 +175,36 @@ let
       # below is the hard check rather than a courtesy. Pinned to the version
       # pi-agent-browser-native 0.8.2 recommends; it accepts 0.35.0 and newer,
       # and refuses browser-backed calls below that floor, at call time, not here.
-      command -v agent-browser >/dev/null || npm install -g agent-browser@0.38.1
+      agent-browser --version >/dev/null 2>&1 || npm install -g agent-browser@0.38.1
       agent-browser --version
 
       for package in @upstash/context7-pi pi-agent-browser-native; do
-        pi list 2>/dev/null | grep -q "$package" || pi install "npm:$package"
+        probe_has "$package" pi list || pi install "npm:$package"
       done
 
-      herdr integration status | grep -q '^pi: current' || herdr integration install pi
+      probe_has '^pi: current' herdr integration status || herdr integration install pi
 
       # pi-agent-browser-native ships a `pi-agent-browser-config` helper, but
       # its own README states that `pi install npm:...` does not put it on
       # PATH and names writing this file as the equivalent route. The shape is
       # the helper's own: {version:1, browser:{executablePath}}. Merged with
       # jq rather than overwritten, because the same file also holds the
-      # extension's webSearch settings.
+      # extension's webSearch settings. An empty or unparseable file is an
+      # error, never something to overwrite: it may hold those settings.
       browser_config_dir="$HOME/.pi/config/pi-agent-browser-native"
       browser_config="$browser_config_dir/config.json"
       mkdir -p "$browser_config_dir"
-      [ -f "$browser_config" ] || echo '{}' > "$browser_config"
-      jq --arg path "${lib.getExe pkgs.chromium}" \
-        '.version = 1 | .browser.executablePath = $path' \
-        "$browser_config" > "$browser_config.tmp"
-      mv -f "$browser_config.tmp" "$browser_config"
+      [ -e "$browser_config" ] || echo '{}' > "$browser_config"
+      jq -e . "$browser_config" >/dev/null \
+        || { echo "yolobox-harness-install: $browser_config is empty or not valid JSON; fix or remove it" >&2; exit 1; }
+      if ! jq -e --arg path "${lib.getExe pkgs.chromium}" \
+        '.version == 1 and .browser.executablePath == $path' \
+        "$browser_config" >/dev/null; then
+        jq --arg path "${lib.getExe pkgs.chromium}" \
+          '.version = 1 | .browser.executablePath = $path' \
+          "$browser_config" > "$browser_config.tmp"
+        mv -f "$browser_config.tmp" "$browser_config"
+      fi
 
       # --no-modify-path: no installer may edit the agent's rc files. The
       # opencode installer has no install-dir override, hence the fixed link.
@@ -274,9 +309,16 @@ in
         Persistent = true;
       };
     };
+    # StartLimitIntervalSec = 0 because the path unit above fires on every
+    # write into the version store, and one ~330 MB download is thousands of
+    # them: systemd's default burst limit would trip and leave the path unit
+    # failed.
     systemd.user.services.yolobox-claude-launcher = {
       description = "Re-assert the box's claude launcher and prune old versions";
-      unitConfig.ConditionUser = agentUser;
+      unitConfig = {
+        ConditionUser = agentUser;
+        StartLimitIntervalSec = 0;
+      };
       serviceConfig = {
         Type = "oneshot";
         ExecStart = lib.getExe claudeLauncherKeeper;
