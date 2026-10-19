@@ -1441,7 +1441,18 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     if profile == booted:
         report.ok("already running the built generation")
     else:
-        run(["limactl", "restart", INSTANCE], capture=False, check=True)
+        try:
+            run(["limactl", "restart", INSTANCE], capture=False, check=True)
+        except YoError as e:
+            raise report.abort(
+                "limactl restart failed: %s" % e.message,
+                "The built generation is installed but not booted; seeding, the herdr machine",
+                "and the 1Password/AWS forwards did not run.",
+                "Recover with: limactl stop %s" % INSTANCE,
+                "If the stop hangs too: yo ssh sudo systemctl reboot, and kill -9 any leftover",
+                "`limactl hostagent` process for %s." % INSTANCE,
+                "Then re-run yo bootstrap: it boots the new generation, sees the two agree, and finishes.",
+            )
         profile, booted = guest_generations()
         if not booted:
             raise report.abort(

@@ -563,7 +563,14 @@ running, so bootstrap skips the reboot; different means `nixos-rebuild
 boot` just installed a generation the box has not started yet, so it
 restarts the VM and re-checks, aborting with a `df /boot` hint if the two
 still disagree (the half-failed bootloader install from the ESP section
-below).
+below). The restart itself can hang: `limactl restart` stops the VM first,
+and lima's stop hang (2026-10-17, see `TODO.md`) leaves it failing after
+three minutes. Bootstrap then aborts saying the built generation is
+installed but not booted, and that seeding, the herdr machine and the
+1Password/AWS forwards did not run. Recover with `limactl stop yolobox`; if
+that hangs too, `yo ssh sudo systemctl reboot` and `kill -9` the leftover
+hostagent; then re-run `yo bootstrap`, which sees the two generations agree
+and finishes the steps the first run never reached.
 
 A project is any git repo at any depth under the guest home, not only
 `<group>/<repo>` — a monorepo puts one at depth 7. So the walk —
