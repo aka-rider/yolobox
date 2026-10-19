@@ -126,10 +126,18 @@ let
       filename="$(jq -r '.filename // empty' <<< "''${tool_input}" 2>/dev/null || true)"
       [ -n "''${filename}" ] || exit 0
 
+      # The basename of "..", "foo/.." or "/" is no file name, so it gets a
+      # fixed one rather than a target that points at a directory.
+      base="$(basename -- "''${filename}")"
+      case "''${base}" in ""|.|..|/) base=unnamed ;; esac
+
+      # A `..` component is checked before anything else: "$out/../../x"
+      # starts with "$out/" yet leaves it.
       case "''${filename}" in
-          "''${out}"/*) exit 0 ;;
-          /*)           target="''${out}/$(basename -- "''${filename}")" ;;
-          *)            target="''${out}/''${filename#./}" ;;
+          ..|../*|*/..|*/../*) target="''${out}/''${base}" ;;
+          "''${out}"/*)        exit 0 ;;
+          /*)                  target="''${out}/''${base}" ;;
+          *)                   target="''${out}/''${filename#./}" ;;
       esac
 
       mkdir -p "$(dirname -- "''${target}")" 2>/dev/null || exit 0
@@ -146,26 +154,35 @@ let
   };
 in
 {
-  systemd.services.xvfb = {
-    wantedBy = [ "multi-user.target" ];
+  # User units of the agent, not system units running as it: a system
+  # unit's log goes to the system journal, which is readable only through
+  # the `systemd-journal` group, and that journal also holds the operator's
+  # sudo command lines. Same shape as nix/herd-server.nix. DISPLAY=:0 stays
+  # box-wide (environment.variables below), so nothing else changes.
+  systemd.user.services.xvfb = {
+    description = "Virtual X display :0";
+    unitConfig.ConditionUser = agentUser;
+    wantedBy = [ "default.target" ];
     serviceConfig = {
-      User = agentUser;
-      Group = "users";
       Restart = "always";
       # -xkbdir works around nixpkgs#3441 ("cannot find xkbcomp" keymap
       # failure) by pointing Xvfb straight at the store's xkb data.
+      # -nolisten tcp keeps the display off the network. There is no -auth,
+      # so any local uid can still connect over the unix socket (verified:
+      # the operator and root can); that is no boundary, the display is the
+      # agent's own.
       ExecStart = "${pkgs.xvfb}/bin/Xvfb :0 -screen 0 1920x1080x24 -nolisten tcp -xkbdir ${pkgs.xkeyboard_config}/etc/X11/xkb";
     };
   };
 
-  systemd.services.openbox = {
-    wantedBy = [ "multi-user.target" ];
+  systemd.user.services.openbox = {
+    description = "openbox on the virtual display";
+    unitConfig.ConditionUser = agentUser;
+    wantedBy = [ "default.target" ];
     after = [ "xvfb.service" ];
     requires = [ "xvfb.service" ];
     environment.DISPLAY = ":0";
     serviceConfig = {
-      User = agentUser;
-      Group = "users";
       Restart = "always";
       # Xvfb's socket lags its own service start; without this wait,
       # openbox crash-loops fast enough to trip systemd's start-limit

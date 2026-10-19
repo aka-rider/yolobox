@@ -27,6 +27,11 @@ let
       };
     };
   };
+  # Where the agent's own direnv config lives: agent-env.nix exports it as
+  # DIRENV_CONFIG for agent processes only.
+  agentDirenvDir = lib.removePrefix "/etc/" agentEnv.env.DIRENV_CONFIG;
+  agentHome = config.users.users.${agentUser}.home;
+
   opProxies = map opProxy [
     { name = "yolobox-op-agent"; listen = agentEnv.env.SSH_AUTH_SOCK; target = "agent.sock"; }
     { name = "yolobox-aws-broker"; listen = agentEnv.awsBrokerSock; target = "aws-broker.sock"; }
@@ -148,16 +153,17 @@ in
 
   # The agent's account. uid must not be 501: a second account sharing
   # lima's uid is an outage this repo already paid for once (see CLAUDE.md,
-  # "The guest account mirrors the host") — passwd lookups resolve a uid to
+  # "Two accounts: the operator mirrors the host, the agent does not") — passwd lookups resolve a uid to
   # whichever entry comes first, so two accounts at 501 are indistinguishable
   # to whoami/SUDO_USER while modules silently write state into the wrong
   # home. It is deliberately not lima's cidata account either, because
   # lima-init runs `usermod -a -G wheel $LIMA_CIDATA_USER` unconditionally on
   # every boot, after activation — removing wheel from that account here
-  # would not stick. systemd-journal is required, not cosmetic: xvfb and
-  # openbox are system units, so their logs go to the system journal, whose
-  # ACL grants read only to wheel and adm (other::---) — without this group
-  # `journalctl -u openbox` silently narrows to the agent's own messages.
+  # would not stick. The agent is in no supplementary group on purpose,
+  # `systemd-journal` included: that group reads the system journal, where
+  # the operator's `sudo ... COMMAND=<argv>` lines live. xvfb and openbox
+  # therefore run as agent user units (nix/display.nix), whose logs sit in
+  # the agent's own user journal, which it owns without any group.
   users.users.${agentUser} = {
     isNormalUser = true;
     uid = 1000;
@@ -165,15 +171,60 @@ in
     home = "/home/${agentUser}";
     shell = pkgs.zsh;
     autoSubUidGidRange = true;
-    extraGroups = [ "systemd-journal" ];
+    # Locked, so a hand-run `passwd` cannot turn this account into a password
+    # login; ssh keys are its only way in.
+    hashedPassword = "!";
     # The agent's user manager must run from boot, not from the first login:
     # it is what installs the harnesses, and nothing may wait for `yo enter`.
     linger = true;
   };
 
+  users.users.root.hashedPassword = "!";
+
+  # With mutableUsers the pinned update-users-groups.pl applies hashedPassword
+  # only when it creates an account, so the declarations above lock nothing on
+  # a box whose accounts already exist (a hand-run `sudo passwd root` would
+  # stick). This enforces the lock on every activation. A field already
+  # starting with ! or * is locked and left alone; `passwd -l` would prefix
+  # another !. A missing shadow entry fails the activation outright.
+  system.activationScripts.lockRootAndAgent = {
+    deps = [ "users" ];
+    text = ''
+      for account in root ${agentUser}; do
+        entry="$(${pkgs.getent}/bin/getent shadow "$account")" || { echo "lockRootAndAgent: no shadow entry for $account" >&2; exit 1; }
+        field="''${entry#*:}"; field="''${field%%:*}"
+        case "$field" in
+          '!'*|'*'*) ;;
+          *) ${pkgs.shadow}/bin/passwd -l "$account" ;;
+        esac
+      done
+    '';
+  };
+
+  # username reaches shell scripts, sshd config and tmpfiles rules below, and
+  # must not be able to collide with or impersonate the agent.
+  assertions = [
+    {
+      assertion = username != agentUser;
+      message = "YOLOBOX_USERNAME is \"${username}\", the agent's own account name; the operator and the agent must be different accounts.";
+    }
+    {
+      assertion = username != "root";
+      message = "YOLOBOX_USERNAME is root; the operator mirrors the Mac user, never root.";
+    }
+    {
+      assertion = builtins.match "[a-z_][a-z0-9_-]*" username != null;
+      message = "YOLOBOX_USERNAME \"${username}\" is not a plain lowercase unix name ([a-z_][a-z0-9_-]*).";
+    }
+  ];
+
   services.openssh.enable = true;
+  # Lima reaches sshd over vsock, which iptables never sees, so no interface
+  # needs port 22 open. The tailnet gets it per interface in nix/tailscale.nix.
+  services.openssh.openFirewall = false;
   services.openssh.settings = {
     PasswordAuthentication = false;
+    KbdInteractiveAuthentication = false;
     PermitRootLogin = "prohibit-password";
   };
   # The default (~agent/.ssh/authorized_keys) must not be honoured: it is
@@ -190,7 +241,7 @@ in
     mode = "0555";
     text = ''
       #!${pkgs.runtimeShell}
-      exec ${pkgs.coreutils}/bin/cat /etc/ssh/authorized_keys.d/${username}
+      exec ${pkgs.coreutils}/bin/cat ${lib.escapeShellArg "/etc/ssh/authorized_keys.d/${username}"}
     '';
   };
   services.openssh.extraConfig = ''
@@ -221,16 +272,19 @@ in
   security.sudo.wheelNeedsPassword = false;
   programs.zsh.enable = true;
 
-  # Rendered to /etc/direnv/direnv.toml, which is where the module's
-  # DIRENV_CONFIG=/etc/direnv makes direnv look — an XDG ~/.config file is
-  # never read.
-  # The whitelist covers only the agent's home: an .envrc is arbitrary code
-  # the agent writes, and auto-trusting it in the operator's shell would
-  # hand over the operator's sudo on the first cd.
-  programs.direnv = {
-    enable = true;
-    settings.whitelist.prefix = [ config.users.users.${agentUser}.home ];
-  };
+  # The module's DIRENV_CONFIG=/etc/direnv is what root and the operator get,
+  # and it carries no whitelist: an .envrc is arbitrary code the agent
+  # writes, and auto-trusting it in the operator's shell would hand over the
+  # operator's sudo on the first cd. The agent alone gets /etc/direnv-agent
+  # (DIRENV_CONFIG in nix/lib/agent-env.nix, which also reaches herdr panes
+  # and t3), whose direnv.toml whitelists its home. direnv reads direnvrc and
+  # lib/*.sh from the same directory, so those two are the /etc/direnv files
+  # themselves, keeping nix-direnv. An XDG ~/.config file is never read.
+  programs.direnv.enable = true;
+  environment.etc."${agentDirenvDir}/direnv.toml".source =
+    (pkgs.formats.toml { }).generate "direnv.toml" { whitelist.prefix = [ agentHome ]; };
+  environment.etc."${agentDirenvDir}/direnvrc".source = config.environment.etc."direnv/direnvrc".source;
+  environment.etc."${agentDirenvDir}/lib/zz-user.sh".source = config.environment.etc."direnv/lib/zz-user.sh".source;
 
   # .NET binaries, such as pi-lens's downloaded marksman, abort without ICU
   # ("Couldn't find a valid ICU package"); that crash-looped into 259

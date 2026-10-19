@@ -130,12 +130,26 @@ let
         mv -T "${homeDir}/.local/bin/$1.tmp" "${homeDir}/.local/bin/$1"
       }
 
-      if [ -z "$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null || true)" ]; then
-        curl -fsSL https://claude.ai/install.sh | bash -s latest
-      fi
-      # Unconditional: the guarantee upstream documents covers updates, not the
-      # initial `claude install` the installer script runs.
-      ${lib.getExe claudeLauncherKeeper}
+      # Each vendor is an independent phase: one vendor's outage (a down
+      # download host, a bad config file) must not keep the others from
+      # installing. A phase runs in its own errexit subshell, so its first
+      # failing command ends that phase and nothing else; the failure is
+      # recorded, and the unit still exits non-zero at the very end so
+      # Restart=on-failure retries. Every phase is idempotent, so a retry
+      # redoes only what is missing.
+      failed=()
+      phase() {
+        local name="$1" status=0
+        shift
+        set +e
+        ( set -e; "$@" )
+        status=$?
+        set -e
+        if [ "$status" -ne 0 ]; then
+          echo "yolobox-harness-install: phase '$name' failed (exit $status)" >&2
+          failed+=("$name")
+        fi
+      }
 
       # grep -q exits at its first match, and a producer still writing then
       # dies of SIGPIPE, which pipefail turns into a failed probe. So the
@@ -147,77 +161,107 @@ let
         grep -q -- "$pattern" <<<"$out"
       }
 
-      probe_has claude-plugins-official claude plugin marketplace list \
-        || claude plugin marketplace add anthropics/claude-plugins-official
-      for plugin in context7 playwright; do
-        probe_has "$plugin@claude-plugins-official" claude plugin list \
-          || claude plugin install "$plugin@claude-plugins-official" --scope user
-      done
+      install_claude() {
+        if [ -z "$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null || true)" ]; then
+          curl -fsSL https://claude.ai/install.sh | bash -s latest
+        fi
+        # Unconditional: the guarantee upstream documents covers updates, not
+        # the initial `claude install` the installer script runs.
+        ${lib.getExe claudeLauncherKeeper}
+
+        probe_has claude-plugins-official claude plugin marketplace list \
+          || claude plugin marketplace add anthropics/claude-plugins-official
+        for plugin in context7 playwright; do
+          probe_has "$plugin@claude-plugins-official" claude plugin list \
+            || claude plugin install "$plugin@claude-plugins-official" --scope user
+        done
+      }
 
       # No tty under systemd, so pi's installer takes its defaults and never
       # edits an rc file. `pi update` self-updates. The boot-time L+ link has
       # already replaced an npm pi's bin link, so the installer cannot see it
       # to migrate; the npm package is removed here instead.
-      [ -x "$HOME/.pi/agent/bin/pi" ] \
-        || curl -fsSL https://pi.dev/install.sh | bash
-      [ ! -d "$HOME/.local/lib/node_modules/@earendil-works/pi-coding-agent" ] \
-        || npm uninstall -g @earendil-works/pi-coding-agent
-      link_bin pi "$HOME/.pi/agent/bin/pi"
+      install_pi() {
+        [ -x "$HOME/.pi/agent/bin/pi" ] \
+          || curl -fsSL https://pi.dev/install.sh | bash
+        [ ! -d "$HOME/.local/lib/node_modules/@earendil-works/pi-coding-agent" ] \
+          || npm uninstall -g @earendil-works/pi-coding-agent
+        link_bin pi "$HOME/.pi/agent/bin/pi"
+      }
 
       # t3code's own vendor install; it never edits an rc file. Its installer
       # unpacks straight into the layout `t3 service install` also uses, so
       # this download is reused rather than repeated.
-      [ -x "$HOME/.local/bin/t3" ] || curl -fsSL https://t3.codes/install.sh | bash
-      [ -f "$HOME/.config/systemd/user/t3code.service" ] || t3 service install
+      install_t3() {
+        [ -x "$HOME/.local/bin/t3" ] || curl -fsSL https://t3.codes/install.sh | bash
+        [ -f "$HOME/.config/systemd/user/t3code.service" ] || t3 service install
+      }
 
       # Scripts ON: agent-browser's postinstall IS the download of
       # its prebuilt binary. That download fails silently, so the version call
       # below is the hard check rather than a courtesy. Pinned to the version
       # pi-agent-browser-native 0.8.2 recommends; it accepts 0.35.0 and newer,
       # and refuses browser-backed calls below that floor, at call time, not here.
-      agent-browser --version >/dev/null 2>&1 || npm install -g agent-browser@0.38.1
-      agent-browser --version
+      install_agent_browser() {
+        agent-browser --version >/dev/null 2>&1 || npm install -g agent-browser@0.38.1
+        agent-browser --version
+      }
 
-      for package in @upstash/context7-pi pi-agent-browser-native; do
-        probe_has "$package" pi list || pi install "npm:$package"
-      done
-
-      probe_has '^pi: current' herdr integration status || herdr integration install pi
+      install_pi_packages() {
+        for package in @upstash/context7-pi pi-agent-browser-native; do
+          probe_has "$package" pi list || pi install "npm:$package"
+        done
+        probe_has '^pi: current' herdr integration status || herdr integration install pi
+      }
 
       # pi-agent-browser-native ships a `pi-agent-browser-config` helper, but
       # its own README states that `pi install npm:...` does not put it on
       # PATH and names writing this file as the equivalent route. The shape is
       # the helper's own: {version:1, browser:{executablePath}}. Merged with
       # jq rather than overwritten, because the same file also holds the
-      # extension's webSearch settings. An empty or unparseable file is an
+      # extension's webSearch settings. A file that is not a JSON object is an
       # error, never something to overwrite: it may hold those settings.
-      browser_config_dir="$HOME/.pi/config/pi-agent-browser-native"
-      browser_config="$browser_config_dir/config.json"
-      mkdir -p "$browser_config_dir"
-      [ -e "$browser_config" ] || echo '{}' > "$browser_config"
-      jq -e . "$browser_config" >/dev/null \
-        || { echo "yolobox-harness-install: $browser_config is empty or not valid JSON; fix or remove it" >&2; exit 1; }
-      if ! jq -e --arg path "${lib.getExe pkgs.chromium}" \
-        '.version == 1 and .browser.executablePath == $path' \
-        "$browser_config" >/dev/null; then
-        jq --arg path "${lib.getExe pkgs.chromium}" \
-          '.version = 1 | .browser.executablePath = $path' \
-          "$browser_config" > "$browser_config.tmp"
-        mv -f "$browser_config.tmp" "$browser_config"
-      fi
+      configure_agent_browser() {
+        local browser_config_dir="$HOME/.pi/config/pi-agent-browser-native"
+        local browser_config="$browser_config_dir/config.json"
+        mkdir -p "$browser_config_dir"
+        [ -e "$browser_config" ] || echo '{}' > "$browser_config"
+        jq -e 'type == "object"' "$browser_config" >/dev/null \
+          || { echo "yolobox-harness-install: $browser_config is not a JSON object; fix or remove it" >&2; return 1; }
+        if ! jq -e --arg path "${lib.getExe pkgs.chromium}" \
+          '.version == 1 and .browser.executablePath == $path' \
+          "$browser_config" >/dev/null; then
+          jq --arg path "${lib.getExe pkgs.chromium}" \
+            '.version = 1 | .browser.executablePath = $path' \
+            "$browser_config" > "$browser_config.tmp"
+          mv -f "$browser_config.tmp" "$browser_config"
+        fi
+      }
 
       # --no-modify-path: no installer may edit the agent's rc files. The
       # opencode installer has no install-dir override, hence the fixed link.
-      [ -x "$HOME/.opencode/bin/opencode" ] \
-        || curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
-      link_bin opencode "$HOME/.opencode/bin/opencode"
+      install_opencode() {
+        [ -x "$HOME/.opencode/bin/opencode" ] \
+          || curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
+        link_bin opencode "$HOME/.opencode/bin/opencode"
+      }
 
-      claude --version
-      pi --version
-      t3 --version
-      opencode --version
-      agent-browser --version
-      node --version
+      phase claude install_claude
+      phase pi install_pi
+      phase t3 install_t3
+      phase agent-browser install_agent_browser
+      phase pi-packages install_pi_packages
+      phase pi-agent-browser-config configure_agent_browser
+      phase opencode install_opencode
+
+      for tool in claude pi t3 opencode agent-browser node; do
+        phase "$tool --version" "$tool" --version
+      done
+
+      if [ "''${#failed[@]}" -gt 0 ]; then
+        printf 'yolobox-harness-install: failed phase: %s\n' "''${failed[@]}" >&2
+        exit 1
+      fi
     '';
   };
 

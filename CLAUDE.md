@@ -91,8 +91,20 @@ its home is `/home/agent`, its only group is `users`, and it is in neither
 
 Both `agent` and `root` carry `hashedPassword = "!"` — locked — and sshd
 has `KbdInteractiveAuthentication = false` beside `PasswordAuthentication =
-false`, so a hand-run `passwd`, or a PAM keyboard-interactive prompt, cannot
-turn either account into a password login: an ssh key is the only way in.
+false`, so a PAM keyboard-interactive prompt cannot turn either account into
+a password login: an ssh key is the only way in. The declaration alone
+locks nothing on a box whose accounts already exist: with
+`users.mutableUsers = true` the pinned `update-users-groups.pl` applies
+`hashedPassword` only when it creates an account, so a hand-run `sudo passwd
+root` would stick. `system.activationScripts.lockRootAndAgent` (after
+`users`) therefore runs `passwd -l` on each account on every activation, but
+only when the second field of `getent shadow <account>` does not already start
+with `!` or `*`, because `passwd -l` on a locked entry would prefix another
+`!`. The script reads the field with `${pkgs.getent}/bin/getent` and does not
+pipe it through `cut`, so a failing lookup is not swallowed: a missing shadow
+entry fails the activation outright, naming the account. Recognise a
+regression with `sudo getent shadow root agent`: both second fields must
+start with `!`.
 `nix/base.nix` also asserts three things about `username` at evaluation
 time, because it reaches sshd config, tmpfiles rules and shell scripts: it
 must differ from `agent` (the operator and the agent are different
@@ -1913,10 +1925,22 @@ just yields no match) and greps the captured text. The agent-browser probe
 is `agent-browser --version`, not `command -v agent-browser`: a binary that
 is on PATH but whose postinstall download never ran is present and broken,
 and only running it tells the two apart. The pi-agent-browser-native config
-file is merged with `jq`, and the merge is loud: an empty or unparseable
-file stops the install with a message naming the file instead of being
-overwritten with `{}`, since it also holds the extension's own settings, and
-an unchanged file is left alone rather than rewritten on every boot.
+file is merged with `jq`, and the merge is loud: a file that is not a JSON
+object (empty, unparseable, or valid but `null`/`false`) fails that phase
+with a message naming the file instead of being overwritten with `{}`, since
+it also holds the extension's own settings, and an unchanged file is left
+alone rather than rewritten on every boot.
+
+That failure does not stop the other vendors. `yolobox-harness-install` runs
+claude, pi, t3, agent-browser, the pi packages, the browser config and
+opencode as separate phases, each in its own errexit subshell through
+`phase()`; a failed phase is recorded in `failed` and the script moves on,
+then prints every failed phase and exits 1 at the very end, so
+`Restart=on-failure` still fires while a down vendor host or a bad config
+file no longer keeps the unrelated installs from happening. The final
+`--version` checks are phases of their own for the same reason. A phase that
+depends on another (the pi packages need pi) fails again on its own when its
+dependency failed, so one outage can list more than one phase.
 
 pi's installer deserves a paragraph, because it is the one phase that
 used to be `npm install -g` and is not any more. `~/.pi/agent/bin/pi` is a
@@ -2309,9 +2333,12 @@ reason, rather than failing the whole of `yo status`.
 `nix/tailscale.nix` puts the box on a tailnet so t3 (see "t3:
 vendor-installed and self-updating, like claude and pi" above) is
 reachable from outside the Mac's own
-LAN, without touching the NixOS firewall. `tailscale0` stays closed:
-`services.tailscale.openFirewall = true` opens only UDP 41641, the tunnel
-port, never a hole for 3773. What actually reaches t3 is `tailscale serve
+LAN, without opening a port for it in the NixOS firewall.
+`nixos-fw` governs `tailscale0` (`--netfilter-mode=off`, below), and it opens
+exactly two things there: TCP 22 and, through
+`services.tailscale.openFirewall = true`, the tunnel's UDP 41641. Every other
+port, 3773 included, is closed to the tailnet in the kernel's filter. What
+actually reaches t3 is `tailscale serve
 --bg --http=3773 http://127.0.0.1:3773`, run once at boot by the
 `yolobox-tailscale-serve` oneshot, which runs `tailscale serve reset`
 first so the unit owns the whole serve config: an entry left behind under
@@ -2323,24 +2350,66 @@ loopback port, so the request never needs a firewall rule to cross
 `interfaceName = "userspace-networking"`) tailscaled owns that traffic
 directly.
 
-"Closed" needed two more things to be true, because two ssh servers would
-otherwise answer on the tailnet. `services.openssh.openFirewall` opens port
-22 on every interface, `tailscale0` included, so any tailnet peer could reach
-the box's sshd; and tailscaled has an ssh server of its own, which `tailscale
-up --ssh` would start, authorising by tailnet ACL instead of by this repo's
-keys. `extraSetFlags` therefore carries `--ssh=false`, and
-`networking.firewall.extraCommands` inserts `ip46tables -I nixos-fw 1 -i
-tailscale0 -p tcp --dport 22 -j DROP` at the top of `nixos-fw`, ahead of the
-accept the port list adds. The chain is flushed on every firewall start, so
-nothing has to remove the rule on stop. It is an iptables rule on purpose and
-an assertion guards that: on the nftables backend `extraCommands` is not
-applied and the rule would be a silent no-op, and the replacement,
-`extraInputRules`, lands *after* the generated accepts, where a drop for
-port 22 never matches. A switch to `networking.nftables.enable` therefore
-fails evaluation, naming the file, instead of quietly reopening sshd to the
-tailnet. Recognise a regression from a tailnet peer: `ssh <box>.ts.net`
-must time out, not offer a key; the tailnet ACLs for the node are not
-reviewed (see `TODO.md`).
+Three more things make that list true. The first is
+`--netfilter-mode=off`, in `extraSetFlags`. By default tailscaled installs
+its own `ts-input` chain, and the live `iptables -S` showed `-A INPUT -j
+ts-input` *before* `-A INPUT -j nixos-fw`, with `-A ts-input -i tailscale0
+-j ACCEPT` inside it: every packet from the tailnet was accepted before
+`nixos-fw` was consulted. Consequence: every port the agent binds on
+`0.0.0.0` was reachable from any tailnet peer, and "`nixos-fw` governs
+`tailscale0`" was false. With
+netfilter mode off, tailscaled adds no rules at all and `nixos-fw` governs
+`tailscale0` like any other interface, so only what NixOS opens is
+reachable. `tailscale serve` is unaffected: tailscaled terminates serve ports
+inside its own netstack, before the kernel's filter sees the packet. The
+tempting alternative, `iptables -I INPUT 1`, is wrong because tailscaled
+re-inserts its jump at the top of `INPUT` whenever it restarts.
+
+The second is sshd. The tailnet may reach it, by key only (see "Two
+accounts"), and `nix/tailscale.nix` says so per interface:
+`networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 22 ]`. That
+list is declarative and works on the iptables and the nftables backend alike,
+which an earlier approach (an `ip46tables ... -j DROP` in `extraCommands`
+plus an assertion against nftables) did not. `nix/base.nix` sets
+`services.openssh.openFirewall = false`, so port 22 is open on `tailscale0`
+and nowhere else. In particular it is not open on `enp0s1`, lima's NAT
+network (192.168.5.15; the gateway 192.168.5.2 is the Mac, and nothing on the
+LAN can reach that subnet anyway), and nothing breaks for it: lima's ssh to
+the guest rides vsock, not TCP. In the VM `ss -a --vsock` shows `v_str LISTEN
+*:22` and the operator's sessions as `ESTAB 3:22 <-> 2:*` (CID 2 is the
+host), while `ss -tan` shows no established connection on port 22 during a
+`yo ssh`. The Mac's `127.0.0.1:60022` (`ssh.localPort`) is the hostagent's
+listener on the Mac side; the hostagent carries the connection to the guest
+over vsock, so the host path never touches iptables. If a future lima or
+driver switched that path to TCP, `yo ssh` would start timing out on an
+otherwise healthy box, and the first thing to check is `ss -tan sport = :22`.
+The third is tailscaled's own ssh server, which `tailscale up --ssh` would
+start, authorising by tailnet ACL instead of by this repo's keys.
+`extraSetFlags` therefore carries `--ssh=false`.
+
+Recognise a regression in the VM with `sudo iptables -S INPUT | head -3`,
+which must show no `ts-input` jump; `sudo iptables -S nixos-fw | grep 'dport
+22'`, which must show exactly one accept, with `-i tailscale0`; and `ss -a
+--vsock | grep ':22'`, which must show the vsock listener. From a tailnet
+device, `ssh <user>@yolobox.<tailnet>.ts.net` must reach sshd and offer keys
+(a password prompt is a bug), and `curl http://yolobox.<tailnet>.ts.net:3773`
+must work. The tailnet ACLs for the node are not reviewed (see `TODO.md`).
+
+A changed `extraSetFlags` has to reach the running box on `switch`, and for a
+while it did not. nixpkgs declares `tailscaled-set`, the unit that runs
+`tailscale set <flags>`, as a bare `Type=oneshot`, which is `inactive` once it
+has exited, and `switch-to-configuration` restarts a changed unit only if it is
+active. So the switch that added `--netfilter-mode=off` listed no
+`tailscaled-set` among its restarts and left the box exposed until the next
+boot: `systemctl is-active tailscaled-set` printed `inactive`, `tailscale debug
+prefs` still showed `"NetfilterMode": 2`, and `iptables -S INPUT` still had
+`-A INPUT -j ts-input` ahead of `nixos-fw`. `nix/tailscale.nix` now sets
+`RemainAfterExit = true` on it, so the unit stays `active (exited)` and a
+changed flag list restarts it on the switch. The switch that first introduces
+`RemainAfterExit` cannot restart a unit that is still inactive, so on a box
+that predates it run `yo ssh sudo systemctl restart tailscaled-set` once;
+`systemctl show tailscaled-set -p RemainAfterExit -p ActiveState` must then
+answer `yes` and `active`.
 
 `--accept-dns=false` in `extraSetFlags` stops MagicDNS from taking over
 `/etc/resolv.conf`. Left at tailscale's default, the guest's DNS would
