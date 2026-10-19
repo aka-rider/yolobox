@@ -1738,11 +1738,20 @@ def t3_service_problem(load_state: str, active_state: str) -> Optional[str]:
             "systemctl --user restart yolobox-harness-install"
         )
     if active_state != "active":
-        return (
+        problem = (
             "t3code service is %s in the VM — diagnose with: "
             "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 journalctl --user -u t3code -n 50, "
             "or tail ~/.t3/userdata/logs/boot-service.log as the agent" % active_state
         )
+        if active_state == "failed":
+            # A stale ~/.t3/runtime/.service-stopping marker survives `t3 update`
+            # and crash-loops the unit until systemd's start limit (CLAUDE.md, "t3").
+            problem += (
+                "; if it crash-looped on 'Service state is invalid or unsupported', clear it with: "
+                "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 sh -c "
+                "'systemctl --user reset-failed t3code.service && ~/.local/bin/t3 service install'"
+            )
+        return problem
     return None
 
 

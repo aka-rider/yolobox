@@ -1790,7 +1790,9 @@ systemd's start limit hit and stayed failed for about 80 minutes. A stale
 `~/.t3/runtime/.service-stopping` marker survived the update; `t3 service
 restart` does not clear it, `systemctl --user reset-failed t3code.service
 && t3 service install` does. Nothing watched the unit then; `yo status`
-does now.
+does now, and when the unit is `failed`, the message `t3_service_problem()`
+produces (on the `t3:` line, and from `yo t3` and `yo pair`) names that
+recovery, so the stale marker is one copy-paste from fixed.
 
 `t3 serve`'s `$HOME` must equal an interactive session's: `t3 pair` finds
 the server through `$HOME/.t3/*/server-runtime.json`, and a mismatch makes

@@ -1332,6 +1332,18 @@ class TestT3ServiceProblem(unittest.TestCase):
         self.assertIn("service is failed", problem)
         self.assertIn("journalctl --user -u t3code", problem)
 
+    def test_failed_unit_names_the_stale_marker_recovery(self):
+        problem = yo.t3_service_problem("loaded", "failed")
+        self.assertIn(
+            "systemctl --user reset-failed t3code.service && ~/.local/bin/t3 service install",
+            problem,
+        )
+
+    def test_non_failed_states_do_not_suggest_reset_failed(self):
+        for state in ("activating", "inactive"):
+            with self.subTest(state=state):
+                self.assertNotIn("reset-failed", yo.t3_service_problem("loaded", state))
+
 
 class TestT3RequireService(unittest.TestCase):
     def require(self, unit_stdout, curl_returncode=0):
