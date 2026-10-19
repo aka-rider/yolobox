@@ -71,7 +71,9 @@ EDITOR_SSH_BLOCK = "Match host %s user %s\n  ControlPath ~/.lima/%s/ssh-agent.so
     INSTANCE,
 )
 
-AGENT_SSH_CONFIG_MARKER = "# yolobox: re-applied by yo; lima rewrites this file on every start"
+AGENT_SSH_CONFIG_MARKER = (
+    "# yolobox: re-applied by yo; lima rewrites this file on every start"
+)
 LIMA_SSH_ALIAS_FIELDS = ("Hostname", "Port", "IdentityFile")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -214,7 +216,12 @@ def ensure_guest_known_hosts() -> None:
     if proc.returncode != 0:
         raise YoError(
             "yo: could not fetch the guest's ssh host keys (%s) to pin them for the %r ssh "
-            "alias: %s" % (HOST_KEY_GLOB, HERDR_SSH_ALIAS, (proc.stderr or proc.stdout or "").strip())
+            "alias: %s"
+            % (
+                HOST_KEY_GLOB,
+                HERDR_SSH_ALIAS,
+                (proc.stderr or proc.stdout or "").strip(),
+            )
         )
 
     lines = known_hosts_lines(lima_values, proc.stdout)
@@ -302,7 +309,9 @@ def run(
         list(argv),
         input=stdin,
         stdout=subprocess.PIPE if capture else None,
-        stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE) if capture else None,
+        stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE)
+        if capture
+        else None,
         env=env,
     )
     if capture:
@@ -313,12 +322,15 @@ def run(
             proc.stderr = proc.stderr.decode("utf-8", "replace").replace("\r", "")
     if check and proc.returncode != 0:
         if capture:
-            stdout_text = proc.stdout.decode("utf-8", "replace") if binary else proc.stdout
+            stdout_text = (
+                proc.stdout.decode("utf-8", "replace") if binary else proc.stdout
+            )
             detail = (proc.stderr or stdout_text or "").strip()
         else:
             detail = ""
         raise YoError(
-            "%s failed (exit %d)%s" % (shlex.join(argv), proc.returncode, ": " + detail if detail else "")
+            "%s failed (exit %d)%s"
+            % (shlex.join(argv), proc.returncode, ": " + detail if detail else "")
         )
     return proc
 
@@ -416,12 +428,16 @@ def guest_helper(
         if helper_missing(role):
             raise YoError(helper_skew("the box has no %s" % HELPER))
         if proc.returncode == HELPER_NO_SUBCOMMAND:
-            raise YoError(helper_skew("the box's %s has no '%s' subcommand" % (HELPER, sub)))
+            raise YoError(
+                helper_skew("the box's %s has no '%s' subcommand" % (HELPER, sub))
+            )
         return proc
     if proc.returncode == 127 and "not found" in (proc.stderr or ""):
         raise YoError(helper_skew("the box has no %s" % HELPER))
     if proc.returncode == HELPER_NO_SUBCOMMAND and HELPER_MARKER in (proc.stderr or ""):
-        raise YoError(helper_skew("the box's %s has no '%s' subcommand" % (HELPER, sub)))
+        raise YoError(
+            helper_skew("the box's %s has no '%s' subcommand" % (HELPER, sub))
+        )
     return proc
 
 
@@ -461,13 +477,18 @@ def require_agent_account() -> None:
         return
     if status == "operator_only":
         err("yo: cannot ssh into %s as '%s'." % (INSTANCE, AGENT_USER))
-        err("    Every AI session runs as that account, and this VM has no working one —")
+        err(
+            "    Every AI session runs as that account, and this VM has no working one —"
+        )
         err("    it predates the operator/agent split. Rebuild it:")
         err("        limactl delete %s && yo bootstrap" % INSTANCE)
     else:
         if detail:
             err(detail)
-        err("yo: cannot reach %s as operator either — is the VM up? yo status" % INSTANCE)
+        err(
+            "yo: cannot reach %s as operator either — is the VM up? yo status"
+            % INSTANCE
+        )
     raise YoError(None, code=1)
 
 
@@ -475,7 +496,9 @@ def guest_path(path: str, roots: Sequence[str] = (AGENT_HOME,)) -> str:
     if "\0" in path or "\n" in path:
         raise YoError("refusing a guest path with a newline or NUL byte")
     normalised = os.path.normpath(path)
-    if not any(normalised == root or normalised.startswith(root + "/") for root in roots):
+    if not any(
+        normalised == root or normalised.startswith(root + "/") for root in roots
+    ):
         if tuple(roots) == (AGENT_HOME,):
             raise YoError(
                 'refusing to target "%s": no yo command may leave the guest home "%s"'
@@ -550,15 +573,23 @@ def resolve_cp_operands(operands: List[str], cwd_mirror: Optional[str]) -> CpPla
     source_guest_flags = [operand_is_guest(source) for source in sources]
     dest_is_guest = operand_is_guest(dest)
     if len(set(source_guest_flags)) > 1:
-        raise YoError("sources are split between the Mac and the guest; every source must be on one side")
+        raise YoError(
+            "sources are split between the Mac and the guest; every source must be on one side"
+        )
     sources_are_guest = source_guest_flags[0]
     if sources_are_guest and dest_is_guest:
-        raise YoError('sources and destination are both in the guest; use "yo enter" and a plain cp there')
+        raise YoError(
+            'sources and destination are both in the guest; use "yo enter" and a plain cp there'
+        )
     if sources_are_guest:
         guest_paths = [resolve_guest_operand(source, cwd_mirror) for source in sources]
-        return CpPlan(direction="from_guest", local_paths=[dest], guest_paths=guest_paths)
+        return CpPlan(
+            direction="from_guest", local_paths=[dest], guest_paths=guest_paths
+        )
     guest_paths = [resolve_guest_operand(dest, cwd_mirror)]
-    return CpPlan(direction="to_guest", local_paths=list(sources), guest_paths=guest_paths)
+    return CpPlan(
+        direction="to_guest", local_paths=list(sources), guest_paths=guest_paths
+    )
 
 
 def cp_mkdir_target(dest_operand: str, resolved_dest: str, source_count: int) -> str:
@@ -721,7 +752,9 @@ def wait_for_pid_exit(pid: int, timeout: float) -> None:
     try:
         kq = select.kqueue()
     except OSError as failure:
-        raise YoError("cannot create a kqueue to wait for pid %d to exit: %s" % (pid, failure))
+        raise YoError(
+            "cannot create a kqueue to wait for pid %d to exit: %s" % (pid, failure)
+        )
     try:
         event = select.kevent(
             pid,
@@ -731,7 +764,9 @@ def wait_for_pid_exit(pid: int, timeout: float) -> None:
         )
         kq.control([event], 0)
         if not kq.control(None, 1, timeout):
-            raise YoError("stale aws-broker (pid %d) did not exit within %gs" % (pid, timeout))
+            raise YoError(
+                "stale aws-broker (pid %d) did not exit within %gs" % (pid, timeout)
+            )
     except ProcessLookupError:
         pass
     finally:
@@ -744,7 +779,9 @@ def kill_stale_broker(pid: int) -> None:
     except ProcessLookupError:
         return
     except PermissionError:
-        raise YoError("cannot signal the stale aws-broker (pid %d): permission denied" % pid)
+        raise YoError(
+            "cannot signal the stale aws-broker (pid %d): permission denied" % pid
+        )
     wait_for_pid_exit(pid, timeout=10.0)
 
 
@@ -781,7 +818,9 @@ def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
     proc.wait()
     if not line:
         raise YoError("aws-broker produced no handshake within 30s — see %s" % log_path)
-    raise YoError("aws-broker produced an unexpected handshake %r — see %s" % (line, log_path))
+    raise YoError(
+        "aws-broker produced an unexpected handshake %r — see %s" % (line, log_path)
+    )
 
 
 GUEST_AWS_CONFIG_DIR = os.path.dirname(GUEST_AWS_CONFIG_PATH)
@@ -869,14 +908,17 @@ def herdr_machine_exists(listing_json: str) -> bool:
     if not isinstance(entries, list):
         raise YoError("herdr machine list --json did not print a JSON array")
     return any(
-        isinstance(entry, dict) and entry.get("target") == HERDR_SSH_ALIAS for entry in entries
+        isinstance(entry, dict) and entry.get("target") == HERDR_SSH_ALIAS
+        for entry in entries
     )
 
 
 def ensure_herdr_machine() -> None:
     herdr = shutil.which("herdr")
     if herdr is None:
-        err("yo: herdr not found on this Mac's PATH — skipping herdr machine registration")
+        err(
+            "yo: herdr not found on this Mac's PATH — skipping herdr machine registration"
+        )
         return
     listing = run([herdr, "machine", "list", "--json"], check=True)
     if herdr_machine_exists(listing.stdout):
@@ -941,7 +983,13 @@ def lima_config_gap_message(missing: Sequence[str]) -> str:
     return (
         "%s has no reverse forward for %s — restate the full array:\n"
         "    limactl stop %s && limactl edit %s --set '.portForwards = %s' && yo up"
-        % (INSTANCE, " and ".join(missing), INSTANCE, INSTANCE, json.dumps(LIMA_PORT_FORWARDS))
+        % (
+            INSTANCE,
+            " and ".join(missing),
+            INSTANCE,
+            INSTANCE,
+            json.dumps(LIMA_PORT_FORWARDS),
+        )
     )
 
 
@@ -965,7 +1013,9 @@ class ReverseForward:
 
 
 def one_password_forward() -> ReverseForward:
-    return ReverseForward("1password", OP_GUEST_SOCK, op_sock(), ("ssh-add", "-l"), op_probe_alive)
+    return ReverseForward(
+        "1password", OP_GUEST_SOCK, op_sock(), ("ssh-add", "-l"), op_probe_alive
+    )
 
 
 def aws_broker_forward() -> ReverseForward:
@@ -1009,7 +1059,10 @@ def heal_forward_collecting_errors(forward: ReverseForward, errors: List[str]) -
         )
         return
     if not healed:
-        errors.append("the %s forward into the VM is still dead after re-issuing it" % forward.name)
+        errors.append(
+            "the %s forward into the VM is still dead after re-issuing it"
+            % forward.name
+        )
 
 
 def ensure_op_forward(aws_enabled: bool) -> List[str]:
@@ -1030,7 +1083,12 @@ UNITS_MISSING_NOTE = "box predates the 1Password/AWS forwards; run `yo bootstrap
 
 
 def vm_units_present() -> bool:
-    return ssh_run(OPERATOR, ["systemctl", "cat", PROXY_SOCKET_UNITS[0]], check=False).returncode == 0
+    return (
+        ssh_run(
+            OPERATOR, ["systemctl", "cat", PROXY_SOCKET_UNITS[0]], check=False
+        ).returncode
+        == 0
+    )
 
 
 def vm_services() -> None:
@@ -1053,7 +1111,8 @@ def vm_services() -> None:
 
     if errors:
         raise YoError(
-            "; ".join(errors) + " — recreate the master: limactl stop %s && yo up" % INSTANCE
+            "; ".join(errors)
+            + " — recreate the master: limactl stop %s && yo up" % INSTANCE
         )
 
 
@@ -1137,18 +1196,26 @@ def status_guest_services() -> None:
     guest_version_raw = guest_out(["cat", "/etc/yolobox/version"], check=False).strip()
     guest_version = guest_version_raw or None
     unknown_note = "unknown (box built before /etc/yolobox/version existed)"
-    out("yolobox: host yo %s, box built by %s" % (YO_VERSION, guest_version or unknown_note))
+    out(
+        "yolobox: host yo %s, box built by %s"
+        % (YO_VERSION, guest_version or unknown_note)
+    )
     drift = version_drift(YO_VERSION, guest_version)
     if drift:
         err(drift)
 
     if vm_units_present():
         op_probe = ssh_run(AGENT, ["ssh-add", "-l"], check=False)
-        out("1password: guest forward is %s" % ("up" if op_probe_alive(op_probe) else "down"))
+        out(
+            "1password: guest forward is %s"
+            % ("up" if op_probe_alive(op_probe) else "down")
+        )
 
         for unit in PROXY_SOCKET_UNITS:
             state = ssh_run(
-                OPERATOR, ["systemctl", "show", "-p", "ActiveState", "--value", unit], check=False
+                OPERATOR,
+                ["systemctl", "show", "-p", "ActiveState", "--value", unit],
+                check=False,
             ).stdout.strip()
             out("proxy: %s is %s" % (unit, state or "unknown"))
     else:
@@ -1173,7 +1240,9 @@ def cmd_status(args: argparse.Namespace) -> None:
             err(detail)
         out("vm: unreachable — is it up? start it with: yo up")
 
-    guest_df = second_line(guest_out(["df", "-h", "/"], check=False)) if vm_reachable else ""
+    guest_df = (
+        second_line(guest_out(["df", "-h", "/"], check=False)) if vm_reachable else ""
+    )
     if guest_df:
         out("disk: guest %s" % guest_df)
         fields = guest_df.split()
@@ -1214,7 +1283,13 @@ def cmd_status(args: argparse.Namespace) -> None:
             else:
                 aws_forward_probe = ssh_run(
                     AGENT,
-                    ["curl", "-sS", "--unix-socket", AGENT_AWS_BROKER_SOCK, "http://broker/health"],
+                    [
+                        "curl",
+                        "-sS",
+                        "--unix-socket",
+                        AGENT_AWS_BROKER_SOCK,
+                        "http://broker/health",
+                    ],
                     check=False,
                 )
                 out(
@@ -1225,7 +1300,9 @@ def cmd_status(args: argparse.Namespace) -> None:
                 pid = ha_pid()
                 health = aws_broker_health()
                 if health is None:
-                    out("aws: broker not reachable on this Mac's %s" % aws_broker_sock())
+                    out(
+                        "aws: broker not reachable on this Mac's %s" % aws_broker_sock()
+                    )
                 elif pid is not None and health.get("watch_pid") == pid:
                     out("aws: broker healthy (watching hostagent pid %s)" % pid)
                 else:
@@ -1268,7 +1345,9 @@ def rebuild_hint() -> str:
 
 
 def helper_skew(what: str) -> str:
-    guest_version = guest_out(["cat", "/etc/yolobox/version"], check=False).strip() or None
+    guest_version = (
+        guest_out(["cat", "/etc/yolobox/version"], check=False).strip() or None
+    )
     drift = version_drift(YO_VERSION, guest_version)
     if drift:
         return "%s.\n    %s" % (what, drift[len("yo: ") :])
@@ -1318,7 +1397,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         run(["limactl", "restart", INSTANCE], capture=False, check=True)
         profile, booted = guest_generations()
         if not booted:
-            raise report.abort("cannot read the VM's generations — is it up? (yo status)")
+            raise report.abort(
+                "cannot read the VM's generations — is it up? (yo status)"
+            )
         if profile != booted:
             raise report.abort(
                 "the VM rebooted but is still not running the built generation",
@@ -1377,7 +1458,9 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
     ).splitlines()
     load_state = load_state[0] if load_state else ""
     if not load_state:
-        raise YoError("cannot reach the VM to ask about growpart — is it up? (yo status)")
+        raise YoError(
+            "cannot reach the VM to ask about growpart — is it up? (yo status)"
+        )
     if load_state != "loaded":
         raise YoError(
             "no growpart unit in the VM's current system, so growing the ceiling would leave /dev/vda2 untouched — switch it: %s"
@@ -1396,7 +1479,9 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
     out("lima: raising %s from %dGiB to %dGiB" % (INSTANCE, current_gib, wanted))
 
     run(["limactl", "stop", INSTANCE], capture=False, check=True)
-    resize = run(["limactl", "edit", "--yes", INSTANCE, "--disk", str(wanted)], capture=False)
+    resize = run(
+        ["limactl", "edit", "--yes", INSTANCE, "--disk", str(wanted)], capture=False
+    )
     if resize.returncode != 0:
         raise YoError(
             "limactl refused the resize and %s is left stopped — start it again with: yo up"
@@ -1406,7 +1491,9 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
 
     df_after = second_line(guest_out(["df", "-h", "/"], check=False))
     blocks_after = df_blocks(guest_out(["df", "-k", "/"], check=False))
-    vda2_after = guest_out(["lsblk", "-no", "SIZE", "/dev/vda2"], check=False).splitlines()
+    vda2_after = guest_out(
+        ["lsblk", "-no", "SIZE", "/dev/vda2"], check=False
+    ).splitlines()
     out("before: %s" % df_before)
     out("after:  %s" % df_after)
     out("after:  vda2 is %s" % (vda2_after[0] if vda2_after else ""))
@@ -1426,7 +1513,9 @@ def df_blocks(text: str, field: int = 1) -> Optional[int]:
 
 
 def cmd_ssh(args: argparse.Namespace) -> None:
-    argv = ssh_base(OPERATOR) + forward_agent_opts() + ["-t", VM_HOST] + list(args.ssh_cmd)
+    argv = (
+        ssh_base(OPERATOR) + forward_agent_opts() + ["-t", VM_HOST] + list(args.ssh_cmd)
+    )
     exec_process(argv)
 
 
@@ -1439,7 +1528,11 @@ def cmd_enter(args: argparse.Namespace) -> None:
         )
     target = target_dir(args.project)
 
-    argv = ssh_base(AGENT) + ["-t", VM_HOST, remote(["cd", target]) + ' && exec "$SHELL" -l']
+    argv = ssh_base(AGENT) + [
+        "-t",
+        VM_HOST,
+        remote(["cd", target]) + ' && exec "$SHELL" -l',
+    ]
     exec_process(argv)
 
 
@@ -1451,7 +1544,9 @@ def cmd_cp(args: argparse.Namespace) -> None:
     for operand, resolved in zip(guest_operands, plan.guest_paths):
         err("yo: guest path %s -> %s" % (operand, resolved))
     if plan.direction == "to_guest":
-        target = cp_mkdir_target(args.paths[-1], plan.guest_paths[0], len(plan.local_paths))
+        target = cp_mkdir_target(
+            args.paths[-1], plan.guest_paths[0], len(plan.local_paths)
+        )
         ssh_run(AGENT, ["mkdir", "-p", target], check=True)
         sources = plan.local_paths
         dest = "%s:%s" % (VM_HOST, plan.guest_paths[0])
@@ -1501,7 +1596,9 @@ def ensure_ssh_config_include(refuse: bool) -> None:
         return
 
     if sys.stdin.isatty():
-        err("yo: ~/.ssh/config does not include the VM's ssh config, so Zed, VS Code and a")
+        err(
+            "yo: ~/.ssh/config does not include the VM's ssh config, so Zed, VS Code and a"
+        )
         err("    bare `ssh %s` cannot resolve the host. yo can add one line:" % VM_HOST)
         err("        %s" % INCLUDE_LINE)
         answer = input("    Add it to ~/.ssh/config now? [y/N] ").strip().lower()
@@ -1510,7 +1607,10 @@ def ensure_ssh_config_include(refuse: bool) -> None:
             out("yo: added '%s' to ~/.ssh/config" % INCLUDE_LINE)
             return
 
-    err("yo: add this line to ~/.ssh/config so ssh %s, Zed and VS Code can find the VM:" % VM_HOST)
+    err(
+        "yo: add this line to ~/.ssh/config so ssh %s, Zed and VS Code can find the VM:"
+        % VM_HOST
+    )
     err("    %s" % INCLUDE_LINE)
     if refuse:
         raise YoError(None, code=1)
@@ -1519,14 +1619,20 @@ def ensure_ssh_config_include(refuse: bool) -> None:
 def cmd_code(args: argparse.Namespace) -> None:
     code_cli = shutil.which("code")
     if code_cli is None:
-        code_cli = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+        code_cli = (
+            "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+        )
     if not os.access(code_cli, os.X_OK):
         raise YoError("VS Code CLI not found")
     ensure_ssh_config_include(refuse=True)
     require_agent_account()
     target = target_dir(args.project)
     exec_process(
-        [code_cli, "--folder-uri", "vscode-remote://ssh-remote+%s@%s%s" % (AGENT_USER, VM_HOST, target)]
+        [
+            code_cli,
+            "--folder-uri",
+            "vscode-remote://ssh-remote+%s@%s%s" % (AGENT_USER, VM_HOST, target),
+        ]
     )
 
 
@@ -1548,7 +1654,17 @@ def t3_unit_state() -> Tuple[str, str]:
     # sets XDG_RUNTIME_DIR for a lingering user without a pty.
     unit = ssh_run(
         AGENT,
-        ["systemctl", "--user", "show", "-p", "LoadState", "-p", "ActiveState", "--value", "t3code.service"],
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "--value",
+            "t3code.service",
+        ],
         check=False,
     ).stdout.splitlines()
     return (unit[0] if unit else ""), (unit[1] if len(unit) > 1 else "")
@@ -1576,10 +1692,26 @@ def t3_require_service() -> None:
     problem = t3_service_problem(*t3_unit_state())
     if problem:
         raise YoError(problem)
-    probe = run(["curl", "-sS", "-o", "/dev/null", "--max-time", "5", "http://127.0.0.1:%d/" % T3_PORT])
+    probe = run(
+        [
+            "curl",
+            "-sS",
+            "-o",
+            "/dev/null",
+            "--max-time",
+            "5",
+            "http://127.0.0.1:%d/" % T3_PORT,
+        ]
+    )
     if probe.returncode != 0:
-        err("yo: t3 is healthy in the VM but 127.0.0.1:%d does not answer on this Mac —" % T3_PORT)
-        err("    lima's port forwarding is dead (see ~/.lima/%s/ha.stderr.log)." % INSTANCE)
+        err(
+            "yo: t3 is healthy in the VM but 127.0.0.1:%d does not answer on this Mac —"
+            % T3_PORT
+        )
+        err(
+            "    lima's port forwarding is dead (see ~/.lima/%s/ha.stderr.log)."
+            % INSTANCE
+        )
         err("    Recover with: limactl stop %s && ./yo up" % INSTANCE)
         raise YoError(None, code=1)
 
@@ -1594,14 +1726,19 @@ def parse_pairing_url(text: str) -> Optional[str]:
     if not url:
         return None
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https") or parsed.hostname not in ("127.0.0.1", "localhost"):
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in (
+        "127.0.0.1",
+        "localhost",
+    ):
         raise YoError("'t3 pair' printed a pairing URL yo will not open: %s" % url)
     return url
 
 
 def cmd_t3(args: argparse.Namespace) -> None:
     t3_require_service()
-    pair_out = ssh_run(AGENT, ["t3", "pair", "--ttl", "2m", "--label", "yo"], merge_stderr=True).stdout
+    pair_out = ssh_run(
+        AGENT, ["t3", "pair", "--ttl", "2m", "--label", "yo"], merge_stderr=True
+    ).stdout
     url = parse_pairing_url(pair_out)
     if url is None:
         err("yo: 't3 pair' printed no 'Pairing URL:' line:")
@@ -1613,7 +1750,11 @@ def cmd_t3(args: argparse.Namespace) -> None:
 def cmd_pair(args: argparse.Namespace) -> None:
     t3_require_service()
     host_name = run(["scutil", "--get", "LocalHostName"], check=True).stdout.strip()
-    base_url = args.base_url if args.base_url is not None else "http://%s.local:%d" % (host_name, T3_PORT)
+    base_url = (
+        args.base_url
+        if args.base_url is not None
+        else "http://%s.local:%d" % (host_name, T3_PORT)
+    )
     pair = ssh_run(
         AGENT,
         [
@@ -1645,7 +1786,7 @@ def link_remote_action(existing_url: Optional[str], wanted_url: str) -> str:
         return "update"
     raise YoError(
         "remote 'yolobox' points at %s, which is not this VM — "
-        "run \"git remote remove yolobox\" or fix it by hand" % existing_url
+        'run "git remote remove yolobox" or fix it by hand' % existing_url
     )
 
 
@@ -1702,7 +1843,9 @@ SEED_STRIP_RE = re.compile(r"^\s*(Include|IdentityAgent)\s", re.IGNORECASE)
 
 
 def seed_push(script: str, payload: bytes) -> None:
-    ssh_run(AGENT, ["sh", "-c", script], stdin=payload, mux=True, capture=False, check=True)
+    ssh_run(
+        AGENT, ["sh", "-c", script], stdin=payload, mux=True, capture=False, check=True
+    )
 
 
 def seed_ssh(report: Report) -> None:
@@ -1800,7 +1943,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=DIRECTORY_RESOLUTION_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", "-V", action="version", version="yolobox %s" % YO_VERSION)
+    parser.add_argument(
+        "--version", "-V", action="version", version="yolobox %s" % YO_VERSION
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, help_text: str, description: str) -> argparse.ArgumentParser:
@@ -1832,7 +1977,7 @@ def build_parser() -> argparse.ArgumentParser:
         "configuration from the pinned yolobox flake ref, then seed\n"
         "identities. Safe to run again: every step checks before it acts.\n"
         "YOLOBOX_FLAKE overrides which flake ref to build from (e.g. a\n"
-        "branch), and is required on an unreleased (\"dev\") build.",
+        'branch), and is required on an unreleased ("dev") build.',
     )
     bootstrap.set_defaults(func=cmd_bootstrap)
 
@@ -1851,8 +1996,12 @@ def build_parser() -> argparse.ArgumentParser:
         "node_modules, .next) under the guest home, each deleted only if git\n"
         "ignores it. Run this from the Mac; in-VM tools die first.",
     )
-    gc.add_argument("--deep", action="store_true", help="also reclaim per-project build output")
-    gc.add_argument("--yes", action="store_true", help="apply the reclaim instead of only reporting")
+    gc.add_argument(
+        "--deep", action="store_true", help="also reclaim per-project build output"
+    )
+    gc.add_argument(
+        "--yes", action="store_true", help="apply the reclaim instead of only reporting"
+    )
     gc.set_defaults(func=cmd_gc)
 
     disk_grow = add(
@@ -1891,9 +2040,9 @@ def build_parser() -> argparse.ArgumentParser:
         "cp",
         "Copy files between the Mac and the agent account.",
         "Copy files between the Mac and the VM's agent account, as scp. A guest\n"
-        "path is any operand starting with \":\": \":\" alone is the guest twin of\n"
-        "the current directory, \":rel/path\" extends it, \":~\" and \":~/x\" are the\n"
-        "guest home and a path under it, and \":/abs\" is an absolute guest path\n"
+        'path is any operand starting with ":": ":" alone is the guest twin of\n'
+        'the current directory, ":rel/path" extends it, ":~" and ":~/x" are the\n'
+        'guest home and a path under it, and ":/abs" is an absolute guest path\n'
         "(refused unless it is under the guest home or under /tmp, where agents'\n"
         "scratch output lives). Every source must be on\n"
         "the Mac or every source must be in the guest, never mixed, and the\n"
@@ -1905,10 +2054,10 @@ def build_parser() -> argparse.ArgumentParser:
     link = add(
         "link",
         "Add a yolobox git remote to the current repo.",
-        "Add a \"yolobox\" git remote to the current repo, pointing at the same\n"
+        'Add a "yolobox" git remote to the current repo, pointing at the same\n'
         "$HOME-relative path in the VM (created there if missing). A stale\n"
         "yolobox remote left by a previous box is updated in place. Then\n"
-        "\"git push yolobox main\" carries the project in.",
+        '"git push yolobox main" carries the project in.',
     )
     link.set_defaults(func=cmd_link)
 
@@ -1927,7 +2076,7 @@ def build_parser() -> argparse.ArgumentParser:
         "code",
         "Open VS Code Remote-SSH in the VM.",
         "Open VS Code Remote-SSH in the VM, as the agent account. Needs\n"
-        "\"Include ~/.lima/yolobox/ssh.config\" in ~/.ssh/config (yo code offers to\n"
+        '"Include ~/.lima/yolobox/ssh.config" in ~/.ssh/config (yo code offers to\n'
         "add it otherwise); also needs the ms-vscode-remote.remote-ssh extension.",
     )
     code.add_argument("project", nargs="?")
@@ -1937,7 +2086,7 @@ def build_parser() -> argparse.ArgumentParser:
         "zed",
         "Open Zed in the VM.",
         "Open Zed in the VM, as the agent account. Needs\n"
-        "\"Include ~/.lima/yolobox/ssh.config\" in ~/.ssh/config (yo zed offers to\n"
+        '"Include ~/.lima/yolobox/ssh.config" in ~/.ssh/config (yo zed offers to\n'
         "add it otherwise).",
     )
     zed.add_argument("project", nargs="?")

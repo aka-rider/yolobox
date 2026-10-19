@@ -91,7 +91,12 @@ def unlink_if_same_identity(path, identity):
 def register_pid_watch_event(pid):
     """Register a kqueue watch for process exit, without waiting for it."""
     kq = select.kqueue()
-    event = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
+    event = select.kevent(
+        pid,
+        filter=select.KQ_FILTER_PROC,
+        flags=select.KQ_EV_ADD,
+        fflags=select.KQ_NOTE_EXIT,
+    )
     try:
         kq.control([event], 0)
     except ProcessLookupError:
@@ -131,7 +136,15 @@ def seconds_to_expiry(expiration):
 def export_credentials(profile):
     try:
         proc = subprocess.run(
-            ["aws", "configure", "export-credentials", "--profile", profile, "--format", "process"],
+            [
+                "aws",
+                "configure",
+                "export-credentials",
+                "--profile",
+                profile,
+                "--format",
+                "process",
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -143,7 +156,10 @@ def export_credentials(profile):
 
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
-        return None, f"'aws configure export-credentials --profile {profile}' failed: {detail}"
+        return (
+            None,
+            f"'aws configure export-credentials --profile {profile}' failed: {detail}",
+        )
 
     try:
         data = json.loads(proc.stdout)
@@ -193,10 +209,13 @@ class State:
     # genuinely unexpired keeps serving the stale cache rather than 500ing.
     def get(self):
         with self.lock:
-            needs_remint = self.creds is None or seconds_to_expiry(self.creds["Expiration"]) < 600
+            needs_remint = (
+                self.creds is None or seconds_to_expiry(self.creds["Expiration"]) < 600
+            )
             throttled = (
                 self.last_mint_attempt is not None
-                and (time.monotonic() - self.last_mint_attempt) < self.min_remint_interval
+                and (time.monotonic() - self.last_mint_attempt)
+                < self.min_remint_interval
             )
             if needs_remint and not throttled:
                 self._remint_locked()
@@ -243,20 +262,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._send_json(200, {
-                "pid": os.getpid(),
-                "watch_pid": self.watch_pid,
-                "allow": sorted(self.states),
-            })
+            self._send_json(
+                200,
+                {
+                    "pid": os.getpid(),
+                    "watch_pid": self.watch_pid,
+                    "allow": sorted(self.states),
+                },
+            )
             return
 
         if self.path.startswith("/creds/"):
-            profile = self.path[len("/creds/"):]
+            profile = self.path[len("/creds/") :]
 
             state = self.states.get(profile)
             if state is None:
                 allowed = ", ".join(sorted(self.states)) or "(none)"
-                self._send_text(403, f"profile '{profile}' is not allowlisted; allowed: {allowed}\n")
+                self._send_text(
+                    403, f"profile '{profile}' is not allowlisted; allowed: {allowed}\n"
+                )
                 return
 
             creds = state.get()
@@ -280,7 +304,9 @@ def main():
 
     reclaim_socket_path(args.socket)
 
-    states = {profile: State(profile, args.min_remint_interval) for profile in args.allow}
+    states = {
+        profile: State(profile, args.min_remint_interval) for profile in args.allow
+    }
 
     # Only the socket file's own mode governs who can connect: no bearer
     # token guards these requests, and this file only ever runs on the Mac,
@@ -291,7 +317,9 @@ def main():
     # not the 0o077 that a regular file's 0666 default would call for.
     old_umask = os.umask(0o177)
     try:
-        server = UnixHTTPServer(args.socket, lambda *a, **kw: Handler(states, args.watch_pid, *a, **kw))
+        server = UnixHTTPServer(
+            args.socket, lambda *a, **kw: Handler(states, args.watch_pid, *a, **kw)
+        )
     except OSError as e:
         fail(f"cannot bind unix socket {args.socket}: {e}")
     finally:
@@ -310,7 +338,9 @@ def main():
     os.close(devnull_fd)
 
     threading.Thread(
-        target=wait_for_pid_exit, args=(args.watch_pid, args.socket, identity, kq), daemon=True
+        target=wait_for_pid_exit,
+        args=(args.watch_pid, args.socket, identity, kq),
+        daemon=True,
     ).start()
 
     try:

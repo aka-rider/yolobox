@@ -93,21 +93,34 @@ class TestSshRemainderPassthrough(unittest.TestCase):
     def test_the_rebuild_hint_remedy_round_trips_intact(self):
         args = self.parse(
             [
-                "ssh", "sudo", "YOLOBOX_USERNAME=x", "nixos-rebuild",
-                "switch", "--impure", "--flake", ".#yolobox",
+                "ssh",
+                "sudo",
+                "YOLOBOX_USERNAME=x",
+                "nixos-rebuild",
+                "switch",
+                "--impure",
+                "--flake",
+                ".#yolobox",
             ]
         )
         self.assertEqual(
             args.ssh_cmd,
             [
-                "sudo", "YOLOBOX_USERNAME=x", "nixos-rebuild",
-                "switch", "--impure", "--flake", ".#yolobox",
+                "sudo",
+                "YOLOBOX_USERNAME=x",
+                "nixos-rebuild",
+                "switch",
+                "--impure",
+                "--flake",
+                ".#yolobox",
             ],
         )
 
     def test_a_plain_remote_command_round_trips_intact(self):
         args = self.parse(["ssh", "journalctl", "--user", "-u", "t3code", "-n", "50"])
-        self.assertEqual(args.ssh_cmd, ["journalctl", "--user", "-u", "t3code", "-n", "50"])
+        self.assertEqual(
+            args.ssh_cmd, ["journalctl", "--user", "-u", "t3code", "-n", "50"]
+        )
 
     def test_no_remote_command_is_an_empty_list(self):
         args = self.parse(["ssh"])
@@ -166,7 +179,13 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         env_patcher.start()
         self.addCleanup(env_patcher.stop)
 
-        for name in ("vm_up", "seed_all", "vm_services", "ensure_herdr_machine", "ensure_guest_known_hosts"):
+        for name in (
+            "vm_up",
+            "seed_all",
+            "vm_services",
+            "ensure_herdr_machine",
+            "ensure_guest_known_hosts",
+        ):
             patcher = mock.patch.object(yo, name)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -177,7 +196,9 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         ssh_run_patcher.start()
         self.addCleanup(ssh_run_patcher.stop)
 
-        include_patcher = mock.patch.object(yo, "ssh_config_include_line", return_value=1)
+        include_patcher = mock.patch.object(
+            yo, "ssh_config_include_line", return_value=1
+        )
         include_patcher.start()
         self.addCleanup(include_patcher.stop)
 
@@ -380,7 +401,9 @@ class TestGuestHelperSkew(unittest.TestCase):
             stdout="",
         )
         with mock.patch.object(yo, "YO_VERSION", "1.2.3"):
-            with mock.patch.object(yo, "ssh_run", side_effect=self.fake_ssh_run(main_proc)):
+            with mock.patch.object(
+                yo, "ssh_run", side_effect=self.fake_ssh_run(main_proc)
+            ):
                 with self.assertRaises(yo.YoError) as caught:
                     yo.guest_helper(yo.AGENT, "projects")
         self.assertIn("yo bootstrap", caught.exception.message)
@@ -392,7 +415,9 @@ class TestGuestHelperSkew(unittest.TestCase):
             stdout="",
         )
         with mock.patch.object(yo, "YO_VERSION", "1.2.3"):
-            with mock.patch.object(yo, "ssh_run", side_effect=self.fake_ssh_run(main_proc)):
+            with mock.patch.object(
+                yo, "ssh_run", side_effect=self.fake_ssh_run(main_proc)
+            ):
                 with self.assertRaises(yo.YoError) as caught:
                     yo.guest_helper(yo.AGENT, "projects")
         self.assertIn("projects", caught.exception.message)
@@ -417,7 +442,9 @@ class TestGuestHelperSkew(unittest.TestCase):
             if argv[:1] == ["cat"]:
                 return mock.Mock(returncode=0, stdout="1.1.0\n", stderr="")
             if argv[:2] == ["command", "-v"]:
-                return mock.Mock(returncode=0 if helper_present else 1, stdout="", stderr="")
+                return mock.Mock(
+                    returncode=0 if helper_present else 1, stdout="", stderr=""
+                )
             return main_proc
 
         return run
@@ -426,7 +453,9 @@ class TestGuestHelperSkew(unittest.TestCase):
         main_proc = mock.Mock(returncode=127, stderr=None, stdout=None)
         with mock.patch.object(yo, "YO_VERSION", "1.2.3"):
             with mock.patch.object(
-                yo, "ssh_run", side_effect=self.streamed_ssh_run(main_proc, helper_present=False)
+                yo,
+                "ssh_run",
+                side_effect=self.streamed_ssh_run(main_proc, helper_present=False),
             ):
                 with self.assertRaises(yo.YoError) as caught:
                     yo.guest_helper(yo.OPERATOR, "gc-machine", stream=True)
@@ -436,7 +465,9 @@ class TestGuestHelperSkew(unittest.TestCase):
         main_proc = mock.Mock(returncode=64, stderr=None, stdout=None)
         with mock.patch.object(yo, "YO_VERSION", "1.2.3"):
             with mock.patch.object(
-                yo, "ssh_run", side_effect=self.streamed_ssh_run(main_proc, helper_present=True)
+                yo,
+                "ssh_run",
+                side_effect=self.streamed_ssh_run(main_proc, helper_present=True),
             ):
                 with self.assertRaises(yo.YoError) as caught:
                     yo.guest_helper(yo.OPERATOR, "gc-machine", stream=True)
@@ -522,10 +553,14 @@ class TestEnsureHerdrMachine(unittest.TestCase):
     def test_existing_machine_is_left_alone(self):
         def fake_run(argv, **kwargs):
             if argv[1:3] == ["machine", "list"]:
-                return mock.Mock(returncode=0, stdout='[{"target": "yolobox"}]', stderr="")
+                return mock.Mock(
+                    returncode=0, stdout='[{"target": "yolobox"}]', stderr=""
+                )
             return mock.Mock(returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(yo.shutil, "which", return_value="/opt/homebrew/bin/herdr"):
+        with mock.patch.object(
+            yo.shutil, "which", return_value="/opt/homebrew/bin/herdr"
+        ):
             with mock.patch.object(yo, "run", side_effect=fake_run) as tracked:
                 yo.ensure_herdr_machine()
         calls = [call.args[0] for call in tracked.call_args_list]
@@ -540,11 +575,20 @@ class TestEnsureHerdrMachine(unittest.TestCase):
                 return mock.Mock(returncode=0, stdout="[]", stderr="")
             return mock.Mock(returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(yo.shutil, "which", return_value="/opt/homebrew/bin/herdr"):
+        with mock.patch.object(
+            yo.shutil, "which", return_value="/opt/homebrew/bin/herdr"
+        ):
             with mock.patch.object(yo, "run", side_effect=fake_run):
                 yo.ensure_herdr_machine()
         self.assertIn(
-            ["/opt/homebrew/bin/herdr", "machine", "add", "yolobox", "--label", "yolobox"],
+            [
+                "/opt/homebrew/bin/herdr",
+                "machine",
+                "add",
+                "yolobox",
+                "--label",
+                "yolobox",
+            ],
             calls,
         )
 
@@ -554,7 +598,9 @@ class TestEnsureHerdrMachine(unittest.TestCase):
                 return mock.Mock(returncode=0, stdout="[]", stderr="")
             return mock.Mock(returncode=1, stdout="", stderr="boom")
 
-        with mock.patch.object(yo.shutil, "which", return_value="/opt/homebrew/bin/herdr"):
+        with mock.patch.object(
+            yo.shutil, "which", return_value="/opt/homebrew/bin/herdr"
+        ):
             with mock.patch.object(yo, "run", side_effect=fake_run):
                 with self.assertRaises(yo.YoError) as caught:
                     yo.ensure_herdr_machine()
@@ -572,11 +618,15 @@ class TestVmServicesSkipsOnAnOldBox(unittest.TestCase):
             raise AssertionError("unexpected ssh_run call: %r" % (argv,))
 
         with mock.patch.object(yo, "ssh_run", side_effect=fake_ssh_run):
-            with mock.patch.object(
-                yo, "ensure_aws_broker", return_value=True
-            ) as fake_aws, mock.patch.object(
-                yo, "ensure_op_forward", return_value=[]
-            ) as fake_forward, mock.patch.object(yo, "err") as fake_err:
+            with (
+                mock.patch.object(
+                    yo, "ensure_aws_broker", return_value=True
+                ) as fake_aws,
+                mock.patch.object(
+                    yo, "ensure_op_forward", return_value=[]
+                ) as fake_forward,
+                mock.patch.object(yo, "err") as fake_err,
+            ):
                 yo.vm_services()
         return fake_aws, fake_forward, fake_err
 
@@ -607,7 +657,9 @@ class TestVmServicesSkipsOnAnOldBox(unittest.TestCase):
 
 class TestVmServicesRunsHealersIndependently(unittest.TestCase):
     def setUp(self):
-        status_patcher = mock.patch.object(yo, "account_status", return_value=("agent", ""))
+        status_patcher = mock.patch.object(
+            yo, "account_status", return_value=("agent", "")
+        )
         status_patcher.start()
         self.addCleanup(status_patcher.stop)
 
@@ -616,41 +668,57 @@ class TestVmServicesRunsHealersIndependently(unittest.TestCase):
         self.addCleanup(units_patcher.stop)
 
     def test_a_broken_aws_broker_does_not_stop_the_forward_healing(self):
-        with mock.patch.object(
-            yo, "ensure_aws_broker", side_effect=yo.YoError("broker exploded")
-        ), mock.patch.object(yo, "ensure_op_forward", return_value=[]) as fake_forward:
+        with (
+            mock.patch.object(
+                yo, "ensure_aws_broker", side_effect=yo.YoError("broker exploded")
+            ),
+            mock.patch.object(yo, "ensure_op_forward", return_value=[]) as fake_forward,
+        ):
             with self.assertRaises(yo.YoError):
                 yo.vm_services()
         fake_forward.assert_called_once_with(False)
 
     def test_errors_from_both_phases_are_collected_and_raised_together(self):
-        with mock.patch.object(
-            yo, "ensure_aws_broker", side_effect=yo.YoError("broker exploded")
-        ), mock.patch.object(yo, "ensure_op_forward", return_value=["1password forward dead"]):
+        with (
+            mock.patch.object(
+                yo, "ensure_aws_broker", side_effect=yo.YoError("broker exploded")
+            ),
+            mock.patch.object(
+                yo, "ensure_op_forward", return_value=["1password forward dead"]
+            ),
+        ):
             with self.assertRaises(yo.YoError) as caught:
                 yo.vm_services()
         self.assertIn("broker exploded", caught.exception.message)
         self.assertIn("1password forward dead", caught.exception.message)
 
     def test_no_errors_from_either_phase_does_not_raise(self):
-        with mock.patch.object(yo, "ensure_aws_broker", return_value=True), mock.patch.object(
-            yo, "ensure_op_forward", return_value=[]
+        with (
+            mock.patch.object(yo, "ensure_aws_broker", return_value=True),
+            mock.patch.object(yo, "ensure_op_forward", return_value=[]),
         ):
             yo.vm_services()
 
 
 class TestHealReverseForward(FakeHome):
     def test_alive_probe_never_touches_the_forward(self):
-        forward = yo.ReverseForward("x", "/guest", "/host", ("probe",), lambda proc: True)
-        with mock.patch.object(yo, "ssh_run", return_value=mock.Mock(returncode=0)) as fake_ssh, mock.patch.object(
-            yo, "run"
-        ) as fake_run:
+        forward = yo.ReverseForward(
+            "x", "/guest", "/host", ("probe",), lambda proc: True
+        )
+        with (
+            mock.patch.object(
+                yo, "ssh_run", return_value=mock.Mock(returncode=0)
+            ) as fake_ssh,
+            mock.patch.object(yo, "run") as fake_run,
+        ):
             self.assertTrue(yo.heal_reverse_forward(forward))
         fake_ssh.assert_called_once_with(yo.AGENT, ["probe"])
         fake_run.assert_not_called()
 
     def test_dead_probe_reissues_cancel_then_rm_then_forward(self):
-        forward = yo.ReverseForward("x", "/guest", "/host", ("probe",), lambda proc: proc.returncode == 0)
+        forward = yo.ReverseForward(
+            "x", "/guest", "/host", ("probe",), lambda proc: proc.returncode == 0
+        )
         calls = []
 
         def fake_run(argv, **kwargs):
@@ -665,8 +733,9 @@ class TestHealReverseForward(FakeHome):
             calls.append(("ssh_run", role, list(argv), kwargs.get("check")))
             return mock.Mock(returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(yo, "run", side_effect=fake_run), mock.patch.object(
-            yo, "ssh_run", side_effect=fake_ssh_run
+        with (
+            mock.patch.object(yo, "run", side_effect=fake_run),
+            mock.patch.object(yo, "ssh_run", side_effect=fake_ssh_run),
         ):
             result = yo.heal_reverse_forward(forward)
 
@@ -682,25 +751,33 @@ class TestHealReverseForward(FakeHome):
 
 class TestEnsureOpForward(unittest.TestCase):
     def test_missing_mac_socket_skips_1password_but_still_heals_aws(self):
-        with mock.patch.object(yo.os.path, "exists", return_value=False), mock.patch.object(
-            yo, "heal_reverse_forward", return_value=True
-        ) as fake_heal, mock.patch.object(yo, "err") as fake_err:
+        with (
+            mock.patch.object(yo.os.path, "exists", return_value=False),
+            mock.patch.object(
+                yo, "heal_reverse_forward", return_value=True
+            ) as fake_heal,
+            mock.patch.object(yo, "err") as fake_err,
+        ):
             errors = yo.ensure_op_forward(aws_enabled=True)
         self.assertEqual(errors, [])
         fake_heal.assert_called_once()
         fake_err.assert_called_once()
 
     def test_aws_disabled_never_attempts_its_forward(self):
-        with mock.patch.object(yo.os.path, "exists", return_value=True), mock.patch.object(
-            yo, "heal_reverse_forward", return_value=True
-        ) as fake_heal:
+        with (
+            mock.patch.object(yo.os.path, "exists", return_value=True),
+            mock.patch.object(
+                yo, "heal_reverse_forward", return_value=True
+            ) as fake_heal,
+        ):
             yo.ensure_op_forward(aws_enabled=False)
         self.assertEqual(fake_heal.call_count, 1)
         self.assertEqual(fake_heal.call_args[0][0].name, "1password")
 
     def test_both_forwards_failing_are_both_reported(self):
-        with mock.patch.object(yo.os.path, "exists", return_value=True), mock.patch.object(
-            yo, "heal_reverse_forward", return_value=False
+        with (
+            mock.patch.object(yo.os.path, "exists", return_value=True),
+            mock.patch.object(yo, "heal_reverse_forward", return_value=False),
         ):
             errors = yo.ensure_op_forward(aws_enabled=True)
         self.assertEqual(len(errors), 2)
@@ -711,9 +788,12 @@ class TestEnsureOpForward(unittest.TestCase):
                 raise yo.YoError("1password forward exploded")
             return False
 
-        with mock.patch.object(yo.os.path, "exists", return_value=True), mock.patch.object(
-            yo, "heal_reverse_forward", side_effect=fake_heal
-        ) as fake_heal_mock:
+        with (
+            mock.patch.object(yo.os.path, "exists", return_value=True),
+            mock.patch.object(
+                yo, "heal_reverse_forward", side_effect=fake_heal
+            ) as fake_heal_mock,
+        ):
             errors = yo.ensure_op_forward(aws_enabled=True)
         self.assertEqual(fake_heal_mock.call_count, 2)
         self.assertTrue(any("1password forward exploded" in e for e in errors))
@@ -725,11 +805,17 @@ class TestEnsureOpForward(unittest.TestCase):
                 raise yo.YoError("aws-broker forward exploded")
             return True
 
-        with mock.patch.object(yo.os.path, "exists", return_value=True), mock.patch.object(
-            yo, "heal_reverse_forward", side_effect=fake_heal
+        with (
+            mock.patch.object(yo.os.path, "exists", return_value=True),
+            mock.patch.object(yo, "heal_reverse_forward", side_effect=fake_heal),
         ):
             errors = yo.ensure_op_forward(aws_enabled=True)
-        self.assertEqual(errors, ["the aws-broker forward into the VM failed while healing it: aws-broker forward exploded"])
+        self.assertEqual(
+            errors,
+            [
+                "the aws-broker forward into the VM failed while healing it: aws-broker forward exploded"
+            ],
+        )
 
 
 class TestCmdAwsCheck(unittest.TestCase):
@@ -739,9 +825,10 @@ class TestCmdAwsCheck(unittest.TestCase):
         self.addCleanup(units_patcher.stop)
 
     def test_units_missing_raises_naming_bootstrap_before_anything_else(self):
-        with mock.patch.object(yo, "vm_units_present", return_value=False), mock.patch.object(
-            yo, "ensure_aws_broker"
-        ) as fake_aws:
+        with (
+            mock.patch.object(yo, "vm_units_present", return_value=False),
+            mock.patch.object(yo, "ensure_aws_broker") as fake_aws,
+        ):
             with self.assertRaises(yo.YoError) as caught:
                 yo.cmd_aws_check(yo.build_parser().parse_args(["aws-check"]))
         self.assertEqual(caught.exception.message, yo.UNITS_MISSING_NOTE)
@@ -755,18 +842,30 @@ class TestCmdAwsCheck(unittest.TestCase):
 
     def test_forward_heal_runs_before_the_guest_check(self):
         calls = []
-        with mock.patch.object(yo, "ensure_aws_broker", return_value=True), mock.patch.object(
-            yo, "heal_reverse_forward", side_effect=lambda fw: calls.append("heal") or True
-        ), mock.patch.object(
-            yo, "guest_helper", side_effect=lambda *a, **k: calls.append("guest") or mock.Mock(returncode=0)
+        with (
+            mock.patch.object(yo, "ensure_aws_broker", return_value=True),
+            mock.patch.object(
+                yo,
+                "heal_reverse_forward",
+                side_effect=lambda fw: calls.append("heal") or True,
+            ),
+            mock.patch.object(
+                yo,
+                "guest_helper",
+                side_effect=lambda *a, **k: (
+                    calls.append("guest") or mock.Mock(returncode=0)
+                ),
+            ),
         ):
             yo.cmd_aws_check(yo.build_parser().parse_args(["aws-check"]))
         self.assertEqual(calls, ["heal", "guest"])
 
     def test_dead_forward_raises_before_the_guest_check(self):
-        with mock.patch.object(yo, "ensure_aws_broker", return_value=True), mock.patch.object(
-            yo, "heal_reverse_forward", return_value=False
-        ), mock.patch.object(yo, "guest_helper") as fake_guest:
+        with (
+            mock.patch.object(yo, "ensure_aws_broker", return_value=True),
+            mock.patch.object(yo, "heal_reverse_forward", return_value=False),
+            mock.patch.object(yo, "guest_helper") as fake_guest,
+        ):
             with self.assertRaises(yo.YoError):
                 yo.cmd_aws_check(yo.build_parser().parse_args(["aws-check"]))
         fake_guest.assert_not_called()
@@ -782,27 +881,32 @@ class TestCmdStatus(unittest.TestCase):
         def fake_ssh_run(role, argv, **kwargs):
             return mock.Mock(returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(
-            yo, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
-        ), mock.patch.object(yo, "ssh_run", side_effect=fake_ssh_run), mock.patch.object(
-            yo, "du_kib", return_value=None
-        ), mock.patch.object(
-            yo, "vm_units_present", return_value=units_present
-        ), mock.patch.object(
-            yo, "lima_config_gaps", return_value=gaps
-        ), mock.patch.object(
-            yo.shutil, "which", return_value=aws_which
-        ), mock.patch.object(
-            yo, "aws_allowlist", side_effect=aws_allowlist_side_effect
-        ), mock.patch.object(
-            yo, "out", side_effect=fake_out
-        ), mock.patch.object(yo, "err"):
+        with (
+            mock.patch.object(
+                yo, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
+            ),
+            mock.patch.object(yo, "ssh_run", side_effect=fake_ssh_run),
+            mock.patch.object(yo, "du_kib", return_value=None),
+            mock.patch.object(yo, "vm_units_present", return_value=units_present),
+            mock.patch.object(yo, "lima_config_gaps", return_value=gaps),
+            mock.patch.object(yo.shutil, "which", return_value=aws_which),
+            mock.patch.object(
+                yo, "aws_allowlist", side_effect=aws_allowlist_side_effect
+            ),
+            mock.patch.object(yo, "out", side_effect=fake_out),
+            mock.patch.object(yo, "err"),
+        ):
             yo.cmd_status(yo.build_parser().parse_args(["status"]))
         return outs
 
-    def test_old_box_prints_units_missing_note_instead_of_proxy_and_1password_lines(self):
+    def test_old_box_prints_units_missing_note_instead_of_proxy_and_1password_lines(
+        self,
+    ):
         outs = self.run_status(
-            units_present=False, gaps=[], aws_which=None, aws_allowlist_side_effect=lambda: []
+            units_present=False,
+            gaps=[],
+            aws_which=None,
+            aws_allowlist_side_effect=lambda: [],
         )
         self.assertTrue(any(yo.UNITS_MISSING_NOTE in line for line in outs))
         self.assertFalse(any(line.startswith("1password:") for line in outs))
@@ -810,7 +914,10 @@ class TestCmdStatus(unittest.TestCase):
 
     def test_units_present_prints_1password_and_proxy_lines(self):
         outs = self.run_status(
-            units_present=True, gaps=[], aws_which=None, aws_allowlist_side_effect=lambda: []
+            units_present=True,
+            gaps=[],
+            aws_which=None,
+            aws_allowlist_side_effect=lambda: [],
         )
         self.assertTrue(any(line.startswith("1password:") for line in outs))
         self.assertTrue(any(line.startswith("proxy:") for line in outs))
@@ -822,11 +929,16 @@ class TestCmdStatus(unittest.TestCase):
             aws_which=None,
             aws_allowlist_side_effect=lambda: [],
         )
-        self.assertTrue(any(line.startswith("lima:") and yo.OP_GUEST_SOCK in line for line in outs))
+        self.assertTrue(
+            any(line.startswith("lima:") and yo.OP_GUEST_SOCK in line for line in outs)
+        )
 
     def test_no_lima_config_gap_is_reported_as_ok(self):
         outs = self.run_status(
-            units_present=True, gaps=[], aws_which=None, aws_allowlist_side_effect=lambda: []
+            units_present=True,
+            gaps=[],
+            aws_which=None,
+            aws_allowlist_side_effect=lambda: [],
         )
         self.assertIn("lima: reverse forwards ok", outs)
 
@@ -835,7 +947,9 @@ class TestCmdStatus(unittest.TestCase):
             units_present=True,
             gaps=[],
             aws_which="/usr/local/bin/aws",
-            aws_allowlist_side_effect=yo.YoError("cannot parse ~/.aws/config: bad bytes"),
+            aws_allowlist_side_effect=yo.YoError(
+                "cannot parse ~/.aws/config: bad bytes"
+            ),
         )
         self.assertTrue(any("aws: config unreadable:" in line for line in outs))
 

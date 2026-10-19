@@ -16,6 +16,10 @@ jobs:
         with:
           args: check --output-format=github
 
+      - uses: astral-sh/ruff-action@v4.1.0
+        with:
+          args: format --check
+
       - name: Unit tests
         run: python3 -m unittest discover -s tests
 
