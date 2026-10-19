@@ -1,1 +1,4 @@
-.*
+.ruff_cache/
+.claude/
+.direnv/
+.DS_Store
