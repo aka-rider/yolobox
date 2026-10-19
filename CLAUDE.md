@@ -31,7 +31,8 @@ rules this file justifies.
   environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`, `GOPATH`,
   `PI_CLIPBOARD_OSC52`), applied identically to the herdr server, t3 and every
   agent login shell.
-- `nix/display.nix` — the virtual X display, browsers and screen recording.
+- `nix/display.nix` — the virtual X display (the agent's `xvfb` and `openbox`
+  user units), browsers and screen recording.
 - `nix/lsp.nix` — the Python language-server wiring for every editor.
 - `nix/t3.nix` — t3code's environment: a drop-in onto the vendor-installed
   user unit (`nix/lib/agent-env.nix`, nix-ld), and the path unit that prunes
@@ -53,9 +54,19 @@ rules this file justifies.
 - `homebrew/yolobox.rb` — the brew formula, with `@URL@`/`@SHA256@` holes;
   `release.yml` renders it into `aka-rider/homebrew-tap` on every published
   release.
-- `tests/test_yo.py` — unit tests for yo's pure functions and argv builders;
-  `python3 -m unittest discover -s tests`.
+- `aws-broker` — the Mac-side credential broker (stdlib Python, started and
+  stopped by `yo`); see "AWS credentials" below.
+- `tests/` — `test_yo.py`, `test_yo_commands.py` and `test_yo_paths.py` for
+  yo's pure functions and argv builders, `test_aws_broker.py` for the
+  broker's handler, and `test_consistency.py` and `test_guest_script.py` for
+  the checks that keep the Python, Nix and shell spellings of one fact
+  equal and that run the guest script's functions; all through
+  `python3 -m unittest discover -s tests`, which CI runs on Python 3.9 and
+  the newest 3.x.
 - `TODO.md` — known problems and the upstream PRs still awaiting review.
+- `upstream/` — upstream reports drafted here and not yet filed, one
+  markdown file each; `TODO.md` names the ones it tracks.
+- `LICENSE` — MIT, the same licence the brew formula declares.
 
 ## Two accounts: the operator mirrors the host, the agent does not
 
@@ -74,10 +85,21 @@ manual `nixos-rebuild`.
 
 Every AI coding session runs as a second account instead: `agent`, a
 constant in `flake.nix`, never threaded in from the host. Its uid is 1000,
-its home is `/home/agent`, its groups are `users` and `systemd-journal`,
-and it is in neither `wheel` nor any sudoers rule — it has no `sudo` at
-all. `yo enter`, `yo code`, `yo zed`, and every t3-spawned session land
-there.
+its home is `/home/agent`, its only group is `users`, and it is in neither
+`wheel` nor any sudoers rule — it has no `sudo` at all. `yo enter`,
+`yo code`, `yo zed`, and every t3-spawned session land there.
+
+Both `agent` and `root` carry `hashedPassword = "!"` — locked — and sshd
+has `KbdInteractiveAuthentication = false` beside `PasswordAuthentication =
+false`, so a hand-run `passwd`, or a PAM keyboard-interactive prompt, cannot
+turn either account into a password login: an ssh key is the only way in.
+`nix/base.nix` also asserts three things about `username` at evaluation
+time, because it reaches sshd config, tmpfiles rules and shell scripts: it
+must differ from `agent` (the operator and the agent are different
+accounts), it must not be `root`, and it must match `[a-z_][a-z0-9_-]*`. A
+Mac account that fails one of these stops `nixos-rebuild` with a message
+naming `YOLOBOX_USERNAME`, rather than building a box that quietly merges
+the two accounts or splices an odd name into a script.
 
 The agent's uid is 1000, not 501, because of an outage this box already
 lived through once. An earlier revision hardcoded `alice`, an old Mac
@@ -128,18 +150,29 @@ command is a copied `/etc/ssh/agent-authorized-keys` rather than a store
 path because sshd's `safe_path` refuses any command whose canonical path
 has a group-writable component, and `/nix/store` is `1775`.
 
-The system journal turned out to gate on the same group. `getfacl` on
+The system journal is the other thing the agent must not read, and it gates
+on a group, not on `wheel` alone. `getfacl` on
 `/var/log/journal/*/system.journal` shows `group:wheel:r--`,
-`group:adm:r--`, `other::---` — readable only through `wheel`'s ACL, with
-no other route in. `xvfb` and `openbox` are system units that run *as* the
-agent, so their logs land in the system journal, not some user journal the
-agent already owns by default. Hence the agent carries `extraGroups = [
-"systemd-journal" ]` on top of dropping `wheel` — without it, `journalctl
--u openbox` silently narrows to only the agent's own messages. t3code is
-not part of this any more: it is a vendor-installed *user* unit (see "t3:
-vendor-installed and self-updating, like claude and pi" below), so its
-logs were never gated by this group to begin with — they sit in the
-agent's own user journal, which the agent already owns outright.
+`group:adm:r--`, `other::---`, and the `systemd-journal` group reads it too.
+The agent used to carry that group, for one reason: `xvfb` and `openbox`
+were system units that ran *as* the agent, so their logs landed in the
+system journal, and without the group `journalctl -u openbox` silently
+narrowed to the agent's own messages. The group was the price of those two
+units, and it was too high. The operator's entries (uid 501) live in
+`system.journal`, not in a journal of their own, and among them are the
+`sudo: <operator> : ... COMMAND=<argv>` lines for everything the operator
+ran under `sudo`. An agent in the group could therefore read every command
+the operator had run as root, arguments included. So the group is gone and
+`xvfb` and `openbox` are the agent's own user units
+(`systemd.user.services`, `ConditionUser=agent`, wanted by
+`default.target`, the shape `nix/herd-server.nix` already has): their logs
+sit in the agent's user journal, which it owns outright without any group,
+and `journalctl --user -u openbox` as the agent is the way to read them.
+Recognise a regression by `id` as the agent listing anything but `users`,
+or by `journalctl -u sshd` as the agent printing system entries at all;
+without the group it can show only the agent's own messages. t3code was never part of this: it is a
+vendor-installed *user* unit (see "t3: vendor-installed and self-updating,
+like claude and pi" below), and its logs sit in the same user journal.
 
 Two accounts sharing one VM also exposed a trap in lima's ssh
 multiplexing. Lima's `ControlPath` carries no `%r` in its template, and
@@ -176,7 +209,25 @@ before any connection, `yo code`/`yo zed` included; and the end of
 opens no ssh of its own to trigger the `ssh_base()` repair. `~/.ssh/config`
 itself now needs only one line, `Include ~/.lima/yolobox/ssh.config`, and
 `yo bootstrap`/`yo code`/`yo zed` offer to add it when it is missing and
-stdin is a tty.
+stdin is a tty. That offer edits the file the operator actually keeps: when
+`~/.ssh/config` is a symlink into a dotfiles checkout it writes through the
+link, keeps the mode the operator chose, and reads and writes undecodable
+bytes untouched; an unreadable config is an error, not an empty file the
+`Include` line would then replace.
+
+The same block carries `ForwardAgent no`, and so does the `Host yolobox`
+alias herdr uses. The operator's own `~/.ssh/config` may well say
+`Host lima-yolobox` / `ForwardAgent yes` after the `Include` line, a
+perfectly reasonable thing to write for the operator's `yo ssh`. ssh keeps
+the first value per keyword, and the owned block sits first, so for the
+agent role it neutralises that line: a `yo code`, `yo zed` or t3-spawned
+agent session never forwards the Mac's agent, whatever a later `Host`
+block says. Only a command-line `-o`, which outranks every file, can still
+turn it on, and `yo ssh` is the one place that does (see "SSH identities"
+below). If the file loses its blank line between the owned block and lima's
+`Host` block, the rewrite keeps everything after the marker line rather than
+dropping lima's block: a duplicated owned block is harmless because the
+first value wins, a lost `Host` block is not.
 
 This still leaves a gap, and it is worth stating plainly rather than
 papering over: nothing in lima or ssh enforces the split at the moment a
@@ -259,10 +310,11 @@ herdr server, t3, and every agent login shell (see "Where things live" and
 `cmd_enter` arranges no forward of its own any more; landing in the guest
 is the whole of what it does here.
 
-`ForwardAgent` itself never goes into `~/.lima/yolobox/ssh.config`, the
+A positive `ForwardAgent` never goes into `~/.lima/yolobox/ssh.config` (the
+only value the owned blocks carry is `no`), the
 file every `yo`-spawned ssh connection reads via `-F` (see "Two accounts"
 above): that file is shared by every ssh role `yo` spawns, so a
-`ForwardAgent` sitting there would reach `yo code`, `yo zed` and every
+`ForwardAgent yes` sitting there would reach `yo code`, `yo zed` and every
 t3-spawned session too, not only the one command that asked for it. `yo
 ssh`, the operator's own bare shell, is the one command left that still
 forwards `ForwardAgent` per session — the 1Password socket path itself,
@@ -270,6 +322,44 @@ since the default forwards `$SSH_AUTH_SOCK`, Apple's launchd agent holding
 nothing on this Mac — and only over its own `ControlPath=none` connection,
 so that forward dies with the one pane that opened it rather than riding
 a shared master into a session that never asked to carry it.
+
+Every `yo` ssh also verifies the guest's host key, and that takes three
+overrides, because lima's own `Host lima-yolobox` block works against it:
+it says `StrictHostKeyChecking no`, `UserKnownHostsFile /dev/null` and
+`NoHostAuthenticationForLocalhost yes`. The last is the load-bearing one: it
+makes ssh skip host-key verification for 127.0.0.1 whatever the other two
+say (checked against a throwaway sshd: a changed key still connected).
+`host_key_pin_block()` therefore writes a `Match host lima-yolobox` section
+(any user) into the owned head block of `~/.lima/yolobox/ssh.config`, above
+lima's own block: `UserKnownHostsFile <yo's file>`, `StrictHostKeyChecking
+accept-new` and `NoHostAuthenticationForLocalhost no`. ssh keeps the first
+value per keyword, so the pin beats lima's block for every connection that
+reads the file: each `ssh_base()` role, a bare `ssh lima-yolobox`, `yo code`
+and `yo zed` (which go through the `Include` in `~/.ssh/config`) and the git
+push channel, whose `remote.yolobox.sshCommand` is just `ssh -F <that file>`.
+Before this the pin was `-o` options that `ssh_base()` and `yo link` added
+themselves, so the connections `yo` does not build, `yo code`, `yo zed` and the
+push of an already-linked repo, still ran under lima's `NoHostAuthentication
+ForLocalhost yes` and accepted any key. The pinned file is
+`~/.lima/yolobox/known_hosts`, owned by `yo` and filled by
+`ensure_guest_known_hosts` (see "herdr" below); `accept-new` is what lets an
+empty or missing file learn the key on the first connection while refusing
+any later change. The one ssh that cannot pin is the fetch of those keys: the
+`OPERATOR_FIRST_CONTACT` role opts out with `FIRST_CONTACT_OPTS`
+(`UserKnownHostsFile=/dev/null`, `StrictHostKeyChecking=no`,
+`NoHostAuthenticationForLocalhost=yes` on its command line, which outranks
+the file), because a pin cannot be checked against itself. `yo` does not reset
+the file when it creates an instance: it lives inside `~/.lima/yolobox`, the
+instance directory `limactl delete` removes, so a recreated instance starts
+with no pin and `vm_up` learns it through first contact. Recognise a stale
+pin by ssh's own `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` on every
+`yo` command after the VM was replaced without deleting that directory
+(for instance by restoring an old `~/.lima/yolobox/known_hosts`): remove
+the file and run `yo up`, which fetches the new keys. The pin applies when
+`yo`'s own ssh is the one that opens the connection: operator connections that
+share lima's multiplexed one (`ssh_base(OPERATOR, mux=True)`, used by
+`heal_reverse_forward`) ride a connection lima's hostagent opened with its own
+options, and a client on a shared connection never re-checks the host key.
 
 Because lima never re-establishes its side of a reverse forward — a
 failure is logged once, at hostagent start, and nothing about it retries
@@ -357,7 +447,10 @@ see "t3: vendor-installed and self-updating" below), a lima line from
 print "aws: config unreadable: ..." when the AWS config cannot be read.
 
 `lima_config_gaps()` is the other half of keeping the two in sync, and it
-no longer refuses anything. Before ever starting the VM, `vm_up()` asks
+no longer refuses anything. (It is also where the settings below that lima
+reads once get their notes: a mounts gap and a `forwardAgent` gap are
+reported next to the socket forwards, as the same kind of stderr note.)
+Before ever starting the VM, `vm_up()` asks
 `limactl list yolobox --json` for the running instance's own
 `config.portForwards` — never a text search of `lima/yolobox.yaml`
 itself, which is only ever read once, at creation (see "The VM" section
@@ -381,7 +474,27 @@ nothing, since a brand-new box has no gap to report; the check exists for
 an instance created before a rule existed, exactly the migration
 README.md describes: a box whose forwards still carry only the t3, dhcp
 and 1Password rules because the AWS broker's rule did not exist yet when
-that instance was first created.
+that instance was first created. The check compares the socket rules only.
+The t3 rule now says `proto: tcp` explicitly (`LIMA_PORT_FORWARDS` and the
+yaml agree, position and all, so the restate command is the same text in
+both), but an instance created before that has the same rule without it,
+and lima's default protocol is tcp, so that is no gap and is not reported.
+
+`lima/yolobox.yaml` also pins three settings that were left at lima's
+defaults, each because the default is wrong for a box that is meant to hold
+an agent. `vmType: vz` names Apple's Virtualization.framework, which the
+rosetta block further down only applies to, instead of trusting that lima's
+default driver stays the same. `propagateProxyEnv: false` keeps the Mac's
+`HTTP(S)_PROXY` out of the guest, where a proxy address the VM cannot reach
+would break every fetch the box makes. `ssh.loadDotSSHPubKeys: false` stops
+lima copying every `~/.ssh/*.pub` on the Mac into the guest's authorized
+keys, so the only key that can log in is the one lima generates for the
+instance. Like every setting in that file, none of them reaches an instance
+that already exists: `limactl stop yolobox`, then `limactl edit yolobox
+--set '.propagateProxyEnv = false | .ssh.loadDotSSHPubKeys = false'`. The
+first pin changes nothing on an instance that already runs vz, which every
+box of this repo has, so it is the two others a pre-existing box lacks until
+someone restates them.
 
 Two GitHub accounts share `github.com`, so the account is chosen by which
 key is offered. The Mac does that with a `Host github-work` alias
@@ -389,11 +502,26 @@ whose `IdentityFile` names a public key — a selector, not a key — and
 `~/.dotfiles/gitconfig` rewrites `git@github.com:example-org/` to that alias.
 `yo seed` copies `~/.ssh/config` and every `*.pub` in, minus lima's
 `Include` and `IdentityAgent`, both of which name paths that do not exist
-in the VM and would take the forwarded agent away.
+in the VM and would take the forwarded agent away. The strip matches the
+keyword followed by whitespace *or* `=`, because ssh accepts
+`IdentityAgent=/path` and `Include=...` just as well, and a filter that
+knew only the space form let the `=` form through. A `*.pub` that is a
+symlink is shipped as the regular file it resolves to, never as a link:
+tar stores a symlink as a symlink, which arrives dangling in the guest.
+The same rule covers the group `.gitconfig` files below, and it has a
+bound: the target must be a regular file under the Mac `$HOME`, since a
+link can point anywhere on the Mac and the file would then be shipped into
+the agent's reach. A file that fails it is skipped with a stderr note
+(`yo: not seeding <path>: it does not resolve to a regular file under
+$HOME`), never silently.
 
 `yo seed` also copies group `.gitconfig` files. It asks the guest which
-non-hidden top-level directories exist under its home, and for each one
-that also exists under the Mac `$HOME` (a symlink to a directory counts)
+non-hidden top-level directories exist under its home. The guest is not
+trusted to name them sanely, so a name must match `SEED_ROOT_RE`
+(`[A-Za-z0-9][A-Za-z0-9._ -]*`, whole name) or it is skipped with a stderr
+note naming it; that keeps `..`, a leading dash and anything with a slash or
+a newline out of the Mac paths built from it. For each root that passes and
+also exists under the Mac `$HOME` (a symlink to a directory counts)
 it copies every `<root>/<group>/.gitconfig` with its `$HOME`-relative
 path preserved. Those files sit next to repos, not inside one, so no push
 ever carries them, and without them the `includeIf` in
@@ -437,7 +565,17 @@ logical `$PWD`: the path relative to the Mac `$HOME`, grafted onto the
 guest `$HOME`, subdirectory included. Logical means `$PWD` as the shell
 spells it — a symlinked spelling is mirrored, never resolved, so the
 guest sees whatever name you `cd` through on the Mac. `yo link` maps a
-repo's logical toplevel the same way and refuses a repo outside `$HOME`.
+repo's logical toplevel the same way and refuses a repo outside `$HOME`. It
+finds that toplevel with `git rev-parse --show-toplevel`, which git reports
+with symlinks resolved, and maps it back through the logical cwd:
+`logical_toplevel()` walks up from the cwd as spelled and takes the nearest
+ancestor whose `realpath` equals git's answer. It used to count the `../`
+that `--show-cdup` printed and apply that to the logical cwd, which is wrong
+as soon as a symlink below the root makes the physical and logical depths
+differ: the count then climbs to a different directory than the root.
+Recognise that shape by `yo link` mapping a repo to a parent of the one you
+stood in, or refusing it as `$HOME` itself. When no ancestor of the logical
+cwd resolves to git's answer, it falls back to the physical path.
 When the mirrored path does not exist in the VM, the session lands at
 the deepest existing ancestor; when the Mac cwd is outside `$HOME`, it
 lands at the guest home. Both cases print exactly
@@ -529,6 +667,68 @@ directory once more than one source is given, which is why `yo cp` runs
 single-source rule — whenever there is more than one source, DST is `:`,
 or DST ends in `/`.
 
+What reaches scp's argv is built so that neither a file name on the Mac nor
+one in the guest can steer scp. A Mac operand is made absolute by joining it
+onto the current directory — joined, not normalised, because collapsing a
+`..` lexically would change which file a symlinked spelling means — which
+settles two cases at once: `a:b.png` is a path, not host `a`, and a name that
+starts with `-` is not an option. The operands also sit after a `--`. A guest
+*source* is glob-escaped (`[`, `]`, `*`, `?` and `\` each backslashed),
+because scp expands wildcards in a remote source itself and a guest file
+named `a[1].txt` would otherwise match nothing, or several other files. A
+guest *destination* is deliberately not escaped: scp never globs a
+destination, so the backslashes would be taken literally and create a file
+named `a\[1\].txt`. An empty operand is refused outright (joined onto the
+cwd it would mean the directory itself). Because `yo`'s own parser reads a
+leading `-` too, a source that starts with one is spelled `yo cp -- -odd.txt
+:` — the `--` is argparse's, the second one is `yo`'s own.
+
+An upload refuses symlinks. `scp -r` follows them and uploads what they
+point at, so a link left in a repo by an agent (`leak -> ~/.ssh/id_ed25519`)
+would copy a file the user never named into the guest. Before anything
+leaves, each source is `lstat`'d and, for a directory, walked without
+following links; the first symlink found stops the copy, before even the
+`mkdir -p` in the guest, with `refusing to upload symlink "<link>": scp would
+copy its target "<target>", not the link`. A source that cannot be read is
+refused by name too, not skipped. The guest side is not checked: the test
+exists to keep the Mac's private files from entering the guest, and a guest
+source is something the agent could already read, with that account's own
+permissions as the boundary.
+
+A download never lets scp write onto the Mac destination itself. scp writes
+through a symlink it finds there, and the agent controls what a repo it pushed
+contains: with `notes -> ../../.zshrc` committed, pulling the repo on the Mac
+and then `yo cp :proj ~/wrk/` would overwrite `~/.zshrc` through the link.
+`download_from_guest` instead makes a `.yo-cp-*` staging directory beside the
+destination (inside it when it is an existing directory, so the final move is
+a rename on one filesystem) and has scp fill that. `plan_merge` then plans
+every entry against what is already on the Mac, before anything moves:
+directories merge the way `scp -r` merges them, a file replaces a file, and an
+existing symlink at any depth is refused naming its path (`refusing to copy
+over symlink "<path>": the copy would overwrite its target "<target>", not the
+link`), as is a file meeting a directory. Only then are the entries renamed
+into place; an `os.replace` the Mac refuses (a destination subdirectory that
+is a mount point, a read-only Mac directory) becomes `cannot place <staged> ->
+<target>: <reason> (N of M entries already landed)`, never a traceback. The
+staging directory is removed on every path, a refusal, an scp failure and a
+failed move included. `-p` keeps a guest directory's mode, and sftp-mode scp
+creates each local directory with that mode `| u+wx`, so a read-only guest
+directory (a Go module cache) refuses to lose its children and an agent-side
+`chmod 300 ~/proj/sub` leaves a staged directory nobody can list. Before
+`shutil.rmtree`, `unlock_tree` walks the staged tree top down and chmods each
+real directory to 0700 (it never follows a symlink, which would chmod a Mac
+file). If cleanup still fails, `download_from_guest` prints that failure on
+stderr and re-raises the original error; it never replaces it. The
+single-file rules stay scp's: `yo cp :~/x
+./renamed.txt` names the file, `yo cp :proj dest/` puts `proj` inside an
+existing `dest`, and more than one source needs an existing directory. A
+destination that ends in `/` must already be a directory: `yo cp :~/x newdir/`
+with no `newdir` is refused with `destination "<path>/" is not a directory`
+(scp itself says "No such file or directory"), where it used to create a file
+named `newdir`. A
+trailing slash on an upload source no longer hides a symlink from the check
+above (`lstat("link/")` follows the link, so the slash is stripped first).
+
 ## Per-project dev shells
 
 A project must be a git repo for one reason: the push channel. `yo link`
@@ -543,10 +743,21 @@ authoring `devbox.json` on either side is safe; the remaining discipline is
 ordinary git — the VM commits `devbox.lock`, pull it before pushing again.
 
 Resolution needs network on the first add. `.devbox/` is per-machine and
-gitignored. direnv trusts every `.envrc` under the guest home through
-`/etc/direnv/direnv.toml`; the NixOS module exports `DIRENV_CONFIG=/etc/direnv`,
-so a `~/.config/direnv/direnv.toml` is silently ignored — never put the
-whitelist there.
+gitignored. direnv trusts every `.envrc` under the guest home for the agent
+only. The NixOS module exports `DIRENV_CONFIG=/etc/direnv` to everyone, and
+that directory carries no whitelist: an `.envrc` is arbitrary code the agent
+writes, so auto-trusting it in the operator's or root's shell would hand
+over `sudo` on the first `cd`, and both get "blocked" until they `direnv
+allow` a file they have read. The agent alone is pointed elsewhere:
+`nix/lib/agent-env.nix` sets `DIRENV_CONFIG=/etc/direnv-agent`, whose
+`direnv.toml` whitelists the agent's home. It is in that file, not in the
+login-shell init, so that every agent process sees it — the herdr server
+and its panes, t3, and zed's `direnv export json`, none of which run a login
+shell. direnv reads `direnvrc` and `lib/*.sh` from the same directory, so
+`/etc/direnv-agent` links both from `/etc/direnv`; without them nix-direnv
+silently stops working for the agent and `use flake` fails with an unknown
+function. A `~/.config/direnv/direnv.toml` is silently ignored whichever
+directory applies — never put the whitelist there.
 
 That `git add`-before-Nix discipline still applies to yolobox's own repo,
 but only on a local clone someone is hacking on directly — the VM itself
@@ -645,6 +856,28 @@ they are the thing being deleted. One list serves both on purpose — before
 the move there were two, `PROJECT_FIND` and `GC_USER`'s `project_targets`,
 and neither knew the other existed.
 
+Several guards in the script exist because its inputs come from `yo`
+or from the filesystem the agent writes. `landing-dir` exits 2 with
+`path must be absolute` on a relative argument: its ancestor walk strips
+trailing components until a directory exists, and on a relative path that
+does not exist the strip stops changing the string at its last component
+(`${d%/*}` leaves a name without a slash alone), so the loop never ends.
+`yo` is the other half: it runs the reported directory through
+`guest_path()` before using it, so a helper that answers with a path outside
+the guest home is refused instead of landed in. `remove_tree`, which both
+the cache sweep and `gc --deep` delete through, removes a symlink as the
+link; its `chmod -R u+w` (needed for Go's read-only module cache) used to
+follow a link and rewrite permissions on whatever it pointed at. The Go
+build-cache signature is two facts, not one: a `README` opening with Go's
+own line *and* a `trim.txt` beside it, since a stray README that merely
+starts with that line would otherwise nominate its directory for deletion,
+and `$HOME` itself is never a cache, so a README at the top of the home
+cannot nominate the home. The `podman system prune -f` step removes stopped
+containers, unused networks, dangling images and build cache, and keeps
+volumes; the unit description and the step comment say so in those words
+because "dangling containers" read as if running state was at stake.
+`aws-creds` is covered in "AWS credentials" below.
+
 `BUILD_DIRS` is no longer the only list the script owns. `LOCAL_CACHES` is
 the single spelling of the cache names `gc --yes` deletes under `~/.cache`
 (see "A full disk" below for what belongs in it and what never does), and
@@ -713,10 +946,26 @@ used to fail inside the VM as `bash: --help: command not found`. `yo ssh
 -h` is the one case that actually improves: it now prints `yo`'s own ssh
 help instead of failing the same way.
 
-`allow_abbrev` is on by default and nothing in `build_parser()` turns it
-off, so `yo gc --de` and `yo gc --y` now parse as `--deep` and `--yes`
-where the old hand-rolled flag loop rejected any prefix outright. Worth
-carrying in your head for a command whose job is deleting things.
+`allow_abbrev` is off, on the top-level parser and on every subparser, so
+`yo gc --de` and `yo gc --y` are rejected as unknown arguments, exactly as
+the old hand-rolled flag loop rejected any prefix. It is argparse's default
+to accept them, and for a command whose job is deleting things a flag that
+two keystrokes of a typo can reach is one too many; if a new subparser is
+added without it, `--de` starts working again on that command with no error
+anywhere.
+
+`out()` and `err()`, the two functions every line `yo` prints goes
+through, replace C0 and C1 control characters with `?`, except tab and
+newline. Guest output is attacker-controlled — ssh stderr, a path the
+helper reports, a project name, whatever a failing guest command says — and
+it reaches the operator's terminal on the Mac, which acts on escape
+sequences: a title change, a cursor move that overwrites a line of the
+message above it, an OSC 52 that sets the clipboard. Filtering at the one
+chokepoint, instead of at each call site that happens to print guest text,
+is what keeps a new message from forgetting. It is a display filter only:
+what `yo` runs and writes to files is never altered by it, and a command
+that must hand bytes through untouched (`yo ssh`, `yo enter`) does not
+print them via `out()` at all.
 
 `YO_VERSION = "dev"` (line ~32) must survive as that exact literal
 assignment, unreformatted. `nix/pkgs/yolobox.nix` overwrites it with
@@ -725,7 +974,9 @@ the literal text; either patch is how a release build gets its real
 version number baked in. Reformat that line — reflow it, requote it,
 anything that changes its exact text — and the Nix build fails loudly at
 `--replace-fail` (the safer failure) while the brew formula's `inreplace`
-can silently no-op and ship a binary that still reports `dev`.
+can silently no-op and ship a binary that still reports `dev`. A unit test
+(`TestYoVersionLiteral`) fails when `yo` stops having exactly one line that
+is that literal, so the reformat is caught before the release, not by it.
 
 `enter`, `code` and `zed` take `project` as `nargs="?"`, so `yo enter ""`
 and `yo enter` produce different values — `project=''` against
@@ -758,6 +1009,17 @@ tagged tree, and moving the tag is how it gets there. What makes that safe
 is a guard: the workflow refuses unless the release tag is already the tip
 of `main`, because force-moving a tag cut from an older commit would
 republish different content under a name someone may already have fetched.
+The one other shape it accepts is the state its own failed run leaves: the
+stamp commit pushed and the tag not yet moved, which is HEAD being a
+`release: <version> [skip ci]` commit that changes only `.version`, directly
+on top of the commit the tag still names. Without that, a run that died
+between the push and the tag move could never be re-run, and the only way
+out would be to hand-move a published tag. The workflow fires on the
+`released` event only, not `published`, so a prerelease or a draft does not
+start a tag move, and it validates the tag against `^v[0-9]+\.[0-9]+\.[0-9]+$`
+as its very first step, before any other: the version is spliced into the
+tarball name, the formula URL and the tap commit message, and a tag with a
+slash, a quote or a newline in it must be refused before a tag moves.
 The formula itself lives here too, at `homebrew/yolobox.rb`: the release job
 renders it into the tap from that same tarball, hashed locally rather than
 re-downloaded, so the tap never holds a hand-edited formula and the hash
@@ -853,9 +1115,36 @@ each recognisable on its own:
   v0.9.0 shipped with a tarball and no tap formula, and v0.9.1 was the
   first release to carry both.
 
+The release job's other early refusals all exist because `bump-tap` runs
+after the tag has moved: it checks `HOMEBREW_TAP_TOKEN` is non-empty and,
+through a dry-run `git push` of a per-run branch name, that it can push to
+the tap, so a token that is set but read-only fails before the tag moves and
+not after. The dry run sits after the checkout, since it needs a local repo.
+The REST `permissions.push` field was dropped: it reports the token owner's
+role, not a fine-grained token's own grant, so it can say `true` for a
+read-only token. `bump-tap` renders the formula with `sed` and
+then greps it for a leftover `@HOLE@`: a hole `sed` was not told about would
+otherwise ship a formula with a literal `@SOMETHING@` in it. The grep's exit
+codes are handled as three cases, because `grep` exits 1 for "no hole left",
+which is the good one, and any status above 1 is a real error that must not
+read as success. Workflow permissions are `contents: read` at the top and
+`contents: write` only on the `release` job, and every checkout that does
+not push has `persist-credentials: false`, so a step that runs a script
+from the tree holds no writable token. `homebrew/yolobox.rb` itself now
+carries `depends_on :macos` and `depends_on arch: :arm64`, so a Linux or an
+Intel machine is refused at install with brew's own message, instead of
+installing a `yo` that drives a Virtualization.framework VM it cannot run.
+Immutable releases must stay off, a deliberate cost recorded in `TODO.md`:
+`release` re-uploads the tarball with `--clobber` and force-moves the tag,
+and both are refused on an immutable release.
+
 `verify.yml` is the one workflow `ci.yml` and `release.yml` share, and
 `release` declares `needs: verify`, so whatever it checks gates a tag move.
-Besides ruff, the unit tests and the `yo --help` smoke test it has an
+It is split into `lint` (ruff check, ruff format check, the `yo --help`
+smoke test, and shellcheck at warning severity on
+`nix/guest/yolobox-guest.sh`), `unit` (the unit tests on a matrix of Python
+3.9 and the newest 3.x: 3.9 is the floor `yo` promises, since the Mac's
+Xcode Python is that, and the newest catches the other direction) and an
 `eval` job: `YOLOBOX_USERNAME=ci nix eval --impure --raw --option
 allow-import-from-derivation false
 .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath`, on
@@ -864,10 +1153,14 @@ without building it, so an invalid option fails CI before a tag is moved
 instead of on a user's `yo bootstrap` (the v1.0.1 shape above). It needs no
 aarch64 builder, because the derivation path is computed and never realised,
 and forbidding import-from-derivation is what keeps it so. Proven the way a
-test should be: re-adding `programs.git-lfs` makes it fail. The actions are
-at `actions/checkout@v7` and `astral-sh/ruff-action@v4.1.0`; ruff-action v4
-has no floating major tag (its releases are immutable), so it is pinned to
-the exact tag.
+test should be: re-adding `programs.git-lfs` makes it fail. Every action in
+the three workflows is pinned to a full commit SHA with the tag it was
+resolved from in a trailing comment (`actions/checkout`, `ruff-action`,
+`setup-python`, `install-nix-action`): a tag is a name the action's owner can
+move, a SHA is the content, and the release job holds a writable token and
+the tap's. Bumping one means resolving the new tag to its SHA and changing
+both. ruff-action v4 has no floating major tag in any case (its releases
+are immutable).
 
 ## tmpfiles rules apply on `switch`
 
@@ -1168,8 +1461,15 @@ generation carries the option, so the switch must land before the resize —
 ## Browsers and the virtual display
 
 The display is still `:0`, 1920x1080, Xvfb with openbox on it, and
-`DISPLAY=:0` is still set box-wide — but nothing in this repo wraps a
-browser any more. Two vendor tools reach it instead: claude's official
+`DISPLAY=:0` is still set box-wide. Xvfb and openbox are the agent's *user*
+units (`systemd.user.services` in `nix/display.nix`, `ConditionUser=agent`,
+up from boot through the agent's lingering), not system units that run as
+the agent, so that their logs need no `systemd-journal` group (see "Two
+accounts" above). Xvfb listens on the unix socket only (`-nolisten tcp`) and
+has no `-auth`, so any local uid, the operator and root included, can
+connect to it; that is no boundary, because the display is the agent's own
+and holds nothing the agent does not already hold. Nothing in this repo
+wraps a browser any more. Two vendor tools reach it instead: claude's official
 `playwright` plugin (`npx @playwright/mcp@latest`) and, for pi,
 `pi-agent-browser-native` over Vercel's `agent-browser` CLI. Playwright
 runs headed on the display because `DISPLAY` is set; agent-browser is
@@ -1217,7 +1517,11 @@ output under `~/artifacts` exists to prevent. `nix/display.nix`'s
 `PreToolUse` hook, `yolobox-playwright-artifacts`, catches this before
 the tool runs: it rewrites `filename` in the tool input, keeping a
 relative name's subpath under the output dir and reducing an absolute
-name to its basename there.
+name to its basename there. A name with a `..` component is flattened the
+same way, to its basename, and it is checked before the "already under the
+output dir" exemption, because `$out/../../x` starts with `$out/` and still
+leaves it. A basename that names no file, `.`, `..`, empty or `/`, becomes
+`unnamed`, so the target is never a path that points at a directory.
 
 The old guard that refused loudly when the X socket was missing is gone
 with the per-engine wrappers that used to carry it; upstream's silent
@@ -1465,7 +1769,15 @@ from the guest's own `/etc/ssh/ssh_host_*_key.pub`, fetched over the
 operator's already-trusted lima connection — never a channel that itself
 needs the key it is trying to learn. It runs from `vm_up` right after
 `limactl start` and again from `cmd_bootstrap` just before
-`ensure_herdr_machine`, since a recreated VM has new host keys.
+`ensure_herdr_machine`, since a recreated VM has new host keys. That fetch
+uses the `OPERATOR_FIRST_CONTACT` role, the one ssh `yo` spawns that does not
+pins (see "SSH identities" above). The file lives in the instance directory,
+so a recreated instance starts without one and the file herdr checks against
+can never hold the previous VM's keys. The alias carries `ForwardAgent no` too, for
+the reason the agent role's `Match` block does (see "Two accounts"): herdr
+reaches the alias through the operator's `~/.ssh/config`, where a
+`ForwardAgent yes` meant for the operator's own `yo ssh` could otherwise
+apply.
 
 ## The harnesses come from their vendors; the box owns `~/.local/bin/claude`
 
@@ -1513,6 +1825,20 @@ first `claude` on PATH is the box's launcher either way, and `claude
 update` now works and is welcome. DISABLE_AUTOUPDATER and the reaper are
 gone.
 
+Two details of the launcher script are there because it sits in front of
+every claude session. It is a `writeShellApplication` with *no*
+`runtimeInputs`, and names `find`, `sort`, `tail`, `mkdir` and `git` by
+store path: `runtimeInputs` would prepend the store's coreutils, findutils
+and git to `PATH`, and the script `exec`s claude, so every tool the project
+runs from inside the session (its own pinned `git`, a `find` from its
+devbox) would be shadowed by the box's, a difference nobody would connect
+to a launcher. And it skips a binary modified in the last minute when
+another exists: claude writes a new version straight into `versions/`, so
+the newest executable can be a half-downloaded file for a while. If that
+binary is the only one, as on a first install, it is used anyway, because
+the alternative is no claude for a minute. The probe for "is any version
+there" and the pick are the same function with one extra `find` test.
+
 The custom launcher costs one thing: claude prunes old versions only when
 it owns the launcher, and each version is about 330 MB. So the same user
 path unit that guards the link, `yolobox-claude-launcher`, also prunes
@@ -1530,7 +1856,13 @@ at the next login) runs the same service. The unit watches both
 `~/.local/bin` and `versions/`, re-links within a second when `readlink`
 disagrees, writes only when something is actually wrong (so the
 modification it causes settles rather than looping), and logs the one line
-saying it did. The
+saying it did. The service carries `StartLimitIntervalSec=0`, because the
+path unit fires on every write into the version store and a single ~330 MB
+download is thousands of them: systemd's default start limit (five starts in
+ten seconds) trips in the first second, and the tripped service leaves the
+path unit failed too, which stops it watching at all until something resets
+it. The work per start is a handful of `readlink`s and a `find`, so no limit
+is the right limit. The
 tmpfiles rules at boot and on `switch` are the backstop for the window the
 path unit cannot see — an install made while no user manager of the
 agent's was running.
@@ -1570,6 +1902,21 @@ own installer with `--no-modify-path`, into `~/.opencode/bin`, which a
 tmpfiles link from `~/.local/bin/opencode` makes reachable (the installer
 has no install-dir override). No vendor installer is ever allowed to edit
 an rc file.
+
+The probes in that script are written for `set -o pipefail`. `cmd | grep -q
+x` is a trap there: `grep -q` exits at its first match, a producer still
+writing then dies of SIGPIPE, and pipefail turns that into a failed probe,
+so a package that is installed reads as missing, and the `|| install` after
+it runs again, at random, on any boot. `probe_has` captures
+the producer's whole output first (its failure tolerated, an absent tool
+just yields no match) and greps the captured text. The agent-browser probe
+is `agent-browser --version`, not `command -v agent-browser`: a binary that
+is on PATH but whose postinstall download never ran is present and broken,
+and only running it tells the two apart. The pi-agent-browser-native config
+file is merged with `jq`, and the merge is loud: an empty or unparseable
+file stops the install with a message naming the file instead of being
+overwritten with `{}`, since it also holds the extension's own settings, and
+an unchanged file is left alone rather than rewritten on every boot.
 
 pi's installer deserves a paragraph, because it is the one phase that
 used to be `npm install -g` and is not any more. `~/.pi/agent/bin/pi` is a
@@ -1805,7 +2152,17 @@ update -y` both leave every version they ever downloaded behind, ~200 MB
 each. `nix/t3.nix`'s `yolobox-t3-prune`, a `systemd.user.paths` unit
 watching that directory the same way `yolobox-claude-launcher` watches
 claude's own version store, keeps the two newest and never deletes
-whichever version `~/.local/bin/t3` currently resolves to. A version in
+whichever version `~/.local/bin/t3` currently resolves to. "Resolves to" is
+a prefix match, not an equality: the script `readlink -f`s the link and
+spares any version directory that is a path prefix of the answer, because
+the binary sits some levels inside its version directory, and an equality
+against its `dirname` matched the wrong level and would delete the running
+version. Like claude's keeper it ranks first and settles second: it sorts
+*all* version directories and takes everything older than the two newest,
+and only then drops from that list the ones modified in the last ten
+minutes. Settling first, the order it had, left three versions standing
+whenever the newest was too fresh to be a candidate, because it then
+displaced nobody. A version in
 flight is never a pruning target for a structural reason, not just the
 10-minute settle window borrowed from claude's keeper: install.sh only
 ever stages a download under a hidden `.staging-XXXXXX` name and
@@ -1817,13 +2174,10 @@ dotdirs) is by construction a completed install, never a partial one.
 The forward is inert on an instance that already exists: lima copies
 `lima/yolobox.yaml` into `~/.lima/yolobox/lima.yaml` at creation and reads
 only that afterwards. Migrating means stopping and restating the whole
-array, because lima's yq cannot read the repo file:
-
-```sh
-limactl stop yolobox
-limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"hostIP":"0.0.0.0"},{"proto":"udp","guestPort":68,"guestIP":"0.0.0.0","ignore":true}]'
-./yo up
-```
+array, because lima's yq cannot read the repo file. The array is
+`LIMA_PORT_FORWARDS`, which also carries the two reverse socket rules, so
+the command to run is the one in `README.md`: a copy of it here went stale
+and, run as written, would have dropped the socket rules.
 
 ### Log noise that is not a failure
 
@@ -1847,6 +2201,24 @@ the server started with, `127.0.0.1`, useless elsewhere and with no
 override; only `t3 auth pairing create --base-url` takes one, which is why
 `yo pair` is a separate command that defaults to
 `http://<LocalHostName>.local:3773` and prints instead of opening.
+
+`yo t3` is the command that opens a URL on the Mac, and that URL is text the
+guest produced (`t3 pair` runs from the agent's `PATH`, which the agent
+controls entirely). So `parse_pairing_url` accepts it only when it is an
+`http` or `https` URL whose netloc is exactly `127.0.0.1:3773` or
+`localhost:3773` and whose path starts with `/`, and it refuses, before
+parsing, any URL containing a backslash, an `@`, whitespace or a control
+character. The last rule exists because Python's `urlparse` and a browser
+(the WHATWG parser) disagree about those characters: a URL like
+`http://127.0.0.1:3773\@evil.example/` is loopback to one and
+`evil.example` to the other, and one `urlparse` itself refuses (`http://[::1/pair`
+with an unmatched bracket, or a full-width `＃` that normalises into a
+delimiter) raises `ValueError`, which `is_loopback_t3_url` turns into a
+refusal rather than a traceback. An earlier version compared
+`urlparse(url).hostname` alone, which that string passes. The refusal reads
+`'t3 pair' printed a pairing URL yo will not open: <the URL, repr-quoted>`
+and opens nothing; the quoting also keeps a control character in the
+refused URL from reaching the terminal.
 
 Pairing runs client→server only; no server-to-server pairing exists. Two
 boxes are driven from one browser: `yo pair` on each, both URLs redeemed
@@ -1951,6 +2323,25 @@ loopback port, so the request never needs a firewall rule to cross
 `interfaceName = "userspace-networking"`) tailscaled owns that traffic
 directly.
 
+"Closed" needed two more things to be true, because two ssh servers would
+otherwise answer on the tailnet. `services.openssh.openFirewall` opens port
+22 on every interface, `tailscale0` included, so any tailnet peer could reach
+the box's sshd; and tailscaled has an ssh server of its own, which `tailscale
+up --ssh` would start, authorising by tailnet ACL instead of by this repo's
+keys. `extraSetFlags` therefore carries `--ssh=false`, and
+`networking.firewall.extraCommands` inserts `ip46tables -I nixos-fw 1 -i
+tailscale0 -p tcp --dport 22 -j DROP` at the top of `nixos-fw`, ahead of the
+accept the port list adds. The chain is flushed on every firewall start, so
+nothing has to remove the rule on stop. It is an iptables rule on purpose and
+an assertion guards that: on the nftables backend `extraCommands` is not
+applied and the rule would be a silent no-op, and the replacement,
+`extraInputRules`, lands *after* the generated accepts, where a drop for
+port 22 never matches. A switch to `networking.nftables.enable` therefore
+fails evaluation, naming the file, instead of quietly reopening sshd to the
+tailnet. Recognise a regression from a tailnet peer: `ssh <box>.ts.net`
+must time out, not offer a key; the tailnet ACLs for the node are not
+reviewed (see `TODO.md`).
+
 `--accept-dns=false` in `extraSetFlags` stops MagicDNS from taking over
 `/etc/resolv.conf`. Left at tailscale's default, the guest's DNS would
 answer through the tailnet's resolver for every name, not only
@@ -1975,6 +2366,14 @@ no auth key anywhere in this repo: `yo ssh sudo tailscale up`. It takes
 no `--hostname`: `extraSetFlags` pins the tailnet name to
 `networking.hostName`, so every box joins as `yolobox`, and a hand-typed
 `--hostname` is overwritten by the next `tailscaled-set` run anyway.
+`--netfilter-mode=off`, `--accept-dns=false` and `--hostname` are all
+non-default, so a bare `tailscale up` on an already logged-in node may refuse
+with "changing settings via 'tailscale up' requires mentioning all non-default
+flags". Do not answer that with `tailscale up --reset`, which clears them; run
+`yo ssh sudo tailscale up` and then `yo ssh sudo systemctl restart
+tailscaled-set`, so the flags are re-applied from the unit. Netfilter mode off
+also drops tailscaled's own anti-spoofing rule for 100.64/10, which the
+`ts-input` chain used to carry.
 State from that login — the node key, the tailnet
 identity — persists under `/var/lib/tailscale`, ordinary VM-local state
 like everything else under "Two accounts" above: it does not survive
@@ -2122,11 +2521,27 @@ nothing is ever switched under a process that is still running.
 and `[default]` section that carries `sso_session` or `sso_start_url`
 (`[sso-session …]` sections themselves are excluded — they describe a
 session, not an account to assume). A profile name is checked against
-`AWS_PROFILE_NAME_RE` (`^[A-Za-z0-9._-]+$`) first, and one that fails —
-anything with a space, a shell metacharacter, or other punctuation `yo`
-will not pass down to `credential_process P` unescaped — is excluded with
-a stderr line naming it, before the region is even looked at. A profile
-with no `region` is left out the same way, with a stderr line naming it,
+`AWS_PROFILE_NAME_RE` (`^[A-Za-z0-9][A-Za-z0-9._-]*$`, with `fullmatch`)
+first, and one that fails — anything with a space, a shell metacharacter,
+other punctuation `yo` will not pass down to `credential_process P`
+unescaped, or a leading `-`, `.` or `_`, which would read as an option or a
+hidden path — is excluded with a stderr line naming it, before the region
+is even looked at. The pattern has three spellings and they are the same
+text on purpose: `yo`'s `AWS_PROFILE_NAME_RE`, `aws-broker`'s
+`PROFILE_NAME_PATTERN` (which the broker re-checks on every `--allow`
+argument in `parse_args`, so a broker started by anything but `yo` still
+refuses a name that could be an option), and the regex in
+`yolobox-guest aws-creds`, which exits 2 with `invalid profile name` before
+building the URL path the name goes into. `tests/test_aws_broker.py` reads
+the two Python literals out of the source and fails when they differ, and
+the guest's is checked against them by `tests/test_consistency.py`;
+`fullmatch` rather than `match` is load-bearing in Python, because `$`
+before a trailing newline still matches there. A
+profile's region must match `^[a-z]{2,4}(-[a-z]+)+-\d+$` (ASCII only; the four-letter
+prefix is the AWS European Sovereign Cloud's `eusc-de-east-1`) or the
+profile is excluded the same way: the region lands in the rendered guest
+config, and a value with a newline in it would add lines to that file. A
+profile with no `region` is left out too, with a stderr line naming it,
 rather than reopening the DNS sinkhole below; a malformed config file
 (bad ini syntax, undecodable bytes) raises instead of allow-listing
 whatever partial read it got; no `aws` CLI or no SSO profiles at all means
@@ -2212,10 +2627,13 @@ than serving a broker whose profile set is now wrong. A stale broker is
 SIGTERM'd and waited out with the same kqueue mechanism before the fresh
 one starts; its stderr is truncated and reopened at
 `state_dir()/aws-broker/broker.log` on every start (never appended to a
-growing file), and its stdout carries exactly one handshake line, now
+growing file; the state directory is `0700` and the log `0600`, since the
+log is where every detail the guest is not told ends up and the Mac's other
+users have no business reading it), and its stdout carries exactly one handshake line, now
 just `READY`, before it `os.dup2`s `/dev/null` onto itself — never write a
 secret to stdout after that line, or to any log. Every line that reaches broker.log goes through
-`sanitize()`, which replaces C0/C1 control bytes with `?`, because request paths are guest-chosen
+`sanitize()`, which replaces every C0/C1 control byte with `?` except tab and newline, which
+are kept, because request paths are guest-chosen
 and would otherwise plant terminal escape sequences in the log `yo` tells the user to read. The bind itself refuses
 to steal a live socket: `reclaim_socket_path()` probes a connect before
 unlinking anything and fails outright, naming the collision, if something
@@ -2224,13 +2642,33 @@ is genuinely still being served there; at shutdown (both the normal
 `unlink_if_same_identity()` removes the socket file only when its
 `(st_dev, st_ino)` still match the pair this same broker recorded at
 bind time, so a superseded broker exiting late can never delete a newer
-broker's socket out from under it.
+broker's socket out from under it. Both the recording and the comparison use
+`lstat`, never `stat`: a path that has since been replaced by a symlink to
+the old socket would otherwise report the target's identity and be deleted
+as ours.
 
 Minting stays lazy and per-profile, each with its own lock, cache,
 throttle and last error, so one profile's expired SSO session never
 blocks another's `/creds/<P>` request; the long-lived-key refusal (an IAM
 user's keys, which never expire and must never enter the guest this way)
-stays a request-time 500 naming the fix. `aws sso login --profile P` on
+stays a request-time 500. Every failure on the request path answers the
+same way: a clean 500 whose body is `mint failed: run `aws sso login
+--profile P` on the Mac; the detail is in broker.log`, and nothing else.
+The detail (`aws`'s stderr, Mac paths, account ids, the traceback of a bug)
+goes to `broker.log` and never to the guest, because the guest is the
+untrusted side and the response is the one channel it reads. That includes
+an exception raised inside the handler, which used to drop the connection and
+reach `credential_process` as an unexplained empty reply. The mint also
+validates what `aws configure export-credentials` returned before trusting
+it: the output must be a JSON object, the four fields non-empty strings (a
+message names the field, never its value), and `Expiration` must parse. Its
+parser takes the shapes different botocore versions print: a `Z` or an
+offset with or without a colon, fractional seconds of any width, or no zone
+(read as UTC). The broker is bounded, too: at most 32 requests are served at
+once and the next is answered `503` immediately instead of queueing a thread
+behind a mint that can take 30 s, and every connection has a 10 s socket
+timeout so a client that connects and says nothing frees its slot.
+`aws sso login --profile P` on
 the Mac heals a running guest session with no re-enter, exactly as under
 v1 and v2 — the next `/creds/<P>` hit just re-mints successfully.
 
@@ -2260,10 +2698,14 @@ lima side drifting at runtime, on every `vm_up()` — as a stderr note now,
 never a refusal, since `heal_reverse_forward()` adds the forward live
 regardless — rather than only at test time.
 
-**`aws-creds`, in `nix/guest/yolobox-guest.sh`:** `curl -sS
+**`aws-creds`, in `nix/guest/yolobox-guest.sh`:** `curl -sS -g
 --fail-with-body --unix-socket "${YOLOBOX_AWS_BROKER_SOCK}"
-"http://broker/creds/${profile}"`, printing the body and curl's own error
-to stderr on failure. Three of curl's own exit codes, not one, are
+"http://broker/creds/${profile}"`, after the name check above. `-g` turns off
+curl's own `[]` and `{}` globbing of the URL, so a name cannot expand into
+several requests. curl's stdout and stderr are captured apart: the success
+body is process-credential JSON that the AWS SDK reads from this command's
+stdout, so a curl warning must never join it, and on failure both curl's own
+error and the body go to stderr. Three of curl's own exit codes, not one, are
 treated as "the broker is unreachable" and given the `yo up`-on-the-Mac
 remedy rather than curl's generic message: 7 (connection refused, meaning
 the proxy *socket unit itself* is absent — an old box) and also 52 and 56
