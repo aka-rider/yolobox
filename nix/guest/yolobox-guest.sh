@@ -232,7 +232,10 @@ cmd_gc_machine() {
 
     GC_FAILED=0
     MEASURE_AS=sudo
-    local machine_paths=(/var/log/journal /nix/store /root/.cache/nix)
+    # Nix's download caches: root's, and the operator's own, which every
+    # `nixos-rebuild --flake` run as the operator fills (mostly gitv3).
+    local nix_caches=(/root/.cache/nix "${HOME}/.cache/nix")
+    local machine_paths=(/var/log/journal /nix/store "${nix_caches[@]}" /var/lib/systemd/coredump)
 
     if [ "${apply}" != 1 ]; then
         printf 'yo gc: report only, nothing is deleted. Add --yes to act.\n\n'
@@ -279,11 +282,18 @@ cmd_gc_machine() {
             "until both agree, then ./yo gc --yes again."
     fi
 
-    # Outside that guard on purpose: this is nix's download cache, tied to no
-    # generation, so it is safe to drop even when the profile is in the
-    # broken state above — and that is exactly when the space is most
-    # needed.
-    step 'rm -rf /root/.cache/nix' sudo rm -rf /root/.cache/nix
+    # Outside that guard on purpose: these are nix's download caches and the
+    # coredump store, tied to no generation, so they are safe to drop even
+    # when the profile is in the broken state above — and that is exactly
+    # when the space is most needed.
+    local c
+    for c in "${nix_caches[@]}"; do
+        step "rm -rf ${c}" sudo rm -rf "${c}"
+    done
+    # Crash dumps are diagnostics nobody reads after the fact; `coredumpctl`
+    # lists them before --yes if you need one. Contents only: systemd owns
+    # the directory.
+    step 'empty /var/lib/systemd/coredump' sudo find /var/lib/systemd/coredump -mindepth 1 -delete
 
     [ "${GC_FAILED}" = 0 ] || exit 1
 }

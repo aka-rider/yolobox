@@ -91,6 +91,11 @@ in
 
   swapDevices = [{ device = "/var/swapfile"; size = 16384; }];
 
+  # A crash-looping language server (marksman, 2026-10-05..18, missing ICU) filled
+  # /var/lib/systemd/coredump with 2.1G of dumps nobody read; systemd's
+  # default cap is 10% of the filesystem, ~40G here. `yo gc --yes` empties it.
+  systemd.coredump.settings.Coredump.MaxUse = "1G";
+
   services.lima.enable = true;
   # nixos-lima declares lima-init and lima-guestagent as ordinary NixOS
   # units, so a nixpkgs bump alone rehashes the store paths their

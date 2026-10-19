@@ -1985,16 +1985,18 @@ def build_parser() -> argparse.ArgumentParser:
         "gc",
         "Report and reclaim the VM's disk usage.",
         "Report what is using the VM's disk. --yes reclaims the machine's own\n"
-        "caches: journald, nix garbage plus a store optimise, npm, podman, the\n"
-        "tool caches under ~/.cache (go-build, gopls, goimports, golangci-lint,\n"
-        "staticcheck, uv, pip, pip-tools, pnpm, zig, cargo-zigbuild, opengrep,\n"
-        "nix), cargo's registry and git checkouts, and every Go module and\n"
-        "build cache under the guest home. Each of those is rebuilt or\n"
-        "refetched on demand, so the next build is slower and needs network.\n"
-        "Model weights and other app data are never touched. /tmp scratchpads\n"
-        "are reported only. --deep adds per-project build output (target,\n"
-        "node_modules, .next) under the guest home, each deleted only if git\n"
-        "ignores it. Run this from the Mac; in-VM tools die first.",
+        "caches: journald, systemd coredumps, nix garbage plus a store\n"
+        "optimise, root's and the operator's nix download caches, npm, podman,\n"
+        "the tool caches under ~/.cache (go-build, gopls, goimports,\n"
+        "golangci-lint, staticcheck, uv, pip, pip-tools, pnpm, zig,\n"
+        "cargo-zigbuild, opengrep, nix), cargo's registry and git checkouts,\n"
+        "and every Go module and build cache under the guest home. Each of\n"
+        "those is rebuilt or refetched on demand, so the next build is slower\n"
+        "and needs network. Model weights and other app data are never\n"
+        "touched. /tmp scratchpads are reported only. --deep adds per-project\n"
+        "build output (target, node_modules, .next) under the guest home, each\n"
+        "deleted only if git ignores it. Run this from the Mac; in-VM tools die\n"
+        "first.",
     )
     gc.add_argument(
         "--deep", action="store_true", help="also reclaim per-project build output"
