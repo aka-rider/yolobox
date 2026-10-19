@@ -1,3 +1,5 @@
+import io
+import tarfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,7 +24,63 @@ class TestAgentPaths(unittest.TestCase):
         self.assertEqual(result, ["a/b\nwith-newline", "c/d"])
 
 
+class TestAgentPathsWalkFailures(unittest.TestCase):
+    def test_an_unreachable_vm_is_an_error_not_a_find_failure(self):
+        proc = mock.Mock(returncode=255, stdout=b"", stderr="ssh: connect refused\n")
+        with mock.patch.object(yo, "ssh_run", return_value=proc):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.agent_paths("projects", check=False)
+        self.assertIn("cannot reach the VM", caught.exception.message)
+        self.assertNotIn("find exit", caught.exception.message)
+
+    def test_the_helpers_stderr_is_shown_with_a_partial_listing(self):
+        proc = mock.Mock(
+            returncode=1,
+            stdout=b"/a\0",
+            stderr="find: '/x': Permission denied\n",
+        )
+        with mock.patch.object(yo, "ssh_run", return_value=proc):
+            with mock.patch.object(yo, "err") as fake_err:
+                result = yo.agent_paths("projects", check=False)
+        self.assertEqual(result, ["/a"])
+        shown = [call.args[0] for call in fake_err.call_args_list]
+        self.assertIn("find: '/x': Permission denied", shown)
+
+
 class TestPickProject(FakeHome):
+    def pick_with_fzf_exit(self, code):
+        projects = [yo.AGENT_HOME + "/a/normal"]
+        with (
+            mock.patch.object(yo, "require_tool"),
+            mock.patch.object(yo, "agent_paths", return_value=projects),
+            mock.patch.object(yo, "err") as fake_err,
+            mock.patch.object(
+                yo.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=code, stdout=b""),
+            ),
+        ):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.pick_project("q")
+        return caught.exception, fake_err
+
+    def test_fzf_exit_1_is_no_match(self):
+        failure, fake_err = self.pick_with_fzf_exit(1)
+        self.assertEqual(failure.code, 1)
+        self.assertIsNone(failure.message)
+        self.assertIn("no project matches", fake_err.call_args.args[0])
+
+    def test_fzf_exit_130_is_a_silent_cancel(self):
+        failure, fake_err = self.pick_with_fzf_exit(130)
+        self.assertEqual(failure.code, 130)
+        fake_err.assert_not_called()
+
+    def test_any_other_fzf_failure_is_reported_as_such(self):
+        for code in (2, 126, 127):
+            with self.subTest(code=code):
+                failure, _ = self.pick_with_fzf_exit(code)
+                self.assertEqual(failure.message, "fzf failed (exit %d)" % code)
+
     def test_agent_paths_is_reached_with_the_projects_subcommand(self):
         proc = mock.Mock(
             returncode=0, stdout=(yo.AGENT_HOME + "/a/normal\0").encode(), stderr=""
@@ -93,31 +151,106 @@ class TestPickProject(FakeHome):
         self.assertEqual(result, expected)
 
 
-class TestSeedGitconfig(FakeHome):
-    def test_a_root_named_with_an_embedded_newline_is_one_entry(self):
-        weird_root = "group\nname"
-        identity_dir = Path(self.home) / weird_root / "sub"
-        identity_dir.mkdir(parents=True)
-        (identity_dir / ".gitconfig").write_text("[user]\n")
+class SeedHarness(FakeHome):
+    def seeded(self, func, *args):
+        """Run a seed function, return {tar member name: (type, content)}."""
+        pushed = []
+        with mock.patch.object(
+            yo, "seed_push", side_effect=lambda script, payload: pushed.append(payload)
+        ):
+            func(*args)
+        members = {}
+        for payload in pushed:
+            with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
+                for member in archive.getmembers():
+                    content = None
+                    if member.isfile():
+                        content = archive.extractfile(member).read()
+                    members[member.name] = (member.type, content)
+        return members
 
-        with mock.patch.object(yo, "agent_paths", return_value=[weird_root]):
-            with mock.patch.object(yo, "ssh_run") as fake_ssh_run:
-                with mock.patch.object(
-                    yo, "tar_stream", return_value=b""
-                ) as fake_tar_stream:
-                    yo.seed_gitconfig()
 
-        fake_tar_stream.assert_called_once()
-        members = fake_tar_stream.call_args[0][0]
-        self.assertEqual(len(members), 1)
-        self.assertIn(weird_root, members[0][1])
-        fake_ssh_run.assert_called_once()
+class TestSeedGitconfig(SeedHarness):
+    def identity(self, root, group, text="[user]\n"):
+        directory = Path(self.home) / root / group
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / ".gitconfig").write_text(text)
 
-    def test_rejects_roots_with_a_slash_or_dot_names(self):
-        with mock.patch.object(yo, "agent_paths", return_value=["a/b", ".", "..", ""]):
-            with mock.patch.object(yo, "ssh_run") as fake_ssh_run:
-                yo.seed_gitconfig()
-        fake_ssh_run.assert_not_called()
+    def seed_roots(self, roots):
+        with mock.patch.object(yo, "agent_paths", return_value=roots):
+            return self.seeded(yo.seed_gitconfig)
+
+    def test_a_plain_root_is_seeded_with_its_home_relative_path(self):
+        self.identity("Developer", "work")
+        self.assertEqual(
+            self.seed_roots(["Developer"]),
+            {"Developer/work/.gitconfig": (tarfile.REGTYPE, b"[user]\n")},
+        )
+
+    def test_roots_with_odd_names_are_refused(self):
+        for root in ["group\nname", ".ssh", "-rf", "a\n", "x;y"]:
+            self.identity(root, "sub")
+        for root in ["group\nname", "a/b", ".", "..", ".ssh", "-rf", "a\n", "x;y"]:
+            with self.subTest(root=root):
+                self.assertEqual(self.seed_roots([root]), {})
+
+    def test_an_empty_root_is_ignored(self):
+        self.assertEqual(self.seed_roots([""]), {})
+
+    def test_a_symlinked_gitconfig_arrives_as_a_regular_file(self):
+        self.identity("Developer", "work")
+        dotfiles = Path(self.home) / "dotfiles"
+        dotfiles.mkdir()
+        (dotfiles / "work.gitconfig").write_text("[user]\nname = w\n")
+        link = Path(self.home) / "Developer" / "work" / ".gitconfig"
+        link.unlink()
+        link.symlink_to(dotfiles / "work.gitconfig")
+        self.assertEqual(
+            self.seed_roots(["Developer"]),
+            {"Developer/work/.gitconfig": (tarfile.REGTYPE, b"[user]\nname = w\n")},
+        )
+
+    def test_a_gitconfig_linking_outside_home_is_not_seeded(self):
+        self.identity("Developer", "work")
+        link = Path(self.home) / "Developer" / "work" / ".gitconfig"
+        link.unlink()
+        link.symlink_to("/etc/hosts")
+        self.assertEqual(self.seed_roots(["Developer"]), {})
+
+
+class TestSeedSsh(SeedHarness):
+    def setUp(self):
+        super().setUp()
+        self.ssh = Path(self.home) / ".ssh"
+        self.ssh.mkdir()
+
+    def test_pubkeys_are_seeded_as_regular_files_even_when_linked(self):
+        (self.ssh / "plain.pub").write_text("ssh-ed25519 AAA plain\n")
+        (Path(self.home) / "real.pub").write_text("ssh-ed25519 BBB linked\n")
+        (self.ssh / "linked.pub").symlink_to(Path(self.home) / "real.pub")
+        self.assertEqual(
+            self.seeded(yo.seed_ssh, yo.Report()),
+            {
+                "linked.pub": (tarfile.REGTYPE, b"ssh-ed25519 BBB linked\n"),
+                "plain.pub": (tarfile.REGTYPE, b"ssh-ed25519 AAA plain\n"),
+            },
+        )
+
+    def test_a_pubkey_linking_outside_home_is_not_seeded(self):
+        (self.ssh / "evil.pub").symlink_to("/etc/hosts")
+        self.assertEqual(self.seeded(yo.seed_ssh, yo.Report()), {})
+
+    def test_include_and_identityagent_lines_are_stripped_with_either_separator(self):
+        (self.ssh / "config").write_text(
+            "Include ~/x\nInclude=~/y\n  IdentityAgent=/s\nidentityagent /s\n"
+            "IncludeNot yes\nHost a\n"
+        )
+        sent = []
+        with mock.patch.object(
+            yo, "seed_push", side_effect=lambda script, payload: sent.append(payload)
+        ):
+            yo.seed_ssh(yo.Report())
+        self.assertEqual(sent, [b"IncludeNot yes\nHost a\n"])
 
 
 class TestVersionDrift(unittest.TestCase):

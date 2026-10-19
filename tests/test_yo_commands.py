@@ -2,6 +2,7 @@ import contextlib
 import io
 import os
 import re
+import shlex
 import subprocess
 import unittest
 from pathlib import Path
@@ -32,6 +33,13 @@ class TestFlakeRef(unittest.TestCase):
     def test_released_version_pins_the_tagged_ref(self):
         with env_without("YOLOBOX_FLAKE"), mock.patch.object(yo, "YO_VERSION", "1.2.3"):
             self.assertEqual(yo.flake_ref(), "github:aka-rider/yolobox/v1.2.3")
+
+    def test_the_hint_quotes_a_ref_with_shell_metacharacters(self):
+        ref = "github:x/y'; touch pwned #"
+        with mock.patch.dict(os.environ, {"YOLOBOX_FLAKE": ref}):
+            hint = yo.rebuild_hint()
+        flake_arg = hint.split("--flake ", 1)[1]
+        self.assertEqual(shlex.split(flake_arg), [ref + "#yolobox"])
 
     def test_dev_build_falls_back_to_a_hint_naming_the_override(self):
         with env_without("YOLOBOX_FLAKE"), mock.patch.object(yo, "YO_VERSION", "dev"):
@@ -73,6 +81,14 @@ class TestMainPreflight(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 yo.main([])
         self.assertEqual(caught.exception.code, 2)
+
+    def test_an_abbreviated_flag_is_a_usage_error(self):
+        for argv in (["gc", "--y"], ["gc", "--de"], ["--vers"]):
+            with self.subTest(argv=argv):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        yo.main(argv)
+                self.assertEqual(caught.exception.code, 2)
 
     def test_unknown_command_is_a_usage_error(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -388,6 +404,16 @@ class TestDirForCwdLandsOnDeepestExistingAncestor(FakeHome):
             yo.AGENT, [yo.HELPER, "landing-dir", yo.AGENT_HOME + "/a/b"]
         )
 
+    def test_a_landing_dir_outside_the_guest_home_is_refused_unprinted(self):
+        reported = "/etc/\x1b]0;pwned\x07"
+        proc = mock.Mock(returncode=0, stdout=reported + "\n", stderr="")
+        with mock.patch.object(yo, "logical_cwd", return_value=self.home + "/a"):
+            with mock.patch.object(yo, "ssh_run", return_value=proc):
+                with mock.patch.object(yo, "err") as fake_err:
+                    with self.assertRaises(yo.YoError):
+                        yo.dir_for_cwd()
+        fake_err.assert_not_called()
+
     def test_outside_home_lands_on_the_agent_home(self):
         with mock.patch.object(yo, "logical_cwd", return_value="/etc"):
             with mock.patch.object(yo, "ssh_run") as fake_ssh_run:
@@ -396,6 +422,64 @@ class TestDirForCwdLandsOnDeepestExistingAncestor(FakeHome):
         fake_ssh_run.assert_not_called()
         self.assertEqual(result, yo.AGENT_HOME)
         fake_err.assert_called_once_with(yo.MISSING_PATH_NOTE % ("/etc", yo.AGENT_HOME))
+
+
+class TestTerminalSanitising(unittest.TestCase):
+    def printed(self, func, text):
+        stream = io.StringIO()
+        target = "sys.stdout" if func is yo.out else "sys.stderr"
+        with mock.patch(target, stream):
+            func(text)
+        return stream.getvalue()
+
+    def test_escape_and_c1_controls_are_replaced_on_both_streams(self):
+        for func in (yo.out, yo.err):
+            with self.subTest(func=func.__name__):
+                self.assertEqual(
+                    self.printed(func, "a\x1b]0;x\x07b\x9bc\x7fd\x00e\rf"),
+                    "a?]0;x?b?c?d?e?f\n",
+                )
+
+    def test_tab_newline_and_printable_unicode_survive(self):
+        for func in (yo.out, yo.err):
+            with self.subTest(func=func.__name__):
+                self.assertEqual(
+                    self.printed(func, "a\tb\nc \u00a0é—"), "a\tb\nc \u00a0é—\n"
+                )
+
+
+class TestEditorUris(unittest.TestCase):
+    def launched(self, command, tool):
+        argv = []
+        with (
+            mock.patch.object(yo.shutil, "which", return_value=tool),
+            mock.patch.object(yo.os, "access", return_value=True),
+            mock.patch.object(yo, "ensure_ssh_config_include"),
+            mock.patch.object(yo, "require_agent_account"),
+            mock.patch.object(
+                yo, "target_dir", return_value=yo.AGENT_HOME + "/a b/c#d?e%f"
+            ),
+            mock.patch.object(yo, "exec_process", side_effect=argv.extend),
+        ):
+            args = yo.build_parser().parse_args([command])
+            args.func(args)
+        return argv[-1]
+
+    def test_zed_uri_percent_encodes_the_project_path(self):
+        self.assertEqual(
+            self.launched("zed", "/bin/zed"),
+            "ssh://agent@lima-yolobox/home/agent/a%20b/c%23d%3Fe%25f",
+        )
+
+    def test_code_uri_percent_encodes_the_project_path(self):
+        self.assertEqual(
+            self.launched("code", "/bin/code"),
+            "vscode-remote://ssh-remote+agent@lima-yolobox/home/agent/a%20b/c%23d%3Fe%25f",
+        )
+
+    def test_an_ordinary_path_is_unchanged(self):
+        path = "/home/agent/wrk/rune"
+        self.assertEqual(yo.editor_uri_path(path), path)
 
 
 class TestGuestHelperSkew(unittest.TestCase):
