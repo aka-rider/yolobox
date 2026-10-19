@@ -12,8 +12,8 @@ Posted 2026-10-02, awaiting review. The reasoning behind it is in CLAUDE.md, "An
   - 2026-10-01: the same again, the child spinning at ~99% and still alive after the guest rebooted from inside.
 
   The gentler recovery when `limactl stop` hangs is `sudo systemctl reboot` inside the guest (`yo ssh sudo systemctl reboot`); the child still needs `kill -9`. Not written up until a narrower repro exists.
+- t3code: the crash loop after `t3 update` across a service-launcher protocol bump (2026-10-01, stale `.service-stopping` marker) is pingdotgg/t3code#12627, open; its fix PR #12629 was closed unmerged on 2026-10-12. Nothing to file; `yo status` names the recovery.
 
 # Known problems
 
 - `ruff format --check` fails on 5 files on `main` (`yo`, `aws-broker`, `tests/test_yo.py`, `tests/test_yo_commands.py`, `tests/test_yo_paths.py`), and has done so since before 2026-10-14. CI runs only `ruff check`, so nothing catches the drift. Fix: run `ruff format` once, confirm `YO_VERSION = "dev"` keeps its exact text (both `nix/pkgs/yolobox.nix`'s `--replace-fail` and the brew formula's `inreplace` match it literally, see CLAUDE.md), then add `ruff format --check` to `verify.yml`.
-- `t3 update -y` (0.0.42 -> 0.0.44, 2026-10-01) reported "Background service restarted" and `active`, then t3code.service crash-looped on `[service-launcher] Service state is invalid or unsupported.` until systemd's start limit hit, leaving it failed and t3 down for about 80 minutes. A stale `~/.t3/runtime/.service-stopping` marker survived the update; `t3 service restart` did not clear it, `systemctl --user reset-failed t3code.service && t3 service install` did. It is a vendor bug, and `yo status` now shows it in its `t3:` line, so it is visible from the Mac, but only the recovery above fixes it.
