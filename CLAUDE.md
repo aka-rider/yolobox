@@ -861,12 +861,15 @@ every box has, however far its agent setup got.
 build-output directory names are spelled, inside the guest script; the one
 other spelling, the prose of `yo gc`'s `--help` in `build_parser()`, is
 guarded by `TestGcHelpNamesEverythingItDeletes`, which fails when the help
-stops naming a directory in the array. The
-project walk prunes them, because a repo living inside `node_modules` is
-not a project a person would pick; `gc --deep` matches them, because there
-they are the thing being deleted. One list serves both on purpose — before
-the move there were two, `PROJECT_FIND` and `GC_USER`'s `project_targets`,
-and neither knew the other existed.
+stops naming a directory in the array. The project walk prunes them, because
+a repo living inside `node_modules` is not a project a person would pick.
+`BUILD_DIRS` only prunes: since 2026-10-20 it no longer decides what `gc
+--deep` deletes. A name match is no evidence that a directory is build
+output, so the project that owns the directory decides, through the clean
+command it defines (see "A full disk" below). Before the move there were two
+lists, `PROJECT_FIND` and `GC_USER`'s `project_targets`, and neither knew
+the other existed. Now the walk and the Go-cache walk share this one prune
+list, and the names the tier deletes live in arrays of their own.
 
 Several guards in the script exist because its inputs come from `yo`
 or from the filesystem the agent writes. `landing-dir` exits 2 with
@@ -895,8 +898,16 @@ the single spelling of the cache names `gc --yes` deletes under `~/.cache`
 (see "A full disk" below for what belongs in it and what never does), and
 the same test parses it and fails when `yo gc --help` stops naming an entry.
 Cargo's `registry` and `git`, and the Go caches, are not in that array:
-cargo's two directories are fixed paths spelled once in `cache_targets`,
-and the Go caches have no fixed path at all.
+cargo's two directories are fixed paths spelled once in `cache_targets`, and
+the Go caches have no fixed path at all. The `--deep` project tier has two
+arrays of its own in the script, one for the directory names it removes
+outright and one for the names it removes only beside a manifest, and it
+runs three clean commands (`make clean`, `cargo clean`, `go clean`), each
+through one `in_project_env "${root}" <tool> clean` call.
+`TestGcHelpNamesEverythingItDeletes` checks the help against both arrays and
+against the clean commands it reads out of those call lines, so a directory
+the tier can delete, or a clean it can run, is always named in `yo gc
+--help`.
 
 The Mac side never guesses what a box supports; it reads the exit code.
 A subcommand `yo` was built to call after `yolobox-guest` shipped it exits
@@ -1341,29 +1352,124 @@ is why both run outside the booted-equals-profile guard.
 
 `yo gc` reports, and `--yes` now runs two ordered ssh sessions, one per
 account, not one session doing everything. The machine tier runs as the
-**operator** — journald, `nix-collect-garbage`, `nix-store --optimise`, root's
-nix cache, systemd coredumps, the operator's own nix cache — and it
+**operator** — journald, `nix-collect-garbage`, `nix-store --optimise`,
+root's nix cache, systemd coredumps, the operator's own nix cache — and it
 runs first on purpose: ext4's root reserve is what makes the rest of the
-cleanup possible at all on a genuinely full disk. The user tier then runs
-as the **agent** — npm cache, rootless podman, the cache tier below, and under `--deep --yes`
-the project tier: `target`, `node_modules` and `.next` deleted anywhere
-under the agent's home, hidden directories pruned. The split is not
-cosmetic: npm's cache, podman's storage and every project checkout live
-under the agent's home now, not the operator's, so a `yo gc` that only ran
-as the operator would measure and clean an empty home and still report
-success — a silent no-op that never touches the account actually holding
-the state. `.venv` and `.devbox/virtenv` are excluded — `nix/lsp.nix`
-points basedpyright at `.venv`, and `virtenv` is devbox's toolchain, not
-build output.
+cleanup possible at all on a genuinely full disk. The user tier then runs as
+the **agent** — npm cache, rootless podman, the cache tier below, and under
+`--deep --yes` the project tier, described in the 2026-10-20 paragraphs
+below. The split is not cosmetic: npm's cache, podman's storage and every
+project checkout live under the agent's home now, not the operator's, so a
+`yo gc` that only ran as the operator would measure and clean an empty home
+and still report success — a silent no-op that never touches the account
+actually holding the state. `.devbox/virtenv` is not touched, because hidden
+directories other than the names the tier removes are pruned, and `virtenv`
+is devbox's toolchain, not build output.
 
 Two traps. Deleting a build directory the project's `.gitignore` does not
 match dirties the checkout, and every later `git push yolobox` is refused
 with no obvious link back; `iurii.net` anchors `/node_modules`, so a nested
-`web/node_modules` is tracked. Hence `--deep` asks `git check-ignore` per
-directory. And `nix-collect-garbage -d` deletes the running generation
-when a switch half-failed (see the ESP section); `yo gc` compares the two
-readlinks and reports a skip, which means the box needs a repaired switch
-before it needs a garbage collection.
+`web/node_modules` is tracked. Hence the project tier runs `git
+check-ignore` on each directory before removing it, or before cargo removes
+a `target`, and refuses a tracked one. And `nix-collect-garbage -d` deletes
+the running generation when a switch half-failed (see the ESP section); `yo
+gc` compares the two readlinks and reports a skip, which means the box needs
+a repaired switch before it needs a garbage collection.
+
+The project tier changed on 2026-10-20, from matching names to asking each
+project. The old rule deleted every `target`, `node_modules` and `.next`
+under the agent's home that `.gitignore` ignored. The objection was that a
+directory called `target` can hold a project's code or data, and a name is
+no evidence that something is build output: the build tool should decide
+what it owns. The live box showed the other half of the problem.
+`~/Developer/lopata` (devbox.json and a Makefile) held `out` at 89G and
+`.venv` at 1.6G, which no name-based tier touches.
+`~/Developer/rune-wt-search/target` (52G) and
+`~/Developer/rune-wt-undo/target` (60G) were cargo's, because each carries
+cargo's `CACHEDIR.TAG`, and each sits beside `Cargo.toml`, `devbox.json` and
+a Makefile. `~/Developer/shukach` (go.mod, a Makefile, an `.envrc`) held
+`dist` at 13G. The old tier would have reclaimed about 112G of the roughly
+250G of build output and missed the rest.
+
+The tier now starts from every git repo under the home, the same walk
+`projects` uses, and treats each one as a project root. A root with a
+`Makefile`, `GNUmakefile` or `makefile` whose `make -n clean` succeeds gets
+`make clean`. A root with a `go.mod` gets `go clean`. A `target` directory
+beside a `Cargo.toml` gets `cargo clean`, run in that directory. Only
+`node_modules` and `.venv` are removed outright, plus a `.next` that has a
+`package.json` beside it. A `target` with no `Cargo.toml` beside it, or a
+`.next` with no `package.json`, is kept, and the output says so with `kept
+<path>: no Cargo.toml beside it, so it is not cargo's build output`; that
+line is information, not a failure. Every directory the tier removes, or
+leaves for cargo to remove, still passes the `git check-ignore` guard first,
+and a tracked one fails with `kept <path>: git does not ignore it` and exit
+1. `make clean` and `go clean` are not guarded, because they are the
+project's own definition of clean. `cargo clean` itself removes the whole
+`target` directory, the same as `rm -rf` would; the protection is the
+detection, a `Cargo.toml` beside the directory, not the tool. The guard runs
+when a directory's turn comes, after the cleans before it, and a Makefile
+whose `clean` does `rm -rf target` (common) has already removed the
+directory by then. `git check-ignore` on a path that no longer exists exits
+1 for a directory-only pattern like `target/`, which used to read as
+`kept ...: git does not ignore it` for a directory that was already gone; now
+a directory missing at apply time prints `ok:   already gone: <path>` and
+gets neither the guard nor the action.
+
+`cargo`, `go` and `make` are not on the box-wide PATH, because the box has
+no toolchain of its own; each project's devbox supplies one. So each command
+runs in the project's own environment: `devbox run -q -- <cmd>` when the root
+has a `devbox.json` (`-q` drops devbox's `Info:` lines; its `Error:` lines
+and the command's own stderr still show), else `direnv exec <root> <cmd>` when it has an
+`.envrc`, else the command directly. `devbox run` takes about half a second
+per project when its packages are installed, and needs network when they are
+not. Stdin is `/dev/null` for all three forms, because the plan is built
+inside `while read` loops over a NUL-separated file and a tool that reads
+stdin would otherwise eat the roots after its own. A tool that does not
+resolve in that environment is a `FAIL` line naming the tool and the root,
+and only that tool's action in that root is skipped: a missing `cargo` keeps
+the `target`, while the same root's `make clean`, `go clean` and
+`node_modules` removal still run. The remedy is adding the tool to the
+project's `devbox.json` or `.envrc`, or cleaning by hand. Report mode, `yo gc --deep` without `--yes`, measures each
+cargo target, `node_modules`, `.venv` and `.next` with the action named
+after it, prints `<root>: make clean would run:` followed by the output of
+`make -n clean`, and `<root>: go clean`, and deletes nothing. Apply runs
+`podman system prune -af`, then every `make clean`, every `cargo clean` and
+every `go clean`, and only then the outright removals, each through `step`.
+Report mode runs no clean, but it does enter each project's environment for
+the tool probes and `make -n clean`: `devbox run` can install the project's
+packages (network) and rewrite `devbox.lock`, and GNU make's `-n` still
+evaluates `$(shell ...)` and remakes included makefiles, so a report is not
+free of side effects. `go clean` without flags removes only the package's own
+build outputs in that directory, so it reclaims little and is there for
+completeness. `cargo clean` acts on whatever cargo considers the target
+directory (`CARGO_TARGET_DIR`, `build.target-dir`, a workspace root), which
+may not be the `target` the guard checked; the guard vouches for the
+directory beside the `Cargo.toml`, not for cargo's own choice. `.venv` is
+deleted now, which costs basedpyright its environment (see
+`nix/lsp.nix`) until the project's own `uv sync` or devbox recreates it, and
+that needs network.
+
+Three output shapes look like faults and are not. A `kept ...: no Cargo.toml
+beside it, so it is not cargo's build output` line for a directory that
+happens to be called `target` is correct: it is a data directory, and the
+tier has declined to guess. A `FAIL` line naming a tool and a root, saying
+the tool is not in that root's environment, means the project's
+`devbox.json` or `.envrc` lacks the tool; only that tool's action in that
+project was skipped. And `make clean` output appearing inside `yo gc` is the Makefile's
+own recipe running, not gc's own message, so whatever the project's clean
+prints is what the operator sees.
+
+The first live report of the tier on the box (2026-10-20) is the picture to
+compare against. It printed `FAIL` lines for `ukrainians.nl` and `moneta`
+(each has a Makefile and no make in its devbox) and for
+`razom/packages/mls/target` (no cargo in its environment); `kept` lines for
+three `target` directories in `metasploit-framework` and for `zrdp/go/target`,
+none of them cargo's; `make clean would run: rm -rf bin` for shukach and a
+dozen Go worktrees; and four cargo targets, `rune-wt-crlf` at 32G,
+`rune-wt-undo` at 60G, `rune-wt-search` at 53G and `zrdp` at 7.1G. It took
+1m45s because every project's devbox is entered, and it exits 1 for as long as
+any project lacks a tool it needs, so a nonzero exit from `yo gc --deep` is
+expected until those `devbox.json` files gain make and cargo.
 
 ## Debuggers: same-uid ptrace
 

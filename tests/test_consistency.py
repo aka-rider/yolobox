@@ -232,9 +232,40 @@ class TestGcHelpNamesEverythingItDeletes(unittest.TestCase):
         listed = self.parenthetical(self.gc_help(), "the tool caches under ~/.cache")
         self.assertCountEqual(listed, self.script_array("LOCAL_CACHES"))
 
-    def test_help_lists_exactly_the_build_dirs(self):
-        listed = self.parenthetical(self.gc_help(), "build output")
-        self.assertCountEqual(listed, self.script_array("BUILD_DIRS"))
+    def test_help_names_every_directory_gc_deep_removes_or_cleans(self):
+        help_text = self.gc_help()
+        names = self.script_array("REMOVED_OUTRIGHT") + [
+            entry.split(":")[0] for entry in self.script_array("NEEDS_MANIFEST")
+        ]
+        for name in names:
+            self.assertTrue(
+                word_in(name, help_text),
+                f"`yo gc --help` does not name the directory '{name}'",
+            )
+
+    def test_help_names_the_manifest_each_directory_needs(self):
+        help_text = self.gc_help()
+        for entry in self.script_array("NEEDS_MANIFEST"):
+            manifest = entry.split(":")[1]
+            self.assertTrue(
+                word_in(manifest, help_text),
+                f"`yo gc --help` does not name the manifest '{manifest}'",
+            )
+
+    def clean_commands_the_script_runs(self):
+        # `in_project_env "${root}" make clean`: the tool and `clean` straight
+        # after the root. `make -n clean`, the dry run, has `-n` in between
+        # and is not a clean.
+        found = re.findall(r'in_project_env "[^"]*" (\w+) clean\b', self.script_text())
+        self.assertTrue(found, "the script runs no clean command; this test is stale")
+        return sorted({f"{tool} clean" for tool in found})
+
+    def test_help_names_each_clean_command_the_script_runs(self):
+        help_text = self.gc_help()
+        for command in self.clean_commands_the_script_runs():
+            self.assertIn(
+                command, help_text, f"`yo gc --help` does not name '{command}'"
+            )
 
     def test_every_deletion_target_of_the_script_has_a_help_mapping(self):
         self.assertEqual(self.guest_deletion_targets(), set(self.HELP_WORDS))
