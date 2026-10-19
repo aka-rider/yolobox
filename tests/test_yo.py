@@ -4,6 +4,8 @@ import importlib.util
 import io
 import json
 import os
+import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -498,6 +500,60 @@ class TestEnsureSshConfigInclude(FakeHome):
         self.assertEqual(stat.S_IMODE(os.stat(self.config_path()).st_mode), 0o600)
         self.assertEqual(self.read_config(), yo.INCLUDE_LINE + "\n")
 
+    def test_a_dangling_config_symlink_is_a_yo_error_naming_the_target(self):
+        os.makedirs(os.path.join(self.home, ".ssh"))
+        target = os.path.join(self.home, "gone", "ssh_config")
+        os.symlink(target, self.config_path())
+        with isatty(True):
+            with mock.patch("builtins.input", return_value="y"):
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.ensure_ssh_config_include(refuse=True)
+        self.assertIn(target, caught.exception.message)
+
+    def test_accepted_writes_through_a_symlinked_config(self):
+        dotfiles = os.path.join(self.home, "dotfiles")
+        os.makedirs(dotfiles)
+        target = os.path.join(dotfiles, "ssh_config")
+        with open(target, "w") as handle:
+            handle.write("Host other\n")
+        os.makedirs(os.path.join(self.home, ".ssh"))
+        os.symlink(target, self.config_path())
+        with isatty(True):
+            with mock.patch("builtins.input", return_value="y"):
+                yo.ensure_ssh_config_include(refuse=True)
+        self.assertTrue(os.path.islink(self.config_path()))
+        with open(target) as handle:
+            self.assertEqual(handle.read(), yo.INCLUDE_LINE + "\nHost other\n")
+
+    def test_accepted_keeps_the_existing_mode(self):
+        path = self.write_config("Host other\n")
+        os.chmod(path, 0o644)
+        with isatty(True):
+            with mock.patch("builtins.input", return_value="y"):
+                yo.ensure_ssh_config_include(refuse=True)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o644)
+
+    def test_accepted_keeps_undecodable_bytes(self):
+        path = self.write_config("")
+        with open(path, "wb") as handle:
+            handle.write(b"# caf\xe9\nHost other\n")
+        with isatty(True):
+            with mock.patch("builtins.input", return_value="y"):
+                yo.ensure_ssh_config_include(refuse=True)
+        with open(path, "rb") as handle:
+            self.assertEqual(
+                handle.read(), yo.INCLUDE_LINE.encode() + b"\n# caf\xe9\nHost other\n"
+            )
+
+    def test_an_unreadable_config_is_an_error_not_an_empty_file(self):
+        path = self.write_config("Host other\n")
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o600)
+        with isatty(True):
+            with mock.patch("builtins.input", return_value="y"):
+                with self.assertRaises(PermissionError):
+                    yo.ensure_ssh_config_include(refuse=True)
+
     def test_accepted_a_second_time_does_not_duplicate(self):
         self.write_config("Host other\n")
         with isatty(True):
@@ -608,6 +664,13 @@ class TestEnsureAgentSshConfig(FakeHome):
         self.assertLess(content.index("ssh-agent.sock"), content.index("ssh.sock"))
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
+    def test_the_agent_match_block_forwards_no_agent(self):
+        self.write_config(LIMA_BLOCK)
+        yo.ensure_agent_ssh_config()
+        match = self.read_config().split("Match host", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("user agent", match)
+        self.assertIn("\n  ForwardAgent no", match)
+
     def test_second_call_is_byte_identical(self):
         self.write_config(LIMA_BLOCK)
         yo.ensure_agent_ssh_config()
@@ -639,7 +702,39 @@ class TestEnsureAgentSshConfig(FakeHome):
         alias = content.split("Host yolobox\n", 1)[1]
         self.assertIn("  User agent\n", alias)
         self.assertIn("  ControlPath none\n", alias)
-        self.assertNotIn("ForwardAgent", alias)
+        self.assertIn("  ForwardAgent no\n", alias)
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_agent_role_never_forwards_even_if_a_later_host_block_says_yes(self):
+        # A user's own "Host lima-yolobox / ForwardAgent yes" sits after the
+        # Include; ssh keeps the first value, so the owned block must win.
+        self.write_config(LIMA_BLOCK + "\nHost lima-yolobox\n  ForwardAgent yes\n")
+        yo.ensure_agent_ssh_config()
+
+        def forwardagent(user):
+            proc = subprocess.run(
+                ["ssh", "-G", "-F", self.config_path(), "-o", "User=" + user]
+                + ["lima-yolobox"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return [line for line in proc.stdout.splitlines() if "forwardagent" in line]
+
+        self.assertEqual(forwardagent("agent"), ["forwardagent no"])
+        self.assertEqual(forwardagent("xiii"), ["forwardagent yes"])
+
+    def test_a_marker_without_a_blank_line_keeps_limas_host_block(self):
+        self.write_config(yo.AGENT_SSH_CONFIG_MARKER + "\n" + LIMA_BLOCK)
+
+        yo.ensure_agent_ssh_config()
+
+        content = self.read_config()
+        self.assertIn(LIMA_BLOCK, content)
+        self.assertIn("Host yolobox\n", content)
+        first = content
+        yo.ensure_agent_ssh_config()
+        self.assertEqual(self.read_config(), first)
 
     def test_herdr_alias_takes_hostname_port_identityfile_from_lima(self):
         self.write_config(LIMA_BLOCK)
@@ -738,6 +833,102 @@ class TestKnownHostsLines(unittest.TestCase):
         self.assertEqual(lines, [])
 
 
+LIMA_ALIAS_BLOCK = (
+    "Host lima-yolobox\n"
+    "  StrictHostKeyChecking no\n"
+    "  UserKnownHostsFile /dev/null\n"
+    "  NoHostAuthenticationForLocalhost yes\n"
+    "  User xiii\n"
+    "  Hostname 127.0.0.1\n"
+    "  Port 60022\n"
+)
+
+
+class TestHostKeyPinning(FakeHome):
+    PINNED = {
+        "stricthostkeychecking": "accept-new",
+        "nohostauthenticationforlocalhost": "no",
+    }
+
+    def write_lima_config(self):
+        lima = os.path.join(self.home, ".lima", "yolobox")
+        os.makedirs(lima, exist_ok=True)
+        with open(os.path.join(lima, "ssh.config"), "w") as handle:
+            handle.write(LIMA_ALIAS_BLOCK)
+        with mock.patch.object(yo, "err"):
+            yo.ensure_agent_ssh_config()
+
+    def effective(self, argv):
+        proc = subprocess.run(
+            list(argv) + ["-G", yo.VM_HOST], capture_output=True, text=True, check=True
+        )
+        wanted = ("stricthostkeychecking", "userknownhostsfile", "nohostauth")
+        lines = [line for line in proc.stdout.splitlines() if line.startswith(wanted)]
+        return dict(line.split(" ", 1) for line in lines)
+
+    def assert_pinned(self, effective):
+        for keyword, value in self.PINNED.items():
+            self.assertEqual(effective[keyword], value)
+        self.assertEqual(effective["userknownhostsfile"], yo.known_hosts_path())
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_every_yo_role_pins_the_key_over_limas_loopback_exemption(self):
+        self.write_lima_config()
+        for role in (yo.OPERATOR, yo.AGENT):
+            with self.subTest(role=role):
+                self.assert_pinned(self.effective(yo.ssh_base(role)))
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_a_bare_ssh_through_the_written_file_pins_the_key(self):
+        self.write_lima_config()
+        for user in ([], ["-o", "User=agent"]):
+            with self.subTest(user=user):
+                argv = ["ssh", "-F", yo.ssh_cfg()] + user
+                self.assert_pinned(self.effective(argv))
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_yo_code_and_zed_reach_the_pin_through_the_users_include(self):
+        self.write_lima_config()
+        user_config = os.path.join(self.home, ".ssh", "config")
+        os.makedirs(os.path.dirname(user_config))
+        with open(user_config, "w") as handle:
+            handle.write("Include %s\n" % yo.ssh_cfg())
+        self.assert_pinned(self.effective(["ssh", "-F", user_config]))
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_first_contact_overrides_all_three_pinned_keywords(self):
+        self.write_lima_config()
+        effective = self.effective(yo.ssh_base(yo.OPERATOR_FIRST_CONTACT))
+        self.assertEqual(effective["stricthostkeychecking"], "false")
+        self.assertEqual(effective["userknownhostsfile"], "/dev/null")
+        self.assertEqual(effective["nohostauthenticationforlocalhost"], "yes")
+
+    def test_the_push_channel_takes_its_pin_from_the_file_alone(self):
+        project = os.path.join(self.home, "wrk", "rune")
+        os.makedirs(project)
+        calls = []
+
+        def fake_run(argv, **rest):
+            calls.append(list(argv))
+            missing = "get-url" in argv
+            top = project if "--show-toplevel" in argv else ""
+            return mock.Mock(returncode=128 if missing else 0, stdout=top, stderr="")
+
+        with (
+            mock.patch.object(yo, "require_agent_account"),
+            mock.patch.object(yo, "logical_cwd", lambda: project),
+            mock.patch.object(yo, "guest_helper_check"),
+            mock.patch.object(yo, "guest_helper"),
+            mock.patch.object(yo, "run", fake_run),
+        ):
+            yo.cmd_link(yo.build_parser().parse_args(["link"]))
+        ssh_command = [c for c in calls if "remote.yolobox.sshCommand" in c][0][-1]
+        self.assertEqual(
+            shlex.split(ssh_command),
+            ["ssh", "-F", yo.ssh_cfg(), "-o", "ControlPath=none"],
+        )
+
+
 class TestEnsureGuestKnownHosts(FakeHome):
     def config_path(self):
         ssh_dir = os.path.join(self.home, ".lima", "yolobox")
@@ -770,7 +961,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
             yo.ensure_guest_known_hosts()
 
         role, argv = fake_ssh_run.call_args[0]
-        self.assertIs(role, yo.OPERATOR)
+        self.assertIs(role, yo.OPERATOR_FIRST_CONTACT)
         self.assertEqual(argv[0], "sh")
         self.assertIn(yo.HOST_KEY_GLOB, argv[-1])
 

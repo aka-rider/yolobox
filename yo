@@ -80,10 +80,12 @@ GUEST_AWS_CONFIG_PATH = AGENT_HOME + "/.config/yolobox/aws-config"
 
 PROXY_SOCKET_UNITS = ("yolobox-op-agent.socket", "yolobox-aws-broker.socket")
 
-EDITOR_SSH_BLOCK = "Match host %s user %s\n  ControlPath ~/.lima/%s/ssh-agent.sock" % (
-    VM_HOST,
-    AGENT_USER,
-    INSTANCE,
+# ssh keeps the first value it sees per keyword, so this block beats both lima's
+# Host block below it and a user's own "Host lima-yolobox / ForwardAgent yes"
+# included after it: the agent role never forwards the Mac's agent.
+EDITOR_SSH_BLOCK = (
+    "Match host %s user %s\n  ControlPath ~/.lima/%s/ssh-agent.sock\n  ForwardAgent no"
+    % (VM_HOST, AGENT_USER, INSTANCE)
 )
 
 AGENT_SSH_CONFIG_MARKER = (
@@ -117,7 +119,7 @@ def known_hosts_path() -> str:
 def atomic_write(path: str, content: str, mode: int) -> None:
     fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
     try:
-        with os.fdopen(fd, "w") as handle:
+        with os.fdopen(fd, "w", errors="surrogateescape") as handle:
             handle.write(content)
         os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
@@ -156,11 +158,43 @@ def herdr_alias_block(lima_values: Dict[str, str]) -> str:
             # does not re-check a new connection's login user against the
             # master's, so herdr would silently ride an operator session.
             "  ControlPath none",
+            "  ForwardAgent no",
             "  Hostname %s" % lima_values["Hostname"],
             "  Port %s" % lima_values["Port"],
             '  IdentityFile "%s"' % lima_values["IdentityFile"],
             '  UserKnownHostsFile "%s"' % known_hosts_path(),
             "  IdentitiesOnly yes",
+        ]
+    )
+
+
+def lima_part_of(current: str) -> str:
+    if not current.startswith(AGENT_SSH_CONFIG_MARKER):
+        return current
+    _, blank_line, rest = current.partition("\n\n")
+    if blank_line:
+        return rest
+    # Nothing says where our block ends, so keep everything after the marker
+    # line: a duplicate owned block is harmless (first value wins), a lost
+    # Host block is not.
+    return current.partition("\n")[2]
+
+
+def host_key_pin_block() -> str:
+    # Lima's own Host block says StrictHostKeyChecking no, UserKnownHostsFile
+    # /dev/null and NoHostAuthenticationForLocalhost yes, and the last one makes
+    # ssh skip host-key verification for 127.0.0.1 whatever else is set (checked
+    # against a throwaway sshd: a changed key still connected). ssh keeps the
+    # first value per keyword, so this block, written above lima's, is the one
+    # place that pins the key for every connection that reads this file: every
+    # yo role, `yo code`, `yo zed` and the push channel. Accept-new learns the
+    # key on first use when ensure_guest_known_hosts has not stored one yet.
+    return "\n".join(
+        [
+            "Match host %s" % VM_HOST,
+            '  UserKnownHostsFile "%s"' % known_hosts_path(),
+            "  StrictHostKeyChecking accept-new",
+            "  NoHostAuthenticationForLocalhost no",
         ]
     )
 
@@ -173,12 +207,9 @@ def ensure_agent_ssh_config() -> None:
     except OSError:
         return
 
-    if current.startswith(AGENT_SSH_CONFIG_MARKER):
-        _, _, rest = current.partition("\n\n")
-    else:
-        rest = current
+    rest = lima_part_of(current)
 
-    owned = [AGENT_SSH_CONFIG_MARKER, EDITOR_SSH_BLOCK]
+    owned = [AGENT_SSH_CONFIG_MARKER, EDITOR_SSH_BLOCK, host_key_pin_block()]
     lima_values = parse_lima_ssh_block(rest, VM_HOST)
     if lima_values is None:
         err(
@@ -227,7 +258,9 @@ def ensure_guest_known_hosts() -> None:
     if lima_values is None:
         return
 
-    proc = ssh_run(OPERATOR, ["sh", "-c", "cat %s" % HOST_KEY_GLOB], check=False)
+    proc = ssh_run(
+        OPERATOR_FIRST_CONTACT, ["sh", "-c", "cat %s" % HOST_KEY_GLOB], check=False
+    )
     if proc.returncode != 0:
         raise YoError(
             "could not fetch the guest's ssh host keys (%s) to pin them for the %r ssh "
@@ -374,15 +407,33 @@ def exec_process(argv: Sequence[str], env: Optional[Dict[str, str]] = None) -> N
 class SshRole:
     user: Optional[str]
     own_control_path: bool
+    pins_host_key: bool = True
 
 
 OPERATOR = SshRole(None, False)
 AGENT = SshRole(AGENT_USER, True)
+# Only for fetching the guest's host keys to pin them (ensure_guest_known_hosts):
+# the pin cannot be checked against itself, and after a VM recreated behind
+# yo's back the old pin would refuse the very connection that replaces it.
+OPERATOR_FIRST_CONTACT = SshRole(None, False, pins_host_key=False)
+
+# The one opt-out from the pin host_key_pin_block writes into ssh.config. A
+# command-line -o outranks the file, so these beat the pin's three keywords.
+FIRST_CONTACT_OPTS = [
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "NoHostAuthenticationForLocalhost=yes",
+]
 
 
 def ssh_base(role: SshRole, mux: bool = False) -> List[str]:
     ensure_agent_ssh_config()
     argv = ["ssh", "-F", ssh_cfg()]
+    if not role.pins_host_key:
+        argv += FIRST_CONTACT_OPTS
     if role.user is not None:
         argv += ["-o", "User=%s" % role.user]
     if not mux:
@@ -1717,13 +1768,22 @@ def add_ssh_config_include() -> None:
     if not os.path.isdir(ssh_dir):
         os.mkdir(ssh_dir, 0o700)
         os.chmod(ssh_dir, 0o700)
-    config_path = os.path.join(ssh_dir, "config")
+    # ~/.ssh/config is often a symlink into a dotfiles checkout: write through
+    # it, keep the mode the user chose, and never rewrite undecodable bytes.
+    config_path = os.path.realpath(os.path.join(ssh_dir, "config"))
     try:
-        with open(config_path, "r") as handle:
+        with open(config_path, "r", errors="surrogateescape") as handle:
             current = handle.read()
-    except OSError:
+        mode = stat.S_IMODE(os.stat(config_path).st_mode)
+    except FileNotFoundError:
+        if not os.path.isdir(os.path.dirname(config_path)):
+            raise YoError(
+                '~/.ssh/config is a symlink to "%s", whose directory does not exist; '
+                "fix or remove the link, then run this again" % config_path
+            )
         current = ""
-    atomic_write(config_path, INCLUDE_LINE + "\n" + current, 0o600)
+        mode = 0o600
+    atomic_write(config_path, INCLUDE_LINE + "\n" + current, mode)
 
 
 def ensure_ssh_config_include(refuse: bool) -> None:
@@ -2015,7 +2075,9 @@ def cmd_link(args: argparse.Namespace) -> None:
             toplevel,
             "config",
             "remote.yolobox.sshCommand",
-            shlex.join(["ssh", "-F", ssh_cfg(), "-o", "ControlPath=none"]),
+            shlex.join(
+                ["ssh", "-F", ssh_cfg(), "-o", "ControlPath=none"]
+            ),
         ],
         check=True,
     )
