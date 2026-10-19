@@ -12,9 +12,8 @@ import os
 import re
 import unittest
 from pathlib import Path
-from unittest import mock
 
-from test_yo import FakeHome, yo
+from test_yo import yo
 
 REPO = Path(yo.__file__).parent
 YOLOBOX_YAML = REPO / "lima" / "yolobox.yaml"
@@ -316,33 +315,6 @@ class TestGuestSubcommandsMatchTheCaseTable(unittest.TestCase):
 
     def test_every_guest_script_subcommand_is_invoked_by_yo(self):
         self.assertEqual(self.case_labels() - self.invoked_by_yo(), set())
-
-
-class TestCpMkdirOrder(FakeHome):
-    def test_mkdir_of_the_destination_runs_before_scp_for_to_guest(self):
-        events = []
-
-        def fake_run(argv, **kwargs):
-            events.append(("run", list(argv)))
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        def fake_ssh_run(role, argv, **kwargs):
-            events.append(("ssh_run", list(argv)))
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        with (
-            mock.patch.object(yo, "run", fake_run),
-            mock.patch.object(yo, "ssh_run", fake_ssh_run),
-        ):
-            yo.cmd_cp(yo.build_parser().parse_args(["cp", "a.txt", ":~/x"]))
-
-        steps = [
-            "mkdir" if argv[:2] == ["mkdir", "-p"] else kind
-            for kind, argv in events
-            if argv != ["true"]
-        ]
-        self.assertEqual(steps, ["mkdir", "run"])
-        self.assertEqual(events[-1][1][0], "scp")
 
 
 class TestGuestProfilePatternMatchesYo(unittest.TestCase):

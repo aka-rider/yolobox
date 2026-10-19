@@ -239,7 +239,16 @@ class TestCpMkdirTarget(unittest.TestCase):
         )
 
 
-class TestCpArgv(FakeHome):
+class CpHarness(FakeHome):
+    def setUp(self):
+        super().setUp()
+        previous = os.getcwd()
+        os.chdir(self.home)
+        self.addCleanup(os.chdir, previous)
+        self.cwd = os.getcwd()
+        for name in ("a.txt", "a:b.png", "-oProxyCommand=x"):
+            Path(name).write_text("data")
+
     def run_cp(self, paths):
         calls = {"run": None, "ssh_run": []}
 
@@ -259,6 +268,8 @@ class TestCpArgv(FakeHome):
             yo.cmd_cp(args)
         return calls
 
+
+class TestCpArgv(CpHarness):
     def test_to_guest_argv_carries_scp_flags_and_no_forward_agent(self):
         argv = self.run_cp(["a.txt", ":~/x"])["run"]
         self.assertIn("-r", argv)
@@ -268,22 +279,421 @@ class TestCpArgv(FakeHome):
         self.assertIn("ControlPath=none", argv)
         self.assertNotIn("ForwardAgent", " ".join(argv))
 
+    def test_local_operands_become_absolute_after_a_double_dash(self):
+        argv = self.run_cp(["a.txt", ":~/x"])["run"]
+        separator = argv.index("--")
+        self.assertEqual(
+            argv[separator + 1 :],
+            [os.path.join(self.cwd, "a.txt"), "lima-yolobox:/home/agent/x"],
+        )
+
+    def test_a_source_with_a_colon_is_not_read_as_a_host(self):
+        argv = self.run_cp(["a:b.png", ":~/x"])["run"]
+        self.assertIn(os.path.join(self.cwd, "a:b.png"), argv)
+        self.assertNotIn("a:b.png", argv)
+
+    def test_a_source_that_looks_like_an_option_is_not_read_as_one(self):
+        argv = self.run_cp(["--", "-oProxyCommand=x", ":~/x"])["run"]
+        self.assertNotIn("-oProxyCommand=x", argv)
+        self.assertGreater(
+            argv.index(os.path.join(self.cwd, "-oProxyCommand=x")), argv.index("--")
+        )
+
+    def test_guest_source_globs_are_escaped_for_scp(self):
+        argv = self.run_cp([":~/a[1]*?\\.txt", "out"])["run"]
+        self.assertIn("lima-yolobox:/home/agent/a\\[1\\]\\*\\?\\\\.txt", argv)
+
+    def test_guest_destination_is_not_escaped(self):
+        # scp never globs a destination; escaping would create a file whose
+        # name contains the backslashes.
+        argv = self.run_cp(["a.txt", ":~/a[1].txt"])["run"]
+        self.assertIn("lima-yolobox:/home/agent/a[1].txt", argv)
+
+    def test_an_empty_operand_is_refused(self):
+        with self.assertRaises(yo.YoError):
+            self.run_cp(["", ":~/x"])
+
     def test_to_guest_remote_operand_is_prefixed_with_vm_host(self):
         argv = self.run_cp(["a.txt", ":~/x"])["run"]
         self.assertIn("lima-yolobox:/home/agent/x", argv)
 
     def test_mkdir_runs_before_scp_for_to_guest(self):
-        calls = self.run_cp(["a.txt", ":~/x"])
-        self.assertEqual(calls["ssh_run"], [["true"], ["mkdir", "-p", "/home/agent"]])
+        events = []
+
+        def fake_run(argv, **kwargs):
+            events.append(("run", list(argv)))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def fake_ssh_run(role, argv, **kwargs):
+            events.append(("ssh_run", list(argv)))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(yo, "run", fake_run),
+            mock.patch.object(yo, "ssh_run", fake_ssh_run),
+        ):
+            yo.cmd_cp(yo.build_parser().parse_args(["cp", "a.txt", ":~/x"]))
+
+        steps = [
+            "mkdir" if argv[:2] == ["mkdir", "-p"] else kind
+            for kind, argv in events
+            if argv != ["true"]
+        ]
+        self.assertEqual(steps, ["mkdir", "run"])
+        self.assertEqual(events[-1][1][0], "scp")
 
     def test_no_mkdir_for_from_guest(self):
         calls = self.run_cp([":~/x", "dest.txt"])
         self.assertEqual(calls["ssh_run"], [["true"]])
         self.assertIn("lima-yolobox:/home/agent/x", calls["run"])
-        self.assertIn("dest.txt", calls["run"])
+
+
+class TestCpFromGuestNeverWritesThroughSymlinks(CpHarness):
+    """scp is faked by a function that writes files into whatever directory
+    cmd_cp told it to download into, like the real one would."""
+
+    def setUp(self):
+        super().setUp()
+        self.scp_destinations = []
+
+    def copy(self, paths, guest_files, scp_fails=False):
+        # guest_files: {relative path inside the download dir: content}
+        def fake_run(argv, **kwargs):
+            destination = argv[-1]
+            self.scp_destinations.append(destination)
+            if scp_fails:
+                raise yo.YoError("scp failed")
+            for relative, content in guest_files.items():
+                path = os.path.join(destination, relative)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as handle:
+                    handle.write(content)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(yo, "run", fake_run),
+            mock.patch.object(
+                yo,
+                "ssh_run",
+                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+            ),
+        ):
+            yo.cmd_cp(yo.build_parser().parse_args(["cp"] + paths))
+
+    def read(self, path):
+        with open(path) as handle:
+            return handle.read()
+
+    def leftovers(self, directory):
+        return [n for n in os.listdir(directory) if n.startswith(".yo-cp-")]
+
+    def test_a_symlink_inside_an_existing_destination_tree_is_not_written_through(
+        self,
+    ):
+        os.makedirs("dest/proj")
+        Path("victim").write_text("precious")
+        os.symlink(os.path.join(self.cwd, "victim"), "dest/proj/notes")
+
+        with self.assertRaises(yo.YoError) as caught:
+            self.copy([":~/proj", "dest/"], {"proj/notes": "from the agent"})
+
+        self.assertIn(
+            os.path.join(self.cwd, "dest/proj/notes"), caught.exception.message
+        )
+        self.assertEqual(self.read("victim"), "precious")
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_nothing_lands_when_any_entry_is_refused(self):
+        os.makedirs("dest/proj")
+        os.symlink("/etc/hosts", "dest/proj/b")
+
+        with self.assertRaises(yo.YoError):
+            self.copy([":~/proj", "dest/"], {"proj/a": "1", "proj/b": "2"})
+
+        self.assertFalse(os.path.lexists("dest/proj/a"))
+
+    def test_a_top_level_symlink_at_the_destination_is_refused(self):
+        os.makedirs("elsewhere")
+        os.makedirs("dest")
+        os.symlink(os.path.join(self.cwd, "elsewhere"), "dest/proj")
+
+        with self.assertRaises(yo.YoError):
+            self.copy([":~/proj", "dest/"], {"proj/f": "x"})
+
+        self.assertEqual(os.listdir("elsewhere"), [])
+
+    def test_a_symlink_as_the_named_destination_file_is_refused(self):
+        Path("victim").write_text("precious")
+        os.symlink(os.path.join(self.cwd, "victim"), "renamed.txt")
+
+        with self.assertRaises(yo.YoError):
+            self.copy([":~/x", "renamed.txt"], {"x": "from the agent"})
+
+        self.assertEqual(self.read("victim"), "precious")
+
+    def test_a_directory_lands_inside_an_existing_directory_and_merges(self):
+        os.makedirs("dest/proj")
+        Path("dest/proj/mine").write_text("keep")
+        Path("dest/proj/shared").write_text("old")
+
+        self.copy([":~/proj", "dest/"], {"proj/shared": "new", "proj/sub/f": "x"})
+
+        self.assertEqual(self.read("dest/proj/mine"), "keep")
+        self.assertEqual(self.read("dest/proj/shared"), "new")
+        self.assertEqual(self.read("dest/proj/sub/f"), "x")
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_a_directory_copied_to_a_new_name_becomes_that_directory(self):
+        self.copy([":~/proj", "fresh"], {"proj/f": "x"})
+
+        self.assertEqual(self.read("fresh/f"), "x")
+        self.assertEqual(self.leftovers("."), [])
+
+    def test_a_single_file_copied_to_a_new_name_is_renamed(self):
+        self.copy([":~/x", "renamed.txt"], {"x": "data"})
+
+        self.assertEqual(self.read("renamed.txt"), "data")
+
+    def test_a_single_file_replaces_an_existing_file(self):
+        Path("renamed.txt").write_text("old")
+
+        self.copy([":~/x", "renamed.txt"], {"x": "data"})
+
+        self.assertEqual(self.read("renamed.txt"), "data")
+
+    def test_several_sources_land_side_by_side_in_a_directory(self):
+        os.makedirs("dest")
+
+        self.copy([":~/a", ":~/b", "dest"], {"a": "1", "b": "2"})
+
+        self.assertEqual(sorted(os.listdir("dest")), ["a", "b"])
+
+    def test_several_sources_need_an_existing_directory(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.copy([":~/a", ":~/b", "nowhere"], {"a": "1", "b": "2"})
+
+        self.assertIn("nowhere", caught.exception.message)
+        self.assertEqual(self.scp_destinations, [])
+
+    def test_a_file_cannot_replace_a_directory(self):
+        os.makedirs("dest/x")
+
+        with self.assertRaises(yo.YoError):
+            self.copy([":~/x", "dest/"], {"x": "data"})
+
+        self.assertEqual(os.listdir("dest/x"), [])
+
+    def test_staging_sits_beside_the_destination_on_the_same_filesystem(self):
+        os.makedirs("dest")
+        self.copy([":~/x", "dest/"], {"x": "data"})
+        self.copy([":~/x", "newname"], {"x": "data"})
+
+        self.assertEqual(
+            os.path.dirname(self.scp_destinations[0]), os.path.join(self.cwd, "dest")
+        )
+        self.assertEqual(os.path.dirname(self.scp_destinations[1]), self.cwd)
+
+    def test_staging_is_removed_when_scp_fails(self):
+        os.makedirs("dest")
+
+        with self.assertRaises(yo.YoError):
+            self.copy([":~/x", "dest/"], {}, scp_fails=True)
+
+        self.assertEqual(os.listdir("dest"), [])
+
+    def test_a_read_only_guest_directory_is_still_cleaned_up_on_refusal(self):
+        os.makedirs("dest/proj")
+        os.symlink("/etc/hosts", "dest/proj/b")
+
+        def fake_run(argv, **kwargs):
+            tree = os.path.join(argv[-1], "proj")
+            os.makedirs(tree)
+            Path(tree, "b").write_text("x")
+            os.chmod(tree, 0o555)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(yo, "run", fake_run),
+            mock.patch.object(
+                yo,
+                "ssh_run",
+                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+            ),
+            self.assertRaises(yo.YoError),
+        ):
+            yo.cmd_cp(yo.build_parser().parse_args(["cp", ":~/proj", "dest/"]))
+
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def scp_creating(self, relative, mode):
+        # A fake scp that leaves one directory with the given mode, as sftp-mode
+        # scp does for a guest directory the agent chmodded.
+        def fake_run(argv, **kwargs):
+            tree = os.path.join(argv[-1], relative)
+            os.makedirs(tree)
+            os.chmod(tree, mode)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        return fake_run
+
+    def run_cp_with(self, fake_run, paths):
+        with (
+            mock.patch.object(yo, "run", fake_run),
+            mock.patch.object(
+                yo,
+                "ssh_run",
+                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+            ),
+        ):
+            yo.cmd_cp(yo.build_parser().parse_args(["cp"] + paths))
+
+    def test_an_unreadable_staged_subdirectory_is_cleaned_up(self):
+        os.makedirs("dest")
+        make_dir = self.scp_creating("proj/sub", 0o300)
+
+        def fake_run(argv, **kwargs):
+            make_dir(argv)
+            raise yo.YoError("scp failed")
+
+        with self.assertRaises(yo.YoError) as caught:
+            self.run_cp_with(fake_run, [":~/proj", "dest/"])
+
+        self.assertEqual(caught.exception.message, "scp failed")
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_an_unreadable_staged_subdirectory_does_not_break_a_good_copy(self):
+        os.makedirs("dest")
+
+        self.addCleanup(os.chmod, os.path.join(self.cwd, "dest/proj/sub"), 0o700)
+
+        self.run_cp_with(self.scp_creating("proj/sub", 0o300), [":~/proj", "dest/"])
+
+        self.assertEqual(self.leftovers("dest"), [])
+        self.assertTrue(os.path.isdir("dest/proj/sub"))
+
+    def test_a_cleanup_failure_is_reported_next_to_the_original_error(self):
+        os.makedirs("dest")
+        stderr = io.StringIO()
+
+        def fake_run(argv, **kwargs):
+            raise yo.YoError("scp failed")
+
+        with (
+            mock.patch.object(yo, "remove_staging", side_effect=yo.YoError("stuck")),
+            mock.patch("sys.stderr", stderr),
+            self.assertRaises(yo.YoError) as caught,
+        ):
+            self.run_cp_with(fake_run, [":~/proj", "dest/"])
+
+        self.assertEqual(caught.exception.message, "scp failed")
+        self.assertIn("stuck", stderr.getvalue())
+
+    def test_a_move_the_mac_refuses_is_a_yo_error_counting_what_landed(self):
+        os.makedirs("dest")
+
+        with (
+            mock.patch.object(
+                yo.os, "replace", side_effect=PermissionError(13, "Permission denied")
+            ),
+            self.assertRaises(yo.YoError) as caught,
+        ):
+            self.copy([":~/a", ":~/b", "dest"], {"a": "1", "b": "2"})
+
+        self.assertIn("Permission denied", caught.exception.message)
+        self.assertIn("0 of 2 entries already landed", caught.exception.message)
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_a_trailing_slash_on_a_missing_directory_is_refused(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.copy([":~/x", "newdir/"], {"x": "data"})
+
+        self.assertIn(
+            '"%s/" is not a directory' % os.path.join(self.cwd, "newdir"),
+            caught.exception.message,
+        )
+        self.assertEqual(self.scp_destinations, [])
+        self.assertFalse(os.path.lexists("newdir"))
+
+    def test_a_trailing_slash_on_a_file_is_refused(self):
+        Path("afile").write_text("keep")
+
+        with self.assertRaises(yo.YoError):
+            self.copy([":~/x", "afile/"], {"x": "data"})
+
+        self.assertEqual(self.read("afile"), "keep")
+
+    def test_a_missing_destination_parent_is_a_yo_error(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.copy([":~/x", "no/such/parent"], {"x": "data"})
+
+        self.assertIn("no/such", caught.exception.message)
 
 
 STALE_REMOTE = "ssh://lima-yolobox/home/xiii.guest/wrk/rune"
+
+
+class TestCpRefusesSymlinks(CpHarness):
+    def refused(self, paths, message_part):
+        with self.assertRaises(yo.YoError) as caught:
+            self.run_cp(paths)
+        self.assertIn(message_part, caught.exception.message)
+
+    def test_a_symlink_source_is_refused_by_name(self):
+        os.symlink("a.txt", "link")
+        self.refused(["link", ":~/x"], os.path.join(self.cwd, "link"))
+
+    def test_a_symlink_inside_a_source_directory_is_refused_by_name(self):
+        os.makedirs("repo/sub")
+        os.symlink("/etc/passwd", "repo/sub/leak")
+        self.refused(["repo", ":~/x"], os.path.join(self.cwd, "repo/sub/leak"))
+
+    def test_a_symlink_to_a_directory_inside_a_source_is_refused(self):
+        os.makedirs("repo")
+        os.symlink("/etc", "repo/etc")
+        self.refused(["repo", ":~/x"], "repo/etc")
+
+    def test_the_message_says_scp_would_copy_the_target(self):
+        os.symlink("/etc/passwd", "link")
+        self.refused(["link", ":~/x"], "scp would copy its target")
+
+    def test_nothing_reaches_the_guest_when_a_source_is_refused(self):
+        os.symlink("a.txt", "link")
+        calls = {"run": [], "ssh_run": []}
+
+        def fake_run(argv, **kwargs):
+            calls["run"].append(list(argv))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def fake_ssh_run(role, argv, **kwargs):
+            calls["ssh_run"].append(list(argv))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(yo, "run", fake_run),
+            mock.patch.object(yo, "ssh_run", fake_ssh_run),
+            self.assertRaises(yo.YoError),
+        ):
+            yo.cmd_cp(yo.build_parser().parse_args(["cp", "a.txt", "link", ":~/x"]))
+        self.assertEqual(calls, {"run": [], "ssh_run": [["true"]]})
+
+    def test_a_trailing_slash_does_not_hide_a_symlink_source(self):
+        os.makedirs("real")
+        Path("real/secret").write_text("x")
+        os.symlink("real", "lnk")
+        self.refused(["lnk/", ":~/x"], os.path.join(self.cwd, "lnk"))
+
+    def test_a_missing_source_is_refused_naming_it(self):
+        self.refused(["nope", ":~/x"], os.path.join(self.cwd, "nope"))
+
+    def test_a_directory_without_symlinks_is_uploaded(self):
+        os.makedirs("repo/sub")
+        Path("repo/sub/f").write_text("x")
+        argv = self.run_cp(["repo", ":~/x"])["run"]
+        self.assertIn(os.path.join(self.cwd, "repo"), argv)
+
+    def test_a_symlink_on_the_guest_side_is_not_checked(self):
+        os.symlink("a.txt", "link")
+        self.run_cp([":~/x", "link2"])
 
 
 class TestLinkRemoteAction(unittest.TestCase):

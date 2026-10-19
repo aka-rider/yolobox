@@ -19,6 +19,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -640,6 +641,8 @@ def resolve_guest_operand(operand: str, cwd_mirror: Optional[str]) -> str:
 def resolve_cp_operands(operands: List[str], cwd_mirror: Optional[str]) -> CpPlan:
     if len(operands) < 2:
         raise YoError("yo cp needs at least one source and a destination")
+    if "" in operands:
+        raise YoError("yo cp got an empty operand")
     sources = operands[:-1]
     dest = operands[-1]
     if not any(operand_is_guest(operand) for operand in operands):
@@ -1722,6 +1725,52 @@ def cmd_enter(args: argparse.Namespace) -> None:
     exec_process(argv)
 
 
+SCP_GLOB_RE = re.compile(r"([\[\]*?\\])")
+
+
+def scp_glob_escape(path: str) -> str:
+    # scp expands wildcards in a remote *source* itself, so a guest file named
+    # "a[1].txt" would otherwise match nothing, or several other files.
+    return SCP_GLOB_RE.sub(r"\\\1", path)
+
+
+def local_cp_operand(operand: str) -> str:
+    # Absolute, so a Mac file "a:b.png" is not read as host "a" and a name
+    # starting with "-" is not read as an option. Joined, not normalised: a
+    # lexical ".." collapse would change which file a symlinked path means.
+    return os.path.join(os.getcwd(), operand)
+
+
+def refuse_symlinks_in(source: str) -> None:
+    # scp -r follows symlinks and uploads what they point at, so a link the
+    # agent pushed into a repo (leak -> ~/.ssh/id_ed25519) would copy a file
+    # the user never named into the guest.
+    def refuse(link: str) -> None:
+        raise YoError(
+            'refusing to upload symlink "%s": scp would copy its target "%s", not the link'
+            % (link, os.readlink(link))
+        )
+
+    def fail(failure: OSError) -> None:
+        raise YoError("cannot read %s: %s" % (failure.filename, failure.strerror))
+
+    # lstat of "link/" follows the link, so a trailing slash would hide it.
+    source = source.rstrip("/") or "/"
+    try:
+        mode = os.lstat(source).st_mode
+    except OSError as failure:
+        raise YoError("cannot read %s: %s" % (source, failure.strerror))
+    if stat.S_ISLNK(mode):
+        refuse(source)
+    if not stat.S_ISDIR(mode):
+        return
+    for directory, subdirs, files in os.walk(source, onerror=fail, followlinks=False):
+        for name in subdirs + files:
+            path = os.path.join(directory, name)
+            if os.path.islink(path):
+                refuse(path)
+
+
 def cmd_cp(args: argparse.Namespace) -> None:
     require_agent_account()
     cwd_mirror = mirror(logical_cwd())
@@ -1729,18 +1778,129 @@ def cmd_cp(args: argparse.Namespace) -> None:
     guest_operands = [operand for operand in args.paths if operand_is_guest(operand)]
     for operand, resolved in zip(guest_operands, plan.guest_paths):
         err("yo: guest path %s -> %s" % (operand, resolved))
+    local_paths = [local_cp_operand(path) for path in plan.local_paths]
     if plan.direction == "to_guest":
+        for source in local_paths:
+            refuse_symlinks_in(source)
         target = cp_mkdir_target(
             args.paths[-1], plan.guest_paths[0], len(plan.local_paths)
         )
         ssh_run(AGENT, ["mkdir", "-p", target], check=True)
-        sources = plan.local_paths
-        dest = "%s:%s" % (VM_HOST, plan.guest_paths[0])
+        scp_to(local_paths, "%s:%s" % (VM_HOST, plan.guest_paths[0]))
     else:
-        sources = ["%s:%s" % (VM_HOST, guest) for guest in plan.guest_paths]
-        dest = plan.local_paths[0]
-    argv = ["scp", "-r", "-p"] + ssh_base(AGENT)[1:] + sources + [dest]
+        sources = [
+            "%s:%s" % (VM_HOST, scp_glob_escape(guest)) for guest in plan.guest_paths
+        ]
+        download_from_guest(sources, local_paths[0])
+
+
+def scp_to(sources: Sequence[str], dest: str) -> None:
+    argv = ["scp", "-r", "-p"] + ssh_base(AGENT)[1:] + ["--"] + list(sources) + [dest]
     run(argv, capture=False, check=True)
+
+
+def plan_merge(staged: str, target: str, moves: List[Tuple[str, str]]) -> None:
+    # Where the staged tree meets what is already on the Mac: directories merge
+    # (as scp -r would merge them), files replace files, anything else, and any
+    # symlink, is refused. scp itself writes through a symlink it finds at the
+    # destination, and the agent controls what a pulled repo's links say.
+    try:
+        existing = os.lstat(target).st_mode
+    except FileNotFoundError:
+        moves.append((staged, target))
+        return
+    except OSError as failure:
+        raise YoError("cannot read %s: %s" % (target, failure.strerror))
+    if stat.S_ISLNK(existing):
+        raise YoError(
+            'refusing to copy over symlink "%s": the copy would overwrite its target "%s", not the link'
+            % (target, os.readlink(target))
+        )
+    staged_is_dir = stat.S_ISDIR(os.lstat(staged).st_mode)
+    if staged_is_dir and stat.S_ISDIR(existing):
+        for name in sorted(os.listdir(staged)):
+            plan_merge(os.path.join(staged, name), os.path.join(target, name), moves)
+    elif staged_is_dir or stat.S_ISDIR(existing):
+        raise YoError(
+            'cannot copy over "%s": it is a directory on one side and not on the other'
+            % target
+        )
+    else:
+        moves.append((staged, target))
+
+
+def unlock_tree(path: str) -> None:
+    # scp -p keeps a guest directory's mode, and sftp-mode scp adds only u+wx
+    # to it: a read-only directory (a Go module cache) refuses to lose its
+    # children, and an agent-side chmod 300 leaves one nobody can list. Top
+    # down, so each directory is readable before it is entered. Symlinks are
+    # never followed: chmod would reach the Mac file they point at.
+    os.chmod(path, 0o700)
+    with os.scandir(path) as entries:
+        subdirs = [e.path for e in entries if e.is_dir(follow_symlinks=False)]
+    for subdir in subdirs:
+        unlock_tree(subdir)
+
+
+def remove_staging(path: str) -> None:
+    try:
+        unlock_tree(path)
+        shutil.rmtree(path)
+    except OSError as failure:
+        raise YoError(
+            'cannot remove the staging directory "%s": %s; delete it by hand'
+            % (path, failure.strerror or failure)
+        )
+
+
+def land_staged(moves: Sequence[Tuple[str, str]]) -> None:
+    for landed, (staged, target) in enumerate(moves):
+        try:
+            os.replace(staged, target)
+        except OSError as failure:
+            raise YoError(
+                "cannot place %s -> %s: %s (%d of %d entries already landed)"
+                % (staged, target, failure.strerror or failure, landed, len(moves))
+            )
+
+
+def download_from_guest(sources: Sequence[str], dest: str) -> None:
+    # scp into a staging directory beside the destination instead of onto it:
+    # scp writes through any symlink it meets there, so a link the agent
+    # committed into a repo (notes -> ../../.zshrc) would overwrite a Mac file
+    # on the next pull. Same filesystem, so landing each entry is a rename.
+    dest_is_dir = os.path.isdir(dest)
+    if dest.endswith("/") and not dest_is_dir:
+        raise YoError('destination "%s" is not a directory' % dest)
+    if not dest_is_dir and len(sources) > 1:
+        raise YoError(
+            '"%s" is not an existing directory, which %d sources need'
+            % (dest, len(sources))
+        )
+    new_name = dest.rstrip("/") or "/"
+    staging_parent = dest if dest_is_dir else os.path.dirname(new_name)
+    try:
+        staging = tempfile.mkdtemp(prefix=".yo-cp-", dir=staging_parent)
+    except OSError as failure:
+        raise YoError(
+            "cannot stage a copy in %s: %s" % (staging_parent, failure.strerror)
+        )
+    try:
+        scp_to(sources, staging)
+        moves: List[Tuple[str, str]] = []
+        for name in sorted(os.listdir(staging)):
+            target = os.path.join(dest, name) if dest_is_dir else new_name
+            plan_merge(os.path.join(staging, name), target, moves)
+        land_staged(moves)
+    except BaseException:
+        # The copy's own failure is the one to show; a cleanup failure joins it
+        # on stderr instead of replacing it.
+        try:
+            remove_staging(staging)
+        except YoError as cleanup:
+            err("yo: %s" % cleanup.message)
+        raise
+    remove_staging(staging)
 
 
 INCLUDE_LINE = "Include ~/.lima/%s/ssh.config" % INSTANCE
@@ -2075,9 +2235,7 @@ def cmd_link(args: argparse.Namespace) -> None:
             toplevel,
             "config",
             "remote.yolobox.sshCommand",
-            shlex.join(
-                ["ssh", "-F", ssh_cfg(), "-o", "ControlPath=none"]
-            ),
+            shlex.join(["ssh", "-F", ssh_cfg(), "-o", "ControlPath=none"]),
         ],
         check=True,
     )
