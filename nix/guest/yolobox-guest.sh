@@ -2,7 +2,7 @@
 # The guest-side half of `yo`: subcommands over ssh, one per account, so the
 # find expressions, the gc tiers and the AWS probe are shellchecked at build
 # time instead of living in yo's Python string literals where nothing checks
-# them. Subcommands: projects, home-roots, landing-dir,
+# them. Subcommands: projects, landing-dir,
 # ensure-repo, generations, gc-machine, gc-user, aws-creds, aws-check,
 # net-check.
 #
@@ -323,6 +323,12 @@ deep_plan() {
     while IFS= read -r -d '' dir; do
         name="${dir##*/}"
         parent="${dir%/*}"
+        # Outside every repo there is no project to own it and no .gitignore
+        # to vouch for it.
+        if ! git -C "${parent}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            printf 'kept %s: not inside a git repository\n' "${dir}"
+            continue
+        fi
         manifest="$(manifest_for "${name}")"
         if [ -n "${manifest}" ] && [ ! -f "${parent}/${manifest}" ]; then
             case "${name}" in
@@ -350,9 +356,17 @@ deep_plan() {
 # and receive.denyCurrentBranch=updateInstead then refuses every later `git
 # push yolobox` — a breakage that surfaces much later with no link back to
 # here. The name alone does not settle it: an anchored /node_modules in
-# .gitignore leaves a nested one tracked.
+# .gitignore leaves a nested one tracked. A directory that ignores itself
+# (uv and venv write a `*` .gitignore into a .venv) is not reported ignored, but
+# git neither tracks nor sees anything in it, which is the same promise.
 git_ignores() {
-    git -C "${1%/*}" check-ignore -q "$1"
+    local parent="${1%/*}" seen
+    if git -C "${parent}" check-ignore -q "$1"; then
+        return 0
+    fi
+    seen="$(git -C "${parent}" ls-files -- "$1" \
+        && git -C "${parent}" status --porcelain --untracked-files=all -- "$1")" || return 1
+    [ -z "${seen}" ]
 }
 
 fail_not_ignored() {
@@ -440,10 +454,6 @@ project_roots() {
 
 cmd_projects() {
     project_roots
-}
-
-cmd_home_roots() {
-    find "$HOME" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\0'
 }
 
 cmd_landing_dir() {
@@ -677,12 +687,26 @@ cmd_aws_check() {
         exit 1
     fi
 
-    local failed=0
-    local profile
+    local failed=0 profile profiles
+    # A plain capture, not a process substitution, so a failing awk stops
+    # here; and a file with no profile is a failed check, not a vacuous pass.
+    profiles="$(awk '/^\[profile / {
+        s = $0;
+        sub(/^\[profile /, "", s);
+        sub(/\].*/, "", s);
+        print s;
+    }
+    /^\[default\]/ {
+        print "default";
+    }' "${config_file}")"
+    if [ -z "${profiles}" ]; then
+        printf 'yolobox-guest: no profile sections in %s\n' "${config_file}" >&2
+        exit 1
+    fi
 
     while IFS= read -r profile; do
         local arn error_msg rc=0
-        arn="$(AWS_PROFILE="${profile}" aws sts get-caller-identity --query Arn --output text 2>&1)" || rc=$?
+        arn="$(AWS_PROFILE="${profile}" aws sts get-caller-identity --query Arn --output text 2>&1 </dev/null)" || rc=$?
 
         if [ "${rc}" = 0 ]; then
             printf 'OK %s %s\n' "${profile}" "${arn}"
@@ -691,15 +715,7 @@ cmd_aws_check() {
             printf 'FAIL %s %s\n' "${profile}" "${error_msg}"
             failed=1
         fi
-    done < <(awk '/^\[profile / {
-        s = $0;
-        sub(/^\[profile /, "", s);
-        sub(/\].*/, "", s);
-        print s;
-    }
-    /^\[default\]/ {
-        print "default";
-    }' "${config_file}")
+    done <<<"${profiles}"
 
     [ "${failed}" = 0 ] || exit 1
 }
@@ -731,7 +747,6 @@ main() {
     [ "$#" -ge 1 ] && shift
     case "${sub}" in
     projects) cmd_projects ;;
-    home-roots) cmd_home_roots ;;
     landing-dir) cmd_landing_dir "$@" ;;
     ensure-repo) cmd_ensure_repo "$@" ;;
     generations) generations ;;

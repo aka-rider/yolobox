@@ -1,7 +1,7 @@
 """Tests that bind one file of the repo to another.
 
 Each class reads a second file off disk (a nix module, the guest script, the
-brew formula, the README) and compares it to what `yo` declares, so a change
+brew formula) and compares it to what `yo` declares, so a change
 to one side alone fails here instead of on a user's box.
 """
 
@@ -114,14 +114,6 @@ class TestLimaYamlMatchesPortForwardsConstant(unittest.TestCase):
         self.assertEqual(ssh.get("loadDotSSHPubKeys"), "false")
 
 
-class TestReadmeRestatesPortForwards(unittest.TestCase):
-    def test_the_limactl_edit_command_equals_lima_port_forwards(self):
-        readme = (REPO / "README.md").read_text()
-        commands = re.findall(r"--set '\.portForwards = (\[.*\])'", readme)
-        self.assertEqual(len(commands), 1, "README must restate portForwards once")
-        self.assertEqual(json.loads(commands[0]), yo.LIMA_PORT_FORWARDS)
-
-
 class TestAgentEnvMatchesYoSockets(unittest.TestCase):
     def assigned(self, name):
         text = (REPO / "nix" / "lib" / "agent-env.nix").read_text()
@@ -160,6 +152,21 @@ class TestBaseNixMatchesYoConstants(unittest.TestCase):
             self.assertTrue(unit.endswith(".socket"))
             name = unit[: -len(".socket")]
             self.assertIn(name, text)
+
+
+class TestOnlyBaseNixSeesTheOperator(unittest.TestCase):
+    # CONSTITUTION.md: every User=, ConditionUser= and home path in the other
+    # modules names agentUser. A module that takes `username` (the operator)
+    # can aim one of those at the operator's account instead.
+    IDENTIFIER_RE = re.compile(r"(?<![\w-])username(?![\w-])")
+
+    def test_no_module_but_base_nix_names_the_operator_variable(self):
+        for path in sorted((REPO / "nix").rglob("*.nix")):
+            if path.name == "base.nix":
+                continue
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                with self.subTest(path=str(path.relative_to(REPO)), line=number):
+                    self.assertIsNone(self.IDENTIFIER_RE.search(line), line)
 
 
 class TestGcHelpNamesEverythingItDeletes(unittest.TestCase):

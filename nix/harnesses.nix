@@ -34,9 +34,11 @@ let
     text = ''
       versions="${claudeVersionsDir}"
 
-      # Newest executable under $versions. Extra find tests go in "$@".
+      # Newest executable under $versions. Extra find tests go in "$@". No
+      # versions directory is no install; any other find error is shown.
       newest_version() {
-        ${pkgs.findutils}/bin/find "$versions" -maxdepth 1 -type f -perm -u+x "$@" -printf '%f\n' 2>/dev/null \
+        [ -d "$versions" ] || return 0
+        ${pkgs.findutils}/bin/find "$versions" -maxdepth 1 -type f -perm -u+x "$@" -printf '%f\n' \
           | ${pkgs.coreutils}/bin/sort -V | ${pkgs.coreutils}/bin/tail -n 1 || true
       }
 
@@ -60,9 +62,19 @@ let
       # launcher is the only place left that can make it per project. The
       # project comes from the logical cwd, not git's physical toplevel:
       # ~/wrk is a symlink to ~/Developer, and the repo mirrors logical
-      # paths, so show-toplevel would resolve the symlink away.
-      cdup="$(${pkgs.git}/bin/git rev-parse --show-cdup 2>/dev/null || true)"
-      top="$(cd "$PWD/$cdup" 2>/dev/null && pwd -L || printf '%s' "$PWD")"
+      # paths, so show-toplevel would resolve the symlink away. The root is
+      # the nearest logical ancestor that resolves to git's physical one,
+      # yo's logical_toplevel(): counting --show-cdup's `../` up the logical
+      # path climbs elsewhere when a symlink sits below the root.
+      top="$PWD"
+      physical_top="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
+      if [ -n "$physical_top" ]; then
+        d="$PWD"
+        while [ -n "$d" ] && [ "$(cd "$d" 2>/dev/null && pwd -P)" != "$physical_top" ]; do
+          d="''${d%/*}"
+        done
+        top="''${d:-$physical_top}"
+      fi
       default_output_dir="$HOME/artifacts"
       output_dir="''${PLAYWRIGHT_MCP_OUTPUT_DIR:-$default_output_dir}"
       case "$top" in
@@ -106,7 +118,10 @@ let
       # download in flight is never a pruning target. Nothing else prunes
       # them: keeping every version is precisely what the custom launcher
       # buys, at ~330 MB each.
-      older="$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -printf '%f\n' 2>/dev/null | sort -V | head -n "-$keep_versions" || true)"
+      older=""
+      if [ -d "${claudeVersionsDir}" ]; then
+        older="$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -printf '%f\n' | sort -V | head -n "-$keep_versions" || true)"
+      fi
       if [ -n "$older" ]; then
         while IFS= read -r version; do
           if [ -n "$(find "${claudeVersionsDir}/$version" -maxdepth 0 -mmin "+$settle_minutes" -print)" ]; then

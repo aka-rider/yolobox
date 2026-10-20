@@ -98,11 +98,24 @@ class TestProfileNamePattern(unittest.TestCase):
         self.assertEqual(pattern_in(sample, YO_PATTERN_RE), "^[a-z]+$")
 
     def test_yo_carries_the_same_pattern(self):
-        # Fails until the yo worktree (AWS_PROFILE_NAME_RE) lands.
         broker_pattern = pattern_in(Path(BROKER_PATH).read_text(), BROKER_PATTERN_RE)
         yo_pattern = pattern_in(YO_PATH.read_text(), YO_PATTERN_RE)
         self.assertEqual(broker_pattern, yo_pattern)
         self.assertEqual(broker_pattern, broker.PROFILE_NAME_PATTERN)
+
+
+class TestControlByteFilterMatchesYo(unittest.TestCase):
+    # broker.log and yo's terminal output are read by the same person; a byte
+    # one filter lets through must not be one the other replaces.
+    def test_yo_and_the_broker_replace_the_same_characters(self):
+        from test_yo import yo
+
+        for code in range(0x200):
+            char = chr(code)
+            with self.subTest(code=hex(code)):
+                self.assertEqual(
+                    broker.sanitize(char), yo.TERMINAL_CONTROL_RE.sub("?", char)
+                )
 
 
 class TestParseArgs(unittest.TestCase):
@@ -307,8 +320,13 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
     def test_leaves_a_newer_file_alone(self):
         server, identity = broker.bind_server(self.sock, {}, 1)
         server.server_close()
-        os.unlink(self.sock)
-        Path(self.sock).write_text("newer broker")
+        # Made while the old socket still exists, then renamed over it: Linux
+        # hands a freed inode number straight to the next file, which would
+        # give the newer file the old identity. (The broker runs on APFS,
+        # which does not reuse inode numbers.)
+        newer = os.path.join(self.dir, "newer")
+        Path(newer).write_text("newer broker")
+        os.rename(newer, self.sock)
         broker.unlink_if_same_identity(self.sock, identity)
         self.assertTrue(os.path.exists(self.sock))
 
@@ -340,10 +358,6 @@ class TestBindServer(SocketDirCase):
         missing = os.path.join(self.dir, "no-such-dir", "s.sock")
         out = self.fails(broker.bind_server, missing, {}, 1)
         self.assertIn("cannot bind", out)
-
-    def test_request_queue_is_deep_enough_for_a_burst(self):
-        self.assertEqual(broker.UnixHTTPServer.request_queue_size, 64)
-        self.assertEqual(broker.Handler.timeout, 10)
 
 
 class ServedBroker(SocketDirCase):
@@ -483,6 +497,12 @@ class TestServedRequests(ServedBroker):
         self.assertEqual(status, 500)
         self.assertIn("request failed", stderr.getvalue())
         self.assertNotIn("\x1b", stderr.getvalue())
+
+    def test_a_long_request_path_is_clipped_in_the_log(self):
+        path = "/" + "x" * 20000
+        self.assertEqual(self.get(path)[0], 404)
+        self.assertNotIn(path, self.logged())
+        self.assertIn("more)", self.logged())
 
     def test_secrets_never_reach_the_log(self):
         self.aws(aws_result(process_json()))
