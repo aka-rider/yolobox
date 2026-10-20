@@ -30,7 +30,10 @@ let
       # $keep_versions kept (the link points at the newest, which ranking
       # always spares). Only then does settling filter the rest, as the
       # claude keeper does.
-      older="$(find "${t3VersionsDir}" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' 2>/dev/null | sort -V | head -n "-$keep_versions" || true)"
+      older=""
+      if [ -d "${t3VersionsDir}" ]; then
+        older="$(find "${t3VersionsDir}" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' | sort -V | head -n "-$keep_versions" || true)"
+      fi
       if [ -n "$older" ]; then
         while IFS= read -r version; do
           dir="${t3VersionsDir}/$version"

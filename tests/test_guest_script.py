@@ -6,7 +6,7 @@ bash gets the same three options, and PATH holds a scratch directory with a
 fake `curl` ahead of the system tools. Only subcommands that need nothing but
 what macOS and Linux share are exercised, except `gc-user --deep`, which runs
 only where GNU find's `-printf` exists (CI, the guest): the other subcommands
-(`projects`, `home-roots`, `gc-machine`) use it or sudo too.
+(`projects`, `gc-machine`) use it or sudo too.
 """
 
 import os
@@ -159,6 +159,35 @@ class TestLandingDir(GuestScript):
         result = self.run_script("landing-dir", "/yolobox-test-no-such-root/deep")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "%s\n" % self.home)
+
+
+FAKE_AWS = """#!/bin/sh
+cat >/dev/null
+echo "arn:aws:sts::1:assumed-role/r/$AWS_PROFILE"
+"""
+
+
+class TestAwsCheck(GuestScript):
+    def check(self, config):
+        aws = self.tmp / "bin" / "aws"
+        aws.write_text(FAKE_AWS)
+        aws.chmod(0o755)
+        path = self.tmp / "aws-config"
+        path.write_text(config)
+        return self.run_script("aws-check", extra_env={"AWS_CONFIG_FILE": str(path)})
+
+    def test_every_profile_is_checked_even_when_aws_reads_stdin(self):
+        result = self.check("[profile a]\nregion = x\n[default]\n[profile b]\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [line.split()[1] for line in result.stdout.splitlines()],
+            ["a", "default", "b"],
+        )
+
+    def test_a_config_with_no_profile_fails_instead_of_passing_vacuously(self):
+        result = self.check("[sso-session s]\nsso_region = x\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no profile sections", result.stderr)
 
 
 class TestUnknownSubcommand(GuestScript):
@@ -342,6 +371,21 @@ class TestGcUserDeep(GuestScript):
         self.assertFalse((root / "node_modules").exists())
         self.assertFalse((root / ".venv").exists())
         self.assertTrue((root / "src" / "app").exists())
+
+    def test_a_venv_that_ignores_itself_is_removed(self):
+        # uv writes `*` into .venv/.gitignore and nothing into the project's.
+        root = self.project("p", {".venv/.gitignore": "*\n", ".venv/bin/py": "x"})
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((root / ".venv").exists())
+
+    def test_a_directory_outside_every_repo_is_kept_without_failing(self):
+        loose = self.home / "loose" / "node_modules"
+        loose.mkdir(parents=True)
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kept %s: not inside a git repository" % loose, result.stdout)
+        self.assertTrue(loose.exists())
 
     def test_a_next_beside_package_json_is_removed_and_one_without_is_kept(self):
         web = self.project(

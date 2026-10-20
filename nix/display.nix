@@ -137,7 +137,15 @@ let
           ..|../*|*/..|*/../*) target="''${out}/''${base}" ;;
           "''${out}"/*)        exit 0 ;;
           /*)                  target="''${out}/''${base}" ;;
-          *)                   target="''${out}/''${filename#./}" ;;
+          *)
+              # A relative name that ends in a directory (".", "./", "sub/",
+              # "sub/.") keeps its subpath and gets the fixed file name.
+              rel="''${filename#./}"
+              case "''${rel}" in
+                  ""|.|*/|*/.) rel="''${rel%.}"; rel="''${rel%/}"; rel="''${rel:+''${rel}/}unnamed" ;;
+              esac
+              target="''${out}/''${rel}"
+              ;;
       esac
 
       mkdir -p "$(dirname -- "''${target}")" 2>/dev/null || exit 0

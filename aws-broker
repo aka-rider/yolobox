@@ -27,6 +27,11 @@ PROFILE_NAME_RE = re.compile(PROFILE_NAME_PATTERN)
 MAX_CONCURRENT_REQUESTS = 32
 REQUEST_TIMEOUT_SECONDS = 10
 REQUEST_QUEUE_SIZE = 64
+# http.server's own cap on a request line.
+MAX_REQUEST_LINE = 65536
+# A guest-chosen request path is cut to this many characters in broker.log, so
+# a loop of long requests cannot grow the log by 64 KB a line.
+LOGGED_PATH_MAX = 256
 
 
 # Request paths come from the guest, so they can carry terminal escape
@@ -36,6 +41,12 @@ CONTROL_BYTES_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 def sanitize(text):
     return CONTROL_BYTES_RE.sub("?", text)
+
+
+def clip(text):
+    if len(text) <= LOGGED_PATH_MAX:
+        return text
+    return f"{text[:LOGGED_PATH_MAX]}...({len(text) - LOGGED_PATH_MAX} more)"
 
 
 def log(msg):
@@ -314,12 +325,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def handle(self):
         if not self.slots.acquire(blocking=False):
             log("too many concurrent requests; replying 503")
-            body = b"broker busy; retry\n"
-            self.wfile.write(
-                b"HTTP/1.0 503 Service Unavailable\r\n"
-                b"Content-Type: text/plain\r\n"
-                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
-            )
+            # The request is read before the answer: closing a socket the
+            # client is still writing to resets the connection, and the client
+            # would never see the 503.
+            try:
+                self.raw_requestline = self.rfile.readline(MAX_REQUEST_LINE + 1)
+            except OSError as failure:
+                log(f"503 not sent: reading the request failed: {failure}")
+                return
+            if self.parse_request():
+                self._send_text(503, "broker busy; retry\n")
             return
         try:
             super().handle()
@@ -334,7 +349,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return "unix-socket"
 
     def log_message(self, fmt, *args):
-        log(f"{self.address_string()} - {self.log_date_time_string()} - {fmt % args}")
+        log(
+            f"{self.address_string()} - {self.log_date_time_string()} - {clip(fmt % args)}"
+        )
 
     def _send_json(self, status, payload):
         body = json.dumps(payload).encode()
@@ -393,8 +410,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             status, kind, payload = self._route()
         except Exception:
             # A bug or an unexpected shape must become a clean 500, never a
-            # dropped connection; the traceback shows code, not values.
-            log(f"{self.path}: request failed:\n{traceback.format_exc()}")
+            # dropped connection. The traceback carries the exception's own
+            # message, so no code on this path may put a credential in one.
+            log(f"{clip(self.path)}: request failed:\n{traceback.format_exc()}")
             profile = (
                 self.path[len("/creds/") :] if self.path.startswith("/creds/") else ""
             )
