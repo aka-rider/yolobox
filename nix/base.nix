@@ -219,9 +219,11 @@ in
   ];
 
   services.openssh.enable = true;
-  # Lima reaches sshd over vsock, which iptables never sees, so no interface
-  # needs port 22 open. The tailnet gets it per interface in nix/tailscale.nix.
+  # Lima's hostagent waits for, and forwards to, TCP 22 on 192.168.5.15
+  # (enp0s1, lima's NAT network, unreachable from the LAN), so 22 is open there
+  # and on tailscale0 (nix/tailscale.nix) and nowhere else.
   services.openssh.openFirewall = false;
+  networking.firewall.interfaces.enp0s1.allowedTCPPorts = [ 22 ];
   services.openssh.settings = {
     PasswordAuthentication = false;
     KbdInteractiveAuthentication = false;

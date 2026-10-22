@@ -2487,26 +2487,55 @@ accounts"), and `nix/tailscale.nix` says so per interface:
 list is declarative and works on the iptables and the nftables backend alike,
 which an earlier approach (an `ip46tables ... -j DROP` in `extraCommands`
 plus an assertion against nftables) did not. `nix/base.nix` sets
-`services.openssh.openFirewall = false`, so port 22 is open on `tailscale0`
-and nowhere else. In particular it is not open on `enp0s1`, lima's NAT
-network (192.168.5.15; the gateway 192.168.5.2 is the Mac, and nothing on the
-LAN can reach that subnet anyway), and nothing breaks for it: lima's ssh to
-the guest rides vsock, not TCP. In the VM `ss -a --vsock` shows `v_str LISTEN
-*:22` and the operator's sessions as `ESTAB 3:22 <-> 2:*` (CID 2 is the
-host), while `ss -tan` shows no established connection on port 22 during a
-`yo ssh`. The Mac's `127.0.0.1:60022` (`ssh.localPort`) is the hostagent's
-listener on the Mac side; the hostagent carries the connection to the guest
-over vsock, so the host path never touches iptables. If a future lima or
-driver switched that path to TCP, `yo ssh` would start timing out on an
-otherwise healthy box, and the first thing to check is `ss -tan sport = :22`.
+`services.openssh.openFirewall = false`, so NixOS opens no port for sshd by
+default; 22 is opened per interface on exactly two, `tailscale0` (in
+`nix/tailscale.nix`) and `enp0s1` (in `nix/base.nix`), lima's NAT network
+(192.168.5.15; the gateway 192.168.5.2 is the Mac, and nothing on the LAN can
+reach that subnet anyway).
+The `enp0s1` rule is needed because lima's hostagent reaches the guest's sshd
+over TCP on that address. Its readiness wait polls 192.168.5.15:22 before
+`limactl start` reports the instance up, and its usernet forwarder dials the
+same address. The TCP wait comes first and gates everything; vsock is only
+detected after it. With 22 dropped, `yo up` timed out even with
+`ssh.overVsock: true` set on the instance (`limactl edit yolobox --set
+'.ssh.overVsock = true'`), and the hostagent log never mentioned vsock. With
+22 open on `enp0s1`, the same boot logged the wait, then `Detected SSH server
+is listening on the vsock port`, and the sessions then ride vsock. So the wait
+needs `enp0s1` whatever `ssh.overVsock` says, and the earlier belief that
+`enp0s1` needs nothing was wrong. Whether limactl 2.2.0 waited the same way is
+not established (the instance was last started under 2.2.0 before this boot).
+When ssh does ride vsock, `ss -a --vsock` shows `v_str LISTEN *:22` and the
+operator's sessions as `ESTAB 3:22 <-> 2:*` (CID 2 is the host), while `ss
+-tan` shows no established connection on port 22 during a `yo ssh`. The Mac's
+`127.0.0.1:60022` (`ssh.localPort`) is the hostagent's listener on the Mac
+side.
 The third is tailscaled's own ssh server, which `tailscale up --ssh` would
 start, authorising by tailnet ACL instead of by this repo's keys.
 `extraSetFlags` therefore carries `--ssh=false`.
 
+The `enp0s1` rule was added for the first boot under limactl 2.2.1 after
+`2e7cb35`, which had opened 22 on `tailscale0` only. That boot died in `yo up`
+after 600 s with `timed out waiting for port to become available on
+192.168.5.15:22`, then `did not receive an event with the running status`.
+`~/.lima/yolobox/ha.stderr.log` showed the wait starting at 16:02:43 and
+timing out at 16:12:37, then `Failed to wait for the guest SSH server to
+become available, falling back to usernet forwarder`, and every dial to
+192.168.5.15:22 ending in `context deadline exceeded`, not `connection
+refused`: nixos-fw dropped the packets. `serialv.log` ended at `yolobox
+login:`, so the guest itself was healthy. Recognise that shape by timeouts
+rather than refusals, with the guest at its login prompt. The `Can't proxy a
+datagram to udp ... 127.0.0.1:5351` lines in the same output are noise from
+tailscaled. The box was recovered over the tailnet, where 22 stayed open (`ssh
+-i ~/.lima/_config/user <operator>@<tailnet IP>`): the working tree was tarred
+in and switched with `nixos-rebuild switch --impure --flake path:...#yolobox`,
+and a box with no tailnet login would have had no way in, since root and agent
+are locked and the serial console is output-only.
+
 Recognise a regression in the VM with `sudo iptables -S INPUT | head -3`,
 which must show no `ts-input` jump; `sudo iptables -S nixos-fw | grep 'dport
-22'`, which must show exactly one accept, with `-i tailscale0`; and `ss -a
---vsock | grep ':22'`, which must show the vsock listener. From a tailnet
+22'`, which must show exactly two accepts, one with `-i enp0s1` and one with
+`-i tailscale0`; and `ss -a --vsock | grep ':22'`, which shows the vsock
+listener whenever ssh rides vsock. From a tailnet
 device, `ssh <user>@yolobox.<tailnet>.ts.net` must reach sshd and offer keys
 (a password prompt is a bug), and `curl http://yolobox.<tailnet>.ts.net:3773`
 must work. The tailnet ACLs for the node are not reviewed (see `TODO.md`).
