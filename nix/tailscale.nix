@@ -6,8 +6,8 @@ in
   # tailscale0 is governed by nixos-fw (see --netfilter-mode=off below), so
   # this per-interface list is the whole of what the tailnet can reach in the
   # kernel's filter: sshd. t3 does not need a rule, tailscale serve terminates
-  # it in tailscaled's own netstack. base.nix turns services.openssh.openFirewall
-  # off, so 22 is not open on enp0s1: the Mac reaches sshd over vsock.
+  # it in tailscaled's own netstack. base.nix opens 22 on enp0s1 for lima's
+  # hostagent, and this opens it for the tailnet.
   networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 22 ];
 
   services.tailscale = {
