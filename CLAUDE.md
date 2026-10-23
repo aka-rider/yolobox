@@ -2495,15 +2495,19 @@ reach that subnet anyway).
 The `enp0s1` rule is needed because lima's hostagent reaches the guest's sshd
 over TCP on that address. Its readiness wait polls 192.168.5.15:22 before
 `limactl start` reports the instance up, and its usernet forwarder dials the
-same address. The TCP wait comes first and gates everything; vsock is only
-detected after it. With 22 dropped, `yo up` timed out even with
-`ssh.overVsock: true` set on the instance (`limactl edit yolobox --set
-'.ssh.overVsock = true'`), and the hostagent log never mentioned vsock. With
-22 open on `enp0s1`, the same boot logged the wait, then `Detected SSH server
-is listening on the vsock port`, and the sessions then ride vsock. So the wait
-needs `enp0s1` whatever `ssh.overVsock` says, and the earlier belief that
-`enp0s1` needs nothing was wrong. Whether limactl 2.2.0 waited the same way is
-not established (the instance was last started under 2.2.0 before this boot).
+same address. Under limactl 2.2.1 the hostagent takes one of two paths at
+start. When it detects sshd on the vsock port, it logs `Started vsock
+forwarder: 127.0.0.1:60022 -> vsock:22 on VM` and `Detected SSH server is
+listening on the vsock port; changed 127.0.0.1:60022 to proxy for the vsock
+port`, and it never waits on TCP (the 2026-10-24 boot did this 17 s after
+start). When it does not, it waits up to 600 s on TCP 192.168.5.15:22 and then
+falls back to its usernet forwarder, which dials the same address. On
+2026-10-22 the log carried no vsock line at all, and setting `ssh.overVsock:
+true` on the instance (`limactl edit yolobox --set '.ssh.overVsock = true'`)
+did not change that; why detection missed that day is not known. With 22 open
+on `enp0s1` the TCP path succeeded and the box came up. So the TCP fallback is
+real, `enp0s1` must allow 22 whatever `ssh.overVsock` says, and the earlier
+belief that `enp0s1` needs nothing was wrong.
 When ssh does ride vsock, `ss -a --vsock` shows `v_str LISTEN *:22` and the
 operator's sessions as `ESTAB 3:22 <-> 2:*` (CID 2 is the host), while `ss
 -tan` shows no established connection on port 22 during a `yo ssh`. The Mac's
