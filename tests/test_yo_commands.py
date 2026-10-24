@@ -1,10 +1,12 @@
 import contextlib
 import io
+import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -243,9 +245,33 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         calls = self.run_bootstrap([("g1", "g1")])
         self.assertNotIn(["limactl", "restart", "yolobox"], calls)
 
-    def test_restarts_exactly_once_when_the_second_read_agrees(self):
+    def test_stops_exactly_once_then_starts_again_when_the_second_read_agrees(self):
         calls = self.run_bootstrap([("g1", "g0"), ("g1", "g1")])
-        self.assertEqual(calls, [["limactl", "restart", "yolobox"]])
+        self.assertEqual(calls, [["limactl", "stop", "yolobox"]])
+        self.assertEqual(
+            [call.kwargs for call in yo.vm_up.call_args_list],
+            [
+                {"run_services": False},
+                {"run_services": False, "passphrase": yo.vm_up.return_value},
+            ],
+        )
+
+    def test_the_passphrase_is_derived_before_the_vm_stops(self):
+        # A missing 1Password key must leave the running box alone.
+        yo.vm_up.return_value = None
+        order = []
+        with (
+            mock.patch.object(
+                yo,
+                "luks_passphrase",
+                side_effect=lambda: order.append("passphrase") or b"a" * 64,
+            ),
+            mock.patch.object(
+                yo, "lima_stop", side_effect=lambda: order.append("stop")
+            ),
+        ):
+            self.run_bootstrap([("g1", "g0"), ("g1", "g1")])
+        self.assertEqual(order, ["passphrase", "stop"])
 
     def test_tells_the_operator_the_ssh_identity_comes_from_dotfiles(self):
         self.run_bootstrap([("g1", "g1")])
@@ -284,10 +310,10 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         messages = " ".join(call.args[0] for call in fake_err.call_args_list)
         self.assertIn("yo status", messages)
 
-    def test_failed_restart_aborts_naming_the_recovery(self):
+    def test_failed_stop_aborts_naming_the_recovery(self):
         def fake_run(argv, **kwargs):
-            if argv[:2] == ["limactl", "restart"]:
-                raise yo.YoError("limactl restart yolobox failed (exit 1)")
+            if argv[:2] == ["limactl", "stop"]:
+                raise yo.YoError("limactl stop yolobox failed (exit 1)")
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         args = yo.build_parser().parse_args(["bootstrap"])
@@ -299,7 +325,7 @@ class TestBootstrapRebootDecision(unittest.TestCase):
             with self.assertRaises(yo.YoError):
                 yo.cmd_bootstrap(args)
         messages = " ".join(call.args[0] for call in fake_err.call_args_list)
-        self.assertIn("limactl stop", messages)
+        self.assertIn("limactl stop failed", messages)
         self.assertIn("yo bootstrap", messages)
 
     def test_ssh_include_and_herdr_run_before_vm_services(self):
@@ -335,6 +361,68 @@ class TestBootstrapRebootDecision(unittest.TestCase):
                 "vm_services",
             ],
         )
+
+
+class TestBootstrapWarnsBeforeEncryptingInPlace(unittest.TestCase):
+    def run_bootstrap(self, fstype, df_line):
+        rebuilds = self.rebuilds = []
+
+        def fake_ssh_run(role, argv, **kwargs):
+            if argv[:2] == ["lsblk", "-no"]:
+                return mock.Mock(returncode=0, stdout=fstype + "\n", stderr="")
+            if argv[:2] == ["df", "-P"]:
+                header = "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                return mock.Mock(returncode=0, stdout=header + df_line, stderr="")
+            if "nixos-rebuild" in argv:
+                rebuilds.append(argv)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        args = yo.build_parser().parse_args(["bootstrap"])
+        with (
+            mock.patch.dict(os.environ, {"YOLOBOX_FLAKE": "github:x/y"}),
+            mock.patch.object(yo, "vm_up"),
+            mock.patch.object(yo, "vm_services"),
+            mock.patch.object(yo, "ensure_herdr_machine"),
+            mock.patch.object(yo, "ensure_guest_known_hosts"),
+            mock.patch.object(yo, "ensure_ssh_config_include"),
+            mock.patch.object(yo, "ssh_run", side_effect=fake_ssh_run),
+            mock.patch.object(yo, "guest_generations", return_value=("g1", "g1")),
+            mock.patch.object(yo, "out"),
+            mock.patch.object(yo, "err") as fake_err,
+        ):
+            try:
+                yo.cmd_bootstrap(args)
+            finally:
+                self.stderr = " ".join(call.args[0] for call in fake_err.call_args_list)
+        return rebuilds
+
+    def test_an_unencrypted_disk_gets_the_no_interruption_warning(self):
+        rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /\n")
+        self.assertEqual(len(rebuilds), 1)
+        self.assertIn("encrypts /dev/vda2 in place", self.stderr)
+        self.assertIn("must not be interrupted", self.stderr)
+
+    def test_an_encrypted_disk_gets_no_warning(self):
+        rebuilds = self.run_bootstrap(
+            "crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /\n"
+        )
+        self.assertEqual(len(rebuilds), 1)
+        self.assertNotIn("in place", self.stderr)
+
+    def test_a_disk_over_90_percent_full_is_refused(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.run_bootstrap("ext4", "/dev/vda2 1000 950 50 95% /\n")
+        self.assertIn("95% full", caught.exception.message)
+        self.assertIn("yo gc --deep --yes", caught.exception.message)
+        self.assertEqual(self.rebuilds, [])
+
+    def test_exactly_90_percent_full_is_still_allowed(self):
+        rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 900 100 90% /\n")
+        self.assertEqual(len(rebuilds), 1)
+
+    def test_an_unreadable_df_is_an_error_not_a_pass(self):
+        with self.assertRaises(yo.YoError):
+            self.run_bootstrap("ext4", "garbage\n")
 
 
 class TestGcSkipsCollectionOnHalfFailedSwitch(unittest.TestCase):
@@ -1005,6 +1093,7 @@ class TestCmdStatus(unittest.TestCase):
         aws_which,
         aws_allowlist_side_effect,
         net_check=None,
+        fstype="",
     ):
         outs = []
         # net_check is either the net-check subprocess result or the YoError
@@ -1023,7 +1112,8 @@ class TestCmdStatus(unittest.TestCase):
             outs.append(line)
 
         def fake_ssh_run(role, argv, **kwargs):
-            return mock.Mock(returncode=0, stdout="", stderr="")
+            stdout = fstype if argv[:2] == ["lsblk", "-no"] else ""
+            return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
         with (
             mock.patch.object(
@@ -1098,6 +1188,64 @@ class TestCmdStatus(unittest.TestCase):
         )
         self.assertTrue(any("aws: config unreadable:" in line for line in outs))
 
+    def status_with_fstype(self, fstype):
+        return self.run_status(
+            units_present=True,
+            gaps=[],
+            aws_which=None,
+            aws_allowlist_side_effect=lambda: [],
+            fstype=fstype,
+        )
+
+    def test_an_unencrypted_root_is_flagged_with_the_remedy(self):
+        outs = self.status_with_fstype("ext4\n")
+        self.assertIn(
+            "disk: /dev/vda2 is ext4 — NOT encrypted; rebuild and reboot: yo bootstrap",
+            outs,
+        )
+
+    def test_an_encrypted_root_is_reported_plainly(self):
+        outs = self.status_with_fstype("crypto_LUKS\next4\n")
+        self.assertIn("disk: /dev/vda2 is crypto_LUKS", outs)
+        self.assertFalse(any("NOT encrypted" in line for line in outs))
+
+    def test_an_unreadable_root_type_is_not_called_unencrypted(self):
+        outs = self.status_with_fstype("")
+        self.assertIn("disk: cannot read the type of /dev/vda2", outs)
+        self.assertFalse(any("NOT encrypted" in line for line in outs))
+
+    def test_the_lima_line_names_the_over_vsock_remedy(self):
+        outs = self.run_status(
+            units_present=True,
+            gaps=[yo.GAP_SSH_OVER_VSOCK],
+            aws_which=None,
+            aws_allowlist_side_effect=lambda: [],
+        )
+        self.assertTrue(
+            any(
+                line.startswith("lima:") and ".ssh.overVsock = false" in line
+                for line in outs
+            )
+        )
+
+    def test_a_box_waiting_in_its_initrd_says_it_is_locked(self):
+        outs = []
+        with (
+            mock.patch.object(yo, "run", return_value=mock.Mock(returncode=0)),
+            mock.patch.object(yo, "account_status", return_value=("unreachable", "")),
+            mock.patch.object(yo, "sshd_answers", return_value="yes") as answers,
+            mock.patch.object(yo, "lima_config_gaps", return_value=[]),
+            mock.patch.object(yo, "du_kib", return_value=None),
+            mock.patch.object(yo.shutil, "which", return_value=None),
+            mock.patch.object(yo, "out", side_effect=outs.append),
+            mock.patch.object(yo, "err"),
+        ):
+            yo.cmd_status(yo.build_parser().parse_args(["status"]))
+        answers.assert_called_once_with("root")
+        self.assertTrue(
+            any(line.startswith("disk: locked") and "yo up" in line for line in outs)
+        )
+
     def test_network_line_reports_what_the_guest_net_check_answered(self):
         outs = self.run_status(
             units_present=True,
@@ -1155,6 +1303,474 @@ class TestNetworkStatusLine(unittest.TestCase):
     def test_both_dead_points_at_the_lima_line(self):
         line = yo.network_status_line(False, False)
         self.assertIn("neither the internet nor lima's gateway", line)
+
+
+class FakeStarter:
+    """A `limactl start` process: running until waited on, or already exited."""
+
+    def __init__(self, code, exited_already):
+        self.code = code
+        self.exited_already = exited_already
+        self.terminated = False
+        self.waited = False
+
+    def poll(self):
+        return self.code if self.exited_already or self.waited else None
+
+    @property
+    def returncode(self):
+        return self.poll()
+
+    def wait(self):
+        self.waited = True
+        return self.code
+
+    def terminate(self):
+        self.terminated = True
+
+
+class RecordedStdin:
+    def __init__(self):
+        self.sent = b""
+
+    def write(self, data):
+        self.sent += data
+
+    def close(self):
+        pass
+
+
+class FakeHelper:
+    """The `yolobox-unlock` ssh session: scripted stdout lines, exit code, stderr."""
+
+    def __init__(self, lines, code, stderr):
+        self.stdout = io.BytesIO("".join(line + "\n" for line in lines).encode())
+        self.stderr = io.BytesIO(stderr.encode())
+        self.stdin = RecordedStdin()
+        self.code = code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def wait(self):
+        return self.code
+
+
+NOT_LISTENING = (255, "ssh: connect to host 127.0.0.1 port 60022: Connection refused")
+REFUSED = (255, "root@127.0.0.1: Permission denied (publickey).")
+ANSWERS = (0, "")
+UNLOCKED = (["yolobox-unlock: unlocked"], 0, "")
+MIGRATE_ASKED = "yolobox-unlock: answered id=%s" % yo.MIGRATE_ASK_ID
+MIGRATED_AND_UNLOCKED = ([MIGRATE_ASKED, "yolobox-unlock: unlocked"], 0, "")
+DROPPED_AFTER_MIGRATING = ([MIGRATE_ASKED], 255, "")
+NOT_LISTENING_HELPER = ([], *NOT_LISTENING)
+REFUSED_HELPER = ([], *REFUSED)
+
+
+class FakeBox:
+    """Lima and the guest's two sshds as the Mac sees them, at run and Popen.
+
+    Each script is a list consumed front to back whose last entry repeats.
+    Time is virtual: sleeping advances the clock the deadlines read.
+    """
+
+    def __init__(
+        self,
+        test,
+        *,
+        statuses=("Running",),
+        operator=(ANSWERS,),
+        root=(ANSWERS,),
+        helpers=(UNLOCKED,),
+        starts=((0, False),),
+    ):
+        self.statuses = list(statuses)
+        self.operator = list(operator)
+        self.root = list(root)
+        self.helper_script = list(helpers)
+        self.start_script = list(starts)
+        self.clock = 1000.0
+        self.sleeps = []
+        self.stops = 0
+        self.starts = []
+        self.helpers = []
+        self.running_since = None
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+        self.luks_passphrase = mock.Mock(return_value=b"a" * 64)
+        self.vm_services = mock.Mock()
+        home = tempfile.TemporaryDirectory()
+        test.addCleanup(home.cleanup)
+        patches = [
+            mock.patch.dict(os.environ, {"HOME": home.name}),
+            mock.patch.object(yo, "run", self.run),
+            mock.patch.object(yo.subprocess, "Popen", self.popen),
+            mock.patch.object(yo, "luks_passphrase", self.luks_passphrase),
+            mock.patch.object(yo, "vm_services", self.vm_services),
+            mock.patch.object(yo, "ensure_agent_ssh_config"),
+            mock.patch.object(yo, "ensure_guest_known_hosts"),
+            mock.patch.object(yo, "lima_config_gaps", return_value=[]),
+            mock.patch.object(yo.time, "sleep", self.sleep),
+            mock.patch.object(yo.time, "monotonic", lambda: self.clock),
+            contextlib.redirect_stdout(self.stdout),
+            contextlib.redirect_stderr(self.stderr),
+        ]
+        for patch in patches:
+            patch.__enter__()
+            test.addCleanup(patch.__exit__, None, None, None)
+
+    @staticmethod
+    def next(script):
+        return script.pop(0) if len(script) > 1 else script[0]
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.clock += seconds
+
+    def run(self, argv, **kwargs):
+        argv = list(argv)
+        if argv[:3] == ["limactl", "list", "yolobox"]:
+            status = self.next(self.statuses)
+            if status == "Running" and self.starts and self.running_since is None:
+                self.running_since = self.clock
+            payload = json.dumps({"status": status, "config": {}})
+            return subprocess.CompletedProcess(argv, 0, payload, "")
+        if argv[:3] == ["limactl", "list", "-q"]:
+            return subprocess.CompletedProcess(argv, 0, "yolobox\n", "")
+        if argv[:2] == ["limactl", "stop"]:
+            self.stops += 1
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "ssh" and argv[-1] == "true":
+            user = next(a for a in argv if a.startswith("User=")).split("=", 1)[1]
+            script = self.root if user == "root" else self.operator
+            code, stderr = self.next(script)
+            return subprocess.CompletedProcess(argv, code, "", stderr)
+        raise AssertionError("unexpected run: %r" % argv)
+
+    def popen(self, argv, **kwargs):
+        argv = list(argv)
+        if argv[:2] == ["limactl", "start"]:
+            starter = FakeStarter(*self.next(self.start_script))
+            self.starts.append(starter)
+            return starter
+        if argv[-1] == yo.INITRD_UNLOCK_HELPER:
+            helper = FakeHelper(*self.next(self.helper_script))
+            self.helpers.append(helper)
+            return helper
+        raise AssertionError("unexpected Popen: %r" % argv)
+
+    def up(self):
+        yo.cmd_up(yo.build_parser().parse_args(["up"]))
+
+
+class TestUpStartsAndUnlocks(unittest.TestCase):
+    def test_a_box_that_is_up_needs_no_passphrase_and_no_start(self):
+        box = FakeBox(self, statuses=["Running"], operator=[ANSWERS])
+        box.up()
+        box.luks_passphrase.assert_not_called()
+        self.assertEqual(box.starts, [])
+        self.assertEqual(box.helpers, [])
+        box.vm_services.assert_called_once_with()
+
+    def test_a_stopped_box_is_started_and_unlocked_with_the_derived_passphrase(self):
+        box = FakeBox(self, statuses=["Stopped", "Running"], helpers=[UNLOCKED])
+        box.up()
+        self.assertEqual(len(box.starts), 1)
+        self.assertEqual(len(box.helpers), 1)
+        self.assertEqual(box.helpers[0].stdin.sent, b"a" * 64 + b"\n")
+        self.assertIn("yolobox-unlock: unlocked", box.stdout.getvalue())
+        box.vm_services.assert_called_once_with()
+
+    def test_a_box_waiting_in_its_initrd_is_unlocked_without_a_start(self):
+        box = FakeBox(self, operator=[REFUSED, ANSWERS], root=[ANSWERS])
+        box.up()
+        self.assertEqual(box.starts, [])
+        self.assertEqual(len(box.helpers), 1)
+        box.luks_passphrase.assert_called_once_with()
+
+    def test_a_running_box_that_answers_nowhere_is_an_error_without_a_prompt(self):
+        box = FakeBox(self, operator=[NOT_LISTENING], root=[NOT_LISTENING])
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("neither its initrd nor its sshd", caught.exception.message)
+        box.luks_passphrase.assert_not_called()
+
+    def test_a_migration_after_lima_gave_up_restarts_cleanly_once(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            helpers=[MIGRATED_AND_UNLOCKED, UNLOCKED],
+            starts=[(1, False), (0, False)],
+        )
+        box.up()
+        self.assertEqual(box.stops, 1)
+        self.assertEqual(len(box.starts), 2)
+        self.assertEqual(len(box.helpers), 2)
+        box.vm_services.assert_called_once_with()
+
+    def test_lima_failing_without_a_migration_is_not_restarted(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            helpers=[UNLOCKED],
+            starts=[(1, False)],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("limactl start exited 1", caught.exception.message)
+        self.assertEqual(box.stops, 0)
+
+    def test_a_failed_migration_says_the_plaintext_is_intact_and_ends_the_start(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            helpers=[(["e2fsck failed"], 2, "no space")],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("plaintext intact", caught.exception.message)
+        self.assertIn("no space", caught.exception.message)
+        self.assertTrue(box.starts[0].terminated)
+
+    def test_a_wrong_key_is_named_and_there_is_no_recovery_slot(self):
+        box = FakeBox(self, statuses=["Stopped", "Running"], helpers=[([], 1, "")])
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("no recovery slot", caught.exception.message)
+
+    def test_a_lost_watch_in_the_helper_is_reported(self):
+        box = FakeBox(self, statuses=["Stopped", "Running"], helpers=[([], 3, "lost")])
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("lost its watch", caught.exception.message)
+
+    def test_an_unexpected_helper_exit_carries_its_stderr(self):
+        box = FakeBox(
+            self, statuses=["Stopped", "Running"], helpers=[([], 17, "weird")]
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("exit 17", caught.exception.message)
+        self.assertIn("weird", caught.exception.message)
+
+    def test_an_ssh_failure_of_no_known_shape_is_surfaced_not_retried(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            helpers=[([], 255, "Bad configuration option: lizard")],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("lizard", caught.exception.message)
+        self.assertEqual(box.sleeps, [])
+
+    def test_a_key_refused_for_root_and_the_operator_names_cidata_at_the_deadline(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            operator=[REFUSED],
+            helpers=[REFUSED_HELPER],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("cidata", caught.exception.message)
+        self.assertGreater(sum(box.sleeps), yo.INITRD_WAIT_SECONDS)
+
+    def test_a_refusal_that_clears_when_the_operators_key_lands_is_no_error(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            operator=[REFUSED, ANSWERS],
+            helpers=[REFUSED_HELPER],
+        )
+        box.up()
+        self.assertEqual(len(box.starts), 1)
+
+    def test_lima_exiting_before_the_initrd_answers_is_reported_at_once(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            helpers=[NOT_LISTENING_HELPER],
+            starts=[(1, True)],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("limactl start exited 1", caught.exception.message)
+        self.assertLessEqual(len(box.sleeps), 1)
+
+    def test_the_deadline_starts_only_when_lima_reports_running(self):
+        installing = 400  # 400 polls of 2 s would already pass the 600 s budget
+        box = FakeBox(
+            self,
+            statuses=["Stopped"] + ["Installing"] * installing + ["Running"],
+            helpers=[NOT_LISTENING_HELPER],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("never offered its initrd sshd", caught.exception.message)
+        self.assertGreaterEqual(len(box.sleeps), installing)
+        waited = box.clock - box.running_since
+        self.assertGreater(waited, yo.INITRD_WAIT_SECONDS)
+        self.assertLess(waited, yo.INITRD_WAIT_SECONDS + 10)
+
+    def test_an_unlocked_disk_whose_operator_never_answers_is_an_error(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            operator=[NOT_LISTENING],
+            helpers=[UNLOCKED],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("not reachable as the operator", caught.exception.message)
+        self.assertTrue(box.starts[0].terminated)
+
+
+class TestUnlockSurvivesADroppedSession(unittest.TestCase):
+    # The migration streamed for longer than lima's 10 minutes, so limactl start
+    # exited 1 long ago and the session then dropped at switch-root; stage 2's
+    # sshd refuses root, and the operator answers only a few probes later.
+    SCRIPT = dict(
+        statuses=["Stopped", "Running"],
+        operator=[NOT_LISTENING, NOT_LISTENING, NOT_LISTENING, ANSWERS],
+        helpers=[
+            DROPPED_AFTER_MIGRATING,
+            REFUSED_HELPER,
+            REFUSED_HELPER,
+            REFUSED_HELPER,
+            UNLOCKED,
+        ],
+    )
+
+    def test_lima_having_exited_is_not_blamed_once_the_session_has_run(self):
+        FakeBox(self, **self.SCRIPT)
+        outcome = yo.unlock_disk(b"a" * 64, FakeStarter(1, True))
+        self.assertEqual(outcome, ("already-unlocked", True))
+
+    def test_up_then_stops_and_starts_lima_cleanly(self):
+        box = FakeBox(self, starts=[(1, True), (0, False)], **self.SCRIPT)
+        box.up()
+        self.assertEqual(box.stops, 1)
+        self.assertEqual(len(box.starts), 2)
+        self.assertEqual(len(box.helpers), 5)
+        box.vm_services.assert_called_once_with()
+
+
+class TestRunTimeout(unittest.TestCase):
+    def test_a_command_over_its_timeout_is_an_error_naming_it(self):
+        expired = subprocess.TimeoutExpired(["limactl", "stop"], 5)
+        with mock.patch.object(yo.subprocess, "run", side_effect=expired) as fake_run:
+            with self.assertRaises(yo.YoError) as caught:
+                yo.run(["limactl", "stop", "yolobox"], timeout=5)
+        self.assertEqual(fake_run.call_args.kwargs["timeout"], 5)
+        self.assertIn(
+            "limactl stop yolobox did not finish within 5 s", caught.exception.message
+        )
+
+
+class TestLimaStop(unittest.TestCase):
+    def test_a_hung_stop_carries_the_recovery(self):
+        expired = subprocess.TimeoutExpired(["limactl", "stop"], yo.LIMA_STOP_TIMEOUT)
+        with mock.patch.object(yo.subprocess, "run", side_effect=expired):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.lima_stop()
+        self.assertIn(
+            "did not finish within %d s" % yo.LIMA_STOP_TIMEOUT,
+            caught.exception.message,
+        )
+        self.assertIn("kill -9", caught.exception.message)
+        self.assertIn("systemctl reboot", caught.exception.message)
+
+    def test_down_stops_the_instance_under_the_timeout(self):
+        with mock.patch.object(yo, "run") as fake_run:
+            yo.cmd_down(yo.build_parser().parse_args(["down"]))
+        fake_run.assert_called_once_with(
+            ["limactl", "stop", "yolobox"],
+            capture=False,
+            check=True,
+            timeout=yo.LIMA_STOP_TIMEOUT,
+        )
+
+
+class TestDiskGrowResizesTheMapping(FakeHome):
+    def disk_grow(self, fstype="crypto_LUKS\next4\n"):
+        os.makedirs(os.path.join(self.home, ".lima"))
+        calls = []
+        df_k = iter(
+            [
+                "Filesystem 1K-blocks\n/dev/mapper/root 100\n",
+                "x\n/dev/mapper/root 200\n",
+            ]
+        )
+
+        def fake_run(argv, **kwargs):
+            if argv[:2] == ["limactl", "list"]:
+                return mock.Mock(returncode=0, stdout=str(100 * 1024**3), stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def fake_ssh_run(role, argv, **kwargs):
+            calls.append((argv, kwargs.get("stdin")))
+            stdout = ""
+            if argv[:2] == ["systemctl", "show"]:
+                stdout = "loaded\n"
+            elif argv[:2] == ["lsblk", "-no"] and argv[2] == "FSTYPE":
+                stdout = fstype
+            elif argv[:3] == ["df", "-k", "/"]:
+                stdout = next(df_k)
+            elif argv[:2] == ["df", "-h"]:
+                stdout = "Filesystem Size\n/dev/mapper/root 100G\n"
+            return mock.Mock(returncode=0, stdout=stdout, stderr="")
+
+        order = []
+        with (
+            mock.patch.object(yo, "run", side_effect=fake_run),
+            mock.patch.object(yo, "ssh_run", side_effect=fake_ssh_run),
+            mock.patch.object(
+                yo, "lima_stop", side_effect=lambda: order.append("stop")
+            ),
+            mock.patch.object(
+                yo, "vm_up", side_effect=lambda **kw: order.append(kw)
+            ) as up,
+            mock.patch.object(
+                yo,
+                "luks_passphrase",
+                side_effect=lambda: order.append("passphrase") or b"p" * 64,
+            ),
+            mock.patch.object(yo, "out"),
+        ):
+            try:
+                yo.cmd_disk_grow(yo.build_parser().parse_args(["disk-grow", "200"]))
+            finally:
+                self.order = order
+                self.up = up
+        return calls
+
+    def test_grows_the_mapping_with_the_passphrase_then_the_filesystem(self):
+        calls = self.disk_grow()
+        resize = (
+            ["sudo", "cryptsetup", "resize", "--key-file", "-", "root"],
+            b"p" * 64,
+        )
+        grow_fs = (["sudo", "resize2fs", "/dev/mapper/root"], None)
+        self.assertIn(resize, calls)
+        self.assertEqual(calls.index(grow_fs), calls.index(resize) + 1)
+
+    def test_the_passphrase_is_derived_before_the_vm_stops_and_reused_for_the_start(
+        self,
+    ):
+        self.disk_grow()
+        self.assertEqual(self.order[0], "passphrase")
+        self.assertEqual(self.order[1], "stop")
+        self.assertEqual(self.order[2], {"passphrase": b"p" * 64})
+
+    def test_an_unencrypted_disk_is_refused_before_anything_stops(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.disk_grow(fstype="ext4\n")
+        self.assertIn("yo bootstrap", caught.exception.message)
+        self.assertEqual(self.order, [])
 
 
 if __name__ == "__main__":
