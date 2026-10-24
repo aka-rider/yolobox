@@ -32,6 +32,9 @@ commit `4c154fc`.
   push-to-checkout target (`receive.denyCurrentBranch = updateInstead`), so
   the VM refuses a push when its worktree differs from HEAD. The VM commits
   `devbox.lock`, so pull before you push again.
+- **The root disk is encrypted.** `/dev/vda2` is LUKS2; `yo up` derives the
+  passphrase from a 1Password SSH key and feeds it to an sshd inside the
+  initrd. See `docs/disk-encryption.md`.
 - **The box builds from a published flake ref.** `yo bootstrap` runs
   `nixos-rebuild` against `github:aka-rider/yolobox/v<version>`. The VM holds
   no checkout of this repo. See `docs/distribution.md`.
@@ -59,6 +62,9 @@ Box configuration (Nix):
 - `nix/base.nix`: filesystems, boot, sshd, tmpfiles, git defaults, the lima
   units and core packages. It declares both accounts, `users.users.${username}`
   and the agent's. `nix/base.md`, `docs/accounts.md`.
+- `nix/luks.nix` and `nix/luks/`: the root disk's encryption. `luks.nix` is
+  the initrd configuration, `apps.nix` defines the three scripts that run
+  there. `docs/disk-encryption.md`.
 - `nix/agentic.nix`: only an imports list for `harnesses.nix`,
   `herd-server.nix`, `display.nix` and `t3.nix`.
 - `nix/harnesses.nix`: the `claude` launcher and the user service that
@@ -105,6 +111,8 @@ Tests, all under `tests/`:
 - `test_consistency.py`: keeps the Python, Nix and shell spellings of one
   fact equal.
 - `test_guest_script.py`: runs the guest script's functions under bash.
+- `test_yo_luks.py`: the passphrase derivation and the ssh agent protocol.
+- `test_luks_scripts.py`: runs the three initrd scripts under bash.
 
 ## Build, test, release
 
@@ -134,8 +142,8 @@ YOLOBOX_USERNAME=$(id -un) nix flake check --impure
 
 `docs/README.md` states the convention and lists every story file. A story
 lives in `<stem>.md` beside the file it explains, and cross-cutting ones live
-in `docs/<topic>.md` (`accounts`, `ssh`, `aws`, `disk`, `mac-network`,
-`distribution`). Before editing a file, check whether its `<stem>.md`
+in `docs/<topic>.md` (`accounts`, `ssh`, `aws`, `disk`, `disk-encryption`,
+`mac-network`, `distribution`). Before editing a file, check whether its `<stem>.md`
 exists and read it. A short "why" stays in the code comment; the story file
 holds the incident, the evidence and how to recognise the failure.
 
