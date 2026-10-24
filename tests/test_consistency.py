@@ -190,9 +190,7 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
             'YOLOBOX_UNLOCK_UNTIL_UNIT = "systemd-cryptsetup@${facts.mapper}.service";',
             text,
         )
-        self.assertIn(
-            "YOLOBOX_SSH_LOCAL_PORT = toString facts.sshLocalPort;", text
-        )
+        self.assertIn("YOLOBOX_SSH_LOCAL_PORT = toString facts.sshLocalPort;", text)
 
     def test_the_unlock_header_table_and_yo_agree_on_the_exit_codes(self):
         script = self.text("nix", "luks", "yolobox-unlock.sh")
