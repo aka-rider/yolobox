@@ -2,7 +2,7 @@
 
 The VM's root partition, `/dev/vda2`, is LUKS2-encrypted. `yo up` unlocks it at every start with a passphrase it derives from a 1Password SSH key, and it hands that passphrase to an sshd that runs inside the initrd. Nothing secret is written to disk on the Mac or in the guest. This page explains why the box works that way, what the design does not protect, and how to recognise each piece failing. The rules are in [CONSTITUTION.md](../CONSTITUTION.md#disk-encryption).
 
-The code is in `nix/luks.nix` (the initrd configuration), `nix/luks/apps.nix` with the three scripts beside it (`yolobox-initrd-authorized-keys.sh`, `yolobox-unlock.sh`, `yolobox-luks-migrate.sh`), and in `yo` (`vm_up`, `unlock_disk`, `luks_passphrase`, `lima_stop`, `sshd_answers`). Sections that describe behaviour nobody has observed yet say so.
+The code is in `nix/luks.nix` (the initrd configuration), `nix/luks/facts.nix` (the device, label, mapper name and ssh port that more than one file needs, defined once and tied to `yo` and `lima/yolobox.yaml` by `tests/test_consistency.py`), `nix/luks/apps.nix` with the three scripts beside it (`yolobox-initrd-authorized-keys.sh`, `yolobox-unlock.sh`, `yolobox-luks-migrate.sh`), and in `yo` (`vm_up`, `unlock_disk`, `luks_passphrase`, `lima_stop`, `sshd_answers`). Sections that describe behaviour nobody has observed yet say so.
 
 ## What is encrypted and what is not
 
@@ -81,7 +81,7 @@ It checks the migration unit first. A migration that failed would otherwise leav
 
 ## Encrypting in place
 
-The box is not recreated to encrypt it. The first boot of the generation that carries `nix/luks.nix` encrypts `/dev/vda2` in place, inside the initrd. The same code serves a fresh instance, whose first boot is the plain nixos-lima image. `yolobox-luks-migrate.service` is an initrd oneshot that `systemd-cryptsetup@root.service` requires and runs before. It looks at `/dev/vda2` and picks one of four states.
+The box is not recreated to encrypt it. The first boot of the generation that carries `nix/luks.nix` encrypts `/dev/vda2` in place, inside the initrd. The same code serves a fresh instance, whose first boot is the plain nixos-lima image. `yolobox-luks-migrate.service` is an initrd oneshot that `systemd-cryptsetup@root.service` requires and runs before. The unit runs `yolobox-luks-migrate <device> <label> <mapper>` with the three values from `nix/luks/facts.nix` (`/dev/vda2`, `yolobox-luks`, `root`), and the script uses the mapper name everywhere it opens, inspects or closes the mapping. It looks at `/dev/vda2` and picks one of four states.
 
 - ext4: encrypt. `e2fsck -f -y`, shrink the filesystem to its minimum plus 5%, then `cryptsetup reencrypt --encrypt` with `--reduce-device-size 32M` and `--device-size` set to the shrunken filesystem plus 32 MiB, rounded up to 4 MiB. Then finalize.
 - LUKS with an unfinished reencryption (`luksDump` shows `online-reencrypt` in its requirements): resume with `--resume-only`, then finalize.

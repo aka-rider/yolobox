@@ -4,8 +4,8 @@
 # scripts live in nix/luks/ and their definitions in nix/luks/apps.nix.
 { config, pkgs, lib, utils, ... }:
 let
-  device = "/dev/vda2";
-  label = "yolobox-luks";
+  inherit (import ./luks/facts.nix) device label mapper;
+  cryptsetupUnit = "systemd-cryptsetup@${mapper}.service";
   cidataDevice = "/dev/disk/by-label/cidata";
   cidataUnit = "${utils.escapeSystemdPath cidataDevice}.device";
   deviceUnit = "${utils.escapeSystemdPath device}.device";
@@ -19,9 +19,9 @@ in
   # The cidata ISO is mounted in the initrd to read lima's key.
   boot.initrd.kernelModules = [ "isofs" ];
 
-  # dm-crypt in the initrd, and /etc/crypttab for systemd-cryptsetup@root.
+  # dm-crypt in the initrd, and /etc/crypttab for systemd-cryptsetup@<mapper>.service.
   # Discards pass through so the host's sparse disk file stays sparse.
-  boot.initrd.luks.devices.root = {
+  boot.initrd.luks.devices.${mapper} = {
     inherit device;
     allowDiscards = true;
   };
@@ -89,11 +89,11 @@ in
     description = "Encrypt or finish encrypting ${device} in place before it is opened";
     # requiredBy: a failed migration stops the cryptsetup unit with a
     # dependency failure, so it is never misread as a wrong passphrase.
-    requiredBy = [ "systemd-cryptsetup@root.service" ];
+    requiredBy = [ cryptsetupUnit ];
     wants = [ "cryptsetup-pre.target" ];
     requires = [ deviceUnit ];
     after = [ deviceUnit ];
-    before = [ "systemd-cryptsetup@root.service" "cryptsetup-pre.target" "shutdown.target" ];
+    before = [ cryptsetupUnit "cryptsetup-pre.target" "shutdown.target" ];
     conflicts = [ "shutdown.target" ];
     unitConfig = {
       DefaultDependencies = false;
@@ -113,7 +113,7 @@ in
       # It waits for the passphrase indefinitely, then encrypts for hours.
       TimeoutStartSec = "infinity";
     };
-    script = "exec ${lib.getExe apps.migrate} ${device} ${label}";
+    script = "exec ${lib.getExe apps.migrate} ${device} ${label} ${mapper}";
   };
 
   # cryptsetup resize and luksDump need the CLI in stage 2; only the

@@ -118,17 +118,65 @@ class TestLimaYamlMatchesPortForwardsConstant(unittest.TestCase):
         self.assertEqual(ssh.get("localPort"), str(yo.SSH_LOCAL_PORT))
 
 
+def luks_facts():
+    """nix/luks/facts.nix as a dict: `name = "text";` and `name = 123;` lines."""
+    text = (REPO / "nix" / "luks" / "facts.nix").read_text()
+    found = re.findall(r'^\s*(\w+) = "?([^";]+)"?;', text, re.M)
+    return {name: yaml_scalar(value) for name, value in found}
+
+
 class TestLuksFilesMatchYoConstants(unittest.TestCase):
+    # The label is the one fact yo does not know: the script writes it and
+    # reads it back, and nothing on the Mac does.
+    LABEL = "yolobox-luks"
+
     def text(self, *parts):
         return REPO.joinpath(*parts).read_text()
 
-    def test_luks_nix_names_the_device_label_and_mapper_yo_uses(self):
-        text = self.text("nix", "luks.nix")
-        self.assertIn('device = "%s";' % yo.LUKS_DEVICE, text)
-        self.assertIn('label = "%s";' % yo.LUKS_LABEL, text)
-        self.assertIn("boot.initrd.luks.devices.%s = " % yo.LUKS_MAPPER, text)
+    def test_facts_nix_holds_exactly_the_literals_yo_and_lima_state(self):
+        facts = luks_facts()
+        self.assertEqual(
+            facts,
+            {
+                "device": yo.LUKS_DEVICE,
+                "label": self.LABEL,
+                "mapper": yo.LUKS_MAPPER,
+                "sshLocalPort": yo.SSH_LOCAL_PORT,
+            },
+        )
+        self.assertEqual(
+            yaml_scalar(
+                dict(
+                    line.strip().split(":", 1)
+                    for line in yaml_block(self.text("lima", "yolobox.yaml"), "ssh")
+                    if ":" in line and not line.strip().startswith("#")
+                )["localPort"]
+            ),
+            facts["sshLocalPort"],
+        )
 
-    def test_apps_nix_names_the_three_scripts_and_the_device(self):
+    def test_luks_nix_takes_device_label_and_mapper_from_facts_nix(self):
+        text = self.text("nix", "luks.nix")
+        self.assertIn("inherit (import ./luks/facts.nix) device label mapper;", text)
+        self.assertIn("boot.initrd.luks.devices.${mapper} = ", text)
+
+    def test_the_root_filesystem_is_the_mapper_facts_nix_names(self):
+        self.assertIn(
+            'device = "/dev/mapper/%s";' % luks_facts()["mapper"],
+            self.text("nix", "base.nix"),
+        )
+
+    def test_the_label_luks_nix_hands_the_migrate_script_is_the_documented_one(self):
+        luks = self.text("nix", "luks.nix")
+        (args,) = re.findall(r"exec \$\{lib\.getExe apps\.migrate\} (.*?)\";", luks)
+        self.assertEqual(args, "${device} ${label} ${mapper}")
+        self.assertEqual(luks_facts()["label"], self.LABEL)
+        self.assertIn("`%s`" % self.LABEL, self.text("docs", "disk-encryption.md"))
+        script = self.text("nix", "luks", "yolobox-luks-migrate.sh")
+        for position, name in enumerate(("device", "label", "mapper"), start=1):
+            self.assertIn("\n%s=$%d\n" % (name, position), script)
+
+    def test_apps_nix_names_the_three_scripts_and_takes_its_facts_from_facts_nix(self):
         text = self.text("nix", "luks", "apps.nix")
         for name in (
             yo.INITRD_UNLOCK_HELPER,
@@ -136,7 +184,25 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
             "yolobox-initrd-authorized-keys",
         ):
             self.assertIn(name, text)
-        self.assertIn('LUKS_DEVICE = "%s";' % yo.LUKS_DEVICE, text)
+        self.assertIn("facts = import ./facts.nix;", text)
+        self.assertIn("LUKS_DEVICE = facts.device;", text)
+        self.assertIn(
+            "YOLOBOX_SSH_LOCAL_PORT = toString facts.sshLocalPort;", text
+        )
+
+    def test_the_unlock_header_table_and_yo_agree_on_the_exit_codes(self):
+        script = self.text("nix", "luks", "yolobox-unlock.sh")
+        table = {int(n) for n in re.findall(r"^#   exit (\d+)  \S", script, re.M)}
+        used = {int(n) for n in re.findall(r"^\s*exit (\d+)$", script, re.M)}
+        yo_codes = {
+            0,
+            yo.HELPER_EXIT_WRONG_KEY,
+            yo.HELPER_EXIT_MIGRATION_FAILED,
+            yo.HELPER_EXIT_WATCH_LOST,
+            yo.HELPER_EXIT_NO_PASSPHRASE,
+        }
+        self.assertEqual(table, yo_codes)
+        self.assertEqual(used, table)
 
     def test_the_migrate_script_posts_the_ask_id_yo_looks_for(self):
         text = self.text("nix", "luks", "yolobox-luks-migrate.sh")
