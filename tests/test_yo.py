@@ -1834,13 +1834,21 @@ class TestGuestAwsConfigText(unittest.TestCase):
 
 class TestLimaConfigGaps(FakeHome):
     def mock_lima_list(
-        self, forwards, host_agent_pid=123, mounts=None, forward_agent=None
+        self,
+        forwards,
+        host_agent_pid=123,
+        mounts=None,
+        forward_agent=None,
+        over_vsock=False,
     ):
         config = {"portForwards": forwards}
         if mounts is not None:
             config["mounts"] = mounts
+        config["ssh"] = {}
         if forward_agent is not None:
-            config["ssh"] = {"forwardAgent": forward_agent}
+            config["ssh"]["forwardAgent"] = forward_agent
+        if over_vsock is not None:
+            config["ssh"]["overVsock"] = over_vsock
         payload = json.dumps({"hostAgentPID": host_agent_pid, "config": config})
         return mock.patch.object(
             yo, "run", return_value=mock.Mock(returncode=0, stdout=payload, stderr="")
@@ -1922,6 +1930,17 @@ class TestLimaConfigGaps(FakeHome):
                 with self.mock_lima_list(self.both_forwards(), forward_agent=value):
                     self.assertEqual(yo.lima_config_gaps(), [])
 
+    def test_ssh_over_vsock_left_at_lima_default_is_reported(self):
+        for value in (None, True):
+            with self.subTest(value=value):
+                with self.mock_lima_list(self.both_forwards(), over_vsock=value):
+                    self.assertEqual(yo.lima_config_gaps(), [yo.GAP_SSH_OVER_VSOCK])
+
+    def test_the_over_vsock_remedy_sets_it_false(self):
+        message = yo.lima_config_gap_message([yo.GAP_SSH_OVER_VSOCK])
+        self.assertIn("--set '.ssh.overVsock = false'", message)
+        self.assertNotIn("portForwards", message)
+
     def both_forwards(self):
         return [
             {
@@ -1979,36 +1998,35 @@ class TestLimaSettingGapMessage(unittest.TestCase):
 
 
 class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
-    def test_a_gap_is_reported_on_stderr_and_the_vm_still_comes_up(self):
+    def vm_up_on_a_running_box(self, gaps):
+        running = yo.LimaInfo(
+            host_agent_pid=1,
+            port_forwards=[],
+            mounts=[],
+            forward_agent=False,
+            status="Running",
+            over_vsock=False,
+        )
         with (
-            mock.patch.object(yo, "lima_config_gaps", return_value=[yo.OP_GUEST_SOCK]),
-            mock.patch.object(
-                yo,
-                "run",
-                return_value=mock.Mock(returncode=0, stdout="yolobox\n", stderr=""),
-            ),
+            mock.patch.object(yo, "lima_config_gaps", return_value=gaps),
+            mock.patch.object(yo, "lima_instance_info", return_value=running),
+            mock.patch.object(yo, "sshd_answers", return_value="yes"),
             mock.patch.object(yo, "ensure_agent_ssh_config"),
+            mock.patch.object(yo, "ensure_guest_known_hosts"),
             mock.patch.object(yo, "vm_services") as fake_services,
             mock.patch.object(yo, "err") as fake_err,
         ):
             yo.vm_up()
+        return fake_err, fake_services
+
+    def test_a_gap_is_reported_on_stderr_and_the_vm_still_comes_up(self):
+        fake_err, fake_services = self.vm_up_on_a_running_box([yo.OP_GUEST_SOCK])
         message = " ".join(call.args[0] for call in fake_err.call_args_list)
         self.assertIn(yo.OP_GUEST_SOCK, message)
         fake_services.assert_called_once_with()
 
     def test_no_gaps_prints_nothing_about_lima_config(self):
-        with (
-            mock.patch.object(yo, "lima_config_gaps", return_value=[]),
-            mock.patch.object(
-                yo,
-                "run",
-                return_value=mock.Mock(returncode=0, stdout="yolobox\n", stderr=""),
-            ),
-            mock.patch.object(yo, "ensure_agent_ssh_config"),
-            mock.patch.object(yo, "vm_services"),
-            mock.patch.object(yo, "err") as fake_err,
-        ):
-            yo.vm_up()
+        fake_err, _ = self.vm_up_on_a_running_box([])
         fake_err.assert_not_called()
 
 
@@ -2174,6 +2192,7 @@ class TestStatusWithVmDown(unittest.TestCase):
             mock.patch.object(yo, "account_status", lambda: ("unreachable", "")),
             mock.patch.object(yo, "ssh_run", ssh_run),
             mock.patch.object(yo, "lima_config_gaps", lambda: []),
+            mock.patch.object(yo, "sshd_answers", lambda user: "not-listening"),
             mock.patch.object(yo.shutil, "which", lambda name: None),
         ):
             yo.cmd_status(yo.build_parser().parse_args(["status"]))
