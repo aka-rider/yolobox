@@ -293,8 +293,7 @@ in
       # connection on capability, not exact version equality — the guest
       # server's endpoint_protocol_generation has to match the Mac
       # client's own constant exactly, coarser than the version string
-      # (see CLAUDE.md, "herdr: the VM runs its own server, panes are real
-      # ptys").
+      # (see nix/herd-server.md#capability-gating).
       #
       # Setting version+hash here re-pins the guest to a GitHub release
       # (nix/pkgs/herdr-bin.nix) — the escape hatch for when nixpkgs lags a

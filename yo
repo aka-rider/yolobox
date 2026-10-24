@@ -1620,7 +1620,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
                 "profile: %s" % profile,
                 "booted:  %s" % booted,
                 "Check df /boot in the VM — a half-failed bootloader install leaves the two",
-                "generations disagreeing (see CLAUDE.md).",
+                "generations disagreeing.",
             )
         report.ok("rebooted into the built generation")
 
@@ -2041,10 +2041,10 @@ def cmd_zed(args: argparse.Namespace) -> None:
 def t3_unit_state() -> Tuple[str, str]:
     # t3code is a vendor-installed *user* unit now (nix/t3.nix), not a system
     # one — installed and kept current by yolobox-harness-install, running
-    # as the agent from boot (see CLAUDE.md, "The harnesses come from their
-    # vendors"). Ask systemd the same question ssh_run(AGENT, ...) always
-    # asks it: as the agent, over its own login PAM session, which is what
-    # sets XDG_RUNTIME_DIR for a lingering user without a pty.
+    # as the agent from boot (see nix/harnesses.md#lingering). Ask systemd the
+    # same question ssh_run(AGENT, ...) always asks it: as the agent, over its
+    # own login PAM session, which is what sets XDG_RUNTIME_DIR for a lingering
+    # user without a pty.
     unit = ssh_run(
         AGENT,
         [
@@ -2080,7 +2080,7 @@ def t3_service_problem(load_state: str, active_state: str) -> Optional[str]:
         )
         if active_state == "failed":
             # A stale ~/.t3/runtime/.service-stopping marker survives `t3 update`
-            # and crash-loops the unit until systemd's start limit (CLAUDE.md, "t3").
+            # and crash-loops the unit until systemd's start limit (nix/t3.md#service-status).
             problem += (
                 "; if it crash-looped on 'Service state is invalid or unsupported', clear it with: "
                 "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 sh -c "
@@ -2114,7 +2114,7 @@ def t3_require_service() -> None:
             "    lima's port forwarding is dead (see ~/.lima/%s/ha.stderr.log)."
             % INSTANCE
         )
-        err("    Recover with: limactl stop %s && ./yo up" % INSTANCE)
+        err("    Recover with: limactl stop %s && yo up" % INSTANCE)
         raise YoError(None, code=1)
 
 

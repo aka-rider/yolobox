@@ -1,3 +1,14 @@
+# The agent's environment, declared once. `env` is applied identically to every
+# agent process:
+#   - the herdr server and its panes (nix/herd-server.nix),
+#   - t3 (the drop-in in nix/t3.nix),
+#   - every agent login shell (nix/base.nix, `environment.extraInit`).
+# Those processes share one environment because most of them start without a
+# login shell, so a variable set only in shell init would miss them.
+#
+# `awsBrokerSock` is not exported to anything. It names the agent-facing AWS
+# broker socket, which nix/base.nix (`opProxy`) listens on and nix/guest.nix
+# hands to `yolobox-guest aws-creds`.
 { agentHome }:
 {
   env = {

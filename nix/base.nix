@@ -91,7 +91,7 @@ in
   boot.growPartition = true;
   boot.kernelPackages = pkgs.linuxPackages_latest;
   # Same-uid ptrace (py-spy, gdb, strace -p). The uid split, not Yama, is the
-  # boundary; see CLAUDE.md "Debuggers: same-uid ptrace".
+  # boundary; see nix/base.md#same-uid-ptrace.
   boot.kernel.sysctl."kernel.yama.ptrace_scope" = 0;
 
   swapDevices = [{ device = "/var/swapfile"; size = 16384; }];
@@ -152,8 +152,8 @@ in
   };
 
   # The agent's account. uid must not be 501: a second account sharing
-  # lima's uid is an outage this repo already paid for once (see CLAUDE.md,
-  # "Two accounts: the operator mirrors the host, the agent does not") — passwd lookups resolve a uid to
+  # lima's uid is an outage this repo already paid for once (see
+  # docs/accounts.md#two-accounts) — passwd lookups resolve a uid to
   # whichever entry comes first, so two accounts at 501 are indistinguishable
   # to whoami/SUDO_USER while modules silently write state into the wrong
   # home. It is deliberately not lima's cidata account either, because
@@ -336,6 +336,8 @@ in
     (callPackage ./pkgs/far2l.nix { })
     delta
     gh
+    # Client only: the box runs no Forgejo server. A box that once ran one
+    # keeps /var/lib/forgejo, which can be deleted by hand.
     forgejo-cli
     shellcheck
     shfmt

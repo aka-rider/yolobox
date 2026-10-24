@@ -606,7 +606,7 @@ class TestGuestHelperSkew(unittest.TestCase):
 
 
 class TestGcArgv(unittest.TestCase):
-    # ext4's root reserve is the operator's alone (see CLAUDE.md), so on a
+    # ext4's root reserve is the operator's alone (see docs/disk.md#recognising-a-full-disk), so on a
     # genuinely full disk the machine tier must run, and complete, before the
     # agent-tier steps that depend on the space it frees. This is the guard
     # against that ordering being silently swapped.

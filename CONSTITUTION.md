@@ -1,299 +1,172 @@
 # Constitution
 
-Rules for changing this repo. Each one was paid for by an outage; the
-reason follows every rule so you can tell when it stops applying. The full
-story behind each lives in `CLAUDE.md`.
+The rules for changing this repo. Read this before your first change.
+
+Every rule was paid for by an outage or a near miss. The sentence after the
+rule says why, so you can tell when it stops applying. The link after that
+is the story: what happened, the evidence, and how to recognise it again.
+Stories live beside the code they explain (`nix/base.md` beside
+`nix/base.nix`) or, when they span several files, in `docs/`.
+[docs/README.md](docs/README.md) is the index.
 
 ## Before you start
 
-Identify whether you are running on the host (MacOS) or Guest (Linux).
+Identify whether you are running on the host (macOS) or the guest (Linux).
 
 ## The VM
 
-- ALWAYS keep the VM rebuildable from this repo alone. It has no snapshots
-  and is meant to be thrown away; anything that needs hand setup after
-  creation is a defect.
-- ALWAYS keep `nix/base.nix`'s mount layout identical to the shipped
-  nixos-lima image (`/boot` is the ESP). Diverging means every fresh
-  instance needs a manual mount migration before its first switch.
-- ALWAYS keep `boot.loader.grub.configurationLimit = 1`. The ESP is 249 MiB
-  and GRUB copies the incoming kernel before pruning old ones, so two
-  retained kernels plus one incoming do not fit.
-- ALWAYS keep `restartIfChanged = false` on `lima-init` and
-  `lima-guestagent`. Restarting the guest agent kills every port lima
-  forwards until the VM is stopped and started again.
-- ALWAYS declare the operator's account as `users.users.${username}`, fed
-  by `YOLOBOX_USERNAME=$(id -un)` and `--impure` — uid 501 (lima's own),
-  home `/home/${username}.guest`, in `wheel`. A hardcoded name creates a
-  second account with the same uid and splits state across two homes.
-- ALWAYS treat `lima/yolobox.yaml` as read once, at creation. An existing
-  instance is changed with `limactl edit` while stopped, and `portForwards`
-  must be restated in full because lima's yq cannot read the file. A unit
-  test (`TestLimaYamlMatchesPortForwardsConstant` in `tests/test_yo.py`)
-  keeps the checked-in file's socket-forward rules in sync with `yo`'s own
-  `LIMA_PORT_FORWARDS` constant — that constant, not the yaml, is what a
-  restate command is built from, so the two owe each other this check.
+- ALWAYS keep the VM rebuildable from this repo alone. It has no snapshots and is meant to be thrown away, so anything that needs hand setup after creation is a defect. [story](docs/distribution.md#flake-ref-not-a-checkout)
+- ALWAYS keep `nix/base.nix`'s mount layout identical to the shipped nixos-lima image (`/boot` is the ESP). Diverging means every fresh instance needs a manual mount migration before its first switch. [story](nix/base.md#the-esp-holds-one-kernel)
+- ALWAYS keep `boot.loader.grub.configurationLimit = 1`. The ESP is 249 MiB and GRUB copies the incoming kernel before it prunes old ones, so two retained kernels plus one incoming do not fit. [story](nix/base.md#the-esp-holds-one-kernel)
+- ALWAYS keep `restartIfChanged = false` on `lima-init` and `lima-guestagent`. Restarting the guest agent kills every port lima forwards until the VM is stopped and started again. [story](lima/yolobox.md#an-empty-page-means-limas-forwarder-died)
+- ALWAYS declare the operator's account in `nix/base.nix` as `users.users.${username}`, fed by `YOLOBOX_USERNAME=$(id -un)` and `--impure`. A hardcoded name creates a second account with the same uid and splits state across two homes. [story](docs/accounts.md#two-accounts)
+- ALWAYS treat `lima/yolobox.yaml` as read once, at creation. An existing instance changes only through `limactl edit` while stopped. [story](lima/yolobox.md#read-once)
+- ALWAYS restate `portForwards` in full, with the command `yo up` prints, never a hand-copied one. Lima's yq cannot read the repo file, and a stale copy drops the socket rules. [story](lima/yolobox.md#checking-a-running-instance)
+- ALWAYS keep the socket-forward rules in `lima/yolobox.yaml` equal to `yo`'s `LIMA_PORT_FORWARDS`. The constant, not the yaml, builds the restate command, and `TestLimaYamlMatchesPortForwardsConstant` in `tests/test_consistency.py` enforces it. [story](lima/yolobox.md#checking-a-running-instance)
+- ALWAYS keep `vmType`, `propagateProxyEnv: false` and `ssh.loadDotSSHPubKeys: false` pinned in `lima/yolobox.yaml`. Lima's defaults leak the Mac's proxy variables and every `~/.ssh/*.pub` into the guest. [story](lima/yolobox.md#pinned-settings)
+- ALWAYS keep the `user@.service` `OOMScoreAdjust` override an `asDropin`. Replacing upstream's unit text loses the rest of it, and the default of 100 makes the user manager the kernel's preferred victim. [story](nix/base.md#memory-pressure)
 
 ## Accounts
 
-- NEVER give the agent account uid 501. uid 501 is lima's own cidata uid,
-  reserved for the operator; a second account sharing it splits state
-  across two homes exactly the way the hardcoded `xiii` account once did,
-  with `whoami` and `SUDO_USER` unable to tell them apart.
-- NEVER add the agent to `wheel`, to `nix.settings.trusted-users`, or to
-  any sudoers rule, and NEVER make the agent lima's cidata account.
-  `lima-init` runs `usermod -a -G wheel $LIMA_CIDATA_USER` unconditionally,
-  after NixOS activation, with no `Condition=` guarding it — wheel
-  stripped from that account is silently reinstated on the very next boot.
-- NEVER grant `CAP_SYS_PTRACE` — through `security.wrappers`, `setcap`, or
-  ambient capabilities — to any binary the agent can run. The capability
-  ignores uids, so it attaches to root's processes and hands the agent root.
-  Same-uid debugging comes from `kernel.yama.ptrace_scope = 0` in
-  `nix/base.nix` instead.
-- ALWAYS let an ssh role, not a bare `User=` override, own the
-  `ControlPath`. Lima's `ControlPath` carries no `%r`, so OpenSSH's mux
-  client never re-checks the login user against an already-open master's,
-  and `-o User=agent` layered onto the operator's live master silently
-  runs as the operator.
-- ALWAYS point `homeTmpfiles`, every systemd `User=` and `ConditionUser=`,
-  and the direnv whitelist at `agentUser`, never at `${username}`. Review
-  invariant, enforced by `TestOnlyBaseNixSeesTheOperator`: no module but
-  `nix/base.nix` names the `username` variable.
-- NEVER add a whitelist to `/etc/direnv`, the config root root and the
-  operator read. It carries none, so they get "blocked" for an `.envrc` the
-  agent wrote; only `/etc/direnv-agent` (`DIRENV_CONFIG` in
-  `nix/lib/agent-env.nix`) trusts the agent's home.
-- NEVER put the agent in `systemd-journal`, `adm` or any other group that
-  reads the system journal. The operator's `sudo ... COMMAND=<argv>` lines
-  are in it. The display units are the agent's own user units for that
-  reason.
-
-## Distribution
-
-- NEVER hand-edit `.version` — the release workflow writes it from the
-  release tag. `yo` bakes the version in at package build time and derives
-  its flake ref straight from it (`github:aka-rider/yolobox/v<version>`),
-  so a wrong version ships a `yo` that builds the wrong system with no
-  error anywhere.
-- ALWAYS publish a release from a commit that is the tip of `main`. The
-  release workflow force-moves the tag onto its stamp commit, so it refuses
-  any release whose tag sits anywhere else — a release cut from a feature
-  branch fails at that guard rather than republishing different content
-  under a tag someone may already have fetched.
-- NEVER let a VM hold a checkout of yolobox's own repo. `yo bootstrap`
-  builds from a flake ref now, not a push; a guest checkout would reopen
-  the exact push-to-checkout hazard this repo already carries for user
-  projects, for a repo nothing in the VM reads any more.
-- ALWAYS pin every GitHub Action in `.github/workflows/` to a full commit
-  SHA, with the tag in a comment. The release job holds a writable token and
-  the tap's.
-- ALWAYS keep `aka-rider/yolobox` public. `nixos-rebuild` fetches the
-  flake ref anonymously, with no credentials configured anywhere in `yo`;
-  a private repo fails every `yo bootstrap` and every
-  `/etc/yolobox/local.nix` rebuild with an auth error, on every box in the
-  field at once.
-
-## Building
-
-- ALWAYS `git add` before `nixos-rebuild` when hacking on a local clone.
-  Nix evaluates the git tree, so an untracked file does not exist to it.
-  This does not apply to the VM itself any more: it builds from a
-  published flake ref, not a checkout, so there is no local git tree for
-  it to evaluate at all.
-- ALWAYS run `nixos-rebuild switch` unpiped, and read its exit code. A
-  pipe through `tail` hides a failed bootloader install as exit 0.
-- ALWAYS check `df /boot` and compare `readlink /run/current-system` with
-  `readlink /nix/var/nix/profiles/system` when a switch behaves strangely.
-  Disagreement means the box runs one generation and the profile claims
-  another; do not garbage-collect in that state.
-- ALWAYS use the `path` option, not `environment.PATH`, in a systemd unit.
-  NixOS already defines the latter for every service, so a second
-  definition is a conflict.
-- ALWAYS write `${pkgs.xvfb}/bin/Xvfb` explicitly. `pkgs.xorg.xvfb` is
-  deprecated and `lib.getExe pkgs.xvfb` points at a binary that does not
-  exist.
-- NEVER add a tmpfiles rule for `/tmp/.X11-unix`; systemd ships one and a
-  duplicate logs errors every boot.
-
-## Disk
-
-- ALWAYS diagnose a full disk from the Mac with `yo gc`. In-VM tools die
-  first, while `yo ssh` still works because it reaches in from the Mac, and
-  the operator's `sudo` still works there because ext4 reserves 4.3 GB for
-  root — the agent has no `sudo` at all, so a stuck agent session proves
-  nothing about disk space either way.
-- ALWAYS reclaim before growing. A full disk has so far always been one
-  project's build output, never a real need for more space.
-- ALWAYS gate the deletion of a project build directory on `git
-  check-ignore`. Deleting a tracked directory dirties the checkout and
-  silently refuses every later push into it.
-- ALWAYS switch to a generation carrying `boot.growPartition` before
-  `limactl edit --disk`. Otherwise the backing file grows and the guest
-  partition stays where it was, with no error anywhere.
+- NEVER give the agent account uid 501. It is lima's own cidata uid, reserved for the operator, and a second account sharing it splits state across two homes with `whoami` unable to tell them apart. [story](docs/accounts.md#why-a-new-account-not-a-stripped-one)
+- NEVER add the agent to `wheel`, to `nix.settings.trusted-users` or to any sudoers rule, and NEVER make the agent lima's cidata account. `lima-init` runs `usermod -a -G wheel $LIMA_CIDATA_USER` after activation on every boot, so stripping `wheel` from that account is silently undone. [story](docs/accounts.md#why-a-new-account-not-a-stripped-one)
+- NEVER give `agent` or `root` a usable password. Both stay locked, and `passwd -l` runs on every activation, because `hashedPassword` applies only when an account is created. [story](docs/accounts.md#locked-passwords)
+- NEVER point the agent's `AuthorizedKeysFile` at a file lima-init writes. sshd opens it with the agent's uid, which gets `EACCES`, so the agent uses the root-run `AuthorizedKeysCommand` instead. [story](docs/accounts.md#authorizedkeyscommand)
+- NEVER grant `CAP_SYS_PTRACE`, through `security.wrappers`, `setcap` or ambient capabilities, to any binary the agent can run. The capability ignores uids, so it attaches to root's processes and hands the agent root. Same-uid debugging comes from `kernel.yama.ptrace_scope = 0`. [story](nix/base.md#same-uid-ptrace)
+- ALWAYS point `homeTmpfiles`, every systemd `User=` and `ConditionUser=`, and the direnv whitelist at `agentUser`, never at `${username}`. No module but `nix/base.nix` may name the `username` variable, and `TestOnlyBaseNixSeesTheOperator` enforces it. [story](docs/accounts.md#two-accounts)
+- NEVER add a whitelist to `/etc/direnv`, the config root and the operator read. They would trust every `.envrc` the agent writes, which is `sudo` on the first `cd`, so only `/etc/direnv-agent` (`DIRENV_CONFIG` in `nix/lib/agent-env.nix`) trusts the agent's home. [story](nix/base.nix)
+- NEVER put the whitelist in `~/.config/direnv/direnv.toml`. direnv ignores that file silently, whichever config directory applies. [story](nix/base.nix)
+- NEVER put the agent in `systemd-journal`, `adm` or any other group that reads the system journal. It holds the operator's `sudo ... COMMAND=<argv>` lines, which is why the display units are the agent's own user units. [story](docs/accounts.md#no-journal-group)
+- NEVER make `~/wrk` a `L+` tmpfiles rule. `L+` deletes a real `~/wrk` directory, so the rule is a plain `L`. [story](yo.md#the-mirror)
 
 ## Identities and SSH
 
-- ALWAYS reach the agent's 1Password through the lima reverse socket
-  forward (`/run/yolobox-op/agent.sock`, operator-owned, proxied by
-  `systemd-socket-proxyd` to the agent-owned `/run/yolobox/op-agent.sock`),
-  never `ForwardAgent`. The reverse forward is set up once per hostagent
-  start and lives with the VM, not with any one pane.
-- NEVER put a `ForwardAgent` other than `no` in `~/.lima/yolobox/ssh.config`.
-  That file is shared by every ssh role `yo` spawns, so a forward declared
-  there would reach `yo code`, `yo zed` and every t3-spawned session, not
-  only the one interactive command that asked for it. The owned agent
-  `Match` block and the herdr alias say `ForwardAgent no` so that the
-  operator's own `Host lima-yolobox` / `ForwardAgent yes` cannot apply to
-  them.
-- ALWAYS verify the guest's host key from `~/.lima/yolobox/known_hosts`,
-  with `NoHostAuthenticationForLocalhost no` in the owned head block of
-  `~/.lima/yolobox/ssh.config`, so that every connection that reads that
-  file is pinned, `yo code`, `yo zed` and the git push channel included.
-  Lima's own Host block sets it to yes, which disables verification for
-  127.0.0.1 whatever else is configured; ssh keeps the first value, and the
-  owned block sits first. That block is the one place that pins. The one ssh
-  that fetches the keys to pin them (`OPERATOR_FIRST_CONTACT`) is the only
-  one allowed not to, and opts out explicitly on its command line.
-- ALWAYS give `yo ssh`'s own `ForwardAgent` the 1Password socket path
-  itself, and only over its own `ControlPath=none` connection — the
-  operator's per-session forward, kept because the operator is not the
-  agent and carries no reverse forward of its own. The default forwards
-  `$SSH_AUTH_SOCK`, which on this Mac is Apple's empty agent.
-- ALWAYS get the guest's ssh identity (`~/.ssh/config`, the `*.pub`
-  selectors) from the agent's own dotfiles checkout, never by the Mac
-  reading files and pushing them in. The Mac reading paths the guest can
-  influence is how a repo-held symlink once pointed at a private key.
-- NEVER set `IdentityAgent` unconditionally in the shared ssh config. It is
-  set only under `Match exec "test -S <1Password socket>"`, and the VM has no
-  such socket, so its forwarded `SSH_AUTH_SOCK` stays in charge. An
-  unconditional `IdentityAgent` would take that forwarded agent away.
-- ALWAYS spell git `includeIf` paths exactly as the project path is
-  spelled on the Mac. `yo` mirrors the logical spelling into the VM
-  verbatim, so any other spelling matches nothing there.
-- NEVER copy a private key into the VM.
+- ALWAYS let an ssh role, not a bare `User=` override, own the `ControlPath`. Lima's `ControlPath` has no `%r`, so OpenSSH never re-checks the login user of a new connection, and `-o User=agent` over the operator's live master silently runs as the operator. [story](docs/ssh.md#one-controlpath-per-role)
+- ALWAYS reach the agent's 1Password through the lima reverse socket forward (`/run/yolobox-op/agent.sock`, proxied by `systemd-socket-proxyd` to the agent-owned `/run/yolobox/op-agent.sock`), never through `ForwardAgent`. The forward is set up once per hostagent start and lives with the VM, not with any one pane. [story](docs/ssh.md#1password-reaches-the-agent)
+- NEVER put a `ForwardAgent` other than `no` in `~/.lima/yolobox/ssh.config`. Every ssh role `yo` spawns reads that file, so a forward there would reach `yo code`, `yo zed` and every t3 session. The owned agent `Match` block and the herdr alias say `no`, so the operator's own `ForwardAgent yes` cannot apply to them. [story](docs/ssh.md#the-owned-block-in-sshconfig)
+- ALWAYS limit `yo ssh`'s `ForwardAgent` to its own command line over `ControlPath=none`, pointing at the 1Password socket. The default forwards `$SSH_AUTH_SOCK`, which on this Mac is Apple's empty agent, and a forward on a shared master would outlive its pane. [story](docs/ssh.md#yo-ssh-forwards-per-session)
+- ALWAYS verify the guest's host key from `~/.lima/yolobox/known_hosts`, with `NoHostAuthenticationForLocalhost no` in the owned head block of `ssh.config`. Lima's own block sets it to yes, which disables verification for 127.0.0.1, and ssh keeps the first value. Only the fetch of the keys (`OPERATOR_FIRST_CONTACT`) may opt out, on its command line. [story](docs/ssh.md#host-key-pin)
+- ALWAYS get the guest's ssh identity (`~/.ssh/config`, the `*.pub` selectors) from the agent's own dotfiles checkout, never by the Mac reading files and pushing them in. The Mac reading paths the guest can influence is how a repo-held symlink once pointed at a private key. [story](docs/ssh.md#two-github-accounts)
+- NEVER set `IdentityAgent` unconditionally in the shared ssh config. It goes only under `Match exec "test -S <1Password socket>"`, and the VM has no such socket, so an unconditional one would take the forwarded agent away. [story](docs/ssh.md#two-github-accounts)
+- NEVER let an rc file replace an inherited `SSH_AUTH_SOCK`. `/etc/zshenv` sets it before `~/.zshrc` runs, and an `eval "$(ssh-agent -s)"` there swapped in an empty agent in the first shells after boot. [story](docs/ssh.md#an-rc-file-took-the-agent-away)
+- ALWAYS spell git `includeIf` paths exactly as the project path is spelled on the Mac. `yo` mirrors the logical spelling into the VM verbatim, so any other spelling matches nothing there. [story](docs/ssh.md#two-github-accounts)
+- NEVER copy a private key into the VM. [story](docs/ssh.md#two-github-accounts)
 
-## AWS credentials
+## Network and Tailscale
 
-- ALWAYS fix a process's AWS profile with `AWS_PROFILE` against the
-  guest's rendered `AWS_CONFIG_FILE`, never one global, switchable
-  profile. botocore fixes a process's credential source at first use and
-  only refreshes minutes before expiry, so flipping one shared profile
-  mid-session leaves an already-running process on the old account until
-  its next refresh, tens of minutes later.
-- ALWAYS tie the AWS broker's lifetime to lima's hostagent
-  (`--watch-pid <pid>`, that pid read from `limactl list yolobox --json`'s
-  `hostAgentPID`, never by opening lima's own `~/.lima/yolobox/ha.pid`
-  directly — lima rewrites that file on every start), never to a
-  per-session forward or an idle timeout. Profiles are chosen per process,
-  not per session, so there is no session left to bound the broker's life
-  by.
-- ALWAYS reach the AWS broker the same way as 1Password: a lima reverse
-  unix-socket forward (`/run/yolobox-op/aws-broker.sock`, operator-owned,
-  proxied by `systemd-socket-proxyd` to the agent-owned
-  `/run/yolobox/aws-broker.sock`), never a forwarded TCP port. A live test
-  showed a Mac-side VPN blackholing every guest connection to lima's
-  gateway address while general egress kept working; a reverse unix
-  socket rides lima's own ssh connection instead and is unaffected.
-- NEVER guard a reversed unix socket with a bearer token. Filesystem
-  permissions on the agent-owned socket are the entire authorization
-  boundary — anything more is a second mechanism to keep in sync with the
-  first for no added safety.
-- ALWAYS keep the agent's environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`)
-  declared once, in `nix/lib/agent-env.nix`, applied identically to the
-  herdr server, t3 and every agent login shell, rather than three copies
-  left to drift apart. The same file's `awsBrokerSock` is the one place
-  naming the guest-side broker socket path, read by `nix/base.nix`'s proxy
-  unit and folded into the guest script's `YOLOBOX_AWS_BROKER_SOCK`
-  (`nix/guest.nix`); a unit test (`TestAgentEnvMatchesYoSockets`) checks it
-  against `yo`'s own `AGENT_AWS_BROKER_SOCK` constant, the same discipline
-  as the `lima/yolobox.yaml` check above.
-- NEVER let the broker write a secret to stdout after its handshake line,
-  or to any log.
+- ALWAYS keep `--netfilter-mode=off` in tailscale's `extraSetFlags`, and NEVER fix exposure with `iptables -I INPUT 1`. By default tailscaled accepts everything from `tailscale0` before `nixos-fw` is consulted, and it re-inserts its jump at the top whenever it restarts. [story](nix/tailscale.md#firewall)
+- ALWAYS keep `--ssh=false` and `--accept-dns=false` in `extraSetFlags`. The first stops tailscaled authorising ssh by tailnet ACL instead of this repo's keys, and the second keeps MagicDNS from taking over the guest's resolver. [story](nix/tailscale.md#dns-and-logging)
+- NEVER pass `--hostname` to `tailscale up`, and NEVER answer a refused `tailscale up` with `--reset`. `extraSetFlags` pins the name and the other non-default flags, and `--reset` clears them. Restart `tailscaled-set` instead. [story](nix/tailscale.md#login)
+- ALWAYS open port 22 only on `tailscale0` and `enp0s1`, whatever `ssh.overVsock` says. Lima's start-up wait and its usernet fallback dial 192.168.5.15:22 over TCP, and a dropped packet there shows as a 600 s timeout. [story](nix/tailscale.md#sshd-on-two-interfaces)
+- ALWAYS keep `RemainAfterExit = true` on `tailscaled-set`. A `Type=oneshot` unit that has exited is inactive, and a switch restarts a changed unit only if it is active, so flag changes would never apply. [story](nix/tailscale.md#tailscaled-set)
+- ALWAYS put a box-local route in `networking.dhcpcd.runHook`, never in `networking.interfaces.<if>.ipv4.routes`. A dhcpcd restart flushes the route and the oneshot that added it never runs again. [story](nix/tailscale.md#box-local-routes)
+- NEVER narrow the `hostIP: "0.0.0.0"` forward of port 3773 to loopback. A Mac that never runs `tailscale up` still reaches t3 from the LAN through it. [story](nix/tailscale.md#why-3773-also-stays-on-0000)
 
-## Agents and the herd
+## yo internals
 
-- ALWAYS start an agent in a herdr pane on the saved `yolobox` machine,
-  never expect `yo enter`'s plain landing shell to report to herdr. Only a
-  real pty opened against the VM's own herdr server reaches its manifest.
-- ALWAYS treat herdr compatibility as capability-gated, not
-  version-equal. `herdr machine add` accepts a saved connection only when
-  the guest's `endpoint_protocol_generation` matches the client's own
-  constant exactly — coarser than the version string, so the VM and the
-  Mac may run different herdr versions as long as the generation agrees.
-  Bump `yolobox.harness.herdr.version`/`.hash` when it does not.
-- ALWAYS keep `herdrPkg` in `environment.systemPackages`. `herdr machine
-  add` adopts a running, compatible server rather than starting its own,
-  and installs its own binary only when none turns up on its probe list —
-  a list that includes `/run/current-system/sw/bin/herdr`. Drop the
-  package and a fresh `machine add` tries to install over the system one
-  instead of adopting it, and a non-interactive install is refused
-  outright.
-- ALWAYS keep `HERDR_AGENT=claude` exported in the claude launcher ahead
-  of its `exec`. herdr classifies a pane's agent by its foreground
-  process name, and the launcher execs a binary named after its version
-  directory, not `claude` — without the hint, classification never
-  reaches herdr's screen manifest and the session reports nothing, with
-  no error anywhere.
-- NEVER add a tmpfiles rule that deletes a herdr-installed integration
-  file (`~/.pi/agent/extensions/herdr-agent-state.ts`, for one).
-  `systemd-tmpfiles-resetup.service` reapplies `r` rules on every switch,
-  not once, so the rule would silently un-install the integration on the
-  very next switch.
-- ALWAYS deliver hooks through the box-owned `~/.local/bin/claude`
-  launcher's `--settings` file. The
-  `/etc/claude-code/managed-settings.json` tier is discarded whole
-  whenever the remote-settings tier is non-empty, and it always is here.
-- NEVER let anything but the box own `~/.local/bin/claude`. That path is
-  the only hook channel, and the agent's own dotfiles prepend the
-  directory to PATH, so nothing on the system PATH can win the race
-  against it. It is a tmpfiles `L+` link to `/etc/yolobox/bin/claude`,
-  re-asserted by `yolobox-claude-launcher`; `claude update` leaves a
-  custom launcher alone and is welcome.
-- NEVER run `agent-browser install`: it downloads a glibc Chrome for
-  Testing that cannot execute on NixOS. And NEVER let a vendor installer
-  edit an rc file: opencode's is told so with `--no-modify-path`, pi's
-  has no such flag and stays off the rc file only because its prompts
-  read `/dev/tty` and the install service has none. An installer-written
-  rc line changes PATH behind the box's back on the very path it owns.
-- ALWAYS let pi own `~/.pi/agent/settings.json`. pi rewrites it and only
-  logs a failed write, so a symlink there silently drops every installed
-  package.
-- ALWAYS install pi packages with `pi install`, never by editing its
-  settings file.
-- ALWAYS keep the VM free of a C and Python toolchain. It keeps native npm
-  modules from compiling at install time; every package that would
-  otherwise need one — t3, agent-browser — installs itself from a
-  vendor-shipped prebuilt binary instead of a source npm package.
-- NEVER set `PLAYWRIGHT_MCP_USER_DATA_DIR`. The box runs Playwright
-  isolated per launch, and the server throws when both an isolated launch
-  and a user-data-dir are set.
+- ALWAYS keep `YO_VERSION = "dev"` as that exact literal, unreformatted. The Nix build and the brew formula match its text, and the formula's `inreplace` can silently no-op. `TestYoVersionLiteral` guards it. [story](yo.md#yo_version)
+- NEVER let a guest subcommand's own stderr contain `unknown subcommand`. `yo` reads that marker, with exit 64, as "the box is older than this `yo`". [story](nix/guest/yolobox-guest.md#version-skew)
+- ALWAYS set `allow_abbrev=False` on the top-level parser and on every subparser. Otherwise two keystrokes of a typo reach `yo gc --deep` and `--yes`. [story](yo.md#one-parser)
+- ALWAYS keep `yo ssh`'s trailing arguments `nargs=argparse.REMAINDER`. The printed `nixos-rebuild --impure` remedy only works if argparse passes `--impure` through. [story](yo.md#one-parser)
+- ALWAYS branch on `project is not None`, never on truthiness, for the optional `project` of `enter`, `code` and `zed`. `yo enter ""` and `yo enter` are different invocations. [story](yo.md#one-parser)
+- ALWAYS print through `out()` and `err()`, never `print` or a raw stream. They replace control characters, and guest output is attacker-controlled text that reaches the Mac's terminal. [story](yo.md#output-filter)
+- ALWAYS parse a URL the guest produced before `yo` opens it on the Mac, and refuse anything but `http(s)` to `127.0.0.1:3773` or `localhost:3773`. `urlparse` and browsers disagree about backslashes and `@`. [story](yo.md#opening-a-guest-url)
+- NEVER disable `services.openssh.allowSFTP`. `yo cp` runs scp, which speaks sftp, so sshd runs `sftp-server` and no login shell. [story](yo.md#yo-cp)
+- ALWAYS glob-escape a guest source in `yo cp`, and NEVER escape a guest destination. scp expands wildcards in remote sources only, so escaping a destination creates a file named with backslashes. [story](yo.md#yo-cp)
+- NEVER upload a symlink with `yo cp`. `scp -r` follows it and copies the target, which can be a private file the user never named. [story](yo.md#yo-cp)
+- ALWAYS stage a `yo cp` download beside its destination and plan the merge before anything moves. scp writes through a symlink at the destination, and the agent controls what a pulled repo contains. [story](yo.md#yo-cp)
 
 ## Paths
 
-- ALWAYS derive a guest path by mirroring the Mac's logical `$PWD` (or a
-  repo's logical toplevel) relative to `$HOME` onto the guest `$HOME`.
-  Logical, never `realpath` or `cd -P`: physical resolution loses the
-  spelling the user stands in, and a hardcoded root splits state across
-  two trees the way a hardcoded username once split it across two homes.
-- NEVER let a `yo` command target a guest path outside the guest `$HOME`.
-  A path the mirror cannot place lands at the guest home with a loud
-  stderr notification instead of a silent guess.
-  One exception: `yo cp` may also use an absolute guest path under `/tmp`,
-  because agents' scratch output lives there and scp runs as `agent`,
-  whose permissions are the real boundary.
+- ALWAYS derive a guest path by mirroring the Mac's logical `$PWD` (or a repo's logical toplevel) relative to `$HOME` onto the guest `$HOME`. Use the logical path, never `realpath` or `cd -P`: physical resolution loses the spelling the user stands in. [story](yo.md#the-mirror)
+- NEVER let a `yo` command target a guest path outside the guest `$HOME`. A path the mirror cannot place lands at the guest home with a loud stderr note. The one exception is `yo cp`, which also takes an absolute path under `/tmp`, where agents' scratch output lives. [story](yo.md#yo-cp)
+
+## Distribution and release
+
+- NEVER hand-edit `.version`. The release workflow writes it from the release tag, and `yo` derives its flake ref from it, so a wrong version builds the wrong system with no error. [story](docs/distribution.md#flake-ref-not-a-checkout)
+- ALWAYS publish a release from a commit that is the tip of `main`. The workflow force-moves the tag onto its stamp commit, and moving a tag cut elsewhere republishes different content under a name someone may have fetched. [story](.github/workflows/release.md#moving-the-tag)
+- NEVER let a VM hold a checkout of yolobox's own repo. `yo bootstrap` builds from a flake ref, and a guest checkout would reopen the push-to-checkout hazard for a repo nothing in the VM reads. [story](docs/distribution.md#flake-ref-not-a-checkout)
+- ALWAYS keep `aka-rider/yolobox` public. `nixos-rebuild` fetches the flake ref anonymously, so a private repo fails every `yo bootstrap` and every `local.nix` rebuild at once. [story](docs/distribution.md#failure-shapes)
+- ALWAYS validate the release tag against `^v[0-9]+\.[0-9]+\.[0-9]+$` as the first step of the workflow. The version is spliced into the tarball name, the formula URL and a commit message before any tag moves. [story](.github/workflows/release.md#early-refusals)
+- ALWAYS pin every GitHub Action to a full commit SHA, with the tag in a comment. A tag is a name its owner can move, and the release job holds a writable token and the tap's. [story](.github/workflows/release.md#pinned-actions)
+- ALWAYS keep workflow `permissions` at `contents: read`, with `contents: write` only on the `release` job, and `persist-credentials: false` on every checkout that does not push. A step that runs a script from the tree should not hold a writable token. [story](.github/workflows/release.md#early-refusals)
+- ALWAYS give `bump-tap`'s checkout `ref:` the release tag name. A bare checkout asserts the tag still points at the commit that triggered the run, which `release` has just moved. [story](.github/workflows/release.md#bump-tap-and-actionscheckout)
+- ALWAYS re-run only the failed jobs after a release failure, never the whole run. `verify.yml` would replay against the already-moved tag. [story](.github/workflows/release.md#bump-tap-and-actionscheckout)
+- NEVER turn on immutable releases. `release` re-uploads the tarball with `--clobber` and force-moves the tag, and both are refused on an immutable release. [story](.github/workflows/release.md#moving-the-tag)
+
+## Building
+
+- ALWAYS `git add` new files before nix evaluates a local clone. Nix reads the git tree, so an untracked file does not exist to it. [story](docs/distribution.md#flake-ref-not-a-checkout)
+- ALWAYS run `nixos-rebuild switch` unpiped, and read its exit code. A pipe through `tail` reports a failed bootloader install as exit 0. [story](nix/base.md#the-esp-holds-one-kernel)
+- ALWAYS check `df /boot`, and compare `readlink /run/current-system` with `readlink /nix/var/nix/profiles/system`, when a switch behaves strangely. Disagreement means the box runs one generation and the profile claims another, so do not garbage-collect. [story](nix/base.md#the-esp-holds-one-kernel)
+- ALWAYS use the `path` option, not `environment.PATH`, in a systemd unit. NixOS already defines the latter for every service, so a second definition conflicts.
+
+## Display and browsers
+
+- ALWAYS write `${pkgs.xvfb}/bin/Xvfb` explicitly. `pkgs.xorg.xvfb` is deprecated and `lib.getExe pkgs.xvfb` names a binary that does not exist. [story](nix/display.md#learned-the-hard-way)
+- NEVER add a tmpfiles rule for `/tmp/.X11-unix`. systemd ships one, and a duplicate logs errors every boot. [story](nix/display.md#learned-the-hard-way)
+- ALWAYS make `openbox` wait for the X socket in `ExecStartPre`, never in a `Restart=` loop. The socket lags Xvfb's start, and a restart loop trips systemd's start limit and stays failed. [story](nix/display.md#learned-the-hard-way)
+- NEVER set `AGENT_BROWSER_EXECUTABLE_PATH`. pi-agent-browser-native disables its managed session restore whenever it is present, so the browser path goes in the extension's config file. [story](nix/display.md#browsers)
+- NEVER set `PLAYWRIGHT_MCP_USER_DATA_DIR`. The box runs Playwright isolated per launch, and the server throws when both are set. [story](nix/display.md#browsers)
+- NEVER run `agent-browser install`. It downloads a glibc Chrome for Testing that cannot execute on NixOS, and leaves a binary that looks installed. [story](nix/display.md#browsers)
+
+## Harnesses and installs
+
+- ALWAYS deliver hooks through the box-owned `~/.local/bin/claude` launcher's `--settings` file. The `/etc/claude-code/managed-settings.json` tier is discarded whole whenever the remote-settings tier is non-empty, and it always is here. [story](nix/harnesses.md#the-launcher)
+- NEVER let anything but the box own `~/.local/bin/claude`. It is the only hook channel, and the agent's dotfiles prepend that directory to `PATH`, so nothing on the system `PATH` can win. It is a tmpfiles `L+` link to `/etc/yolobox/bin/claude`, re-asserted by `yolobox-claude-launcher`. [story](nix/harnesses.md#the-launcher)
+- NEVER follow `claude update`'s "Fix" line about removing `~/.local/bin/claude`. It is the installer noticing the box's launcher, and removing the link runs claude unwrapped, with no `HERDR_AGENT` and no Playwright hook. [story](nix/harnesses.md#recognising-a-broken-launcher)
+- NEVER give the launcher `runtimeInputs`. It would prepend the store's coreutils, findutils and git to `PATH`, and every tool a session runs would be shadowed by the box's. [story](nix/harnesses.md#the-launcher)
+- ALWAYS set `StartLimitIntervalSec = 0` on a service a path unit triggers. One download writes thousands of times, and the default limit trips in the first second and leaves the path unit failed. [story](nix/harnesses.md#the-version-keeper)
+- NEVER pipe into `grep -q` in a `set -o pipefail` script. `grep -q` exits at its first match, the producer dies of SIGPIPE, and an installed package reads as missing. Capture the output first. [story](nix/harnesses.md#install-phases)
+- ALWAYS run each install phase in its own errexit subshell through `phase()`. One vendor's outage then cannot block the others, and the script still exits 1 at the end. [story](nix/harnesses.md#install-phases)
+- NEVER let a vendor installer edit an rc file. opencode's gets `--no-modify-path`, and pi's has no such flag, so answer `n` to its PATH prompt by hand. An rc line changes `PATH` behind the box's back. [story](nix/harnesses.md#pi)
+- ALWAYS keep `~/.claude/settings.json` a regular file, never a symlink into the dotfiles. Plugin installs are recorded there and would write into the checkout. [story](nix/harnesses.md#plugins-not-mcp-files)
+- ALWAYS let pi own `~/.pi/agent/settings.json`, and NEVER add a tmpfiles rule for it. pi rewrites it and only logs a failed write, so a symlink silently drops every package, and an unconditional `r` rule deletes the real file. [story](nix/harnesses.md#pi)
+- ALWAYS install pi packages with `pi install`, never by editing its settings file. [story](nix/harnesses.md#pi)
+- NEVER drop a retired `L+` link or file from the config without an `r` rule or a hand delete. A rebuild does not remove what it stops declaring, and the dangling link breaks its owner. [story](nix/harnesses.md#pi)
+- ALWAYS keep the VM free of a C and Python toolchain. It keeps native npm modules from compiling at install time, so t3 and agent-browser install vendor-built binaries instead. [story](nix/harnesses.md#install-phases)
+- ALWAYS keep t3's `HOME` equal to an interactive session's. `t3 pair` finds the server through `$HOME/.t3/*/server-runtime.json`, and a mismatch reads as "No running T3 Code server found". [story](nix/t3.md#vendor-install-and-drop-in)
+
+## herdr
+
+- ALWAYS start an agent in a herdr pane on the saved `yolobox` machine, never expect `yo enter`'s plain landing shell to report to herdr. Only a real pty opened against the VM's own herdr server reaches its manifest. [story](nix/herd-server.md#machine-panes)
+- ALWAYS treat herdr compatibility as capability-gated, not version-equal. A saved machine needs the guest's `endpoint_protocol_generation` to equal the client's exactly, so bump `yolobox.harness.herdr.version`/`.hash` when it does not. [story](nix/herd-server.md#capability-gating)
+- ALWAYS keep `herdrPkg` in `environment.systemPackages`. `herdr machine add` adopts a compatible binary on its probe list, which includes `/run/current-system/sw/bin/herdr`, and otherwise tries an install that a non-interactive run refuses. [story](nix/herd-server.md#capability-gating)
+- ALWAYS keep `HERDR_AGENT=claude` exported in the claude launcher ahead of its `exec`. herdr classifies by process name, and the launcher execs a binary named after its version directory, so without the hint a session reports nothing. [story](nix/herd-server.md#herdr_agent)
+- NEVER add a tmpfiles rule that deletes a herdr-installed integration file (`~/.pi/agent/extensions/herdr-agent-state.ts`, for one). `r` rules rerun on every switch, so the rule would silently un-install the integration. [story](nix/harnesses.md#herdrs-pi-integration)
+
+## Disk and gc
+
+- ALWAYS diagnose a full disk from the Mac with `yo gc`. In-VM tools die first, while `yo ssh` still works and the operator's `sudo` can use ext4's 4.3 GB root reserve. A dying agent session proves nothing, because the agent has no `sudo`. [story](docs/disk.md#recognising-a-full-disk)
+- ALWAYS reclaim before growing. A full disk has so far always been build output and caches, never a real need for more space. [story](docs/disk.md#incidents)
+- ALWAYS gate the deletion of a project directory on `git check-ignore`. Deleting a tracked directory dirties the checkout and silently refuses every later push. [story](nix/guest/yolobox-guest.md#gc-tiers)
+- NEVER delete a directory because its name is in `BUILD_DIRS`. A name proves nothing, since a `target` can hold code or data. The project's own clean command, or a manifest beside a git-ignored directory, decides. [story](nix/guest/yolobox-guest.md#build_dirs-and-local_caches)
+- ALWAYS limit `LOCAL_CACHES` to caches a tool rebuilds or refetches by itself. Model weights and app data (`huggingface`, `ms-playwright`, `rune`) cost a download the box may not repeat, or break a tool. [story](nix/guest/yolobox-guest.md#build_dirs-and-local_caches)
+- NEVER give `podman system prune` the `--volumes` flag, in `gc` or in the prune timer. Volumes hold database state. [story](nix/guest/yolobox-guest.md#gc-tiers)
+- NEVER let `gc --deep` touch `.devbox/virtenv`. It is devbox's toolchain, not build output, and the walk prunes hidden directories so it stays out of reach. [story](nix/guest/yolobox-guest.md#gc-tiers)
+- ALWAYS switch to a generation carrying `boot.growPartition` before `limactl edit --disk`. Otherwise the backing file grows and the guest partition stays where it was, with no error. [story](nix/base.md#growing-the-root-disk)
+
+## AWS credentials
+
+- ALWAYS fix a process's AWS profile with `AWS_PROFILE` against the guest's rendered `AWS_CONFIG_FILE`, never one global, switchable profile. botocore fixes its credential source at first use, so flipping a shared profile leaves a running process on the old account for tens of minutes. [story](docs/aws.md#design)
+- ALWAYS tie the AWS broker's lifetime to lima's hostagent (`--watch-pid`, read from `limactl list yolobox --json`'s `hostAgentPID`), never to a per-session forward or an idle timeout, and never by opening lima's `ha.pid`. Profiles are chosen per process, so no session bounds the broker, and lima rewrites `ha.pid` on every start. [story](docs/aws.md#broker-lifetime)
+- ALWAYS reach the AWS broker the way 1Password is reached: a lima reverse unix-socket forward (`/run/yolobox-op/aws-broker.sock`, proxied to the agent-owned `/run/yolobox/aws-broker.sock`), never a forwarded TCP port. A Mac-side VPN blackholed every guest connection to lima's gateway address while general egress kept working. [story](docs/aws.md#transport)
+- NEVER guard a reversed unix socket with a bearer token. Filesystem permissions on the agent-owned socket are the whole authorization boundary, and a token is a second mechanism to keep in sync. [story](docs/aws.md#transport)
+- ALWAYS keep the agent's environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`, `GOPATH`, `PI_CLIPBOARD_OSC52`) declared once, in `nix/lib/agent-env.nix`, applied identically to the herdr server, t3 and every agent login shell. `awsBrokerSock` there is the one name of the guest-side broker socket, and `TestAgentEnvMatchesYoSockets` checks it against `yo`. [story](docs/aws.md#guest-config)
+- NEVER let the broker write a secret to stdout after its handshake line, or to any log. [story](docs/aws.md#broker-lifetime)
+
+### Broker hardening
+
+- ALWAYS spell the profile-name pattern identically in `yo`, `aws-broker` and `yolobox-guest`, and match it with `fullmatch`. A name goes into a `credential_process` argument and a URL path, and `$` matches before a trailing newline. [story](docs/aws.md#allowlist)
+- NEVER allow-list a profile without a valid `region`. A region-less profile makes the CLI target the global STS endpoint, which this Mac's DNS filter sinkholes, and the region lands in the rendered config file. [story](docs/aws.md#allowlist)
+- ALWAYS answer every request failure with the same generic 500, and write the detail only to `broker.log`. The guest is the untrusted side and the response is the one channel it reads. [story](docs/aws.md#minting)
+- NEVER hand long-lived IAM keys to the guest. A response without a `SessionToken` is refused at request time. [story](docs/aws.md#minting)
+- ALWAYS compare socket identity with `lstat`, never `stat`. A path replaced by a symlink to the old socket would otherwise report the target's identity and be deleted as ours. [story](docs/aws.md#broker-lifetime)
+- ALWAYS bound the broker: at most 32 concurrent requests, answering the next with 503, and a 10 s timeout per connection. A mint can take 30 s, and a silent client must free its slot. [story](docs/aws.md#minting)
+- ALWAYS write the guest AWS config atomically, with `mktemp` and `mv`. A `credential_process` call must never read a half-written file. [story](docs/aws.md#guest-config)
 
 ## Project repos in the VM
 
-- ALWAYS keep a project's VM checkout clean before pushing to it. The push
-  target is `updateInstead`, which refuses when the worktree or index
-  differs from HEAD.
-- ALWAYS pull the VM's commits (it commits `devbox.lock`) before pushing
-  again, or the push lands on a diverged branch and is refused. That pull
-  is also the sandbox's trust boundary: review the agent-authored commits
-  before running anything they contain.
-- ALWAYS keep Playwright output in `~/artifacts/<project>/`, never inside
-  the project checkout, so the push channel never sees stray binaries. The
-  box's claude launcher exports a per-project `PLAYWRIGHT_MCP_OUTPUT_DIR`
-  before exec, and a PreToolUse hook reroutes an explicit `filename` into
-  that same directory, because Playwright resolves an explicit name
-  against the checkout by design.
+- ALWAYS keep a project's VM checkout clean before pushing to it. The push target is `updateInstead`, which refuses when the worktree or index differs from HEAD. [story](docs/distribution.md#flake-ref-not-a-checkout)
+- ALWAYS pull the VM's commits (it commits `devbox.lock`) before pushing again, or the push lands on a diverged branch and is refused. The pull is also the sandbox's trust boundary, so review agent-authored commits before running anything in them. [story](docs/distribution.md#flake-ref-not-a-checkout)
+- ALWAYS keep Playwright output in `~/artifacts/<project>/`, never inside the project checkout. The claude launcher exports a per-project `PLAYWRIGHT_MCP_OUTPUT_DIR`, and a `PreToolUse` hook reroutes an explicit `filename` there, because Playwright resolves explicit names against the checkout. [story](nix/display.md#output-directory-and-the-pretooluse-hook)
