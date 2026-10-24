@@ -1246,7 +1246,7 @@ class TestCmdStatus(unittest.TestCase):
         with (
             mock.patch.object(yo, "run", return_value=mock.Mock(returncode=0)),
             mock.patch.object(yo, "account_status", return_value=("unreachable", "")),
-            mock.patch.object(yo, "sshd_answers", return_value="yes") as answers,
+            mock.patch.object(yo, "initrd_waiting", return_value=True) as waiting,
             mock.patch.object(yo, "lima_config_gaps", return_value=[]),
             mock.patch.object(yo, "du_kib", return_value=None),
             mock.patch.object(yo.shutil, "which", return_value=None),
@@ -1254,7 +1254,7 @@ class TestCmdStatus(unittest.TestCase):
             mock.patch.object(yo, "err"),
         ):
             yo.cmd_status(yo.build_parser().parse_args(["status"]))
-        answers.assert_called_once_with("root")
+        waiting.assert_called_once_with()
         self.assertTrue(
             any(line.startswith("disk: locked") and "yo up" in line for line in outs)
         )
@@ -1499,6 +1499,27 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
         self.assertIn("yolobox-unlock: unlocked", box.stdout.getvalue())
         box.vm_services.assert_called_once_with()
 
+    def test_a_helper_warning_on_a_successful_unlock_reaches_the_operator(self):
+        warning = "yolobox-unlock: reply to 7 failed"
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            helpers=[(["yolobox-unlock: unlocked"], 0, warning)],
+        )
+        box.up()
+        self.assertIn(warning, box.stderr.getvalue())
+
+    def test_a_helper_warning_before_the_session_dropped_reaches_the_operator(self):
+        warning = "yolobox-unlock: ask names no socket, skipped"
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            operator=[NOT_LISTENING, ANSWERS],
+            helpers=[([MIGRATE_ASKED], 255, warning)],
+        )
+        box.up()
+        self.assertIn(warning, box.stderr.getvalue())
+
     def test_a_box_waiting_in_its_initrd_is_unlocked_without_a_start(self):
         box = FakeBox(self, operator=[REFUSED, ANSWERS], root=[ANSWERS])
         box.up()
@@ -1709,8 +1730,8 @@ class TestUnlockSurvivesADroppedSession(unittest.TestCase):
 
     def test_lima_having_exited_is_not_blamed_once_the_session_has_run(self):
         FakeBox(self, **dict(self.SCRIPT, statuses=["Running"]))
-        outcome = yo.unlock_disk(b"a" * 64, FakeStarter(1, True))
-        self.assertEqual(outcome, ("already-unlocked", True))
+        migrated = yo.unlock_disk(b"a" * 64, FakeStarter(1, True))
+        self.assertTrue(migrated)
 
     def test_up_then_stops_and_starts_lima_cleanly(self):
         box = FakeBox(self, starts=[(1, True), (0, False)], **self.SCRIPT)

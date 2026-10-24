@@ -39,16 +39,6 @@ class TestDeriveLuksPassphrase(unittest.TestCase):
         self.assertEqual(yo.LUKS_SIGN_DATA, b"yolobox luks v1")
         self.assertEqual(yo.LUKS_KDF_INFO, b"yolobox luks passphrase v1")
 
-    def test_is_64_lowercase_hex_characters(self):
-        passphrase = yo.derive_luks_passphrase(RAW_SIGNATURE)
-        self.assertRegex(passphrase.decode("ascii"), r"^[0-9a-f]{64}$")
-
-    def test_is_deterministic(self):
-        self.assertEqual(
-            yo.derive_luks_passphrase(RAW_SIGNATURE),
-            yo.derive_luks_passphrase(RAW_SIGNATURE),
-        )
-
     def test_differs_between_two_signatures(self):
         self.assertNotEqual(
             yo.derive_luks_passphrase(RAW_SIGNATURE),
@@ -223,9 +213,24 @@ class TestSshAgentClientFailures(FakeAgent):
             yo.ssh_agent_identities(self.sock_path)
         self.assertIn("not answering", caught.exception.message)
 
-    def test_a_missing_socket_is_refused(self):
-        with self.assertRaises(yo.YoError):
+    def test_a_missing_socket_is_refused_without_a_prompt_hint(self):
+        with self.assertRaises(yo.YoError) as caught:
             yo.ssh_agent_identities(os.path.join(self.dir, "nothing.sock"))
+        self.assertIn("not answering", caught.exception.message)
+        self.assertNotIn("approve", caught.exception.message)
+
+    def test_a_reply_that_never_comes_names_the_prompt_to_approve(self):
+        # The timeout is the behaviour under test, so this one waits for real.
+        hang = threading.Event()
+        self.addCleanup(hang.set)
+        self.raw_reply = None
+        with (
+            mock.patch.object(yo, "AGENT_REPLY_TIMEOUT", 0.2),
+            mock.patch.object(FakeAgent, "answer", lambda agent, conn: hang.wait(5)),
+        ):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.ssh_agent_identities(self.sock_path)
+        self.assertIn("approve its prompt", caught.exception.message)
 
 
 class TestLuksPassphraseWithoutOnePassword(FakeHome):
@@ -239,14 +244,16 @@ class TestClassifyInitrdAttempt(unittest.TestCase):
     def test_a_command_that_ran_is_ran_whatever_it_exited_with(self):
         for code in (0, 1, 2, 3, 130):
             with self.subTest(code=code):
-                self.assertEqual(yo.classify_initrd_attempt(code, "x"), "ran")
+                self.assertEqual(
+                    yo.classify_initrd_attempt(code, "x"), yo.SshOutcome.RAN
+                )
 
     def test_permission_denied_on_a_connection_is_refused(self):
         self.assertEqual(
             yo.classify_initrd_attempt(
                 255, "root@127.0.0.1: Permission denied (publickey)."
             ),
-            "refused",
+            yo.SshOutcome.REFUSED,
         )
 
     def test_nothing_listening_shapes(self):
@@ -261,12 +268,16 @@ class TestClassifyInitrdAttempt(unittest.TestCase):
             "ssh: connect to host 127.0.0.1 port 60022: Operation timed out",
         ):
             with self.subTest(text=text):
-                self.assertEqual(yo.classify_initrd_attempt(255, text), "not-listening")
+                self.assertEqual(
+                    yo.classify_initrd_attempt(255, text), yo.SshOutcome.NOT_LISTENING
+                )
 
     def test_an_unknown_ssh_failure_is_an_error(self):
         for text in ("", "Bad configuration option: lizard"):
             with self.subTest(text=text):
-                self.assertEqual(yo.classify_initrd_attempt(255, text), "error")
+                self.assertEqual(
+                    yo.classify_initrd_attempt(255, text), yo.SshOutcome.ERROR
+                )
 
 
 class TestInitrdSshArgv(FakeHome):

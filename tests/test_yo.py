@@ -2010,7 +2010,7 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
         with (
             mock.patch.object(yo, "lima_config_gaps", return_value=gaps),
             mock.patch.object(yo, "lima_instance_info", return_value=running),
-            mock.patch.object(yo, "sshd_answers", return_value="yes"),
+            mock.patch.object(yo, "stage2_up", return_value=True),
             mock.patch.object(yo, "ensure_agent_ssh_config"),
             mock.patch.object(yo, "ensure_guest_known_hosts"),
             mock.patch.object(yo, "vm_services") as fake_services,
@@ -2192,7 +2192,7 @@ class TestStatusWithVmDown(unittest.TestCase):
             mock.patch.object(yo, "account_status", lambda: ("unreachable", "")),
             mock.patch.object(yo, "ssh_run", ssh_run),
             mock.patch.object(yo, "lima_config_gaps", lambda: []),
-            mock.patch.object(yo, "sshd_answers", lambda user: "not-listening"),
+            mock.patch.object(yo, "initrd_waiting", lambda: False),
             mock.patch.object(yo.shutil, "which", lambda name: None),
         ):
             yo.cmd_status(yo.build_parser().parse_args(["status"]))
@@ -2200,6 +2200,19 @@ class TestStatusWithVmDown(unittest.TestCase):
         self.assertEqual(guest_calls, [])
         self.assertEqual(stdout.getvalue().count("unreachable"), 1)
         self.assertIn("yo up", stdout.getvalue())
+
+
+class TestClassifyDisk(unittest.TestCase):
+    def test_each_filesystem_type_has_its_state(self):
+        for fstype, state in (
+            ("", yo.DiskState.UNREADABLE),
+            ("ext4", yo.DiskState.PLAIN_EXT4),
+            ("crypto_LUKS", yo.DiskState.ENCRYPTED),
+            ("xfs", yo.DiskState.OTHER),
+            ("lizard", yo.DiskState.OTHER),
+        ):
+            with self.subTest(fstype=fstype):
+                self.assertIs(yo.classify_disk(fstype), state)
 
 
 if __name__ == "__main__":
