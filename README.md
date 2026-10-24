@@ -20,6 +20,8 @@ A development sanbox virtual machine. It's a NixOS Linux run by Lima.
 
 You need [1Password](https://1password.com/) with its SSH agent turned on. It holds your keys.
 
+Create an `SSH Key` item in 1Password, type Ed25519, titled `yolobox-disk`. It unlocks the VM's disk: `yo up` asks 1Password for it (Touch ID) every time the VM starts. Approve that prompt only when you ran `yo` yourself. Keep the item: if it is lost, the disk is lost.
+
 ### Homebrew
 
 ```bash
@@ -90,6 +92,8 @@ You can paste images from the host's clipboard into a herdr pane in the VM.
 ### 1Password and AWS
 
 1Password's SSH agent works in the VM automatically.
+
+The VM's disk is encrypted. `yo up` asks 1Password for the `yolobox-disk` key to unlock it.
 
 For AWS, log in on the host, then pick the profile in the VM:
 

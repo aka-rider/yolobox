@@ -1,0 +1,126 @@
+# Disk encryption: LUKS on the root partition
+
+The VM's root partition, `/dev/vda2`, is LUKS2-encrypted. `yo up` unlocks it at every start with a passphrase it derives from a 1Password SSH key, and it hands that passphrase to an sshd that runs inside the initrd. Nothing secret is written to disk on the Mac or in the guest. This page explains why the box works that way, what the design does not protect, and how to recognise each piece failing. The rules are in [CONSTITUTION.md](../CONSTITUTION.md#disk-encryption).
+
+The code is in `nix/luks.nix` (the initrd configuration), `nix/luks/apps.nix` with the three scripts beside it (`yolobox-initrd-authorized-keys.sh`, `yolobox-unlock.sh`, `yolobox-luks-migrate.sh`), and in `yo` (`vm_up`, `unlock_disk`, `luks_passphrase`, `lima_stop`, `sshd_answers`). Sections that describe behaviour nobody has observed yet say so.
+
+## What is encrypted and what is not
+
+`/dev/vda2` is encrypted: the whole root filesystem, `/tmp`, the swapfile and every home directory. The cipher is `aes-xts-plain64` with a 512-bit key and an argon2id key derivation, and the mapping is called `root`. The header carries the label `yolobox-luks`, which is how the migration tells a finished disk from an unfinished one.
+
+`/dev/vda1`, the ESP mounted at `/boot`, is not encrypted. GRUB has to read the kernel and the initrd from it before anything can be unlocked. The initrd holds no secret: the sshd inside it generates its host key at every boot, in the initrd's own RAM filesystem, so no private key ever sits on the ESP.
+
+The reason for encrypting at all is the image file. `~/.lima/yolobox/disk` is the whole disk in one file, and without encryption it is plaintext in every backup, every copy and every snapshot, and it stays plaintext while the VM is stopped. Where FileVault is on, it already covers the file at rest on that Mac. This design guards the copies FileVault does not: Time Machine, a file sent somewhere, an image copied off the Mac.
+
+Four limits are worth stating plainly, because the word "encrypted" promises more than the design delivers.
+
+- The encryption protects the file, not the running machine. While the VM runs, a process on the Mac that runs as the operator can ssh into the box with lima's key, and the guest holds the key in kernel memory.
+- Anyone who can replace the initrd on the ESP owns the next unlock. The initrd receives the passphrase, so a modified one can keep it. The ESP is not encrypted and not signed. Secure Boot and a TPM are not on offer under the vz driver.
+- An agent session in the VM can ask for the same signature. The 1Password agent socket is forwarded into every agent session (see [docs/ssh.md](ssh.md#1password-reaches-the-agent)), so an agent can list the `yolobox-disk` key and request a signature. 1Password then prompts the operator and names the requesting application. One approved signature is the disk passphrase. So approve a `yolobox-disk` prompt only while you are running `yo up`, `yo bootstrap` or `yo disk-grow` yourself. 1Password approves per application until it locks, so the prompt does not repeat for every use, and a second request inside that window gets no prompt at all. The passphrase alone is useless without the image file, which only the Mac holds.
+- The migration encrypts only the current `~/.lima/yolobox/disk`. APFS snapshots, Time Machine and every earlier copy of that file still hold the plaintext. Delete the copies you made before the migration. The guest also runs `blkdiscard` on the old plaintext and mounts `/` with `discard`, but that punches holes only in the current file.
+
+There is one keyslot and no recovery passphrase. The operator declined one on 2026-10-24. If the `yolobox-disk` item is lost, renamed to something else or recreated, the disk is gone.
+
+## The key
+
+The key is an Ed25519 key in 1Password, an `SSH Key` item titled exactly `yolobox-disk`. 1Password serves only items of that type through its agent, so the item must be an SSH key and not a login or a passkey.
+
+`yo` speaks the SSH agent protocol itself over the Mac-side socket, with nothing but the standard library. It asks the agent to list identities (message 11) and picks the one whose comment is `yolobox-disk`. 1Password uses the item title as the comment. Zero matches, several matches and a key of the wrong type are three different `YoError`s. Then `yo` sends a sign request (message 13, flags 0) over the fixed bytes `LUKS_SIGN_DATA` (`yolobox luks v1`). 1Password asks for Touch ID at that moment. The passphrase is then `HMAC-SHA256(key = the raw 64-byte signature, msg = LUKS_KDF_INFO)` written as 64 lowercase hex characters, where `LUKS_KDF_INFO` is `yolobox luks passphrase v1`. `derive_luks_passphrase` does the HMAC and `luks_passphrase` runs the whole sequence.
+
+Why a signature and not a stored secret: the agent hands out signatures, never keys. The vault stays the only place the secret lives, there is nothing to back up or leak from the Mac's disk, and a signature request shows up as a prompt that names the asking application. The 1Password CLI (`op`) was rejected for the opposite reasons. It adds a session token that any process of the same user can reuse without a prompt, and it is one more interface to trust. A passkey was rejected too, because nothing in `yo`'s stdlib-only Python can drive a browser or platform authenticator dialog.
+
+The passphrase exists as `bytes` in `yo`'s memory and leaves it only on an ssh stdin pipe. It is never written to a file, a log, an environment variable or argv, on the Mac or in the guest. The passphrase is exactly the 64 characters. `cryptsetup --key-file -` reads stdin to the end and keeps a trailing newline as part of the passphrase, so one stray `\n` makes a passphrase that never matches. `yo` sends the bytes to `cryptsetup resize` with no newline, the migration script feeds `cryptsetup` with `printf '%s'`, and `yolobox-unlock` reads its line with `IFS= read -r`, which strips the newline `yo` appends.
+
+Never change `LUKS_SIGN_DATA`, `LUKS_KDF_INFO` or `derive_luks_passphrase`. Together they are the passphrase of every existing disk, and there is no second slot to fall back on. The two constants carry a comment that says so.
+
+Determinism is the assumption everything rests on, and it is not documented. RFC 8032 Ed25519 signatures are deterministic, but 1Password's documentation says nothing about its agent. Before the first encryption, sign the same bytes twice through the real socket and compare the HMACs, and do not start the migration unless they match. If they differ, switch the item to RSA-4096 and sign with the `rsa-sha2-256` flag (value 2), whose PKCS#1 v1.5 signatures are deterministic by construction. A future 1Password release that randomised signatures would make the disk unopenable, which is the price of declining a recovery slot.
+
+## How yo reaches the initrd
+
+The disk cannot be unlocked from inside the guest, because the guest is not running yet. So the initrd runs a small sshd on TCP port 22, and `yo` reaches it as `root@127.0.0.1:60022`. These are the facts about lima 2.2.1 under the vz driver that make that work, all read from its source or observed on this box.
+
+- The Mac-side listener on `127.0.0.1:60022` appears only after the guest's TCP port 22 first answers. Until then nothing listens, and `ssh` gets `Connection refused`.
+- At that instant lima chooses once per VM start. If a listener on vsock port 22 answers, it proxies 60022 to vsock and never creates the TCP forward. Otherwise it forwards 60022 to `192.168.5.15:22` and never switches.
+- The initrd sshd speaks TCP only. So `lima/yolobox.yaml` pins `ssh.overVsock: false`, which makes lima skip the vsock check and makes the choice the same every time. Without the pin, the stage-2 sshd (which does answer on vsock) could win a later restart and leave 60022 pointing at a path the initrd cannot serve. Like every setting in that file, the pin reaches an existing instance only through `limactl edit` while stopped; `yo up` prints the command (see [lima/yolobox.md](../lima/yolobox.md#pinned-settings)).
+- Lima's static `portForwards` and the guest-agent tunnel do not exist before the guest agent runs. So the unlock channel cannot depend on either.
+
+The initrd sshd authorizes lima's own key, and it reads that key live from lima's cidata. Lima regenerates the cidata ISO on every start and writes the operator's public key into its `user-data` under `ssh-authorized-keys:`. The initrd mounts `/dev/disk/by-label/cidata` on a `mktemp -d` under `/tmp` and extracts the key with the same gawk program nixos-lima's `lima-init` uses. It writes the result to `/etc/ssh/yolobox_authorized_keys`, and a `Match User root` block in the sshd config points `AuthorizedKeysFile` at it. `isofs` is in the initrd's kernel modules so the mount works. Both `/tmp` and `/etc` here are the initrd's own filesystem, freed at switch-root. Nothing is created or chmodded under `/run`, because `/run/yolobox` survives switch-root and holds the agent's sockets (`0755 root`); the initrd must not change it.
+
+Nothing pins the initrd's host key. It is new at every boot, so `yo` connects with `FIRST_CONTACT_OPTS` (no known-hosts file, no strict checking) through `initrd_ssh_argv()`. That is acceptable because the only party on the loopback path to port 60022 is lima's hostagent, running as the same Mac user, and anyone who could replace the ESP could replace the initrd anyway.
+
+Every probe made before the disk is unlocked must go through `initrd_ssh_argv()`, never through a pinned role such as the one `account_status()` uses. The pinned roles use `accept-new`, which would write the initrd's per-boot host key into `~/.lima/yolobox/known_hosts`. Every later stage-2 connection would then fail with `REMOTE HOST IDENTIFICATION HAS CHANGED` until `ensure_guest_known_hosts()` rewrote the file.
+
+Two different sshds answer on port 60022 over one boot. The initrd one accepts `root` with lima's key and has no operator account. The stage-2 one refuses `root` and accepts the operator. So `Permission denied` for `root` proves nothing on its own, because an initrd whose cidata extraction failed says the same thing. `sshd_answers(user)` runs `true` over `initrd_ssh_argv()` as one user and classifies the result. Asking as the operator and getting `yes` means stage 2 is up. Asking as `root` and getting `yes` means the initrd is waiting. A refusal of both is retried until the deadline, never raised on first sight, because on a fresh instance's plain first boot `lima-init` writes the operator's key moments after sshd starts.
+
+During a boot, lima's own readiness check logs in to the initrd sshd as the cidata user every 3 s and fails with `Invalid user`. That is noise. But it matters in another way: OpenSSH 10 penalises a source address per failed login (`PerSourcePenalties`, defaults `authfail:5 invaliduser:5 ... max:600`). Lima and `yo` share one source address, because gvproxy forwards both. After about three attempts sshd would drop every connection from that address, `yo`'s included, for up to 600 s. So the initrd's `sshd_config` says `PerSourcePenalties no`, and that line comes before the `Match User root` block. A global keyword written after a `Match` line belongs to the block, sshd refuses it there, and an initrd sshd that refuses its config never starts, on a box with no rollback generation. The build checks this with `sshd -t` on the initrd's built config.
+
+The initrd is built by a builder that follows ELF dependencies only. A shell script's text references are never followed, so a `writeShellApplication` listed in the initrd arrives alone. Every tool the three scripts call (each `runtimeInputs` bin directory, `inotifywait`, `systemd-reply-password`) is therefore listed by hand in `boot.initrd.systemd.storePaths`. A missing tool shows up as a box stuck in its initrd. The check that catches it is a listing of the built initrd, run before any reboot.
+
+`yo` has no event source for a remote TCP port coming up or for lima's readiness. So it polls, in exactly two places: `unlock_disk` retries the initrd connection every 2 s, and `wait_for_operator` probes the stage-2 sshd every 3 s. Each is bounded by a 600 s deadline and says in a comment that it polls an external machine. Everything inside the guest is event-driven.
+
+## Delivering the passphrase
+
+`yo` runs `yolobox-unlock` over that ssh connection with the passphrase and a newline on stdin. The helper speaks systemd's password-agent protocol. When `systemd-cryptsetup@root.service` needs a passphrase, systemd writes an ask file, `/run/systemd/ask-password/ask.*`, with a `Socket=` key naming where to send the answer. The helper watches that directory with `inotifywait` (and `/dev/mapper`, where the mapping appears) and answers each ask exactly once with `systemd-reply-password 1 <Socket>`, feeding the passphrase on stdin. The same helper answers the migration's own ask (id `yolobox:luks-migrate`) when a migration has to run. There is no polling anywhere in it.
+
+File events alone do not say a unit changed state. `/dev/mapper/root` appears while `systemd-cryptsetup attach` is still running, and a failing unit posts no file event at all. So the helper's event stream also carries the journal lines of the migrate and cryptsetup units, and each line wakes it to re-check `systemctl is-active` and `is-failed`. It echoes those lines, which is how `yo` shows migration progress. The two watchers are plain background processes writing into a FIFO that the main loop reads, and not a pipeline. A loop fed by a pipe runs in a subshell, where `exit` ends only the subshell. A surviving watcher would also keep the ssh session's stderr open after the helper left, and `yo` would hang on a failure exit.
+
+The helper reports its outcome by exit code, and `yo` reads it.
+
+- 0: `systemd-cryptsetup@root.service` is active. The disk is unlocked.
+- 1: that unit failed. The passphrase does not open the device, which means a different key encrypted this disk.
+- 2: the migration unit failed. The helper prints the last 20 journal lines on stderr. The plaintext is still intact.
+- 3: the helper lost its ask-password watch.
+
+It checks the migration unit first. A migration that failed would otherwise leave the cryptsetup unit failed too (it requires the migrate unit), and that would read as a wrong key.
+
+## Encrypting in place
+
+The box is not recreated to encrypt it. The first boot of the generation that carries `nix/luks.nix` encrypts `/dev/vda2` in place, inside the initrd. The same code serves a fresh instance, whose first boot is the plain nixos-lima image. `yolobox-luks-migrate.service` is an initrd oneshot that `systemd-cryptsetup@root.service` requires and runs before. It looks at `/dev/vda2` and picks one of four states.
+
+- ext4: encrypt. `e2fsck -f -y`, shrink the filesystem to its minimum plus 5%, then `cryptsetup reencrypt --encrypt` with `--reduce-device-size 32M` and `--device-size` set to the shrunken filesystem plus 32 MiB, rounded up to 4 MiB. Then finalize.
+- LUKS with an unfinished reencryption (`luksDump` shows `online-reencrypt` in its requirements): resume with `--resume-only`, then finalize.
+- LUKS without the label `yolobox-luks`: finalize only.
+- LUKS with the label: do nothing, ask nothing, exit 0.
+
+Finalize opens the device, discards the raw tail, checks and grows the filesystem back to full size, closes the mapping, and only then writes the label. A failure after the open closes the mapping before the script exits, so `systemd-cryptsetup` can never report a half-finalized device as already active. The script asks for the passphrase only inside the encrypt, resume and finalize branches. A labelled disk must not post an ask on every boot, and that ask is also how `yo` learns that a migration ran.
+
+Why `--device-size`: `cryptsetup reencrypt` with only `--reduce-device-size` would encrypt the whole 400 GiB, including free space, and the sparse image file would grow to its full size. With `--device-size` only the used region is ever written as ciphertext, so `~/.lima/yolobox/disk` should stay about as small as it was. Check it afterwards with `du -h`. The cost is that when the reencryption completes, the LUKS segment becomes "dynamic" and covers the whole device. The tail past `--device-size` then decrypts to garbage, and the raw tail still holds the old plaintext until it is discarded. That is why finalize runs `blkdiscard -f` on it. It computes the start from `cryptsetup status root` (the data offset in 512-byte sectors) plus the filesystem size from `dumpe2fs -h`, never from a number remembered across boots, because a resumed run has none. `-f` is needed because dm holds the device open.
+
+Why the default 512-byte encryption sector: vda2 is 838,334,431 sectors of 512 bytes, which is not a multiple of 8. A 4096-byte sector size would fail with `Device size is not aligned to requested sector size` once the segment covers the whole device, and by then the data would already be rewritten. The rehearsal images are `2G + 3584` bytes for the same reason, so they are unaligned too.
+
+Resumability is uneven. LUKS2 reencryption is crash-resumable, and the unit resumes on the next boot. The offline `resize2fs` shrink that comes first is not crash-safe. An interruption during it (power loss on the Mac, `limactl stop`, killing the VM) can corrupt the filesystem. The operator accepted that when choosing in-place over recreating. `yo bootstrap` prints a warning naming the window, and `yo gc --deep --yes` beforehand shortens it, because with the disk about 85% used, shrinking to 89% moves only the blocks above the new end. The reencryption of about 320 GiB takes an hour or more, so the migration outlives lima's ten minutes. After that `limactl start` returns non-zero while the VM keeps running. `vm_up` reads that as "lima gave up", not "the VM failed". It keeps the helper's session for the progress, and when the helper reports that a migration ran, it runs `lima_stop()` and starts once more.
+
+The migration unit is `requiredBy` and `before` the cryptsetup unit. So a failed migration stops the boot in the initrd with the plaintext intact, and the journal is reachable over the initrd sshd. The unit also carries `RemainAfterExit` and `IgnoreOnIsolate`, the pair systemd's own cryptsetup generator gives its unit. `RemainAfterExit` keeps it active, so a later transaction that reaches the cryptsetup unit during switch-root drops the migrate job as redundant, instead of running the script again. `IgnoreOnIsolate` stops the isolate from stopping it, which through `Requires=` would stop the cryptsetup unit and detach the root mapping under the mounted `/sysroot`.
+
+The script also refuses early. If the shrunken filesystem plus the LUKS headers need more bytes than the device has, it prints the exit-7 message and touches nothing. `yo bootstrap` makes the same check before rebuilding, and refuses above 90% use. The reason to check twice is that a refusal in the initrd can only be remedied from a root shell there (see Recognising failures).
+
+## Growing an encrypted disk
+
+Growing has three halves now. The host half is unchanged: `limactl edit yolobox --disk <GiB>` with the instance stopped. The partition half is `boot.growPartition`, which runs `growpart` at boot. Its stock script finds the disk by following `fileSystems."/".device`, which is `/dev/mapper/root` now and resolves to `/dev/dm-0`, so `nix/luks.nix` overrides the script to `growpart /dev/vda 2`. The third half moved to `yo disk-grow`.
+
+`fileSystems."/".autoResize` is off. It rendered `x-systemd.growfs`, and `systemd-growfs` cannot resize a keyring-keyed LUKS2 mapping. So after the stop, edit and start, `yo disk-grow` runs two commands as the operator: `cryptsetup resize --key-file - root` with the passphrase on stdin (no newline), then `resize2fs /dev/mapper/root`. The passphrase is needed because `cryptsetup resize` on a keyring-keyed mapping insists on a key file; it only reloads the device-mapper table. `yo` is the only holder of the passphrase, which is why this step cannot live in a boot unit. The migration's finalize step grows the filesystem once, right after encrypting.
+
+## Recognising failures
+
+Start with `yo status`. When the VM is unreachable and the initrd sshd answers, it prints `disk: locked`, and `yo up` unlocks it. When the VM is reachable it prints the filesystem type of `/dev/vda2`, and `crypto_LUKS` is the healthy answer; anything else is flagged as not encrypted.
+
+- **Wrong key.** The helper exits 1 and `yo` says the `yolobox-disk` key does not open the device. Another item was renamed `yolobox-disk`, or the key was recreated. The disk is lost by design, since there is no recovery slot.
+- **Migration failure.** The helper exits 2 with the journal tail on stderr, and `yo` says the box is still in its initrd with the plaintext intact. Read the whole journal as root over the initrd sshd:
+  `ssh -F /dev/null -i ~/.lima/_config/user -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 60022 root@127.0.0.1 journalctl -u yolobox-luks-migrate`.
+  If the initrd reached emergency mode, its sshd may not be running. Its `systemd.services.sshd` is a normal initrd unit, so whether it survives emergency mode is not verified.
+- **1Password locked or declining.** The sign request fails and `yo` says 1Password declined to sign with the `yolobox-disk` key. Unlock 1Password and run `yo up` again. If 1Password is not running there is no socket at all, and `yo` says so.
+- **The initrd never comes up.** `yo` waits up to 600 s after lima reports the instance Running, then names `limactl list` and `~/.lima/yolobox/serialv.log`. The serial console is output only, but it shows where boot stopped. A cidata device that never appeared shows up as the initrd sshd's `preStart` failing and restarting until its start limit.
+- **Refused for both users.** If `root` and the operator are both refused for the whole deadline, `yo` names cidata. It means the initrd is up but reading lima's key from `user-data` produced nothing.
+- **`yo` refused for minutes after a hand-run `limactl start`.** That is the sshd per-source penalty: lima's readiness login failed as an invalid user until sshd blocked the shared source address. `PerSourcePenalties no` in the initrd config prevents it. If it comes back, check that the line is still above `Match User root` in the built `sshd_config`.
+- **A migration refused for lack of space.** The script exits 7 with a message naming the bytes it needs, and the helper reports exit 2. The plaintext is untouched and `yo gc` cannot run, because stage 2 never starts. Log in to the initrd as root over port 60022 (the ssh command above without the `journalctl` part), mount `/dev/vda2` on `/sysroot`, delete build output, unmount, and then run `systemctl reset-failed yolobox-luks-migrate` and `systemctl start --no-block systemd-cryptsetup@root.service`. Run `yo up` again. Do not restart the migrate unit alone. The cryptsetup job ended with result "dependency" and would not be queued again, and the next `yo up` would wait forever. Starting the cryptsetup unit pulls the migrate unit in through `Requires=`.
+- **A box waiting in its initrd after `yo down`.** `yo down` followed by a bare `limactl start yolobox` leaves the box at the passphrase prompt, and lima's own start gives up after ten minutes. Harmless: `yo status` says `disk: locked`, and `yo up` unlocks without starting anything.
+- **`limactl stop` hangs.** It has hung four times on this Mac (see `TODO.md`). `lima_stop()` is the one place `yo` runs it. It has a 300 s timeout and prints the recovery: `yo ssh sudo systemctl reboot`, then `kill -9` any leftover `limactl hostagent` for yolobox, then `yo up`.
+
+The last resort, if the initrd never comes up at all, is a throwaway lima instance with this instance's `disk` file attached as a second drive, from which the LUKS header and the plaintext can be inspected with the passphrase. This rescue is UNTESTED. Nobody has run it, and the steps are not written down because they would be guesses.
+
+## Decisions
+
+- **2026-10-24: in-guest LUKS, not a Mac-side encrypted image.** The operator chose encryption inside the guest, so the unlock is a step of the guest's own boot and the disk image stays an ordinary file lima knows how to run.
+- **2026-10-24: encrypt in place, not recreate.** The live box holds about 320 GiB of state that is expensive to rebuild. The cost is the uninterruptible shrink described above.
+- **2026-10-24: one keyslot, recovery declined.** The operator chose it explicitly. The consequence is the sentence under the first section: lose the item, lose the disk.
+- **Unverified: what `systemctl reboot` inside the guest looks like under vz.** Either the instance shows Stopped and the hostagent exits, so the next `limactl start` is a fresh boot, or the VM restarts in place and the hostagent keeps the TCP forward, which `overVsock: false` makes safe. `vm_up` handles both by reading the instance status and probing port 60022. Which one happens has not been observed. The rollout step that watches `limactl list yolobox` for a minute after a guest reboot will settle it, and the answer goes here.
