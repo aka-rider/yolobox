@@ -74,18 +74,17 @@ in
     fsType = "vfat";
   };
   fileSystems."/" = {
-    device = "/dev/disk/by-label/nixos";
-    autoResize = true;
+    device = "/dev/mapper/root";
     fsType = "ext4";
     options = [ "noatime" "nodiratime" "discard" ];
   };
-  # The two halves of growing the root disk, and they only work together:
-  # autoResize above grows the ext4 filesystem into vda2, this grows vda2
-  # into whatever the disk has become. Upstream orders the growpart oneshot
-  # before systemd-growfs-root, so a boot after `limactl edit --disk` picks
-  # up the extra space in that order and needs nothing else; SuccessExitStatus
-  # "0 1" makes the already-grown case a no-op on every later boot. Without
-  # this the bump is silent: the backing file gets bigger, the guest boots
+  # Growing the root disk is three steps. growpart below grows vda2 into
+  # whatever the disk has become, on every boot, and SuccessExitStatus "0 1"
+  # makes the already-grown case a no-op. The LUKS mapping and the ext4
+  # filesystem inside it are grown by `yo disk-grow`, which holds the
+  # passphrase `cryptsetup resize` needs; autoResize is off because
+  # systemd-growfs cannot resize a keyring-keyed LUKS2 mapping. Without
+  # growpart the bump is silent: the backing file gets bigger, the guest boots
   # clean, vda2 stays where it was and df is unchanged. Only vda2 moves —
   # vda1 ends at the sector vda2 starts on, so the ESP above is unaffected.
   boot.growPartition = true;
