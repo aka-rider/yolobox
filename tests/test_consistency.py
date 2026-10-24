@@ -187,6 +187,10 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
         self.assertIn("facts = import ./facts.nix;", text)
         self.assertIn("LUKS_DEVICE = facts.device;", text)
         self.assertIn(
+            'YOLOBOX_UNLOCK_UNTIL_UNIT = "systemd-cryptsetup@${facts.mapper}.service";',
+            text,
+        )
+        self.assertIn(
             "YOLOBOX_SSH_LOCAL_PORT = toString facts.sshLocalPort;", text
         )
 

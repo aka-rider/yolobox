@@ -5,11 +5,18 @@
 #   exit 0  the cryptsetup unit is active
 #   exit 1  the cryptsetup unit failed (the passphrase does not open the disk)
 #   exit 2  the migration unit failed
-#   exit 3  the ask-password watch could not be set up or ended on its own
+#   exit 3  the ask-password watch could not be set up or ended on its own, or
+#           the helper was started without YOLOBOX_UNLOCK_UNTIL_UNIT
 #   exit 4  no passphrase on stdin
 shopt -s nullglob
 
-UNTIL_UNIT="${YOLOBOX_UNLOCK_UNTIL_UNIT:-systemd-cryptsetup@root.service}"
+# The unit that opens the disk; nix/luks/apps.nix sets it from the mapper name
+# in nix/luks/facts.nix, so no default here can drift from it.
+UNTIL_UNIT="${YOLOBOX_UNLOCK_UNTIL_UNIT:-}"
+if [ -z "$UNTIL_UNIT" ]; then
+  echo "yolobox-unlock: YOLOBOX_UNLOCK_UNTIL_UNIT is not set" >&2
+  exit 3
+fi
 MIGRATE_UNIT="${YOLOBOX_UNLOCK_MIGRATE_UNIT:-yolobox-luks-migrate.service}"
 ASK_DIR="${YOLOBOX_ASK_DIR:-/run/systemd/ask-password}"
 # Journal lines shown on a failed migration and replayed when the watch starts.

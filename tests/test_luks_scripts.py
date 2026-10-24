@@ -434,6 +434,7 @@ printf 'reply %s %s [%s]\\n' "$1" "$2" "$body" >> "$FAKE_REPLY_LOG"
             ),
             "REPLY_PASSWORD": str(bin_dir / "reply-password"),
             "LUKS_DEVICE": "/dev/fake",
+            "YOLOBOX_UNLOCK_UNTIL_UNIT": "systemd-cryptsetup@root.service",
             "YOLOBOX_ASK_DIR": str(self.ask_dir),
             "FAKE_STATE": str(self.state),
             "FAKE_JOURNAL_FIFO": str(self.tmp / "journal.fifo"),
@@ -648,6 +649,13 @@ class TestUnlockOutcomes(UnlockScript):
                 self.assertEqual(rc, 4, err)
                 self.assertIn("no passphrase", err)
                 self.assertEqual(self.replies(), [])
+
+    def test_a_helper_not_told_which_unit_opens_the_disk_refuses_to_start(self):
+        self.start(YOLOBOX_UNLOCK_UNTIL_UNIT="")
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 3, err)
+        self.assertIn("YOLOBOX_UNLOCK_UNTIL_UNIT", err)
+        self.assertEqual(self.replies(), [])
 
     def test_a_watch_inotifywait_could_not_set_up_is_fatal(self):
         self.start(FAKE_INOTIFY_COULDNT_WATCH="/run/fake/ask-password")
