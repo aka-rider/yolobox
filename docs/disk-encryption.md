@@ -74,7 +74,7 @@ The helper reports its outcome by exit code, and `yo` reads it.
 - 0: `systemd-cryptsetup@root.service` is active. The disk is unlocked.
 - 1: that unit failed. The passphrase does not open the device, which means a different key encrypted this disk.
 - 2: the migration unit failed. The helper prints the last 20 journal lines on stderr. The plaintext is still intact.
-- 3: the helper could not set up its ask-password watch, or lost it.
+- 3: the helper could not set up its ask-password watch, or lost it, or was started without `YOLOBOX_UNLOCK_UNTIL_UNIT` (the cryptsetup unit to wait for, which `nix/luks/apps.nix` derives from the mapper name).
 - 4: no passphrase arrived on stdin.
 
 It checks the migration unit first. A migration that failed would otherwise leave the cryptsetup unit failed too (it requires the migrate unit), and that would read as a wrong key.

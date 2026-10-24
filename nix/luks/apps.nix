@@ -17,6 +17,7 @@ in
     runtimeEnv = {
       REPLY_PASSWORD = "${systemd}/lib/systemd/systemd-reply-password";
       LUKS_DEVICE = facts.device;
+      YOLOBOX_UNLOCK_UNTIL_UNIT = "systemd-cryptsetup@${facts.mapper}.service";
     };
     text = builtins.readFile ./yolobox-unlock.sh;
   };
