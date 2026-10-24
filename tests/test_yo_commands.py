@@ -374,7 +374,7 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(unittest.TestCase):
         rebuilds = self.rebuilds = []
 
         def fake_ssh_run(role, argv, **kwargs):
-            if argv[:2] == ["lsblk", "-no"]:
+            if argv[:2] == ["lsblk", "-dno"]:
                 return mock.Mock(returncode=0, stdout=fstype + "\n", stderr="")
             if argv[:2] == ["df", "-P"]:
                 header = "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
@@ -1125,7 +1125,7 @@ class TestCmdStatus(unittest.TestCase):
             outs.append(line)
 
         def fake_ssh_run(role, argv, **kwargs):
-            stdout = fstype if argv[:2] == ["lsblk", "-no"] else ""
+            stdout = fstype if argv[:2] == ["lsblk", "-dno"] else ""
             return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
         with (
@@ -1218,7 +1218,7 @@ class TestCmdStatus(unittest.TestCase):
         )
 
     def test_an_encrypted_root_is_reported_plainly(self):
-        outs = self.status_with_fstype("crypto_LUKS\next4\n")
+        outs = self.status_with_fstype("crypto_LUKS\n")
         self.assertIn("disk: /dev/vda2 is crypto_LUKS", outs)
         self.assertFalse(any("NOT encrypted" in line for line in outs))
 
@@ -1765,7 +1765,7 @@ class TestLimaStop(unittest.TestCase):
 
 
 class TestDiskGrowResizesTheMapping(FakeHome):
-    def disk_grow(self, fstype="crypto_LUKS\next4\n", size="200"):
+    def disk_grow(self, fstype="crypto_LUKS\n", size="200"):
         os.makedirs(os.path.join(self.home, ".lima"))
         calls = []
         df_k = iter(
@@ -1788,7 +1788,7 @@ class TestDiskGrowResizesTheMapping(FakeHome):
             stdout = ""
             if argv[:2] == ["systemctl", "show"]:
                 stdout = "loaded\n"
-            elif argv[:2] == ["lsblk", "-no"] and argv[2] == "FSTYPE":
+            elif argv[:2] == ["lsblk", "-dno"] and argv[2] == "FSTYPE":
                 stdout = fstype
             elif argv[:3] == ["df", "-k", "/"]:
                 stdout = next(df_k)

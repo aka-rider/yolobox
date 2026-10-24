@@ -2082,8 +2082,9 @@ def host_user() -> str:
 
 
 def luks_device_fstype() -> str:
-    lines = guest_out(["lsblk", "-no", "FSTYPE", LUKS_DEVICE], check=False).splitlines()
-    return lines[0].strip() if lines else ""
+    # -d: the device alone. Without it lsblk lists the mapped child too, and on
+    # the live box it printed the child's ext4 before the device's crypto_LUKS.
+    return guest_out(["lsblk", "-dno", "FSTYPE", LUKS_DEVICE], check=False).strip()
 
 
 def guest_generations() -> Tuple[str, str]:
