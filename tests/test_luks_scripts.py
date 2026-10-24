@@ -357,8 +357,6 @@ class UnlockScript(unittest.TestCase):
         self.state.mkdir()
         self.ask_dir = self.tmp / "ask"
         self.ask_dir.mkdir()
-        self.mapper_dir = self.tmp / "mapper"
-        self.mapper_dir.mkdir()
         self.reply_log = self.tmp / "reply.log"
         self.journal_tail = self.tmp / "journal-tail"
         self.journal_tail.write_text("")
@@ -401,6 +399,9 @@ cat "$FAKE_JOURNAL_TAIL"
             "inotifywait",
             """
 exec 3< "$FAKE_INOTIFY_FIFO"
+if [ -n "${FAKE_INOTIFY_COULDNT_WATCH:-}" ]; then
+  echo "Couldn't watch $FAKE_INOTIFY_COULDNT_WATCH: No such file or directory" >&2
+fi
 echo "Setting up watches." >&2
 echo "Watches established." >&2
 echo inotify-ready > "$FAKE_READY_FIFO"
@@ -429,7 +430,6 @@ printf 'reply %s %s [%s]\\n' "$1" "$2" "$body" >> "$FAKE_REPLY_LOG"
             "REPLY_PASSWORD": str(bin_dir / "reply-password"),
             "LUKS_DEVICE": "/dev/fake",
             "YOLOBOX_ASK_DIR": str(self.ask_dir),
-            "YOLOBOX_MAPPER_DIR": str(self.mapper_dir),
             "FAKE_STATE": str(self.state),
             "FAKE_JOURNAL_FIFO": str(self.tmp / "journal.fifo"),
             "FAKE_INOTIFY_FIFO": str(self.tmp / "inotify.fifo"),
@@ -640,9 +640,25 @@ class TestUnlockOutcomes(UnlockScript):
             with self.subTest(stdin=stdin):
                 self.start(stdin=stdin)
                 rc, out, err = self.finish()
-                self.assertEqual(rc, 2, err)
+                self.assertEqual(rc, 4, err)
                 self.assertIn("no passphrase", err)
                 self.assertEqual(self.replies(), [])
+
+    def test_a_watch_inotifywait_could_not_set_up_is_fatal(self):
+        self.start(FAKE_INOTIFY_COULDNT_WATCH="/run/fake/ask-password")
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 3, err)
+        self.assertIn("Couldn't watch /run/fake/ask-password", err)
+
+    def test_a_missing_ask_directory_is_created_before_it_is_watched(self):
+        self.ask_dir.rmdir()
+        self.start()
+        self.wait_until_streams_are_up()
+        self.assertTrue(self.ask_dir.is_dir())
+        self.set_unit("systemd-cryptsetup@root.service", "active")
+        self.send("journal", "Finished")
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 0, err)
 
     def test_both_streams_ending_with_nothing_unlocked_exits_3(self):
         self.start()

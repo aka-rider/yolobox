@@ -150,6 +150,37 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
         self.assertIn("./nix/luks.nix", self.text("flake.nix"))
 
 
+class TestLuksStorePathsCoverTheScripts(unittest.TestCase):
+    # The initrd builder follows ELF dependencies only, so a tool a script runs
+    # that is not listed by hand is missing in the initrd, and the box sits
+    # there waiting.
+    def test_every_runtime_input_has_its_bin_directory_in_the_initrd(self):
+        apps = (REPO / "nix" / "luks" / "apps.nix").read_text()
+        luks = (REPO / "nix" / "luks.nix").read_text()
+        inputs = set()
+        for block in re.findall(r"runtimeInputs = \[(.*?)\];", apps, re.S):
+            inputs.update(re.findall(r"pkgs\.([\w-]+)", block))
+        self.assertTrue(inputs, "found no runtimeInputs in nix/luks/apps.nix")
+        for name in sorted(inputs):
+            with self.subTest(package=name):
+                self.assertIn('"${pkgs.%s}/bin"' % name, luks)
+
+
+class TestInitrdSshdConfigOrder(unittest.TestCase):
+    # A global keyword after a Match line belongs to the block; sshd refuses
+    # it there and the initrd, with no rollback, never gets its sshd.
+    def test_per_source_penalties_precede_the_match_block(self):
+        text = (REPO / "nix" / "luks.nix").read_text()
+        found = re.search(r"extraConfig = \'\'(.*?)\'\';", text, re.S)
+        self.assertIsNotNone(found, "no extraConfig in nix/luks.nix")
+        config = found.group(1)
+        self.assertIn("PerSourcePenalties no", config)
+        self.assertIn("Match User root", config)
+        self.assertLess(
+            config.index("PerSourcePenalties no"), config.index("Match User root")
+        )
+
+
 class TestAgentEnvMatchesYoSockets(unittest.TestCase):
     def assigned(self, name):
         text = (REPO / "nix" / "lib" / "agent-env.nix").read_text()

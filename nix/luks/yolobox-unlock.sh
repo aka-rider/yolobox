@@ -4,19 +4,19 @@
 # unlock ended through its exit code. Event-driven, no polling. See nix/luks.nix.
 #   exit 0  the cryptsetup unit is active
 #   exit 1  the cryptsetup unit failed (the passphrase does not open the disk)
-#   exit 2  the migration unit failed, or no passphrase on stdin
-#   exit 3  the event stream ended on its own
+#   exit 2  the migration unit failed
+#   exit 3  the ask-password watch could not be set up or ended on its own
+#   exit 4  no passphrase on stdin
 shopt -s nullglob
 
 UNTIL_UNIT="${YOLOBOX_UNLOCK_UNTIL_UNIT:-systemd-cryptsetup@root.service}"
 MIGRATE_UNIT="${YOLOBOX_UNLOCK_MIGRATE_UNIT:-yolobox-luks-migrate.service}"
 ASK_DIR="${YOLOBOX_ASK_DIR:-/run/systemd/ask-password}"
-MAPPER_DIR="${YOLOBOX_MAPPER_DIR:-/dev/mapper}"
 
 IFS= read -r key || true
 if [ -z "$key" ]; then
   echo "yolobox-unlock: no passphrase on stdin" >&2
-  exit 2
+  exit 4
 fi
 
 # Newline-delimited set of ask files already answered, keyed by full path. A
@@ -70,10 +70,18 @@ fifo=$(mktemp -u /tmp/yolobox-unlock.XXXXXX)
 mkfifo "$fifo"
 trap 'kill "${inotify_pid:-}" "${journal_pid:-}" 2>/dev/null || true; rm -f "$fifo"' EXIT
 
+# Only asks are watched, not /dev/mapper: a unit changing state posts no file
+# event whatever the mapper does, and the journal below carries unit state.
+# systemd creates the directory itself; creating it here only keeps the watch
+# from failing when the helper runs before systemd's first ask.
+mkdir -p "$ASK_DIR" || {
+  echo "yolobox-unlock: cannot create ${ASK_DIR}" >&2
+  exit 3
+}
 # No -q: the two startup lines are the first events, so the first scan runs
-# after the watches exist and nothing created in between is missed.
+# after the watch exists and nothing created in between is missed.
 inotifywait -m -e create -e close_write -e moved_to -e delete \
-  --format 'inotify %e %w%f' "$ASK_DIR" "$MAPPER_DIR" > "$fifo" 2>&1 &
+  --format 'inotify %e %w%f' "$ASK_DIR" > "$fifo" 2>&1 &
 inotify_pid=$!
 # A unit changing state posts no file event; its journal lines wake the loop.
 # -n 20 replays the last lines on purpose: a state change logged just before
@@ -85,6 +93,12 @@ journal_pid=$!
 # inside check_units ends the script.
 while IFS= read -r line; do
   case "$line" in
+    # Without the watch a new ask would go unanswered and the helper would wait
+    # on the journal alone.
+    "Couldn't watch "* | "Failed to watch "*)
+      echo "yolobox-unlock: ${line}" >&2
+      exit 3
+      ;;
     "inotify "* | "Setting up watches." | "Watches established.") ;;
     *) echo "$line" ;;
   esac
