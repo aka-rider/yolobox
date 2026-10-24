@@ -49,7 +49,17 @@
         in {
           inherit yolobox;
           default = yolobox;
-        });
+        }
+        # Linux-only, so `nix flake check` on a Mac never evaluates systemd or
+        # cryptsetup for darwin.
+        // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") (
+          let apps = import ./nix/luks/apps.nix { inherit pkgs; systemd = pkgs.systemd; };
+          in {
+            yolobox-luks-migrate = apps.migrate;
+            yolobox-unlock = apps.unlock;
+            yolobox-initrd-authorized-keys = apps.keys;
+          }
+        ));
 
       nixosConfigurations.yolobox = nixpkgs.lib.nixosSystem {
         system = "aarch64-linux";
@@ -72,6 +82,7 @@
           }
           nixos-lima.nixosModules.lima
           ./nix/base.nix
+          ./nix/luks.nix
           ./nix/podman.nix
           ./nix/agentic.nix
           ./nix/lsp.nix
