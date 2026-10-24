@@ -23,3 +23,4 @@ Posted 2026-10-02, awaiting review. The reasoning behind it is in lima/yolobox.m
 - GitHub `environment: release` protection for HOMEBREW_TAP_TOKEN not configured.
 - Tailnet ACLs for the yolobox node not reviewed.
 - Immutable releases must stay off: release.yml force-moves the tag and re-uploads with --clobber.
+- Secrets that still live on disk despite the constitution's rule: lima's instance ssh key (`~/.lima/_config/user`, lima owns it), the agent's vendor credentials (`~/.claude`, `~/.config/gh`, `fj auth`), and the stage-2 sshd host keys. Each is a vendor's own storage; the rule forbids this repo from adding to the list, and the LUKS root now covers the guest-side ones at rest.
