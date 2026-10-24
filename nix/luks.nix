@@ -56,11 +56,15 @@ in
 
   # The initrd builder follows ELF dependencies only, never a shell script's
   # references, so the scripts' tools are listed by hand (a directory is
-  # copied whole).
+  # copied whole). Every package in nix/luks/apps.nix's runtimeInputs is here
+  # (TestLuksStorePathsCoverTheScripts). The exception is systemd: systemctl,
+  # journalctl and systemd-ask-password come from the initrd's own systemd
+  # (initrdBin), the same package as config.systemd.package.
   boot.initrd.systemd.storePaths = [
     apps.keys
     apps.unlock
     apps.migrate
+    "${pkgs.coreutils}/bin"
     "${pkgs.gawk}/bin"
     "${pkgs.gnused}/bin"
     "${pkgs.gnugrep}/bin"
