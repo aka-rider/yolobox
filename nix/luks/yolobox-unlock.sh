@@ -11,8 +11,10 @@
 shopt -s nullglob
 
 # The unit that opens the disk; nix/luks/apps.nix sets it from the mapper name
-# in nix/luks/facts.nix, so no default here can drift from it.
-UNTIL_UNIT="${YOLOBOX_UNLOCK_UNTIL_UNIT:-}"
+# in nix/luks/facts.nix, so no default here can drift from it. The wrapper
+# exports it unconditionally, so the rehearsal's own unit comes through the
+# _OVERRIDE name (the migrate script's YOLOBOX_LUKS_KEY_FILE is the same shape).
+UNTIL_UNIT="${YOLOBOX_UNLOCK_UNTIL_UNIT_OVERRIDE:-${YOLOBOX_UNLOCK_UNTIL_UNIT:-}}"
 if [ -z "$UNTIL_UNIT" ]; then
   echo "yolobox-unlock: YOLOBOX_UNLOCK_UNTIL_UNIT is not set" >&2
   exit 3
