@@ -98,6 +98,8 @@ LUKS_SIGN_DATA = b"yolobox luks v1"
 LUKS_KDF_INFO = b"yolobox luks passphrase v1"
 # SSH agent protocol message types (draft-miller-ssh-agent).
 SSH_AGENT_FAILURE = 5
+# How long a sign request may wait for the human to approve 1Password's prompt.
+AGENT_REPLY_TIMEOUT = 300
 SSH_AGENT_REQUEST_IDENTITIES = 11
 SSH_AGENT_IDENTITIES_ANSWER = 12
 SSH_AGENT_SIGN_REQUEST = 13
@@ -424,13 +426,17 @@ def ssh_agent_call(sock_path: str, payload: bytes) -> bytes:
             conn.settimeout(10)
             conn.connect(sock_path)
             conn.sendall(ssh_string(payload))
+            # A sign request is answered only after the human approves
+            # 1Password's prompt, so the reply gets minutes, not seconds.
+            conn.settimeout(AGENT_REPLY_TIMEOUT)
             (length,) = struct.unpack(">I", recv_exact(conn, 4))
             if length == 0 or length > 1 << 20:
                 raise OSError("implausible reply length %d" % length)
             return recv_exact(conn, length)
     except OSError as failure:
         raise YoError(
-            "1Password's SSH agent at %s is not answering: %s" % (sock_path, failure)
+            "1Password's SSH agent at %s is not answering: %s (approve its prompt within %d s)"
+            % (sock_path, failure, AGENT_REPLY_TIMEOUT)
         )
 
 
