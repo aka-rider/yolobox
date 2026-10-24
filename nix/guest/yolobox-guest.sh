@@ -111,7 +111,7 @@ measure() {
 }
 
 # The ESP is small and GRUB copies the incoming kernel before pruning old
-# ones (see CLAUDE.md), so a nixos-rebuild that runs out of space there
+# ones (see nix/base.md#the-esp-holds-one-kernel), so a nixos-rebuild that runs out of space there
 # advances the system profile and then dies installing the bootloader,
 # leaving the booted generation and the profile pointing at different
 # closures. Both `generations` (the subcommand) and gc-machine's
@@ -720,9 +720,9 @@ cmd_aws_check() {
     [ "${failed}" = 0 ] || exit 1
 }
 
-# Tells apart the two Mac-VPN shapes CLAUDE.md describes: a WireGuard default
-# route kills egress while the gateway answers; ProtonVPN blackholes the
-# gateway while egress works. yo listens on the Mac's loopback at PORT, and
+# Tells apart the two Mac-VPN shapes (docs/mac-network.md#vpn-shapes): a
+# WireGuard default route kills egress while the gateway answers; ProtonVPN
+# blackholes the gateway while egress works. yo listens on the Mac's loopback at PORT, and
 # 192.168.5.2 is gvproxy's NAT of lima's gateway to that loopback. Both
 # probes only classify, so this exits 0 whatever the network state.
 cmd_net_check() {

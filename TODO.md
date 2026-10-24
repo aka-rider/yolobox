@@ -1,6 +1,6 @@
 # Upstream
 
-Posted 2026-10-02, awaiting review. The reasoning behind it is in CLAUDE.md, "An empty page means lima's forwarder died, not t3". The lima side is done: lima-vm/lima#5557 was closed and PR #5558 merged on 2026-10-03, and the fix shipped in lima v2.2.1.
+Posted 2026-10-02, awaiting review. The reasoning behind it is in lima/yolobox.md#an-empty-page-means-limas-forwarder-died. The lima side is done: lima-vm/lima#5557 was closed and PR #5558 merged on 2026-10-03, and the fix shipped in lima v2.2.1.
 
 - nixos-lima PR [nixos-lima/nixos-lima#125](https://github.com/nixos-lima/nixos-lima/pull/125): `restartIfChanged = false` on `lima-init` and `lima-guestagent`, because a nixpkgs bump alone restarts them and, on lima v2.1.2 through v2.2.0, that triggers the dead-forward bug. Still open and unmerged as of 2026-10-16. Fork `aka-rider/nixos-lima`, commit `ea30db4`; checkout in the guest at `~/wrk/nixos-lima/nixos-lima`.
   - Once it is merged and this flake's `nixos-lima` input is bumped, this box's own `restartIfChanged = false` becomes redundant: remove it.

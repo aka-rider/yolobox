@@ -228,7 +228,7 @@ in
 
   fonts.packages = with pkgs; [ dejavu_fonts liberation_ttf noto-fonts noto-fonts-color-emoji ];
 
-  # This file is delivered to claude by `--settings <this file>` (the wrapper
+  # This file is delivered to claude by `--settings <this file>` (the launcher
   # in nix/harnesses.nix), never by /etc/claude-code/managed-settings.json:
   # Claude Code builds its policySettings from three tiers — remote
   # server-fetched settings, MDM, and that /etc file — and takes only the

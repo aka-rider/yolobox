@@ -1,0 +1,103 @@
+# SSH: roles, forwarded sockets and identities
+
+This file covers how `yo` and the agent reach the VM and how secrets reach the agent over ssh. The two accounts it talks about are explained in [docs/accounts.md](accounts.md). The rules that follow from it are in [CONSTITUTION.md](../CONSTITUTION.md).
+
+## One ControlPath per role
+
+Two accounts sharing one VM exposed a trap in lima's ssh multiplexing. Lima's `ControlPath` carries no `%r` in its template, and OpenSSH's mux client never re-checks the login user of a new connection against the master's. It reuses whatever session the master already authenticated. So `-o User=agent` issued over a `ControlMaster` the operator's session already opened silently runs as the **operator**, with no error from ssh at all.
+
+Recognise it by a session that looks separated, because the shell prompt names `agent` and the command line said `-o User=agent`, but `id` still reports uid 501 and every file it touches lands under `/home/<operator>.guest` instead of `/home/agent`.
+
+The fix is structural, not a flag. An ssh role owns the `ControlPath` itself, with a distinct socket per role (for the agent, `~/.lima/yolobox/ssh-agent.sock`), so the two accounts never share a multiplexed master. The `Host yolobox` alias herdr uses sets `ControlPath none` for the same reason.
+
+## The owned block in ssh.config
+
+The agent role's settings live in `~/.lima/yolobox/ssh.config` itself, in a block `yo` writes above lima's own `Host lima-yolobox` block. They are not hand-written into `~/.ssh/config`. The file is a safe place for it because lima writes it but never reads it back (its own header says so), and because ssh resolves `Include` recursively and keeps the first value it sees per keyword. The `Match` at the head of the included file therefore beats lima's `Host` block further down.
+
+Lima rewrites `ssh.config` on every `limactl start`. Its mtime tracks the last start, the same second as `ha.pid` and `cidata.iso`, while `lima.yaml` and `lima-version` stay older. A one-shot write would be undone by the next `yo up`, so `yo` re-applies the block idempotently from two places. One is `ssh_base()`, which every ssh `yo` spawns funnels through, so the file is repaired before any connection, `yo code` and `yo zed` included. The other is the end of `cmd_up()`, because `limactl start` is what clobbers the file and `cmd_up` opens no ssh of its own to trigger the `ssh_base()` repair.
+
+`~/.ssh/config` itself needs only one line, `Include ~/.lima/yolobox/ssh.config`. `yo bootstrap`, `yo code` and `yo zed` offer to add it when it is missing and stdin is a tty. The offer edits the file the operator actually keeps. When `~/.ssh/config` is a symlink into a dotfiles checkout, it writes through the link, keeps the mode the operator chose, and reads and writes undecodable bytes untouched. An unreadable config is an error, not an empty file the `Include` line would then replace.
+
+If the file loses its blank line between the owned block and lima's `Host` block, the rewrite keeps everything after the marker line instead of dropping lima's block. A duplicated owned block is harmless because the first value wins. A lost `Host` block is not.
+
+### ForwardAgent no
+
+The owned block carries `ForwardAgent no`, and so does the `Host yolobox` alias herdr uses. The operator's own `~/.ssh/config` may well say `Host lima-yolobox` / `ForwardAgent yes` after the `Include` line, which is a reasonable thing to write for the operator's `yo ssh`. Because the owned block sits first and ssh keeps the first value per keyword, it neutralises that line for the agent role. A `yo code`, `yo zed` or t3-spawned agent session never forwards the Mac's agent, whatever a later `Host` block says. Only a command-line `-o`, which outranks every file, can turn it on, and `yo ssh` is the one place that does (next sections).
+
+### The gap
+
+Nothing in lima or ssh enforces the split at the moment a connection is made. `limactl start yolobox` run by hand, followed by launching Zed directly with no `yo` command in between, still opens the project as the operator, because nothing has re-applied the `Match` block or even required it to exist. Any `yo` command that touches the VM heals this the next time it runs, but the box can sit unhealed until then.
+
+## 1Password reaches the agent
+
+1Password is available to every agent session for as long as the VM runs, not only inside the one pane that happened to start it. Lima itself carries the forward. `lima/yolobox.yaml`'s `portForwards` declares a reverse unix-socket rule, `{guestSocket: /run/yolobox-op/agent.sock, hostSocket: "<1Password's agent.sock>", reverse: true}`, next to the t3 and dhcp rules and a sibling reverse rule for the AWS broker (see [docs/aws.md](aws.md#transport)). Lima's hostagent dials that socket itself, once, at every `limactl start` or `yo up`, over its own ssh master, as the operator. No `yo` command has to be running, and no pane has to stay open. Like every setting in that file, the rule reaches an existing instance only by being restated; see [lima/yolobox.md](../lima/yolobox.md#read-once).
+
+`nix/base.nix` gives the forward somewhere to land before lima tries. The tmpfiles rule `d /run/yolobox-op 0700 ${username} users -` runs through `systemd-tmpfiles-setup` before `sysinit.target`, well ahead of sshd and lima's own forward, and `-resetup` recreates it on every `switch`. This was verified against the running VM. Lima's hostagent runs `rm -f /run/yolobox-op/agent.sock` and then `ssh -O forward -R /run/yolobox-op/agent.sock:<1Password socket> lima-yolobox` over its own master exactly once, at hostagent start. A failure there is only logged and nothing retries it. Also, nixos-lima's `lima-init` never runs lima's own `/run/host-services` boot script, so unlike a stock lima guest, nothing else creates that directory. The socket lands owned by the operator with mode 0600 (`StreamLocalBindMask 0177`), because lima's hostagent connects as the operator.
+
+The agent cannot reach an operator-owned socket directly, so `nix/base.nix` proxies it with the `opProxy` helper. `systemd.sockets.yolobox-op-agent` listens on `/run/yolobox/op-agent.sock` with `SocketUser=agent` and `SocketMode=0600`, wanted by `sockets.target`, so the agent-facing socket exists from boot with no window where it is missing or wrongly permissioned. The matching service execs `systemd-socket-proxyd /run/yolobox-op/agent.sock` as the **operator** (`User=${username}`, never root), since the operator is the account that can already read the target.
+
+`nix/lib/agent-env.nix` is the one place that points the agent at the proxy, with `SSH_AUTH_SOCK=/run/yolobox/op-agent.sock`. Its header comment lists every process that gets it. `cmd_enter` arranges no forward of its own, and landing in the guest is the whole of what it does here.
+
+## yo ssh forwards per session
+
+A positive `ForwardAgent` never goes into `~/.lima/yolobox/ssh.config`. The only value the owned blocks carry is `no` (see [above](#forwardagent-no)). That file is shared by every ssh role `yo` spawns, so a `ForwardAgent yes` there would reach `yo code`, `yo zed` and every t3-spawned session too, not only the one command that asked for it.
+
+`yo ssh`, the operator's own bare shell, is the one command that still forwards per session. It names the 1Password socket path itself as the `ForwardAgent` value, because the default, `$SSH_AUTH_SOCK`, is Apple's launchd agent, which holds nothing on this Mac. It does so only over its own `ControlPath=none` connection, so that forward dies with the one pane that opened it instead of riding a shared master into a session that never asked to carry it.
+
+## Host-key pin
+
+Every `yo` ssh verifies the guest's host key, and that takes three overrides, because lima's own `Host lima-yolobox` block works against it. It says `StrictHostKeyChecking no`, `UserKnownHostsFile /dev/null` and `NoHostAuthenticationForLocalhost yes`. The last is the load-bearing one. It makes ssh skip host-key verification for 127.0.0.1 whatever the other two say (checked against a throwaway sshd, where a changed key still connected).
+
+`host_key_pin_block()` therefore writes a `Match host lima-yolobox` section (any user) into the owned head block of `ssh.config`, above lima's own block. It sets `UserKnownHostsFile` to `~/.lima/yolobox/known_hosts`, `StrictHostKeyChecking accept-new` and `NoHostAuthenticationForLocalhost no`. Because ssh keeps the first value per keyword, the pin beats lima's block for every connection that reads the file. That covers each `ssh_base()` role, a bare `ssh lima-yolobox`, `yo code` and `yo zed` (which go through the `Include` in `~/.ssh/config`), and the git push channel, whose `remote.yolobox.sshCommand` is just `ssh -F <that file>`.
+
+Before this, the pin was `-o` options that `ssh_base()` and `yo link` added themselves. The connections `yo` does not build (`yo code`, `yo zed`, and the push of an already-linked repo) still ran under lima's `NoHostAuthenticationForLocalhost yes` and accepted any key.
+
+The known-hosts file is owned by `yo` and filled by `ensure_guest_known_hosts`, which runs from `vm_up` right after `limactl start` and again from `cmd_bootstrap` just before `ensure_herdr_machine`, since a recreated VM has new host keys. It reads the guest's own `/etc/ssh/ssh_host_*_key.pub` over the operator's already-trusted lima connection, never over a channel that itself needs the key it is trying to learn. `accept-new` is what lets an empty or missing file learn the key on first connection while refusing any later change.
+
+The one ssh that cannot pin is that fetch. The `OPERATOR_FIRST_CONTACT` role opts out with `FIRST_CONTACT_OPTS` (`UserKnownHostsFile=/dev/null`, `StrictHostKeyChecking=no`, `NoHostAuthenticationForLocalhost=yes` on its command line, which outranks the file), because a pin cannot be checked against itself.
+
+`yo` does not reset the file when it creates an instance. It lives inside `~/.lima/yolobox`, the instance directory `limactl delete` removes, so a recreated instance starts with no pin and `vm_up` learns it through first contact. Recognise a stale pin by ssh's own `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` on every `yo` command after the VM was replaced without deleting that directory (for instance by restoring an old `~/.lima/yolobox/known_hosts`). Remove the file and run `yo up`, which fetches the new keys.
+
+The pin applies when `yo`'s own ssh opens the connection. Operator connections that share lima's multiplexed one (`ssh_base(OPERATOR, mux=True)`, used by `heal_reverse_forward`) ride a connection lima's hostagent opened with its own options, and a client on a shared connection never re-checks the host key.
+
+### herdr's alias
+
+`herdr machine add yolobox --label yolobox` (run by `yo bootstrap` through `ensure_herdr_machine`) can fail loudly with "No ED25519 host key is known for [127.0.0.1]:60022 and you have requested strict checking. Host key verification failed." herdr runs system ssh through its own generated config, which `Include`s `~/.ssh/config`, which `Include`s `~/.lima/yolobox/ssh.config`, where `yo`'s `Host yolobox` alias lives. For every saved machine herdr also appends `-o StrictHostKeyChecking=yes` on the ssh command line itself (`apply_noninteractive_ssh_options` in herdr's `src/remote/attach.rs`), and a command-line option outranks the same keyword set inside a `-F` config file.
+
+So the alias cannot fix this by relaxing checking. It used to carry `StrictHostKeyChecking no` paired with `UserKnownHostsFile /dev/null`. herdr's own `yes` silently overrode the `no`, while the `/dev/null` guaranteed no key could ever be known, so strict checking could never pass. The alias now pins the real key, with `UserKnownHostsFile` pointing at the same `~/.lima/yolobox/known_hosts`. The file lives in the instance directory, so a recreated instance starts without one and the file herdr checks against can never hold the previous VM's keys. The alias carries `ForwardAgent no` too, for the reason above. herdr reaches the alias through the operator's `~/.ssh/config`, where a `ForwardAgent yes` meant for `yo ssh` could otherwise apply.
+
+## Healing reverse forwards
+
+Lima never re-establishes its side of a reverse forward. A failure is logged once, at hostagent start, and nothing retries it. So `yo` heals every reverse forward itself, 1Password's and the AWS broker's alike, through one mechanism and not one hand-written probe per socket. A `ReverseForward` dataclass names each one with a label, the guest path, the Mac-side path, a probe command run as the agent, and an `alive(proc)` callable. Two constructors build the instances, `one_password_forward()` (probe `ssh-add -l`, judged by `op_probe_alive`) and `aws_broker_forward()` (probe `curl --unix-socket /run/yolobox/aws-broker.sock http://broker/health`, alive on exit 0 alone).
+
+`op_probe_alive` is not "alive on exit 0 or 1", because `ssh-add` exits 1 for two different reasons that must not be conflated. Alive is exit 0, or exit 1 *with* "The agent has no identities" in stdout, meaning a reachable agent that holds no keys yet. A **dead** forward also exits 1, but with "communication with agent failed". The agent-side socket unit `yolobox-op-agent.socket` always accepts the connection whether or not lima's forward and the Mac's own agent are alive behind it. The `accept()` succeeds and only the SSH-agent protocol exchange after it fails, so the exit code alone cannot tell the two apart and the exact stdout wording is load-bearing. Recognise a dead 1Password forward by that wording. `yo status` runs this exact same `op_probe_alive` check on the same probe, so the two can never disagree about what counts as "up".
+
+`heal_reverse_forward()` probes one entry as the agent first and, only on a dead probe, re-issues exactly what lima's hostagent would have, over the operator's own `ssh_base(OPERATOR, mux=True)` connection. It runs `-O cancel` first (its failure tolerated, since there may be no live master or no registered forward to cancel). Then a plain `rm -f <guest path>`, which is not an `-O` control command, so issuing it through `ControlMaster auto` in lima's ssh config also revives the master if it had died. Then `-O forward -R <guest path>:<host path>`. It probes again, and a still-dead probe raises a `YoError` naming `limactl stop yolobox && yo up` as the recreate.
+
+`ensure_op_forward(aws_enabled)` runs this per forward through `heal_forward_collecting_errors()`, which also catches a `YoError` raised out of `heal_reverse_forward()` and appends it, so one forward's hard failure cannot abort the other's healing. The two services are independent and optional. A missing Mac-side 1Password socket (1Password simply not running) is only a stderr note, and 1Password's heal is skipped for that reason alone, never because AWS happens to be disabled. The AWS heal runs only when `aws_enabled` is true, meaning `ensure_aws_broker()` has itself started, or found already running, a broker that answered its handshake. Failures from `ensure_aws_broker()` and from either forward are collected into one list and raised together, once, at the end.
+
+`vm_services()` decides whether any of this can run before trying. `account_status()` runs first, and a status of `"unreachable"` (the operator account cannot be ssh'd into, so the VM is not up) is a stderr note and a return. Being reachable as the operator is not enough on its own. `vm_units_present()` then runs `systemctl cat yolobox-op-agent.socket` in the VM, and a box that predates the proxy socket units answers with a nonzero exit. In that case `vm_services()` prints `UNITS_MISSING_NOTE` ("box predates the 1Password/AWS forwards; run `yo bootstrap`") and returns. An earlier design gated this on whether the *agent account* was reachable yet, which was wrong, because an older box's agent account can be reachable while still lacking these units. Past both checks, `ensure_aws_broker()` runs first and then `ensure_op_forward()`.
+
+`vm_services()` runs at the end of `vm_up()` by default, which `cmd_up` and `cmd_disk_grow` reach. `cmd_bootstrap` calls `vm_up(run_services=False)` instead, because at that point in a fresh bootstrap the proxy units may not exist yet and the rebuild that creates the agent account may not have landed. Once the rebuild and reboot decision has settled, it calls `vm_services()` itself exactly once, never twice. On a box with the proxy units, `yo status` prints the 1Password probe status and the proxy socket unit statuses. On an older box it prints `UNITS_MISSING_NOTE`.
+
+## Two GitHub accounts
+
+Two GitHub accounts share `github.com`, so the account is chosen by which key is offered. The Mac does that with a `Host github-work` alias whose `IdentityFile` names a public key, which is a selector and not a key. `~/.dotfiles/gitconfig` rewrites `git@github.com:example-org/` to that alias.
+
+The guest gets the same setup from the agent's own checkout of the private dotfiles repo, not from the Mac. `~/.dotfiles/_do_install.sh`, run as the agent in the VM after cloning, links `~/.ssh/config` and the `*.pub` selector files. The config picks the agent itself at ssh runtime, with two `Match exec "test -S <socket>"` blocks. They test the macOS 1Password socket (`~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock`) and then the Linux one (`~/.1password/agent.sock`, for a Linux desktop running 1Password locally), and each sets `IdentityAgent` only when its socket exists.
+
+The VM has neither socket, so no `IdentityAgent` is set there. That absence is load-bearing. An `IdentityAgent` in the guest would name a path that does not exist there and take the forwarded agent away from ssh, so `SSH_AUTH_SOCK` (the proxy socket above) has to stay in charge. `yo bootstrap` prints a one-line stderr note saying so when a fresh box is set up. Running the installer is the operator's step, since only the operator knows where the dotfiles live.
+
+Recognise the class with `ssh -T git@github.com` and `ssh -T git@github-work` in the VM, which must greet two different names. "Could not resolve hostname" means the dotfiles' ssh config is not linked (`_do_install.sh` has not run). The wrong name means the `.pub` selectors are missing.
+
+### The retired yo seed
+
+There used to be a `yo seed` that read `~/.ssh/config`, the `*.pub` files and group `.gitconfig` files on the Mac and tar-piped them into the guest. It is gone, and so is the `home-roots` helper subcommand it asked the guest for. It was the one place the Mac read files at paths the guest could influence, and that went wrong once. A `.gitconfig` committed into a repo the agent had pushed was a symlink to `~/.ssh/id_ed25519`, which resolved inside `$HOME` and would have been shipped into the agent's reach. With the copy gone there is no such path to guard. The group `.gitconfig` copy was dropped outright, because no such file exists on the Mac. An `includeIf` in the dotfiles' gitconfig must still spell the path exactly as the project is spelled on the Mac, because the mirror carries that spelling into the VM verbatim.
+
+## An rc file took the agent away
+
+A dotfile can take the forwarded agent away too, and it fails only in the first shell after boot. On 2026-10-01, `git pull` in a freshly restored herdr pane died with `Load key "/home/agent/.ssh/work-github.pub": invalid format` and `Permission denied (publickey)`, while a newly opened pane worked.
+
+`~/.dotfiles/zshrc.d/ssh-agent.zsh` ran `eval "$(ssh-agent -s)"` whenever `pgrep -u $USER ssh-agent` found nothing. That is true only for the first shells after boot, and herdr restores several panes at once, so all of them lost that race. `/etc/zshenv` sets `SSH_AUTH_SOCK=/run/yolobox/op-agent.sock` before `~/.zshrc` runs, so the rc file's `eval` silently overwrote it with an empty agent. ssh then found no key matching the `IdentityFile *.pub` selector and fell back to reading the `.pub` as a private key, which is where "invalid format" comes from.
+
+Recognise it inside the failing pane. `echo $SSH_AUTH_SOCK` must print `/run/yolobox/op-agent.sock` (or herdr's `~/.config/herdr/herdr.sock.agent`, a symlink to it), and `pgrep -au agent ssh-agent` must print nothing. The rule is that no rc file may replace an inherited `SSH_AUTH_SOCK`. The dotfile now starts an agent only when `SSH_AUTH_SOCK` is not a socket. The box cannot guard this itself, because nothing it owns runs after the user's `~/.zshrc`.
