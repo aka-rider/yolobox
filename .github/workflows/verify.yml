@@ -26,7 +26,7 @@ jobs:
         run: ./yo --help
 
       - name: Shellcheck the guest helper
-        run: shellcheck -S warning nix/guest/yolobox-guest.sh
+        run: shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh
 
   # 3.9 is the floor yo promises; the newest 3.x catches the other direction.
   unit:
