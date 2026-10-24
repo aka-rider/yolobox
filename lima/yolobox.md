@@ -20,13 +20,14 @@ The same check reports two more gaps as stderr notes: a mounts gap and a `forwar
 
 ## Pinned settings
 
-`lima/yolobox.yaml` pins three settings that lima leaves at its defaults. Each default is wrong for a box that holds an agent.
+`lima/yolobox.yaml` pins four settings that lima leaves at its defaults. Each default is wrong for a box that holds an agent.
 
 - `vmType: vz` names Apple's Virtualization.framework. The rosetta block in the same file applies only to that driver, so the driver is pinned rather than left to lima's default.
 - `propagateProxyEnv: false` keeps the Mac's `HTTP(S)_PROXY` out of the guest. A proxy address the VM cannot reach would break every fetch the box makes.
 - `ssh.loadDotSSHPubKeys: false` stops lima copying every `~/.ssh/*.pub` from the Mac into the guest's authorized keys. The only key that can log in is then the one lima generates for the instance.
+- `ssh.overVsock: false` makes lima forward port 60022 to the guest's TCP port 22 and never to vsock. Lima chooses once per VM start, at the moment the guest first answers on port 22, and the initrd sshd that unlocks the disk speaks only TCP. Without the pin the choice would depend on which sshd answers first. The reasoning is in [docs/disk-encryption.md](../docs/disk-encryption.md#how-yo-reaches-the-initrd).
 
-None of them reaches an existing instance. Restate the two that an older box may lack with `limactl stop yolobox`, then `limactl edit yolobox --set '.propagateProxyEnv = false | .ssh.loadDotSSHPubKeys = false'`. The `vz` pin changes nothing on an instance that already runs vz, and every box of this repo does.
+None of them reaches an existing instance. Restate the three that an older box may lack with `limactl stop yolobox`, then `limactl edit yolobox --set '.propagateProxyEnv = false | .ssh.loadDotSSHPubKeys = false | .ssh.overVsock = false'`. `yo up` prints the exact command for any gap it finds. The `vz` pin changes nothing on an instance that already runs vz, and every box of this repo does.
 
 ## An empty page means lima's forwarder died
 

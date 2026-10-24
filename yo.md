@@ -83,6 +83,10 @@ A download never lets scp write onto the Mac destination itself. scp writes thro
 
 The staging directory is removed on every path, a refusal, an scp failure and a failed move included. `-p` keeps a guest directory's mode, and sftp-mode scp creates each local directory with that mode `| u+wx`. A read-only guest directory (a Go module cache) then refuses to lose its children, and an agent-side `chmod 300 ~/proj/sub` leaves a staged directory nobody can list. So `unlock_tree` chmods each real directory to 0700 before `shutil.rmtree`, and never follows a symlink, which would chmod a Mac file. If cleanup still fails, `download_from_guest` prints that failure on stderr and re-raises the original error. It never replaces it.
 
+## Starting and unlocking
+
+Starting the VM is no longer one `limactl start`. The root disk is encrypted, and lima's own start blocks until its ssh works, which needs the disk unlocked. So `vm_up` derives the passphrase first (`luks_passphrase`, which asks 1Password for the `yolobox-disk` key and so shows a Touch ID prompt), starts `limactl start` in the background, and hands the passphrase to the initrd with `unlock_disk` once the initrd's sshd answers. It then waits for the stage-2 sshd to accept the operator. A VM that is running and already accepts the operator needs no passphrase and no prompt. `lima_stop()` is the one place that runs `limactl stop`, with a timeout and the recovery text for its known hang. Every pre-unlock probe goes through `initrd_ssh_argv()` and `sshd_answers`, never a pinned ssh role. The reasons, the protocol and the failure shapes are in [docs/disk-encryption.md](docs/disk-encryption.md).
+
 ## One parser
 
 `build_parser()` is the single declaration of `yo`'s command line: `add_subparsers` plus `set_defaults(func=cmd_x)` per subcommand. `main()` parses, runs the `limactl` preflight, then calls `args.func(args)`. Every command function takes the parsed `argparse.Namespace`.
