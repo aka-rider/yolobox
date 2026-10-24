@@ -16,15 +16,28 @@ Identify whether you are running on the host (macOS) or the guest (Linux).
 ## The VM
 
 - ALWAYS keep the VM rebuildable from this repo alone. It has no snapshots and is meant to be thrown away, so anything that needs hand setup after creation is a defect. [story](docs/distribution.md#flake-ref-not-a-checkout)
-- ALWAYS keep `nix/base.nix`'s mount layout identical to the shipped nixos-lima image (`/boot` is the ESP). Diverging means every fresh instance needs a manual mount migration before its first switch. [story](nix/base.md#the-esp-holds-one-kernel)
+- ALWAYS keep `nix/base.nix`'s mount layout identical to the shipped nixos-lima image (`/boot` is the ESP), except `/` on LUKS, which the initrd migrates in place on the first boot. Any other divergence means every fresh instance needs a manual mount migration before its first switch. [story](nix/base.md#the-esp-holds-one-kernel)
 - ALWAYS keep `boot.loader.grub.configurationLimit = 1`. The ESP is 249 MiB and GRUB copies the incoming kernel before it prunes old ones, so two retained kernels plus one incoming do not fit. [story](nix/base.md#the-esp-holds-one-kernel)
 - ALWAYS keep `restartIfChanged = false` on `lima-init` and `lima-guestagent`. Restarting the guest agent kills every port lima forwards until the VM is stopped and started again. [story](lima/yolobox.md#an-empty-page-means-limas-forwarder-died)
 - ALWAYS declare the operator's account in `nix/base.nix` as `users.users.${username}`, fed by `YOLOBOX_USERNAME=$(id -un)` and `--impure`. A hardcoded name creates a second account with the same uid and splits state across two homes. [story](docs/accounts.md#two-accounts)
 - ALWAYS treat `lima/yolobox.yaml` as read once, at creation. An existing instance changes only through `limactl edit` while stopped. [story](lima/yolobox.md#read-once)
 - ALWAYS restate `portForwards` in full, with the command `yo up` prints, never a hand-copied one. Lima's yq cannot read the repo file, and a stale copy drops the socket rules. [story](lima/yolobox.md#checking-a-running-instance)
 - ALWAYS keep the socket-forward rules in `lima/yolobox.yaml` equal to `yo`'s `LIMA_PORT_FORWARDS`. The constant, not the yaml, builds the restate command, and `TestLimaYamlMatchesPortForwardsConstant` in `tests/test_consistency.py` enforces it. [story](lima/yolobox.md#checking-a-running-instance)
-- ALWAYS keep `vmType`, `propagateProxyEnv: false` and `ssh.loadDotSSHPubKeys: false` pinned in `lima/yolobox.yaml`. Lima's defaults leak the Mac's proxy variables and every `~/.ssh/*.pub` into the guest. [story](lima/yolobox.md#pinned-settings)
+- ALWAYS keep `vmType`, `propagateProxyEnv: false`, `ssh.loadDotSSHPubKeys: false` and `ssh.overVsock: false` pinned in `lima/yolobox.yaml`. Lima's defaults leak the Mac's proxy variables and every `~/.ssh/*.pub` into the guest, and let ssh ride vsock where the initrd that unlocks the disk cannot answer. [story](lima/yolobox.md#pinned-settings)
 - ALWAYS keep the `user@.service` `OOMScoreAdjust` override an `asDropin`. Replacing upstream's unit text loses the rest of it, and the default of 100 makes the user manager the kernel's preferred victim. [story](nix/base.md#memory-pressure)
+
+## Disk encryption
+
+- ALWAYS keep `/` on LUKS2 (`boot.initrd.luks.devices.root` over `/dev/vda2`, `fileSystems."/".device = "/dev/mapper/root"`), unlocked only by `yo` through the initrd sshd. The image file on the Mac is otherwise plaintext in every backup and copy. [story](docs/disk-encryption.md#what-is-encrypted-and-what-is-not)
+- NEVER use the 1Password CLI (`op`) or any 1Password interface but its SSH agent socket, on the Mac or in the guest. The CLI adds a session token any process can reuse, while the agent hands out signatures, never keys, and names the asking application in its prompt. [story](docs/disk-encryption.md#the-key)
+- NEVER store the disk's secrets on disk, on the Mac or in the guest: no key file, passphrase, signature, token, recovery code or initrd host key. Secrets travel over sockets and stdin and live in memory, the passphrase is derived on demand, and the initrd host key is generated per boot in RAM. [story](docs/disk-encryption.md#the-key)
+- NEVER change `LUKS_SIGN_DATA`, `LUKS_KDF_INFO` or `derive_luks_passphrase`. Together they are the passphrase of every existing disk, and there is no recovery slot. [story](docs/disk-encryption.md#the-key)
+- NEVER approve a 1Password prompt for the `yolobox-disk` key outside `yo up`, `yo bootstrap` or `yo disk-grow`. The same agent is forwarded into every agent session, and one approved signature is the disk passphrase. [story](docs/disk-encryption.md#what-is-encrypted-and-what-is-not)
+- ALWAYS keep `ssh.overVsock: false` pinned on the instance. Lima picks vsock or TCP for port 60022 once per start, and the initrd only speaks TCP. [story](docs/disk-encryption.md#how-yo-reaches-the-initrd)
+- ALWAYS grow an encrypted root with `yo disk-grow`, never with `autoResize`. `cryptsetup resize` needs the passphrase, which only `yo` holds. [story](docs/disk-encryption.md#growing-an-encrypted-disk)
+- ALWAYS list a shell script's tools in `boot.initrd.systemd.storePaths` when the script runs in the initrd. The initrd builder follows ELF dependencies only, and a missing tool shows up as a box stuck in its initrd. [story](docs/disk-encryption.md#how-yo-reaches-the-initrd)
+- NEVER create or chmod anything under `/run/yolobox` from the initrd. The directory survives switch-root and holds the agent's sockets. [story](docs/disk-encryption.md#encrypting-in-place)
+- ALWAYS keep `PerSourcePenalties no` ahead of the `Match` block in the initrd's `sshd_config`. Lima's readiness loop fails as an invalid user from `yo`'s own source address every 3 s, and OpenSSH would block that address for up to 600 s, while a global keyword after `Match` makes sshd refuse its config and leaves the initrd unreachable. [story](docs/disk-encryption.md#how-yo-reaches-the-initrd)
 
 ## Accounts
 
