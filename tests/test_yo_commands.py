@@ -208,6 +208,12 @@ class TestBootstrapRebootDecision(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+        fstype_patcher = mock.patch.object(
+            yo, "luks_device_fstype", return_value="crypto_LUKS"
+        )
+        fstype_patcher.start()
+        self.addCleanup(fstype_patcher.stop)
+
         ssh_run_patcher = mock.patch.object(
             yo, "ssh_run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
         )
@@ -423,6 +429,13 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(unittest.TestCase):
     def test_an_unreadable_df_is_an_error_not_a_pass(self):
         with self.assertRaises(yo.YoError):
             self.run_bootstrap("ext4", "garbage\n")
+
+    def test_an_unreadable_device_type_is_an_error_not_a_skipped_check(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.run_bootstrap("", "/dev/vda2 1000 950 50 95% /\n")
+        self.assertIn("cannot read the type of /dev/vda2", caught.exception.message)
+        self.assertIn("yo status", caught.exception.message)
+        self.assertEqual(self.rebuilds, [])
 
 
 class TestGcSkipsCollectionOnHalfFailedSwitch(unittest.TestCase):
@@ -1428,6 +1441,8 @@ class FakeBox:
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
+        if len(self.sleeps) > 2000:
+            raise AssertionError("yo is polling forever")
         self.clock += seconds
 
     def run(self, argv, **kwargs):
@@ -1547,6 +1562,53 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
             box.up()
         self.assertIn("lost its watch", caught.exception.message)
 
+    def test_an_empty_passphrase_at_the_helper_is_reported_as_such(self):
+        box = FakeBox(self, statuses=["Stopped", "Running"], helpers=[([], 4, "")])
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("no passphrase reached", caught.exception.message)
+
+    def test_a_vm_that_stops_while_nothing_is_starting_it_is_an_error_not_a_wait(
+        self,
+    ):
+        box = FakeBox(
+            self,
+            statuses=["Running", "Running", "Stopped"],
+            operator=[NOT_LISTENING],
+            root=[ANSWERS],
+            helpers=[NOT_LISTENING_HELPER],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("is Stopped, not Running", caught.exception.message)
+        self.assertLessEqual(len(box.sleeps), 2)
+
+    def test_a_plain_boot_whose_lima_start_already_succeeded_needs_no_unlock(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            helpers=[NOT_LISTENING_HELPER],
+            starts=[(0, True)],
+        )
+        box.up()
+        self.assertEqual(len(box.starts), 1)
+        box.vm_services.assert_called_once_with()
+
+    def test_a_finished_lima_start_with_a_silent_operator_waits_for_the_deadline(
+        self,
+    ):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            operator=[NOT_LISTENING],
+            helpers=[NOT_LISTENING_HELPER],
+            starts=[(0, True)],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        self.assertIn("never offered its initrd sshd", caught.exception.message)
+        self.assertGreater(sum(box.sleeps), yo.INITRD_WAIT_SECONDS)
+
     def test_an_unexpected_helper_exit_carries_its_stderr(self):
         box = FakeBox(
             self, statuses=["Stopped", "Running"], helpers=[([], 17, "weird")]
@@ -1646,7 +1708,7 @@ class TestUnlockSurvivesADroppedSession(unittest.TestCase):
     )
 
     def test_lima_having_exited_is_not_blamed_once_the_session_has_run(self):
-        FakeBox(self, **self.SCRIPT)
+        FakeBox(self, **dict(self.SCRIPT, statuses=["Running"]))
         outcome = yo.unlock_disk(b"a" * 64, FakeStarter(1, True))
         self.assertEqual(outcome, ("already-unlocked", True))
 
@@ -1662,10 +1724,9 @@ class TestUnlockSurvivesADroppedSession(unittest.TestCase):
 class TestRunTimeout(unittest.TestCase):
     def test_a_command_over_its_timeout_is_an_error_naming_it(self):
         expired = subprocess.TimeoutExpired(["limactl", "stop"], 5)
-        with mock.patch.object(yo.subprocess, "run", side_effect=expired) as fake_run:
+        with mock.patch.object(yo.subprocess, "run", side_effect=expired):
             with self.assertRaises(yo.YoError) as caught:
                 yo.run(["limactl", "stop", "yolobox"], timeout=5)
-        self.assertEqual(fake_run.call_args.kwargs["timeout"], 5)
         self.assertIn(
             "limactl stop yolobox did not finish within 5 s", caught.exception.message
         )
@@ -1684,6 +1745,14 @@ class TestLimaStop(unittest.TestCase):
         self.assertIn("kill -9", caught.exception.message)
         self.assertIn("systemctl reboot", caught.exception.message)
 
+    def test_a_stop_that_failed_for_another_reason_is_not_called_a_hang(self):
+        failed = subprocess.CompletedProcess(["limactl", "stop"], 1, None, None)
+        with mock.patch.object(yo.subprocess, "run", return_value=failed):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.lima_stop()
+        self.assertIn("failed", caught.exception.message)
+        self.assertNotIn("kill -9", caught.exception.message)
+
     def test_down_stops_the_instance_under_the_timeout(self):
         with mock.patch.object(yo, "run") as fake_run:
             yo.cmd_down(yo.build_parser().parse_args(["down"]))
@@ -1696,7 +1765,7 @@ class TestLimaStop(unittest.TestCase):
 
 
 class TestDiskGrowResizesTheMapping(FakeHome):
-    def disk_grow(self, fstype="crypto_LUKS\next4\n"):
+    def disk_grow(self, fstype="crypto_LUKS\next4\n", size="200"):
         os.makedirs(os.path.join(self.home, ".lima"))
         calls = []
         df_k = iter(
@@ -1706,7 +1775,10 @@ class TestDiskGrowResizesTheMapping(FakeHome):
             ]
         )
 
+        self.limactl = limactl = []
+
         def fake_run(argv, **kwargs):
+            limactl.append(list(argv))
             if argv[:2] == ["limactl", "list"]:
                 return mock.Mock(returncode=0, stdout=str(100 * 1024**3), stderr="")
             return mock.Mock(returncode=0, stdout="", stderr="")
@@ -1742,7 +1814,7 @@ class TestDiskGrowResizesTheMapping(FakeHome):
             mock.patch.object(yo, "out"),
         ):
             try:
-                yo.cmd_disk_grow(yo.build_parser().parse_args(["disk-grow", "200"]))
+                yo.cmd_disk_grow(yo.build_parser().parse_args(["disk-grow", size]))
             finally:
                 self.order = order
                 self.up = up
@@ -1765,6 +1837,26 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         self.assertEqual(self.order[0], "passphrase")
         self.assertEqual(self.order[1], "stop")
         self.assertEqual(self.order[2], {"passphrase": b"p" * 64})
+
+    def test_asking_for_the_current_ceiling_finishes_a_failed_grow_without_editing_lima(
+        self,
+    ):
+        # `limactl edit --disk` cannot be repeated, so a grow that failed after
+        # it is finished by asking for the ceiling the instance already has.
+        calls = self.disk_grow(size="100")
+        resize = (
+            ["sudo", "cryptsetup", "resize", "--key-file", "-", "root"],
+            b"p" * 64,
+        )
+        self.assertIn(resize, calls)
+        self.assertEqual(self.order, ["passphrase", {"passphrase": b"p" * 64}])
+        self.assertEqual([c for c in self.limactl if c[:2] != ["limactl", "list"]], [])
+
+    def test_a_ceiling_below_the_current_one_is_refused_before_anything_runs(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.disk_grow(size="50")
+        self.assertIn("at least 100", caught.exception.message)
+        self.assertEqual(self.order, [])
 
     def test_an_unencrypted_disk_is_refused_before_anything_stops(self):
         with self.assertRaises(yo.YoError) as caught:

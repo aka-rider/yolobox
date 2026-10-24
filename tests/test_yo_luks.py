@@ -28,6 +28,17 @@ def signature_answer(algorithm, raw):
 
 
 class TestDeriveLuksPassphrase(unittest.TestCase):
+    def test_the_derivation_is_pinned_byte_for_byte(self):
+        # Changing this literal, LUKS_SIGN_DATA, LUKS_KDF_INFO or the
+        # derivation changes the passphrase of every existing disk, and there
+        # is no recovery slot: every encrypted box becomes unopenable.
+        self.assertEqual(
+            yo.derive_luks_passphrase(bytes(range(64))),
+            b"c458a9e0a398126f0803952afdad3dd7446381cdbd58ffe6bda010dddc56e352",
+        )
+        self.assertEqual(yo.LUKS_SIGN_DATA, b"yolobox luks v1")
+        self.assertEqual(yo.LUKS_KDF_INFO, b"yolobox luks passphrase v1")
+
     def test_is_64_lowercase_hex_characters(self):
         passphrase = yo.derive_luks_passphrase(RAW_SIGNATURE)
         self.assertRegex(passphrase.decode("ascii"), r"^[0-9a-f]{64}$")
@@ -111,6 +122,8 @@ class FakeAgent(unittest.TestCase):
     raw_reply = None
 
     def setUp(self):
+        self.requests = []
+        self.stopping = False
         self.dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dir)
         self.sock_path = os.path.join(self.dir, "a.sock")
@@ -119,16 +132,23 @@ class FakeAgent(unittest.TestCase):
         self.listener.listen()
         self.thread = threading.Thread(target=self.serve)
         self.thread.start()
-        self.addCleanup(self.thread.join)
-        self.addCleanup(self.listener.close)
+        self.addCleanup(self.stop_serving)
+
+    def stop_serving(self):
+        # Closing a listener does not wake an accept() blocked in another
+        # thread on Linux, so a last connection does.
+        self.stopping = True
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as waker:
+            waker.connect(self.sock_path)
+        self.thread.join()
+        self.listener.close()
 
     def serve(self):
         while True:
-            try:
-                conn, _ = self.listener.accept()
-            except OSError:
-                return
+            conn, _ = self.listener.accept()
             with conn:
+                if self.stopping:
+                    return
                 self.answer(conn)
 
     def answer(self, conn):
@@ -136,6 +156,7 @@ class FakeAgent(unittest.TestCase):
         request = b""
         while len(request) < length:
             request += conn.recv(length - len(request))
+        self.requests.append(request)
         if self.raw_reply is not None:
             conn.sendall(self.raw_reply)
         elif request[0] == yo.SSH_AGENT_REQUEST_IDENTITIES:
@@ -162,6 +183,18 @@ class TestSshAgentClient(FakeAgent):
     def test_signs_with_a_known_key(self):
         signature = yo.ssh_agent_sign(self.sock_path, ED25519_BLOB, yo.LUKS_SIGN_DATA)
         self.assertEqual(signature, RAW_SIGNATURE)
+
+    def test_the_sign_request_is_the_fixed_bytes_with_no_flags(self):
+        yo.ssh_agent_sign(self.sock_path, ED25519_BLOB, yo.LUKS_SIGN_DATA)
+        self.assertEqual(
+            self.requests,
+            [
+                bytes([13])
+                + yo.ssh_string(ED25519_BLOB)
+                + yo.ssh_string(b"yolobox luks v1")
+                + b"\x00\x00\x00\x00"
+            ],
+        )
 
     def test_a_declined_signature_names_the_prompt(self):
         with self.assertRaises(yo.YoError) as caught:
@@ -222,6 +255,8 @@ class TestClassifyInitrdAttempt(unittest.TestCase):
             "read: Connection reset by peer",
             "kex_exchange_identification: read: Connection reset by peer",
             "Connection closed by 127.0.0.1 port 60022",
+            "Connection to 127.0.0.1 closed by remote host.",
+            "client_loop: send disconnect: Broken pipe",
             "Connection timed out during banner exchange",
             "ssh: connect to host 127.0.0.1 port 60022: Operation timed out",
         ):
