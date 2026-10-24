@@ -112,6 +112,42 @@ class TestLimaYamlMatchesPortForwardsConstant(unittest.TestCase):
             )
         }
         self.assertEqual(ssh.get("loadDotSSHPubKeys"), "false")
+        # The initrd sshd that unlocks the disk only speaks TCP, so lima must
+        # not pick vsock for the port yo dials.
+        self.assertEqual(ssh.get("overVsock"), "false")
+        self.assertEqual(ssh.get("localPort"), str(yo.SSH_LOCAL_PORT))
+
+
+class TestLuksFilesMatchYoConstants(unittest.TestCase):
+    def text(self, *parts):
+        return REPO.joinpath(*parts).read_text()
+
+    def test_luks_nix_names_the_device_label_and_mapper_yo_uses(self):
+        text = self.text("nix", "luks.nix")
+        self.assertIn('device = "%s";' % yo.LUKS_DEVICE, text)
+        self.assertIn('label = "%s";' % yo.LUKS_LABEL, text)
+        self.assertIn("boot.initrd.luks.devices.%s = " % yo.LUKS_MAPPER, text)
+
+    def test_apps_nix_names_the_three_scripts_and_the_device(self):
+        text = self.text("nix", "luks", "apps.nix")
+        for name in (
+            yo.INITRD_UNLOCK_HELPER,
+            "yolobox-luks-migrate",
+            "yolobox-initrd-authorized-keys",
+        ):
+            self.assertIn(name, text)
+        self.assertIn('LUKS_DEVICE = "%s";' % yo.LUKS_DEVICE, text)
+
+    def test_the_migrate_script_posts_the_ask_id_yo_looks_for(self):
+        text = self.text("nix", "luks", "yolobox-luks-migrate.sh")
+        self.assertIn("--id=%s" % yo.MIGRATE_ASK_ID, text)
+
+    def test_the_unlock_script_prints_the_line_yo_reads_the_ask_id_from(self):
+        text = self.text("nix", "luks", "yolobox-unlock.sh")
+        self.assertIn("answered id=", text)
+
+    def test_the_flake_imports_the_luks_module(self):
+        self.assertIn("./nix/luks.nix", self.text("flake.nix"))
 
 
 class TestAgentEnvMatchesYoSockets(unittest.TestCase):
