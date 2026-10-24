@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import enum
 import hashlib
 import hmac
 import http.client
@@ -45,6 +46,12 @@ T3_PORT = 3773
 HELPER = "yolobox-guest"
 HELPER_NO_SUBCOMMAND = 64
 SSH_UNREACHABLE = 255
+# yolobox-unlock's exit codes; nix/luks/yolobox-unlock.sh documents the same
+# table in its header and tests/test_consistency.py compares the two.
+HELPER_EXIT_WRONG_KEY = 1
+HELPER_EXIT_MIGRATION_FAILED = 2
+HELPER_EXIT_WATCH_LOST = 3
+HELPER_EXIT_NO_PASSPHRASE = 4
 FZF_NO_MATCH = 1
 FZF_CANCELLED = 130
 HELPER_MARKER = "unknown subcommand"
@@ -90,7 +97,6 @@ LIMA_SETTING_GAPS = {
 # luks_passphrase) and never stored.
 LUKS_DEVICE = "/dev/vda2"
 LUKS_MAPPER = "root"
-LUKS_LABEL = "yolobox-luks"
 # Title of the Ed25519 "SSH Key" item in 1Password that unlocks the disk.
 LUKS_KEY_ITEM = "yolobox-disk"
 # Changing LUKS_SIGN_DATA or LUKS_KDF_INFO changes every existing disk's passphrase.
@@ -98,8 +104,13 @@ LUKS_SIGN_DATA = b"yolobox luks v1"
 LUKS_KDF_INFO = b"yolobox luks passphrase v1"
 # SSH agent protocol message types (draft-miller-ssh-agent).
 SSH_AGENT_FAILURE = 5
+# How long a connect to the agent socket may take; a refusal is immediate.
+AGENT_CONNECT_TIMEOUT = 10
 # How long a sign request may wait for the human to approve 1Password's prompt.
 AGENT_REPLY_TIMEOUT = 300
+# Larger than any reply the agent protocol has a reason to send here.
+AGENT_MAX_REPLY_BYTES = 1 << 20
+ED25519_SIGNATURE_LENGTH = 64
 SSH_AGENT_REQUEST_IDENTITIES = 11
 SSH_AGENT_IDENTITIES_ANSWER = 12
 SSH_AGENT_SIGN_REQUEST = 13
@@ -114,11 +125,24 @@ INITRD_UNLOCK_HELPER = "yolobox-unlock"
 MIGRATE_ASK_ID = "yolobox:luks-migrate"
 INITRD_WAIT_SECONDS = 600
 OPERATOR_WAIT_SECONDS = 600
+# Polls of a machine outside yo, not orderings between yo's own events: nothing
+# on the Mac can wait on a remote TCP port coming up.
+INITRD_POLL_SECONDS = 2
+OPERATOR_POLL_SECONDS = 3
 LIMA_STOP_TIMEOUT = 300
-# What `limactl list` reports while `limactl start` is still bringing an
-# instance up. Stopped is among them because the status has not changed yet in
-# the moments before the hostagent exists.
-LIMA_STARTING_STATUSES = ("", "Installing", "Starting", "Stopped")
+# What `limactl list` reports before the guest is running: not listed yet,
+# Installing, Starting, and Stopped, which an instance still says in the moments
+# after `limactl start` is spawned and before its hostagent exists.
+LIMA_PRE_BOOT_STATUSES = ("", "Installing", "Starting", "Stopped")
+# The ssh options of every probe of the initrd's sshd.
+SSH_CONNECT_TIMEOUT_SECONDS = 5
+SSH_ALIVE_INTERVAL_SECONDS = 15
+# The fullest the root may be for the first boot to encrypt it in place.
+IN_PLACE_MAX_USED_PERCENT = 90
+# `yo status` warns when the guest's / is this full.
+DISK_WARN_PERCENT = 90
+DISK_FSTYPE_PLAIN = "ext4"
+DISK_FSTYPE_LUKS = "crypto_LUKS"
 
 GUEST_AWS_CONFIG_PATH = AGENT_HOME + "/.config/yolobox/aws-config"
 
@@ -369,9 +393,10 @@ def parse_agent_signature(body: bytes) -> bytes:
             "the %s key signed with %s; it must be an Ed25519 key"
             % (LUKS_KEY_ITEM, algorithm.decode("utf-8", "replace"))
         )
-    if len(raw) != 64:
+    if len(raw) != ED25519_SIGNATURE_LENGTH:
         raise YoError(
-            "the ssh agent returned a %d-byte Ed25519 signature, not 64" % len(raw)
+            "the ssh agent returned a %d-byte Ed25519 signature, not %d"
+            % (len(raw), ED25519_SIGNATURE_LENGTH)
         )
     return raw
 
@@ -420,23 +445,32 @@ def recv_exact(conn: socket.socket, count: int) -> bytes:
     return b"".join(chunks)
 
 
+def read_agent_reply(conn: socket.socket) -> bytes:
+    (length,) = struct.unpack(">I", recv_exact(conn, 4))
+    if length == 0 or length > AGENT_MAX_REPLY_BYTES:
+        raise OSError("implausible reply length %d" % length)
+    return recv_exact(conn, length)
+
+
 def ssh_agent_call(sock_path: str, payload: bytes) -> bytes:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-            conn.settimeout(10)
+            conn.settimeout(AGENT_CONNECT_TIMEOUT)
             conn.connect(sock_path)
             conn.sendall(ssh_string(payload))
             # A sign request is answered only after the human approves
             # 1Password's prompt, so the reply gets minutes, not seconds.
             conn.settimeout(AGENT_REPLY_TIMEOUT)
-            (length,) = struct.unpack(">I", recv_exact(conn, 4))
-            if length == 0 or length > 1 << 20:
-                raise OSError("implausible reply length %d" % length)
-            return recv_exact(conn, length)
+            try:
+                return read_agent_reply(conn)
+            except socket.timeout:
+                raise YoError(
+                    "1Password's SSH agent at %s did not answer within %d s — "
+                    "approve its prompt" % (sock_path, AGENT_REPLY_TIMEOUT)
+                )
     except OSError as failure:
         raise YoError(
-            "1Password's SSH agent at %s is not answering: %s (approve its prompt within %d s)"
-            % (sock_path, failure, AGENT_REPLY_TIMEOUT)
+            "1Password's SSH agent at %s is not answering: %s" % (sock_path, failure)
         )
 
 
@@ -1447,8 +1481,8 @@ BOOTSTRAP_IDENTITY_NOTE = (
 )
 IN_PLACE_ENCRYPTION_WARNING = (
     "yo: the next boot encrypts %s in place. The box is unusable until it finishes "
-    "(an hour or more at this size), and the first minutes, an offline filesystem "
-    "shrink, must not be interrupted: do not stop the VM or the Mac until yo up "
+    "(about ten to fifteen minutes at this disk's size; a fuller disk takes longer), "
+    "and the first minutes, an offline filesystem shrink, must not be interrupted: do not stop the VM or the Mac until yo up "
     'reports "unlocked". yo gc --deep --yes first shrinks the work.' % LUKS_DEVICE
 )
 
@@ -1544,9 +1578,9 @@ def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:
             "-o",
             "BatchMode=yes",
             "-o",
-            "ConnectTimeout=5",
+            "ConnectTimeout=%d" % SSH_CONNECT_TIMEOUT_SECONDS,
             "-o",
-            "ServerAliveInterval=15",
+            "ServerAliveInterval=%d" % SSH_ALIVE_INTERVAL_SECONDS,
             "-o",
             "LogLevel=ERROR",
         ]
@@ -1567,24 +1601,52 @@ NOT_LISTENING_MARKERS = (
 )
 
 
-def classify_initrd_attempt(returncode: int, stderr: str) -> str:
+class SshOutcome(enum.Enum):
+    """What one ssh attempt at the initrd's or stage 2's sshd came to."""
+
+    ANSWERED = "answered"  # the command ran and exited 0
+    RAN = "ran"  # the command ran and exited non-zero
+    REFUSED = "refused"  # sshd answered and refused the key
+    NOT_LISTENING = "not-listening"  # no sshd behind the port (yet)
+    ERROR = "error"  # ssh failed in a way yo has no name for
+
+
+def classify_initrd_attempt(returncode: int, stderr: str) -> SshOutcome:
     if returncode != SSH_UNREACHABLE:
-        return "ran"
+        return SshOutcome.RAN
     if "Permission denied" in stderr:
-        return "refused"
+        return SshOutcome.REFUSED
     if any(marker in stderr for marker in NOT_LISTENING_MARKERS):
-        return "not-listening"
-    return "error"
+        return SshOutcome.NOT_LISTENING
+    return SshOutcome.ERROR
 
 
-def sshd_answers(user: str) -> str:
+def sshd_answers(user: str) -> SshOutcome:
     proc = run(initrd_ssh_argv("true", user=user), stdin=b"")
     if proc.returncode == 0:
-        return "yes"
+        return SshOutcome.ANSWERED
     return classify_initrd_attempt(proc.returncode, proc.stderr)
 
 
-def run_initrd_helper(passphrase: bytes) -> Tuple[int, str, bool, bool]:
+def stage2_up() -> bool:
+    return sshd_answers(host_user()) is SshOutcome.ANSWERED
+
+
+def initrd_waiting() -> bool:
+    return sshd_answers("root") is SshOutcome.ANSWERED
+
+
+@dataclass(frozen=True)
+class HelperRun:
+    """One run of the initrd's yolobox-unlock over ssh."""
+
+    returncode: int
+    stderr: str
+    migrated: bool
+    streamed: bool  # the helper's stdout reached the terminal before the session ended
+
+
+def run_initrd_helper(passphrase: bytes) -> HelperRun:
     stderr_lines: List[str] = []
 
     def collect(source: io.BufferedReader) -> None:
@@ -1592,9 +1654,9 @@ def run_initrd_helper(passphrase: bytes) -> Tuple[int, str, bool, bool]:
             stderr_lines.append(raw.decode("utf-8", "replace").rstrip("\n"))
 
     migrated = False
-    printed = False
+    streamed = False
     try:
-        proc_context = subprocess.Popen(
+        helper = subprocess.Popen(
             initrd_ssh_argv(INITRD_UNLOCK_HELPER),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -1602,7 +1664,7 @@ def run_initrd_helper(passphrase: bytes) -> Tuple[int, str, bool, bool]:
         )
     except FileNotFoundError:
         raise YoError("ssh not found on PATH")
-    with proc_context as proc:
+    with helper as proc:
         collector = threading.Thread(target=collect, args=(proc.stderr,))
         collector.start()
         try:
@@ -1612,125 +1674,160 @@ def run_initrd_helper(passphrase: bytes) -> Tuple[int, str, bool, bool]:
             pass  # ssh already ended; its exit code and stderr, returned below, say why
         for raw in iter(proc.stdout.readline, b""):
             line = raw.decode("utf-8", "replace").rstrip("\n")
-            printed = True
+            streamed = True
             migrated = migrated or "id=%s" % MIGRATE_ASK_ID in line
             out(line)
         collector.join()
         returncode = proc.wait()
-    return returncode, "\n".join(stderr_lines), migrated, printed
+    return HelperRun(returncode, "\n".join(stderr_lines), migrated, streamed)
 
 
-def unlock_disk(
-    passphrase: bytes, starter: Optional[subprocess.Popen] = None
-) -> Tuple[str, bool]:
+class Verdict(enum.Enum):
+    """What unlock_disk does after one helper run.
+
+    UNLOCKED: the helper finished its job. FAILED: a failure retrying cannot
+    fix. DROPPED: the session ran and then ended (switch-root, or a migration
+    that outlived the connection). REFUSED: sshd refused the key, and stage 2's
+    sshd may be about to accept it. NOT_LISTENING: nothing to talk to yet.
+    """
+
+    UNLOCKED = "unlocked"
+    FAILED = "failed"
+    DROPPED = "dropped"
+    REFUSED = "refused"
+    NOT_LISTENING = "not-listening"
+
+
+def judge_helper_run(attempt: HelperRun) -> Verdict:
+    outcome = classify_initrd_attempt(attempt.returncode, attempt.stderr)
+    if outcome is SshOutcome.RAN:
+        return Verdict.UNLOCKED if attempt.returncode == 0 else Verdict.FAILED
+    if attempt.streamed:
+        return Verdict.DROPPED
+    if outcome is SshOutcome.ERROR:
+        return Verdict.FAILED
+    if outcome is SshOutcome.REFUSED:
+        return Verdict.REFUSED
+    return Verdict.NOT_LISTENING
+
+
+def helper_failure_message(attempt: HelperRun) -> str:
+    code, stderr = attempt.returncode, attempt.stderr
+    if code == SSH_UNREACHABLE:
+        return stderr or "ssh to 127.0.0.1:%d failed with exit %d and no message" % (
+            SSH_LOCAL_PORT,
+            code,
+        )
+    if code == HELPER_EXIT_MIGRATION_FAILED:
+        return (
+            "encrypting the disk failed in the initrd; the box is still in its initrd "
+            "with the plaintext intact. Inspect it as root: ssh -F /dev/null -i "
+            "~/.lima/_config/user -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "
+            "-o UserKnownHostsFile=/dev/null -p %d root@127.0.0.1 journalctl -u "
+            "yolobox-luks-migrate\n%s" % (SSH_LOCAL_PORT, stderr)
+        )
+    if code == HELPER_EXIT_WRONG_KEY:
+        return (
+            "the %s key in 1Password does not open %s — a different key encrypted "
+            "this disk, and there is no recovery slot" % (LUKS_KEY_ITEM, LUKS_DEVICE)
+        )
+    if code == HELPER_EXIT_WATCH_LOST:
+        return "the initrd helper lost its watch:\n%s" % stderr
+    if code == HELPER_EXIT_NO_PASSPHRASE:
+        return "no passphrase reached the initrd helper"
+    return "the initrd helper failed with exit %d: %s" % (code, stderr)
+
+
+def deadline_after(
+    deadline: Optional[float], status: str, lima_is_starting: bool, now: float
+) -> Optional[float]:
+    """The unlock budget after seeing lima's status: it starts when lima says Running."""
+    if status == "Running":
+        return deadline or now + INITRD_WAIT_SECONDS
+    if lima_is_starting and status in LIMA_PRE_BOOT_STATUSES:
+        # Lima is still creating, downloading or booting.
+        return None
+    raise YoError(
+        "%s is %s, not Running — limactl list" % (INSTANCE, status or "not listed")
+    )
+
+
+def initrd_timeout_error(key_was_refused: bool) -> YoError:
+    if key_was_refused:
+        return YoError(
+            "the sshd on 127.0.0.1:%d refused lima's key for root and for %s — if %s "
+            "is in its initrd, reading the key from cidata failed; see "
+            "docs/disk-encryption.md#recognising-failures"
+            % (SSH_LOCAL_PORT, host_user(), INSTANCE)
+        )
+    return YoError(
+        "%s never offered its initrd sshd on 127.0.0.1:%d within %d s of lima "
+        "reporting it Running — limactl list, ~/.lima/%s/serialv.log"
+        % (INSTANCE, SSH_LOCAL_PORT, INITRD_WAIT_SECONDS, INSTANCE)
+    )
+
+
+def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -> bool:
+    """Answer the initrd's passphrase ask; True when this boot migrated the disk."""
     migrated_any = False
     session_ran = False
     deadline: Optional[float] = None
     refused_since: Optional[float] = None
     err("yo: waiting for %s's initrd to ask for its disk passphrase" % INSTANCE)
     while True:
-        rc, stderr_text, migrated, printed = run_initrd_helper(passphrase)
-        migrated_any = migrated_any or migrated
-        kind = classify_initrd_attempt(rc, stderr_text)
-        if kind == "ran":
-            if rc == 0:
-                return "unlocked", migrated_any
-            if rc == 2:
-                raise YoError(
-                    "encrypting the disk failed in the initrd; the box is still in its initrd "
-                    "with the plaintext intact. Inspect it as root: ssh -F /dev/null -i "
-                    "~/.lima/_config/user -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "
-                    "-o UserKnownHostsFile=/dev/null -p %d root@127.0.0.1 journalctl -u "
-                    "yolobox-luks-migrate\n%s" % (SSH_LOCAL_PORT, stderr_text)
-                )
-            if rc == 1:
-                raise YoError(
-                    "the %s key in 1Password does not open %s — a different key encrypted "
-                    "this disk, and there is no recovery slot"
-                    % (LUKS_KEY_ITEM, LUKS_DEVICE)
-                )
-            if rc == 3:
-                raise YoError("the initrd helper lost its watch:\n%s" % stderr_text)
-            if rc == 4:
-                raise YoError("no passphrase reached the initrd helper")
-            raise YoError(
-                "the initrd helper failed with exit %d: %s" % (rc, stderr_text)
-            )
-
-        if rc == SSH_UNREACHABLE and printed:
-            # The session ran and then dropped: switch-root, or an hour-long
-            # migration that outlived the connection. A fresh budget, since the
-            # old one may have expired while the session streamed.
+        attempt = run_initrd_helper(passphrase)
+        migrated_any = migrated_any or attempt.migrated
+        verdict = judge_helper_run(attempt)
+        if verdict in (Verdict.UNLOCKED, Verdict.DROPPED):
+            for line in attempt.stderr.splitlines():
+                err(line)
+        if verdict is Verdict.UNLOCKED:
+            return migrated_any
+        if verdict is Verdict.FAILED:
+            raise YoError(helper_failure_message(attempt))
+        if verdict is Verdict.DROPPED:
+            # Switch-root, or a migration that outlived the connection. A fresh
+            # budget, since the old one may have expired while the session streamed.
             session_ran = True
             deadline = time.monotonic() + INITRD_WAIT_SECONDS
-            probe_operator = True
-        elif kind == "error":
-            raise YoError(
-                stderr_text
-                or "ssh to 127.0.0.1:%d failed with exit %d and no message"
-                % (SSH_LOCAL_PORT, rc)
-            )
-        else:
-            probe_operator = kind == "refused"
-        if probe_operator:
-            if sshd_answers(host_user()) == "yes":
-                return "already-unlocked", migrated_any
-            if kind == "refused":
-                # A fresh instance's first plain boot writes the operator's key
-                # moments after its sshd starts, so a refusal is retried.
-                refused_since = refused_since or time.monotonic()
+        if verdict in (Verdict.DROPPED, Verdict.REFUSED) and stage2_up():
+            return migrated_any
+        if verdict is Verdict.REFUSED:
+            # A fresh instance's first plain boot writes the operator's key
+            # moments after its sshd starts, so a refusal is retried.
+            refused_since = refused_since or time.monotonic()
 
         starter_alive = starter is not None and starter.poll() is None
-        if not session_ran and starter is not None and not starter_alive:
+        if starter is not None and not starter_alive and not session_ran:
             if starter.returncode != 0:
                 raise YoError(
                     "limactl start exited %d before %s offered its initrd sshd"
                     % (starter.returncode, INSTANCE)
                 )
             # Lima's own ssh worked, so this was a plain boot: stage 2 is up.
-            if sshd_answers(host_user()) == "yes":
-                return "already-unlocked", migrated_any
+            if stage2_up():
+                return migrated_any
         info = lima_instance_info()
-        status = info.status if info is not None else ""
-        if status == "Running":
-            deadline = deadline or time.monotonic() + INITRD_WAIT_SECONDS
-        elif starter_alive and not session_ran and status in LIMA_STARTING_STATUSES:
-            # Lima is still creating, downloading or booting: the budget starts
-            # when it reports Running.
-            deadline = None
-        else:
-            raise YoError(
-                "%s is %s, not Running — limactl list"
-                % (INSTANCE, status or "not listed")
-            )
+        deadline = deadline_after(
+            deadline,
+            info.status if info is not None else "",
+            starter_alive and not session_ran,
+            time.monotonic(),
+        )
         if deadline is not None and time.monotonic() > deadline:
-            if refused_since is not None:
-                raise YoError(
-                    "the sshd on 127.0.0.1:%d refused lima's key for root and for %s — if %s "
-                    "is in its initrd, reading the key from cidata failed; see "
-                    "docs/disk-encryption.md#recognising-failures"
-                    % (SSH_LOCAL_PORT, host_user(), INSTANCE)
-                )
-            raise YoError(
-                "%s never offered its initrd sshd on 127.0.0.1:%d within %d s of lima "
-                "reporting it Running — limactl list, ~/.lima/%s/serialv.log"
-                % (INSTANCE, SSH_LOCAL_PORT, INITRD_WAIT_SECONDS, INSTANCE)
-            )
-        # A poll of a machine outside yo, not an ordering between yo's own
-        # events: nothing on the Mac can wait on a remote TCP port coming up.
-        time.sleep(2)
+            raise initrd_timeout_error(refused_since is not None)
+        time.sleep(INITRD_POLL_SECONDS)
 
 
 def wait_for_operator() -> None:
     deadline = time.monotonic() + OPERATOR_WAIT_SECONDS
-    while sshd_answers(host_user()) != "yes":
+    while not stage2_up():
         if time.monotonic() > deadline:
             raise YoError(
                 "the disk is unlocked but %s is not reachable as the operator — yo status"
                 % INSTANCE
             )
-        # A poll of lima's readiness, not an ordering between yo's own events.
-        time.sleep(3)
+        time.sleep(OPERATOR_POLL_SECONDS)
 
 
 def spawn_limactl_start(argv: Sequence[str]) -> subprocess.Popen:
@@ -1757,7 +1854,7 @@ def start_and_unlock(passphrase: bytes) -> None:
     # unlocked, so it runs beside the unlock instead of before it.
     starter = spawn_limactl_start(start_argv)
     try:
-        _, migrated = unlock_disk(passphrase, starter)
+        migrated = unlock_disk(passphrase, starter)
         rc = starter.wait()
         if rc != 0 and migrated:
             err(
@@ -1792,8 +1889,8 @@ def vm_up(
     if not running:
         passphrase = passphrase or luks_passphrase()
         start_and_unlock(passphrase)
-    elif sshd_answers(host_user()) != "yes":
-        if sshd_answers("root") != "yes":
+    elif not stage2_up():
+        if not initrd_waiting():
             raise YoError(
                 "%s is Running but neither its initrd nor its sshd answers on 127.0.0.1:%d "
                 "— limactl list, yo status" % (INSTANCE, SSH_LOCAL_PORT)
@@ -1952,7 +2049,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         if detail:
             err(detail)
         out("vm: unreachable — is it up? start it with: yo up")
-        if sshd_answers("root") == "yes":
+        if initrd_waiting():
             out(
                 "disk: locked — %s is waiting in its initrd for the passphrase; unlock it with: yo up"
                 % INSTANCE
@@ -1965,16 +2062,17 @@ def cmd_status(args: argparse.Namespace) -> None:
         out("disk: guest %s" % guest_df)
         fields = guest_df.split()
         use_pct = fields[4].rstrip("%") if len(fields) > 4 else ""
-        if use_pct.isdigit() and int(use_pct) >= 90:
+        if use_pct.isdigit() and int(use_pct) >= DISK_WARN_PERCENT:
             out(
                 "disk: WARNING guest / is %s%% full — reclaim with: yo gc --deep --yes, or raise the ceiling with: yo disk-grow <GiB>"
                 % use_pct
             )
     if vm_reachable:
         fstype = luks_device_fstype()
-        if not fstype:
+        state = classify_disk(fstype)
+        if state is DiskState.UNREADABLE:
             out("disk: cannot read the type of %s" % LUKS_DEVICE)
-        elif fstype == "crypto_LUKS":
+        elif state is DiskState.ENCRYPTED:
             out("disk: %s is %s" % (LUKS_DEVICE, fstype))
         else:
             out(
@@ -2087,6 +2185,23 @@ def host_user() -> str:
     return pwd.getpwuid(os.getuid()).pw_name
 
 
+class DiskState(enum.Enum):
+    UNREADABLE = "unreadable"
+    PLAIN_EXT4 = "plain ext4"
+    ENCRYPTED = "encrypted"
+    OTHER = "other"
+
+
+def classify_disk(fstype: str) -> DiskState:
+    if not fstype:
+        return DiskState.UNREADABLE
+    if fstype == DISK_FSTYPE_PLAIN:
+        return DiskState.PLAIN_EXT4
+    if fstype == DISK_FSTYPE_LUKS:
+        return DiskState.ENCRYPTED
+    return DiskState.OTHER
+
+
 def luks_device_fstype() -> str:
     # -d: the device alone. Without it lsblk lists the mapped child too, and on
     # the live box it printed the child's ext4 before the device's crypto_LUKS.
@@ -2105,21 +2220,21 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     passphrase = vm_up(run_services=False)
     report.ok("VM up")
 
-    fstype = luks_device_fstype()
-    if not fstype:
+    disk = classify_disk(luks_device_fstype())
+    if disk is DiskState.UNREADABLE:
         raise YoError(
             "cannot read the type of %s — is the box up? yo status" % LUKS_DEVICE
         )
-    if fstype == "ext4":
+    if disk is DiskState.PLAIN_EXT4:
         guest_df = guest_out(["df", "-P", "/"])
         total, used = df_blocks(guest_df, 1), df_blocks(guest_df, 2)
         if total is None or used is None:
             raise YoError("cannot read the VM's root usage from df: %r" % guest_df)
-        if used * 100 > total * 90:
+        if used * 100 > total * IN_PLACE_MAX_USED_PERCENT:
             raise YoError(
-                "%s's root is %d%% full; the in-place encryption needs about 5%% headroom "
-                "plus 64 MiB — reclaim first: yo gc --deep --yes"
-                % (INSTANCE, used * 100 // total)
+                "%s's root is %d%% full, over the %d%% the in-place encryption allows "
+                "(it needs about 5%% headroom plus 64 MiB) — reclaim first: yo gc --deep --yes"
+                % (INSTANCE, used * 100 // total, IN_PLACE_MAX_USED_PERCENT)
             )
         err(IN_PLACE_ENCRYPTION_WARNING)
 
@@ -2217,7 +2332,7 @@ def require_growable_guest() -> None:
             % rebuild_hint()
         )
 
-    if luks_device_fstype() != "crypto_LUKS":
+    if classify_disk(luks_device_fstype()) is not DiskState.ENCRYPTED:
         raise YoError(
             "%s is not encrypted yet, so there is no mapping to grow — run: yo bootstrap"
             % LUKS_DEVICE
@@ -2948,8 +3063,9 @@ def build_parser() -> argparse.ArgumentParser:
         "YOLOBOX_FLAKE overrides which flake ref to build from (e.g. a\n"
         'branch), and is required on an unreleased ("dev") build.\n'
         "The reboot into the first encrypted generation encrypts the disk in\n"
-        "place: the box is unusable for an hour or more, and its first minutes\n"
-        "(an offline filesystem shrink) must not be interrupted.",
+        "place: the box is unusable for about ten to fifteen minutes at this disk's\n"
+        "size (a fuller disk takes longer), and its first minutes (an offline\n"
+        "filesystem shrink) must not be interrupted.",
     )
     bootstrap.set_defaults(func=cmd_bootstrap)
 
