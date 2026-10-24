@@ -113,6 +113,10 @@ MIGRATE_ASK_ID = "yolobox:luks-migrate"
 INITRD_WAIT_SECONDS = 600
 OPERATOR_WAIT_SECONDS = 600
 LIMA_STOP_TIMEOUT = 300
+# What `limactl list` reports while `limactl start` is still bringing an
+# instance up. Stopped is among them because the status has not changed yet in
+# the moments before the hostagent exists.
+LIMA_STARTING_STATUSES = ("", "Installing", "Starting", "Stopped")
 
 GUEST_AWS_CONFIG_PATH = AGENT_HOME + "/.config/yolobox/aws-config"
 
@@ -485,6 +489,10 @@ class YoError(Exception):
         self.code = code
 
 
+class RunTimeout(YoError):
+    """A command `run()` gave up on after its timeout."""
+
+
 # Guest-controlled text reaches these two (ssh stderr, paths, helper output). A
 # terminal acts on escape sequences and C1 controls, so they are shown as "?".
 # Tab and newline stay.
@@ -565,7 +573,7 @@ def run(
     except FileNotFoundError:
         raise YoError("%s not found on PATH" % argv[0])
     except subprocess.TimeoutExpired:
-        raise YoError(
+        raise RunTimeout(
             "%s did not finish within %d s" % (shlex.join(argv), timeout or 0)
         )
     if capture:
@@ -1481,7 +1489,7 @@ def lima_stop() -> None:
             check=True,
             timeout=LIMA_STOP_TIMEOUT,
         )
-    except YoError as failure:
+    except RunTimeout as failure:
         raise YoError(
             "%s\n    limactl stop hangs on the vz driver sometimes (TODO.md); recover with: "
             "yo ssh sudo systemctl reboot, then kill -9 any leftover 'limactl hostagent' "
@@ -1546,6 +1554,8 @@ NOT_LISTENING_MARKERS = (
     "Connection reset",
     "kex_exchange_identification",
     "Connection closed",
+    "closed by remote host",
+    "Broken pipe",
     "Connection timed out",
     "Operation timed out",
 )
@@ -1635,6 +1645,8 @@ def unlock_disk(
                 )
             if rc == 3:
                 raise YoError("the initrd helper lost its watch:\n%s" % stderr_text)
+            if rc == 4:
+                raise YoError("no passphrase reached the initrd helper")
             raise YoError(
                 "the initrd helper failed with exit %d: %s" % (rc, stderr_text)
             )
@@ -1662,18 +1674,29 @@ def unlock_disk(
                 # moments after its sshd starts, so a refusal is retried.
                 refused_since = refused_since or time.monotonic()
 
-        if not session_ran and starter is not None and starter.poll() is not None:
-            raise YoError(
-                "limactl start exited %d before %s offered its initrd sshd"
-                % (starter.returncode, INSTANCE)
-            )
+        starter_alive = starter is not None and starter.poll() is None
+        if not session_ran and starter is not None and not starter_alive:
+            if starter.returncode != 0:
+                raise YoError(
+                    "limactl start exited %d before %s offered its initrd sshd"
+                    % (starter.returncode, INSTANCE)
+                )
+            # Lima's own ssh worked, so this was a plain boot: stage 2 is up.
+            if sshd_answers(host_user()) == "yes":
+                return "already-unlocked", migrated_any
         info = lima_instance_info()
-        if info is None or info.status != "Running":
-            # Lima is still creating or downloading: the budget starts when it
-            # reports Running.
+        status = info.status if info is not None else ""
+        if status == "Running":
+            deadline = deadline or time.monotonic() + INITRD_WAIT_SECONDS
+        elif starter_alive and not session_ran and status in LIMA_STARTING_STATUSES:
+            # Lima is still creating, downloading or booting: the budget starts
+            # when it reports Running.
             deadline = None
         else:
-            deadline = deadline or time.monotonic() + INITRD_WAIT_SECONDS
+            raise YoError(
+                "%s is %s, not Running — limactl list"
+                % (INSTANCE, status or "not listed")
+            )
         if deadline is not None and time.monotonic() > deadline:
             if refused_since is not None:
                 raise YoError(
@@ -2075,7 +2098,12 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     passphrase = vm_up(run_services=False)
     report.ok("VM up")
 
-    if luks_device_fstype() == "ext4":
+    fstype = luks_device_fstype()
+    if not fstype:
+        raise YoError(
+            "cannot read the type of %s — is the box up? yo status" % LUKS_DEVICE
+        )
+    if fstype == "ext4":
         guest_df = guest_out(["df", "-P", "/"])
         total, used = df_blocks(guest_df, 1), df_blocks(guest_df, 2)
         if total is None or used is None:
@@ -2167,23 +2195,7 @@ def cmd_gc(args: argparse.Namespace) -> None:
         raise YoError(None, code=1)
 
 
-def cmd_disk_grow(args: argparse.Namespace) -> None:
-    wanted = args.size
-
-    probe = run(["limactl", "list", INSTANCE, "--format", "{{.Disk}}"])
-    current_bytes = probe.stdout.strip() if probe.returncode == 0 else ""
-    if not current_bytes.isdigit():
-        raise YoError(
-            "limactl reports no disk size for %s — does the instance exist? (yo status)"
-            % INSTANCE
-        )
-    current_gib = int(current_bytes) // 1024 // 1024 // 1024
-    if wanted <= current_gib:
-        raise YoError(
-            "%s's ceiling is already %dGiB and lima can only grow it — ask for more than %d"
-            % (INSTANCE, current_gib, current_gib)
-        )
-
+def require_growable_guest() -> None:
     load_state = guest_out(
         ["systemctl", "show", "-p", "LoadState", "--value", "growpart"], check=False
     ).splitlines()
@@ -2203,30 +2215,65 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
             "%s is not encrypted yet, so there is no mapping to grow — run: yo bootstrap"
             % LUKS_DEVICE
         )
-    # Derived before the VM stops, so a missing 1Password key leaves the box running.
-    passphrase = luks_passphrase()
+
+
+def cmd_disk_grow(args: argparse.Namespace) -> None:
+    wanted = args.size
+
+    probe = run(["limactl", "list", INSTANCE, "--format", "{{.Disk}}"])
+    current_bytes = probe.stdout.strip() if probe.returncode == 0 else ""
+    if not current_bytes.isdigit():
+        raise YoError(
+            "limactl reports no disk size for %s — does the instance exist? (yo status)"
+            % INSTANCE
+        )
+    current_gib = int(current_bytes) // 1024 // 1024 // 1024
+    if wanted < current_gib:
+        raise YoError(
+            "%s's ceiling is already %dGiB and lima can only grow it — ask for at least %d"
+            % (INSTANCE, current_gib, current_gib)
+        )
+    # The ceiling edit is the one step that cannot be repeated, so asking for
+    # the ceiling the instance already has finishes a grow that failed after it.
+    finishing = wanted == current_gib
+
+    if finishing:
+        out(
+            "lima: %s already has a %dGiB ceiling; finishing a previous grow"
+            % (INSTANCE, current_gib)
+        )
+        # Derived first: the box may be stopped or waiting in its initrd.
+        passphrase = luks_passphrase()
+        vm_up(passphrase=passphrase)
+        require_growable_guest()
+    else:
+        require_growable_guest()
+        # Derived before the VM stops, so a missing 1Password key leaves the box running.
+        passphrase = luks_passphrase()
 
     df_before = second_line(guest_out(["df", "-h", "/"], check=False))
     blocks_before = df_blocks(guest_out(["df", "-k", "/"], check=False))
 
-    free_kib = shutil.disk_usage(os.path.join(home(), ".lima")).free // 1024
-    image_kib = du_kib(os.path.join(lima_dir(), "disk")) or 0
-    out(
-        "host: ~/.lima has %dGiB free; the disk image allocates %dGiB today"
-        % (free_kib // 1024 // 1024, image_kib // 1024 // 1024)
-    )
-    out("lima: raising %s from %dGiB to %dGiB" % (INSTANCE, current_gib, wanted))
-
-    lima_stop()
-    resize = run(
-        ["limactl", "edit", "--yes", INSTANCE, "--disk", str(wanted)], capture=False
-    )
-    if resize.returncode != 0:
-        raise YoError(
-            "limactl refused the resize and %s is left stopped — start it again with: yo up"
-            % INSTANCE
+    if not finishing:
+        free_kib = shutil.disk_usage(os.path.join(home(), ".lima")).free // 1024
+        image_kib = du_kib(os.path.join(lima_dir(), "disk")) or 0
+        out(
+            "host: ~/.lima has %dGiB free; the disk image allocates %dGiB today"
+            % (free_kib // 1024 // 1024, image_kib // 1024 // 1024)
         )
-    vm_up(passphrase=passphrase)
+        out("lima: raising %s from %dGiB to %dGiB" % (INSTANCE, current_gib, wanted))
+
+        lima_stop()
+        resize = run(
+            ["limactl", "edit", "--yes", INSTANCE, "--disk", str(wanted)],
+            capture=False,
+        )
+        if resize.returncode != 0:
+            raise YoError(
+                "limactl refused the resize and %s is left stopped — start it again with: yo up"
+                % INSTANCE
+            )
+        vm_up(passphrase=passphrase)
     # systemd-growfs cannot resize a keyring-keyed LUKS2 mapping, so the
     # mapping and then the filesystem are grown here, with the passphrase.
     ssh_run(
@@ -2939,7 +2986,9 @@ def build_parser() -> argparse.ArgumentParser:
         "Raise the VM's disk ceiling (grow-only; the backing file is sparse, so\n"
         "a large ceiling costs nothing until used). Stops and restarts the VM.\n"
         "Refuses unless the VM already runs a generation with boot.growPartition.\n"
-        "Needs the disk passphrase (1Password, Touch ID) to grow the LUKS mapping.",
+        "Needs the disk passphrase (1Password, Touch ID) to grow the LUKS mapping.\n"
+        "If a grow failed after the ceiling was raised, repeat the same size: the\n"
+        "ceiling edit is skipped and only the mapping and filesystem are grown.",
     )
     disk_grow.add_argument("size", type=disk_grow_size, metavar="GiB")
     disk_grow.set_defaults(func=cmd_disk_grow)
