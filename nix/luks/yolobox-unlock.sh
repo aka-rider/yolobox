@@ -12,6 +12,8 @@ shopt -s nullglob
 UNTIL_UNIT="${YOLOBOX_UNLOCK_UNTIL_UNIT:-systemd-cryptsetup@root.service}"
 MIGRATE_UNIT="${YOLOBOX_UNLOCK_MIGRATE_UNIT:-yolobox-luks-migrate.service}"
 ASK_DIR="${YOLOBOX_ASK_DIR:-/run/systemd/ask-password}"
+# Journal lines shown on a failed migration and replayed when the watch starts.
+journal_tail_lines=20
 
 IFS= read -r key || true
 if [ -z "$key" ]; then
@@ -47,7 +49,7 @@ answer_pending() {
 
 check_units() {
   if systemctl is-failed --quiet "$MIGRATE_UNIT"; then
-    journalctl -u "$MIGRATE_UNIT" -o cat --no-pager | tail -n 20 >&2
+    journalctl -u "$MIGRATE_UNIT" -o cat --no-pager | tail -n "$journal_tail_lines" >&2
     echo "yolobox-unlock: encrypting ${LUKS_DEVICE} failed; its journal is above" >&2
     exit 2
   fi
@@ -84,9 +86,9 @@ inotifywait -m -e create -e close_write -e moved_to -e delete \
   --format 'inotify %e %w%f' "$ASK_DIR" > "$fifo" 2>&1 &
 inotify_pid=$!
 # A unit changing state posts no file event; its journal lines wake the loop.
-# -n 20 replays the last lines on purpose: a state change logged just before
+# -n replays the last lines on purpose: a state change logged just before
 # journalctl attached still produces an event.
-journalctl -f -n 20 -q -o cat -u "$MIGRATE_UNIT" -u "$UNTIL_UNIT" > "$fifo" 2>/dev/null &
+journalctl -f -n "$journal_tail_lines" -q -o cat -u "$MIGRATE_UNIT" -u "$UNTIL_UNIT" > "$fifo" 2>/dev/null &
 journal_pid=$!
 
 # Fed from a FIFO, not a pipe, so the loop runs in the main shell and `exit`

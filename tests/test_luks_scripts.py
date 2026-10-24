@@ -41,6 +41,9 @@ TAIL = MAPPER_OFFSET_SECTORS * 512 + FS_BLOCKS * FS_BLOCK_SIZE
 
 DEVICE = "/dev/fake"
 LABEL = "yolobox-luks"
+# Not "root": a mapper name that leaked from the script would fail here.
+MAPPER = "mapped"
+SSH_PORT = "60099"
 PASSPHRASE = "k" * 64
 
 
@@ -122,10 +125,11 @@ class MigrateScript(unittest.TestCase):
             "FAKE_DEVICE_BYTES": str(DEVICE_BYTES),
             "FAKE_ISLUKS_RC": "1",
             "FAKE_BLKID_TYPE": "ext4",
+            "YOLOBOX_SSH_LOCAL_PORT": SSH_PORT,
         }
 
     def run_migrate(self, *args, **env):
-        args = args or (DEVICE, LABEL)
+        args = args or (DEVICE, LABEL, MAPPER)
         return subprocess.run(
             [*BASH, str(MIGRATE), *args],
             capture_output=True,
@@ -170,9 +174,9 @@ class TestMigrateEncryptsPlainExt4(MigrateScript):
             "cryptsetup reencrypt",
             "cryptsetup open",
             "blkdiscard -f --offset %d" % TAIL,
-            "e2fsck -f -y /dev/mapper/root",
-            "resize2fs /dev/mapper/root",
-            "cryptsetup close root",
+            "e2fsck -f -y /dev/mapper/" + MAPPER,
+            "resize2fs /dev/mapper/" + MAPPER,
+            "cryptsetup close " + MAPPER,
             "cryptsetup config --label %s %s" % (LABEL, DEVICE),
         )
 
@@ -214,7 +218,8 @@ class TestMigrateEncryptsPlainExt4(MigrateScript):
         result = self.run_migrate(FAKE_DEVICE_BYTES=str(REGION + 32 * MIB - 1))
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertIn("too full", result.stderr)
-        self.assertIn("systemd-cryptsetup@root.service", result.stderr)
+        self.assertIn("systemd-cryptsetup@%s.service" % MAPPER, result.stderr)
+        self.assertIn("port " + SSH_PORT, result.stderr)
         calls = self.calls()
         self.assertFalse([c for c in calls if c.startswith("resize2fs " + DEVICE)])
         self.assertFalse([c for c in calls if c.startswith("cryptsetup reencrypt")])
@@ -245,7 +250,7 @@ class TestMigrateStates(MigrateScript):
             calls,
             "cryptsetup reencrypt --batch-mode --progress-frequency 30 --resume-only",
             "cryptsetup open",
-            "cryptsetup close root",
+            "cryptsetup close " + MAPPER,
             "cryptsetup config --label",
         )
         self.assertFalse([c for c in calls if c.startswith("resize2fs -P")])
@@ -267,8 +272,8 @@ class TestMigrateStates(MigrateScript):
             calls,
             "cryptsetup open",
             "blkdiscard",
-            "resize2fs /dev/mapper/root",
-            "cryptsetup close root",
+            "resize2fs /dev/mapper/" + MAPPER,
+            "cryptsetup close " + MAPPER,
             "cryptsetup config --label %s %s" % (LABEL, DEVICE),
         )
         self.assertFalse([c for c in calls if c.startswith("cryptsetup reencrypt")])
@@ -304,7 +309,7 @@ class TestMigrateStates(MigrateScript):
         self.assertFalse([c for c in self.calls() if c.startswith("cryptsetup open")])
 
     def test_wrong_argument_count_prints_usage(self):
-        for args in (("only-one",), (DEVICE, LABEL, "extra")):
+        for args in (("only-one",), (DEVICE, LABEL), (DEVICE, LABEL, MAPPER, "extra")):
             with self.subTest(args=args):
                 result = self.run_migrate(*args)
                 self.assertEqual(result.returncode, 2)
@@ -322,7 +327,7 @@ class TestMigrateFinalizeFailures(MigrateScript):
         self.assertEqual(result.returncode, 5, result.stderr)
         self.assertIn("left closed", result.stderr)
         calls = self.calls()
-        self.assertIn("cryptsetup close root", calls)
+        self.assertIn("cryptsetup close " + MAPPER, calls)
         self.assertFalse([c for c in calls if c.startswith("cryptsetup config")])
 
     def test_a_failing_grow_closes_the_mapping_and_does_not_label(self):
