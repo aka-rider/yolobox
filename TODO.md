@@ -17,6 +17,8 @@ Posted 2026-10-02, awaiting review. The reasoning behind it is in lima/yolobox.m
 
 # Known problems
 
+- Unverified: what `systemctl reboot` inside the guest looks like under vz. The instance may show Stopped, with the hostagent exiting, or restart in place with the hostagent keeping its TCP forward. `vm_up` handles both, but nobody has observed which one happens; the rollout step that watches `limactl list yolobox` after a guest reboot settles it. Record the answer in `docs/disk-encryption.md#decisions` and remove this entry.
+- The throwaway-instance rescue for a box stuck in its initrd (a second lima instance with this instance's `disk` file attached) is untested. See `docs/disk-encryption.md#recognising-failures`.
 - `limactl stop yolobox` hangs on the vz driver (lima 2.2.0 and 2.2.1); see the lima entry under Upstream.
 - GitHub `environment: release` protection for HOMEBREW_TAP_TOKEN not configured.
 - Tailnet ACLs for the yolobox node not reviewed.
