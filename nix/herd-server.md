@@ -28,7 +28,7 @@ pane. Inside the guest, navigation is left to the agent's dotfiles (`z`,
 
 ### The regression this design fixes
 
-`d3fe9ff` ("herdr v0.9 supports cross-machine connections natively") removed
+`a91644c` ("herdr v0.9 supports cross-machine connections natively") removed
 `yo enter`'s forwarding of the Mac pane's herdr socket, on the theory that
 native machine panes made it unnecessary. Nothing yet moved agents into those
 panes, so the removal shipped with no replacement. It left this shape:

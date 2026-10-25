@@ -14,7 +14,7 @@ yolobox is one NixOS VM on a Mac, run by Lima, where coding agents work with
 no host mounts. Git is the only bridge between the Mac and the VM. The
 README gets a person from nothing to a working project; this file is for
 people who change the repo itself. Version 1 was Docker-based and lives at
-commit `4c154fc`.
+commit `1fed88d`.
 
 ## The mental model
 

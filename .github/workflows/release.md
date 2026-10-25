@@ -20,7 +20,7 @@ Immutable releases must stay off, a deliberate cost recorded in [TODO.md](../../
 
 ## bump-tap and actions/checkout
 
-`bump-tap` once failed on the tag that `release` had just moved. The v0.9.0 release (2026-09-02) showed it. `verify` and `release` both succeeded, then `bump-tap`'s bare `actions/checkout@v6` died with `The ref 'refs/tags/v0.9.0' does not point to the expected commit '4069fe0…'. The ref may have been updated after the workflow was triggered.`
+`bump-tap` once failed on the tag that `release` had just moved. The v0.9.0 release (2026-09-02) showed it. `verify` and `release` both succeeded, then `bump-tap`'s bare `actions/checkout@v6` died with `The ref 'refs/tags/v0.9.0' does not point to the expected commit '9735ba8…'. The ref may have been updated after the workflow was triggered.`
 
 With no `ref:`, checkout resolves `github.ref` (the release tag) and asserts that the tag still points at `github.sha`, where it pointed when the release was published (`testRef` in `src/ref-helper.ts`). Two jobs earlier, `release` had moved the tag onto its own stamp commit, so the assertion fails by construction. This is a behaviour change in actions/checkout v6.0.2 and later (`actions/checkout#2356`, "Fix tag handling"; v7.0.1 keeps it). A tag used to be fetched by sha, so a moved tag went unnoticed. Now it is fetched by name and compared, and no input turns the comparison off.
 

@@ -16,7 +16,7 @@ That readlink pair is also what `yo bootstrap` compares to decide whether to reb
 
 The trade is that no rollback generation survives a kernel bump. That is acceptable, because the VM is rebuildable from this repo.
 
-Moving `/boot` onto the root filesystem was tried (`a2057d8`, reverted in `03e2dbc`). It gives unlimited space, but it makes `nix/base.nix` diverge from the image, so every fresh instance would need a manual mount migration before its first switch.
+Moving `/boot` onto the root filesystem was tried (`8bb22d1`, reverted in `d53bca1`). It gives unlimited space, but it makes `nix/base.nix` diverge from the image, so every fresh instance would need a manual mount migration before its first switch.
 
 ## Same-uid ptrace
 

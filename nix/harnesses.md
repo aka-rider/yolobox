@@ -23,7 +23,7 @@ to be the `claude` a human session actually runs.
 Both attempts raced a directory the box does not own, and then forbade
 anything from living in it.
 
-- `657fc21` put a nix wrapper on the system PATH, pointed it at upstream's
+- `d79fea0` put a nix wrapper on the system PATH, pointed it at upstream's
   self-updating install and appended `~/.local/bin` to PATH. It assumed only
   `environment.localBinInPath` could prepend that directory. Within a day this
   proved wrong: the agent's own dotfiles prepend it too, and `yo enter` ends
@@ -31,7 +31,7 @@ anything from living in it.
   first `claude update` (2026-09-04 14:42, 2.1.259 to 2.1.260) put a bare
   launcher ahead of the wrapper and ended herd reporting for every typed
   `claude`, box-wide.
-- `d8db855` answered by making the box the only claude installation, with
+- `279184d` answered by making the box the only claude installation, with
   `DISABLE_AUTOUPDATER`, a reaper that deleted any home install within a
   second, and a rule that no second claude may exist.
 
@@ -188,7 +188,7 @@ migrating.
 ### pi's settings.json belongs to pi
 
 pi rewrites `~/.pi/agent/settings.json` on its own and logs, rather than
-raises, a failed write. A deleted `nix/pi.nix` (`cb5e863`) once linked it to
+raises, a failed write. A deleted `nix/pi.nix` (`cb122e1`) once linked it to
 `/etc/static/...`. The module went and the dangling link stayed. That file is
 the only place pi keeps its `packages` list, so nothing from
 `~/.dotfiles/pi/packages.json` installed: `pi list` said "No packages
