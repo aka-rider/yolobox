@@ -94,6 +94,14 @@ class TestLimaYamlMatchesPortForwardsConstant(unittest.TestCase):
             canonical_forwards(parsed), canonical_forwards(yo.LIMA_PORT_FORWARDS)
         )
 
+    def test_no_guest_udp_listener_is_mirrored_onto_the_mac(self):
+        # tailscaled's UDP 41641 would otherwise fight the Mac's own Tailscale
+        # for the same loopback port, on every hostagent start.
+        parsed = parse_yaml_list_entries(
+            yaml_block(YOLOBOX_YAML.read_text(), "portForwards")
+        )
+        self.assertIn({"proto": "udp", "ignore": True}, parsed)
+
     def test_the_vm_has_no_host_mounts(self):
         # The whole design is "no host mounts, git is the only bridge".
         text = YOLOBOX_YAML.read_text()
@@ -575,6 +583,30 @@ class TestKillSwitchStaysClosed(unittest.TestCase):
         for hook in ("ExecStop", "preStop", "postStop"):
             with self.subTest(hook=hook):
                 self.assertNotIn(hook, nix_code(KILL_SWITCH_NIX))
+
+
+class TestTailscaledLogFilter(unittest.TestCase):
+    """The filter drops the relayed-path line and nothing else."""
+
+    DERP = "magicsock: new contact: peer=[+1OFL] usec=13217671625 cached=false via=derp"
+    DIRECT = DERP.replace("via=derp", "via=direct")
+    NOW_USING = "magicsock: disco: node [+1OFL] d:1b4eb41609986a64 now using 203.0.113.7:41641 mtu=1360"
+
+    def pattern(self):
+        found = re.search(
+            r'systemd\.services\.tailscaled\.serviceConfig\.LogFilterPatterns\s*=\s*"~([^"]+)";',
+            nix_code(REPO / "nix" / "tailscale.nix"),
+        )
+        self.assertIsNotNone(found, "tailscaled has no negated LogFilterPatterns")
+        return found.group(1)
+
+    def test_a_relayed_contact_is_dropped(self):
+        self.assertRegex(self.DERP, self.pattern())
+
+    def test_a_direct_contact_and_path_changes_are_kept(self):
+        for line in (self.DIRECT, self.NOW_USING):
+            with self.subTest(line=line):
+                self.assertNotRegex(line, self.pattern())
 
 
 class TestHomeLinksBelongToTheirUser(unittest.TestCase):

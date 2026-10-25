@@ -64,6 +64,7 @@ SUDO_MISSING_HELPER = "sudo: %s: command not found" % HELPER
 GAP_MOUNTS = "mounts"
 GAP_FORWARD_AGENT = "ssh.forwardAgent"
 GAP_SSH_OVER_VSOCK = "ssh.overVsock"
+GAP_UDP_FORWARDS = "portForwards.udp"
 
 OP_GUEST_SOCK = "/run/yolobox-op/agent.sock"
 AWS_BROKER_GUEST_SOCK = "/run/yolobox-op/aws-broker.sock"
@@ -71,7 +72,7 @@ AGENT_AWS_BROKER_SOCK = "/run/yolobox/aws-broker.sock"
 
 LIMA_PORT_FORWARDS = [
     {"guestPort": T3_PORT, "proto": "tcp", "hostIP": "0.0.0.0"},
-    {"proto": "udp", "guestPort": 68, "guestIP": "0.0.0.0", "ignore": True},
+    {"proto": "udp", "ignore": True},
     {
         "guestSocket": OP_GUEST_SOCK,
         "hostSocket": "{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
@@ -84,6 +85,8 @@ LIMA_PORT_FORWARDS = [
     },
 ]
 
+RESTATE_PORT_FORWARDS = ".portForwards = %s" % json.dumps(LIMA_PORT_FORWARDS)
+
 LIMA_SETTING_GAPS = {
     GAP_MOUNTS: ("mounts host directories into the VM", ".mounts = []"),
     GAP_FORWARD_AGENT: (
@@ -93,6 +96,10 @@ LIMA_SETTING_GAPS = {
     GAP_SSH_OVER_VSOCK: (
         "lets lima proxy ssh over vsock, which the initrd that unlocks the disk cannot answer",
         ".ssh.overVsock = false",
+    ),
+    GAP_UDP_FORWARDS: (
+        "mirrors guest UDP listeners onto the Mac's localhost, where tailscaled's 41641 collides with the Mac's own Tailscale",
+        RESTATE_PORT_FORWARDS,
     ),
 }
 
@@ -1376,6 +1383,14 @@ def lima_config_gaps() -> List[str]:
             for forward in info.port_forwards
         )
     ]
+    if not any(
+        isinstance(forward, dict)
+        and forward.get("ignore") is True
+        and forward.get("proto") == "udp"
+        and forward.get("guestPortRange") == [1, 65535]
+        for forward in info.port_forwards
+    ):
+        gaps.append(GAP_UDP_FORWARDS)
     if info.mounts:
         gaps.append(GAP_MOUNTS)
     if info.forward_agent:
@@ -1397,13 +1412,17 @@ def lima_config_gap_message(gaps: Sequence[str]) -> str:
     missing = [gap for gap in gaps if gap not in LIMA_SETTING_GAPS]
     lines = []
     if missing:
-        restate = ".portForwards = %s" % json.dumps(LIMA_PORT_FORWARDS)
         lines.append(
             "%s has no reverse forward for %s — restate the full array:\n    %s"
-            % (INSTANCE, " and ".join(missing), lima_edit_command(restate))
+            % (
+                INSTANCE,
+                " and ".join(missing),
+                lima_edit_command(RESTATE_PORT_FORWARDS),
+            )
         )
     for gap in gaps:
-        if gap in LIMA_SETTING_GAPS:
+        # The socket gaps' restate already carries the whole array, UDP rule included.
+        if gap in LIMA_SETTING_GAPS and not (missing and gap == GAP_UDP_FORWARDS):
             problem, expression = LIMA_SETTING_GAPS[gap]
             lines.append(
                 "%s %s:\n    %s" % (INSTANCE, problem, lima_edit_command(expression))

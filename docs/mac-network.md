@@ -22,6 +22,20 @@ Such a box has one way out: its tailnet exit node. The kill switch rejects every
 
 The gateway probe is rejected by design on such a box. `yolobox-guest net-check` therefore reports `gateway=skipped` whenever `/etc/yolobox/network.json` exists (it exists only on a box that opted in), and `network:` defers to the `egress:` line. A failed gateway probe on such a box is expected, and it says nothing about a VPN.
 
+### A VPN that disconnects leaves UDP flows stuck
+
+lima's vz networking is gvproxy inside the host agent. For each guest UDP flow it opens a socket on the Mac, and the socket is bound to whichever address the Mac's default route had then. tailscaled keeps sending on the same flows (UDP 41641 to its peers' endpoints, and STUN to the DERP server), so they never go idle. If the VPN that owned the default route disconnects, those sockets keep the VPN's tunnel address and every datagram fails.
+
+Seen live: the Mac had a VPN up at host agent start (tailscaled's first `endpoints changed` line then listed a STUN address that was not the Mac's own public one, and the box was direct to two peers) and dropped it later. From that second on, `~/.lima/yolobox/ha.stderr.log` gained 2,136 lines in 45 minutes of the form
+
+```
+{"level":"error","msg":"Can't proxy a datagram to udp: write udp 10.2.0.2:51145->203.0.113.7:41641: write: can't assign requested address\n",...}
+```
+
+and `lsof -nP -a -p $(cat ~/.lima/yolobox/ha.pid) -iUDP` listed sockets whose local address was that vanished tunnel address (`10.2.0.2`), which `ifconfig` no longer showed. Inside the guest, tailscaled logged `netcheck: UDP is blocked, trying HTTPS` every 25 seconds starting the same second, while `tailscale netcheck` on the command line, whose fresh ephemeral sockets make fresh flows, reported `UDP: true`. The first symptom for the operator is tailscaled's relayed-contact lines ([nix/tailscale.md](../nix/tailscale.md#relayed-contacts-in-the-log)) and peers that stay on DERP.
+
+The box stays reachable: DERP and the exit node's TCP paths are not affected. Only direct UDP paths and the endpoint discovery behind them are. The cure that ends the stale flows is a host agent restart, `limactl stop yolobox && yo up`, which drops every flow. That restart is the expected cure and has not been run against this failure yet.
+
 ### Telling them apart
 
 Recognise the two by those patterns, and run `scutil --nc list` on the Mac before debugging anything inside the VM.

@@ -1,6 +1,6 @@
 # The Lima instance
 
-`lima/yolobox.yaml` seeds the VM. Lima reads it once, and the rest of this file explains what that means for a running box, which settings lima leaves to the seed, and one lima bug that kills every forwarded port.
+`lima/yolobox.yaml` seeds the VM. Lima reads it once, and the rest of this file explains what that means for a running box, which settings lima leaves to the seed, why no guest UDP port is forwarded, and one lima bug that kills every forwarded port.
 
 ## Read once
 
@@ -14,9 +14,35 @@ Before it starts the VM, `vm_up()` runs `limactl list yolobox --json` and reads 
 
 A missing rule prints a stderr note from `lima_config_gap_message()`, and `vm_up()` carries on. It can carry on because `heal_reverse_forward()` adds the forward live, over lima's own ssh master, with a bare `-O forward -R <guest>:<host>`. That needs no matching entry in `portForwards` (see [Healing reverse forwards](../docs/ssh.md#healing-reverse-forwards)). The restated array is what makes the forward permanent: it survives the next hostagent restart with no `yo` run to heal it again.
 
-With no instance at all, `limactl list` fails and the check prints nothing, because a brand-new box has no gap to report. The check exists for an instance created before a rule existed. Such a box has only the t3, dhcp and 1Password rules, since the AWS broker's rule came later. The check compares the socket rules only. The t3 rule now says `proto: tcp` explicitly. An older instance without that word is not a gap, because lima's default protocol is tcp.
+With no instance at all, `limactl list` fails and the check prints nothing, because a brand-new box has no gap to report. The check exists for an instance created before a rule existed. Such a box has only the t3, dhcp and 1Password rules, since the AWS broker's rule came later, and its UDP rule ignores port 68 alone (see [Guest UDP is never mirrored](#guest-udp-is-never-mirrored)). The check compares the socket rules only. The t3 rule now says `proto: tcp` explicitly. An older instance without that word is not a gap, because lima's default protocol is tcp.
 
-The same check reports two more gaps as stderr notes: a mounts gap and a `forwardAgent` gap. Both are settings lima reads once.
+The same check reports three more gaps as stderr notes: a mounts gap, a `forwardAgent` gap, and a UDP gap (an instance with no rule that ignores all guest UDP, see below). All three are settings lima reads once. The UDP gap is restated with the same full-array command as the socket rules, and `lima_config_gap_message()` prints that command once when both kinds of gap are present.
+
+## Guest UDP is never mirrored
+
+Lima mirrors every port a guest process listens on onto the Mac's localhost, UDP included. Nothing here needs a UDP one: t3 is TCP, and the secrets travel as reversed unix sockets. So `lima/yolobox.yaml` ends its `portForwards` with one rule, `proto: udp` with `ignore: true`. Lima's default `guestIP` of 127.0.0.1 also matches listeners bound to `0.0.0.0` and `::`, and the default range is every port, so the single rule covers tailscaled's UDP 41641, its ephemeral UDP sockets and anything the agent runs later. It replaces the earlier rule that ignored UDP 68 alone ([nixos-lima#50](https://github.com/nixos-lima/nixos-lima/issues/50): the mirror intercepted the Mac's DHCP packets), which was the same fault for one port.
+
+The failure that earned the rule is in `~/.lima/yolobox/ha.stderr.log`, the host agent's log. It starts fresh with each host agent start, and within the first second it holds a few lines like
+
+```
+{"error":"listen udp 127.0.0.1:41641: bind: address already in use","level":"warning","msg":"failed to listen udp: 127.0.0.1:41641",...}
+```
+
+The guest's tailscaled listens on UDP 41641, lima tries to mirror that onto the Mac's loopback, and the Mac's own Tailscale already holds the port. Seen on a live box: four such lines in the first second of a host agent start, and none after, so the line is a start-up note and not a loop. The mirror was never in the way of tailscaled's own packets, which leave through the NAT and not through the mirror. The cost is those lines and, on a Mac without Tailscale, a UDP port on the Mac's loopback that would forward datagrams into the guest's tailscaled. That second part is why the rule ignores all guest UDP and does not just name 41641.
+
+The tailnet does not use this path. `tailscale serve` for t3 terminates inside tailscaled on the tailnet interface (see [nix/tailscale.md](../nix/tailscale.md#firewall)), and lima plays no part in it.
+
+### Applying it to an existing instance
+
+The instance still has its old rule set, so the mirror keeps running there until it is restated. `yo up` and `yo status` now notice that: an instance with no rule that ignores all UDP gets a note that names the problem and prints the command. It is the same command as for a missing socket rule, because lima's yq cannot merge into the array and the whole array must be written back:
+
+```sh
+limactl stop yolobox && limactl edit yolobox --set '.portForwards = <the array yo prints>' && yo up
+```
+
+Take the array from `yo up`'s note, never from this file (see [Read once](#read-once)). Editing `~/.lima/yolobox/lima.yaml` by hand does the same job, but `limactl edit` also validates the result. Stop the VM first, as for every `portForwards` restate: lima reads the file at the next host agent start. The old rule for port 68 leaves with the restate, because the new rule covers it.
+
+Verify with `limactl list yolobox --json`: `config.portForwards` must hold an entry with `"proto":"udp"`, `"ignore":true` and `"guestPortRange":[1,65535]`, and the next host agent log must have no `failed to listen udp`.
 
 ## Pinned settings
 

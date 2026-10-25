@@ -48,6 +48,22 @@ On a box that opted in to the [kill switch](killswitch.md) the guest's resolver 
 
 `disableUpstreamLogging = true` sets `TS_NO_LOGS_NO_SUPPORT=true` on tailscaled. The node uploads no logs to log.tailscale.com, and for the same reason Tailscale support will not help with this node. It is working when `yo ssh journalctl -u tailscaled -b` shows `You have disabled logging`. It takes effect on the next switch, because the variable sits in the unit's environment and a changed unit makes the switch restart tailscaled.
 
+## Relayed contacts in the log
+
+`journalctl -u tailscaled` shows `magicsock: new contact: peer=[+1OFL] usec=... cached=false via=derp` over and over, every few seconds for as long as a burst lasts. The line is not an error and not a reconnect. In tailscale v1.104.1 (`wgengine/magicsock/magicsock.go`) it is logged each time a peer's disco call-me-maybe arrives over DERP while the box holds no direct path to that peer (`if !lastBest.ap.IsValid()`). A peer that wants a direct path with us sends one every few seconds until its pings are answered, so the line repeats exactly as long as the path stays relayed. The direct twin, `via=direct`, is logged once when a direct path is first adopted.
+
+The peer in the short form `[+1OFL]` is the first five characters of the base64 of its node key, while `tailscale status --json` prints the key as hex. Convert before matching: `python3 -c 'import base64,sys; print(base64.b64encode(bytes.fromhex(sys.argv[1])).decode()[:5])' <hex after "nodekey:">`. On the box where this was written the peer varied: two other nodes during the first hours, then the exit node itself.
+
+Measured on a live box: 706 such lines in 3.7 hours (about three a minute), roughly 100 bytes each. That is about 0.04 percent of the journal's size. The 2.8 GiB journal is container output (see TODO.md), so the line is noise in `journalctl -u tailscaled` and not a disk problem. Rules out, in turn:
+
+- The Mac's own Tailscale node as the peer: it appeared twice in the whole boot.
+- The UDP 41641 collision in [lima/yolobox.md](../lima/yolobox.md#guest-udp-is-never-mirrored): that is lima's mirror on the Mac's loopback, which no packet of tailscaled's takes.
+- The kill switch: the marked-packet accept counter rises, the final reject counter stayed at 6 packets, and `journalctl -k` showed no `yolobox-killswitch` line in three hours.
+
+What decides whether a direct path exists is outside this repo. The box reaches the internet through lima's NAT on the Mac, so a peer can use only addresses the Mac's network lets through. One cause was found and it is on the Mac: a VPN that disconnects leaves lima's UDP flows bound to the VPN's vanished address, tailscaled's UDP then goes nowhere, and netcheck logs `UDP is blocked, trying HTTPS` every 25 seconds. That is described in [docs/mac-network.md](../docs/mac-network.md#a-vpn-that-disconnects-leaves-udp-flows-stuck). Clearing it needs a host agent restart on the Mac, so no setting in the guest could.
+
+tailscaled has no switch for this line, and its verbosity flags only add lines. So `nix/tailscale.nix` sets `LogFilterPatterns` on the unit to drop exactly `via=derp`, a mitigation and not a fix. systemd's journald applies it to the unit's stream, so it also holds for tailscaled's stderr. The `via=direct` line, `now using` (the path change) and `endpoints changed` all stay, because they report events. `TestTailscaledLogFilter` checks the pattern against real lines. Drop the setting if tailscale ever ratelimits or demotes the line. To see the relayed state without it, use `tailscale status` (`relay "..."` and no `direct`) or `tailscale ping <node>`, which answers `via DERP(...)` or `via <ip:port>`.
+
 ## Login
 
 Login is interactive and happens once, by the operator, because no auth key exists anywhere in this repo: `yo ssh sudo tailscale up`. It takes no `--hostname`. `extraSetFlags` pins the tailnet name to `networking.hostName`, so every box joins as `yolobox`, and a hand-typed `--hostname` is overwritten by the next `tailscaled-set` run.

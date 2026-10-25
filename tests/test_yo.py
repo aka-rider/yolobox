@@ -1874,7 +1874,8 @@ class TestLimaConfigGaps(FakeHome):
             self.assertEqual(yo.lima_config_gaps(), [])
 
     def test_missing_reverse_rule_is_reported_not_raised(self):
-        with self.mock_lima_list([{"guestPort": 3773}]):
+        forwards = [self.both_forwards()[0], {"guestPort": 3773}]
+        with self.mock_lima_list(forwards):
             gaps = yo.lima_config_gaps()
         self.assertEqual(set(gaps), {yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK})
 
@@ -1895,11 +1896,23 @@ class TestLimaConfigGaps(FakeHome):
                 "hostSocket": "/somewhere/else.sock",
                 "reverse": True,
             },
-            *self.both_forwards()[1:],
+            *self.both_forwards()[2:],
         ]
         with self.mock_lima_list(forwards):
             gaps = yo.lima_config_gaps()
         self.assertIn(yo.OP_GUEST_SOCK, gaps)
+
+    def test_an_instance_that_only_ignores_dhcp_still_mirrors_udp_listeners(self):
+        # Older instances ignore UDP 68 alone; tailscaled's 41641 is still
+        # mirrored onto the Mac, where the Mac's own Tailscale holds it.
+        dhcp_only = {"proto": "udp", "guestPortRange": [68, 68], "ignore": True}
+        with self.mock_lima_list([dhcp_only, *self.both_forwards()[1:]]):
+            self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
+
+    def test_a_blanket_udp_rule_that_forwards_instead_of_ignoring_is_a_gap(self):
+        forwarding = {"proto": "udp", "guestPortRange": [1, 65535]}
+        with self.mock_lima_list([forwarding, *self.both_forwards()[1:]]):
+            self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
 
     def test_reads_host_agent_pid_from_the_same_listing(self):
         with self.mock_lima_list([], host_agent_pid=999):
@@ -1942,7 +1955,9 @@ class TestLimaConfigGaps(FakeHome):
         self.assertNotIn("portForwards", message)
 
     def both_forwards(self):
+        # The instance's normalized UDP rule: lima fills in the full range.
         return [
+            {"proto": "udp", "guestPortRange": [1, 65535], "ignore": True},
             {
                 "guestSocket": yo.OP_GUEST_SOCK,
                 "hostSocket": yo.op_sock(),
@@ -1983,6 +1998,15 @@ class TestLimaSettingGapMessage(unittest.TestCase):
         message = yo.lima_config_gap_message([yo.GAP_FORWARD_AGENT])
         self.assertIn("--set '.ssh.forwardAgent = false'", message)
         self.assertNotIn("portForwards", message)
+
+    def test_the_udp_gap_is_remedied_by_restating_the_full_array(self):
+        message = yo.lima_config_gap_message([yo.GAP_UDP_FORWARDS])
+        self.assertIn(yo.RESTATE_PORT_FORWARDS, message)
+        self.assertIn("41641", message)
+
+    def test_a_socket_gap_and_the_udp_gap_print_one_restate(self):
+        message = yo.lima_config_gap_message([yo.OP_GUEST_SOCK, yo.GAP_UDP_FORWARDS])
+        self.assertEqual(message.count(".portForwards = "), 1)
 
     def test_every_gap_kind_gets_its_own_remedy(self):
         message = yo.lima_config_gap_message(
