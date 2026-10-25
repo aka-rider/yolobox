@@ -20,6 +20,7 @@ Posted 2026-10-02, awaiting review. The reasoning behind it is in lima/yolobox.m
 
 - The throwaway-instance rescue for a box stuck in its initrd (a second lima instance with this instance's `disk` file attached) is untested. See `docs/disk-encryption.md#recognising-failures`.
 - `limactl stop yolobox` hangs on the vz driver (lima 2.2.0 and 2.2.1); see the lima entry under Upstream.
+- The Python 3.9 unit leg in `.github/workflows/verify.yml` is pinned to `ubuntu-24.04`, because setup-python has no 3.9 build for ubuntu-latest's 26.04 image. The pin will age out when GitHub retires the 24.04 image. Then run the leg in a `python:3.9` container as a non-root user with `jq` and `gawk` installed (as root with those missing, 26 tests fail and 2 skip), or drop the floor along with the Mac's Xcode Python 3.9.
 - GitHub `environment: release` protection for HOMEBREW_TAP_TOKEN not configured.
 - Tailnet ACLs for the yolobox node not reviewed.
 - Kill switch (opt-in) items written from source and netns rehearsals, not yet run on a live box (`nix/killswitch.md`):
