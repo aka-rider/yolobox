@@ -63,9 +63,15 @@ portForwards:
   # holds that port ("failed to listen udp: 127.0.0.1:41641: address already
   # in use"), and port 68 would intercept the host's DHCP packets, which is an
   # issue with NixOS that other distros do not show
-  # (https://github.com/nixos-lima/nixos-lima/issues/50). The default guestIP
-  # also covers listeners bound to 0.0.0.0 and ::.
+  # (https://github.com/nixos-lima/nixos-lima/issues/50).
+  # Both guestIP lines are load-bearing. Lima skips an ignore rule for a
+  # listener bound to 0.0.0.0 or :: unless the rule's guestIP is unspecified
+  # too, and treats guestIP 0.0.0.0 as an exact match unless guestIPMustBeZero
+  # is false. Without them the rule (default guestIP 127.0.0.1) matches only
+  # loopback listeners. See lima/yolobox.md.
   - proto: udp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
     ignore: true
 
 containerd:

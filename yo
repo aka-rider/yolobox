@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import http.client
 import io
+import ipaddress
 import json
 import os
 import pwd
@@ -72,7 +73,7 @@ AGENT_AWS_BROKER_SOCK = "/run/yolobox/aws-broker.sock"
 
 LIMA_PORT_FORWARDS = [
     {"guestPort": T3_PORT, "proto": "tcp", "hostIP": "0.0.0.0"},
-    {"proto": "udp", "ignore": True},
+    {"proto": "udp", "guestIP": "0.0.0.0", "guestIPMustBeZero": False, "ignore": True},
     {
         "guestSocket": OP_GUEST_SOCK,
         "hostSocket": "{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
@@ -98,7 +99,7 @@ LIMA_SETTING_GAPS = {
         ".ssh.overVsock = false",
     ),
     GAP_UDP_FORWARDS: (
-        "mirrors guest UDP listeners onto the Mac's localhost, where tailscaled's 41641 collides with the Mac's own Tailscale",
+        "mirrors guest UDP listeners onto the Mac's localhost (including DHCP's 68 and tailscaled's 41641, which collides with the Mac's own Tailscale)",
         RESTATE_PORT_FORWARDS,
     ),
 }
@@ -1364,6 +1365,32 @@ def ha_pid() -> Optional[int]:
     return info.host_agent_pid if info else None
 
 
+def ignores_all_guest_udp(forward: object) -> bool:
+    """Whether a normalized portForwards entry ignores UDP listeners on every address.
+
+    Lima's matcher skips an ignore rule for a listener bound to 0.0.0.0 or ::
+    unless the rule's own guestIP is unspecified too, and it matches a listener
+    on a specific address only when the rule's guestIPMustBeZero is false
+    (see lima/yolobox.md, "Guest UDP is never mirrored").
+    """
+    if not isinstance(forward, dict):
+        return False
+    guest_ip = forward.get("guestIP")
+    try:
+        unspecified = (
+            isinstance(guest_ip, str) and ipaddress.ip_address(guest_ip).is_unspecified
+        )
+    except ValueError:
+        unspecified = False
+    return (
+        forward.get("ignore") is True
+        and forward.get("proto") == "udp"
+        and forward.get("guestPortRange") == [1, 65535]
+        and unspecified
+        and forward.get("guestIPMustBeZero") is False
+    )
+
+
 def lima_config_gaps() -> List[str]:
     info = lima_instance_info()
     if info is None:
@@ -1383,13 +1410,7 @@ def lima_config_gaps() -> List[str]:
             for forward in info.port_forwards
         )
     ]
-    if not any(
-        isinstance(forward, dict)
-        and forward.get("ignore") is True
-        and forward.get("proto") == "udp"
-        and forward.get("guestPortRange") == [1, 65535]
-        for forward in info.port_forwards
-    ):
+    if not any(ignores_all_guest_udp(forward) for forward in info.port_forwards):
         gaps.append(GAP_UDP_FORWARDS)
     if info.mounts:
         gaps.append(GAP_MOUNTS)

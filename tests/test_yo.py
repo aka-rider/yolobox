@@ -1905,12 +1905,44 @@ class TestLimaConfigGaps(FakeHome):
     def test_an_instance_that_only_ignores_dhcp_still_mirrors_udp_listeners(self):
         # Older instances ignore UDP 68 alone; tailscaled's 41641 is still
         # mirrored onto the Mac, where the Mac's own Tailscale holds it.
-        dhcp_only = {"proto": "udp", "guestPortRange": [68, 68], "ignore": True}
+        dhcp_only = self.udp_ignore_rule(
+            guestPortRange=[68, 68], guestIPMustBeZero=True
+        )
         with self.mock_lima_list([dhcp_only, *self.both_forwards()[1:]]):
             self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
 
+    def test_a_udp_ignore_rule_with_lima_default_guest_ip_still_mirrors_wildcard_listeners(
+        self,
+    ):
+        # Lima skips an ignore rule for a listener on 0.0.0.0 or :: unless the
+        # rule's guestIP is unspecified: tailscaled's 41641 and DHCP's 68 stay.
+        loopback_only = self.udp_ignore_rule(guestIP="127.0.0.1")
+        with self.mock_lima_list([loopback_only, *self.both_forwards()[1:]]):
+            self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
+
+    def test_a_udp_ignore_rule_pinned_to_exactly_zero_still_mirrors_loopback_listeners(
+        self,
+    ):
+        # guestIPMustBeZero makes 0.0.0.0 an exact match, so 127.0.0.1 and
+        # specific-address listeners fall through to the default forward.
+        exact_zero = self.udp_ignore_rule(guestIPMustBeZero=True)
+        with self.mock_lima_list([exact_zero, *self.both_forwards()[1:]]):
+            self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
+
+    def test_a_udp_ignore_rule_with_garbage_guest_ip_is_a_gap(self):
+        for guest_ip in ("lizard", "", None, 0):
+            with self.subTest(guest_ip=guest_ip):
+                rule = self.udp_ignore_rule(guestIP=guest_ip)
+                with self.mock_lima_list([rule, *self.both_forwards()[1:]]):
+                    self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
+
+    def test_an_ipv6_unspecified_udp_ignore_rule_covers_every_listener(self):
+        rule = self.udp_ignore_rule(guestIP="::")
+        with self.mock_lima_list([rule, *self.both_forwards()[1:]]):
+            self.assertEqual(yo.lima_config_gaps(), [])
+
     def test_a_blanket_udp_rule_that_forwards_instead_of_ignoring_is_a_gap(self):
-        forwarding = {"proto": "udp", "guestPortRange": [1, 65535]}
+        forwarding = self.udp_ignore_rule(ignore=False)
         with self.mock_lima_list([forwarding, *self.both_forwards()[1:]]):
             self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
 
@@ -1954,10 +1986,21 @@ class TestLimaConfigGaps(FakeHome):
         self.assertIn("--set '.ssh.overVsock = false'", message)
         self.assertNotIn("portForwards", message)
 
+    def udp_ignore_rule(self, **overrides):
+        rule = {
+            "proto": "udp",
+            "guestIP": "0.0.0.0",
+            "guestIPMustBeZero": False,
+            "guestPortRange": [1, 65535],
+            "ignore": True,
+        }
+        rule.update(overrides)
+        return rule
+
     def both_forwards(self):
         # The instance's normalized UDP rule: lima fills in the full range.
         return [
-            {"proto": "udp", "guestPortRange": [1, 65535], "ignore": True},
+            self.udp_ignore_rule(),
             {
                 "guestSocket": yo.OP_GUEST_SOCK,
                 "hostSocket": yo.op_sock(),

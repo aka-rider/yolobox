@@ -96,11 +96,21 @@ class TestLimaYamlMatchesPortForwardsConstant(unittest.TestCase):
 
     def test_no_guest_udp_listener_is_mirrored_onto_the_mac(self):
         # tailscaled's UDP 41641 would otherwise fight the Mac's own Tailscale
-        # for the same loopback port, on every hostagent start.
+        # for the same loopback port, on every hostagent start. Lima's default
+        # guestIP (127.0.0.1) leaves listeners bound to 0.0.0.0 and :: mirrored,
+        # and 0.0.0.0 alone leaves loopback ones: both lines are needed.
         parsed = parse_yaml_list_entries(
             yaml_block(YOLOBOX_YAML.read_text(), "portForwards")
         )
-        self.assertIn({"proto": "udp", "ignore": True}, parsed)
+        self.assertIn(
+            {
+                "proto": "udp",
+                "guestIP": "0.0.0.0",
+                "guestIPMustBeZero": False,
+                "ignore": True,
+            },
+            parsed,
+        )
 
     def test_the_vm_has_no_host_mounts(self):
         # The whole design is "no host mounts, git is the only bridge".
