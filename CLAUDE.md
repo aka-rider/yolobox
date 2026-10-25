@@ -28,6 +28,15 @@ commit `4c154fc`.
   with no `sudo`. Every AI coding session runs as the agent, so it cannot
   reach root. Lima would re-grant `wheel` to its own account on every boot,
   which is why the agent is a separate account. See `docs/accounts.md`.
+- **Egress is open unless the box opts in to a kill switch.** By default the box reaches the
+  internet through the Lima NAT. A box that names `yolobox.network.exitNode`
+  in `/etc/yolobox/local.nix` arms a kill switch instead: an nft table (loaded
+  by the generation, with no stop hook and no off switch) rejects every packet
+  that does not leave through that tailnet exit node, and DNS is plain DNS to a
+  resolver on the tailnet. That box must also name `networking.nameservers`,
+  and its tailnet ACL must grant it `autogroup:internet`. These are
+  prerequisites of opting in, not of yolobox. With no exit node named the
+  kill switch is absent. See `nix/killswitch.md`.
 - **Git is the bridge.** `yo link` makes the VM side of a repo a
   push-to-checkout target (`receive.denyCurrentBranch = updateInstead`), so
   the VM refuses a push when its worktree differs from HEAD. The VM commits
@@ -76,7 +85,12 @@ Box configuration (Nix):
   `nix/display.md`.
 - `nix/t3.nix`: a drop-in onto the vendor-installed t3code user unit.
   `nix/t3.md`.
-- `nix/tailscale.nix`: the tailnet and `tailscale serve` for t3.
+- `nix/killswitch.nix`: the opt-in kill switch (armed by
+  `yolobox.network.exitNode`): the nft table that rejects egress outside the
+  tailnet exit node, the nameserver assertion and `/etc/yolobox/network.json`.
+  `nix/killswitch.md`.
+- `nix/tailscale.nix`: the tailnet, `tailscale serve` for t3 and, on a box that
+  opted in to the kill switch, the exit-node selection.
   `nix/tailscale.md`.
 - `nix/podman.nix`: rootless podman with a docker-compatible socket.
 - `nix/lsp.nix`: Python language-server wiring for every editor.
@@ -125,6 +139,15 @@ YOLOBOX_USERNAME=$(id -un) nix flake check --impure
 
 - Python 3.9 is the floor because the Mac's Xcode Python is 3.9. The Mac
   usually has no nix, so check Nix changes inside the guest.
+- The default configuration evaluates as it is. A box that opts in to the kill
+  switch with `yolobox.network.exitNode` must also name
+  `networking.nameservers`, both in `/etc/yolobox/local.nix`. To evaluate the
+  opted-in variant anywhere else, go through `extendModules` with a stand-in,
+  as the `eval` job in `.github/workflows/verify.yml` does (its `ARMED`
+  expression). Inside a box that opted in through its `local.nix`, evaluating
+  the plain un-armed configuration requires forcing
+  `yolobox.network.exitNode = lib.mkForce null`, for example through
+  `extendModules`.
 - Nix needs `YOLOBOX_USERNAME=$(id -un)` and `--impure` on every command,
   because the flake has no pure way to learn the host username. `flake.nix`
   throws if it is unset.

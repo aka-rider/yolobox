@@ -13,8 +13,31 @@
 - `projects`, `landing-dir`, `ensure-repo`, `gc-user` and `aws-check` run as the agent.
 - `generations` and `gc-machine` run as the operator, because ext4's root reserve, which makes any of this recoverable on a genuinely full disk, is the operator's alone.
 - `net-check` runs as the operator too, the one account every box has, however far its agent setup got.
+- `egress-status` runs as the operator through `sudo -n` when `yo` asks. Listing the kill switch's nft table needs root, so a run as the agent, by hand, sees `kill switch: unknown (needs root)` and the verdict on egress still holds.
 
 `aws-creds` is covered in [docs/aws.md](../../docs/aws.md#aws-creds).
+
+## egress-status: the kill switch's verdict
+
+The kill switch is optional (see [Opting in](../killswitch.md#opting-in)). On a box that opted in, egress is meant to leave only through a tailnet exit node. `egress-status` reads three things, the desired state Nix writes to `/etc/yolobox/network.json`, the tailnet's own `tailscale status --json`, and whether the kill switch's nft table `inet yolobox-killswitch` is loaded, and prints one line about whether egress is what the state says. The state file is exactly `{"exitNode": "<tailnet host name>"}`, and Nix writes it only when the box names an exit node.
+
+Its exit codes are the contract `yo` reads: 0 is ok through the desired exit node, 1 is blocked or a state file it cannot read, 2 is a state file that exists while the kill switch's table is absent.
+
+Exit 0 also needs proof that traffic gets through. Configuration can all look right while the exit node drops the packets, for example when the tailnet policy does not grant the node `autogroup:internet` through it. So once the configuration checks pass, `egress-status` runs the same probe `net-check` runs, an HTTPS fetch of `https://github.com` bounded by `--max-time 5` (`probe_egress` in the script is the one place that is spelled). A probe that fails, times out, or cannot run is BLOCKED, exit 1, with the hint to check that policy. It is never ok. Desired state is then `internet via exit node <name>`, and the actual says the node is selected and online but the traffic does not get through. Each blocked line gives desired against actual and the command that changes it, and nothing refuses. `yo bootstrap` prints a bad line and still rebuilds, because bootstrap is how a box gets fixed.
+
+Three choices need their reason written down:
+
+- A box with no `network.json` did not opt in to the kill switch. It exits 0 with the neutral line `kill switch not enabled`, because nothing is desired and an alarm would make every ordinary box look broken.
+- A `network.json` of any other shape, an empty file included, is blocked: a field other than `exitNode`, a missing `exitNode`, a name that is not a string (`null` included, since Nix never writes the file without a name), or an empty name. Read as "no exit node" it would look like a choice, and it is a damaged file.
+- An `nft` that fails for a reason other than a missing table is reported as `unknown (nft: ...)`, not as absent. Calling a permission error "not armed" would send the operator to rebuild a box whose kill switch is in place.
+
+`net-check` treats the file's presence as the kill switch: a box whose generation writes `network.json` opted in, so `net-check` reports `gateway=skipped` and does not probe the gateway, since the gateway is rejected by design there. A damaged file still skips the probe, because the gateway is meaningless on an armed box either way, and `net-check` warns on stderr that the file is unreadable. `egress-status` is still the subcommand that judges the damage.
+
+On such a box `net-check`'s `egress=` is not a verdict of its own. Its `network:` line in `yo status` says `judged by the egress line above`, and the egress line is the single verdict on egress. Two lines that could disagree would make the operator guess which one to believe, and the egress line already carries the same probe result.
+
+A box with no `network.json` does not reach the probe at all in `egress-status` (it exits 0 with the not-enabled line), so on such a box `net-check` probes the gateway as it always did and the `network:` line carries its own verdict, which the neutral `egress:` line does not contradict.
+
+`YOLOBOX_NETWORK_STATE` overrides the file's path for the tests. `sudo` strips the environment, so the root run cannot be pointed elsewhere from the agent's side.
 
 ## The project walk
 
@@ -54,6 +77,8 @@ Several guards exist because the script's inputs come from `yo` or from the file
 The Mac side never guesses what a box supports; it reads the exit code. A subcommand `yo` was built to call after `yolobox-guest` shipped it exits **64**, with `yolobox-guest: unknown subcommand '<sub>'` on stderr. The box is older than this Mac's `yo`. A box with no `yolobox-guest` at all exits **127**, with the shell's own "command not found" on stderr. It predates the helper entirely. Both route through `guest_helper()` and `helper_skew()` in `yo` into the same message: which version this Mac's `yo` is, which version built the box, and `yo bootstrap` as the fix.
 
 The exit code alone is never enough in either direction. A subcommand's own child process (`podman`, `npm`) can legitimately exit 127 or 64 for reasons that have nothing to do with the helper. So both branches require the stderr marker too before reinterpreting the exit. The corollary is load-bearing: no subcommand's own stderr may ever contain the literal string `unknown subcommand`.
+
+A root run goes through `sudo -n --` (`egress-status` is the only one). sudo does not pass the helper's 127 through. For a helper it cannot find, it prints `sudo: yolobox-guest: command not found` and exits **1**, which is also the exit of a blocked egress. So `yo` names that message as the missing-helper marker, and the note reads as "not checked", never as a blocked egress. Without that, a box with no helper would be reported as blocked, and the operator would go looking for a network fault that is not there. `-n` is there so that a sudo wanting a password fails at once instead of hanging the ssh session.
 
 It follows that adding a subcommand to the script does not make it callable on its own. The box has to be rebuilt first (`yo bootstrap`, or a plain `nixos-rebuild switch` for someone iterating inside the VM). Calling it against an un-rebuilt box hits the 64 path, correctly, because from the box's point of view the subcommand really is unknown.
 

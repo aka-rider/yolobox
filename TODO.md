@@ -22,5 +22,11 @@ Posted 2026-10-02, awaiting review. The reasoning behind it is in lima/yolobox.m
 - `limactl stop yolobox` hangs on the vz driver (lima 2.2.0 and 2.2.1); see the lima entry under Upstream.
 - GitHub `environment: release` protection for HOMEBREW_TAP_TOKEN not configured.
 - Tailnet ACLs for the yolobox node not reviewed.
+- Kill switch (opt-in) items written from source and netns rehearsals, not yet run on a live box (`nix/killswitch.md`):
+  - A fresh VM: the README's optional section writes `/etc/yolobox/local.nix` and then runs `yo bootstrap`. That sequence has not been run on a VM that opted in from its first bootstrap.
+  - CI's `nft --check` of the rendered rule file on the runner: the step was written but has not yet run there.
+  - The rejects for tailscaled's marked packets to the Lima link (its port mapper's NAT-PMP, PCP and SSDP) are rehearsed in a namespace but not yet loaded on a live box. After the next switch, `sudo nft list table inet yolobox-killswitch` must show their counters rising and `tailscale status` must stay connected.
+  - The ICMPv6 neighbour-discovery accept in `nix/killswitch.nix` (`icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept`) has no destination scope, so such a packet addressed to a global address could leave via enp0s1. Scope it to the link: multicast `ff02::/16` or link-local `fe80::/10` destinations. Neighbour adverts can go unicast on the link, so the scope needs care: an on-link unicast advert must still pass. The new MLD accept is already scoped to `ff02::/16`.
+- tailscaled on the box logs `new contact: peer=[...] via=derp` about every 6 s for one peer, and it already did so before the kill-switch change. The cause has not been investigated; possibly a peer that never gets a direct path.
 - Immutable releases must stay off: release.yml force-moves the tag and re-uploads with --clobber.
 - Secrets that still live on disk despite the constitution's rule: lima's instance ssh key (`~/.lima/_config/user`, lima owns it), the agent's vendor credentials (`~/.claude`, `~/.config/gh`, `fj auth`), and the stage-2 sshd host keys. Each is a vendor's own storage; the rule forbids this repo from adding to the list, and the LUKS root now covers the guest-side ones at rest.

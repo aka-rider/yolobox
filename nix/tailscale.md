@@ -1,6 +1,6 @@
 # Tailscale
 
-The code is `nix/tailscale.nix`, which puts the box on a tailnet so t3 (see [t3code](t3.md)) is reachable from outside the Mac's own LAN. It opens no port for t3 in the NixOS firewall. The comments in that file give the short reason for each setting. This file holds the evidence and how to recognise each failure.
+The code is `nix/tailscale.nix`, which puts the box on a tailnet so t3 (see [t3code](t3.md)) is reachable from outside the Mac's own LAN, and, on a box that opted in to the [kill switch](killswitch.md), selects the exit node it leaves as the box's only way out. It opens no port for t3 in the NixOS firewall. The comments in that file give the short reason for each setting. This file holds the evidence and how to recognise each failure.
 
 ## Firewall
 
@@ -44,6 +44,8 @@ A changed `extraSetFlags` has to reach the running box on `switch`, and for a wh
 
 `--accept-dns=false` stops MagicDNS from taking over `/etc/resolv.conf`. At tailscale's default the guest's DNS would answer through the tailnet's resolver for every name, not only `*.ts.net`. That would silently change what every other process in the box resolves, including the Mac's own DNS filter that the AWS setup relies on staying in place (see [The DNS sinkhole](../docs/mac-network.md#the-dns-sinkhole)). The box's own name is still reachable as `yolobox.<tailnet>.ts.net`, because MagicDNS runs on the client end of a tailnet connection, never in this guest's resolver.
 
+On a box that opted in to the [kill switch](killswitch.md) the guest's resolver is `networking.nameservers`, set per box (see [DNS](killswitch.md#dns)), and there is a second reason for the flag: with MagicDNS enabled, tailscaled would forward the queries it cannot answer to upstream resolvers from its own sockets, and those carry the `0x80000` mark the kill switch lets out of the Lima interface. DNS would then leave the box directly, which is exactly what the kill switch exists to prevent.
+
 `disableUpstreamLogging = true` sets `TS_NO_LOGS_NO_SUPPORT=true` on tailscaled. The node uploads no logs to log.tailscale.com, and for the same reason Tailscale support will not help with this node. It is working when `yo ssh journalctl -u tailscaled -b` shows `You have disabled logging`. It takes effect on the next switch, because the variable sits in the unit's environment and a changed unit makes the switch restart tailscaled.
 
 ## Login
@@ -53,6 +55,10 @@ Login is interactive and happens once, by the operator, because no auth key exis
 `--netfilter-mode=off`, `--accept-dns=false` and `--hostname` are all non-default, so a bare `tailscale up` on an already logged-in node may refuse with "changing settings via 'tailscale up' requires mentioning all non-default flags". Do not answer that with `tailscale up --reset`, which clears them. Run `yo ssh sudo tailscale up`, then `yo ssh sudo systemctl restart tailscaled-set`, so the unit re-applies the flags.
 
 State from the login, the node key and the tailnet identity, persists under `/var/lib/tailscale`. Like everything else under [Two accounts](../docs/accounts.md#two-accounts), it is VM-local. Recreating the VM loses it, and the new box logs in again the same way.
+
+## Exit node
+
+`yolobox.network.exitNode` (declared in `nix/killswitch.nix`) names the tailnet node all egress goes through. It is null by default, and the box then has no exit-node unit and none of the kill switch. When it is set, `yolobox-tailscale-exit-node` runs `tailscale set --exit-node=<node> --exit-node-allow-lan-access` after tailscaled is `Running`. It uses the same wait and failure messages as the serve unit, from the shared `waitForRunning` script and the shared oneshot settings in `tailscale.nix`. The kill switch is what makes the choice binding, and why the flag is needed is in [The exit node](killswitch.md#the-exit-node).
 
 ## Serve readiness
 

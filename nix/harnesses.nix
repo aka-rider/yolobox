@@ -330,7 +330,7 @@ in
     # a dropped L+ link is not removed by the rebuild that drops it.
     systemd.tmpfiles.rules = homeTmpfiles {
       home = homeDir;
-      dirUser = agentUser;
+      user = agentUser;
       dirs = [ ".local" ".local/bin" ];
       links = [
         { path = ".local/bin/claude"; argument = launcherPath; }

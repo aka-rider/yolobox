@@ -56,7 +56,7 @@ in
   # conflict — one provider only.
   systemd.tmpfiles.rules = homeTmpfiles {
     home = homeDir;
-    dirUser = agentUser;
+    user = agentUser;
     dirs = [ ".config" ".config/zed" ".claude" ".claude/skills" ];
     links = [
       { path = ".config/zed/settings.json"; argument = "/etc/yolobox/lsp/zed-settings.json"; }

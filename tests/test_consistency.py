@@ -497,3 +497,103 @@ class TestGuestProfilePatternMatchesYo(unittest.TestCase):
         )
         self.assertEqual(len(found), 1, "aws-creds must check the profile name once")
         self.assertEqual(found[0], yo.AWS_PROFILE_NAME_RE.pattern)
+
+
+def nix_code(path: Path) -> str:
+    """The file's text without its comment lines."""
+    return "\n".join(
+        line
+        for line in path.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+# The kill switch's spellings: the nft table it loads and the state file Nix
+# writes. Each is checked in code, not in comments, in every file that names it.
+KILL_SWITCH_TABLE = "inet yolobox-killswitch"
+NETWORK_STATE_FILE = "/etc/yolobox/network.json"
+NETWORK_STATE_NIX = 'environment.etc."yolobox/network.json"'
+KILL_SWITCH_NIX = REPO / "nix" / "killswitch.nix"
+KILL_SWITCH_FILES = [GUEST_SCRIPT, KILL_SWITCH_NIX]
+
+
+class TestKillSwitchSpellingsAgree(unittest.TestCase):
+    def test_every_copy_names_the_kill_switch_table(self):
+        for path in KILL_SWITCH_FILES:
+            with self.subTest(file=path.name):
+                self.assertIn(KILL_SWITCH_TABLE, nix_code(path))
+
+    def test_the_guest_reads_the_state_file_nix_writes(self):
+        self.assertIn(NETWORK_STATE_FILE, nix_code(GUEST_SCRIPT))
+        self.assertIn(NETWORK_STATE_NIX, nix_code(KILL_SWITCH_NIX))
+
+
+class TestKillSwitchIsOptIn(unittest.TestCase):
+    """A box that never names an exit node is a box without a kill switch."""
+
+    def test_the_exit_node_option_defaults_to_null(self):
+        self.assertIn("default = null;", nix_code(KILL_SWITCH_NIX))
+
+    def test_the_whole_module_config_waits_for_the_exit_node(self):
+        code = nix_code(KILL_SWITCH_NIX)
+        self.assertIn("config = lib.mkIf (cfg.exitNode != null) {", code)
+        self.assertNotIn("config = {", code)
+
+    def test_the_exit_node_unit_waits_for_the_exit_node(self):
+        code = nix_code(REPO / "nix" / "tailscale.nix")
+        self.assertIn(
+            "systemd.services.yolobox-tailscale-exit-node = lib.mkIf (exitNode != null)",
+            code,
+        )
+
+    def test_no_other_module_reaches_for_the_kill_switch(self):
+        # Each is something only an opted-in box may have. killswitch.nix owns
+        # them behind its mkIf, and no other module may add them unconditionally.
+        owned = ("yolobox-killswitch", "nohook resolv.conf", "networking.nameservers")
+        for path in sorted((REPO / "nix").rglob("*.nix")) + [REPO / "flake.nix"]:
+            if path == KILL_SWITCH_NIX:
+                continue
+            for text in owned:
+                with self.subTest(file=path.name, text=text):
+                    self.assertNotIn(text, nix_code(path))
+
+    def test_the_repo_never_sets_the_exit_node_itself(self):
+        for path in sorted((REPO / "nix").rglob("*.nix")) + [REPO / "flake.nix"]:
+            if path == KILL_SWITCH_NIX:
+                continue
+            with self.subTest(file=path.name):
+                self.assertNotRegex(
+                    nix_code(path), r"yolobox\.network\.exitNode\s*=(?!=)"
+                )
+
+
+class TestKillSwitchStaysClosed(unittest.TestCase):
+    """The rule that keeps the kill switch from being a leak."""
+
+    def test_unit_has_no_stop_hook(self):
+        # A stop hook would open the box whenever the unit stops or restarts.
+        for hook in ("ExecStop", "preStop", "postStop"):
+            with self.subTest(hook=hook):
+                self.assertNotIn(hook, nix_code(KILL_SWITCH_NIX))
+
+
+class TestHomeLinksBelongToTheirUser(unittest.TestCase):
+    """tmpfiles makes an L line's link root-owned unless the line names a user."""
+
+    def test_no_tmpfiles_link_into_a_home_leaves_its_owner_unset(self):
+        unowned = re.compile(r'"L\+?\s+\S*(home|\{home\})\S*\s+-\s+-\s+-')
+        for path in sorted((REPO / "nix").rglob("*.nix")):
+            with self.subTest(file=path.name):
+                self.assertIsNone(unowned.search(nix_code(path)))
+
+
+class TestEgressExitCodesAgree(unittest.TestCase):
+    def test_the_guest_table_and_yo_agree_on_the_egress_exit_codes(self):
+        script = GUEST_SCRIPT.read_text()
+        table = {int(n) for n in re.findall(r"^#   exit (\d+)  \S", script, re.M)}
+        body = re.search(
+            r"^cmd_egress_status\(\) \{\n(.*?)^\}$", script, re.M | re.S
+        ).group(1)
+        used = {int(n) for n in re.findall(r"^\s*return (\d+)$", body, re.M)}
+        self.assertEqual(table, set(yo.EGRESS_EXIT_OUTCOMES))
+        self.assertEqual(used, table)

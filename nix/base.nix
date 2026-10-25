@@ -257,7 +257,7 @@ in
     # ~/wrk is the Mac's spelling of ~/Developer, and the mirror carries it
     # verbatim. Plain L, never L+: L+ would delete a real ~/wrk directory.
     "d ${config.users.users.${agentUser}.home}/Developer 0755 ${agentUser} users -"
-    "L ${config.users.users.${agentUser}.home}/wrk - - - - Developer"
+    "L ${config.users.users.${agentUser}.home}/wrk - ${agentUser} users - Developer"
   ];
 
   environment.localBinInPath = true;

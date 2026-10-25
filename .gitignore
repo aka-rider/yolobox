@@ -1,4 +1,8 @@
-.ruff_cache/
-.claude/
-.direnv/
-.DS_Store
+# Dotfiles are ignored by default. Track one by negating it below.
+.*
+
+# Tracked dotfiles, re-included explicitly.
+!.github/
+!.gitignore
+!.version
+!templates/default/.envrc

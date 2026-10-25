@@ -32,7 +32,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 # Rewritten at build time: nix substituteInPlace, Homebrew inreplace.
 YO_VERSION = "dev"
@@ -55,6 +55,9 @@ HELPER_EXIT_NO_PASSPHRASE = 4
 FZF_NO_MATCH = 1
 FZF_CANCELLED = 130
 HELPER_MARKER = "unknown subcommand"
+# sudo exits 1, not 127, when the helper it was asked to run does not exist.
+SUDO_EXIT_FAILED = 1
+SUDO_MISSING_HELPER = "sudo: %s: command not found" % HELPER
 
 # lima_config_gaps() entries that are not a missing reverse forward's guest
 # socket: a setting on the instance that breaks the no-host-mounts promise.
@@ -752,12 +755,32 @@ def helper_missing(role: SshRole) -> bool:
 
 
 def guest_helper(
-    role: SshRole, sub: str, args: Sequence[str] = (), *, stream: bool = False, **kwargs
+    role: SshRole,
+    sub: str,
+    args: Sequence[str] = (),
+    *,
+    root: bool = False,
+    stream: bool = False,
+    **kwargs,
 ) -> subprocess.CompletedProcess:
     if stream:
         kwargs["capture"] = False
         kwargs["filtered"] = True
-    proc = ssh_run(role, [HELPER, sub, *args], **kwargs)
+    # sudo keeps the operator's exit status, so a box too old for the subcommand
+    # still answers 64, and the skew checks below see the same codes. -n makes a
+    # sudo that would ask for a password fail at once instead of hanging ssh.
+    argv = [HELPER, sub, *args]
+    if root:
+        argv = ["sudo", "-n", "--", *argv]
+    proc = ssh_run(role, argv, **kwargs)
+    # sudo answers a missing helper with its own message, not the shell's 127,
+    # so the version-skew note is named from that message instead.
+    if (
+        root
+        and proc.returncode == SUDO_EXIT_FAILED
+        and SUDO_MISSING_HELPER in (proc.stderr or "")
+    ):
+        raise YoError(helper_skew("the box has no %s" % HELPER))
     if proc.returncode not in (127, HELPER_NO_SUBCOMMAND):
         return proc
     # A streamed run has no captured stderr to match the marker against, so the
@@ -1955,10 +1978,59 @@ def tailscale_status_line(stdout: str, stderr: str) -> str:
     return "tailscale: WARNING %s, serve %s — fix with: %s" % (backend, serve, remedy)
 
 
-def network_status_line(egress_ok: bool, gateway_ok: bool) -> str:
-    if egress_ok and gateway_ok:
+class EgressOutcome(enum.Enum):
+    OK = "ok"
+    BLOCKED = "blocked"
+    NOT_ARMED = "not armed"
+    # Not an exit code: the box gave no usable answer, so nothing is judged.
+    NOT_CHECKED = "not checked"
+
+
+# yolobox-guest egress-status's exit codes; the table is the header of
+# nix/guest/yolobox-guest.sh's cmd_egress_status.
+EGRESS_EXIT_OUTCOMES = {
+    0: EgressOutcome.OK,
+    1: EgressOutcome.BLOCKED,
+    2: EgressOutcome.NOT_ARMED,
+}
+
+
+class EgressCheck(NamedTuple):
+    outcome: EgressOutcome
+    line: str
+
+
+class Gateway(enum.Enum):
+    # net-check's word for the probe of lima's gateway. SKIPPED means the box
+    # opted in to the kill switch: it rejects the gateway by design, so the probe is
+    # not run.
+    OK = "ok"
+    DEAD = "dead"
+    SKIPPED = "skipped"
+
+
+GATEWAY_WORDS = {gateway.value: gateway for gateway in Gateway}
+
+
+class NetCheck(NamedTuple):
+    egress_ok: bool
+    gateway: Gateway
+
+
+def network_status_line(check: NetCheck) -> str:
+    # On a box with the kill switch the gateway probe is skipped by design, and the egress
+    # probe's verdict is the egress line's, which egress-status judges against
+    # the desired exit node. This line only points there, so yo status never
+    # prints two verdicts on egress that can disagree.
+    egress_ok, gateway = check
+    if gateway is Gateway.SKIPPED:
+        return (
+            "network: judged by the egress line above (kill switch enabled; "
+            "gateway probe skipped by design)"
+        )
+    if egress_ok and gateway is Gateway.OK:
         return "network: ok"
-    if gateway_ok:
+    if gateway is Gateway.OK:
         return (
             "network: WARNING guest egress is dead while lima's gateway answers — "
             "a Mac VPN owns the default route; check scutil --nc list on the Mac"
@@ -1990,14 +2062,46 @@ def guest_network_line() -> str:
             return "network: not checked — %s" % e.message
     finally:
         listener.close()
-    egress = guest_field(proc.stdout, "egress")
-    gateway = guest_field(proc.stdout, "gateway")
-    if egress not in ("ok", "dead") or gateway not in ("ok", "dead"):
+    check = parse_net_check(proc.stdout)
+    if check is None:
         return "network: not checked — net-check answered %r (exit %d)" % (
             proc.stdout.strip(),
             proc.returncode,
         )
-    return network_status_line(egress == "ok", gateway == "ok")
+    return network_status_line(check)
+
+
+def parse_net_check(text: str) -> Optional[NetCheck]:
+    egress = guest_field(text, "egress")
+    gateway = guest_field(text, "gateway")
+    if egress not in ("ok", "dead") or gateway not in GATEWAY_WORDS:
+        return None
+    return NetCheck(egress == "ok", GATEWAY_WORDS[gateway])
+
+
+def egress_check() -> EgressCheck:
+    # Root, through sudo (passwordless for the operator, nix/base.nix): listing
+    # the kill switch's nft table needs it. A box too old for the subcommand, or
+    # without the helper, raises the skew note, which is a note and not a verdict.
+    try:
+        proc = guest_helper(OPERATOR, "egress-status", root=True)
+    except YoError as failure:
+        return EgressCheck(
+            EgressOutcome.NOT_CHECKED, "egress: not checked — %s" % failure.message
+        )
+    lines = proc.stdout.splitlines()
+    outcome = EGRESS_EXIT_OUTCOMES.get(proc.returncode)
+    if outcome is not None and len(lines) == 1:
+        return EgressCheck(outcome, lines[0])
+    return EgressCheck(
+        EgressOutcome.NOT_CHECKED,
+        "egress: not checked — egress-status answered %r (exit %d)%s"
+        % (
+            proc.stdout.strip(),
+            proc.returncode,
+            ": " + proc.stderr.strip() if proc.stderr.strip() else "",
+        ),
+    )
 
 
 def status_guest_services() -> None:
@@ -2031,6 +2135,7 @@ def status_guest_services() -> None:
 
     tailscale_probe = ssh_run(OPERATOR, ["sh", "-c", TAILSCALE_PROBE], check=False)
     out(tailscale_status_line(tailscale_probe.stdout, tailscale_probe.stderr))
+    out(egress_check().line)
 
     t3_problem = t3_service_problem(*t3_unit_state())
     out("t3: %s" % ("WARNING " + t3_problem if t3_problem else "active"))
@@ -2213,12 +2318,23 @@ def guest_generations() -> Tuple[str, str]:
     return guest_field(proc.stdout, "profile"), guest_field(proc.stdout, "booted")
 
 
+def egress_preflight() -> None:
+    # Bootstrap is how a blocked box gets fixed, so a bad egress is shown loudly
+    # and the rebuild still runs. Nothing here refuses. A box that cannot answer
+    # (NOT_CHECKED) is silent: a fresh VM has no helper before its first
+    # bootstrap, which is no fault, and `yo status` shows the note afterwards.
+    check = egress_check()
+    if check.outcome in (EgressOutcome.BLOCKED, EgressOutcome.NOT_ARMED):
+        err(check.line)
+
+
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     report = Report()
     ref = flake_ref()
 
     passphrase = vm_up(run_services=False)
     report.ok("VM up")
+    egress_preflight()
 
     disk = classify_disk(luks_device_fstype())
     if disk is DiskState.UNREADABLE:

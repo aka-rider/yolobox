@@ -203,7 +203,7 @@ in
 
   systemd.tmpfiles.rules = homeTmpfiles {
     home = homeDir;
-    dirUser = agentUser;
+    user = agentUser;
     dirs = [ "artifacts" ];
     links = [ ];
   };
