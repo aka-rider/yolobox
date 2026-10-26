@@ -31,7 +31,8 @@ commit `1fed88d`.
 - **Egress is Lima NAT, minus the host.** The box reaches the internet through
   the Lima NAT, but `nix/egress.nix` rejects guest traffic to the host and to
   private networks, except DNS to the gateway, DHCP and the networks named in
-  `yolobox.network.lanAllow`. If the rules fail to load, the box runs in
+  `yolobox.network.lanAllow`. Traffic out of `tailscale0` is not judged either:
+  the tailnet ACL is the gate for what the box reaches there. If the rules fail to load, the box runs in
   recovery mode: no network, Lima ssh only. Tailscale is optional: a box that
   never logs in works as before, and `tailscale0` is a trusted interface, so a
   logged-in box is reachable on every port by whatever its tailnet ACL admits.

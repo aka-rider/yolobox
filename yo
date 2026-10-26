@@ -2106,7 +2106,8 @@ def tailscale_status_line(stdout: str, stderr: str) -> str:
 # loads it. The unit is "active" only when the full rules loaded; a loaded unit
 # in any other state means the box is in recovery mode (nix/egress.md). A box
 # built before the unit existed reports LoadState not-found, and systemctl show
-# exits 0 for it, so one round trip tells the two apart.
+# exits 0 for it, so one round trip tells the two apart. A masked unit never
+# loads the table at boot, so it gets its own warning.
 EGRESS_TABLE = "inet yolobox-egress"
 EGRESS_UNIT = "yolobox-egress"
 EGRESS_PROBE = [
@@ -2125,6 +2126,11 @@ def egress_status_line(probe: subprocess.CompletedProcess) -> str:
     active_state = guest_field(probe.stdout, "ActiveState")
     if load_state == "not-found":
         return "egress: box predates the egress table; run yo bootstrap"
+    if load_state == "masked":
+        return (
+            "egress: WARNING the egress table is masked — the box may reach the host; "
+            "unmask with: yo ssh sudo systemctl unmask %s" % EGRESS_UNIT
+        )
     if load_state != "loaded" or not active_state:
         stderr = probe.stderr.strip()
         return "egress: not checked — the probe answered %r (exit %d)%s" % (

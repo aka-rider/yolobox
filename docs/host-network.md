@@ -1,6 +1,6 @@
 # The host's network, as the guest sees it
 
-The guest reaches the outside world through the host, so the host's network settings decide what the guest can do. This file covers the two VPN shapes that break guest traffic, the marker for a box that blocks the gateway on purpose and a DNS filter that breaks one AWS endpoint.
+The guest reaches the outside world through the host, so the host's network settings decide what the guest can do. This file covers the two VPN shapes that break guest traffic, a fake-IP proxy that does not, the marker for a box that blocks the gateway on purpose and a DNS filter that breaks one AWS endpoint.
 
 ## VPN shapes
 
@@ -42,6 +42,10 @@ Recognise the two by those patterns, and on a macOS host run `scutil --nc list` 
 - `gateway=`, a DNS query for the root name servers sent to `192.168.5.2` with `dig +time=2 +tries=1`. DNS is the one gateway path the [egress table](../nix/egress.md) leaves open on a plain box, and it rides the NAT path above, so a reply proves gvproxy really reaches the host. The probe counts a reply by the `->>HEADER<<-` line `dig` prints, whatever the reply's status, and never by `dig`'s exit code, which bind9 reports as 0 on an ICMP unreachable or a reset connection. `skipped` when `/etc/yolobox/gateway-blocked` exists, see [above](#a-box-that-blocks-the-gateway-on-purpose).
 
 `network_status_line()` maps the pair. Egress dead with the gateway answering is a VPN that owns the host's default route. Egress ok with the gateway silent is a VPN that blackholes lima's gateway, or a DNS filter on the host that drops the query. Both dead means the guest network itself is down, or both faults at once. A box whose `yolobox-guest` still wants the old `PORT` argument exits 2 when `yo` sends none, and `yo` prints `network: not checked` with the reason. The rest of `yo status` still runs.
+
+### A fake-IP proxy on the host
+
+A proxy on the host in fake-IP mode (Surge, Clash, sing-box or Stash) answers every name with an address in `198.18.0.0/15` and proxies the connection itself. The guest's DNS goes through the host's resolver, so the box gets those addresses too and reaches the internet through the proxy. This works: the [egress table](../nix/egress.md) does not block `198.18.0.0/15`.
 
 ## The DNS sinkhole
 

@@ -2434,11 +2434,20 @@ class TestEgressStatusLine(unittest.TestCase):
         )
 
     def test_an_unrecognised_load_state_is_not_checked(self):
-        for load_state in ("lizard", "masked", "error"):
+        for load_state in ("lizard", "error"):
             with self.subTest(load_state=load_state):
                 line = yo.egress_status_line(self.answer(load_state, "active"))
                 self.assertTrue(line.startswith("egress: not checked"))
                 self.assertIn("LoadState=%s" % load_state, line)
+
+    def test_a_masked_unit_warns_that_the_box_may_reach_the_host(self):
+        for active_state in ("inactive", "active"):
+            with self.subTest(active_state=active_state):
+                self.assertEqual(
+                    yo.egress_status_line(self.answer("masked", active_state)),
+                    "egress: WARNING the egress table is masked — the box may reach "
+                    "the host; unmask with: yo ssh sudo systemctl unmask yolobox-egress",
+                )
 
     def test_a_loaded_unit_with_no_active_state_is_not_checked(self):
         line = yo.egress_status_line(self.probe("LoadState=loaded\n"))

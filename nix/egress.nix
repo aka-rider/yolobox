@@ -12,9 +12,8 @@ let
 
   # Everything on the host or a private network the guest can address: RFC1918,
   # the Lima subnet inside it, CGNAT (tailscale0 is accepted before this is
-  # judged), link-local, the benchmarking range 198.18.0.0/15 (a fake-IP proxy
-  # on the host answers there), multicast and the limited broadcast.
-  blockedV4 = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 255.255.255.255";
+  # judged), link-local, multicast and the limited broadcast.
+  blockedV4 = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255";
   blockedV6 = "fc00::/7, fe80::/10, ff00::/8";
 
   # Runs after every rerouting hook (mangle -150, dstnat -100), so the oif

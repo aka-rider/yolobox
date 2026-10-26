@@ -1,12 +1,12 @@
 # The egress table
 
-The code is `nix/egress.nix`. It is always on. The box reaches the internet through Lima's NAT, and the table rejects every guest-originated packet that is addressed to the host or to a private network. The promise is that the guest firewall controls every entrance from the guest into the host that goes through Lima's NAT: DNS to Lima's gateway on a plain box and DHCP. The reverse unix sockets for 1Password and the AWS broker are ssh channels the guest firewall never sees. One more entrance is not the firewall's to control: the tailnet, whose access policy decides (see [The tailnet is an entrance](#the-tailnet-is-an-entrance)).
+The code is `nix/egress.nix`. It is always on. The box reaches the internet through Lima's NAT, and the table rejects every guest-originated packet that is addressed to the host or to a private network. The promise is that the guest firewall controls every entrance from the guest into the host's private and Lima addresses: DNS to Lima's gateway on a plain box and DHCP are the only ones it leaves open. The host's public address, reached through the same NAT, is not an address the firewall can tell from the internet (see [Residuals](#residuals)). The reverse unix sockets for 1Password and the AWS broker are ssh channels the guest firewall never sees. One more entrance is not the firewall's to control: the tailnet, whose access policy decides (see [The tailnet is an entrance](#the-tailnet-is-an-entrance)).
 
 ## What is blocked and why
 
 Lima's gateway, 192.168.5.2, is gvproxy's NAT to the host's own loopback, on every port (`natTable()` in lima's `pkg/networks/usernet/gvproxy.go`). A guest that connects to 192.168.5.2:5432 reaches whatever listens on the host's `127.0.0.1:5432`, a database or a dev server the user never meant to share. A guest connection to the host's LAN address, or to any host on the LAN, also leaves through gvproxy. So the table rejects, with `reject with icmpx type admin-prohibited` (a blocked program fails at once instead of timing out):
 
-- IPv4: `10.0.0.0/8`, `100.64.0.0/10`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16` (which holds the Lima subnet), `198.18.0.0/15` (the benchmarking range, where a fake-IP proxy on the host answers), `224.0.0.0/4` and `255.255.255.255`;
+- IPv4: `10.0.0.0/8`, `100.64.0.0/10`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16` (which holds the Lima subnet), `224.0.0.0/4` and `255.255.255.255`;
 - IPv6: `fc00::/7`, `fe80::/10` and `ff00::/8`.
 
 These are accepted before the rejects are judged:
@@ -40,7 +40,7 @@ Name single addresses where you can. An entry that covers the host's own LAN add
 
 IPv4 entries become one `ip daddr { … } accept` and IPv6 entries one `ip6 daddr { … } accept`, placed before the rejects. An entry that is not a CIDR fails the evaluation with `yolobox.network.lanAllow: not a CIDR: <entries>`, because the string goes into the rule file and a typo must not reach `nft` on a user's box, where it would drop the box into recovery mode. IPv4 octets must be 0 to 255 without leading zeros and the prefix 0 to 32. IPv6 entries need well-formed groups (at most eight, `::` once) and a prefix of 0 to 128. CI evaluates `300.1.1.1/8`, `10.0.0.0/33`, `lizard` and `fd00::/129` and expects each to fail.
 
-Allowing `192.168.5.0/24`, the Lima subnet, would open the host again through the gateway. Do not.
+An entry that covers the Lima gateway (`192.168.5.2/32`, `192.168.5.0/24`, `192.168.0.0/16`), or `0.0.0.0/0` or `::/0`, cancels the protection: it is accepted before the rejects, so the guest again reaches every port of the host's loopback through the gateway, or every address at all. The evaluation accepts such entries on purpose. Only the root-owned `local.nix` can set the option, so this is the operator's explicit choice, and the table does not second-guess it.
 
 ## The tailnet is an entrance
 
@@ -50,6 +50,7 @@ That is by design: the tailnet access policy is the gate. Close it there, with a
 
 ## Residuals
 
+- A fake-IP proxy on the host (Surge, Clash, sing-box or Stash in fake-IP mode) answers every name with an address in `198.18.0.0/15`. The table does not block that range: the box reaches the internet through the proxy, which is the host's own choice, and a block would take the whole box offline.
 - A guest connection to the host's public address leaves through the NAT and returns through the host's network. The table cannot tell it from any other internet traffic, so a service the host exposes on its public address stays reachable (the hairpin). The same holds for any host address outside the blocked sets, such as a public IPv4 address assigned directly on the host's LAN interface.
 - `AF_VSOCK` to the host (CID 2) is not seen by netfilter. Whether Lima's vz driver registers a host-side vsock listener a guest could dial has not been checked, see `TODO.md`.
 - The terminal's OSC 52 clipboard sequence (`PI_CLIPBOARD_OSC52`) carries text from the guest to the host's clipboard. It is not network traffic and out of scope here.
