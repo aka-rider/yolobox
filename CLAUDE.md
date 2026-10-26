@@ -38,7 +38,7 @@ commit `1fed88d`.
   A box whose own `/etc/yolobox/local.nix` blocks Lima's gateway by design
   creates `/etc/yolobox/gateway-blocked`, and `net-check` then skips its
   gateway probe. See `nix/egress.md`, `nix/tailscale.md` and
-  `docs/mac-network.md`.
+  `docs/host-network.md`.
 - **Git is the bridge.** `yo link` makes the VM side of a repo a
   push-to-checkout target (`receive.denyCurrentBranch = updateInstead`), so
   the VM refuses a push when its worktree differs from HEAD. The VM commits
@@ -162,7 +162,7 @@ YOLOBOX_USERNAME=$(id -un) nix flake check --impure
 `docs/README.md` states the convention and lists every story file. A story
 lives in `<stem>.md` beside the file it explains, and cross-cutting ones live
 in `docs/<topic>.md` (`accounts`, `ssh`, `aws`, `disk`, `disk-encryption`,
-`mac-network`, `distribution`). Before editing a file, check whether its `<stem>.md`
+`host-network`, `distribution`). Before editing a file, check whether its `<stem>.md`
 exists and read it. A short "why" stays in the code comment; the story file
 holds the incident, the evidence and how to recognise the failure.
 

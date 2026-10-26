@@ -350,6 +350,9 @@ in
     sqlite
     curl
     wget
+    # dig, and kdig for DoT/DoH checks
+    dnsutils
+    knot-dns
     unzip
     devbox
     awscli2

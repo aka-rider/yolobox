@@ -21,7 +21,7 @@ Sibling `.md` files are safe to add. No package installs them: `nix/pkgs/yolobox
 | [aws.md](aws.md) | The Mac-side AWS credential broker: the allowlist, the guest config, the reverse-socket transport, the broker's lifetime, minting, and `aws-creds`. |
 | [disk.md](disk.md) | Recognising a full disk and the incidents that taught the recovery order. |
 | [disk-encryption.md](disk-encryption.md) | LUKS on the root partition: the 1Password-derived passphrase, the initrd sshd lima can reach, the password-agent delivery, the in-place migration, growing, and how to recognise an unlock failure. |
-| [mac-network.md](mac-network.md) | Mac VPN shapes that blackhole guest traffic, the gateway-blocked marker for a box that blocks the gateway on purpose, the DNS sinkhole, UDP flows stuck after a VPN disconnects, and lima listening on ports 80 and 443. |
+| [host-network.md](host-network.md) | VPN shapes on the host that blackhole guest traffic, the DNS probe of lima's gateway, the gateway-blocked marker for a box that blocks the gateway on purpose, the DNS sinkhole, UDP flows stuck after a VPN disconnects, and lima listening on ports 80 and 443. |
 | [distribution.md](distribution.md) | Building the box from a flake ref instead of a checkout, the bootstrap reboot decision, and the failure shapes that follow. |
 | [../yo.md](../yo.md) | The Mac-side CLI: the path mirror, `yo link`, `yo cp`, the guest helper, the `network:` line, the single parser, the output filter, the `YO_VERSION` literal, and opening a guest URL. |
 | [../lima/yolobox.md](../lima/yolobox.md) | `lima/yolobox.yaml` as read-once config, checking a running instance, why guest UDP is never mirrored, which guest ports reach the host, pinned settings, and the forwarder bug. |

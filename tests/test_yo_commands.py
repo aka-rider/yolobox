@@ -1329,6 +1329,25 @@ class TestCmdStatus(unittest.TestCase):
                 )
 
 
+class TestGuestNetworkLine(unittest.TestCase):
+    def test_net_check_runs_as_the_operator_with_no_arguments(self):
+        helper = mock.Mock(
+            return_value=mock.Mock(returncode=0, stdout="egress=ok\ngateway=ok\n")
+        )
+        with mock.patch.object(yo, "guest_helper", helper):
+            line = yo.guest_network_line()
+        helper.assert_called_once_with(yo.OPERATOR, "net-check", [])
+        self.assertEqual(line, "network: ok")
+
+    def test_a_box_that_still_wants_a_port_reports_not_checked(self):
+        helper = mock.Mock(
+            return_value=mock.Mock(returncode=2, stdout="", stderr="usage: net-check")
+        )
+        with mock.patch.object(yo, "guest_helper", helper):
+            line = yo.guest_network_line()
+        self.assertTrue(line.startswith("network: not checked — "))
+
+
 class TestNetworkStatusLine(unittest.TestCase):
     def test_both_ok(self):
         self.assertEqual(
@@ -1337,17 +1356,29 @@ class TestNetworkStatusLine(unittest.TestCase):
 
     def test_dead_egress_with_answering_gateway_blames_a_default_route_vpn(self):
         line = yo.network_status_line(yo.NetCheck(False, yo.Gateway.OK))
-        self.assertIn("WARNING guest egress is dead", line)
-        self.assertIn("scutil --nc list", line)
+        self.assertEqual(
+            line,
+            "network: WARNING guest egress is dead while lima's gateway answers DNS — "
+            "a VPN on the host likely owns its default route",
+        )
 
-    def test_blackholed_gateway_with_working_egress_blames_proton_style_vpn(self):
+    def test_a_silent_gateway_with_working_egress_blames_the_hosts_vpn_or_dns_filter(
+        self,
+    ):
         line = yo.network_status_line(yo.NetCheck(True, yo.Gateway.DEAD))
-        self.assertIn("WARNING 192.168.5.2", line)
-        self.assertIn("ProtonVPN", line)
+        self.assertEqual(
+            line,
+            "network: WARNING lima's gateway does not answer DNS while egress works — "
+            "DNS through the gateway will fail; check the host's VPN or DNS filter",
+        )
 
     def test_both_dead_points_at_the_lima_line(self):
         line = yo.network_status_line(yo.NetCheck(False, yo.Gateway.DEAD))
-        self.assertIn("neither the internet nor lima's gateway", line)
+        self.assertEqual(
+            line,
+            "network: WARNING the guest reaches neither the internet nor lima's gateway DNS — "
+            "check yo status's lima line and the host's VPN",
+        )
 
     def test_a_blocked_gateway_with_working_egress_says_the_probe_was_skipped(self):
         self.assertEqual(
@@ -1355,7 +1386,7 @@ class TestNetworkStatusLine(unittest.TestCase):
             "network: ok (lima's gateway probe skipped: this box blocks it by design)",
         )
 
-    def test_a_blocked_gateway_with_dead_egress_warns_without_blaming_the_mac_vpn(
+    def test_a_blocked_gateway_with_dead_egress_warns_without_blaming_a_vpn(
         self,
     ):
         self.assertEqual(

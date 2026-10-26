@@ -93,9 +93,9 @@ Starting the VM is no longer one `limactl start`. The root disk is encrypted, an
 
 ## The network line and the gateway-blocked marker
 
-`yo status` prints one `network:` line, built by `network_status_line()` from the two results of `yolobox-guest net-check`: whether egress works and whether lima's gateway answers. The pair tells a Mac VPN that owns the default route from one that blackholes the gateway (see [docs/mac-network.md](docs/mac-network.md#vpn-shapes)).
+`yo status` prints one `network:` line, built by `network_status_line()` from the two results of `yolobox-guest net-check`: whether egress works and whether lima's gateway answers a DNS query. The pair tells a VPN on the host that owns its default route from one that blackholes the gateway (see [docs/host-network.md](docs/host-network.md#vpn-shapes)).
 
-The gateway result has a third value, `Gateway.SKIPPED`. A box that blocks lima's gateway by design creates `/etc/yolobox/gateway-blocked`; while that file exists `net-check` prints `gateway=skipped`, and `yo` says so in the line: `network: ok (lima's gateway probe skipped: this box blocks it by design)` when egress works, and `network: WARNING guest egress is dead (lima's gateway probe skipped: this box blocks it by design)` when it does not. Without the marker a refused probe would read as a Mac VPN fault that is not there. The marker is the whole contract: `yo` never learns why the gateway is blocked, and the repo creates the file nowhere.
+The gateway result has a third value, `Gateway.SKIPPED`. A box that blocks lima's gateway by design creates `/etc/yolobox/gateway-blocked`; while that file exists `net-check` prints `gateway=skipped`, and `yo` says so in the line: `network: ok (lima's gateway probe skipped: this box blocks it by design)` when egress works, and `network: WARNING guest egress is dead (lima's gateway probe skipped: this box blocks it by design)` when it does not. Without the marker a refused probe would read as a VPN fault that is not there. The marker is the whole contract: `yo` never learns why the gateway is blocked, and the repo creates the file nowhere.
 
 ## One parser
 

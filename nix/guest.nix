@@ -17,6 +17,7 @@ let
       pkgs.gawk
       pkgs.git
       pkgs.curl
+      pkgs.dnsutils
     ];
     runtimeEnv = {
       YOLOBOX_AWS_BROKER_SOCK = agentEnv.awsBrokerSock;

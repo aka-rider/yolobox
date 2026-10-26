@@ -117,7 +117,7 @@ RESTATE_PORT_FORWARDS = ".portForwards = %s" % json.dumps(LIMA_PORT_FORWARDS)
 LIMA_SETTING_GAPS = {
     GAP_MOUNTS: ("mounts host directories into the VM", ".mounts = []"),
     GAP_FORWARD_AGENT: (
-        "forwards the Mac's ssh agent to every lima ssh session",
+        "forwards the host's ssh agent to every lima ssh session",
         ".ssh.forwardAgent = false",
     ),
     GAP_SSH_OVER_VSOCK: (
@@ -125,7 +125,7 @@ LIMA_SETTING_GAPS = {
         ".ssh.overVsock = false",
     ),
     GAP_UDP_FORWARDS: (
-        "mirrors guest UDP listeners onto the Mac's localhost (including DHCP's 68 and tailscaled's 41641, which collides with the Mac's own Tailscale)",
+        "mirrors guest UDP listeners onto the host's localhost (including DHCP's 68 and tailscaled's 41641, which collides with the host's own Tailscale)",
         RESTATE_PORT_FORWARDS,
     ),
     GAP_TCP_FORWARDS: (
@@ -2132,36 +2132,25 @@ def network_status_line(check: NetCheck) -> str:
         return "network: ok"
     if gateway is Gateway.OK:
         return (
-            "network: WARNING guest egress is dead while lima's gateway answers — "
-            "a Mac VPN owns the default route; check scutil --nc list on the Mac"
+            "network: WARNING guest egress is dead while lima's gateway answers DNS — "
+            "a VPN on the host likely owns its default route"
         )
     if egress_ok:
         return (
-            "network: WARNING 192.168.5.2 (the Mac, through lima's gateway) is blackholed "
-            "while egress works — a Mac VPN such as ProtonVPN; "
-            "forwarded TCP ports to the Mac will not answer"
+            "network: WARNING lima's gateway does not answer DNS while egress works — "
+            "DNS through the gateway will fail; check the host's VPN or DNS filter"
         )
     return (
-        "network: WARNING the guest reaches neither the internet nor lima's gateway — "
-        "check yo status's lima line and the Mac's VPN (scutil --nc list)"
+        "network: WARNING the guest reaches neither the internet nor lima's gateway DNS — "
+        "check yo status's lima line and the host's VPN"
     )
 
 
 def guest_network_line() -> str:
-    # The guest connects to a listener on the Mac's loopback through lima's
-    # gateway address, the same path a forwarded TCP port takes. The kernel
-    # completes the handshake from the backlog, so nothing needs to accept.
-    listener = socket.socket()
     try:
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(1)
-        port = listener.getsockname()[1]
-        try:
-            proc = guest_helper(OPERATOR, "net-check", [str(port)])
-        except YoError as e:
-            return "network: not checked — %s" % e.message
-    finally:
-        listener.close()
+        proc = guest_helper(OPERATOR, "net-check", [])
+    except YoError as e:
+        return "network: not checked — %s" % e.message
     check = parse_net_check(proc.stdout)
     if check is None:
         return "network: not checked — net-check answered %r (exit %d)" % (

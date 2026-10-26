@@ -734,15 +734,30 @@ probe_egress() {
     curl -sS -o /dev/null --max-time "${EGRESS_PROBE_SECONDS}" "${EGRESS_PROBE_URL}" 2>/dev/null
 }
 
-# Tells apart the two Mac-VPN shapes (docs/mac-network.md#vpn-shapes): a
-# WireGuard default route kills egress while the gateway answers; ProtonVPN
-# blackholes the gateway while egress works. yo listens on the Mac's loopback at PORT, and
-# 192.168.5.2 is gvproxy's NAT of lima's gateway to that loopback. Both
-# probes only classify, so this exits 0 whatever the network state.
+# Lima's gateway, the one address a plain box may talk to, and then only for
+# DNS (nix/egress.nix).
+GATEWAY_DNS=192.168.5.2
+
+# Succeeds only if a DNS reply arrived. `dig` prints its ->>HEADER<<- line
+# exactly when one did, whatever the reply's status, so that line is the
+# answer. dig's exit code is not: bind9 reports 0 on an ICMP unreachable or a
+# reset connection (isc-projects/bind9 #3235, #3615). The reply is captured
+# first, because `grep -q` closing the pipe early would hand dig a SIGPIPE
+# that pipefail turns into a failed probe.
+probe_gateway_dns() {
+    local reply
+    reply=$(dig +time=2 +tries=1 "@${GATEWAY_DNS}" . NS 2>&1) || true
+    [[ "${reply}" == *'->>HEADER<<-'* ]]
+}
+
+# Tells apart the two host-VPN shapes (docs/host-network.md#vpn-shapes): a VPN
+# that owns the host's default route kills egress while the gateway still
+# answers DNS; a VPN that blackholes lima's gateway leaves egress working
+# while the gateway's DNS goes silent. Both probes only classify, so this
+# exits 0 whatever the network state.
 cmd_net_check() {
-    local port="${1:-}"
-    if [ "$#" -ne 1 ] || ! [[ "${port}" =~ ^[0-9]+$ ]] || [ "${port}" -lt 1 ] || [ "${port}" -gt 65535 ]; then
-        printf 'yolobox-guest: net-check: usage: net-check PORT (1-65535)\n' >&2
+    if [ "$#" -ne 0 ]; then
+        printf 'yolobox-guest: net-check: usage: net-check (takes no arguments)\n' >&2
         exit 2
     fi
     local egress=dead gateway=dead
@@ -751,11 +766,10 @@ cmd_net_check() {
     fi
     # A box whose local configuration blocks the gateway by design marks it
     # with GATEWAY_BLOCKED, so probing it would report a fault that is not
-    # there (docs/mac-network.md).
+    # there (docs/host-network.md).
     if [ -e "${GATEWAY_BLOCKED}" ]; then
         gateway=skipped
-    # bash's /dev/tcp needs no extra dependency; timeout bounds a blackhole.
-    elif timeout 3 "${BASH}" -c ': >/dev/tcp/192.168.5.2/'"${port}" 2>/dev/null; then
+    elif probe_gateway_dns; then
         gateway=ok
     fi
     printf 'egress=%s\ngateway=%s\n' "${egress}" "${gateway}"

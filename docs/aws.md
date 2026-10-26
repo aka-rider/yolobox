@@ -27,7 +27,7 @@ A profile name must `fullmatch` `AWS_PROFILE_NAME_RE` (`^[A-Za-z0-9][A-Za-z0-9._
 
 `tests/test_aws_broker.py` reads the two Python literals out of the source and fails when they differ. `tests/test_consistency.py` checks the guest's spelling against them. `fullmatch` is load-bearing in Python, because `$` before a trailing newline still matches under `match`.
 
-A profile's region must match `^[a-z]{2,4}(-[a-z]+)+-\d+$`, ASCII only. The four-letter prefix is the AWS European Sovereign Cloud's `eusc-de-east-1`. The region lands in the rendered guest config, so a value with a newline in it would add lines to that file. A profile with no region is excluded too, with a stderr line naming it, because a region-less profile reopens the DNS sinkhole (see [the DNS sinkhole](mac-network.md#the-dns-sinkhole)). A malformed config file (bad ini syntax, undecodable bytes) raises instead of allow-listing whatever partial read it got. With no `aws` CLI, or no SSO profiles, `yo` prints one stderr line and starts no broker.
+A profile's region must match `^[a-z]{2,4}(-[a-z]+)+-\d+$`, ASCII only. The four-letter prefix is the AWS European Sovereign Cloud's `eusc-de-east-1`. The region lands in the rendered guest config, so a value with a newline in it would add lines to that file. A profile with no region is excluded too, with a stderr line naming it, because a region-less profile reopens the DNS sinkhole (see [the DNS sinkhole](host-network.md#the-dns-sinkhole)). A malformed config file (bad ini syntax, undecodable bytes) raises instead of allow-listing whatever partial read it got. With no `aws` CLI, or no SSO profiles, `yo` prints one stderr line and starts no broker.
 
 ## Guest config
 
@@ -47,7 +47,7 @@ Because `AWS_CONFIG_FILE` replaces the guest's own AWS config path, an agent-wri
 
 Why `credential_process` and not the container credential provider? botocore dials the container provider only as an HTTP(S) URI and has no unix-socket form. Once the broker moved to a unix socket, that provider stopped being a candidate. `credential_process` runs any command and reads process-credential JSON from its stdout, so `yolobox-guest aws-creds P` can `curl --unix-socket` the Mac-side broker.
 
-Why a unix socket and not a forwarded TCP port? A connected ProtonVPN blackholes every guest connection to `192.168.5.2:<port>`, the path version 2's TCP `-R` relied on (see [ProtonVPN connected](mac-network.md#protonvpn-connected)). Lima's reverse unix-socket forwards ride lima's own ssh connection and are unaffected. 1Password's forward already had that shape (see [1Password reaches the agent](ssh.md#1password-reaches-the-agent)), so the broker uses it too.
+Why a unix socket and not a forwarded TCP port? A VPN on the host that blackholes lima's gateway blackholes every guest connection to `192.168.5.2:<port>`, the path version 2's TCP `-R` relied on (see [A VPN that blackholes lima's gateway](host-network.md#a-vpn-that-blackholes-limas-gateway)). Lima's reverse unix-socket forwards ride lima's own ssh connection and are unaffected. 1Password's forward already had that shape (see [1Password reaches the agent](ssh.md#1password-reaches-the-agent)), so the broker uses it too.
 
 The chain has four links:
 

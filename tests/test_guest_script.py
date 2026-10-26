@@ -574,52 +574,74 @@ class TestGcUserDeep(GuestScript):
         self.assertEqual(cleans, ["cargo %s clean" % root])
 
 
-FAKE_TIMEOUT = """#!/bin/sh
-printf '%s\n' "$@" > "$FAKE_TIMEOUT_ARGV"
-exit "$FAKE_TIMEOUT_RC"
+FAKE_DIG = """#!/bin/sh
+printf '%s\\n' "$@" > "$FAKE_DIG_ARGV"
+printf '%s' "$FAKE_DIG_OUT"
+exit "$FAKE_DIG_RC"
 """
+
+DNS_REPLY = ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n"
+DNS_SERVFAIL = ";; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 1\n"
 
 
 class TestNetCheckSkipsTheGatewayProbeOnlyWhenTheBoxBlocksIt(GuestScript):
     def setUp(self):
         super().setUp()
         bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
-        timeout = bin_dir / "timeout"
-        timeout.write_text(FAKE_TIMEOUT)
-        timeout.chmod(0o755)
-        self.probe_argv = self.tmp / "timeout-argv"
+        dig = bin_dir / "dig"
+        dig.write_text(FAKE_DIG)
+        dig.chmod(0o755)
+        self.dig_argv = self.tmp / "dig-argv"
         self.blocked = self.tmp / "gateway-blocked"
         self.env.update(
-            FAKE_TIMEOUT_ARGV=str(self.probe_argv),
+            FAKE_DIG_ARGV=str(self.dig_argv),
             YOLOBOX_GATEWAY_BLOCKED=str(self.blocked),
         )
 
-    def net_check(self, *, curl_rc=0, probe_rc=0):
+    def net_check(self, *args, curl_rc=0, dig_out=DNS_REPLY, dig_rc=0):
         return self.run_script(
             "net-check",
-            "8080",
+            *args,
             curl_rc=curl_rc,
-            extra_env={"FAKE_TIMEOUT_RC": str(probe_rc)},
+            extra_env={"FAKE_DIG_OUT": dig_out, "FAKE_DIG_RC": str(dig_rc)},
         )
 
-    def test_without_the_marker_the_gateway_is_probed_on_the_port(self):
-        result = self.net_check(probe_rc=0)
+    def test_without_the_marker_the_gateway_is_asked_for_the_root_name_servers(self):
+        result = self.net_check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "egress=ok\ngateway=ok\n")
-        self.assertIn("/dev/tcp/192.168.5.2/8080", self.probe_argv.read_text())
+        argv = self.dig_argv.read_text().split("\n")
+        self.assertEqual(argv[-4:-1], ["@192.168.5.2", ".", "NS"])
 
-    def test_a_gateway_that_does_not_answer_is_reported_dead(self):
-        result = self.net_check(probe_rc=1)
+    def test_a_dns_error_reply_still_proves_the_gateway_answers(self):
+        result = self.net_check(dig_out=DNS_SERVFAIL, dig_rc=0)
+        self.assertEqual(result.stdout, "egress=ok\ngateway=ok\n")
+
+    def test_a_gateway_that_sends_no_reply_is_reported_dead(self):
+        result = self.net_check(dig_out=";; no servers could be reached\n", dig_rc=9)
+        self.assertEqual(result.stdout, "egress=ok\ngateway=dead\n")
+
+    def test_dig_exiting_zero_without_a_reply_is_still_dead(self):
+        # bind9 #3235 and #3615: exit 0 on an ICMP unreachable.
+        result = self.net_check(dig_out=";; Connection refused\n", dig_rc=0)
         self.assertEqual(result.stdout, "egress=ok\ngateway=dead\n")
 
     def test_egress_that_fails_is_reported_dead_whatever_the_gateway_does(self):
-        result = self.net_check(curl_rc=6, probe_rc=0)
+        result = self.net_check(curl_rc=6)
         self.assertEqual(result.stdout, "egress=dead\ngateway=ok\n")
 
     def test_a_box_with_the_marker_skips_the_gateway_probe_without_running_it(self):
         self.blocked.write_text("")
-        result = self.net_check(probe_rc=0)
+        result = self.net_check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "egress=ok\ngateway=skipped\n")
         self.assertEqual(result.stderr, "")
-        self.assertFalse(self.probe_argv.exists())
+        self.assertFalse(self.dig_argv.exists())
+
+    def test_an_argument_is_a_usage_error(self):
+        for arg in ("8080", "", "lizard"):
+            with self.subTest(arg=arg):
+                result = self.net_check(arg)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("usage: net-check", result.stderr)
