@@ -18,7 +18,7 @@ let
   # claude as `--settings <file>` and nowhere else (see nix/display.nix for
   # why the enterprise settings tier can't carry it). The box therefore OWNS
   # that path with a launcher of its own rather than putting a wrapper on the
-  # system PATH and racing it: the agent's dotfiles prepend $HOME/.local/bin,
+  # system PATH and racing it: the agent's shell rc files may prepend $HOME/.local/bin,
   # so any wrapper behind it loses in every interactive shell, silently,
   # which is exactly how d79fea0 ended herd reporting box-wide within a day.
   #

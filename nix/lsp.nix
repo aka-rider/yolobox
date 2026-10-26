@@ -49,7 +49,7 @@ in
   environment.variables.OPENCODE_CONFIG = "/etc/yolobox/lsp/opencode.json";
 
   # pi is absent from this module on purpose. It gains LSP from pi-lens, an
-  # npm extension in the user layer (~/.dotfiles/pi/packages.json), which
+  # npm extension in the user layer (pi's own package list), which
   # auto-detects basedpyright off the same project devbox PATH and covers
   # every other language too. The flake's own pi-lsp extension registered a
   # second `lsp_diagnostics` tool, and pi refuses to start on a tool-name

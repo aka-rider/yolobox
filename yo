@@ -1538,10 +1538,6 @@ def ensure_op_forward(aws_enabled: bool) -> List[str]:
 
 
 UNITS_MISSING_NOTE = "box predates the 1Password/AWS forwards; run `yo bootstrap`"
-BOOTSTRAP_IDENTITY_NOTE = (
-    "yo: the box's ssh identity comes from your dotfiles: after cloning them "
-    "in the VM, run ~/.dotfiles/_do_install.sh as the agent (yo enter)"
-)
 IN_PLACE_ENCRYPTION_WARNING = (
     "yo: the next boot encrypts %s in place. The box is unusable until it finishes "
     "(about ten to fifteen minutes at this disk's size; a fuller disk takes longer), "
@@ -2448,8 +2444,6 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
             )
         report.ok("rebooted into the built generation")
 
-    err(BOOTSTRAP_IDENTITY_NOTE)
-
     ensure_ssh_config_include(refuse=False)
     ensure_guest_known_hosts()
     ensure_herdr_machine()
@@ -2812,7 +2806,7 @@ def add_ssh_config_include() -> None:
     if not os.path.isdir(ssh_dir):
         os.mkdir(ssh_dir, 0o700)
         os.chmod(ssh_dir, 0o700)
-    # ~/.ssh/config is often a symlink into a dotfiles checkout: write through
+    # ~/.ssh/config may be a symlink into a version-controlled directory: write through
     # it, keep the mode the user chose, and never rewrite undecodable bytes.
     config_path = os.path.realpath(os.path.join(ssh_dir, "config"))
     try:

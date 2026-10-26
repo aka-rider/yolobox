@@ -921,9 +921,9 @@ class TestEnsureSshConfigInclude(FakeHome):
         self.assertIn(target, caught.exception.message)
 
     def test_accepted_writes_through_a_symlinked_config(self):
-        dotfiles = os.path.join(self.home, "dotfiles")
-        os.makedirs(dotfiles)
-        target = os.path.join(dotfiles, "ssh_config")
+        kept = os.path.join(self.home, "kept")
+        os.makedirs(kept)
+        target = os.path.join(kept, "ssh_config")
         with open(target, "w") as handle:
             handle.write("Host other\n")
         os.makedirs(os.path.join(self.home, ".ssh"))

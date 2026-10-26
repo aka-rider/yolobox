@@ -287,11 +287,6 @@ class TestBootstrapRebootDecision(unittest.TestCase):
             self.run_bootstrap([("g1", "g0"), ("g1", "g1")])
         self.assertEqual(order, ["passphrase", "stop"])
 
-    def test_tells_the_operator_the_ssh_identity_comes_from_dotfiles(self):
-        self.run_bootstrap([("g1", "g1")])
-        messages = " ".join(call.args[0] for call in yo.err.call_args_list)
-        self.assertIn("_do_install.sh", messages)
-
     def test_a_blocked_egress_is_reported_on_stderr_and_the_rebuild_still_runs(self):
         blocked = (
             "egress: BLOCKED — desired: exit node exit1; actual: none selected. "

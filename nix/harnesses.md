@@ -26,7 +26,7 @@ anything from living in it.
 - `d79fea0` put a nix wrapper on the system PATH, pointed it at upstream's
   self-updating install and appended `~/.local/bin` to PATH. It assumed only
   `environment.localBinInPath` could prepend that directory. Within a day this
-  proved wrong: the agent's own dotfiles prepend it too, and `yo enter` ends
+  proved wrong: the agent's own shell rc files may prepend it too, and `yo enter` ends
   with `exec "$SHELL" -l`, an interactive login zsh that sources them. The
   first `claude update` (2026-09-04 14:42, 2.1.259 to 2.1.260) put a bare
   launcher ahead of the wrapper and ended herd reporting for every typed
@@ -41,7 +41,7 @@ under `~/.local/share/claude/versions/` and execs it with `--settings
 /etc/claude-code/claude-hooks.json` ahead of `"$@"`, so a user's own later
 `--settings` still wins. Anthropic documents (setup docs, since 2.1.207) that a
 custom launcher at that path is left alone by `claude update` and auto-update,
-which only drop new binaries into `versions/`. The dotfiles may prepend
+which only drop new binaries into `versions/`. Shell rc files may prepend
 `~/.local/bin` all they like. The first `claude` on PATH is the box's launcher
 either way, and `claude update` works and is welcome. `DISABLE_AUTOUPDATER`
 and the reaper are gone.
@@ -190,8 +190,8 @@ migrating.
 pi rewrites `~/.pi/agent/settings.json` on its own and logs, rather than
 raises, a failed write. A deleted `nix/pi.nix` (`cb122e1`) once linked it to
 `/etc/static/...`. The module went and the dangling link stayed. That file is
-the only place pi keeps its `packages` list, so nothing from
-`~/.dotfiles/pi/packages.json` installed: `pi list` said "No packages
+the only place pi keeps its `packages` list, so no
+package listed there installed: `pi list` said "No packages
 installed" and `cc-compat` complained on every start that `AskUserQuestion` was
 unavailable.
 
@@ -215,8 +215,7 @@ it, and the integration is installed with `herdr integration install pi`, not
 rendered by the flake. `pi-mcp-adapter` and the `mcp-scripting` skill went
 earlier, with `nix/mcp.nix`. The context7 and agent-browser packages are
 installed with `pi install`, so pi owns them. Skills, agents, prompts,
-`cc-compat` and the rest of the packages come from
-`~/.dotfiles/_do_install.sh`, re-run after a dotfiles pull. Two extensions
+`cc-compat` and the rest of the packages are the agent's own to install. Two extensions
 registering the same tool name kill pi at startup, which is what retired the
 flake's pi-lsp extension in favour of pi-lens.
 
@@ -249,7 +248,7 @@ first. They are recorded in `~/.claude/settings.json` under `enabledPlugins`.
   it wants network the first time each version is used.
 
 Because that file records the installs, `~/.claude/settings.json` must not be
-a symlink into the dotfiles checkout, or plugin installs write there instead.
+a symlink into a version-controlled directory, or plugin installs write there instead.
 
 pi gets no MCP at all. `@upstash/context7-pi` is Upstash's own pi package,
 pure JS, exposing native pi tools. `pi-agent-browser-native` drives Vercel's

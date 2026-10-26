@@ -159,7 +159,7 @@ build_targets() {
 
 # Fills CACHE_PATHS with every existing cache directory gc --yes reclaims: the
 # LOCAL_CACHES, cargo's downloaded sources, and the Go caches. GOPATH used to be
-# set only by interactive dotfiles, so a cache can sit at any old GOPATH;
+# set only by an interactive shell rc file, so a cache can sit at any old GOPATH;
 # Go's caches are found by signature, not by
 # path: a module cache is a `pkg/mod` holding `cache/download`, a build cache
 # is a directory whose README opens with GO_BUILD_CACHE_HEADER. The walk stops

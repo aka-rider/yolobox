@@ -23,8 +23,7 @@ or a t3-spawned agent. None of them opens a pty on the guest herdr server, so
 all of them show as `unknown` or not at all. The place to run an agent is a
 workspace opened on the saved `yolobox` machine. `cmd_enter` says so on
 stderr when `HERDR_ENV=1`, meaning the command itself runs inside a herdr
-pane. Inside the guest, navigation is left to the agent's dotfiles (`z`,
-`fzf`). Nothing named `yo` exists in the guest.
+pane. Inside the guest, navigation is left to the agent's own shell setup. Nothing named `yo` exists in the guest.
 
 ### The regression this design fixes
 

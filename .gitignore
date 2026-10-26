@@ -1,7 +1,7 @@
-# Dotfiles are ignored by default. Track one by negating it below.
+# Hidden files are ignored by default. Track one by negating it below.
 .*
 
-# Tracked dotfiles, re-included explicitly.
+# Tracked hidden files, re-included explicitly.
 !.github/
 !.gitignore
 !.version
