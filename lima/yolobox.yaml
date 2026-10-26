@@ -7,7 +7,7 @@ images:
 # Apple's Virtualization.framework; the rosetta block below only applies to vz.
 vmType: vz
 
-# Keep the Mac's HTTP(S)_PROXY out of the guest: a proxy the VM cannot reach
+# Keep the host's HTTP(S)_PROXY out of the guest: a proxy the VM cannot reach
 # would break every fetch the box makes.
 propagateProxyEnv: false
 
@@ -84,7 +84,7 @@ portForwards:
     hostSocket: "{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
     reverse: true
 
-  # Same shape, for the AWS broker: a VPN owning the Mac's default route
+  # Same shape, for the AWS broker: a VPN owning the host's default route
   # blackholes the guest's TCP path to 192.168.5.2 (gvproxy's NAT to host
   # loopback), so the broker is reached as a reversed unix socket instead of
   # a forwarded port, exactly like 1Password above.
@@ -92,10 +92,10 @@ portForwards:
     hostSocket: "{{.Home}}/.local/state/yolobox/aws-broker.sock"
     reverse: true
 
-  # Forward no guest UDP listener to the Mac. Lima mirrors every guest
-  # listener onto the Mac's localhost, and nothing here needs a UDP one: the
+  # Forward no guest UDP listener to the host. Lima mirrors every guest
+  # listener onto the host's localhost, and nothing here needs a UDP one: the
   # secrets are unix sockets. The mirror only collides or intercepts.
-  # tailscaled's UDP 41641 loses to the Mac's own Tailscale, which holds that
+  # tailscaled's UDP 41641 loses to the host's own Tailscale, which holds that
   # port ("failed to listen udp: 127.0.0.1:41641: address already in use"), and
   # port 68 would intercept the host's DHCP packets, which is an
   # issue with NixOS that other distros do not show

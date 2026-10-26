@@ -1,6 +1,6 @@
 # The host's network, as the guest sees it
 
-The guest reaches the outside world through the host, so the host's network settings decide what the guest can do. This file covers the two VPN shapes that break guest traffic, the marker for a box that blocks the gateway on purpose, a DNS filter that breaks one AWS endpoint, and the port 80 and 443 binds lima makes on the host.
+The guest reaches the outside world through the host, so the host's network settings decide what the guest can do. This file covers the two VPN shapes that break guest traffic, the marker for a box that blocks the gateway on purpose and a DNS filter that breaks one AWS endpoint.
 
 ## VPN shapes
 
@@ -8,7 +8,7 @@ lima NATs the guest's traffic out through the host's default route. A VPN on the
 
 ### A VPN that owns the host's default route
 
-This happened with a full-tunnel profile in a WireGuard client. The tunnel does not carry the forwarded packets, so they are blackholed. From the guest, every destination fails on every port: GitHub on 443 and 80, 1.1.1.1 on 53, and even the LAN router. The one exception is `192.168.5.2:53`, lima's own resolver, which keeps answering because the host process serves it. `nixos-rebuild` fails with GitHub fetch timeouts. Disconnecting the tunnel restores egress at once.
+This happened with a full-tunnel profile in a WireGuard client. The tunnel does not carry the forwarded packets, so they are blackholed. From the guest, every destination fails on every port: GitHub on 443 and 80, and 1.1.1.1 on 53. The one exception is `192.168.5.2:53`, lima's own resolver, which keeps answering because the host process serves it. `nixos-rebuild` fails with GitHub fetch timeouts. Disconnecting the tunnel restores egress at once.
 
 ### A VPN that blackholes lima's gateway
 
@@ -50,9 +50,3 @@ The first launch of v1, the Docker-based predecessor, showed a DNS failure that 
 That error is DNS, not AWS. The host's DNS filter in that setup sinkholed the global `sts.amazonaws.com` name to 0.0.0.0. A guest that uses lima's resolver (192.168.5.2) inherits the host's resolver and with it the filter. The AWS CLI targets the global endpoint only when the profile has no region. Regional endpoints such as `sts.eu-west-1.amazonaws.com` resolve fine on both sides.
 
 That is why a profile without a region is left out of the [allowlist](aws.md#allowlist) rather than shipped broken.
-
-## lima on port 80 and 443
-
-On macOS, a non-root process cannot bind `127.0.0.1:80`, but it can bind `0.0.0.0:80`. So lima binds `0.0.0.0` for any host port below 1024. It wraps that listener so it drops any non-loopback peer after the handshake. This is not exposure.
-
-The real cost is that nothing else on the host can bind port 80 or 443.

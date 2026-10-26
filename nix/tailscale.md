@@ -4,7 +4,7 @@ The code is `nix/tailscale.nix`, which puts the box on a tailnet so that its ser
 
 ## Firewall
 
-`tailscale0` is a trusted interface (`networking.firewall.trustedInterfaces = [ "tailscale0" ]`), so `nixos-fw` accepts everything that arrives on it. The tailnet ACL, not the box, decides who gets in. This replaces the rule of commit `80f8327`, "keep tailnet to sshd only", which opened TCP 22 on `tailscale0` and nothing else. That rule is how the change was found: a service the agent started on `<tailnet-ip>:5137` could not be reached from the Mac over the tailnet, because `nixos-fw` dropped every port but 22 on `tailscale0`. The decision is the operator's: reaching the box's services over the tailnet with no further setup is worth more than a second filter behind the ACL.
+`tailscale0` is a trusted interface (`networking.firewall.trustedInterfaces = [ "tailscale0" ]`), so `nixos-fw` accepts everything that arrives on it. The tailnet ACL, not the box, decides who gets in. This replaces the rule of commit `80f8327`, "keep tailnet to sshd only", which opened TCP 22 on `tailscale0` and nothing else. That rule is how the change was found: a service the agent started on `<tailnet-ip>:5137` could not be reached from the host over the tailnet, because `nixos-fw` dropped every port but 22 on `tailscale0`. The decision is the operator's: reaching the box's services over the tailnet with no further setup is worth more than a second filter behind the ACL.
 
 What trusting the interface opens, all of it to whatever the ACL admits:
 
@@ -14,7 +14,7 @@ What trusting the interface opens, all of it to whatever the ACL admits:
 - tailscaled's peerAPI listeners on the tailnet addresses;
 - every rootless podman port published on `0.0.0.0` (see [nix/podman.nix](podman.nix)), because a wildcard bind also answers on `tailscale0`.
 
-Other nodes the ACL admits, such as other yolobox VMs, each running their own agents, reach all of it. Tighten the ACL, not the box, to narrow that.
+Other nodes the ACL admits, such as other yolobox VMs, each running their own agents, reach all of it. Tighten the ACL, not the box, to narrow that. The other direction is the same: the egress table accepts everything that leaves by `tailscale0`, so a host that is a tailnet node is reachable from the box unless the ACL forbids it (see [The tailnet is an entrance](egress.md#the-tailnet-is-an-entrance)).
 
 The enp0s1 side is unchanged: `nixos-fw` opens only TCP 22 there (see [sshd on two interfaces](#sshd-on-two-interfaces)), and the tunnel's UDP 41641 stays open through `services.tailscale.openFirewall = true`.
 
@@ -24,7 +24,7 @@ Recognise the setup with `sudo iptables -S INPUT | head -3`, which must show no 
 
 ## sshd on two interfaces
 
-`nix/base.nix` sets `services.openssh.openFirewall = false`, so NixOS opens no port for sshd by default. sshd is reachable on exactly two interfaces: `tailscale0`, which is trusted whole (see [Firewall](#firewall); sshd takes keys only, see [Two accounts](../docs/accounts.md#two-accounts)), and `enp0s1`, where `nix/base.nix` opens port 22 and nothing else. `enp0s1` is lima's NAT network, 192.168.5.15. The gateway 192.168.5.2 is the Mac, and nothing on the LAN can reach that subnet. The per-interface list is declarative and works on the iptables and nftables backends alike. An earlier approach, an `ip46tables ... -j DROP` in `extraCommands` plus an assertion against nftables, did not.
+`nix/base.nix` sets `services.openssh.openFirewall = false`, so NixOS opens no port for sshd by default. sshd is reachable on exactly two interfaces: `tailscale0`, which is trusted whole (see [Firewall](#firewall); sshd takes keys only, see [Two accounts](../docs/accounts.md#two-accounts)), and `enp0s1`, where `nix/base.nix` opens port 22 and nothing else. `enp0s1` is lima's NAT network, 192.168.5.15. The gateway 192.168.5.2 is the host, and nothing on the LAN can reach that subnet. The per-interface list is declarative and works on the iptables and nftables backends alike. An earlier approach, an `ip46tables ... -j DROP` in `extraCommands` plus an assertion against nftables, did not.
 
 The `enp0s1` rule exists because lima's hostagent can reach the guest's sshd over TCP on that address. Its readiness wait polls 192.168.5.15:22 before `limactl start` reports the instance up, and its usernet forwarder dials the same address. Under limactl 2.2.1 the hostagent takes one of two paths at start.
 
@@ -42,9 +42,9 @@ tailscaled's own ssh server, which `tailscale up --ssh` would start, authorises 
 Checks in the VM:
 
 - `sudo iptables -S nixos-fw | grep 'dport 22'` must show exactly one accept, with `-i enp0s1`. The tailnet needs none, because `tailscale0` jumps to `nixos-fw-accept` before the port rules.
-- `ss -a --vsock | grep ':22'` shows `v_str LISTEN *:22` whenever ssh rides vsock. The operator's sessions then appear as `ESTAB 3:22 <-> 2:*` (CID 2 is the host), and `ss -tan` shows no established connection on port 22 during a `yo ssh`. The Mac's `127.0.0.1:60022` (`ssh.localPort`) is the hostagent's listener on the Mac side.
+- `ss -a --vsock | grep ':22'` shows `v_str LISTEN *:22` whenever ssh rides vsock. The operator's sessions then appear as `ESTAB 3:22 <-> 2:*` (CID 2 is the host), and `ss -tan` shows no established connection on port 22 during a `yo ssh`. The host's `127.0.0.1:60022` (`ssh.localPort`) is the hostagent's listener on the host side.
 
-Checks from a tailnet device: `ssh <user>@yolobox.<tailnet>.ts.net` must reach sshd and offer keys, and a password prompt is a bug. a service the agent binds on a wildcard address, say `python3 -m http.server 8080`, must answer `curl http://yolobox.<tailnet>.ts.net:8080`. The tailnet ACLs for the node are not reviewed (see `TODO.md`).
+Checks from a tailnet device: `ssh <user>@yolobox.<tailnet>.ts.net` must reach sshd and offer keys, and a password prompt is a bug. A service the agent binds on a wildcard address, say `python3 -m http.server 8080`, must answer `curl http://yolobox.<tailnet>.ts.net:8080`. The tailnet ACLs for the node are not reviewed (see `TODO.md`).
 
 ## tailscaled-set
 
@@ -54,7 +54,7 @@ A changed `extraSetFlags` has to reach the running box on `switch`, and for a wh
 
 ## DNS and logging
 
-`--accept-dns=false` stops MagicDNS from taking over `/etc/resolv.conf`. At tailscale's default the guest's DNS would answer through the tailnet's resolver for every name, not only `*.ts.net`. That would silently change what every other process in the box resolves, including the Mac's own DNS filter that the AWS setup relies on staying in place (see [The DNS sinkhole](../docs/host-network.md#the-dns-sinkhole)). The box's own name is still reachable as `yolobox.<tailnet>.ts.net`, because MagicDNS runs on the client end of a tailnet connection, never in this guest's resolver.
+`--accept-dns=false` stops MagicDNS from taking over `/etc/resolv.conf`. At tailscale's default the guest's DNS would answer through the tailnet's resolver for every name, not only `*.ts.net`. That would silently change what every other process in the box resolves, including the host's own DNS filter that the AWS setup relies on staying in place (see [The DNS sinkhole](../docs/host-network.md#the-dns-sinkhole)). The box's own name is still reachable as `yolobox.<tailnet>.ts.net`, because MagicDNS runs on the client end of a tailnet connection, never in this guest's resolver.
 
 `disableUpstreamLogging = true` sets `TS_NO_LOGS_NO_SUPPORT=true` on tailscaled. The node uploads no logs to log.tailscale.com, and for the same reason Tailscale support will not help with this node. It is working when `yo ssh journalctl -u tailscaled -b` shows `You have disabled logging`. It takes effect on the next switch, because the variable sits in the unit's environment and a changed unit makes the switch restart tailscaled.
 
@@ -66,10 +66,10 @@ The peer in the short form `[+1OFL]` is the first five characters of the base64 
 
 Measured on a live box: 706 such lines in 3.7 hours (about three a minute), roughly 100 bytes each. That is about 0.04 percent of the journal's size. The 2.8 GiB journal is container output (see TODO.md), so the line is noise in `journalctl -u tailscaled` and not a disk problem. Rules out, in turn:
 
-- The Mac's own Tailscale node as the peer: it appeared twice in the whole boot.
-- The UDP 41641 collision in [lima/yolobox.md](../lima/yolobox.md#guest-udp-is-never-mirrored): that is lima's mirror on the Mac's loopback, which no packet of tailscaled's takes.
+- The host's own Tailscale node as the peer: it appeared twice in the whole boot.
+- The UDP 41641 collision in [lima/yolobox.md](../lima/yolobox.md#guest-udp-is-never-mirrored): that is lima's mirror on the host's loopback, which no packet of tailscaled's takes.
 
-What decides whether a direct path exists is outside this repo. The box reaches the internet through lima's NAT on the Mac, so a peer can use only addresses the Mac's network lets through. One cause was found and it is on the Mac: a VPN that disconnects leaves lima's UDP flows bound to the VPN's vanished address, tailscaled's UDP then goes nowhere, and netcheck logs `UDP is blocked, trying HTTPS` every 25 seconds. That is described in [docs/host-network.md](../docs/host-network.md#a-vpn-that-disconnects-leaves-udp-flows-stuck). Clearing it needs a host agent restart on the Mac, so no setting in the guest could.
+What decides whether a direct path exists is outside this repo. The box reaches the internet through lima's NAT on the host, so a peer can use only addresses the host's network lets through. One cause was found and it is on the host: a VPN that disconnects leaves lima's UDP flows bound to the VPN's vanished address, tailscaled's UDP then goes nowhere, and netcheck logs `UDP is blocked, trying HTTPS` every 25 seconds. That is described in [docs/host-network.md](../docs/host-network.md#a-vpn-that-disconnects-leaves-udp-flows-stuck). Clearing it needs a host agent restart, so no setting in the guest could.
 
 tailscaled has no switch for this line, and its verbosity flags only add lines. So `nix/tailscale.nix` sets `LogFilterPatterns` on the unit to drop exactly `via=derp`, a mitigation and not a fix. systemd's journald applies it to the unit's stream, so it also holds for tailscaled's stderr. The `via=direct` line, `now using` (the path change) and `endpoints changed` all stay, because they report events. `TestTailscaledLogFilter` checks the pattern against real lines. Drop the setting if tailscale ever ratelimits or demotes the line. To see the relayed state without it, use `tailscale status` (`relay "..."` and no `direct`) or `tailscale ping <node>`, which answers `via DERP(...)` or `via <ip:port>`.
 

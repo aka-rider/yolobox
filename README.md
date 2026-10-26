@@ -12,8 +12,8 @@ A development sanbox virtual machine. It's a NixOS Linux run by Lima.
 
 - The agent runs as its own user with no `sudo`. The filesystem is airgaped. Files move only through git, scp, or rsync.
 - The VM can use your 1Password SSH agent. You must approve the access (TouchID or similarly).
-- The VM reaches the internet, but not your computer or your local network. To let it reach a network, name it in `/etc/yolobox/local.nix`, for example `yolobox.network.lanAllow = [ "192.168.1.0/24" ];`.
-- Open VM ports are mapped on the host (you can open `http://localhost:3000` directly in your browser)
+- The VM reaches the internet, but not your computer or your local network. To let it reach one address, such as a package cache on your LAN, name it in `/etc/yolobox/local.nix`, for example `yolobox.network.lanAllow = [ "192.168.1.20/32" ];`. The one door the VM does not close is Tailscale: if your computer is on your tailnet, the tailnet's access policy decides whether the VM can reach it, so write a policy that keeps the VM away from it.
+- Open VM ports from 1024 to 49151 are mapped on the host, except a few login-callback ports such as 8085 (you can open `http://localhost:3000` directly in your browser)
 
 
 ## Quickstart
@@ -116,7 +116,7 @@ yo ssh sudo tailscale up
 
 Tailscale is optional. Without it nothing changes, and `yo status` just says the VM is not logged in.
 
-Once the VM is on a tailnet, every service in it is reachable at its tailnet address (`yo ssh tailscale ip -4`), by whatever the tailnet's access policy admits. Without a tailnet, make the service listen on `0.0.0.0` and open `localhost:<port>` on the host.
+Once the VM is on a tailnet, every service in it is reachable at its tailnet address (`yo ssh tailscale ip -4`), by whatever the tailnet's access policy admits. Without a tailnet, make the service listen on `0.0.0.0` and open `localhost:<port>` on the host (ports 1024 to 49151 only, minus a few login-callback ports).
 
 ### Devbox
 
