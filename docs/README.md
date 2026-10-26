@@ -29,6 +29,7 @@ Sibling `.md` files are safe to add. No package installs them: `nix/pkgs/yolobox
 | [../nix/harnesses.md](../nix/harnesses.md) | The `claude` launcher, the version keeper, install phases, pi, the plugins, lingering, and herdr's pi integration. |
 | [../nix/herd-server.md](../nix/herd-server.md) | The VM's own herdr server, machine panes, capability gating, `HERDR_AGENT`, and host keys for the `yolobox` alias. |
 | [../nix/display.md](../nix/display.md) | The virtual display, browsers, the Playwright output hook, the clipboard, and lessons learned. |
+| [../nix/podman.md](../nix/podman.md) | Container output and podman's events kept out of the journal: the 2.8 GiB incident, the log driver, the events logger, the journald cap, how to recognise a flood, and what an old container keeps. |
 | [../nix/t3.md](../nix/t3.md) | The vendor-installed t3code unit and its drop-in, service status, version pruning, pairing, and log noise. |
 | [../nix/killswitch.md](../nix/killswitch.md) | The optional kill switch: opting in through `/etc/yolobox/local.nix`, its nft table and why it has no stop hook, how it fails closed, DNS over the tailnet, the exit node, and `/etc/yolobox/network.json`. |
 | [../nix/tailscale.md](../nix/tailscale.md) | The tailnet: firewall, sshd on two interfaces, `tailscaled-set`, DNS and logging, relayed-contact log lines, login, the exit node, serve readiness, box-local routes. |

@@ -93,6 +93,15 @@ jobs:
           --option allow-import-from-derivation false
           .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
 
+      # containersConf.settings is freeform toml, so a misspelled key
+      # evaluates fine and silently sends container output back to the
+      # journal (nix/podman.md).
+      - name: Check container logs stay out of the journal
+        run: |
+          settings=.#nixosConfigurations.yolobox.config.virtualisation.containers.containersConf.settings
+          test "$(nix eval --impure --raw "$settings.containers.log_driver")" = k8s-file
+          test "$(nix eval --impure --raw "$settings.engine.events_logger")" = file
+
       - name: Evaluate nixosConfigurations.yolobox with the kill switch
         run: >
           nix eval --impure --raw

@@ -619,6 +619,32 @@ class TestTailscaledLogFilter(unittest.TestCase):
                 self.assertNotRegex(line, self.pattern())
 
 
+class TestContainerOutputStaysOutOfTheJournal(unittest.TestCase):
+    """2.8 GiB of journal came from compose healthchecks (nix/podman.md)."""
+
+    PODMAN_NIX = REPO / "nix" / "podman.nix"
+    BASE_NIX = REPO / "nix" / "base.nix"
+
+    def test_containers_log_to_capped_files_not_to_the_journal(self):
+        code = nix_code(self.PODMAN_NIX)
+        self.assertIn('log_driver = "k8s-file"', code)
+        self.assertRegex(code, r"log_size_max\s*=\s*\d")
+
+    def test_podman_events_stay_out_of_the_journal(self):
+        self.assertIn('events_logger = "file"', nix_code(self.PODMAN_NIX))
+
+    def test_journald_has_a_size_cap(self):
+        self.assertRegex(
+            nix_code(self.BASE_NIX),
+            r'services\.journald\.settings\.Journal\.SystemMaxUse\s*=\s*"\d+[KMG]"',
+        )
+
+    def test_no_module_uses_the_removed_journald_extraconfig(self):
+        for path in sorted((REPO / "nix").rglob("*.nix")):
+            with self.subTest(file=path.name):
+                self.assertNotIn("services.journald.extraConfig", nix_code(path))
+
+
 class TestHomeLinksBelongToTheirUser(unittest.TestCase):
     """tmpfiles makes an L line's link root-owned unless the line names a user."""
 

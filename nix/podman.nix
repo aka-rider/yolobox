@@ -5,6 +5,19 @@
     dockerCompat = true;
   };
 
+  # A container's stdout and podman's own healthcheck events must not land in
+  # the journal: a compose stack with 2-second healthchecks wrote 2.4 M lines
+  # (2.8 GiB) in two days. k8s-file keeps `podman logs` working, bounded per
+  # container and deleted with it; the file events logger keeps
+  # `podman events` working without journald. See nix/podman.md.
+  virtualisation.containers.containersConf.settings = {
+    containers = {
+      log_driver = "k8s-file";
+      log_size_max = 10 * 1024 * 1024;
+    };
+    engine.events_logger = "file";
+  };
+
   # Rootless-only: no dockerSocket.enable, no podman group (would grant
   # root-equivalent access and split storage from the rootless CLI).
   systemd.user.sockets.podman.wantedBy = [ "sockets.target" ];

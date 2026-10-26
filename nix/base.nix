@@ -100,6 +100,11 @@ in
   # default cap is 10% of the filesystem, ~40G here. `yo gc --yes` empties it.
   systemd.coredump.settings.Coredump.MaxUse = "1G";
 
+  # journald's default cap is 10% of the disk, at most 4 GiB, so nothing
+  # bounded a flood below that. This is the backstop for every emitter; the
+  # fix for container output is in nix/podman.nix (story: nix/podman.md).
+  services.journald.settings.Journal.SystemMaxUse = "512M";
+
   services.lima.enable = true;
   # nixos-lima declares lima-init and lima-guestagent as ordinary NixOS
   # units, so a nixpkgs bump alone rehashes the store paths their
