@@ -1,4 +1,9 @@
 target-version = "py39"
+# The one ruff version this repo is checked with. ruff refuses to run on any
+# other, so CI and the guest cannot disagree: 0.17 formats a line that 0.16
+# leaves alone. verify.yml installs this same version (a test keeps them equal);
+# CLAUDE.md gives the guest command.
+required-version = "==0.17.2"
 # yo and aws-broker carry no .py suffix, so a bare `ruff check` skips both and
 # the workflow would pass while linting nothing.
 extend-include = ["yo", "aws-broker"]

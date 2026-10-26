@@ -126,11 +126,16 @@ Tests, all under `tests/`:
 
 ```sh
 python3 -m unittest discover -s tests        # CI runs 3.9 and the newest 3.x
-ruff check . && ruff format --check .
+uvx ruff@0.17.2 check . && uvx ruff@0.17.2 format --check .   # see below
 shellcheck -S warning nix/guest/yolobox-guest.sh
 YOLOBOX_USERNAME=$(id -un) nix flake check --impure
 ```
 
+- `ruff.toml` pins `required-version`, and `verify.yml` installs that same
+  version, so ruff refuses to run on any other. The guest's nixpkgs ruff is
+  older (0.16) and formats differently. In the guest, run the pinned one with
+  `nix shell nixpkgs#uv -c uvx ruff@0.17.2 format --check .` from a copy of the
+  tree. To bump it, change `ruff.toml`, `verify.yml` and these commands together.
 - Python 3.9 is the floor because the Mac's Xcode Python is 3.9. The Mac
   usually has no nix, so check Nix changes inside the guest.
 - `nix/base.nix` imports `/etc/yolobox/local.nix` when it exists, so a flake

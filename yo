@@ -2019,9 +2019,12 @@ def tailscale_status_line(stdout: str, stderr: str) -> str:
             " — then: " + TAILSCALE_SERVE_RESTART
         )
     if backend != "Running":
-        return "tailscale: WARNING %s — fix with: yo ssh sudo tailscale up, then: %s" % (
-            backend,
-            TAILSCALE_SERVE_RESTART,
+        return (
+            "tailscale: WARNING %s — fix with: yo ssh sudo tailscale up, then: %s"
+            % (
+                backend,
+                TAILSCALE_SERVE_RESTART,
+            )
         )
     try:
         serve = json.loads(serve_json)

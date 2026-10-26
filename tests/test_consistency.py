@@ -584,3 +584,19 @@ class TestHomeLinksBelongToTheirUser(unittest.TestCase):
         for path in sorted((REPO / "nix").rglob("*.nix")):
             with self.subTest(file=path.name):
                 self.assertIsNone(unowned.search(nix_code(path)))
+
+
+class TestRuffVersionIsPinnedOnce(unittest.TestCase):
+    def test_verify_workflow_installs_the_version_ruff_toml_requires(self):
+        required = re.search(
+            r'^required-version = "==([\d.]+)"$',
+            (REPO / "ruff.toml").read_text(),
+            re.M,
+        )
+        installed = re.findall(
+            r'^\s+version: "([\d.]+)"$',
+            (REPO / ".github" / "workflows" / "verify.yml").read_text(),
+            re.M,
+        )
+        self.assertIsNotNone(required)
+        self.assertEqual(installed, [required.group(1)] * 2)
