@@ -87,7 +87,6 @@
           ./nix/agentic.nix
           ./nix/lsp.nix
           ./nix/guest.nix
-          ./nix/killswitch.nix
           ./nix/tailscale.nix
         ];
       };

@@ -9,7 +9,6 @@ only where GNU find's `-printf` exists (CI, the guest): the other subcommands
 (`projects`, `gc-machine`) use it or sudo too.
 """
 
-import json
 import os
 import shutil
 import subprocess
@@ -575,310 +574,13 @@ class TestGcUserDeep(GuestScript):
         self.assertEqual(cleans, ["cargo %s clean" % root])
 
 
-# `id -u` is the only thing these stubs fake: the root check needs a choice,
-# and the real id answers everything else.
-REAL_ID = shutil.which("id")
-FAKE_ID = (
-    "#!/bin/sh\n"
-    'if [ "$1" = -u ]; then printf \'%s\\n\' "$FAKE_UID"; else exec "'
-    + REAL_ID
-    + '" "$@"; fi\n'
-)
-
-FAKE_TAILSCALE = """#!/bin/sh
-printf '%s' "$FAKE_TS_JSON"
-printf '%s' "$FAKE_TS_ERR" >&2
-exit "$FAKE_TS_RC"
-"""
-
-FAKE_NFT = """#!/bin/sh
-printf '%s' "$FAKE_NFT_ERR" >&2
-exit "$FAKE_NFT_RC"
-"""
-
-EXIT1_ONLINE = {"ID": "n-exit1", "Online": True, "TailscaleIPs": ["100.101.102.103"]}
-
-
-def tailnet_node(host, *, selected=False):
-    return {
-        "HostName": host,
-        "DNSName": host + ".example-tailnet.ts.net.",
-        "ExitNode": selected,
-        "ExitNodeOption": True,
-    }
-
-
-def tailscale_status(backend="Running", peers=(), exit_status=None):
-    document = {
-        "BackendState": backend,
-        "Peer": {"nodekey:%d" % i: peer for i, peer in enumerate(peers)},
-    }
-    if exit_status is not None:
-        document["ExitNodeStatus"] = exit_status
-    return json.dumps(document)
-
-
 FAKE_TIMEOUT = """#!/bin/sh
 printf '%s\n' "$@" > "$FAKE_TIMEOUT_ARGV"
 exit "$FAKE_TIMEOUT_RC"
 """
 
-# Documents that are not the one shape NETWORK_STATE accepts: a non-empty
-# exitNode string and no other key. Nix writes the file only for a box that
-# names an exit node, so null is damage too.
-DAMAGED_STATE_DOCUMENTS = (
-    "",
-    "not json",
-    "null",
-    "[]",
-    '"exit1"',
-    "{}",
-    '{"exitNode": 7}',
-    '{"exitNode": null}',
-    '{"exitNode": ""}',
-    '{"exitNode": "exit1", "killSwitch": true}',
-    '{"killSwitch": true, "exitNode": "exit1"}',
-)
 
-
-class TestEgressStatus(GuestScript):
-    def setUp(self):
-        super().setUp()
-        bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
-        for name, body in (
-            ("id", FAKE_ID),
-            ("tailscale", FAKE_TAILSCALE),
-            ("nft", FAKE_NFT),
-        ):
-            stub = bin_dir / name
-            stub.write_text(body)
-            stub.chmod(0o755)
-        self.state = self.tmp / "network.json"
-        self.write_state({"exitNode": "exit1"})
-        self.env.update(
-            YOLOBOX_NETWORK_STATE=str(self.state),
-            FAKE_UID="0",
-            FAKE_TS_JSON=tailscale_status(
-                peers=[tailnet_node("exit1", selected=True)],
-                exit_status=EXIT1_ONLINE,
-            ),
-            FAKE_TS_RC="0",
-            FAKE_TS_ERR="",
-            FAKE_NFT_RC="0",
-            FAKE_NFT_ERR="",
-        )
-
-    def write_state(self, document):
-        text = document if isinstance(document, str) else json.dumps(document)
-        self.state.write_text(text)
-
-    def egress(self, **fakes):
-        return self.run_script("egress-status", extra_env=fakes)
-
-    def assert_one_line(self, result):
-        self.assertEqual(len(result.stdout.splitlines()), 1, result.stdout)
-
-    def test_a_box_with_no_state_file_did_not_opt_in_and_exits_zero_neutrally(self):
-        self.state.unlink()
-        result = self.egress()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("kill switch not enabled", result.stdout)
-        self.assertNotIn("BLOCKED", result.stdout)
-        self.assertNotIn("WARNING", result.stdout)
-        self.assert_one_line(result)
-
-    def test_egress_is_ok_through_the_desired_exit_node_with_the_kill_switch_armed(
-        self,
-    ):
-        result = self.egress()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            result.stdout,
-            "egress: ok — via exit node exit1; kill switch: armed\n",
-        )
-
-    def test_configuration_that_is_right_but_a_probe_that_fails_is_blocked_with_the_policy_hint(
-        self,
-    ):
-        # curl exit 6: could not resolve or reach the host.
-        result = self.egress(FAKE_CURL_RC="6")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(
-            result.stdout,
-            "egress: BLOCKED — desired: internet via exit node exit1; actual: "
-            "exit1 selected and online, but traffic does not get through (probe "
-            "https://github.com failed). Fix: check the tailnet policy grants this "
-            "node autogroup:internet via exit1\n",
-        )
-
-    def test_a_probe_that_times_out_is_blocked_never_ok(self):
-        # curl exit 28: the --max-time bound ran out, the blackhole case.
-        result = self.egress(FAKE_CURL_RC="28")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("BLOCKED", result.stdout)
-        self.assertNotIn("egress: ok", result.stdout)
-        self.assert_one_line(result)
-
-    def test_a_probe_tool_that_cannot_run_is_blocked_never_ok(self):
-        # The shell's "command not found" exit: the probe could not run at all.
-        result = self.egress(FAKE_CURL_RC="127")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("BLOCKED", result.stdout)
-        self.assertNotIn("egress: ok", result.stdout)
-
-    def test_the_probe_is_bounded_by_its_timeout_constant(self):
-        self.egress()
-        self.assertEqual(
-            self.curl_argv.read_text().split("\n"),
-            ["-sS", "-o", "/dev/null", "--max-time", "5", "https://github.com", ""],
-        )
-
-    def test_net_check_and_egress_status_send_the_same_probe(self):
-        # The probe is one function, so the two subcommands cannot judge it differently.
-        self.run_script("net-check", "8080")
-        net_check_argv = self.curl_argv.read_text()
-        self.curl_argv.unlink()
-        self.egress()
-        self.assertEqual(self.curl_argv.read_text(), net_check_argv)
-
-    def test_a_missing_kill_switch_table_is_a_warning_that_exits_two(self):
-        result = self.egress(
-            FAKE_NFT_RC="1", FAKE_NFT_ERR="Error: No such file or directory\n"
-        )
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("WARNING kill switch not armed", result.stdout)
-        self.assertIn(
-            "Fix: yo ssh sudo systemctl start yolobox-killswitch", result.stdout
-        )
-        self.assert_one_line(result)
-
-    def test_without_root_the_table_is_unknown_and_egress_is_still_judged(self):
-        result = self.egress(
-            FAKE_UID="501",
-            FAKE_NFT_RC="1",
-            FAKE_NFT_ERR="Error: No such file or directory\n",
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("kill switch: unknown (needs root)", result.stdout)
-
-    def test_an_nft_failure_that_is_not_a_missing_table_is_unknown_not_absent(self):
-        result = self.egress(
-            FAKE_NFT_RC="1",
-            FAKE_NFT_ERR="Error: Could not process rule: Operation not permitted\n",
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            "kill switch: unknown (nft: Error: Could not process rule: "
-            "Operation not permitted)",
-            result.stdout,
-        )
-        self.assertNotIn("WARNING", result.stdout)
-
-    def test_a_state_file_of_any_other_shape_is_blocked_not_read_as_no_exit_node(
-        self,
-    ):
-        for document in DAMAGED_STATE_DOCUMENTS:
-            with self.subTest(document=document):
-                self.write_state(document)
-                result = self.egress()
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn("BLOCKED — desired state unreadable", result.stdout)
-                self.assertIn("Fix: yo bootstrap", result.stdout)
-                self.assert_one_line(result)
-
-    def test_tailscale_that_is_not_running_is_blocked_naming_the_backend(self):
-        result = self.egress(FAKE_TS_JSON=tailscale_status(backend="NeedsLogin"))
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("actual: tailscale is NeedsLogin", result.stdout)
-        self.assertIn("Fix: yo ssh sudo tailscale up", result.stdout)
-
-    def test_a_tailscale_that_cannot_answer_is_blocked_with_its_stderr_and_a_restart(
-        self,
-    ):
-        result = self.egress(
-            FAKE_TS_RC="1", FAKE_TS_ERR="failed to connect to local tailscaled\n"
-        )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("failed to connect to local tailscaled", result.stdout)
-        self.assertIn("Fix: yo ssh sudo systemctl restart tailscaled", result.stdout)
-        self.assert_one_line(result)
-
-    def test_tailscale_output_that_is_not_status_json_is_blocked_as_unreadable(self):
-        for output in ("", "garbage", "[]"):
-            with self.subTest(output=output):
-                result = self.egress(FAKE_TS_JSON=output)
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn("tailscale status unreadable", result.stdout)
-                self.assert_one_line(result)
-
-    def test_no_exit_node_selected_is_blocked_with_the_restart_of_the_exit_node_unit(
-        self,
-    ):
-        result = self.egress(
-            FAKE_TS_JSON=tailscale_status(peers=[tailnet_node("exit1")])
-        )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(
-            result.stdout,
-            "egress: BLOCKED — desired: internet via exit node exit1; actual: none selected. "
-            "Fix: yo ssh sudo systemctl restart yolobox-tailscale-exit-node\n",
-        )
-
-    def test_a_different_exit_node_selected_names_both_the_actual_and_the_desired(
-        self,
-    ):
-        peers = [tailnet_node("exit1"), tailnet_node("exit2", selected=True)]
-        result = self.egress(
-            FAKE_TS_JSON=tailscale_status(peers=peers, exit_status=EXIT1_ONLINE)
-        )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("desired: internet via exit node exit1", result.stdout)
-        self.assertIn("actual: exit2 selected", result.stdout)
-        self.assertIn(
-            "Fix: yo ssh sudo systemctl restart yolobox-tailscale-exit-node",
-            result.stdout,
-        )
-
-    def test_a_selected_exit_node_that_is_offline_is_blocked(self):
-        offline = {"ID": "n-exit1", "Online": False, "TailscaleIPs": []}
-        for exit_status in (None, offline):
-            with self.subTest(exit_status=exit_status):
-                result = self.egress(
-                    FAKE_TS_JSON=tailscale_status(
-                        peers=[tailnet_node("exit1", selected=True)],
-                        exit_status=exit_status,
-                    )
-                )
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("actual: exit1 selected but offline", result.stdout)
-
-    def test_a_desired_node_missing_from_the_tailnet_is_blocked_by_name(self):
-        documents = (
-            tailscale_status(peers=[tailnet_node("exit2")]),
-            tailscale_status(peers=[]),
-            '{"BackendState": "Running"}',
-        )
-        for document in documents:
-            with self.subTest(document=document):
-                result = self.egress(FAKE_TS_JSON=document)
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("no node named exit1 in the tailnet", result.stdout)
-
-    def test_the_desired_node_is_matched_by_the_first_label_of_its_dns_name(self):
-        peer = {
-            "HostName": "Exit1-Box",
-            "DNSName": "exit1.example-tailnet.ts.net.",
-            "ExitNode": True,
-            "ExitNodeOption": True,
-        }
-        result = self.egress(
-            FAKE_TS_JSON=tailscale_status(peers=[peer], exit_status=EXIT1_ONLINE)
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("via exit node exit1", result.stdout)
-
-
-class TestNetCheckProbesTheGatewayOnlyWithoutTheKillSwitch(GuestScript):
+class TestNetCheckSkipsTheGatewayProbeOnlyWhenTheBoxBlocksIt(GuestScript):
     def setUp(self):
         super().setUp()
         bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
@@ -886,10 +588,10 @@ class TestNetCheckProbesTheGatewayOnlyWithoutTheKillSwitch(GuestScript):
         timeout.write_text(FAKE_TIMEOUT)
         timeout.chmod(0o755)
         self.probe_argv = self.tmp / "timeout-argv"
-        self.state = self.tmp / "network.json"
+        self.blocked = self.tmp / "gateway-blocked"
         self.env.update(
             FAKE_TIMEOUT_ARGV=str(self.probe_argv),
-            YOLOBOX_NETWORK_STATE=str(self.state),
+            YOLOBOX_GATEWAY_BLOCKED=str(self.blocked),
         )
 
     def net_check(self, *, curl_rc=0, probe_rc=0):
@@ -900,7 +602,7 @@ class TestNetCheckProbesTheGatewayOnlyWithoutTheKillSwitch(GuestScript):
             extra_env={"FAKE_TIMEOUT_RC": str(probe_rc)},
         )
 
-    def test_without_a_state_file_the_gateway_is_probed_on_the_port(self):
+    def test_without_the_marker_the_gateway_is_probed_on_the_port(self):
         result = self.net_check(probe_rc=0)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "egress=ok\ngateway=ok\n")
@@ -914,21 +616,10 @@ class TestNetCheckProbesTheGatewayOnlyWithoutTheKillSwitch(GuestScript):
         result = self.net_check(curl_rc=6, probe_rc=0)
         self.assertEqual(result.stdout, "egress=dead\ngateway=ok\n")
 
-    def test_a_kill_switch_box_skips_the_gateway_probe_without_running_it(self):
-        self.state.write_text('{"exitNode": "exit1"}')
+    def test_a_box_with_the_marker_skips_the_gateway_probe_without_running_it(self):
+        self.blocked.write_text("")
         result = self.net_check(probe_rc=0)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "egress=ok\ngateway=skipped\n")
         self.assertEqual(result.stderr, "")
         self.assertFalse(self.probe_argv.exists())
-
-    def test_a_damaged_state_file_still_skips_the_probe_and_warns_on_stderr(self):
-        for document in DAMAGED_STATE_DOCUMENTS:
-            with self.subTest(document=document):
-                self.state.write_text(document)
-                result = self.net_check(probe_rc=0)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, "egress=ok\ngateway=skipped\n")
-                self.assertIn(str(self.state), result.stderr)
-                self.assertIn("unreadable", result.stderr)
-                self.assertFalse(self.probe_argv.exists())

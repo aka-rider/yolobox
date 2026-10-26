@@ -226,14 +226,6 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         include_patcher.start()
         self.addCleanup(include_patcher.stop)
 
-        egress_patcher = mock.patch.object(
-            yo,
-            "egress_check",
-            return_value=yo.EgressCheck(yo.EgressOutcome.OK, "egress: ok"),
-        )
-        egress_patcher.start()
-        self.addCleanup(egress_patcher.stop)
-
         out_patcher = mock.patch.object(yo, "out")
         out_patcher.start()
         self.addCleanup(out_patcher.stop)
@@ -286,42 +278,6 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         ):
             self.run_bootstrap([("g1", "g0"), ("g1", "g1")])
         self.assertEqual(order, ["passphrase", "stop"])
-
-    def test_a_blocked_egress_is_reported_on_stderr_and_the_rebuild_still_runs(self):
-        blocked = (
-            "egress: BLOCKED — desired: exit node exit1; actual: none selected. "
-            "Fix: yo ssh sudo tailscale set --exit-node=exit1"
-        )
-        with mock.patch.object(
-            yo,
-            "egress_check",
-            return_value=yo.EgressCheck(yo.EgressOutcome.BLOCKED, blocked),
-        ):
-            self.run_bootstrap([("g1", "g1")])
-        self.assertIn(blocked, [call.args[0] for call in yo.err.call_args_list])
-        self.assertTrue(
-            any("nixos-rebuild" in call.args[1] for call in yo.ssh_run.call_args_list)
-        )
-
-    def test_a_box_that_cannot_answer_prints_nothing_on_stderr(self):
-        # A fresh VM has no helper before its first bootstrap.
-        note = "egress: not checked — the box has no yolobox-guest"
-        with mock.patch.object(
-            yo,
-            "egress_check",
-            return_value=yo.EgressCheck(yo.EgressOutcome.NOT_CHECKED, note),
-        ):
-            self.run_bootstrap([("g1", "g1")])
-        self.assertNotIn(note, [call.args[0] for call in yo.err.call_args_list])
-
-    def test_a_healthy_egress_prints_nothing_on_stderr(self):
-        with mock.patch.object(
-            yo,
-            "egress_check",
-            return_value=yo.EgressCheck(yo.EgressOutcome.OK, "egress: ok"),
-        ):
-            self.run_bootstrap([("g1", "g1")])
-        self.assertNotIn("egress: ok", [call.args[0] for call in yo.err.call_args_list])
 
     def test_vm_up_brings_the_vm_up_without_services(self):
         self.run_bootstrap([("g1", "g1")])
@@ -1146,9 +1102,6 @@ class TestCmdStatus(unittest.TestCase):
         aws_allowlist_side_effect,
         net_check=None,
         fstype="",
-        egress=yo.EgressCheck(
-            yo.EgressOutcome.OK, "egress: ok — via exit node exit1; kill switch: armed"
-        ),
     ):
         outs = []
         # net_check is either the net-check subprocess result or the YoError
@@ -1185,7 +1138,6 @@ class TestCmdStatus(unittest.TestCase):
             mock.patch.object(yo, "out", side_effect=fake_out),
             mock.patch.object(yo, "err"),
             mock.patch.object(yo, "guest_helper", helper),
-            mock.patch.object(yo, "egress_check", return_value=egress),
         ):
             yo.cmd_status(yo.build_parser().parse_args(["status"]))
         return outs
@@ -1314,65 +1266,6 @@ class TestCmdStatus(unittest.TestCase):
         )
         self.assertIn(yo.network_status_line(yo.NetCheck(True, yo.Gateway.DEAD)), outs)
 
-    def test_a_kill_switch_box_defers_its_network_line_to_the_egress_line(
-        self,
-    ):
-        outs = self.run_status(
-            units_present=True,
-            gaps=[],
-            aws_which=None,
-            aws_allowlist_side_effect=lambda: [],
-            net_check=mock.Mock(
-                returncode=0, stdout="egress=ok\ngateway=skipped\n", stderr=""
-            ),
-        )
-        network = [line for line in outs if line.startswith("network:")]
-        self.assertEqual(
-            network,
-            [
-                "network: judged by the egress line above (kill switch enabled; "
-                "gateway probe skipped by design)"
-            ],
-        )
-
-    def test_an_armed_box_whose_probe_fails_shows_one_egress_verdict(self):
-        blocked = (
-            "egress: BLOCKED — desired: internet via exit node exit1; actual: "
-            "exit1 selected and online, but traffic does not get through (probe "
-            "https://github.com failed). Fix: check the tailnet policy grants this "
-            "node autogroup:internet via exit1"
-        )
-        outs = self.run_status(
-            units_present=True,
-            gaps=[],
-            aws_which=None,
-            aws_allowlist_side_effect=lambda: [],
-            net_check=mock.Mock(
-                returncode=0, stdout="egress=dead\ngateway=skipped\n", stderr=""
-            ),
-            egress=yo.EgressCheck(yo.EgressOutcome.BLOCKED, blocked),
-        )
-        verdicts = [line for line in outs if line.startswith(("egress:", "network:"))]
-        self.assertEqual(
-            verdicts,
-            [
-                blocked,
-                "network: judged by the egress line above (kill switch enabled; "
-                "gateway probe skipped by design)",
-            ],
-        )
-
-    def test_status_prints_the_egress_line_the_guest_answered(self):
-        line = "egress: WARNING kill switch not armed — desired: nft table inet yolobox-killswitch loaded; actual: absent. Fix: yo ssh sudo systemctl start yolobox-killswitch"
-        outs = self.run_status(
-            units_present=True,
-            gaps=[],
-            aws_which=None,
-            aws_allowlist_side_effect=lambda: [],
-            egress=yo.EgressCheck(yo.EgressOutcome.NOT_ARMED, line),
-        )
-        self.assertIn(line, outs)
-
     def test_old_box_without_net_check_reports_not_checked_instead_of_raising(self):
         outs = self.run_status(
             units_present=True,
@@ -1430,105 +1323,20 @@ class TestNetworkStatusLine(unittest.TestCase):
         line = yo.network_status_line(yo.NetCheck(False, yo.Gateway.DEAD))
         self.assertIn("neither the internet nor lima's gateway", line)
 
-    def test_an_armed_box_with_dead_egress_does_not_blame_the_mac_vpn(self):
-        line = yo.network_status_line(yo.NetCheck(False, yo.Gateway.SKIPPED))
-        self.assertIn("judged by the egress line", line)
-        self.assertNotIn("VPN", line)
-        self.assertNotIn("scutil", line)
-        self.assertNotIn("WARNING", line)
-
-
-class TestEgressCheck(unittest.TestCase):
-    LINE = "egress: ok — via exit node exit1; kill switch: armed"
-
-    def check_with(self, **helper_result):
-        with mock.patch.object(yo, "ssh_run") as ssh:
-            ssh.return_value = mock.Mock(**helper_result)
-            return yo.egress_check(), ssh
-
-    def check_against_box(self, helper_result):
-        # The real helper path: only ssh is stubbed. The version probe answers
-        # empty, so the skew note names no version.
-        def answer(role, argv, **kwargs):
-            if argv[0] == "cat":
-                return mock.Mock(returncode=0, stdout="", stderr="")
-            return mock.Mock(**helper_result)
-
-        with (
-            mock.patch.dict(
-                os.environ, {"YOLOBOX_FLAKE": "github:aka-rider/yolobox/t"}
-            ),
-            mock.patch.object(yo, "ssh_run", side_effect=answer),
-        ):
-            return yo.egress_check()
-
-    def test_each_exit_code_of_the_helper_gives_its_outcome_and_line(self):
-        for code, outcome in (
-            (0, yo.EgressOutcome.OK),
-            (1, yo.EgressOutcome.BLOCKED),
-            (2, yo.EgressOutcome.NOT_ARMED),
-        ):
-            with self.subTest(exit_code=code):
-                check, _ = self.check_with(
-                    returncode=code, stdout=self.LINE + "\n", stderr=""
-                )
-                self.assertEqual(check, yo.EgressCheck(outcome, self.LINE))
-
-    def test_the_check_runs_the_helper_as_root_through_sudo_without_a_password_prompt(
-        self,
-    ):
-        _, ssh = self.check_with(returncode=0, stdout=self.LINE + "\n", stderr="")
+    def test_a_blocked_gateway_with_working_egress_says_the_probe_was_skipped(self):
         self.assertEqual(
-            ssh.call_args.args[1],
-            ["sudo", "-n", "--", "yolobox-guest", "egress-status"],
+            yo.network_status_line(yo.NetCheck(True, yo.Gateway.SKIPPED)),
+            "network: ok (lima's gateway probe skipped: this box blocks it by design)",
         )
 
-    def test_a_box_whose_helper_lacks_the_subcommand_is_not_checked_and_names_the_rebuild(
+    def test_a_blocked_gateway_with_dead_egress_warns_without_blaming_the_mac_vpn(
         self,
     ):
-        check = self.check_against_box(
-            dict(
-                returncode=yo.HELPER_NO_SUBCOMMAND,
-                stdout="",
-                stderr="yolobox-guest: unknown subcommand 'egress-status'\n",
-            )
+        self.assertEqual(
+            yo.network_status_line(yo.NetCheck(False, yo.Gateway.SKIPPED)),
+            "network: WARNING guest egress is dead "
+            "(lima's gateway probe skipped: this box blocks it by design)",
         )
-        self.assertEqual(check.outcome, yo.EgressOutcome.NOT_CHECKED)
-        self.assertIn(
-            "the box's yolobox-guest has no 'egress-status' subcommand", check.line
-        )
-        self.assertIn("nixos-rebuild", check.line)
-
-    def test_a_box_without_the_helper_under_sudo_is_not_checked_and_names_the_rebuild(
-        self,
-    ):
-        # sudo, not the shell, reports a missing helper, and exits 1 for it.
-        check = self.check_against_box(
-            dict(
-                returncode=1,
-                stdout="",
-                stderr="sudo: yolobox-guest: command not found\n",
-            )
-        )
-        self.assertEqual(check.outcome, yo.EgressOutcome.NOT_CHECKED)
-        self.assertIn("the box has no yolobox-guest", check.line)
-        self.assertIn("nixos-rebuild", check.line)
-
-    def test_empty_or_multi_line_output_is_not_checked_and_keeps_stderr(self):
-        for stdout in ("", "one\ntwo\n"):
-            with self.subTest(stdout=stdout):
-                check, _ = self.check_with(
-                    returncode=0, stdout=stdout, stderr="sudo: a password is required"
-                )
-                self.assertEqual(check.outcome, yo.EgressOutcome.NOT_CHECKED)
-                self.assertIn("a password is required", check.line)
-
-    def test_an_exit_code_outside_the_contract_is_not_checked(self):
-        check, _ = self.check_with(
-            returncode=139, stdout="", stderr="Segmentation fault"
-        )
-        self.assertEqual(check.outcome, yo.EgressOutcome.NOT_CHECKED)
-        self.assertIn("exit 139", check.line)
 
 
 class FakeStarter:

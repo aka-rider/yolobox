@@ -4,7 +4,7 @@
 # time instead of living in yo's Python string literals where nothing checks
 # them. Subcommands: projects, landing-dir,
 # ensure-repo, generations, gc-machine, gc-user, aws-creds, aws-check,
-# net-check, egress-status.
+# net-check.
 #
 # writeShellApplication prepends `set -o errexit -o nounset -o pipefail`. The
 # gc tiers below were written for a shell with none of that — a cleanup step
@@ -38,17 +38,9 @@ LOCAL_CACHES=(go-build gopls goimports golangci-lint staticcheck uv pip pip-tool
 # What `go` writes as the first line of a build cache's README.
 GO_BUILD_CACHE_HEADER='This directory holds cached build artifacts from the Go build system.'
 
-# The desired egress state, written by Nix only on a box that opted in to the
-# kill switch (see nix/killswitch.md): the exit node, and by its presence the
-# kill switch. A box that did not opt in has no such file. The
-# YOLOBOX_NETWORK_STATE override
-# is a test seam: sudo drops the environment before egress-status runs as root,
-# so nothing on the box can point it elsewhere.
-NETWORK_STATE="${YOLOBOX_NETWORK_STATE:-/etc/yolobox/network.json}"
-
-# The nftables table that enforces the kill switch. nix/killswitch.nix spells
-# the same table; tests/test_consistency.py compares the copies.
-KILL_SWITCH_TABLE=(inet yolobox-killswitch)
+# A box whose local configuration blocks lima's gateway by design creates this
+# file. The YOLOBOX_GATEWAY_BLOCKED override is a test seam.
+GATEWAY_BLOCKED="${YOLOBOX_GATEWAY_BLOCKED:-/etc/yolobox/gateway-blocked}"
 
 # Sets EXPR to a find expression matching any of the given directory names.
 build_expr() {
@@ -732,10 +724,9 @@ cmd_aws_check() {
     [ "${failed}" = 0 ] || exit 1
 }
 
-# The one egress probe, shared by net-check and egress-status so the two cannot
-# disagree about whether traffic gets through. Exits nonzero on every failure:
-# a missing curl (127), a timeout (curl's 28) or a refused fetch. The callers
-# read nonzero as dead, so a probe that cannot run is never a pass.
+# The one egress probe: net-check classifies by it. Exits nonzero on every
+# failure: a missing curl (127), a timeout (curl's 28) or a refused fetch. The
+# caller reads nonzero as dead, so a probe that cannot run is never a pass.
 EGRESS_PROBE_URL=https://github.com
 EGRESS_PROBE_SECONDS=5
 
@@ -754,179 +745,20 @@ cmd_net_check() {
         printf 'yolobox-guest: net-check: usage: net-check PORT (1-65535)\n' >&2
         exit 2
     fi
-    local egress=dead gateway=dead damage
+    local egress=dead gateway=dead
     if probe_egress; then
         egress=ok
     fi
-    # A state file exists only on a box that opted in to the kill switch, which
-    # rejects the gateway by design, so probing it would report a fault that is
-    # not there (docs/mac-network.md). A box without the file is probed as ever.
-    # A damaged file still skips the probe, and the warning says why
-    # egress-status would call it blocked.
-    if [ -e "${NETWORK_STATE}" ]; then
+    # A box whose local configuration blocks the gateway by design marks it
+    # with GATEWAY_BLOCKED, so probing it would report a fault that is not
+    # there (docs/mac-network.md).
+    if [ -e "${GATEWAY_BLOCKED}" ]; then
         gateway=skipped
-        if ! damage="$(desired_exit_node 2>&1 >/dev/null)"; then
-            printf 'yolobox-guest: net-check: %s is unreadable (%s); the gateway probe is skipped all the same\n' \
-                "${NETWORK_STATE}" "$(one_line "${damage:-no output}")" >&2
-        fi
     # bash's /dev/tcp needs no extra dependency; timeout bounds a blackhole.
     elif timeout 3 "${BASH}" -c ': >/dev/tcp/192.168.5.2/'"${port}" 2>/dev/null; then
         gateway=ok
     fi
     printf 'egress=%s\ngateway=%s\n' "${egress}" "${gateway}"
-}
-
-# Flattens a multi-line message from jq, nft or tailscale onto one line, because
-# egress-status prints exactly one.
-one_line() {
-    printf '%s' "${1//$'\n'/ }"
-}
-
-# Prints the exit node NETWORK_STATE names. Fails, with jq's message on stderr,
-# on any file that is not exactly {"exitNode": <host name>}, so a damaged state
-# is reported rather than read as a choice. Nix writes the file only when the
-# box names an exit node, so null is damage too.
-NETWORK_STATE_JQ='
-  if type == "object" and keys == ["exitNode"]
-     and (.exitNode | type) == "string" and (.exitNode | length) > 0
-  then .exitNode
-  else error("expected {\"exitNode\": <host name>} and nothing else") end
-'
-desired_exit_node() {
-    jq -e -r "${NETWORK_STATE_JQ}" "${NETWORK_STATE}"
-}
-
-# One line, "|"-separated (read splits on it even when a field is empty):
-# BackendState, the HostName of the peer matching --arg want by HostName or by
-# the first label of DNSName, the HostName of the peer tailscale routes through,
-# and whether that exit node is online. Peer is an object keyed by node key, so
-# the `[]?` iterates its values, and tolerates a missing Peer.
-# shellcheck disable=SC2016 # jq's $want and $peers are not shell variables.
-TS_FIELDS_JQ='
-  [(.Peer // {})[]?] as $peers
-  | ([$peers[] | select(.HostName == $want or ((.DNSName // "") | split(".")[0]) == $want)]
-      | first | .HostName // "") as $desired
-  | ([$peers[] | select(.ExitNode == true)] | first | .HostName // "") as $selected
-  | [(.BackendState // "unknown"), $desired, $selected,
-     (if (.ExitNodeStatus.Online // false) then "online" else "offline" end)]
-  | join("|")
-'
-
-# Prints the state of KILL_SWITCH_TABLE: armed, absent, or unknown with the
-# reason. Listing a table needs root; an unprivileged `nft` says nothing about
-# the table, so it is reported as unknown rather than as absent.
-kill_switch_table_state() {
-    if [ "$(id -u)" != 0 ]; then
-        printf 'unknown (needs root)'
-        return 0
-    fi
-    local nft_err rc=0
-    nft_err="$(nft list table "${KILL_SWITCH_TABLE[@]}" 2>&1 >/dev/null)" || rc=$?
-    if [ "${rc}" = 0 ]; then
-        printf 'armed'
-    elif [[ "${nft_err}" == *"No such file or directory"* ]]; then
-        printf 'absent'
-    else
-        printf 'unknown (nft: %s)' "$(one_line "${nft_err}")"
-    fi
-}
-
-# Prints the one-line verdict for a blocked egress: what is wanted, what is
-# there, and the command that changes it. The caller returns 1.
-egress_blocked() {
-    printf 'egress: BLOCKED — desired: %s; actual: %s. Fix: %s\n' "$1" "$2" "$3"
-}
-
-# Reports whether egress leaves the box the way the desired state says, and
-# whether the probe gets through. Exit codes, shared with yo (EGRESS_* there;
-# tests/test_consistency.py compares the table below with yo and with the
-# returns in cmd_egress_status):
-#   exit 0  egress is ok: the configuration is right and probe_egress got through,
-#           or there is no state file, which means the box did not opt in to the
-#           kill switch and nothing is desired (no probe runs then)
-#   exit 1  blocked: the configuration is wrong, the probe failed, or the state
-#           file cannot be read
-#   exit 2  the kill switch is not armed although the state file exists
-cmd_egress_status() {
-    if [ ! -e "${NETWORK_STATE}" ]; then
-        printf 'egress: kill switch not enabled — %s is missing, so this box did not opt in\n' "${NETWORK_STATE}"
-        return 0
-    fi
-
-    local exit_node state wanted detail tailscaled_hint restart_hint
-    if ! exit_node="$(desired_exit_node 2>&1)"; then
-        printf 'egress: BLOCKED — desired state unreadable in %s: %s. Fix: yo bootstrap\n' \
-            "${NETWORK_STATE}" "$(one_line "${exit_node:-no output}")"
-        return 1
-    fi
-
-    state="$(kill_switch_table_state)"
-    if [ "${state}" = absent ]; then
-        printf 'egress: WARNING kill switch not armed — desired: nft table %s loaded; actual: absent. Fix: yo ssh sudo systemctl start yolobox-killswitch\n' \
-            "${KILL_SWITCH_TABLE[*]}"
-        return 2
-    fi
-
-    # tailscaled's own failures, and a wrong or missing exit node: the unit that
-    # applies the declared node re-applies it with --exit-node-allow-lan-access.
-    wanted="internet via exit node ${exit_node}"
-    tailscaled_hint="yo ssh sudo systemctl restart tailscaled"
-    restart_hint="yo ssh sudo systemctl restart yolobox-tailscale-exit-node"
-
-    local ts_json ts_err errfile rc=0
-    errfile="$(mktemp)"
-    ts_json="$(tailscale status --json 2>"${errfile}")" || rc=$?
-    ts_err="$(cat "${errfile}")"
-    rm -f "${errfile}"
-    if [ "${rc}" != 0 ]; then
-        egress_blocked "${wanted}" "tailscale status failed (exit ${rc}): $(one_line "${ts_err}")" \
-            "${tailscaled_hint}"
-        return 1
-    fi
-
-    local fields backend desired_host selected_host online
-    if ! fields="$(printf '%s' "${ts_json}" | jq -e -r --arg want "${exit_node}" "${TS_FIELDS_JQ}" 2>&1)"; then
-        # jq -e prints nothing for empty input, so an empty answer is named as such.
-        detail="$(one_line "${fields}")"
-        egress_blocked "${wanted}" "tailscale status unreadable: ${detail:-no output}" \
-            "${tailscaled_hint}"
-        return 1
-    fi
-    IFS='|' read -r backend desired_host selected_host online <<<"${fields}"
-
-    if [ "${backend}" != Running ]; then
-        egress_blocked "${wanted}" "tailscale is ${backend}" "yo ssh sudo tailscale up"
-        return 1
-    fi
-    if [ -z "${desired_host}" ]; then
-        egress_blocked "${wanted}" "no node named ${exit_node} in the tailnet" \
-            "check the name with: yo ssh tailscale status"
-        return 1
-    fi
-    if [ -z "${selected_host}" ]; then
-        egress_blocked "${wanted}" "none selected" "${restart_hint}"
-        return 1
-    fi
-    if [ "${selected_host}" != "${desired_host}" ]; then
-        egress_blocked "${wanted}" "${selected_host} selected" "${restart_hint}"
-        return 1
-    fi
-    if [ "${online}" != online ]; then
-        egress_blocked "${wanted}" "${exit_node} selected but offline" \
-            "bring ${exit_node} back, or yo ssh sudo tailscale set --exit-node=<other node>"
-        return 1
-    fi
-    # Configuration can all look right while the exit node drops the traffic
-    # (a tailnet policy that does not grant this node internet access), so the
-    # verdict is ok only once the same probe net-check uses gets through.
-    if ! probe_egress; then
-        egress_blocked "${wanted}" \
-            "${exit_node} selected and online, but traffic does not get through (probe ${EGRESS_PROBE_URL} failed)" \
-            "check the tailnet policy grants this node autogroup:internet via ${exit_node}"
-        return 1
-    fi
-    printf 'egress: ok — via exit node %s; kill switch: %s\n' "${exit_node}" "${state}"
-    return 0
 }
 
 main() {
@@ -942,7 +774,6 @@ main() {
     aws-creds) cmd_aws_creds "$@" ;;
     aws-check) cmd_aws_check ;;
     net-check) cmd_net_check "$@" ;;
-    egress-status) cmd_egress_status ;;
     *)
         printf "yolobox-guest: unknown subcommand '%s'\n" "${sub}" >&2
         exit 64

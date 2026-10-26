@@ -64,17 +64,6 @@ jobs:
     env:
       # flake.nix throws without it; any non-empty name evaluates the same.
       YOLOBOX_USERNAME: ci
-      # The opt-in kill switch. A box arms it with an exit node in
-      # /etc/yolobox/local.nix, and then must name a resolver in
-      # networking.nameservers too (the module asserts it). CI has no
-      # local.nix, so this variant adds both as stand-ins.
-      ARMED: |
-        (builtins.getFlake "path:${builtins.getEnv "PWD"}").nixosConfigurations.yolobox.extendModules {
-          modules = [ {
-            yolobox.network.exitNode = "my-exit-node";
-            networking.nameservers = [ "100.101.102.103" ];
-          } ];
-        }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -85,8 +74,8 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           extra_nix_config: experimental-features = nix-command flakes
 
-      # The default configuration, with no stand-in: it proves that a box
-      # without /etc/yolobox/local.nix evaluates, with no kill switch.
+      # The default configuration, with no stand-in: it proves a box without
+      # /etc/yolobox/local.nix evaluates.
       - name: Evaluate nixosConfigurations.yolobox
         run: >
           nix eval --impure --raw
@@ -101,19 +90,3 @@ jobs:
           settings=.#nixosConfigurations.yolobox.config.virtualisation.containers.containersConf.settings
           test "$(nix eval --impure --raw "$settings.containers.log_driver")" = k8s-file
           test "$(nix eval --impure --raw "$settings.engine.events_logger")" = file
-
-      - name: Evaluate nixosConfigurations.yolobox with the kill switch
-        run: >
-          nix eval --impure --raw
-          --option allow-import-from-derivation false
-          --expr "($ARMED).config.system.build.toplevel.drvPath"
-
-      # nix cannot check the kill switch's rule file (nft needs netlink, which
-      # the build sandbox forbids), and a rule file that fails to load leaves
-      # an opted-in box without the table. `nft --check` parses and validates it
-      # against the runner's kernel without changing any rules.
-      - name: Check the kill switch rules parse
-        run: |
-          rules="$(nix eval --impure --raw --expr "($ARMED).config.system.build.killswitchRules")"
-          sudo apt-get install --yes nftables
-          sudo nft --check --file "$rules"
