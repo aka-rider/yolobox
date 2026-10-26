@@ -1,6 +1,6 @@
 # The Mac's network, as the guest sees it
 
-The guest reaches the outside world through the Mac, so the Mac's network settings decide what the guest can do. This file covers the two VPN shapes that break guest traffic, a DNS filter that breaks one AWS endpoint, and the port 80 and 443 binds lima makes on the Mac.
+The guest reaches the outside world through the Mac, so the Mac's network settings decide what the guest can do. This file covers the two VPN shapes that break guest traffic, the marker for a box that blocks the gateway on purpose, a DNS filter that breaks one AWS endpoint, and the port 80 and 443 binds lima makes on the Mac.
 
 ## VPN shapes
 
@@ -14,13 +14,9 @@ This happens with a full-tunnel profile in WireGuard.app. The tunnel does not ca
 
 General guest egress keeps working, and so does `ssh git@github.com`. But every guest connection to `192.168.5.2:<port>` is silently blackholed. That address is gvproxy's NAT of lima's gateway address to the Mac's own loopback. A forwarded TCP port relies on exactly that path. That is why the AWS broker reaches the guest over a reverse unix-socket forward instead (see [Transport](aws.md#transport)).
 
-### With the kill switch armed
+### A box that blocks the gateway on purpose
 
-This section applies only to a box that opted in to the [kill switch](../nix/killswitch.md#opting-in). Without it the two shapes above describe the box as ever.
-
-Such a box has one way out: its tailnet exit node. The kill switch rejects every packet that leaves by any interface but the tailnet, except tailscaled's own packets, which carry fwmark `0x80000`, and even those are rejected when they are addressed to the Lima link itself (its port mapper asks the gateway, which is the Mac). So a Mac VPN matters only to tailscaled. Its control-plane and exit-node packets still leave through the Mac's default route, and a VPN that blackholes them takes the tailnet down while the Mac itself stays fine. General guest egress does not leave by the Mac, so the two shapes above do not describe it. Check `egress:` in `yo status` first. It names the desired exit node and what is actually selected.
-
-The gateway probe is rejected by design on such a box. `yolobox-guest net-check` therefore reports `gateway=skipped` whenever `/etc/yolobox/network.json` exists (it exists only on a box that opted in), and `network:` defers to the `egress:` line. A failed gateway probe on such a box is expected, and it says nothing about a VPN.
+The two shapes are told apart by probing the gateway. A box whose own configuration (its `/etc/yolobox/local.nix`, or a module that file imports) rejects traffic to the Lima gateway by design would fail that probe every time, and `yo status` would blame a Mac VPN that is not there. Such a box creates the file `/etc/yolobox/gateway-blocked`. Only its existence counts, never its content. While the file exists, `yolobox-guest net-check` prints `gateway=skipped` and does not probe, and the `network:` line in `yo status` says the probe was skipped because the box blocks it by design, with the verdict on egress alone. This repo creates no such file and names no reason for it.
 
 ### A VPN that disconnects leaves UDP flows stuck
 
@@ -34,7 +30,7 @@ Seen live: the Mac had a VPN up at host agent start (tailscaled's first `endpoin
 
 and `lsof -nP -a -p $(cat ~/.lima/yolobox/ha.pid) -iUDP` listed sockets whose local address was that vanished tunnel address (`10.2.0.2`), which `ifconfig` no longer showed. Inside the guest, tailscaled logged `netcheck: UDP is blocked, trying HTTPS` every 25 seconds starting the same second, while `tailscale netcheck` on the command line, whose fresh ephemeral sockets make fresh flows, reported `UDP: true`. The first symptom for the operator is tailscaled's relayed-contact lines ([nix/tailscale.md](../nix/tailscale.md#relayed-contacts-in-the-log)) and peers that stay on DERP.
 
-The box stays reachable: DERP and the exit node's TCP paths are not affected. Only direct UDP paths and the endpoint discovery behind them are. The cure that ends the stale flows is a host agent restart, `limactl stop yolobox && yo up`, which drops every flow. That restart is the expected cure and has not been run against this failure yet.
+The box stays reachable: DERP and the TCP paths are not affected. Only direct UDP paths and the endpoint discovery behind them are. The cure that ends the stale flows is a host agent restart, `limactl stop yolobox && yo up`, which drops every flow. That restart is the expected cure and has not been run against this failure yet.
 
 ### Telling them apart
 
@@ -43,19 +39,17 @@ Recognise the two by those patterns, and run `scutil --nc list` on the Mac befor
 `yo status` tells them apart on its `network:` line. It opens a temporary TCP listener on the Mac's `127.0.0.1:<random port>`, then runs `yolobox-guest net-check <port>` as the operator. That prints two results:
 
 - `egress=`, an HTTPS fetch of github.com.
-- `gateway=`, a TCP connect to `192.168.5.2:<port>` through bash `/dev/tcp`, which is the NAT path above. A pass means gvproxy really reaches the Mac's loopback. `skipped` on a box that opted in to the kill switch, see above.
+- `gateway=`, a TCP connect to `192.168.5.2:<port>` through bash `/dev/tcp`, which is the NAT path above. A pass means gvproxy really reaches the Mac's loopback. `skipped` when `/etc/yolobox/gateway-blocked` exists, see [above](#a-box-that-blocks-the-gateway-on-purpose).
 
 `network_status_line()` maps the pair. Egress dead with gateway ok is the WireGuard shape. Egress ok with gateway dead is the ProtonVPN shape. Both dead means the guest network itself is down, and no VPN caused that. A box whose `yolobox-guest` predates `net-check` prints `network: not checked` with the reason, and the rest of `yo status` still runs.
 
 ## The DNS sinkhole
 
-The first launch of v1, the Docker-based predecessor, showed a DNS failure that applies to a guest that resolves through lima, as boxes did before the kill switch. Credentials arrived, but `aws sts get-caller-identity` died with `Could not connect to the endpoint URL: "https://sts.amazonaws.com/"`.
+The first launch of v1, the Docker-based predecessor, showed a DNS failure that applies to a guest that resolves through lima, as boxes do by default. Credentials arrived, but `aws sts get-caller-identity` died with `Could not connect to the endpoint URL: "https://sts.amazonaws.com/"`.
 
 That error is DNS, not AWS. This Mac's DNS filter sinkholes the global `sts.amazonaws.com` name to 0.0.0.0. A guest that uses lima's resolver (192.168.5.2) inherits the Mac's resolver and with it the filter. The AWS CLI targets the global endpoint only when the profile has no region. Regional endpoints such as `sts.eu-west-1.amazonaws.com` resolve fine on both sides.
 
 That is why a profile without a region is left out of the [allowlist](aws.md#allowlist) rather than shipped broken.
-
-A box that opted in to the kill switch no longer asks lima's resolver anything. Its `networking.nameservers` names a resolver on the tailnet, so the Mac's filter does not apply to it and `sts.amazonaws.com` answers with a real address. The rule against profiles without a region stays, because it also keeps the region from drifting out from under the account. See [DNS](../nix/killswitch.md#dns) for why the box must never send DNS to the Lima gateway.
 
 ## lima on port 80 and 443
 

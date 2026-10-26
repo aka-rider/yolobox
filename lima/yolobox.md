@@ -77,6 +77,15 @@ Take the array from `yo up`'s note, never from this file (see [Read once](#read-
 
 Verify with `limactl list yolobox --json`: `config.portForwards` must hold an entry with `"proto":"udp"`, `"ignore":true`, `"guestPortRange":[1,65535]`, `"guestIP":"0.0.0.0"` and `"guestIPMustBeZero":false`. Then `lsof -nP -iUDP -a -c limactl` must show no socket bound to `*:68` or `127.0.0.1:41641` (the outbound `10.x->peer` flows are gvproxy's NAT and stay), and the next host agent log must have no `Forwarding UDP` and no `failed to listen udp`.
 
+## Reaching a guest service from the Mac
+
+A service an agent starts in the box is reachable from the Mac in one of two ways, and which one depends on the address it listens on.
+
+- **Through lima's forwarder.** Lima forwards a TCP port only when the guest process listens on a wildcard address (`0.0.0.0` or `::`) or on loopback. By default it publishes the port on the Mac's `127.0.0.1` alone. Only a `portForwards` rule with `hostIP: 0.0.0.0` publishes it to the Mac's LAN, which is why 3773 has one. So a service bound to `0.0.0.0` is at `http://localhost:<port>` on the Mac with no setup.
+- **Over the tailnet.** A service bound to the box's tailnet address alone is not on lima's list, so lima does not forward it. It is reachable over the tailnet only, at that address, by whatever the tailnet's access policy admits (`tailscale0` is trusted, see [nix/tailscale.md](../nix/tailscale.md#firewall)).
+
+Recognise the first case in `~/.lima/yolobox/ha.stderr.log`. A service listening on `::` logs `Forwarding TCP from [::]:5137`. The same service rebound to the tailnet address logs `Not forwarding TCP <tailnet-ip>:5137`, and `localhost:5137` on the Mac stops answering. Nothing is broken: the service moved out of the set lima forwards. Rebind it to `0.0.0.0` to get `localhost:<port>` back.
+
 ## Pinned settings
 
 `lima/yolobox.yaml` pins four settings that lima leaves at its defaults. Each default is wrong for a box that holds an agent.

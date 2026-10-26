@@ -87,21 +87,15 @@ The staging directory is removed on every path, a refusal, an scp failure and a 
 
 Starting the VM is no longer one `limactl start`. The root disk is encrypted, and lima's own start blocks until its ssh works, which needs the disk unlocked. So `vm_up` derives the passphrase first (`luks_passphrase`, which asks 1Password for the `yolobox-disk` key and so shows a Touch ID prompt), starts `limactl start` in the background, and hands the passphrase to the initrd with `unlock_disk` once the initrd's sshd answers. It then waits for the stage-2 sshd to accept the operator. A VM that is running and already accepts the operator needs no passphrase and no prompt. `lima_stop()` is the one place that runs `limactl stop`, with a timeout and the recovery text for its known hang. Every pre-unlock probe goes through `initrd_ssh_argv()` and `sshd_answers`, never a pinned ssh role. The reasons, the protocol and the failure shapes are in [docs/disk-encryption.md](docs/disk-encryption.md).
 
-## The guest helper and sudo
+## The guest helper
 
-`guest_helper(role, sub, args, root=True)` runs a `yolobox-guest` subcommand through `sudo -n --`. Only `egress-status` asks for root, because listing the kill switch's nft table needs it, and the operator's passwordless sudo (nix/base.nix) is the path to it. `-n` makes a sudo that would prompt fail at once, so the ssh session never hangs on a password.
+`guest_helper(role, sub, args)` runs a `yolobox-guest` subcommand over ssh as the operator or the agent, and turns a missing helper or subcommand into a version-skew note instead of a bare exit code. Nothing in it asks for root. The reasons are in [nix/guest/yolobox-guest.md](nix/guest/yolobox-guest.md#version-skew).
 
-sudo does not answer a missing helper with the shell's 127. It prints `sudo: yolobox-guest: command not found` and exits 1. `guest_helper` recognises that message and raises the same version-skew note a 127 gets, so an old box reads as "not checked" and not as a blocked egress. The reasons are in [nix/guest/yolobox-guest.md](nix/guest/yolobox-guest.md#version-skew).
+## The network line and the gateway-blocked marker
 
-## Egress: the status line and the bootstrap preflight
+`yo status` prints one `network:` line, built by `network_status_line()` from the two results of `yolobox-guest net-check`: whether egress works and whether lima's gateway answers. The pair tells a Mac VPN that owns the default route from one that blackholes the gateway (see [docs/mac-network.md](docs/mac-network.md#vpn-shapes)).
 
-`yo status` prints one `egress:` line, the one `yolobox-guest egress-status` wrote. `egress_check()` returns it as an `EgressCheck`, whose `outcome` is an `EgressOutcome`. OK, BLOCKED and NOT_ARMED are the helper's exit codes 0, 1 and 2, and each line says what is wanted, what is there, and the command that changes it. OK needs the helper's probe to get through, so a configuration that looks right while the traffic is dropped is BLOCKED.
-
-NOT_CHECKED is `yo`'s own outcome for a box that gave no usable answer: too old for the subcommand, no helper, sudo refused, or output that is not one line. It is a note, not a verdict, so it is never printed as BLOCKED.
-
-On a box that opted in to the kill switch, `yo status` shows one verdict on egress. The `network:` line is `judged by the egress line above` and carries no verdict of its own, because `net-check` skips the gateway probe there and the egress probe result is already in the egress line. A box that did not opt in has no `network.json`: its `egress:` line is the neutral `kill switch not enabled`, and the `network:` line is `net-check`'s own verdict.
-
-`yo bootstrap` runs the same check before it rebuilds (`egress_preflight`). A BLOCKED or NOT_ARMED line goes to stderr and the rebuild still runs, because bootstrap is how a blocked box gets fixed. A NOT_CHECKED box is silent, since a fresh VM has no helper before its first bootstrap. The preflight refuses nothing.
+The gateway result has a third value, `Gateway.SKIPPED`. A box that blocks lima's gateway by design creates `/etc/yolobox/gateway-blocked`; while that file exists `net-check` prints `gateway=skipped`, and `yo` says so in the line: `network: ok (lima's gateway probe skipped: this box blocks it by design)` when egress works, and `network: WARNING guest egress is dead (lima's gateway probe skipped: this box blocks it by design)` when it does not. Without the marker a refused probe would read as a Mac VPN fault that is not there. The marker is the whole contract: `yo` never learns why the gateway is blocked, and the repo creates the file nowhere.
 
 ## One parser
 

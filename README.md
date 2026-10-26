@@ -12,7 +12,7 @@ A development sanbox virtual machine. It's a NixOS Linux run by Lima.
 
 - The agent runs as its own user with no `sudo`. The filesystem is airgaped. Files move only through git, scp, or rsync.
 - The VM can use your 1Password SSH agent. You must approve the access (TouchID or similarly).
-- The VM accesses the internet and your LAN freely. Optionally, you can take that away: see [No direct internet](#optional-no-direct-internet).
+- The VM accesses the internet and your LAN freely.
 - Open VM ports are mapped on the host (you can open `http://localhost:3000` directly in your browser)
 
 
@@ -45,33 +45,6 @@ Then add this line to `~/.ssh/config`:
 ```
 Include ~/.lima/yolobox/ssh.config
 ```
-
-## Optional: no direct internet
-
-By default the VM reaches the internet through the host's network. If you use [Tailscale](https://tailscale.com/), you can instead make the VM send everything through a node of your tailnet, and refuse anything that tries to go out another way. The VM then has no direct internet, and its DNS goes to a resolver on your tailnet. Skip this section if you don't want it.
-
-It needs three things on your side:
-
-- An [exit node](https://tailscale.com/kb/1103/exit-nodes) on your tailnet, approved in the admin console.
-- A tailnet access policy that lets the VM reach the internet through it (the `autogroup:internet` destination). Without it the exit node drops the VM's traffic.
-- A resolver on your tailnet that answers the VM's names (the exit node itself usually does).
-
-Write the exit node and the resolver to `/etc/yolobox/local.nix` inside the VM, then rebuild it:
-
-```bash
-yo ssh sudo mkdir -p /etc/yolobox
-yo ssh sudo tee /etc/yolobox/local.nix <<'EOF'
-{ ... }: {
-  yolobox.network.exitNode = "my-exit-node";
-  networking.nameservers = [ "100.101.102.103" ];
-}
-EOF
-yo bootstrap
-```
-
-`exitNode` is the node's name as `tailscale status` shows it, and the nameserver is its tailnet address. The build stops with a message if the resolver is missing. Once the VM is built, log it in to your tailnet with `yo ssh sudo tailscale up`. Until you do, it has no internet at all. `yo status` shows whether traffic is leaving the way you asked.
-
-To go back, remove those lines from `/etc/yolobox/local.nix`, rebuild, and restart the VM: the rules that refuse direct traffic stay loaded until the next boot.
 
 ## Daily use
 
@@ -149,11 +122,16 @@ To reach it from anywhere on your [Tailscale](https://tailscale.com/) network, l
 yo ssh sudo tailscale up
 ```
 
-Then pair with the tailnet address:
+Then start sharing T3 Code on the tailnet and pair with its address:
 
 ```bash
+yo ssh sudo systemctl restart yolobox-tailscale-serve
 yo pair http://yolobox.<tailnet>.ts.net:3773
 ```
+
+Tailscale is optional. Without it nothing changes, and `yo status` just says the VM is not logged in.
+
+Once the VM is on a tailnet, every service in it is reachable at its tailnet address (`yo ssh tailscale ip -4`), by whatever the tailnet's access policy admits. Without a tailnet, make the service listen on `0.0.0.0` and open `localhost:<port>` on the host.
 
 ### Devbox
 
