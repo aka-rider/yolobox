@@ -2084,14 +2084,27 @@ def tailscale_status_line(stdout: str, stderr: str) -> str:
 
 
 # nix/egress.nix: the table the guest's egress rules live in, and the unit that
-# loads it. The unit is "active" only when the full rules loaded; any other
-# state means the box is in recovery mode (nix/egress.md).
+# loads it. The unit is "active" only when the full rules loaded; a loaded unit
+# in any other state means the box is in recovery mode (nix/egress.md). A box
+# built before the unit existed reports LoadState not-found, and systemctl show
+# exits 0 for it, so one round trip tells the two apart.
 EGRESS_TABLE = "inet yolobox-egress"
 EGRESS_UNIT = "yolobox-egress"
+EGRESS_PROBE = [
+    "systemctl",
+    "show",
+    "-p",
+    "LoadState",
+    "-p",
+    "ActiveState",
+    EGRESS_UNIT,
+]
 
 
-def egress_status_line(state: str) -> str:
-    if state == "active":
+def egress_status_line(load_state: str, active_state: str) -> str:
+    if load_state == "not-found":
+        return "egress: box predates the egress table; run yo bootstrap"
+    if active_state == "active":
         return "egress: host and LAN blocked"
     return (
         "egress: WARNING recovery mode — the egress rules failed to load "
@@ -2099,7 +2112,7 @@ def egress_status_line(state: str) -> str:
         "yo ssh sudo nixos-rebuild switch --rollback; "
         "logs: yo ssh journalctl -u %s; "
         "table: yo ssh sudo nft list table %s"
-        % (EGRESS_UNIT, state or "unknown", EGRESS_UNIT, EGRESS_TABLE)
+        % (EGRESS_UNIT, active_state or "unknown", EGRESS_UNIT, EGRESS_TABLE)
     )
 
 
@@ -2200,10 +2213,13 @@ def status_guest_services() -> None:
     tailscale_probe = ssh_run(OPERATOR, ["sh", "-c", TAILSCALE_PROBE], check=False)
     out(tailscale_status_line(tailscale_probe.stdout, tailscale_probe.stderr))
 
-    egress_probe = ssh_run(
-        OPERATOR, ["systemctl", "is-active", EGRESS_UNIT], check=False
+    egress_probe = ssh_run(OPERATOR, EGRESS_PROBE, check=False)
+    out(
+        egress_status_line(
+            guest_field(egress_probe.stdout, "LoadState"),
+            guest_field(egress_probe.stdout, "ActiveState"),
+        )
     )
-    out(egress_status_line(egress_probe.stdout.strip()))
 
     out(guest_network_line())
 

@@ -1102,7 +1102,7 @@ class TestCmdStatus(unittest.TestCase):
         aws_allowlist_side_effect,
         net_check=None,
         fstype="",
-        egress_state="active\n",
+        egress_probe="LoadState=loaded\nActiveState=active\n",
     ):
         outs = []
         # net_check is either the net-check subprocess result or the YoError
@@ -1124,8 +1124,8 @@ class TestCmdStatus(unittest.TestCase):
             stdout = ""
             if argv[:2] == ["lsblk", "-dno"]:
                 stdout = fstype
-            elif argv[:2] == ["systemctl", "is-active"]:
-                stdout = egress_state
+            elif argv == yo.EGRESS_PROBE:
+                stdout = egress_probe
             return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
         with (
@@ -1259,26 +1259,38 @@ class TestCmdStatus(unittest.TestCase):
             any(line.startswith("disk: locked") and "yo up" in line for line in outs)
         )
 
-    def egress_lines(self, egress_state):
+    def egress_lines(self, egress_probe):
         outs = self.run_status(
             units_present=True,
             gaps=[],
             aws_which=None,
             aws_allowlist_side_effect=lambda: [],
-            egress_state=egress_state,
+            egress_probe=egress_probe,
         )
         return [line for line in outs if line.startswith("egress:")]
 
     def test_a_box_whose_egress_unit_is_active_reports_the_host_blocked(self):
         self.assertEqual(
-            self.egress_lines("active\n"), ["egress: host and LAN blocked"]
+            self.egress_lines("LoadState=loaded\nActiveState=active\n"),
+            ["egress: host and LAN blocked"],
         )
 
     def test_a_box_whose_egress_unit_failed_warns_of_recovery_mode(self):
-        lines = self.egress_lines("failed\n")
+        lines = self.egress_lines("LoadState=loaded\nActiveState=failed\n")
         self.assertEqual(len(lines), 1)
         self.assertIn("WARNING recovery mode", lines[0])
         self.assertIn("(yolobox-egress failed)", lines[0])
+
+    def test_a_box_that_predates_the_egress_unit_is_named_not_blamed(self):
+        self.assertEqual(
+            self.egress_lines("LoadState=not-found\nActiveState=inactive\n"),
+            ["egress: box predates the egress table; run yo bootstrap"],
+        )
+
+    def test_a_silent_egress_probe_warns_of_recovery_mode_with_an_unknown_state(self):
+        lines = self.egress_lines("")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("(yolobox-egress unknown)", lines[0])
 
     def test_network_line_reports_what_the_guest_net_check_answered(self):
         outs = self.run_status(

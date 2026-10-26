@@ -1990,7 +1990,7 @@ class TestLimaConfigGaps(FakeHome):
 
     def test_a_leftover_rule_published_beyond_loopback_is_a_tcp_gap(self):
         leftover = yo.normalize_port_forward(
-            {"guestPort": 3773, "proto": "tcp", "hostIP": "0.0.0.0"}
+            {"guestPort": 4321, "proto": "tcp", "hostIP": "0.0.0.0"}
         )
         forwards = [leftover, *self.restated_forwards()]
         self.assertEqual(self.gaps_for(forwards), [yo.GAP_TCP_FORWARDS])
@@ -2017,7 +2017,7 @@ class TestLimaConfigGaps(FakeHome):
     def test_an_instance_from_before_the_port_range_has_the_tcp_gap(self):
         old = [
             yo.normalize_port_forward(
-                {"guestPort": 3773, "proto": "tcp", "hostIP": "0.0.0.0"}
+                {"guestPort": 4321, "proto": "tcp", "hostIP": "0.0.0.0"}
             ),
             *(
                 forward
@@ -2050,14 +2050,14 @@ class TestLimaConfigGaps(FakeHome):
 class TestNormalizePortForward(unittest.TestCase):
     def test_a_bare_guest_port_gets_lima_defaults(self):
         self.assertEqual(
-            yo.normalize_port_forward({"guestPort": 3773}),
+            yo.normalize_port_forward({"guestPort": 4321}),
             {
                 "proto": "any",
                 "guestIP": "127.0.0.1",
                 "guestIPMustBeZero": False,
-                "guestPortRange": [3773, 3773],
+                "guestPortRange": [4321, 4321],
                 "hostIP": "127.0.0.1",
-                "hostPortRange": [3773, 3773],
+                "hostPortRange": [4321, 4321],
                 "ignore": False,
             },
         )
@@ -2272,24 +2272,35 @@ class TestTailscaleStatusLine(unittest.TestCase):
 
 
 class TestEgressStatusLine(unittest.TestCase):
-    def test_an_active_unit_says_the_host_and_lan_are_blocked(self):
+    def test_a_loaded_active_unit_says_the_host_and_lan_are_blocked(self):
         self.assertEqual(
-            yo.egress_status_line("active"), "egress: host and LAN blocked"
+            yo.egress_status_line("loaded", "active"), "egress: host and LAN blocked"
         )
 
-    def test_any_other_state_is_recovery_mode_naming_the_state_and_the_way_out(self):
+    def test_a_loaded_unit_in_any_other_state_is_recovery_mode_naming_the_state(self):
         for state in ("failed", "inactive", "activating", "lizard"):
             with self.subTest(state=state):
-                line = yo.egress_status_line(state)
+                line = yo.egress_status_line("loaded", state)
                 self.assertTrue(line.startswith("egress: WARNING recovery mode"))
                 self.assertIn("(yolobox-egress %s)" % state, line)
                 self.assertIn("yo ssh sudo nixos-rebuild switch --rollback", line)
                 self.assertIn("yo ssh journalctl -u yolobox-egress", line)
 
+    def test_a_unit_the_box_does_not_know_means_the_box_predates_the_table(self):
+        # systemctl prints ActiveState=inactive for an unknown unit.
+        self.assertEqual(
+            yo.egress_status_line("not-found", "inactive"),
+            "egress: box predates the egress table; run yo bootstrap",
+        )
+
     def test_a_silent_probe_is_recovery_mode_with_an_unknown_state(self):
-        line = yo.egress_status_line("")
+        line = yo.egress_status_line("", "")
         self.assertTrue(line.startswith("egress: WARNING recovery mode"))
         self.assertIn("(yolobox-egress unknown)", line)
+
+    def test_an_unrecognised_load_state_is_not_taken_for_a_missing_unit(self):
+        line = yo.egress_status_line("lizard", "")
+        self.assertTrue(line.startswith("egress: WARNING recovery mode"))
 
 
 class TestStatusWithVmDown(unittest.TestCase):

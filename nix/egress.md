@@ -62,7 +62,7 @@ When the full rules fail to load, for example after an `nft` incompatibility, th
 yo ssh sudo nixos-rebuild switch --rollback
 ```
 
-Then fix `local.nix` and rebuild. `yo status` shows `egress: WARNING recovery mode …` with the unit's state, and `egress: host and LAN blocked` when the unit is active.
+Then fix `local.nix` and rebuild. `yo status` shows `egress: WARNING recovery mode …` with the unit's state, and `egress: host and LAN blocked` when the unit is active. A box built before the unit existed has no such unit at all (`LoadState=not-found`), and `yo status` says `egress: box predates the egress table; run yo bootstrap` instead of calling it recovery mode.
 
 Between the two loads, on a restart of the unit during a switch, the recovery table is in force for a moment. Guest-initiated packets sent in that instant are rejected.
 
