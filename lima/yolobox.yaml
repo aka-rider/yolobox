@@ -34,14 +34,6 @@ vmOpts:
       binfmt: true
 
 portForwards:
-  # t3's web UI must be reachable from another Mac on the LAN. Lima's default
-  # host side is 127.0.0.1 for every port, so publishing it takes an explicit
-  # rule; t3 itself keeps binding 127.0.0.1 guest-side, and lima's forwarder
-  # dials it from inside the guest, so the guest firewall is never traversed.
-  - guestPort: 3773
-    proto: tcp
-    hostIP: "0.0.0.0"
-
   # Reverses the Mac's 1Password agent socket into the guest, so the VM
   # never carries any 1Password credential of its own.
   - guestSocket: "/run/yolobox-op/agent.sock"
@@ -57,11 +49,11 @@ portForwards:
     reverse: true
 
   # Forward no guest UDP listener to the Mac. Lima mirrors every guest
-  # listener onto the Mac's localhost, and nothing here needs a UDP one: t3 is
-  # TCP and the secrets are unix sockets. The mirror only collides or
-  # intercepts. tailscaled's UDP 41641 loses to the Mac's own Tailscale, which
-  # holds that port ("failed to listen udp: 127.0.0.1:41641: address already
-  # in use"), and port 68 would intercept the host's DHCP packets, which is an
+  # listener onto the Mac's localhost, and nothing here needs a UDP one: the
+  # secrets are unix sockets. The mirror only collides or intercepts.
+  # tailscaled's UDP 41641 loses to the Mac's own Tailscale, which holds that
+  # port ("failed to listen udp: 127.0.0.1:41641: address already in use"), and
+  # port 68 would intercept the host's DHCP packets, which is an
   # issue with NixOS that other distros do not show
   # (https://github.com/nixos-lima/nixos-lima/issues/50).
   # Both guestIP lines are load-bearing. Lima skips an ignore rule for a

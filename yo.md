@@ -132,11 +132,3 @@ Output streamed live goes through it too. `yo gc` and `yo aws-check` show the gu
 `YO_VERSION = "dev"` must survive as that exact literal assignment, unreformatted. `nix/pkgs/yolobox.nix` overwrites it with `--replace-fail` and `homebrew/yolobox.rb` with `inreplace`. Both match the literal text, and either patch is how a release build gets its real version baked in.
 
 Reformat that line by reflowing it, requoting it or changing its text in any way, and the Nix build fails loudly at `--replace-fail`, which is the safer failure. The brew formula's `inreplace` can silently no-op and ship a binary that still reports `dev`. `TestYoVersionLiteral` fails when `yo` stops having exactly one line that is that literal, so the reformat is caught before the release, not by it.
-
-## Opening a guest URL
-
-`yo t3` is the command that opens a URL on the Mac, and that URL is text the guest produced (`t3 pair` runs from the agent's `PATH`, which the agent controls entirely). So `parse_pairing_url` accepts it only when `is_loopback_t3_url` agrees: an `http` or `https` URL whose netloc is exactly `127.0.0.1:3773` or `localhost:3773` and whose path starts with `/`. Before parsing, it refuses any URL containing a backslash, an `@`, whitespace or a control character.
-
-The last rule exists because Python's `urlparse` and a browser (the WHATWG parser) disagree about those characters. A URL like `http://127.0.0.1:3773\@evil.example/` is loopback to one and `evil.example` to the other. A URL that `urlparse` itself refuses, such as `http://[::1/pair` with an unmatched bracket or a full-width `＃` that normalises into a delimiter, raises `ValueError`, which `is_loopback_t3_url` turns into a refusal rather than a traceback. An earlier version compared `urlparse(url).hostname` alone, which that backslash URL passes.
-
-The refusal reads `'t3 pair' printed a pairing URL yo will not open: <the URL, repr-quoted>` and opens nothing. The quoting also keeps a control character in the refused URL from reaching the terminal.

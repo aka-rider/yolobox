@@ -22,7 +22,7 @@ If the file loses its blank line between the owned block and lima's `Host` block
 
 ### ForwardAgent no
 
-The owned block carries `ForwardAgent no`, and so does the `Host yolobox` alias herdr uses. The operator's own `~/.ssh/config` may well say `Host lima-yolobox` / `ForwardAgent yes` after the `Include` line, which is a reasonable thing to write for the operator's `yo ssh`. Because the owned block sits first and ssh keeps the first value per keyword, it neutralises that line for the agent role. A `yo code`, `yo zed` or t3-spawned agent session never forwards the Mac's agent, whatever a later `Host` block says. Only a command-line `-o`, which outranks every file, can turn it on, and `yo ssh` is the one place that does (next sections).
+The owned block carries `ForwardAgent no`, and so does the `Host yolobox` alias herdr uses. The operator's own `~/.ssh/config` may well say `Host lima-yolobox` / `ForwardAgent yes` after the `Include` line, which is a reasonable thing to write for the operator's `yo ssh`. Because the owned block sits first and ssh keeps the first value per keyword, it neutralises that line for the agent role. A `yo code` or `yo zed` agent session never forwards the Mac's agent, whatever a later `Host` block says. Only a command-line `-o`, which outranks every file, can turn it on, and `yo ssh` is the one place that does (next sections).
 
 ### The gap
 
@@ -30,7 +30,7 @@ Nothing in lima or ssh enforces the split at the moment a connection is made. `l
 
 ## 1Password reaches the agent
 
-1Password is available to every agent session for as long as the VM runs, not only inside the one pane that happened to start it. Lima itself carries the forward. `lima/yolobox.yaml`'s `portForwards` declares a reverse unix-socket rule, `{guestSocket: /run/yolobox-op/agent.sock, hostSocket: "<1Password's agent.sock>", reverse: true}`, next to the t3 and dhcp rules and a sibling reverse rule for the AWS broker (see [docs/aws.md](aws.md#transport)). Lima's hostagent dials that socket itself, once, at every `limactl start` or `yo up`, over its own ssh master, as the operator. No `yo` command has to be running, and no pane has to stay open. Like every setting in that file, the rule reaches an existing instance only by being restated; see [lima/yolobox.md](../lima/yolobox.md#read-once).
+1Password is available to every agent session for as long as the VM runs, not only inside the one pane that happened to start it. Lima itself carries the forward. `lima/yolobox.yaml`'s `portForwards` declares a reverse unix-socket rule, `{guestSocket: /run/yolobox-op/agent.sock, hostSocket: "<1Password's agent.sock>", reverse: true}`, next to the dhcp rule and a sibling reverse rule for the AWS broker (see [docs/aws.md](aws.md#transport)). Lima's hostagent dials that socket itself, once, at every `limactl start` or `yo up`, over its own ssh master, as the operator. No `yo` command has to be running, and no pane has to stay open. Like every setting in that file, the rule reaches an existing instance only by being restated; see [lima/yolobox.md](../lima/yolobox.md#read-once).
 
 `nix/base.nix` gives the forward somewhere to land before lima tries. The tmpfiles rule `d /run/yolobox-op 0700 ${username} users -` runs through `systemd-tmpfiles-setup` before `sysinit.target`, well ahead of sshd and lima's own forward, and `-resetup` recreates it on every `switch`. This was verified against the running VM. Lima's hostagent runs `rm -f /run/yolobox-op/agent.sock` and then `ssh -O forward -R /run/yolobox-op/agent.sock:<1Password socket> lima-yolobox` over its own master exactly once, at hostagent start. A failure there is only logged and nothing retries it. Also, nixos-lima's `lima-init` never runs lima's own `/run/host-services` boot script, so unlike a stock lima guest, nothing else creates that directory. The socket lands owned by the operator with mode 0600 (`StreamLocalBindMask 0177`), because lima's hostagent connects as the operator.
 
@@ -40,7 +40,7 @@ The agent cannot reach an operator-owned socket directly, so `nix/base.nix` prox
 
 ## yo ssh forwards per session
 
-A positive `ForwardAgent` never goes into `~/.lima/yolobox/ssh.config`. The only value the owned blocks carry is `no` (see [above](#forwardagent-no)). That file is shared by every ssh role `yo` spawns, so a `ForwardAgent yes` there would reach `yo code`, `yo zed` and every t3-spawned session too, not only the one command that asked for it.
+A positive `ForwardAgent` never goes into `~/.lima/yolobox/ssh.config`. The only value the owned blocks carry is `no` (see [above](#forwardagent-no)). That file is shared by every ssh role `yo` spawns, so a `ForwardAgent yes` there would reach `yo code` and `yo zed` too, not only the one command that asked for it.
 
 `yo ssh`, the operator's own bare shell, is the one command that still forwards per session. It names the 1Password socket path itself as the `ForwardAgent` value, because the default, `$SSH_AUTH_SOCK`, is Apple's launchd agent, which holds nothing on this Mac. It does so only over its own `ControlPath=none` connection, so that forward dies with the one pane that opened it instead of riding a shared master into a session that never asked to carry it.
 

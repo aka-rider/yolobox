@@ -84,7 +84,6 @@ write it causes settles instead of looping. The tmpfiles rules at boot and on
 `switch` are the backstop for the window the path unit cannot see, an install
 made while no user manager of the agent's was running.
 
-The same keeper design runs for t3 (see [Version prune](t3.md#version-prune)).
 Three things about it were learned by getting them wrong:
 
 - **Rank first, settle second.** The keeper ranks all versions, so a fresh
@@ -115,8 +114,8 @@ enter`. Each phase is idempotent and checks before it acts. The commands and
 their guards are in `harnesses.nix`. What needs recording here:
 
 - **No vendor installer edits an rc file.** pi's and opencode's run with the
-  defaults or with `--no-modify-path`, and t3's never touches one.
-- **A failed phase does not stop the others.** The script runs claude, pi, t3,
+  defaults or with `--no-modify-path`.
+- **A failed phase does not stop the others.** The script runs claude, pi,
   agent-browser, the pi packages, the browser config and opencode as separate
   phases, each in its own errexit subshell through `phase()`. A failed phase
   goes into `failed`, the script moves on, and it prints every failure and
@@ -151,9 +150,7 @@ their guards are in `harnesses.nix`. What needs recording here:
   in `~/.local/bin` beside the launcher. pi's own `pi install` packages live
   under `~/.pi/agent/npm/`, not there. `environment.localBinInPath` puts that
   directory on PATH for non-login shells too, which every non-interactive `yo`
-  guest call (`ssh_run`, behind `yo gc`, `yo status` and the rest) and t3 run
-  in. t3's own unit carries `${homeDir}/.local` in its `path`, so a t3-spawned
-  claude goes through the launcher and carries the hooks like any other.
+  guest call (`ssh_run`, behind `yo gc`, `yo status` and the rest) run in.
 
 ## pi
 
@@ -176,7 +173,7 @@ The box makes pi reachable with a link, `~/.local/bin/pi` to
 `~/.pi/agent/bin/pi`, asserted by the install script on every run and by a
 tmpfiles `L+` rule at boot and on `switch`, the same pattern as opencode.
 `pi update` self-updates and keeps only two releases (since pi 1.1.0), so
-unlike claude and t3 nothing here prunes.
+unlike claude nothing here prunes.
 
 Run by hand in a tty, the installer asks "Add /home/agent/.pi/agent/bin to
 your PATH in /home/agent/.zshrc now? [Y/n]". Answer `n`. The box's link already

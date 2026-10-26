@@ -43,7 +43,6 @@ VM_HOST = "lima-yolobox"
 HERDR_SSH_ALIAS = "yolobox"
 AGENT_USER = "agent"
 AGENT_HOME = "/home/agent"
-T3_PORT = 3773
 HELPER = "yolobox-guest"
 HELPER_NO_SUBCOMMAND = 64
 SSH_UNREACHABLE = 255
@@ -69,7 +68,6 @@ AWS_BROKER_GUEST_SOCK = "/run/yolobox-op/aws-broker.sock"
 AGENT_AWS_BROKER_SOCK = "/run/yolobox/aws-broker.sock"
 
 LIMA_PORT_FORWARDS = [
-    {"guestPort": T3_PORT, "proto": "tcp", "hostIP": "0.0.0.0"},
     {"proto": "udp", "guestIP": "0.0.0.0", "guestIPMustBeZero": False, "ignore": True},
     {
         "guestSocket": OP_GUEST_SOCK,
@@ -1966,79 +1964,33 @@ def du_kib(path: str) -> Optional[int]:
         return None
 
 
-TAILSCALE_SERVE_UNIT = "yolobox-tailscale-serve"
-TAILSCALE_SERVE_RESTART = "yo ssh sudo systemctl restart %s" % TAILSCALE_SERVE_UNIT
-T3_SERVE_PROXY = "http://127.0.0.1:%d" % T3_PORT
-# One operator round trip: tailscale's own status JSON, a separator line, then
-# tailscaled's own serve config JSON. `command -v` first, so a box predating
-# nix/tailscale.nix answers with a marker instead of a bare "not found".
+# One operator round trip: tailscale's own status JSON. `command -v` first, so
+# a box predating nix/tailscale.nix answers with a marker instead of a bare
+# "not found".
 TAILSCALE_PROBE = (
     "command -v tailscale >/dev/null 2>&1 || { echo %s; exit 0; }; "
-    "tailscale status --json; echo; echo %s; "
-    "tailscale serve status --json"
-) % (shlex.quote("NO_TAILSCALE"), shlex.quote("---"))
-
-
-def t3_is_served(serve: dict) -> bool:
-    """True when tailscaled's serve config proxies `<name>:3773` to t3.
-
-    `tailscale serve status --json` looks like
-    {"TCP": {"3773": {"HTTP": true}},
-     "Web": {"<name>:3773": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3773"}}}}}
-    """
-    web = serve.get("Web")
-    if not isinstance(web, dict):
-        return False
-    for host_port, site in web.items():
-        if not host_port.endswith(":%d" % T3_PORT) or not isinstance(site, dict):
-            continue
-        handlers = site.get("Handlers")
-        root = handlers.get("/") if isinstance(handlers, dict) else None
-        if isinstance(root, dict) and root.get("Proxy") == T3_SERVE_PROXY:
-            return True
-    return False
+    "tailscale status --json"
+) % shlex.quote("NO_TAILSCALE")
 
 
 def tailscale_status_line(stdout: str, stderr: str) -> str:
     if stdout.strip() == "NO_TAILSCALE":
         return "tailscale: box predates the tailnet module; run `yo bootstrap`"
-    status_json, _, serve_json = stdout.partition("\n---\n")
     try:
-        backend = json.loads(status_json)["BackendState"]
+        backend = json.loads(stdout)["BackendState"]
     except (ValueError, KeyError, TypeError):
-        detail = stderr.strip() or status_json.strip() or "no output"
+        detail = stderr.strip() or stdout.strip() or "no output"
         return "tailscale: WARNING status unreadable: %s" % detail
     if backend == "NeedsLogin":
         return (
             "tailscale: not logged in (optional) — to join a tailnet: "
-            "yo ssh sudo tailscale up, then: " + TAILSCALE_SERVE_RESTART
+            "yo ssh sudo tailscale up"
         )
     if backend == "NeedsMachineAuth":
-        return (
-            "tailscale: awaiting approval in the tailnet admin console (optional)"
-            " — then: " + TAILSCALE_SERVE_RESTART
-        )
+        return "tailscale: awaiting approval in the tailnet admin console (optional)"
     if backend != "Running":
-        return (
-            "tailscale: WARNING %s — fix with: yo ssh sudo tailscale up, then: %s"
-            % (
-                backend,
-                TAILSCALE_SERVE_RESTART,
-            )
-        )
-    try:
-        serve = json.loads(serve_json)
-        if not isinstance(serve, dict):
-            raise ValueError("not an object")
-    except ValueError:
-        detail = stderr.strip() or serve_json.strip() or "no output"
-        return "tailscale: WARNING Running, but serve status unreadable: %s" % detail
-    if t3_is_served(serve):
-        return "tailscale: Running, t3 served"
-    return (
-        "tailscale: WARNING Running, but t3 is not served — fix with: "
-        + TAILSCALE_SERVE_RESTART
-    )
+        return "tailscale: WARNING %s — fix with: yo ssh sudo tailscale up" % backend
+    return "tailscale: Running"
 
 
 class Gateway(enum.Enum):
@@ -2148,9 +2100,6 @@ def status_guest_services() -> None:
 
     tailscale_probe = ssh_run(OPERATOR, ["sh", "-c", TAILSCALE_PROBE], check=False)
     out(tailscale_status_line(tailscale_probe.stdout, tailscale_probe.stderr))
-
-    t3_problem = t3_service_problem(*t3_unit_state())
-    out("t3: %s" % ("WARNING " + t3_problem if t3_problem else "active"))
 
     out(guest_network_line())
 
@@ -2857,165 +2806,6 @@ def cmd_zed(args: argparse.Namespace) -> None:
     )
 
 
-def t3_unit_state() -> Tuple[str, str]:
-    # t3code is a vendor-installed *user* unit now (nix/t3.nix), not a system
-    # one — installed and kept current by yolobox-harness-install, running
-    # as the agent from boot (see nix/harnesses.md#lingering). Ask systemd the
-    # same question ssh_run(AGENT, ...) always asks it: as the agent, over its
-    # own login PAM session, which is what sets XDG_RUNTIME_DIR for a lingering
-    # user without a pty.
-    unit = ssh_run(
-        AGENT,
-        [
-            "systemctl",
-            "--user",
-            "show",
-            "-p",
-            "LoadState",
-            "-p",
-            "ActiveState",
-            "--value",
-            "t3code.service",
-        ],
-        check=False,
-    ).stdout.splitlines()
-    return (unit[0] if unit else ""), (unit[1] if len(unit) > 1 else "")
-
-
-def t3_service_problem(load_state: str, active_state: str) -> Optional[str]:
-    if not load_state:
-        return "cannot reach the VM's agent account to ask about t3code — is it up? (yo status)"
-    if load_state != "loaded":
-        return (
-            "t3code is not installed for the agent yet — its install is a user service: "
-            "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 "
-            "systemctl --user restart yolobox-harness-install"
-        )
-    if active_state != "active":
-        problem = (
-            "t3code service is %s in the VM — diagnose with: "
-            "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 journalctl --user -u t3code -n 50, "
-            "or tail ~/.t3/userdata/logs/boot-service.log as the agent" % active_state
-        )
-        if active_state == "failed":
-            # A stale ~/.t3/runtime/.service-stopping marker survives `t3 update`
-            # and crash-loops the unit until systemd's start limit (nix/t3.md#service-status).
-            problem += (
-                "; if it crash-looped on 'Service state is invalid or unsupported', clear it with: "
-                "yo ssh sudo -u agent XDG_RUNTIME_DIR=/run/user/1000 sh -c "
-                "'systemctl --user reset-failed t3code.service && ~/.local/bin/t3 service install'"
-            )
-        return problem
-    return None
-
-
-def t3_require_service() -> None:
-    problem = t3_service_problem(*t3_unit_state())
-    if problem:
-        raise YoError(problem)
-    probe = run(
-        [
-            "curl",
-            "-sS",
-            "-o",
-            "/dev/null",
-            "--max-time",
-            "5",
-            "http://127.0.0.1:%d/" % T3_PORT,
-        ]
-    )
-    if probe.returncode != 0:
-        err(
-            "yo: t3 is healthy in the VM but 127.0.0.1:%d does not answer on this Mac —"
-            % T3_PORT
-        )
-        err(
-            "    lima's port forwarding is dead (see ~/.lima/%s/ha.stderr.log)."
-            % INSTANCE
-        )
-        err("    Recover with: limactl stop %s && yo up" % INSTANCE)
-        raise YoError(None, code=1)
-
-
-PAIRING_NETLOCS = ("127.0.0.1:%d" % T3_PORT, "localhost:%d" % T3_PORT)
-PAIRING_FORBIDDEN_RE = re.compile(r"[\\@\s\x00-\x1f\x7f-\x9f]")
-
-
-def is_loopback_t3_url(url: str) -> bool:
-    # The URL comes from the guest and goes to `open`. Python's urlparse and a
-    # browser disagree about backslash and "@", so any URL carrying either (or
-    # whitespace or a control character) is refused instead of parsed.
-    if PAIRING_FORBIDDEN_RE.search(url):
-        return False
-    try:
-        parsed = urllib.parse.urlparse(url)
-    except ValueError:
-        # An unmatched "[" or a NFKC-unstable netloc: not a URL we would open.
-        return False
-    return (
-        parsed.scheme in ("http", "https")
-        and parsed.netloc in PAIRING_NETLOCS
-        and parsed.path.startswith("/")
-    )
-
-
-def parse_pairing_url(text: str) -> Optional[str]:
-    url = ""
-    for line in text.replace("\r", "").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Pairing URL:"):
-            url = stripped[len("Pairing URL:") :].strip()
-            break
-    if not url:
-        return None
-    if not is_loopback_t3_url(url):
-        raise YoError("'t3 pair' printed a pairing URL yo will not open: %r" % url)
-    return url
-
-
-def cmd_t3(args: argparse.Namespace) -> None:
-    t3_require_service()
-    pair_out = ssh_run(
-        AGENT, ["t3", "pair", "--ttl", "2m", "--label", "yo"], merge_stderr=True
-    ).stdout
-    url = parse_pairing_url(pair_out)
-    if url is None:
-        err("yo: 't3 pair' printed no 'Pairing URL:' line:")
-        err(pair_out.rstrip("\n"))
-        raise YoError(None, code=1)
-    exec_process(["open", url])
-
-
-def cmd_pair(args: argparse.Namespace) -> None:
-    t3_require_service()
-    host_name = run(["scutil", "--get", "LocalHostName"], check=True).stdout.strip()
-    base_url = (
-        args.base_url
-        if args.base_url is not None
-        else "http://%s.local:%d" % (host_name, T3_PORT)
-    )
-    pair = ssh_run(
-        AGENT,
-        [
-            "t3",
-            "auth",
-            "pairing",
-            "create",
-            "--ttl",
-            "5m",
-            "--label",
-            "yo@%s" % host_name,
-            "--base-url",
-            base_url,
-        ],
-        merge_stderr=True,
-    )
-    if pair.returncode != 0:
-        err(pair.stdout.rstrip("\n"))
-        raise YoError(None, code=1)
-    out(pair.stdout.rstrip("\n"))
-
-
 def link_remote_action(existing_url: Optional[str], wanted_url: str) -> str:
     if not existing_url:
         return "add"
@@ -3297,23 +3087,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     zed.add_argument("project", nargs="?")
     zed.set_defaults(func=cmd_zed)
-
-    t3 = add(
-        "t3",
-        "Open t3code's web UI in this Mac's browser.",
-        "Open t3code's web UI, served by the VM, in this Mac's browser with a\n"
-        "fresh pairing token. A bookmarked URL fails auth; run this again.",
-    )
-    t3.set_defaults(func=cmd_t3)
-
-    pair = add(
-        "pair",
-        "Print a t3 pairing URL for a browser on another device.",
-        "Print a t3 pairing URL that names this Mac (default\n"
-        "http://<hostname>.local:3773) for a browser on another device.",
-    )
-    pair.add_argument("base_url", nargs="?", metavar="base-url")
-    pair.set_defaults(func=cmd_pair)
 
     aws_check = add(
         "aws-check",

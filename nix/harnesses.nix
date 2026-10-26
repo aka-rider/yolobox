@@ -204,14 +204,6 @@ let
         link_bin pi "$HOME/.pi/agent/bin/pi"
       }
 
-      # t3code's own vendor install; it never edits an rc file. Its installer
-      # unpacks straight into the layout `t3 service install` also uses, so
-      # this download is reused rather than repeated.
-      install_t3() {
-        [ -x "$HOME/.local/bin/t3" ] || curl -fsSL https://t3.codes/install.sh | bash
-        [ -f "$HOME/.config/systemd/user/t3code.service" ] || t3 service install
-      }
-
       # Scripts ON: agent-browser's postinstall IS the download of
       # its prebuilt binary. That download fails silently, so the version call
       # below is the hard check rather than a courtesy. Pinned to the version
@@ -263,13 +255,12 @@ let
 
       phase claude install_claude
       phase pi install_pi
-      phase t3 install_t3
       phase agent-browser install_agent_browser
       phase pi-packages install_pi_packages
       phase pi-agent-browser-config configure_agent_browser
       phase opencode install_opencode
 
-      for tool in claude pi t3 opencode agent-browser node; do
+      for tool in claude pi opencode agent-browser node; do
         phase "$tool --version" "$tool" --version
       done
 
@@ -417,9 +408,9 @@ in
       ];
       # NIX_LD/NIX_LD_LIBRARY_PATH are spelled out rather than inherited: this
       # unit must not depend on PAM having reached the user manager with a
-      # login environment. t3's own downloaded binary needs them too, at
-      # install time (the vendor script runs `t3 --version` to verify the
-      # download) and every time t3code.service execs it (nix/t3.nix).
+      # login environment. The vendor-downloaded binaries (claude, pi,
+      # opencode) are dynamically linked glibc programs and need them at
+      # install time, where the version checks run them.
       environment = {
         NPM_CONFIG_PREFIX = "${homeDir}/.local";
       } // nixLdEnv;

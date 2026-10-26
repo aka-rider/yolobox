@@ -106,27 +106,12 @@ export AWS_PROFILE=<profile>
 aws sts get-caller-identity
 ```
 
-### T3 Code
+### Tailscale (optional)
 
-[T3 Code](https://t3.codes/) is a web UI for coding agents, and it has a mobile app. Open it with:
-
-```bash
-yo t3
-```
-
-One T3 Code can pair with many machines, so you can run all of them from one place.
-
-To reach it from anywhere on your [Tailscale](https://tailscale.com/) network, log the VM in once:
+To reach the VM from anywhere on your [Tailscale](https://tailscale.com/) network, log it in once:
 
 ```bash
 yo ssh sudo tailscale up
-```
-
-Then start sharing T3 Code on the tailnet and pair with its address:
-
-```bash
-yo ssh sudo systemctl restart yolobox-tailscale-serve
-yo pair http://yolobox.<tailnet>.ts.net:3773
 ```
 
 Tailscale is optional. Without it nothing changes, and `yo status` just says the VM is not logged in.

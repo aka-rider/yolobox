@@ -1409,42 +1409,6 @@ class TestEnsureGuestKnownHosts(FakeHome):
         self.assertFalse(caught.exception.message.startswith("yo:"))
 
 
-class TestParsePairingUrl(unittest.TestCase):
-    def test_accepts_loopback(self):
-        url = "http://127.0.0.1:3773/?token=x"
-        self.assertEqual(yo.parse_pairing_url("  Pairing URL: %s\n" % url), url)
-
-    def test_rejects_anything_but_loopback_http(self):
-        urls = [
-            "file:///etc/passwd",
-            "javascript:alert(1)",
-            "http://evil.example/",
-            "http://evil.com\\@127.0.0.1:3773/x",
-            "http://127.0.0.1.evil.com:3773/x",
-            "http://127.0.0.1:3774/x",
-            "http://127.0.0.1/x",
-            "http://user@127.0.0.1:3773/x",
-            "http://127.0.0.1:3773",
-            "http://127.0.0.1:3773/x y",
-            "http://127.0.0.1:3773/x\x1b[31m",
-            "http://127.0.0.1:3773/x\u009by",
-            "http://[::1/pair",
-            "http://127.0.0.1:3773\uff03/x",
-        ]
-        for url in urls:
-            with self.subTest(url=url):
-                with self.assertRaises(yo.YoError):
-                    yo.parse_pairing_url("Pairing URL: %s\n" % url)
-
-    def test_accepts_localhost_and_https(self):
-        for url in ("http://localhost:3773/p#t=1", "https://127.0.0.1:3773/p"):
-            with self.subTest(url=url):
-                self.assertEqual(yo.parse_pairing_url("Pairing URL: %s\n" % url), url)
-
-    def test_none_without_a_pairing_line(self):
-        self.assertIsNone(yo.parse_pairing_url("Grok CLI health check failed\n"))
-
-
 class Reached(Exception):
     pass
 
@@ -1866,15 +1830,8 @@ class TestLimaConfigGaps(FakeHome):
         with self.mock_lima_list(self.both_forwards()):
             self.assertEqual(yo.lima_config_gaps(), [])
 
-    def test_an_instance_whose_t3_rule_predates_proto_tcp_is_no_gap(self):
-        # Only the reverse socket rules are checked; an older instance's
-        # {"guestPort": 3773, "hostIP": "0.0.0.0"} must not trigger a note.
-        forwards = [{"guestPort": yo.T3_PORT, "hostIP": "0.0.0.0"}]
-        with self.mock_lima_list(forwards + self.both_forwards()):
-            self.assertEqual(yo.lima_config_gaps(), [])
-
     def test_missing_reverse_rule_is_reported_not_raised(self):
-        forwards = [self.both_forwards()[0], {"guestPort": 3773}]
+        forwards = [self.both_forwards()[0], {"guestPort": 8080}]
         with self.mock_lima_list(forwards):
             gaps = yo.lima_config_gaps()
         self.assertEqual(set(gaps), {yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK})
@@ -2139,83 +2096,32 @@ class TestYoVersionLiteral(unittest.TestCase):
 
 
 class TestTailscaleStatusLine(unittest.TestCase):
-    SERVED = json.dumps(
-        {
-            "TCP": {"3773": {"HTTP": True}},
-            "Web": {
-                "box.tailnet.ts.net:3773": {
-                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:3773"}}
-                }
-            },
-        }
-    )
-    RESTART = "yo ssh sudo systemctl restart yolobox-tailscale-serve"
+    def probe(self, backend):
+        return json.dumps({"BackendState": backend})
 
-    def probe(self, backend, serve):
-        return json.dumps({"BackendState": backend}) + "\n\n---\n" + serve + "\n"
+    def test_running_is_healthy(self):
+        line = yo.tailscale_status_line(self.probe("Running"), "")
+        self.assertEqual(line, "tailscale: Running")
 
-    def test_running_with_t3_served_is_healthy(self):
-        line = yo.tailscale_status_line(self.probe("Running", self.SERVED), "")
-        self.assertEqual(line, "tailscale: Running, t3 served")
-
-    def test_running_with_nothing_served_warns_and_names_the_restart(self):
-        line = yo.tailscale_status_line(self.probe("Running", "{}"), "")
-        self.assertEqual(
-            line,
-            "tailscale: WARNING Running, but t3 is not served — fix with: "
-            + self.RESTART,
-        )
-
-    def test_running_with_another_port_or_target_served_is_not_served(self):
-        other_port = self.SERVED.replace(":3773", ":8080")
-        other_target = self.SERVED.replace("127.0.0.1:3773", "127.0.0.1:9999")
-        for serve in (other_port, other_target):
-            with self.subTest(serve=serve):
-                line = yo.tailscale_status_line(self.probe("Running", serve), "")
-                self.assertIn("t3 is not served", line)
-
-    def test_malformed_serve_config_is_not_served(self):
-        for serve in (
-            '{"Web": null}',
-            '{"Web": {"x:3773": null}}',
-            '{"Web": {"x:3773": {"Handlers": []}}}',
-        ):
-            with self.subTest(serve=serve):
-                line = yo.tailscale_status_line(self.probe("Running", serve), "")
-                self.assertIn("t3 is not served", line)
-
-    def test_unreadable_serve_status_is_a_warning_with_the_detail(self):
-        for serve in ("lizard", "", "null", "[]"):
-            with self.subTest(serve=serve):
-                line = yo.tailscale_status_line(
-                    self.probe("Running", serve), "serve boom"
-                )
-                self.assertIn(
-                    "WARNING Running, but serve status unreadable: serve boom", line
-                )
-
-    def test_not_logged_in_is_optional_and_names_login_then_serve_restart(self):
-        line = yo.tailscale_status_line(self.probe("NeedsLogin", "{}"), "")
+    def test_not_logged_in_is_optional_and_names_login(self):
+        line = yo.tailscale_status_line(self.probe("NeedsLogin"), "")
         self.assertEqual(
             line,
             "tailscale: not logged in (optional) — to join a tailnet: "
-            "yo ssh sudo tailscale up, then: " + self.RESTART,
+            "yo ssh sudo tailscale up",
         )
 
-    def test_awaiting_approval_is_optional_and_names_serve_restart(self):
-        line = yo.tailscale_status_line(self.probe("NeedsMachineAuth", "{}"), "")
+    def test_awaiting_approval_is_optional(self):
+        line = yo.tailscale_status_line(self.probe("NeedsMachineAuth"), "")
         self.assertEqual(
             line,
-            "tailscale: awaiting approval in the tailnet admin console (optional)"
-            " — then: " + self.RESTART,
+            "tailscale: awaiting approval in the tailnet admin console (optional)",
         )
 
-    def test_a_stopped_backend_is_a_warning_naming_login_and_restart(self):
-        line = yo.tailscale_status_line(self.probe("Stopped", self.SERVED), "")
+    def test_a_stopped_backend_is_a_warning_naming_login(self):
+        line = yo.tailscale_status_line(self.probe("Stopped"), "")
         self.assertEqual(
-            line,
-            "tailscale: WARNING Stopped — fix with: yo ssh sudo tailscale up, then: "
-            + self.RESTART,
+            line, "tailscale: WARNING Stopped — fix with: yo ssh sudo tailscale up"
         )
 
     def test_unparseable_output_surfaces_stderr(self):
@@ -2225,7 +2131,7 @@ class TestTailscaleStatusLine(unittest.TestCase):
     def test_json_that_is_not_an_object_is_unreadable(self):
         for payload in ("null", "[]"):
             with self.subTest(payload=payload):
-                line = yo.tailscale_status_line(payload + "\n\n---\n{}\n", "")
+                line = yo.tailscale_status_line(payload + "\n", "")
                 self.assertIn("status unreadable: " + payload, line)
 
     def test_silent_failure_says_no_output(self):
@@ -2234,73 +2140,6 @@ class TestTailscaleStatusLine(unittest.TestCase):
 
     def test_box_without_tailscale_says_to_bootstrap(self):
         self.assertIn("yo bootstrap", yo.tailscale_status_line("NO_TAILSCALE\n", ""))
-
-
-class TestT3ServiceProblem(unittest.TestCase):
-    def test_loaded_and_active_is_no_problem(self):
-        self.assertIsNone(yo.t3_service_problem("loaded", "active"))
-
-    def test_empty_load_state_means_agent_unreachable(self):
-        self.assertIn("cannot reach", yo.t3_service_problem("", ""))
-
-    def test_missing_unit_names_the_install_restart(self):
-        self.assertIn(
-            "yolobox-harness-install", yo.t3_service_problem("not-found", "inactive")
-        )
-
-    def test_failed_unit_names_its_state_and_journal(self):
-        problem = yo.t3_service_problem("loaded", "failed")
-        self.assertIn("service is failed", problem)
-        self.assertIn("journalctl --user -u t3code", problem)
-
-    def test_failed_unit_names_the_stale_marker_recovery(self):
-        problem = yo.t3_service_problem("loaded", "failed")
-        self.assertIn(
-            "systemctl --user reset-failed t3code.service && ~/.local/bin/t3 service install",
-            problem,
-        )
-
-    def test_non_failed_states_do_not_suggest_reset_failed(self):
-        for state in ("activating", "inactive"):
-            with self.subTest(state=state):
-                self.assertNotIn("reset-failed", yo.t3_service_problem("loaded", state))
-
-
-class TestT3RequireService(unittest.TestCase):
-    def require(self, unit_stdout, curl_returncode=0):
-        def ssh_run(role, argv, **kwargs):
-            return subprocess.CompletedProcess(argv, 0, stdout=unit_stdout, stderr="")
-
-        def run(argv, **kwargs):
-            return subprocess.CompletedProcess(
-                argv, curl_returncode, stdout="", stderr=""
-            )
-
-        with (
-            contextlib.redirect_stderr(io.StringIO()),
-            mock.patch.object(yo, "ssh_run", ssh_run),
-            mock.patch.object(yo, "run", run),
-        ):
-            yo.t3_require_service()
-
-    def test_unreachable_agent_is_refused(self):
-        with self.assertRaisesRegex(yo.YoError, "cannot reach"):
-            self.require("")
-
-    def test_uninstalled_service_is_refused(self):
-        with self.assertRaisesRegex(yo.YoError, "not installed"):
-            self.require("not-found\ninactive\n")
-
-    def test_failed_service_is_refused(self):
-        with self.assertRaisesRegex(yo.YoError, "service is failed"):
-            self.require("loaded\nfailed\n")
-
-    def test_active_service_answering_on_the_mac_passes(self):
-        self.require("loaded\nactive\n")
-
-    def test_active_service_unreachable_from_the_mac_is_refused(self):
-        with self.assertRaises(yo.YoError):
-            self.require("loaded\nactive\n", curl_returncode=7)
 
 
 class TestStatusWithVmDown(unittest.TestCase):

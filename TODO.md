@@ -14,7 +14,6 @@ Posted 2026-10-02, awaiting review. The reasoning behind it is in lima/yolobox.m
   - 2026-10-24, lima 2.2.1, the first `yo down` before the LUKS migration: three minutes, then `did not receive an event with the exiting status`; `lima_stop()` printed its recovery text. Recovered by `kill -9` of the hostagent while the box waited in its initrd (under vz that also ends the VM). The second stop, done by `vm_up` after the migration, worked.
 
   The gentler recovery when `limactl stop` hangs is `sudo systemctl reboot` inside the guest (`yo ssh sudo systemctl reboot`); the child still needs `kill -9`. Not written up until a narrower repro exists.
-- t3code: the crash loop after `t3 update` across a service-launcher protocol bump (2026-10-01, stale `.service-stopping` marker) is pingdotgg/t3code#12627, open; its fix PR #12629 was closed unmerged on 2026-10-12. Nothing to file; `yo status` names the recovery.
 
 # Known problems
 

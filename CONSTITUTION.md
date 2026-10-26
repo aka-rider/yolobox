@@ -57,7 +57,7 @@ Identify whether you are running on the host (macOS) or the guest (Linux).
 
 - ALWAYS let an ssh role, not a bare `User=` override, own the `ControlPath`. Lima's `ControlPath` has no `%r`, so OpenSSH never re-checks the login user of a new connection, and `-o User=agent` over the operator's live master silently runs as the operator. [story](docs/ssh.md#one-controlpath-per-role)
 - ALWAYS reach the agent's 1Password through the lima reverse socket forward (`/run/yolobox-op/agent.sock`, proxied by `systemd-socket-proxyd` to the agent-owned `/run/yolobox/op-agent.sock`), never through `ForwardAgent`. The forward is set up once per hostagent start and lives with the VM, not with any one pane. [story](docs/ssh.md#1password-reaches-the-agent)
-- NEVER put a `ForwardAgent` other than `no` in `~/.lima/yolobox/ssh.config`. Every ssh role `yo` spawns reads that file, so a forward there would reach `yo code`, `yo zed` and every t3 session. The owned agent `Match` block and the herdr alias say `no`, so the operator's own `ForwardAgent yes` cannot apply to them. [story](docs/ssh.md#the-owned-block-in-sshconfig)
+- NEVER put a `ForwardAgent` other than `no` in `~/.lima/yolobox/ssh.config`. Every ssh role `yo` spawns reads that file, so a forward there would reach `yo code` and `yo zed`. The owned agent `Match` block and the herdr alias say `no`, so the operator's own `ForwardAgent yes` cannot apply to them. [story](docs/ssh.md#the-owned-block-in-sshconfig)
 - ALWAYS limit `yo ssh`'s `ForwardAgent` to its own command line over `ControlPath=none`, pointing at the 1Password socket. The default forwards `$SSH_AUTH_SOCK`, which on this Mac is Apple's empty agent, and a forward on a shared master would outlive its pane. [story](docs/ssh.md#yo-ssh-forwards-per-session)
 - ALWAYS verify the guest's host key from `~/.lima/yolobox/known_hosts`, with `NoHostAuthenticationForLocalhost no` in the owned head block of `ssh.config`. Lima's own block sets it to yes, which disables verification for 127.0.0.1, and ssh keeps the first value. Only the fetch of the keys (`OPERATOR_FIRST_CONTACT`) may opt out, on its command line. [story](docs/ssh.md#host-key-pin)
 - ALWAYS let the guest's ssh identity setup (`~/.ssh/config`, the `*.pub` selectors) live in the guest, never by the Mac reading files and pushing them in. The Mac reading paths the guest can influence is how a repo-held symlink once pointed at a private key. [story](docs/ssh.md#git-identities-in-the-guest)
@@ -74,7 +74,6 @@ Identify whether you are running on the host (macOS) or the guest (Linux).
 - ALWAYS keep `tailscale0` trusted, so the tailnet ACL decides who reaches the box, and ALWAYS keep `enp0s1` at port 22 only, whatever `ssh.overVsock` says. A service on the tailnet address must answer with no further setup, and lima's start-up wait and its usernet fallback dial 192.168.5.15:22 over TCP, where a dropped packet shows as a 600 s timeout. [story](nix/tailscale.md#sshd-on-two-interfaces)
 - ALWAYS keep `RemainAfterExit = true` on `tailscaled-set`. A `Type=oneshot` unit that has exited is inactive, and a switch restarts a changed unit only if it is active, so flag changes would never apply. [story](nix/tailscale.md#tailscaled-set)
 - ALWAYS put a box-local route in `networking.dhcpcd.runHook`, never in `networking.interfaces.<if>.ipv4.routes`. A dhcpcd restart flushes the route and the oneshot that added it never runs again. [story](nix/tailscale.md#box-local-routes)
-- NEVER narrow the `hostIP: "0.0.0.0"` forward of port 3773 to loopback. A Mac that never runs `tailscale up` still reaches t3 from the LAN through it. [story](nix/tailscale.md#why-3773-also-stays-on-0000)
 
 ## yo internals
 
@@ -84,7 +83,6 @@ Identify whether you are running on the host (macOS) or the guest (Linux).
 - ALWAYS keep `yo ssh`'s trailing arguments `nargs=argparse.REMAINDER`. The printed `nixos-rebuild --impure` remedy only works if argparse passes `--impure` through. [story](yo.md#one-parser)
 - ALWAYS branch on `project is not None`, never on truthiness, for the optional `project` of `enter`, `code` and `zed`. `yo enter ""` and `yo enter` are different invocations. [story](yo.md#one-parser)
 - ALWAYS print through `out()` and `err()`, never `print` or a raw stream. They replace control characters, and guest output is attacker-controlled text that reaches the Mac's terminal. [story](yo.md#output-filter)
-- ALWAYS parse a URL the guest produced before `yo` opens it on the Mac, and refuse anything but `http(s)` to `127.0.0.1:3773` or `localhost:3773`. `urlparse` and browsers disagree about backslashes and `@`. [story](yo.md#opening-a-guest-url)
 - NEVER disable `services.openssh.allowSFTP`. `yo cp` runs scp, which speaks sftp, so sshd runs `sftp-server` and no login shell. [story](yo.md#yo-cp)
 - ALWAYS glob-escape a guest source in `yo cp`, and NEVER escape a guest destination. scp expands wildcards in remote sources only, so escaping a destination creates a file named with backslashes. [story](yo.md#yo-cp)
 - NEVER upload a symlink with `yo cp`. `scp -r` follows it and copies the target, which can be a private file the user never named. [story](yo.md#yo-cp)
@@ -138,8 +136,7 @@ Identify whether you are running on the host (macOS) or the guest (Linux).
 - ALWAYS let pi own `~/.pi/agent/settings.json`, and NEVER add a tmpfiles rule for it. pi rewrites it and only logs a failed write, so a symlink silently drops every package, and an unconditional `r` rule deletes the real file. [story](nix/harnesses.md#pi)
 - ALWAYS install pi packages with `pi install`, never by editing its settings file. [story](nix/harnesses.md#pi)
 - NEVER drop a retired `L+` link or file from the config without an `r` rule or a hand delete. A rebuild does not remove what it stops declaring, and the dangling link breaks its owner. [story](nix/harnesses.md#pi)
-- ALWAYS keep the VM free of a C and Python toolchain. It keeps native npm modules from compiling at install time, so t3 and agent-browser install vendor-built binaries instead. [story](nix/harnesses.md#install-phases)
-- ALWAYS keep t3's `HOME` equal to an interactive session's. `t3 pair` finds the server through `$HOME/.t3/*/server-runtime.json`, and a mismatch reads as "No running T3 Code server found". [story](nix/t3.md#vendor-install-and-drop-in)
+- ALWAYS keep the VM free of a C and Python toolchain. It keeps native npm modules from compiling at install time, so agent-browser installs vendor-built binaries instead. [story](nix/harnesses.md#install-phases)
 
 ## herdr
 
@@ -166,7 +163,7 @@ Identify whether you are running on the host (macOS) or the guest (Linux).
 - ALWAYS tie the AWS broker's lifetime to lima's hostagent (`--watch-pid`, read from `limactl list yolobox --json`'s `hostAgentPID`), never to a per-session forward or an idle timeout, and never by opening lima's `ha.pid`. Profiles are chosen per process, so no session bounds the broker, and lima rewrites `ha.pid` on every start. [story](docs/aws.md#broker-lifetime)
 - ALWAYS reach the AWS broker the way 1Password is reached: a lima reverse unix-socket forward (`/run/yolobox-op/aws-broker.sock`, proxied to the agent-owned `/run/yolobox/aws-broker.sock`), never a forwarded TCP port. A Mac-side VPN blackholed every guest connection to lima's gateway address while general egress kept working. [story](docs/aws.md#transport)
 - NEVER guard a reversed unix socket with a bearer token. Filesystem permissions on the agent-owned socket are the whole authorization boundary, and a token is a second mechanism to keep in sync. [story](docs/aws.md#transport)
-- ALWAYS keep the agent's environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`, `GOPATH`, `PI_CLIPBOARD_OSC52`) declared once, in `nix/lib/agent-env.nix`, applied identically to the herdr server, t3 and every agent login shell. `awsBrokerSock` there is the one name of the guest-side broker socket, and `TestAgentEnvMatchesYoSockets` checks it against `yo`. [story](docs/aws.md#guest-config)
+- ALWAYS keep the agent's environment (`SSH_AUTH_SOCK`, `AWS_CONFIG_FILE`, `GOPATH`, `PI_CLIPBOARD_OSC52`) declared once, in `nix/lib/agent-env.nix`, applied identically to the herdr server and every agent login shell. `awsBrokerSock` there is the one name of the guest-side broker socket, and `TestAgentEnvMatchesYoSockets` checks it against `yo`. [story](docs/aws.md#guest-config)
 - NEVER let the broker write a secret to stdout after its handshake line, or to any log. [story](docs/aws.md#broker-lifetime)
 
 ### Broker hardening

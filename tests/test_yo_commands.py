@@ -136,9 +136,9 @@ class TestSshRemainderPassthrough(unittest.TestCase):
         )
 
     def test_a_plain_remote_command_round_trips_intact(self):
-        args = self.parse(["ssh", "journalctl", "--user", "-u", "t3code", "-n", "50"])
+        args = self.parse(["ssh", "journalctl", "--user", "-u", "herdr", "-n", "50"])
         self.assertEqual(
-            args.ssh_cmd, ["journalctl", "--user", "-u", "t3code", "-n", "50"]
+            args.ssh_cmd, ["journalctl", "--user", "-u", "herdr", "-n", "50"]
         )
 
     def test_no_remote_command_is_an_empty_list(self):

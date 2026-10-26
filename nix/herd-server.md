@@ -18,9 +18,9 @@ through it. That existed for one reason: a host pane's foreground process was
 
 Agents now run in herdr's own machine panes, not in `yo enter`. `yo enter`
 stays a plain landing shell (`ssh -t ... exec $SHELL -l`). A session started
-there is invisible to herdr, and so is one from `yo ssh`, `yo code`, `yo zed`
-or a t3-spawned agent. None of them opens a pty on the guest herdr server, so
-all of them show as `unknown` or not at all. The place to run an agent is a
+there is invisible to herdr, and so is one from `yo ssh`, `yo code` or
+`yo zed`. None of them opens a pty on the guest herdr server, so all of them
+show as `unknown` or not at all. The place to run an agent is a
 workspace opened on the saved `yolobox` machine. `cmd_enter` says so on
 stderr when `HERDR_ENV=1`, meaning the command itself runs inside a herdr
 pane. Inside the guest, navigation is left to the agent's own shell setup. Nothing named `yo` exists in the guest.

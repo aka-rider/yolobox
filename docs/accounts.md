@@ -8,7 +8,7 @@ Lima creates a guest account named and uid-matched after the Mac account that st
 
 Lima >= 2.1.0 names the operator's home `/home/<user>.guest` (it was `/home/<user>.linux` before; lima-vm/lima#4578).
 
-Every AI coding session runs as a second account, `agent`, a constant in `flake.nix` that is never threaded in from the host. Its uid is 1000, its home is `/home/agent`, its only group is `users`, and it is in neither `wheel` nor any sudoers rule. It has no `sudo` at all. `yo enter`, `yo code`, `yo zed` and every t3-spawned session land there.
+Every AI coding session runs as a second account, `agent`, a constant in `flake.nix` that is never threaded in from the host. Its uid is 1000, its home is `/home/agent`, its only group is `users`, and it is in neither `wheel` nor any sudoers rule. It has no `sudo` at all. `yo enter`, `yo code`, and `yo zed` land there.
 
 Three assertions in `nix/base.nix` check `username` at evaluation time, because it reaches sshd config, tmpfiles rules and shell scripts. It must differ from `agent`, it must not be `root`, and it must match `[a-z_][a-z0-9_-]*`. A Mac account that fails one of these stops `nixos-rebuild` with a message naming `YOLOBOX_USERNAME`, instead of building a box that quietly merges the two accounts.
 
@@ -46,7 +46,7 @@ The system journal is the other thing the agent must not read, and it gates on a
 
 The agent used to carry that group, for one reason. `xvfb` and `openbox` were system units that ran as the agent, so their logs landed in the system journal, and without the group `journalctl -u openbox` silently narrowed to the agent's own messages. The price was too high. The operator's entries (uid 501) live in `system.journal`, not in a journal of their own, and among them are the `sudo: <operator> : ... COMMAND=<argv>` lines for everything the operator ran under `sudo`. An agent in the group could read every command the operator had run as root, arguments included.
 
-So the group is gone, and `xvfb` and `openbox` are the agent's own user units (`systemd.user.services`, `ConditionUser=agent`, wanted by `default.target`; see [nix/display.md](../nix/display.md#display)). Their logs sit in the agent's user journal, which it owns outright without any group. `journalctl --user -u openbox` as the agent is the way to read them. t3code was never part of this. It is a vendor-installed user unit (see [nix/t3.md](../nix/t3.md#vendor-install-and-drop-in)), and its logs sit in the same user journal.
+So the group is gone, and `xvfb` and `openbox` are the agent's own user units (`systemd.user.services`, `ConditionUser=agent`, wanted by `default.target`; see [nix/display.md](../nix/display.md#display)). Their logs sit in the agent's user journal, which it owns outright without any group. `journalctl --user -u openbox` as the agent is the way to read them.
 
 Recognise a regression by `id` as the agent listing anything but `users`, or by `journalctl -u sshd` as the agent printing system entries at all. Without the group it can show only the agent's own messages.
 

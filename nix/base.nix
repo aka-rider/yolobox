@@ -282,8 +282,8 @@ in
   # and it carries no whitelist: an .envrc is arbitrary code the agent
   # writes, and auto-trusting it in the operator's shell would hand over the
   # operator's sudo on the first cd. The agent alone gets /etc/direnv-agent
-  # (DIRENV_CONFIG in nix/lib/agent-env.nix, which also reaches herdr panes
-  # and t3), whose direnv.toml whitelists its home. direnv reads direnvrc and
+  # (DIRENV_CONFIG in nix/lib/agent-env.nix, which also reaches herdr panes),
+  # whose direnv.toml whitelists its home. direnv reads direnvrc and
   # lib/*.sh from the same directory, so those two are the /etc/direnv files
   # themselves, keeping nix-direnv. An XDG ~/.config file is never read.
   programs.direnv.enable = true;

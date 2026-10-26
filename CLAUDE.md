@@ -73,7 +73,7 @@ Box configuration (Nix):
   the initrd configuration, `apps.nix` defines the three scripts that run
   there. `docs/disk-encryption.md`.
 - `nix/agentic.nix`: only an imports list for `harnesses.nix`,
-  `herd-server.nix`, `display.nix` and `t3.nix`.
+  `herd-server.nix` and `display.nix`.
 - `nix/harnesses.nix`: the `claude` launcher and the user service that
   installs claude, pi, opencode and agent-browser from their vendors.
   `nix/harnesses.md`.
@@ -81,10 +81,7 @@ Box configuration (Nix):
   `nix/herd-server.md`.
 - `nix/display.nix`: the virtual X display, browsers and screen recording.
   `nix/display.md`.
-- `nix/t3.nix`: a drop-in onto the vendor-installed t3code user unit.
-  `nix/t3.md`.
-- `nix/tailscale.nix`: the optional tailnet, with `tailscale0` trusted, and
-  `tailscale serve` for t3.
+- `nix/tailscale.nix`: the optional tailnet, with `tailscale0` trusted.
   `nix/tailscale.md`.
 - `nix/podman.nix`: rootless podman with a docker-compatible socket.
 - `nix/lsp.nix`: Python language-server wiring for every editor.
