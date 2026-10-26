@@ -2139,40 +2139,84 @@ class TestYoVersionLiteral(unittest.TestCase):
 
 
 class TestTailscaleStatusLine(unittest.TestCase):
+    SERVED = json.dumps(
+        {
+            "TCP": {"3773": {"HTTP": True}},
+            "Web": {
+                "box.tailnet.ts.net:3773": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:3773"}}
+                }
+            },
+        }
+    )
+    RESTART = "yo ssh sudo systemctl restart yolobox-tailscale-serve"
+
     def probe(self, backend, serve):
         return json.dumps({"BackendState": backend}) + "\n\n---\n" + serve + "\n"
 
-    def test_running_with_active_serve_is_healthy(self):
-        line = yo.tailscale_status_line(self.probe("Running", "active"), "")
-        self.assertEqual(line, "tailscale: Running, serve active")
+    def test_running_with_t3_served_is_healthy(self):
+        line = yo.tailscale_status_line(self.probe("Running", self.SERVED), "")
+        self.assertEqual(line, "tailscale: Running, t3 served")
+
+    def test_running_with_nothing_served_warns_and_names_the_restart(self):
+        line = yo.tailscale_status_line(self.probe("Running", "{}"), "")
+        self.assertEqual(
+            line,
+            "tailscale: WARNING Running, but t3 is not served — fix with: "
+            + self.RESTART,
+        )
+
+    def test_running_with_another_port_or_target_served_is_not_served(self):
+        other_port = self.SERVED.replace(":3773", ":8080")
+        other_target = self.SERVED.replace("127.0.0.1:3773", "127.0.0.1:9999")
+        for serve in (other_port, other_target):
+            with self.subTest(serve=serve):
+                line = yo.tailscale_status_line(self.probe("Running", serve), "")
+                self.assertIn("t3 is not served", line)
+
+    def test_malformed_serve_config_is_not_served(self):
+        for serve in (
+            '{"Web": null}',
+            '{"Web": {"x:3773": null}}',
+            '{"Web": {"x:3773": {"Handlers": []}}}',
+        ):
+            with self.subTest(serve=serve):
+                line = yo.tailscale_status_line(self.probe("Running", serve), "")
+                self.assertIn("t3 is not served", line)
+
+    def test_unreadable_serve_status_is_a_warning_with_the_detail(self):
+        for serve in ("lizard", "", "null", "[]"):
+            with self.subTest(serve=serve):
+                line = yo.tailscale_status_line(
+                    self.probe("Running", serve), "serve boom"
+                )
+                self.assertIn(
+                    "WARNING Running, but serve status unreadable: serve boom", line
+                )
 
     def test_not_logged_in_is_optional_and_names_login_then_serve_restart(self):
-        line = yo.tailscale_status_line(self.probe("NeedsLogin", "active"), "")
+        line = yo.tailscale_status_line(self.probe("NeedsLogin", "{}"), "")
         self.assertEqual(
             line,
             "tailscale: not logged in (optional) — to join a tailnet: "
-            "yo ssh sudo tailscale up, then: "
-            "yo ssh sudo systemctl restart yolobox-tailscale-serve",
+            "yo ssh sudo tailscale up, then: " + self.RESTART,
         )
 
     def test_awaiting_approval_is_optional_and_names_serve_restart(self):
-        line = yo.tailscale_status_line(self.probe("NeedsMachineAuth", "active"), "")
+        line = yo.tailscale_status_line(self.probe("NeedsMachineAuth", "{}"), "")
         self.assertEqual(
             line,
             "tailscale: awaiting approval in the tailnet admin console (optional)"
-            " — then: yo ssh sudo systemctl restart yolobox-tailscale-serve",
+            " — then: " + self.RESTART,
         )
 
-    def test_a_stopped_backend_is_still_a_warning(self):
-        line = yo.tailscale_status_line(self.probe("Stopped", "failed"), "")
-        self.assertIn("WARNING Stopped, serve failed", line)
-        self.assertIn("yo ssh sudo tailscale up", line)
-        self.assertIn("yo ssh sudo systemctl restart yolobox-tailscale-serve", line)
-
-    def test_running_with_dead_serve_only_asks_for_serve_restart(self):
-        line = yo.tailscale_status_line(self.probe("Running", "inactive"), "")
-        self.assertIn("serve inactive", line)
-        self.assertNotIn("tailscale up", line)
+    def test_a_stopped_backend_is_a_warning_naming_login_and_restart(self):
+        line = yo.tailscale_status_line(self.probe("Stopped", self.SERVED), "")
+        self.assertEqual(
+            line,
+            "tailscale: WARNING Stopped — fix with: yo ssh sudo tailscale up, then: "
+            + self.RESTART,
+        )
 
     def test_unparseable_output_surfaces_stderr(self):
         line = yo.tailscale_status_line("", "failed to connect to local tailscaled")
@@ -2181,7 +2225,7 @@ class TestTailscaleStatusLine(unittest.TestCase):
     def test_json_that_is_not_an_object_is_unreadable(self):
         for payload in ("null", "[]"):
             with self.subTest(payload=payload):
-                line = yo.tailscale_status_line(payload + "\n\n---\nactive\n", "")
+                line = yo.tailscale_status_line(payload + "\n\n---\n{}\n", "")
                 self.assertIn("status unreadable: " + payload, line)
 
     def test_silent_failure_says_no_output(self):

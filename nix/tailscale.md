@@ -11,13 +11,14 @@ What trusting the interface opens, all of it to whatever the ACL admits:
 - every TCP port the agent binds on a wildcard or tailnet address, not only 22 and 3773;
 - UDP, which the old rule never admitted except the tunnel's own 41641;
 - IPv6 arriving on `tailscale0`;
-- tailscaled's peerAPI listeners on the tailnet addresses.
+- tailscaled's peerAPI listeners on the tailnet addresses;
+- every rootless podman port published on `0.0.0.0` (see [nix/podman.nix](podman.nix)), because a wildcard bind also answers on `tailscale0`.
 
 Other nodes the ACL admits, such as other yolobox VMs, each running their own agents, reach all of it. Tighten the ACL, not the box, to narrow that.
 
 The enp0s1 side is unchanged: `nixos-fw` opens only TCP 22 there (see [sshd on two interfaces](#sshd-on-two-interfaces)), and the tunnel's UDP 41641 stays open through `services.tailscale.openFirewall = true`.
 
-t3 is still served by `tailscale serve --bg --http=3773 http://127.0.0.1:3773`, run at boot by the `yolobox-tailscale-serve` unit. Serve is tailscaled's own reverse proxy. It terminates on the tailnet interface inside tailscaled's netstack and forwards to the loopback port. The unit runs `tailscale serve reset` first, so it owns the whole serve config. An entry left under an earlier tailnet name, say from a login made with a hand-typed `--hostname`, is dropped instead of served forever beside the current one.
+t3 is still served by `tailscale serve --bg --http=3773 http://127.0.0.1:3773`, run at boot by the `yolobox-tailscale-serve` unit. Serve is tailscaled's own reverse proxy. It does not stay inside tailscaled's userspace netstack: `sudo ss -ltnp` shows tailscaled holding kernel listeners on `<tailnet-ip>%tailscale0:3773`, one per tailnet address (IPv4 and IPv6), beside t3's own `127.0.0.1:3773`. So tailscaled listens on the tailnet address itself and forwards to the loopback port. The unit runs `tailscale serve reset` first, so it owns the whole serve config. An entry left under an earlier tailnet name, say from a login made with a hand-typed `--hostname`, is dropped instead of served forever beside the current one.
 
 `--netfilter-mode=off` in `extraSetFlags` stays, so that `nixos-fw` is the only thing that writes rules. By default tailscaled installs its own `ts-input` chain. The live `iptables -S` showed `-A INPUT -j ts-input` before `-A INPUT -j nixos-fw`, with `-A ts-input -i tailscale0 -j ACCEPT` inside it. That accept happened to match the trust given now, but it re-inserts its jump at the top of `INPUT` whenever tailscaled restarts, which is why `iptables -I INPUT 1` was never a fix for anything here, and it would keep a rule outside the declarative firewall. Netfilter mode off also drops tailscaled's anti-spoofing rule for 100.64/10, which the `ts-input` chain used to carry.
 
@@ -90,7 +91,7 @@ The wait exists because tailscaled counts as "started" before it has loaded its 
 
 Because the unit is `Type=exec`, `systemctl restart yolobox-tailscale-serve` returns at once, before the wait is over. After `tailscale up`, check the result with `yo status` or `yo ssh journalctl -u yolobox-tailscale-serve`.
 
-`yo status` shows the same pair, `BackendState` and the serve unit's state, on its `tailscale:` line. A node that is not logged in or awaits approval is reported as optional, with the commands to join a tailnet; any other state that is not `Running` is a WARNING. t3 itself never depends on any of this. It keeps listening on loopback whether or not the tailnet is up, so t3 reached from inside the VM or through lima's Mac-side forward is unaffected by a login that has not happened yet.
+`yo status` does not take the unit's state as proof that t3 is served, because the unit is `active (exited)` after the wait gave up on a node that was not logged in, and it stays `active` after a later `tailscale up` until someone restarts it. So the `tailscale:` line asks tailscaled itself: one ssh round trip prints `tailscale status --json` and `tailscale serve status --json`, and the line says `Running, t3 served` only when the serve JSON holds the handler `"/"` with `Proxy` `http://127.0.0.1:3773` under a `<name>:3773` entry in `Web`. That stays truthful after a login without a restart, and during the 60 s wait. `Running` with no such handler, or with serve JSON that cannot be read, is a WARNING that names the restart. A node that is not logged in or awaits approval is reported as optional, with the commands to join a tailnet; any other state that is not `Running` is a WARNING. t3 itself never depends on any of this. It keeps listening on loopback whether or not the tailnet is up, so t3 reached from inside the VM or through lima's Mac-side forward is unaffected by a login that has not happened yet.
 
 ## Box-local routes
 

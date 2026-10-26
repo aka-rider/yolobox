@@ -1968,28 +1968,46 @@ def du_kib(path: str) -> Optional[int]:
 
 TAILSCALE_SERVE_UNIT = "yolobox-tailscale-serve"
 TAILSCALE_SERVE_RESTART = "yo ssh sudo systemctl restart %s" % TAILSCALE_SERVE_UNIT
-# One operator round trip: tailscale's own JSON, a separator line, then the
-# serve unit's state. `command -v` first, so a box predating nix/tailscale.nix
-# answers with a marker instead of a bare "not found".
+T3_SERVE_PROXY = "http://127.0.0.1:%d" % T3_PORT
+# One operator round trip: tailscale's own status JSON, a separator line, then
+# tailscaled's own serve config JSON. `command -v` first, so a box predating
+# nix/tailscale.nix answers with a marker instead of a bare "not found".
 TAILSCALE_PROBE = (
     "command -v tailscale >/dev/null 2>&1 || { echo %s; exit 0; }; "
     "tailscale status --json; echo; echo %s; "
-    "systemctl show -p ActiveState --value %s"
-) % (shlex.quote("NO_TAILSCALE"), shlex.quote("---"), TAILSCALE_SERVE_UNIT)
+    "tailscale serve status --json"
+) % (shlex.quote("NO_TAILSCALE"), shlex.quote("---"))
+
+
+def t3_is_served(serve: dict) -> bool:
+    """True when tailscaled's serve config proxies `<name>:3773` to t3.
+
+    `tailscale serve status --json` looks like
+    {"TCP": {"3773": {"HTTP": true}},
+     "Web": {"<name>:3773": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3773"}}}}}
+    """
+    web = serve.get("Web")
+    if not isinstance(web, dict):
+        return False
+    for host_port, site in web.items():
+        if not host_port.endswith(":%d" % T3_PORT) or not isinstance(site, dict):
+            continue
+        handlers = site.get("Handlers")
+        root = handlers.get("/") if isinstance(handlers, dict) else None
+        if isinstance(root, dict) and root.get("Proxy") == T3_SERVE_PROXY:
+            return True
+    return False
 
 
 def tailscale_status_line(stdout: str, stderr: str) -> str:
     if stdout.strip() == "NO_TAILSCALE":
         return "tailscale: box predates the tailnet module; run `yo bootstrap`"
-    status_json, _, serve_state = stdout.partition("\n---\n")
+    status_json, _, serve_json = stdout.partition("\n---\n")
     try:
         backend = json.loads(status_json)["BackendState"]
     except (ValueError, KeyError, TypeError):
         detail = stderr.strip() or status_json.strip() or "no output"
         return "tailscale: WARNING status unreadable: %s" % detail
-    serve = serve_state.strip() or "unknown"
-    if backend == "Running" and serve == "active":
-        return "tailscale: Running, serve active"
     if backend == "NeedsLogin":
         return (
             "tailscale: not logged in (optional) — to join a tailnet: "
@@ -2000,10 +2018,24 @@ def tailscale_status_line(stdout: str, stderr: str) -> str:
             "tailscale: awaiting approval in the tailnet admin console (optional)"
             " — then: " + TAILSCALE_SERVE_RESTART
         )
-    remedy = TAILSCALE_SERVE_RESTART
     if backend != "Running":
-        remedy = "yo ssh sudo tailscale up, then: " + remedy
-    return "tailscale: WARNING %s, serve %s — fix with: %s" % (backend, serve, remedy)
+        return "tailscale: WARNING %s — fix with: yo ssh sudo tailscale up, then: %s" % (
+            backend,
+            TAILSCALE_SERVE_RESTART,
+        )
+    try:
+        serve = json.loads(serve_json)
+        if not isinstance(serve, dict):
+            raise ValueError("not an object")
+    except ValueError:
+        detail = stderr.strip() or serve_json.strip() or "no output"
+        return "tailscale: WARNING Running, but serve status unreadable: %s" % detail
+    if t3_is_served(serve):
+        return "tailscale: Running, t3 served"
+    return (
+        "tailscale: WARNING Running, but t3 is not served — fix with: "
+        + TAILSCALE_SERVE_RESTART
+    )
 
 
 class Gateway(enum.Enum):
