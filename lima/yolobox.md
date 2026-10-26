@@ -1,6 +1,6 @@
 # The Lima instance
 
-`lima/yolobox.yaml` seeds the VM. Lima reads it once, and the rest of this file explains what that means for a running box, which settings lima leaves to the seed, why no guest UDP port is forwarded, and one lima bug that kills every forwarded port.
+`lima/yolobox.yaml` seeds the VM. Lima reads it once, and the rest of this file explains what that means for a running box, which settings lima leaves to the seed, which guest ports are mirrored onto the host and which are not, and one lima bug that kills every forwarded port.
 
 ## Read once
 
@@ -16,11 +16,11 @@ A missing rule prints a stderr note from `lima_config_gap_message()`, and `vm_up
 
 With no instance at all, `limactl list` fails and the check prints nothing, because a brand-new box has no gap to report. The check exists for an instance created before a rule existed. Such a box has only the dhcp and 1Password rules, since the AWS broker's rule came later, and its UDP rule ignores port 68 alone (see [Guest UDP is never mirrored](#guest-udp-is-never-mirrored)). The check compares the socket rules only.
 
-The same check reports three more gaps as stderr notes: a mounts gap, a `forwardAgent` gap, and a UDP gap (an instance with no rule that ignores all guest UDP on every address, see below). All three are settings lima reads once. The UDP gap is restated with the same full-array command as the socket rules, and `lima_config_gap_message()` prints that command once when both kinds of gap are present.
+The same check reports four more gaps as stderr notes: a mounts gap, a `forwardAgent` gap, a UDP gap (an instance with no rule that ignores all guest UDP on every address, see below) and a TCP gap (see [Which guest ports reach the host](#which-guest-ports-reach-the-host)). All four are settings lima reads once. The UDP and TCP gaps are restated with the same full-array command as the socket rules. `lima_config_gap_message()` gives each gap its own problem line and prints that command at most once.
 
 ## Guest UDP is never mirrored
 
-Lima mirrors every port a guest process listens on onto the Mac's localhost, UDP included. Nothing here needs a UDP one: the secrets travel as reversed unix sockets. So `lima/yolobox.yaml` ends its `portForwards` with one rule, which ignores every guest UDP port:
+Lima mirrors every port a guest process listens on onto the host's localhost, UDP included. Nothing here needs a UDP one: the secrets travel as reversed unix sockets. So `lima/yolobox.yaml` ends its `portForwards` with one rule, which ignores every guest UDP port:
 
 ```yaml
 - proto: udp
@@ -61,7 +61,7 @@ The failure that earned the rule is in `~/.lima/yolobox/ha.stderr.log`, the host
 {"error":"listen udp 127.0.0.1:41641: bind: address already in use","level":"warning","msg":"failed to listen udp: 127.0.0.1:41641",...}
 ```
 
-The guest's tailscaled listens on UDP 41641, lima tries to mirror that onto the Mac's loopback, and the Mac's own Tailscale already holds the port. Seen on a live box: four such lines in the first second of a host agent start, and none after, so the line is a start-up note and not a loop. The mirror was never in the way of tailscaled's own packets, which leave through the NAT and not through the mirror. The cost is those lines and, on a Mac without Tailscale, a UDP port on the Mac's loopback that would forward datagrams into the guest's tailscaled. That second part is why the rule ignores all guest UDP and does not just name 41641.
+The guest's tailscaled listens on UDP 41641, lima tries to mirror that onto the host's loopback, and the host's own Tailscale already holds the port. Seen on a live box: four such lines in the first second of a host agent start, and none after, so the line is a start-up note and not a loop. The mirror was never in the way of tailscaled's own packets, which leave through the NAT and not through the mirror. The cost is those lines and, on a Mac without Tailscale, a UDP port on the Mac's loopback that would forward datagrams into the guest's tailscaled. That second part is why the rule ignores all guest UDP and does not just name 41641.
 
 ### Applying it to an existing instance
 
@@ -75,29 +75,45 @@ Take the array from `yo up`'s note, never from this file (see [Read once](#read-
 
 Verify with `limactl list yolobox --json`: `config.portForwards` must hold an entry with `"proto":"udp"`, `"ignore":true`, `"guestPortRange":[1,65535]`, `"guestIP":"0.0.0.0"` and `"guestIPMustBeZero":false`. Then `lsof -nP -iUDP -a -c limactl` must show no socket bound to `*:68` or `127.0.0.1:41641` (the outbound `10.x->peer` flows are gvproxy's NAT and stay), and the next host agent log must have no `Forwarding UDP` and no `failed to listen udp`.
 
-## Reaching a guest service from the Mac
+## Which guest ports reach the host
 
-A service an agent starts in the box is reachable from the Mac in one of two ways, and which one depends on the address it listens on.
+Lima mirrors a guest TCP listener onto the host's `127.0.0.1` only when its port is in 1024 to 49151, and never onto any other host address. Every other port and every protocol other than TCP is ignored. The range is the unprivileged ports below the macOS ephemeral range (`sysctl net.inet.ip.portrange.first` prints 49152), so a mirror can neither take a privileged port nor collide with an outgoing connection's source port. A Linux host would need 1024 to 32767, because the Linux ephemeral range starts at 32768. That is recorded here only, because yolobox runs on macOS.
 
-- **Through lima's forwarder.** Lima forwards a TCP port only when the guest process listens on a wildcard address (`0.0.0.0` or `::`) or on loopback. By default it publishes the port on the Mac's `127.0.0.1` alone. Only a `portForwards` rule with `hostIP: 0.0.0.0` would publish it to the Mac's LAN, and this box has none. So a service bound to `0.0.0.0` is at `http://localhost:<port>` on the Mac with no setup.
+Lima ends a `portForwards` list with its own default rule, protocol `any`, guest 127.0.0.1, ports 1 to 65535 onto the host's 127.0.0.1. On macOS that default also forwards ports below 1024. (A rule's `proto` defaults to `any`, not `tcp`.) So `lima/yolobox.yaml` has to end with catch-all ignore rules, and the order of the list is part of the setting, because lima takes the first matching rule (`pkg/portfwd/forward.go`, `pkg/limayaml/validate.go` in v2.2.1):
+
+1. **The deny-list**, each rule `proto: tcp`, `ignore: true`. These are fixed OAuth callback ports, which a host-side login tool expects to bind itself: 1455 to 1457 (Codex CLI), 8020 (Databricks), 8085 (gcloud), 9005 (Firebase) and 18000 (kubelogin). A guest listener on one of them would answer a browser redirect that belongs to the host. AWS SSO, the Azure CLI and the GitHub CLI pick random ports and need no entry. Port 8000, which kubelogin also uses, stays mirrored on purpose: it is the Django and `http.server` default. The names and ranges live in `OAUTH_CALLBACK_PORT_RANGES` in `yo`.
+2. **The range rule**, `guestPortRange: [1024, 49151]` with `proto: tcp`. `guestIP`, `hostIP` and the host ports stay at lima's defaults: loopback on both sides, the same port number. It is `MIRRORED_TCP_PORTS` in `yo`.
+3. **The reverse socket rules.** They match sockets and not ports, so they could sit anywhere.
+4. **The UDP catch-all**, see [Guest UDP is never mirrored](#guest-udp-is-never-mirrored).
+5. **The TCP catch-all**, `proto: tcp`, `ignore: true`, with `guestIP: 0.0.0.0` and `guestIPMustBeZero: false`. It needs the same two lines as the UDP rule, for the same reason. Without them it would match loopback listeners only and wildcard ones would slip through to lima's default rule. The deny-list rules carry both lines too.
+
+The TCP and UDP catch-alls stay two rules and never become one `proto: any` rule, because `ignores_all_guest_udp()` and the UDP test in `tests/test_consistency.py` pin the exact UDP rule.
+
+Services still reach the host in these ways:
+
+- **Through lima's forwarder.** A service in range that listens on a wildcard address (`0.0.0.0` or `::`) or on loopback is at `http://localhost:<port>` on the host with no setup. Lima publishes it on the host's `127.0.0.1` alone. No rule here has `hostIP: 0.0.0.0`, and `TestHostLoopbackMirroring` keeps it so.
 - **Over the tailnet.** A service bound to the box's tailnet address alone is not on lima's list, so lima does not forward it. It is reachable over the tailnet only, at that address, by whatever the tailnet's access policy admits (`tailscale0` is trusted, see [nix/tailscale.md](../nix/tailscale.md#firewall)).
 
-Recognise the first case in `~/.lima/yolobox/ha.stderr.log`. A service listening on `::` logs `Forwarding TCP from [::]:5137`. The same service rebound to the tailnet address logs `Not forwarding TCP <tailnet-ip>:5137`, and `localhost:5137` on the Mac stops answering. Nothing is broken: the service moved out of the set lima forwards. Rebind it to `0.0.0.0` to get `localhost:<port>` back.
+Recognise the first case in `~/.lima/yolobox/ha.stderr.log`. A service listening on `::` logs `Forwarding TCP from [::]:5137`. The same service rebound to the tailnet address logs `Not forwarding TCP <tailnet-ip>:5137`, and `localhost:5137` on the host stops answering. Nothing is broken: the service moved out of the set lima forwards. Rebind it to `0.0.0.0` to get `localhost:<port>` back. A service in the deny-list or outside 1024 to 49151 is never forwarded, whatever it listens on.
+
+### Applying it to an existing instance
+
+An instance created before the range keeps its old list, which mirrors every port. `lima_config_gaps()` reports the TCP gap when the instance's TCP rules differ from the ones in `LIMA_PORT_FORWARDS`. It cannot compare the rules as written, because `limactl list --json` returns them with lima's defaults filled in (`"guestIP": "127.0.0.1"`, `"proto": "any"`, `"hostPortRange"` and so on). So `normalize_port_forward()` fills the same defaults into both sides, as `FillPortForwardDefaults` in lima v2.2.1 does, and compares them in order. That one comparison catches a missing deny-list rule, range rule or catch-all, a wrong order, and a leftover rule that is in range but extra, such as an old rule that published a port on every host address. The remedy is the full-array restate that `yo up` prints (see [Read once](#read-once)).
 
 ## Pinned settings
 
 `lima/yolobox.yaml` pins four settings that lima leaves at its defaults. Each default is wrong for a box that holds an agent.
 
 - `vmType: vz` names Apple's Virtualization.framework. The rosetta block in the same file applies only to that driver, so the driver is pinned rather than left to lima's default.
-- `propagateProxyEnv: false` keeps the Mac's `HTTP(S)_PROXY` out of the guest. A proxy address the VM cannot reach would break every fetch the box makes.
-- `ssh.loadDotSSHPubKeys: false` stops lima copying every `~/.ssh/*.pub` from the Mac into the guest's authorized keys. The only key that can log in is then the one lima generates for the instance.
+- `propagateProxyEnv: false` keeps the host's `HTTP(S)_PROXY` out of the guest. A proxy address the VM cannot reach would break every fetch the box makes.
+- `ssh.loadDotSSHPubKeys: false` stops lima copying every `~/.ssh/*.pub` from the host into the guest's authorized keys. The only key that can log in is then the one lima generates for the instance.
 - `ssh.overVsock: false` makes lima forward port 60022 to the guest's TCP port 22 and never to vsock. Lima chooses once per VM start, at the moment the guest first answers on port 22, and the initrd sshd that unlocks the disk speaks only TCP. Without the pin the choice would depend on which sshd answers first. The pin applies at the next hostagent start only: under vz a guest reboot restarts the VM in place without a new hostagent, so a hostagent that had chosen vsock keeps proxying to vsock after the reboot and the initrd sshd stays unreachable until the hostagent is restarted. The reasoning is in [docs/disk-encryption.md](../docs/disk-encryption.md#how-yo-reaches-the-initrd).
 
 None of them reaches an existing instance. Restate the three that an older box may lack with `limactl stop yolobox`, then `limactl edit yolobox --set '.propagateProxyEnv = false | .ssh.loadDotSSHPubKeys = false | .ssh.overVsock = false'`. `yo up` prints the exact command for any gap it finds. The `vz` pin changes nothing on an instance that already runs vz, and every box of this repo does.
 
 ## An empty page means lima's forwarder died
 
-From the Mac, `curl -v http://127.0.0.1:<port>/` gets, for a service the guest listens on, `Connection reset by peer` with zero bytes. Inside the VM, the same request returns 200. That asymmetry is the diagnosis. The fault sits in lima's forwarder, not in the service. `~/.lima/yolobox/ha.stderr.log` repeats `tcpproxy: ... grpc: the client connection is closing`.
+From the host, `curl -v http://127.0.0.1:<port>/` gets, for a service the guest listens on, `Connection reset by peer` with zero bytes. Inside the VM, the same request returns 200. That asymmetry is the diagnosis. The fault sits in lima's forwarder, not in the service. `~/.lima/yolobox/ha.stderr.log` repeats `tcpproxy: ... grpc: the client connection is closing`.
 
 Lima v2.1.2 through v2.2.0 carry the guest-agent streams and the TCP tunnel on one grpc connection. When the guest agent restarts, the host agent dials a new connection, but an existing listener keeps its old dialer. So every forwarded port accepts and then resets, and it stays that way.
 

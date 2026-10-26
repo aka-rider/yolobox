@@ -1827,19 +1827,23 @@ class TestLimaConfigGaps(FakeHome):
             self.assertEqual(yo.lima_config_gaps(), [])
 
     def test_present_reverse_rules_are_no_gaps(self):
-        with self.mock_lima_list(self.both_forwards()):
+        with self.mock_lima_list(self.restated_forwards()):
             self.assertEqual(yo.lima_config_gaps(), [])
 
     def test_missing_reverse_rule_is_reported_not_raised(self):
-        forwards = [self.both_forwards()[0], {"guestPort": 8080}]
+        forwards = [
+            forward
+            for forward in self.restated_forwards()
+            if "guestSocket" not in forward
+        ]
         with self.mock_lima_list(forwards):
             gaps = yo.lima_config_gaps()
-        self.assertEqual(set(gaps), {yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK})
+        self.assertEqual(gaps, [yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK])
 
     def test_only_one_missing_rule_is_reported(self):
         forwards = [
             forward
-            for forward in self.both_forwards()
+            for forward in self.restated_forwards()
             if forward.get("guestSocket") != yo.AWS_BROKER_GUEST_SOCK
         ]
         with self.mock_lima_list(forwards):
@@ -1848,12 +1852,10 @@ class TestLimaConfigGaps(FakeHome):
 
     def test_mismatched_host_socket_is_reported(self):
         forwards = [
-            {
-                "guestSocket": yo.OP_GUEST_SOCK,
-                "hostSocket": "/somewhere/else.sock",
-                "reverse": True,
-            },
-            *self.both_forwards()[2:],
+            {**forward, "hostSocket": "/somewhere/else.sock"}
+            if forward.get("guestSocket") == yo.OP_GUEST_SOCK
+            else forward
+            for forward in self.restated_forwards()
         ]
         with self.mock_lima_list(forwards):
             gaps = yo.lima_config_gaps()
@@ -1865,7 +1867,7 @@ class TestLimaConfigGaps(FakeHome):
         dhcp_only = self.udp_ignore_rule(
             guestPortRange=[68, 68], guestIPMustBeZero=True
         )
-        with self.mock_lima_list([dhcp_only, *self.both_forwards()[1:]]):
+        with self.mock_lima_list(self.replacing_udp_rule(dhcp_only)):
             self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
 
     def test_a_udp_ignore_rule_with_lima_default_guest_ip_still_mirrors_wildcard_listeners(
@@ -1874,7 +1876,7 @@ class TestLimaConfigGaps(FakeHome):
         # Lima skips an ignore rule for a listener on 0.0.0.0 or :: unless the
         # rule's guestIP is unspecified: tailscaled's 41641 and DHCP's 68 stay.
         loopback_only = self.udp_ignore_rule(guestIP="127.0.0.1")
-        with self.mock_lima_list([loopback_only, *self.both_forwards()[1:]]):
+        with self.mock_lima_list(self.replacing_udp_rule(loopback_only)):
             self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
 
     def test_a_udp_ignore_rule_pinned_to_exactly_zero_still_mirrors_loopback_listeners(
@@ -1883,24 +1885,24 @@ class TestLimaConfigGaps(FakeHome):
         # guestIPMustBeZero makes 0.0.0.0 an exact match, so 127.0.0.1 and
         # specific-address listeners fall through to the default forward.
         exact_zero = self.udp_ignore_rule(guestIPMustBeZero=True)
-        with self.mock_lima_list([exact_zero, *self.both_forwards()[1:]]):
+        with self.mock_lima_list(self.replacing_udp_rule(exact_zero)):
             self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
 
     def test_a_udp_ignore_rule_with_garbage_guest_ip_is_a_gap(self):
         for guest_ip in ("lizard", "", None, 0):
             with self.subTest(guest_ip=guest_ip):
                 rule = self.udp_ignore_rule(guestIP=guest_ip)
-                with self.mock_lima_list([rule, *self.both_forwards()[1:]]):
+                with self.mock_lima_list(self.replacing_udp_rule(rule)):
                     self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
 
     def test_an_ipv6_unspecified_udp_ignore_rule_covers_every_listener(self):
         rule = self.udp_ignore_rule(guestIP="::")
-        with self.mock_lima_list([rule, *self.both_forwards()[1:]]):
+        with self.mock_lima_list(self.replacing_udp_rule(rule)):
             self.assertEqual(yo.lima_config_gaps(), [])
 
     def test_a_blanket_udp_rule_that_forwards_instead_of_ignoring_is_a_gap(self):
         forwarding = self.udp_ignore_rule(ignore=False)
-        with self.mock_lima_list([forwarding, *self.both_forwards()[1:]]):
+        with self.mock_lima_list(self.replacing_udp_rule(forwarding)):
             self.assertEqual(yo.lima_config_gaps(), [yo.GAP_UDP_FORWARDS])
 
     def test_reads_host_agent_pid_from_the_same_listing(self):
@@ -1915,27 +1917,27 @@ class TestLimaConfigGaps(FakeHome):
 
     def test_a_mount_is_reported(self):
         mounts = [{"location": "/Users/x", "writable": True}]
-        with self.mock_lima_list(self.both_forwards(), mounts=mounts):
+        with self.mock_lima_list(self.restated_forwards(), mounts=mounts):
             self.assertEqual(yo.lima_config_gaps(), [yo.GAP_MOUNTS])
 
     def test_an_empty_mount_list_is_no_gap(self):
-        with self.mock_lima_list(self.both_forwards(), mounts=[]):
+        with self.mock_lima_list(self.restated_forwards(), mounts=[]):
             self.assertEqual(yo.lima_config_gaps(), [])
 
     def test_forward_agent_is_reported(self):
-        with self.mock_lima_list(self.both_forwards(), forward_agent=True):
+        with self.mock_lima_list(self.restated_forwards(), forward_agent=True):
             self.assertEqual(yo.lima_config_gaps(), [yo.GAP_FORWARD_AGENT])
 
     def test_forward_agent_false_or_a_string_is_no_gap(self):
         for value in (False, "true"):
             with self.subTest(value=value):
-                with self.mock_lima_list(self.both_forwards(), forward_agent=value):
+                with self.mock_lima_list(self.restated_forwards(), forward_agent=value):
                     self.assertEqual(yo.lima_config_gaps(), [])
 
     def test_ssh_over_vsock_left_at_lima_default_is_reported(self):
         for value in (None, True):
             with self.subTest(value=value):
-                with self.mock_lima_list(self.both_forwards(), over_vsock=value):
+                with self.mock_lima_list(self.restated_forwards(), over_vsock=value):
                     self.assertEqual(yo.lima_config_gaps(), [yo.GAP_SSH_OVER_VSOCK])
 
     def test_the_over_vsock_remedy_sets_it_false(self):
@@ -1954,27 +1956,141 @@ class TestLimaConfigGaps(FakeHome):
         rule.update(overrides)
         return rule
 
-    def both_forwards(self):
-        # The instance's normalized UDP rule: lima fills in the full range.
+    def restated_forwards(self):
+        # What lima reports for an instance restated from LIMA_PORT_FORWARDS:
+        # lima's defaults filled in, the socket paths expanded the way
+        # op_sock() and aws_broker_sock() expand them.
+        host_sockets = {
+            yo.OP_GUEST_SOCK: yo.op_sock(),
+            yo.AWS_BROKER_GUEST_SOCK: yo.aws_broker_sock(),
+        }
         return [
-            self.udp_ignore_rule(),
-            {
-                "guestSocket": yo.OP_GUEST_SOCK,
-                "hostSocket": yo.op_sock(),
-                "reverse": True,
-            },
-            {
-                "guestSocket": yo.AWS_BROKER_GUEST_SOCK,
-                "hostSocket": yo.aws_broker_sock(),
-                "reverse": True,
-            },
+            {**forward, "hostSocket": host_sockets[forward["guestSocket"]]}
+            if "guestSocket" in forward
+            else yo.normalize_port_forward(forward)
+            for forward in yo.LIMA_PORT_FORWARDS
         ]
+
+    def replacing_udp_rule(self, udp_rule):
+        return [
+            udp_rule if forward.get("proto") == "udp" else forward
+            for forward in self.restated_forwards()
+        ]
+
+    def gaps_for(self, forwards):
+        with self.mock_lima_list(forwards):
+            return yo.lima_config_gaps()
+
+    def test_a_restated_instance_has_no_gap(self):
+        self.assertEqual(self.gaps_for(self.restated_forwards()), [])
+
+    def test_an_instance_without_the_tcp_catch_all_has_the_tcp_gap(self):
+        forwards = self.restated_forwards()[:-1]
+        self.assertEqual(self.gaps_for(forwards), [yo.GAP_TCP_FORWARDS])
+
+    def test_a_leftover_rule_published_beyond_loopback_is_a_tcp_gap(self):
+        leftover = yo.normalize_port_forward(
+            {"guestPort": 3773, "proto": "tcp", "hostIP": "0.0.0.0"}
+        )
+        forwards = [leftover, *self.restated_forwards()]
+        self.assertEqual(self.gaps_for(forwards), [yo.GAP_TCP_FORWARDS])
+
+    def test_an_instance_missing_one_oauth_ignore_has_the_tcp_gap(self):
+        forwards = [
+            forward
+            for forward in self.restated_forwards()
+            if forward.get("guestPortRange") != [8085, 8085]
+        ]
+        self.assertEqual(self.gaps_for(forwards), [yo.GAP_TCP_FORWARDS])
+
+    def test_an_instance_with_the_range_after_the_catch_all_has_the_tcp_gap(self):
+        forwards = self.restated_forwards()
+        forwards.append(forwards.pop(len(yo.OAUTH_CALLBACK_PORT_RANGES)))
+        self.assertEqual(self.gaps_for(forwards), [yo.GAP_TCP_FORWARDS])
+
+    def test_a_tcp_catch_all_with_lima_default_guest_ip_is_a_gap(self):
+        # It would match loopback listeners only; wildcard ones slip past.
+        loopback_catch_all = yo.normalize_port_forward({"proto": "tcp", "ignore": True})
+        forwards = [*self.restated_forwards()[:-1], loopback_catch_all]
+        self.assertEqual(self.gaps_for(forwards), [yo.GAP_TCP_FORWARDS])
+
+    def test_an_instance_from_before_the_port_range_has_the_tcp_gap(self):
+        old = [
+            yo.normalize_port_forward(
+                {"guestPort": 3773, "proto": "tcp", "hostIP": "0.0.0.0"}
+            ),
+            *(
+                forward
+                for forward in self.restated_forwards()
+                if "guestSocket" in forward or forward.get("proto") == "udp"
+            ),
+        ]
+        self.assertEqual(self.gaps_for(old), [yo.GAP_TCP_FORWARDS])
+
+    def test_no_usable_port_forwards_reports_every_gap_without_raising(self):
+        for forwards in ([], None, ["lizard"], [None, 0, "lizard"]):
+            with self.subTest(forwards=forwards):
+                self.assertEqual(
+                    self.gaps_for(forwards),
+                    [
+                        yo.OP_GUEST_SOCK,
+                        yo.AWS_BROKER_GUEST_SOCK,
+                        yo.GAP_UDP_FORWARDS,
+                        yo.GAP_TCP_FORWARDS,
+                    ],
+                )
 
     def test_missing_instance_ha_pid_is_none(self):
         with mock.patch.object(
             yo, "run", return_value=mock.Mock(returncode=1, stdout="", stderr="")
         ):
             self.assertIsNone(yo.ha_pid())
+
+
+class TestNormalizePortForward(unittest.TestCase):
+    def test_a_bare_guest_port_gets_lima_defaults(self):
+        self.assertEqual(
+            yo.normalize_port_forward({"guestPort": 3773}),
+            {
+                "proto": "any",
+                "guestIP": "127.0.0.1",
+                "guestIPMustBeZero": False,
+                "guestPortRange": [3773, 3773],
+                "hostIP": "127.0.0.1",
+                "hostPortRange": [3773, 3773],
+                "ignore": False,
+            },
+        )
+
+    def test_a_wildcard_ignore_rule_must_match_zero_unless_told_otherwise(self):
+        rule = yo.normalize_port_forward({"guestIP": "0.0.0.0", "ignore": True})
+        self.assertIs(rule["guestIPMustBeZero"], True)
+        self.assertEqual(rule["guestPortRange"], [1, 65535])
+        self.assertEqual(rule["hostPortRange"], [1, 65535])
+        self.assertIs(rule["ignore"], True)
+
+    def test_must_be_zero_false_survives(self):
+        rule = yo.normalize_port_forward(
+            {"guestIP": "0.0.0.0", "guestIPMustBeZero": False}
+        )
+        self.assertIs(rule["guestIPMustBeZero"], False)
+
+    def test_a_port_range_gives_the_host_the_same_range(self):
+        rule = yo.normalize_port_forward({"guestPortRange": [1024, 49151]})
+        self.assertEqual(rule["hostPortRange"], [1024, 49151])
+
+    def test_normalizing_twice_changes_nothing(self):
+        for forward in yo.LIMA_PORT_FORWARDS:
+            if "guestSocket" in forward:
+                continue
+            with self.subTest(forward=forward):
+                once = yo.normalize_port_forward(forward)
+                self.assertEqual(yo.normalize_port_forward(once), once)
+
+    def test_an_empty_rule_is_every_port_on_loopback(self):
+        rule = yo.normalize_port_forward({})
+        self.assertEqual(rule["guestPortRange"], [1, 65535])
+        self.assertEqual(rule["guestIP"], "127.0.0.1")
 
 
 class TestLimaConfigGapMessage(unittest.TestCase):
@@ -2004,8 +2120,21 @@ class TestLimaSettingGapMessage(unittest.TestCase):
         self.assertIn(yo.RESTATE_PORT_FORWARDS, message)
         self.assertIn("41641", message)
 
-    def test_a_socket_gap_and_the_udp_gap_print_one_restate(self):
-        message = yo.lima_config_gap_message([yo.OP_GUEST_SOCK, yo.GAP_UDP_FORWARDS])
+    def test_the_tcp_gap_is_remedied_by_restating_the_full_array(self):
+        message = yo.lima_config_gap_message([yo.GAP_TCP_FORWARDS])
+        self.assertEqual(message.count(".portForwards = "), 1)
+        self.assertIn("1024–49151", message)
+
+    def test_a_socket_gap_the_udp_gap_and_the_tcp_gap_print_one_restate(self):
+        message = yo.lima_config_gap_message(
+            [yo.OP_GUEST_SOCK, yo.GAP_UDP_FORWARDS, yo.GAP_TCP_FORWARDS]
+        )
+        self.assertEqual(message.count(".portForwards = "), 1)
+        self.assertIn("41641", message)
+        self.assertIn("1024–49151", message)
+
+    def test_the_udp_gap_and_the_tcp_gap_print_one_restate(self):
+        message = yo.lima_config_gap_message([yo.GAP_UDP_FORWARDS, yo.GAP_TCP_FORWARDS])
         self.assertEqual(message.count(".portForwards = "), 1)
 
     def test_every_gap_kind_gets_its_own_remedy(self):

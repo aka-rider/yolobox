@@ -28,6 +28,8 @@ def yaml_scalar(value):
         return False
     if value.isdigit():
         return int(value)
+    if re.fullmatch(r"\[\s*\d+\s*(,\s*\d+\s*)*\]", value):
+        return [int(number) for number in re.findall(r"\d+", value)]
     return value
 
 
@@ -134,6 +136,60 @@ class TestLimaYamlMatchesPortForwardsConstant(unittest.TestCase):
         # not pick vsock for the port yo dials.
         self.assertEqual(ssh.get("overVsock"), "false")
         self.assertEqual(ssh.get("localPort"), str(yo.SSH_LOCAL_PORT))
+
+
+class TestYamlScalar(unittest.TestCase):
+    def test_a_flow_list_of_integers_is_a_list_of_ints(self):
+        self.assertEqual(yaml_scalar("[1024, 49151]"), [1024, 49151])
+        self.assertEqual(yaml_scalar("[ 1 ]"), [1])
+
+    def test_anything_else_in_brackets_stays_a_string(self):
+        for value in ("[]", "lizard", "[1, ]", "[a, 1]", "[1.5]"):
+            with self.subTest(value=value):
+                self.assertEqual(yaml_scalar(value), value)
+
+
+class TestHostLoopbackMirroring(unittest.TestCase):
+    def rules(self):
+        return parse_yaml_list_entries(
+            yaml_block(YOLOBOX_YAML.read_text(), "portForwards")
+        )
+
+    def index_of(self, rules, **fields):
+        return [
+            i
+            for i, rule in enumerate(rules)
+            if all(rule.get(key) == value for key, value in fields.items())
+        ]
+
+    def test_the_range_rule_comes_before_both_catch_alls(self):
+        rules = self.rules()
+        (range_rule,) = self.index_of(
+            rules, proto="tcp", guestPortRange=yo.MIRRORED_TCP_PORTS
+        )
+        (tcp_catch_all,) = self.index_of(
+            rules, proto="tcp", ignore=True, guestIP="0.0.0.0", guestPortRange=None
+        )
+        (udp_catch_all,) = self.index_of(rules, proto="udp", ignore=True)
+        self.assertLess(range_rule, tcp_catch_all)
+        self.assertLess(range_rule, udp_catch_all)
+
+    def test_every_deny_list_rule_comes_before_the_range_rule(self):
+        rules = self.rules()
+        (range_rule,) = self.index_of(
+            rules, proto="tcp", guestPortRange=yo.MIRRORED_TCP_PORTS
+        )
+        for port_range in yo.OAUTH_CALLBACK_PORT_RANGES:
+            with self.subTest(port_range=port_range):
+                (denied,) = self.index_of(
+                    rules, proto="tcp", ignore=True, guestPortRange=port_range
+                )
+                self.assertLess(denied, range_rule)
+
+    def test_no_forward_rule_publishes_beyond_the_hosts_loopback(self):
+        for rule in self.rules():
+            with self.subTest(rule=rule):
+                self.assertEqual(rule.get("hostIP", "127.0.0.1"), "127.0.0.1")
 
 
 def luks_facts():

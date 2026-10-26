@@ -34,6 +34,50 @@ vmOpts:
       binfmt: true
 
 portForwards:
+  # Lima takes the first rule that matches a listener, so the order is:
+  # deny-list, dev-port range, sockets, catch-alls. Lima mirrors onto the
+  # host's 127.0.0.1 only. See lima/yolobox.md.
+
+  # Fixed OAuth callback ports are never mirrored: a guest listener on one
+  # would squat the port a host-side login tool expects to bind itself.
+  # Each guestIP line is load-bearing, as for the UDP rule below.
+  # Codex CLI 1455-1457.
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [1455, 1457]
+    ignore: true
+  # Databricks 8020.
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [8020, 8020]
+    ignore: true
+  # gcloud 8085.
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [8085, 8085]
+    ignore: true
+  # Firebase 9005.
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [9005, 9005]
+    ignore: true
+  # kubelogin 18000.
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [18000, 18000]
+    ignore: true
+
+  # Mirror guest TCP listeners onto the host's 127.0.0.1 for the unprivileged
+  # dev ports only, below the macOS ephemeral range (49152). Same port on both
+  # sides; guestIP and hostIP stay at lima's loopback defaults.
+  - guestPortRange: [1024, 49151]
+    proto: tcp
+
   # Reverses the Mac's 1Password agent socket into the guest, so the VM
   # never carries any 1Password credential of its own.
   - guestSocket: "/run/yolobox-op/agent.sock"
@@ -62,6 +106,14 @@ portForwards:
   # is false. Without them the rule (default guestIP 127.0.0.1) matches only
   # loopback listeners. See lima/yolobox.md.
   - proto: udp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    ignore: true
+
+  # Everything else over TCP (ports below 1024 and above 49151) is ignored.
+  # Lima's own default rule would mirror it, ports below 1024 included.
+  # Same guestIP lines as the UDP rule above.
+  - proto: tcp
     guestIP: 0.0.0.0
     guestIPMustBeZero: false
     ignore: true

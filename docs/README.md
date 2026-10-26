@@ -24,7 +24,7 @@ Sibling `.md` files are safe to add. No package installs them: `nix/pkgs/yolobox
 | [mac-network.md](mac-network.md) | Mac VPN shapes that blackhole guest traffic, the gateway-blocked marker for a box that blocks the gateway on purpose, the DNS sinkhole, UDP flows stuck after a VPN disconnects, and lima listening on ports 80 and 443. |
 | [distribution.md](distribution.md) | Building the box from a flake ref instead of a checkout, the bootstrap reboot decision, and the failure shapes that follow. |
 | [../yo.md](../yo.md) | The Mac-side CLI: the path mirror, `yo link`, `yo cp`, the guest helper, the `network:` line, the single parser, the output filter, the `YO_VERSION` literal, and opening a guest URL. |
-| [../lima/yolobox.md](../lima/yolobox.md) | `lima/yolobox.yaml` as read-once config, checking a running instance, why guest UDP is never mirrored, reaching a guest service from the Mac, pinned settings, and the forwarder bug. |
+| [../lima/yolobox.md](../lima/yolobox.md) | `lima/yolobox.yaml` as read-once config, checking a running instance, why guest UDP is never mirrored, which guest ports reach the host, pinned settings, and the forwarder bug. |
 | [../nix/base.md](../nix/base.md) | The ESP size, same-uid ptrace, memory pressure, and growing the root disk. |
 | [../nix/harnesses.md](../nix/harnesses.md) | The `claude` launcher, the version keeper, install phases, pi, the plugins, lingering, and herdr's pi integration. |
 | [../nix/herd-server.md](../nix/herd-server.md) | The VM's own herdr server, machine panes, capability gating, `HERDR_AGENT`, and host keys for the `yolobox` alias. |

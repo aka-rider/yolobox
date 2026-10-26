@@ -62,13 +62,42 @@ GAP_MOUNTS = "mounts"
 GAP_FORWARD_AGENT = "ssh.forwardAgent"
 GAP_SSH_OVER_VSOCK = "ssh.overVsock"
 GAP_UDP_FORWARDS = "portForwards.udp"
+GAP_TCP_FORWARDS = "portForwards.tcp"
 
 OP_GUEST_SOCK = "/run/yolobox-op/agent.sock"
 AWS_BROKER_GUEST_SOCK = "/run/yolobox-op/aws-broker.sock"
 AGENT_AWS_BROKER_SOCK = "/run/yolobox/aws-broker.sock"
 
+# The guest TCP ports lima mirrors onto the host's 127.0.0.1: unprivileged and
+# below the macOS ephemeral range (49152). A Linux host would need [1024, 32767].
+MIRRORED_TCP_PORTS = [1024, 49151]
+
+# Fixed OAuth callback ports inside MIRRORED_TCP_PORTS that are never mirrored:
+# Codex CLI 1455-1457, Databricks 8020, gcloud 8085, Firebase 9005, kubelogin 18000.
+# (kubelogin's 8000 stays mirrored on purpose: it is also the Django and
+# http.server default.)
+OAUTH_CALLBACK_PORT_RANGES = [
+    [1455, 1457],
+    [8020, 8020],
+    [8085, 8085],
+    [9005, 9005],
+    [18000, 18000],
+]
+
+# The order matters: lima takes the first matching rule, so the deny-list comes
+# before the range and the catch-alls come last. See lima/yolobox.md.
 LIMA_PORT_FORWARDS = [
-    {"proto": "udp", "guestIP": "0.0.0.0", "guestIPMustBeZero": False, "ignore": True},
+    *[
+        {
+            "proto": "tcp",
+            "guestIP": "0.0.0.0",
+            "guestIPMustBeZero": False,
+            "guestPortRange": port_range,
+            "ignore": True,
+        }
+        for port_range in OAUTH_CALLBACK_PORT_RANGES
+    ],
+    {"proto": "tcp", "guestPortRange": MIRRORED_TCP_PORTS},
     {
         "guestSocket": OP_GUEST_SOCK,
         "hostSocket": "{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
@@ -79,6 +108,8 @@ LIMA_PORT_FORWARDS = [
         "hostSocket": "{{.Home}}/.local/state/yolobox/aws-broker.sock",
         "reverse": True,
     },
+    {"proto": "udp", "guestIP": "0.0.0.0", "guestIPMustBeZero": False, "ignore": True},
+    {"proto": "tcp", "guestIP": "0.0.0.0", "guestIPMustBeZero": False, "ignore": True},
 ]
 
 RESTATE_PORT_FORWARDS = ".portForwards = %s" % json.dumps(LIMA_PORT_FORWARDS)
@@ -95,6 +126,10 @@ LIMA_SETTING_GAPS = {
     ),
     GAP_UDP_FORWARDS: (
         "mirrors guest UDP listeners onto the Mac's localhost (including DHCP's 68 and tailscaled's 41641, which collides with the Mac's own Tailscale)",
+        RESTATE_PORT_FORWARDS,
+    ),
+    GAP_TCP_FORWARDS: (
+        "mirrors guest TCP listeners onto the host's localhost beyond the dev ports 1024–49151 (or publishes one beyond loopback)",
         RESTATE_PORT_FORWARDS,
     ),
 }
@@ -1371,6 +1406,54 @@ def ignores_all_guest_udp(forward: object) -> bool:
     )
 
 
+def normalize_port_forward(rule: dict) -> dict:
+    """A portForwards entry with lima's defaults filled in, as `limactl list --json` shows it.
+
+    Mirrors lima v2.2.1 FillPortForwardDefaults (pkg/limayaml/defaults.go), in
+    its order. Only the fields that decide what is mirrored are returned.
+    """
+    proto = rule.get("proto", "any")
+    guest_ip = rule.get("guestIP")
+    must_be_zero = rule.get("guestIPMustBeZero", guest_ip == "0.0.0.0")
+    if guest_ip is None:
+        guest_ip = "0.0.0.0" if must_be_zero else "127.0.0.1"
+    guest_port_range = rule.get("guestPortRange")
+    if guest_port_range is None:
+        guest_port = rule.get("guestPort")
+        guest_port_range = (
+            [1, 65535] if guest_port is None else [guest_port, guest_port]
+        )
+    host_port_range = rule.get("hostPortRange")
+    if host_port_range is None:
+        host_port = rule.get("hostPort")
+        host_port_range = (
+            guest_port_range if host_port is None else [host_port, host_port]
+        )
+    return {
+        "proto": proto,
+        "guestIP": guest_ip,
+        "guestIPMustBeZero": must_be_zero,
+        "guestPortRange": guest_port_range,
+        "hostIP": rule.get("hostIP", "127.0.0.1"),
+        "hostPortRange": host_port_range,
+        "ignore": rule.get("ignore", False),
+    }
+
+
+def tcp_forward_rules(forwards: Sequence[object]) -> List[dict]:
+    """The ordered, normalized rules that decide which TCP listeners are mirrored.
+
+    The reverse socket rules have their own checks and every UDP rule has its
+    own gap. Order counts: lima takes the first matching rule.
+    """
+    rules = [
+        normalize_port_forward(forward)
+        for forward in forwards
+        if isinstance(forward, dict) and "guestSocket" not in forward
+    ]
+    return [rule for rule in rules if rule["proto"] != "udp"]
+
+
 def lima_config_gaps() -> List[str]:
     info = lima_instance_info()
     if info is None:
@@ -1392,6 +1475,8 @@ def lima_config_gaps() -> List[str]:
     ]
     if not any(ignores_all_guest_udp(forward) for forward in info.port_forwards):
         gaps.append(GAP_UDP_FORWARDS)
+    if tcp_forward_rules(info.port_forwards) != tcp_forward_rules(LIMA_PORT_FORWARDS):
+        gaps.append(GAP_TCP_FORWARDS)
     if info.mounts:
         gaps.append(GAP_MOUNTS)
     if info.forward_agent:
@@ -1412,6 +1497,7 @@ def lima_edit_command(expression: str) -> str:
 def lima_config_gap_message(gaps: Sequence[str]) -> str:
     missing = [gap for gap in gaps if gap not in LIMA_SETTING_GAPS]
     lines = []
+    restated = bool(missing)
     if missing:
         lines.append(
             "%s has no reverse forward for %s — restate the full array:\n    %s"
@@ -1422,12 +1508,16 @@ def lima_config_gap_message(gaps: Sequence[str]) -> str:
             )
         )
     for gap in gaps:
-        # The socket gaps' restate already carries the whole array, UDP rule included.
-        if gap in LIMA_SETTING_GAPS and not (missing and gap == GAP_UDP_FORWARDS):
-            problem, expression = LIMA_SETTING_GAPS[gap]
-            lines.append(
-                "%s %s:\n    %s" % (INSTANCE, problem, lima_edit_command(expression))
-            )
+        if gap not in LIMA_SETTING_GAPS:
+            continue
+        problem, expression = LIMA_SETTING_GAPS[gap]
+        if expression == RESTATE_PORT_FORWARDS and restated:
+            lines.append("%s %s (the restate above fixes it too)" % (INSTANCE, problem))
+            continue
+        restated = restated or expression == RESTATE_PORT_FORWARDS
+        lines.append(
+            "%s %s:\n    %s" % (INSTANCE, problem, lima_edit_command(expression))
+        )
     return "\n".join(lines)
 
 
