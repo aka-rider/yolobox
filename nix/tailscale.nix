@@ -25,6 +25,10 @@
   systemd.services.tailscaled.serviceConfig.RuntimeDirectoryMode = "0750";
   systemd.services.tailscaled.serviceConfig.ExecStartPre = [ "+${pkgs.coreutils}/bin/chgrp wheel /run/tailscale" ];
 
+  # Its NAT-PMP, PCP and SSDP go only to the host and the LAN, which
+  # nix/egress.nix rejects. Peers fall back to public endpoints, then DERP.
+  systemd.services.tailscaled.environment.TS_DISABLE_PORTMAPPER = "1";
+
   # tailscaled logs one "new contact ... via=derp" line for every disco
   # call-me-maybe a peer sends while the box has no direct path to it, which
   # is every few seconds for as long as the path stays relayed, and the box

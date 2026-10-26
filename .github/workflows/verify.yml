@@ -92,3 +92,15 @@ jobs:
           settings=.#nixosConfigurations.yolobox.config.virtualisation.containers.containersConf.settings
           test "$(nix eval --impure --raw "$settings.containers.log_driver")" = k8s-file
           test "$(nix eval --impure --raw "$settings.engine.events_logger")" = file
+
+      # nix cannot check the egress rule files (nft needs netlink, which the
+      # build sandbox forbids), and a rule file that fails to load leaves the
+      # box in recovery mode with no network. `nft --check` parses and validates
+      # each against the runner's kernel without changing any rules.
+      - name: Check the egress rules parse
+        run: |
+          sudo apt-get install --yes nftables
+          for rules in egressRules egressRecoveryRules; do
+            file="$(nix eval --impure --raw ".#nixosConfigurations.yolobox.config.system.build.$rules")"
+            sudo nft --check --file "$file"
+          done

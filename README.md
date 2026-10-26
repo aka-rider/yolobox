@@ -12,7 +12,7 @@ A development sanbox virtual machine. It's a NixOS Linux run by Lima.
 
 - The agent runs as its own user with no `sudo`. The filesystem is airgaped. Files move only through git, scp, or rsync.
 - The VM can use your 1Password SSH agent. You must approve the access (TouchID or similarly).
-- The VM accesses the internet and your LAN freely.
+- The VM reaches the internet, but not your computer or your local network. To let it reach a network, name it in `/etc/yolobox/local.nix`, for example `yolobox.network.lanAllow = [ "192.168.1.0/24" ];`.
 - Open VM ports are mapped on the host (you can open `http://localhost:3000` directly in your browser)
 
 

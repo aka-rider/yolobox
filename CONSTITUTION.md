@@ -69,6 +69,7 @@ Identify whether you are running on the host (macOS) or the guest (Linux).
 
 ## Network and Tailscale
 
+- ALWAYS keep the egress table: no guest-originated traffic to the host or a private network except DNS to the Lima gateway, DHCP and `lanAllow`; no stop hook. [story](nix/egress.md)
 - ALWAYS keep `--netfilter-mode=off` in tailscale's `extraSetFlags`, and NEVER add firewall rules with `iptables -I INPUT 1`. `nixos-fw` owns the rules, and by default tailscaled inserts its own jump ahead of it and re-inserts it at the top whenever it restarts. [story](nix/tailscale.md#firewall)
 - ALWAYS keep `--ssh=false` and `--accept-dns=false` in `extraSetFlags`. The first stops tailscaled authorising ssh by tailnet ACL instead of this repo's keys, and the second keeps MagicDNS from taking over the guest's resolver. [story](nix/tailscale.md#dns-and-logging)
 - NEVER pass `--hostname` to `tailscale up`, and NEVER answer a refused `tailscale up` with `--reset`. `extraSetFlags` pins the name and the other non-default flags, and `--reset` clears them. Restart `tailscaled-set` instead. [story](nix/tailscale.md#login)

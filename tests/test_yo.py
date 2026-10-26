@@ -2271,6 +2271,27 @@ class TestTailscaleStatusLine(unittest.TestCase):
         self.assertIn("yo bootstrap", yo.tailscale_status_line("NO_TAILSCALE\n", ""))
 
 
+class TestEgressStatusLine(unittest.TestCase):
+    def test_an_active_unit_says_the_host_and_lan_are_blocked(self):
+        self.assertEqual(
+            yo.egress_status_line("active"), "egress: host and LAN blocked"
+        )
+
+    def test_any_other_state_is_recovery_mode_naming_the_state_and_the_way_out(self):
+        for state in ("failed", "inactive", "activating", "lizard"):
+            with self.subTest(state=state):
+                line = yo.egress_status_line(state)
+                self.assertTrue(line.startswith("egress: WARNING recovery mode"))
+                self.assertIn("(yolobox-egress %s)" % state, line)
+                self.assertIn("yo ssh sudo nixos-rebuild switch --rollback", line)
+                self.assertIn("yo ssh journalctl -u yolobox-egress", line)
+
+    def test_a_silent_probe_is_recovery_mode_with_an_unknown_state(self):
+        line = yo.egress_status_line("")
+        self.assertTrue(line.startswith("egress: WARNING recovery mode"))
+        self.assertIn("(yolobox-egress unknown)", line)
+
+
 class TestStatusWithVmDown(unittest.TestCase):
     def test_unreachable_vm_is_reported_once_and_no_guest_probe_runs(self):
         stdout = io.StringIO()

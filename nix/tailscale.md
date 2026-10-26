@@ -73,6 +73,10 @@ What decides whether a direct path exists is outside this repo. The box reaches 
 
 tailscaled has no switch for this line, and its verbosity flags only add lines. So `nix/tailscale.nix` sets `LogFilterPatterns` on the unit to drop exactly `via=derp`, a mitigation and not a fix. systemd's journald applies it to the unit's stream, so it also holds for tailscaled's stderr. The `via=direct` line, `now using` (the path change) and `endpoints changed` all stay, because they report events. `TestTailscaledLogFilter` checks the pattern against real lines. Drop the setting if tailscale ever ratelimits or demotes the line. To see the relayed state without it, use `tailscale status` (`relay "..."` and no `direct`) or `tailscale ping <node>`, which answers `via DERP(...)` or `via <ip:port>`.
 
+## The port mapper
+
+`nix/tailscale.nix` sets `TS_DISABLE_PORTMAPPER=1` on tailscaled. Its port mapper sends NAT-PMP and PCP to 192.168.5.2:5351 and SSDP to 239.255.255.250, and both go only to the host and the LAN, which the [egress table](egress.md) rejects. Without the setting tailscaled would keep probing a path that cannot answer. A peer on the same LAN then connects through public endpoints and then DERP, which is slower (tailscale.com/kb/1257).
+
 ## Login
 
 Login is interactive and happens once, by the operator, because no auth key exists anywhere in this repo: `yo ssh sudo tailscale up`. It takes no `--hostname`. `extraSetFlags` pins the tailnet name to `networking.hostName`, so every box joins as `yolobox`, and a hand-typed `--hostname` is overwritten by the next `tailscaled-set` run.

@@ -30,6 +30,7 @@ Sibling `.md` files are safe to add. No package installs them: `nix/pkgs/yolobox
 | [../nix/herd-server.md](../nix/herd-server.md) | The VM's own herdr server, machine panes, capability gating, `HERDR_AGENT`, and host keys for the `yolobox` alias. |
 | [../nix/display.md](../nix/display.md) | The virtual display, browsers, the Playwright output hook, the clipboard, and lessons learned. |
 | [../nix/podman.md](../nix/podman.md) | Container output and podman's events kept out of the journal: the 2.8 GiB incident, the log driver, the events logger, the journald cap, how to recognise a flood, and what an old container keeps. |
+| [../nix/egress.md](../nix/egress.md) | The egress table: what the guest may not reach on the host and the LAN and why, the gateway NAT to the host's loopback, DNS as the one exception, `lanAllow`, how it composes with a kill switch module, and recovery mode with its rollback. |
 | [../nix/tailscale.md](../nix/tailscale.md) | The optional tailnet: why `tailscale0` is trusted and what that opens, sshd on two interfaces, `tailscaled-set`, DNS and logging, relayed-contact log lines, login, box-local routes. |
 | [../nix/guest/yolobox-guest.md](../nix/guest/yolobox-guest.md) | The guest helper script: `net-check` and the gateway-blocked marker, the project walk, `BUILD_DIRS` and `LOCAL_CACHES`, guards, version skew, and the gc tiers. |
 | [../nix/pkgs/far2l.md](../nix/pkgs/far2l.md) | The far2l build and S3 through the broker. |

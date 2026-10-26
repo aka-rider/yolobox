@@ -28,13 +28,17 @@ commit `1fed88d`.
   with no `sudo`. Every AI coding session runs as the agent, so it cannot
   reach root. Lima would re-grant `wheel` to its own account on every boot,
   which is why the agent is a separate account. See `docs/accounts.md`.
-- **Egress is plain Lima NAT.** The box reaches the internet through the Lima
-  NAT and the Mac's network. Tailscale is optional: a box that never logs in
-  works as before, and `tailscale0` is a trusted interface, so a logged-in box
-  is reachable on every port by whatever its tailnet ACL admits. A box whose
-  own `/etc/yolobox/local.nix` blocks Lima's gateway by design creates
-  `/etc/yolobox/gateway-blocked`, and `net-check` then skips its gateway probe.
-  See `nix/tailscale.md` and `docs/mac-network.md`.
+- **Egress is Lima NAT, minus the host.** The box reaches the internet through
+  the Lima NAT, but `nix/egress.nix` rejects guest traffic to the host and to
+  private networks, except DNS to the gateway, DHCP and the networks named in
+  `yolobox.network.lanAllow`. If the rules fail to load, the box runs in
+  recovery mode: no network, Lima ssh only. Tailscale is optional: a box that
+  never logs in works as before, and `tailscale0` is a trusted interface, so a
+  logged-in box is reachable on every port by whatever its tailnet ACL admits.
+  A box whose own `/etc/yolobox/local.nix` blocks Lima's gateway by design
+  creates `/etc/yolobox/gateway-blocked`, and `net-check` then skips its
+  gateway probe. See `nix/egress.md`, `nix/tailscale.md` and
+  `docs/mac-network.md`.
 - **Git is the bridge.** `yo link` makes the VM side of a repo a
   push-to-checkout target (`receive.denyCurrentBranch = updateInstead`), so
   the VM refuses a push when its worktree differs from HEAD. The VM commits
@@ -81,6 +85,8 @@ Box configuration (Nix):
   `nix/herd-server.md`.
 - `nix/display.nix`: the virtual X display, browsers and screen recording.
   `nix/display.md`.
+- `nix/egress.nix`: the egress nft table that keeps the guest off the host and
+  the LAN, `lanAllow`, and recovery mode. `nix/egress.md`.
 - `nix/tailscale.nix`: the optional tailnet, with `tailscale0` trusted.
   `nix/tailscale.md`.
 - `nix/podman.nix`: rootless podman with a docker-compatible socket.
