@@ -1287,10 +1287,11 @@ class TestCmdStatus(unittest.TestCase):
             ["egress: box predates the egress table; run yo bootstrap"],
         )
 
-    def test_a_silent_egress_probe_warns_of_recovery_mode_with_an_unknown_state(self):
-        lines = self.egress_lines("")
-        self.assertEqual(len(lines), 1)
-        self.assertIn("(yolobox-egress unknown)", lines[0])
+    def test_a_silent_egress_probe_is_not_checked_not_recovery_mode(self):
+        self.assertEqual(
+            self.egress_lines(""),
+            ["egress: not checked — the probe answered '' (exit 0)"],
+        )
 
     def test_network_line_reports_what_the_guest_net_check_answered(self):
         outs = self.run_status(

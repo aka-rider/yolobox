@@ -61,6 +61,8 @@ HELPER_MARKER = "unknown subcommand"
 GAP_MOUNTS = "mounts"
 GAP_FORWARD_AGENT = "ssh.forwardAgent"
 GAP_SSH_OVER_VSOCK = "ssh.overVsock"
+GAP_PROPAGATE_PROXY_ENV = "propagateProxyEnv"
+GAP_LOAD_DOT_SSH_PUB_KEYS = "ssh.loadDotSSHPubKeys"
 GAP_UDP_FORWARDS = "portForwards.udp"
 GAP_TCP_FORWARDS = "portForwards.tcp"
 
@@ -123,6 +125,14 @@ LIMA_SETTING_GAPS = {
     GAP_SSH_OVER_VSOCK: (
         "lets lima proxy ssh over vsock, which the initrd that unlocks the disk cannot answer",
         ".ssh.overVsock = false",
+    ),
+    GAP_PROPAGATE_PROXY_ENV: (
+        "copies the host's HTTP(S)_PROXY into the VM, which can point the guest at a proxy on the host's loopback: an entrance to the host nobody controls",
+        ".propagateProxyEnv = false",
+    ),
+    GAP_LOAD_DOT_SSH_PUB_KEYS: (
+        "adds the host's ~/.ssh public keys to the VM's authorized_keys",
+        ".ssh.loadDotSSHPubKeys = false",
     ),
     GAP_UDP_FORWARDS: (
         "mirrors guest UDP listeners onto the host's localhost (including DHCP's 68 and tailscaled's 41641, which collides with the host's own Tailscale)",
@@ -1351,6 +1361,8 @@ class LimaInfo:
     forward_agent: bool
     status: str
     over_vsock: Optional[bool]
+    propagate_proxy_env: Optional[bool]
+    load_dot_ssh_pub_keys: Optional[bool]
 
 
 def lima_instance_info() -> Optional[LimaInfo]:
@@ -1363,15 +1375,18 @@ def lima_instance_info() -> Optional[LimaInfo]:
         return None
     pid = data.get("hostAgentPID")
     config = data.get("config", {})
+    ssh = config.get("ssh", {})
     forwards = config.get("portForwards", [])
     mounts = config.get("mounts", [])
     return LimaInfo(
         host_agent_pid=checked_pid(pid),
         port_forwards=forwards if isinstance(forwards, list) else [],
         mounts=mounts if isinstance(mounts, list) else [],
-        forward_agent=config.get("ssh", {}).get("forwardAgent") is True,
+        forward_agent=ssh.get("forwardAgent") is True,
         status=data.get("status", ""),
-        over_vsock=config.get("ssh", {}).get("overVsock"),
+        over_vsock=ssh.get("overVsock"),
+        propagate_proxy_env=config.get("propagateProxyEnv"),
+        load_dot_ssh_pub_keys=ssh.get("loadDotSSHPubKeys"),
     )
 
 
@@ -1483,6 +1498,10 @@ def lima_config_gaps() -> List[str]:
         gaps.append(GAP_FORWARD_AGENT)
     if info.over_vsock is not False:
         gaps.append(GAP_SSH_OVER_VSOCK)
+    if info.propagate_proxy_env is not False:
+        gaps.append(GAP_PROPAGATE_PROXY_ENV)
+    if info.load_dot_ssh_pub_keys is not False:
+        gaps.append(GAP_LOAD_DOT_SSH_PUB_KEYS)
     return gaps
 
 
@@ -2101,9 +2120,18 @@ EGRESS_PROBE = [
 ]
 
 
-def egress_status_line(load_state: str, active_state: str) -> str:
+def egress_status_line(probe: subprocess.CompletedProcess) -> str:
+    load_state = guest_field(probe.stdout, "LoadState")
+    active_state = guest_field(probe.stdout, "ActiveState")
     if load_state == "not-found":
         return "egress: box predates the egress table; run yo bootstrap"
+    if load_state != "loaded" or not active_state:
+        stderr = probe.stderr.strip()
+        return "egress: not checked — the probe answered %r (exit %d)%s" % (
+            probe.stdout.strip(),
+            probe.returncode,
+            ": " + stderr if stderr else "",
+        )
     if active_state == "active":
         return "egress: host and LAN blocked"
     return (
@@ -2112,7 +2140,7 @@ def egress_status_line(load_state: str, active_state: str) -> str:
         "yo ssh sudo nixos-rebuild switch --rollback; "
         "logs: yo ssh journalctl -u %s; "
         "table: yo ssh sudo nft list table %s"
-        % (EGRESS_UNIT, active_state or "unknown", EGRESS_UNIT, EGRESS_TABLE)
+        % (EGRESS_UNIT, active_state, EGRESS_UNIT, EGRESS_TABLE)
     )
 
 
@@ -2213,13 +2241,7 @@ def status_guest_services() -> None:
     tailscale_probe = ssh_run(OPERATOR, ["sh", "-c", TAILSCALE_PROBE], check=False)
     out(tailscale_status_line(tailscale_probe.stdout, tailscale_probe.stderr))
 
-    egress_probe = ssh_run(OPERATOR, EGRESS_PROBE, check=False)
-    out(
-        egress_status_line(
-            guest_field(egress_probe.stdout, "LoadState"),
-            guest_field(egress_probe.stdout, "ActiveState"),
-        )
-    )
+    out(egress_status_line(ssh_run(OPERATOR, EGRESS_PROBE, check=False)))
 
     out(guest_network_line())
 

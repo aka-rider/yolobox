@@ -1796,6 +1796,9 @@ class TestGuestAwsConfigText(unittest.TestCase):
         self.assertLess(text.index("[profile a]"), text.index("[profile b]"))
 
 
+MISSING = object()
+
+
 class TestLimaConfigGaps(FakeHome):
     def mock_lima_list(
         self,
@@ -1804,6 +1807,8 @@ class TestLimaConfigGaps(FakeHome):
         mounts=None,
         forward_agent=None,
         over_vsock=False,
+        propagate_proxy_env=False,
+        load_dot_ssh_pub_keys=False,
     ):
         config = {"portForwards": forwards}
         if mounts is not None:
@@ -1813,6 +1818,10 @@ class TestLimaConfigGaps(FakeHome):
             config["ssh"]["forwardAgent"] = forward_agent
         if over_vsock is not None:
             config["ssh"]["overVsock"] = over_vsock
+        if propagate_proxy_env is not MISSING:
+            config["propagateProxyEnv"] = propagate_proxy_env
+        if load_dot_ssh_pub_keys is not MISSING:
+            config["ssh"]["loadDotSSHPubKeys"] = load_dot_ssh_pub_keys
         payload = json.dumps({"hostAgentPID": host_agent_pid, "config": config})
         return mock.patch.object(
             yo, "run", return_value=mock.Mock(returncode=0, stdout=payload, stderr="")
@@ -1940,6 +1949,38 @@ class TestLimaConfigGaps(FakeHome):
                 with self.mock_lima_list(self.restated_forwards(), over_vsock=value):
                     self.assertEqual(yo.lima_config_gaps(), [yo.GAP_SSH_OVER_VSOCK])
 
+    def test_host_proxy_env_propagation_is_reported_unless_pinned_off(self):
+        # An instance that predates the pin has true; an absent key falls back
+        # to lima's default (true), so anything but a literal false is a gap.
+        for value in (True, None, MISSING, "lizard", "false", 0):
+            with self.subTest(value=value):
+                with self.mock_lima_list(
+                    self.restated_forwards(), propagate_proxy_env=value
+                ):
+                    self.assertEqual(
+                        yo.lima_config_gaps(), [yo.GAP_PROPAGATE_PROXY_ENV]
+                    )
+
+    def test_host_ssh_pubkey_loading_is_reported_unless_pinned_off(self):
+        for value in (True, None, MISSING, "lizard", "false", 0):
+            with self.subTest(value=value):
+                with self.mock_lima_list(
+                    self.restated_forwards(), load_dot_ssh_pub_keys=value
+                ):
+                    self.assertEqual(
+                        yo.lima_config_gaps(), [yo.GAP_LOAD_DOT_SSH_PUB_KEYS]
+                    )
+
+    def test_the_proxy_env_remedy_sets_it_false(self):
+        message = yo.lima_config_gap_message([yo.GAP_PROPAGATE_PROXY_ENV])
+        self.assertIn("--set '.propagateProxyEnv = false'", message)
+        self.assertNotIn("portForwards", message)
+
+    def test_the_pubkey_remedy_sets_it_false(self):
+        message = yo.lima_config_gap_message([yo.GAP_LOAD_DOT_SSH_PUB_KEYS])
+        self.assertIn("--set '.ssh.loadDotSSHPubKeys = false'", message)
+        self.assertNotIn("portForwards", message)
+
     def test_the_over_vsock_remedy_sets_it_false(self):
         message = yo.lima_config_gap_message([yo.GAP_SSH_OVER_VSOCK])
         self.assertIn("--set '.ssh.overVsock = false'", message)
@@ -1957,19 +1998,90 @@ class TestLimaConfigGaps(FakeHome):
         return rule
 
     def restated_forwards(self):
-        # What lima reports for an instance restated from LIMA_PORT_FORWARDS:
-        # lima's defaults filled in, the socket paths expanded the way
-        # op_sock() and aws_broker_sock() expand them.
-        host_sockets = {
-            yo.OP_GUEST_SOCK: yo.op_sock(),
-            yo.AWS_BROKER_GUEST_SOCK: yo.aws_broker_sock(),
-        }
+        # `limactl list yolobox --json` .config.portForwards after
+        # `yo bootstrap`'s restate, written out by hand from lima's defaults
+        # (FillPortForwardDefaults): proto any, guestIP 127.0.0.1 (0.0.0.0 when
+        # the rule says so), guestIPMustBeZero false, hostIP 127.0.0.1,
+        # hostPortRange = guestPortRange (0-0 for a socket), `ignore` omitted
+        # when false. {{.Home}} is expanded to the home directory.
+        def ignored_tcp_range(first, last):
+            return {
+                "proto": "tcp",
+                "guestIP": "0.0.0.0",
+                "guestIPMustBeZero": False,
+                "guestPortRange": [first, last],
+                "hostIP": "127.0.0.1",
+                "hostPortRange": [first, last],
+                "ignore": True,
+            }
+
+        def reverse_socket(guest_socket, host_socket):
+            return {
+                "proto": "any",
+                "guestIP": "127.0.0.1",
+                "guestIPMustBeZero": False,
+                "guestPortRange": [1, 65535],
+                "guestSocket": guest_socket,
+                "hostIP": "127.0.0.1",
+                "hostPortRange": [0, 0],
+                "hostSocket": host_socket,
+                "reverse": True,
+            }
+
         return [
-            {**forward, "hostSocket": host_sockets[forward["guestSocket"]]}
-            if "guestSocket" in forward
-            else yo.normalize_port_forward(forward)
-            for forward in yo.LIMA_PORT_FORWARDS
+            ignored_tcp_range(1455, 1457),
+            ignored_tcp_range(8020, 8020),
+            ignored_tcp_range(8085, 8085),
+            ignored_tcp_range(9005, 9005),
+            ignored_tcp_range(18000, 18000),
+            {
+                "proto": "tcp",
+                "guestIP": "127.0.0.1",
+                "guestIPMustBeZero": False,
+                "guestPortRange": [1024, 49151],
+                "hostIP": "127.0.0.1",
+                "hostPortRange": [1024, 49151],
+            },
+            reverse_socket(
+                "/run/yolobox-op/agent.sock",
+                self.home
+                + "/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+            ),
+            reverse_socket(
+                "/run/yolobox-op/aws-broker.sock",
+                self.home + "/.local/state/yolobox/aws-broker.sock",
+            ),
+            {
+                "proto": "udp",
+                "guestIP": "0.0.0.0",
+                "guestIPMustBeZero": False,
+                "guestPortRange": [1, 65535],
+                "hostIP": "127.0.0.1",
+                "hostPortRange": [1, 65535],
+                "ignore": True,
+            },
+            {
+                "proto": "tcp",
+                "guestIP": "0.0.0.0",
+                "guestIPMustBeZero": False,
+                "guestPortRange": [1, 65535],
+                "hostIP": "127.0.0.1",
+                "hostPortRange": [1, 65535],
+                "ignore": True,
+            },
         ]
+
+    def leftover_rule(self):
+        # An instance from before the port range: one dev port, published on
+        # every host address.
+        return {
+            "proto": "tcp",
+            "guestIP": "127.0.0.1",
+            "guestIPMustBeZero": False,
+            "guestPortRange": [4321, 4321],
+            "hostIP": "0.0.0.0",
+            "hostPortRange": [4321, 4321],
+        }
 
     def replacing_udp_rule(self, udp_rule):
         return [
@@ -1989,10 +2101,7 @@ class TestLimaConfigGaps(FakeHome):
         self.assertEqual(self.gaps_for(forwards), [yo.GAP_TCP_FORWARDS])
 
     def test_a_leftover_rule_published_beyond_loopback_is_a_tcp_gap(self):
-        leftover = yo.normalize_port_forward(
-            {"guestPort": 4321, "proto": "tcp", "hostIP": "0.0.0.0"}
-        )
-        forwards = [leftover, *self.restated_forwards()]
+        forwards = [self.leftover_rule(), *self.restated_forwards()]
         self.assertEqual(self.gaps_for(forwards), [yo.GAP_TCP_FORWARDS])
 
     def test_an_instance_missing_one_oauth_ignore_has_the_tcp_gap(self):
@@ -2010,15 +2119,21 @@ class TestLimaConfigGaps(FakeHome):
 
     def test_a_tcp_catch_all_with_lima_default_guest_ip_is_a_gap(self):
         # It would match loopback listeners only; wildcard ones slip past.
-        loopback_catch_all = yo.normalize_port_forward({"proto": "tcp", "ignore": True})
+        loopback_catch_all = {
+            "proto": "tcp",
+            "guestIP": "127.0.0.1",
+            "guestIPMustBeZero": False,
+            "guestPortRange": [1, 65535],
+            "hostIP": "127.0.0.1",
+            "hostPortRange": [1, 65535],
+            "ignore": True,
+        }
         forwards = [*self.restated_forwards()[:-1], loopback_catch_all]
         self.assertEqual(self.gaps_for(forwards), [yo.GAP_TCP_FORWARDS])
 
     def test_an_instance_from_before_the_port_range_has_the_tcp_gap(self):
         old = [
-            yo.normalize_port_forward(
-                {"guestPort": 4321, "proto": "tcp", "hostIP": "0.0.0.0"}
-            ),
+            self.leftover_rule(),
             *(
                 forward
                 for forward in self.restated_forwards()
@@ -2159,6 +2274,8 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
             forward_agent=False,
             status="Running",
             over_vsock=False,
+            propagate_proxy_env=False,
+            load_dot_ssh_pub_keys=False,
         )
         with (
             mock.patch.object(yo, "lima_config_gaps", return_value=gaps),
@@ -2272,15 +2389,22 @@ class TestTailscaleStatusLine(unittest.TestCase):
 
 
 class TestEgressStatusLine(unittest.TestCase):
+    def probe(self, stdout="", stderr="", returncode=0):
+        return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+    def answer(self, load_state, active_state):
+        return self.probe("LoadState=%s\nActiveState=%s\n" % (load_state, active_state))
+
     def test_a_loaded_active_unit_says_the_host_and_lan_are_blocked(self):
         self.assertEqual(
-            yo.egress_status_line("loaded", "active"), "egress: host and LAN blocked"
+            yo.egress_status_line(self.answer("loaded", "active")),
+            "egress: host and LAN blocked",
         )
 
     def test_a_loaded_unit_in_any_other_state_is_recovery_mode_naming_the_state(self):
         for state in ("failed", "inactive", "activating", "lizard"):
             with self.subTest(state=state):
-                line = yo.egress_status_line("loaded", state)
+                line = yo.egress_status_line(self.answer("loaded", state))
                 self.assertTrue(line.startswith("egress: WARNING recovery mode"))
                 self.assertIn("(yolobox-egress %s)" % state, line)
                 self.assertIn("yo ssh sudo nixos-rebuild switch --rollback", line)
@@ -2289,18 +2413,36 @@ class TestEgressStatusLine(unittest.TestCase):
     def test_a_unit_the_box_does_not_know_means_the_box_predates_the_table(self):
         # systemctl prints ActiveState=inactive for an unknown unit.
         self.assertEqual(
-            yo.egress_status_line("not-found", "inactive"),
+            yo.egress_status_line(self.answer("not-found", "inactive")),
             "egress: box predates the egress table; run yo bootstrap",
         )
 
-    def test_a_silent_probe_is_recovery_mode_with_an_unknown_state(self):
-        line = yo.egress_status_line("", "")
-        self.assertTrue(line.startswith("egress: WARNING recovery mode"))
-        self.assertIn("(yolobox-egress unknown)", line)
+    def test_a_silent_probe_is_not_checked_rather_than_recovery_mode(self):
+        line = yo.egress_status_line(self.probe())
+        self.assertEqual(line, "egress: not checked — the probe answered '' (exit 0)")
 
-    def test_an_unrecognised_load_state_is_not_taken_for_a_missing_unit(self):
-        line = yo.egress_status_line("lizard", "")
-        self.assertTrue(line.startswith("egress: WARNING recovery mode"))
+    def test_a_failed_ssh_is_not_checked_and_says_why(self):
+        line = yo.egress_status_line(
+            self.probe(
+                stderr="ssh: connect to host lima-yolobox: refused\n", returncode=255
+            )
+        )
+        self.assertEqual(
+            line,
+            "egress: not checked — the probe answered '' (exit 255): "
+            "ssh: connect to host lima-yolobox: refused",
+        )
+
+    def test_an_unrecognised_load_state_is_not_checked(self):
+        for load_state in ("lizard", "masked", "error"):
+            with self.subTest(load_state=load_state):
+                line = yo.egress_status_line(self.answer(load_state, "active"))
+                self.assertTrue(line.startswith("egress: not checked"))
+                self.assertIn("LoadState=%s" % load_state, line)
+
+    def test_a_loaded_unit_with_no_active_state_is_not_checked(self):
+        line = yo.egress_status_line(self.probe("LoadState=loaded\n"))
+        self.assertTrue(line.startswith("egress: not checked"))
 
 
 class TestStatusWithVmDown(unittest.TestCase):
