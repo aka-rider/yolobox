@@ -84,3 +84,9 @@ State from the login, the node key and the tailnet identity, persists under `/va
 ## Box-local routes
 
 The first switch into a generation with this module restarts dhcpcd, because nixpkgs' tailscale module adds `tailscale0` to `networking.dhcpcd.denyInterfaces`, which changes dhcpcd's config. On stop dhcpcd removes the lease address, and the kernel flushes every route that hung off it. That includes any static route a `/etc/yolobox/local.nix` declared through `networking.interfaces.<if>.ipv4.routes`, because its `network-addresses-<if>` unit runs once and never re-adds it. The switch reports success and the route is simply gone. Any later dhcpcd restart, such as a nixpkgs bump, does the same. A box-local route therefore belongs in `networking.dhcpcd.runHook`, re-added with `ip route replace` on every `BOUND`, `REBOOT`, `RENEW` and `REBIND`, so its lifetime follows the lease it depends on.
+
+## The control socket
+
+tailscaled's LocalAPI socket is `/run/tailscale/tailscaled.sock`. tailscaled chmods that socket 0666 itself (`safesocket/unixsocket.go`), so the socket's own mode lets anyone in. What restricts it is the directory. systemd creates `/run/tailscale` from `RuntimeDirectoryMode`, and tailscaled does not re-chmod a directory that exists. `nix/tailscale.nix` sets `RuntimeDirectoryMode = "0750"` and an `ExecStartPre` that runs `chgrp wheel /run/tailscale`, so the directory is `root:wheel` `0750`. The directory exists before `ExecStartPre` runs.
+
+The operator is in `wheel`, so `yo status` can run `tailscale status` as the operator. The agent is uid 1000, group `users`, not in `wheel`, and gets `permission denied` from `tailscale status`. Recognise the setup with `yo ssh 'sudo -u agent tailscale status; echo rc=$?'`, which must print `permission denied` and a non-zero `rc`, and `yo ssh stat -c '%a %U:%G' /run/tailscale`, which must print `750 root:wheel`.

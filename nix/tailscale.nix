@@ -1,4 +1,4 @@
-{ config, ... }:
+{ config, pkgs, ... }:
 {
   # Every port, UDP and IPv6 included, is open to the tailnet; the tailnet ACL
   # is the access control. base.nix opens only 22 on enp0s1, for lima's
@@ -17,6 +17,13 @@
     # --accept-dns=false: MagicDNS must not take over the guest's resolver.
     extraSetFlags = [ "--accept-dns=false" "--ssh=false" "--netfilter-mode=off" "--hostname=${config.networking.hostName}" ];
   };
+
+  # tailscaled makes its socket 0666 itself, so the directory mode is what keeps
+  # the agent, which is not in wheel, off it. The operator is in wheel and keeps
+  # `tailscale status` working. The list merges with other modules' ExecStartPre.
+  # See nix/tailscale.md.
+  systemd.services.tailscaled.serviceConfig.RuntimeDirectoryMode = "0750";
+  systemd.services.tailscaled.serviceConfig.ExecStartPre = [ "+${pkgs.coreutils}/bin/chgrp wheel /run/tailscale" ];
 
   # tailscaled logs one "new contact ... via=derp" line for every disco
   # call-me-maybe a peer sends while the box has no direct path to it, which

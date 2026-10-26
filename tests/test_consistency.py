@@ -600,3 +600,19 @@ class TestRuffVersionIsPinnedOnce(unittest.TestCase):
         )
         self.assertIsNotNone(required)
         self.assertEqual(installed, [required.group(1)] * 2)
+
+
+class TestTailscaleSocketIsOperatorOnly(unittest.TestCase):
+    """The agent is not in wheel, so the socket directory must be wheel-only."""
+
+    def test_the_socket_directory_is_root_and_wheel_only(self):
+        self.assertIn(
+            'systemd.services.tailscaled.serviceConfig.RuntimeDirectoryMode = "0750";',
+            nix_code(REPO / "nix" / "tailscale.nix"),
+        )
+
+    def test_the_socket_directory_is_handed_to_wheel(self):
+        self.assertIn(
+            "chgrp wheel /run/tailscale",
+            nix_code(REPO / "nix" / "tailscale.nix"),
+        )
