@@ -132,6 +132,11 @@ in
   };
 
   networking.hostName = "yolobox";
+  # nixos-lima turns NAT on, and nixpkgs' nat module turns IPv4 forwarding on
+  # with it. Nothing here routes for others: rootless podman uses pasta and
+  # tailscale is only a client. Forwarding would let the host side route
+  # through the guest into the tailnet.
+  networking.nat.enable = lib.mkForce false;
   users.mutableUsers = true;
   system.stateVersion = "25.11";
 

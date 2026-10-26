@@ -1,6 +1,6 @@
 # nix/base.nix: the stories behind its settings
 
-`nix/base.nix` carries the short reason beside each setting. This file keeps the incidents and the ways to recognise them. It covers the boot partition, debugger access, memory pressure and disk growth. Two accounts, locked passwords and the journal group are in [docs/accounts.md](../docs/accounts.md#two-accounts). The disk-full incidents are in [docs/disk.md](../docs/disk.md).
+`nix/base.nix` carries the short reason beside each setting. This file keeps the incidents and the ways to recognise them. It covers the boot partition, debugger access, memory pressure, disk growth and IP forwarding. Two accounts, locked passwords and the journal group are in [docs/accounts.md](../docs/accounts.md#two-accounts). The disk-full incidents are in [docs/disk.md](../docs/disk.md).
 
 ## The ESP holds one kernel
 
@@ -45,3 +45,7 @@ Two changes address the two halves. `swapDevices` in `nix/base.nix` declares a 1
 Raising the ceiling takes three steps, and each one does a different thing. The host step is `limactl edit yolobox --disk <GiB>`, grow-only, with the instance stopped. The partition step is `boot.growPartition = true` in `nix/base.nix`: a `growpart` unit that grows the partition, vda2, to fill the disk on every boot. Its `SuccessExitStatus = "0 1"` makes an already-grown boot a harmless no-op. Its stock script derives the partition from `readlink -f` of `fileSystems."/".device`, which is `/dev/dm-0` now that the root is a mapper device, so `nix/luks.nix` replaces the script with `growpart /dev/vda 2`. The last step is the LUKS mapping and the filesystem on it, and `yo disk-grow` runs it with the passphrase only `yo` holds: `cryptsetup resize --key-file - root`, then `resize2fs /dev/mapper/root`, after the VM is back up. `fileSystems."/".autoResize` is off because it renders `x-systemd.growfs`, and `systemd-growfs` cannot resize a keyring-keyed LUKS2 mapping. The whole design is in [docs/disk-encryption.md](../docs/disk-encryption.md#growing-an-encrypted-disk).
 
 Skipping the partition step is silent. The backing file grows, the guest boots clean, `df` is unchanged, and nothing logs. `systemctl show -p LoadState --value growpart` must answer `loaded`; `not-found` means the running generation cannot grow anything. `growpart` only runs on a boot whose generation carries the option, so the switch must land before the resize. `yo disk-grow` checks this before touching anything. The partition step was missing for a while, because vda2 only reached 99.7G thanks to nixos-lima's own image config growing it at first boot, before our config took over.
+
+## NAT and IP forwarding
+
+nixos-lima's `lima-init.nix` sets `networking.nat.enable = true`, and nixpkgs' nat module turns that into `net.ipv4.ip_forward=1`. That makes the guest a router, so a packet from the host side could cross the guest into the tailnet. `nix/base.nix` turns NAT off with `mkForce`. Nothing in the box routes for others: rootless podman uses pasta, and tailscale runs only as a client, so no feature needs forwarding. The check is `yo ssh sysctl -n net.ipv4.ip_forward`, which must print `0`.
