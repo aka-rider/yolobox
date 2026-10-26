@@ -99,8 +99,31 @@ jobs:
       # each against the runner's kernel without changing any rules.
       - name: Check the egress rules parse
         run: |
+          sudo apt-get update
           sudo apt-get install --yes nftables
           for rules in egressRules egressRecoveryRules; do
             file="$(nix eval --impure --raw ".#nixosConfigurations.yolobox.config.system.build.$rules")"
             sudo nft --check --file "$file"
+          done
+
+      # lanAllow goes into the rule files as text, so a bad entry must fail the
+      # evaluation: nft would reject it at load and drop the box into recovery
+      # mode. The assertions run on a configuration extended with one entry.
+      - name: Check lanAllow rejects what nft would reject
+        run: |
+          check() {
+            nix eval --impure --raw --expr "
+              let
+                box = (builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
+                  modules = [ { yolobox.network.lanAllow = [ \"$1\" ]; } ];
+                };
+              in
+              if builtins.all (a: a.assertion) box.config.assertions then \"accepted\" else \"rejected\"
+            "
+          }
+          for entry in 300.1.1.1/8 10.0.0.0/33 lizard fd00::/129 ::::/64 010.0.0.0/8; do
+            test "$(check "$entry")" = rejected || { echo "not rejected: $entry"; exit 1; }
+          done
+          for entry in 192.168.1.20/32 fd00:1::/64; do
+            test "$(check "$entry")" = accepted || { echo "not accepted: $entry"; exit 1; }
           done

@@ -684,9 +684,13 @@ class TestEgressTableClosesTheHost(unittest.TestCase):
         "169.254.0.0/16",
         "172.16.0.0/12",
         "192.168.0.0/16",
+        "198.18.0.0/15",
         "224.0.0.0/4",
         "255.255.255.255",
     }
+    DHCP = (
+        "udp sport 68 udp dport 67 ip daddr { 255.255.255.255, ${limaGateway} } accept"
+    )
     BLOCKED_V6 = {"fc00::/7", "fe80::/10", "ff00::/8"}
 
     def binding(self, name):
@@ -736,13 +740,22 @@ class TestEgressTableClosesTheHost(unittest.TestCase):
             rules,
         )
 
-    def test_the_gateway_is_reachable_for_dns_and_nothing_else(self):
+    def test_dhcp_goes_to_the_broadcast_and_the_gateway_only(self):
+        # The agent may bind port 68, so a DHCP rule without a destination would
+        # let it send UDP to port 67 of the host or the LAN.
+        for name in ("ruleFile", "recoveryFile"):
+            with self.subTest(file=name):
+                dhcp = [r for r in self.rules(name) if "dport 67" in r]
+                self.assertEqual(dhcp, [self.DHCP])
+
+    def test_the_gateway_is_reachable_for_dns_and_dhcp_and_nothing_else(self):
         gateway = self.binding("limaGateway")
         self.assertEqual(self.CODE.count(gateway), 1, "the gateway is spelled once")
         about_gateway = [r for r in self.rules("ruleFile") if "${limaGateway}" in r]
         self.assertCountEqual(
             about_gateway,
             [
+                self.DHCP,
                 "ip daddr ${limaGateway} udp dport 53 accept",
                 "ip daddr ${limaGateway} tcp dport 53 accept",
             ],
@@ -786,7 +799,7 @@ class TestEgressTableClosesTheHost(unittest.TestCase):
             [
                 'oifname "lo" accept',
                 "ct direction reply accept",
-                "udp sport 68 udp dport 67 accept",
+                self.DHCP,
                 "icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept",
             ],
         )

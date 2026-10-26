@@ -12,8 +12,9 @@ let
 
   # Everything on the host or a private network the guest can address: RFC1918,
   # the Lima subnet inside it, CGNAT (tailscale0 is accepted before this is
-  # judged), link-local, multicast and the limited broadcast.
-  blockedV4 = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255";
+  # judged), link-local, the benchmarking range 198.18.0.0/15 (a fake-IP proxy
+  # on the host answers there), multicast and the limited broadcast.
+  blockedV4 = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 255.255.255.255";
   blockedV6 = "fc00::/7, fe80::/10, ff00::/8";
 
   # Runs after every rerouting hook (mangle -150, dstnat -100), so the oif
@@ -24,10 +25,32 @@ let
 
   logRate = "6/minute burst 3 packets";
 
-  v4Re = "[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}";
-  v6Re = "[0-9a-fA-F:]+/[0-9]{1,3}";
-  isV4 = entry: builtins.match v4Re entry != null;
-  isV6 = entry: builtins.match v6Re entry != null;
+  # lanAllow entries are checked here, so a typo fails the evaluation and never
+  # reaches nft, where it would drop the box into recovery mode. No leading
+  # zeros: inet_pton rejects them.
+  cidrSplit = entry: builtins.match "([^/]+)/(0|[1-9][0-9]{0,2})" entry;
+  octet = "(0|[1-9][0-9]{0,2})";
+  v4Octets = addr: builtins.match "${octet}\\.${octet}\\.${octet}\\.${octet}" addr;
+  v6Groups = part: if part == "" then [ ] else lib.splitString ":" part;
+  isV4Addr = addr:
+    let octets = v4Octets addr;
+    in octets != null && lib.all (o: builtins.fromJSON o <= 255) octets;
+  # "::" stands for one or more zero groups, so a compressed address has at
+  # most 7 written groups and an uncompressed one exactly 8.
+  isV6Addr = addr:
+    let
+      parts = map v6Groups (lib.splitString "::" addr);
+      groups = lib.concatLists parts;
+    in
+    lib.all (g: builtins.match "[0-9a-fA-F]{1,4}" g != null) groups
+    && (if lib.length parts == 1 then lib.length groups == 8
+        else lib.length parts == 2 && lib.length groups <= 7);
+  isCidr = isAddr: maxPrefix: entry:
+    let split = cidrSplit entry;
+    in split != null && isAddr (lib.elemAt split 0)
+    && builtins.fromJSON (lib.elemAt split 1) <= maxPrefix;
+  isV4 = isCidr isV4Addr 32;
+  isV6 = isCidr isV6Addr 128;
   lanV4 = builtins.filter isV4 cfg.lanAllow;
   lanV6 = builtins.filter isV6 cfg.lanAllow;
   notCidr = builtins.filter (entry: !(isV4 entry || isV6 entry)) cfg.lanAllow;
@@ -50,7 +73,7 @@ let
         type filter hook output priority ${hookPriority}; policy accept;
         oifname { "lo", "${tailnetIface}" } accept
         ct direction reply accept
-        udp sport 68 udp dport 67 accept
+        udp sport 68 udp dport 67 ip daddr { 255.255.255.255, ${limaGateway} } accept
         ip daddr ${limaGateway} udp dport 53 accept
         ip daddr ${limaGateway} tcp dport 53 accept
         ${lanRules}
@@ -76,7 +99,7 @@ let
         type filter hook output priority ${hookPriority}; policy accept;
         oifname "lo" accept
         ct direction reply accept
-        udp sport 68 udp dport 67 accept
+        udp sport 68 udp dport 67 ip daddr { 255.255.255.255, ${limaGateway} } accept
         icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
         limit rate ${logRate} log prefix "yolobox-egress: recovery: " level warn
         counter reject with icmpx type admin-prohibited
@@ -88,10 +111,11 @@ in
   options.yolobox.network.lanAllow = lib.mkOption {
     type = lib.types.listOf lib.types.str;
     default = [ ];
-    example = [ "192.168.1.0/24" ];
+    example = [ "192.168.1.20/32" ];
     description = ''
       Private networks the guest may reach, e.g. a LAN package cache. Empty:
-      no LAN, no host.
+      no LAN, no host. Name single addresses where you can: a network that
+      holds the host's own LAN address lets the guest reach the host.
     '';
   };
 
