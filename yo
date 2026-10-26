@@ -1990,6 +1990,16 @@ def tailscale_status_line(stdout: str, stderr: str) -> str:
     serve = serve_state.strip() or "unknown"
     if backend == "Running" and serve == "active":
         return "tailscale: Running, serve active"
+    if backend == "NeedsLogin":
+        return (
+            "tailscale: not logged in (optional) — to join a tailnet: "
+            "yo ssh sudo tailscale up, then: " + TAILSCALE_SERVE_RESTART
+        )
+    if backend == "NeedsMachineAuth":
+        return (
+            "tailscale: awaiting approval in the tailnet admin console (optional)"
+            " — then: " + TAILSCALE_SERVE_RESTART
+        )
     remedy = TAILSCALE_SERVE_RESTART
     if backend != "Running":
         remedy = "yo ssh sudo tailscale up, then: " + remedy

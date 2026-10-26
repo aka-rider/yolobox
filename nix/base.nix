@@ -224,8 +224,8 @@ in
 
   services.openssh.enable = true;
   # Lima's hostagent waits for, and forwards to, TCP 22 on 192.168.5.15
-  # (enp0s1, lima's NAT network, unreachable from the LAN), so 22 is open there
-  # and on tailscale0 (nix/tailscale.nix) and nowhere else.
+  # (enp0s1, lima's NAT network, unreachable from the LAN), so 22 is the only
+  # port open there. tailscale0 is trusted whole (nix/tailscale.nix).
   services.openssh.openFirewall = false;
   networking.firewall.interfaces.enp0s1.allowedTCPPorts = [ 22 ];
   services.openssh.settings = {

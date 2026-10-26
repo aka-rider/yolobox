@@ -2,18 +2,15 @@
 let
   tailscale = config.services.tailscale.package;
 
-  # `tailscale wait` gives up after this long; the unit's own timeout leaves
-  # room for the failure message to be printed before systemd kills it.
+  # `tailscale wait` gives up after this long. The serve unit is Type=exec, so
+  # nothing else bounds it and boot never waits on it.
   readySeconds = 60;
-  unitSeconds = readySeconds + 30;
 in
 {
-  # tailscale0 is governed by nixos-fw (see --netfilter-mode=off below), so
-  # this per-interface list is the whole of what the tailnet can reach in the
-  # kernel's filter: sshd. t3 does not need a rule, tailscale serve terminates
-  # it in tailscaled's own netstack. base.nix opens 22 on enp0s1 for lima's
-  # hostagent, and this opens it for the tailnet.
-  networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 22 ];
+  # Every port, UDP and IPv6 included, is open to the tailnet; the tailnet ACL
+  # is the access control. base.nix opens only 22 on enp0s1, for lima's
+  # hostagent.
+  networking.firewall.trustedInterfaces = [ "tailscale0" ];
 
   services.tailscale = {
     enable = true;
@@ -22,12 +19,8 @@ in
     # them no Tailscale support for this node.
     disableUpstreamLogging = true;
     # --ssh=false: tailscaled must not run its own ssh server on the tailnet.
-    # --netfilter-mode=off: tailscaled installs no iptables rules. Its default
-    # puts "-A INPUT -j ts-input" ahead of nixos-fw, and ts-input accepts
-    # everything from tailscale0, so every port the agent binds on 0.0.0.0
-    # would be reachable from the tailnet. With it off, nixos-fw governs
-    # tailscale0 like any interface; tailscale serve is handled in tailscaled's
-    # own netstack and does not need the kernel filter.
+    # --netfilter-mode=off: nixos-fw owns the rules; tailscaled must not insert
+    # its own (its default puts "-A INPUT -j ts-input" ahead of nixos-fw).
     # --accept-dns=false: MagicDNS must not take over the guest's resolver.
     extraSetFlags = [ "--accept-dns=false" "--ssh=false" "--netfilter-mode=off" "--hostname=${config.networking.hostName}" ];
   };
@@ -52,15 +45,17 @@ in
     after = [ "tailscaled.service" "tailscaled-set.service" ];
     requires = [ "tailscaled.service" ];
     wantedBy = [ "multi-user.target" ];
+    # Type=exec: multi-user.target does not wait on this unit, so a node that
+    # never logs in delays no boot.
     serviceConfig = {
-      Type = "oneshot";
+      Type = "exec";
       RemainAfterExit = true;
-      TimeoutStartSec = "${toString unitSeconds}s";
     };
     # tailscaled starts before it has loaded its state (BackendState NoState),
     # so block until the backend is Running with an IP. A node that is not
-    # logged in never gets there and fails at the timeout; so does a broken
-    # tailscaled, which is why the message names the state it ended in.
+    # logged in never gets there: that is a choice, so the unit prints the
+    # remedy and exits 0. A broken tailscaled fails at the timeout, which is
+    # why the message names the state it ended in.
     script = ''
       if ! ${tailscale}/bin/tailscale wait --timeout=${toString readySeconds}s; then
         state=unreadable
@@ -72,16 +67,18 @@ in
           NeedsLogin)
             echo "Run: yo ssh sudo tailscale up" >&2
             echo "Then: yo ssh sudo systemctl restart yolobox-tailscale-serve" >&2
+            exit 0
             ;;
           NeedsMachineAuth)
             echo "The node needs approval in the tailnet admin console." >&2
             echo "Then: yo ssh sudo systemctl restart yolobox-tailscale-serve" >&2
+            exit 0
             ;;
           *)
             echo "Run: yo ssh journalctl -u tailscaled" >&2
+            exit 1
             ;;
         esac
-        exit 1
       fi
       ${tailscale}/bin/tailscale serve reset
       exec ${tailscale}/bin/tailscale serve --bg --http=3773 http://127.0.0.1:3773

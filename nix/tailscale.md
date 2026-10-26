@@ -1,18 +1,31 @@
 # Tailscale
 
-The code is `nix/tailscale.nix`, which puts the box on a tailnet so t3 (see [t3code](t3.md)) is reachable from outside the Mac's own LAN, and, on a box that opted in to the [kill switch](killswitch.md), selects the exit node it leaves as the box's only way out. It opens no port for t3 in the NixOS firewall. The comments in that file give the short reason for each setting. This file holds the evidence and how to recognise each failure.
+The code is `nix/tailscale.nix`, which puts the box on a tailnet so that its services, t3 (see [t3code](t3.md)) among them, are reachable from outside the Mac's own LAN. Tailscale is optional: a box that never runs `tailscale up` works as before, and nothing in boot waits for a login. The comments in that file give the short reason for each setting. This file holds the evidence and how to recognise each failure.
 
 ## Firewall
 
-`nixos-fw` governs `tailscale0`, and it opens exactly two things there: TCP 22, and the tunnel's UDP 41641 through `services.tailscale.openFirewall = true`. Every other port, 3773 included, is closed to the tailnet in the kernel's filter. What reaches t3 is `tailscale serve --bg --http=3773 http://127.0.0.1:3773`, run at boot by the `yolobox-tailscale-serve` oneshot. Serve is tailscaled's own reverse proxy. It terminates on the tailnet interface inside tailscaled's netstack and forwards to the loopback port, so the request never crosses `tailscale0` in the kernel's filter and needs no rule. The unit runs `tailscale serve reset` first, so it owns the whole serve config. An entry left under an earlier tailnet name, say from a login made with a hand-typed `--hostname`, is dropped instead of served forever beside the current one.
+`tailscale0` is a trusted interface (`networking.firewall.trustedInterfaces = [ "tailscale0" ]`), so `nixos-fw` accepts everything that arrives on it. The tailnet ACL, not the box, decides who gets in. This replaces the rule of commit `80f8327`, "keep tailnet to sshd only", which opened TCP 22 on `tailscale0` and nothing else. That rule is how the change was found: a service the agent started on `<tailnet-ip>:5137` could not be reached from the Mac over the tailnet, because `nixos-fw` dropped every port but 22 on `tailscale0`. The decision is the operator's: reaching the box's services over the tailnet with no further setup is worth more than a second filter behind the ACL.
 
-That list is only true because of `--netfilter-mode=off` in `extraSetFlags`. By default tailscaled installs its own `ts-input` chain. The live `iptables -S` showed `-A INPUT -j ts-input` before `-A INPUT -j nixos-fw`, with `-A ts-input -i tailscale0 -j ACCEPT` inside it. Every packet from the tailnet was accepted before `nixos-fw` was consulted, so every port the agent bound on `0.0.0.0` was reachable from any tailnet peer, and "`nixos-fw` governs `tailscale0`" was false. With netfilter mode off, tailscaled adds no rules and `nixos-fw` governs `tailscale0` like any other interface. `tailscale serve` is unaffected. The tempting alternative, `iptables -I INPUT 1`, is wrong because tailscaled re-inserts its jump at the top of `INPUT` whenever it restarts. Netfilter mode off also drops tailscaled's anti-spoofing rule for 100.64/10, which the `ts-input` chain used to carry.
+What trusting the interface opens, all of it to whatever the ACL admits:
 
-Recognise a regression with `sudo iptables -S INPUT | head -3`, which must show no `ts-input` jump.
+- every TCP port the agent binds on a wildcard or tailnet address, not only 22 and 3773;
+- UDP, which the old rule never admitted except the tunnel's own 41641;
+- IPv6 arriving on `tailscale0`;
+- tailscaled's peerAPI listeners on the tailnet addresses.
+
+Other nodes the ACL admits, such as other yolobox VMs, each running their own agents, reach all of it. Tighten the ACL, not the box, to narrow that.
+
+The enp0s1 side is unchanged: `nixos-fw` opens only TCP 22 there (see [sshd on two interfaces](#sshd-on-two-interfaces)), and the tunnel's UDP 41641 stays open through `services.tailscale.openFirewall = true`.
+
+t3 is still served by `tailscale serve --bg --http=3773 http://127.0.0.1:3773`, run at boot by the `yolobox-tailscale-serve` unit. Serve is tailscaled's own reverse proxy. It terminates on the tailnet interface inside tailscaled's netstack and forwards to the loopback port. The unit runs `tailscale serve reset` first, so it owns the whole serve config. An entry left under an earlier tailnet name, say from a login made with a hand-typed `--hostname`, is dropped instead of served forever beside the current one.
+
+`--netfilter-mode=off` in `extraSetFlags` stays, so that `nixos-fw` is the only thing that writes rules. By default tailscaled installs its own `ts-input` chain. The live `iptables -S` showed `-A INPUT -j ts-input` before `-A INPUT -j nixos-fw`, with `-A ts-input -i tailscale0 -j ACCEPT` inside it. That accept happened to match the trust given now, but it re-inserts its jump at the top of `INPUT` whenever tailscaled restarts, which is why `iptables -I INPUT 1` was never a fix for anything here, and it would keep a rule outside the declarative firewall. Netfilter mode off also drops tailscaled's anti-spoofing rule for 100.64/10, which the `ts-input` chain used to carry.
+
+Recognise the setup with `sudo iptables -S INPUT | head -3`, which must show no `ts-input` jump, and `sudo nft list ruleset | grep 'iifname "tailscale0"'`, which must show a counter and a `jump nixos-fw-accept`.
 
 ## sshd on two interfaces
 
-`nix/base.nix` sets `services.openssh.openFirewall = false`, so NixOS opens no port for sshd by default. Port 22 is opened per interface on exactly two: `tailscale0` (in `nix/tailscale.nix`, by key only, see [Two accounts](../docs/accounts.md#two-accounts)) and `enp0s1` (in `nix/base.nix`). `enp0s1` is lima's NAT network, 192.168.5.15. The gateway 192.168.5.2 is the Mac, and nothing on the LAN can reach that subnet. The per-interface list is declarative and works on the iptables and nftables backends alike. An earlier approach, an `ip46tables ... -j DROP` in `extraCommands` plus an assertion against nftables, did not.
+`nix/base.nix` sets `services.openssh.openFirewall = false`, so NixOS opens no port for sshd by default. sshd is reachable on exactly two interfaces: `tailscale0`, which is trusted whole (see [Firewall](#firewall); sshd takes keys only, see [Two accounts](../docs/accounts.md#two-accounts)), and `enp0s1`, where `nix/base.nix` opens port 22 and nothing else. `enp0s1` is lima's NAT network, 192.168.5.15. The gateway 192.168.5.2 is the Mac, and nothing on the LAN can reach that subnet. The per-interface list is declarative and works on the iptables and nftables backends alike. An earlier approach, an `ip46tables ... -j DROP` in `extraCommands` plus an assertion against nftables, did not.
 
 The `enp0s1` rule exists because lima's hostagent can reach the guest's sshd over TCP on that address. Its readiness wait polls 192.168.5.15:22 before `limactl start` reports the instance up, and its usernet forwarder dials the same address. Under limactl 2.2.1 the hostagent takes one of two paths at start.
 
@@ -29,7 +42,7 @@ tailscaled's own ssh server, which `tailscale up --ssh` would start, authorises 
 
 Checks in the VM:
 
-- `sudo iptables -S nixos-fw | grep 'dport 22'` must show exactly two accepts, one with `-i enp0s1` and one with `-i tailscale0`.
+- `sudo iptables -S nixos-fw | grep 'dport 22'` must show exactly one accept, with `-i enp0s1`. The tailnet needs none, because `tailscale0` jumps to `nixos-fw-accept` before the port rules.
 - `ss -a --vsock | grep ':22'` shows `v_str LISTEN *:22` whenever ssh rides vsock. The operator's sessions then appear as `ESTAB 3:22 <-> 2:*` (CID 2 is the host), and `ss -tan` shows no established connection on port 22 during a `yo ssh`. The Mac's `127.0.0.1:60022` (`ssh.localPort`) is the hostagent's listener on the Mac side.
 
 Checks from a tailnet device: `ssh <user>@yolobox.<tailnet>.ts.net` must reach sshd and offer keys, and a password prompt is a bug. `curl http://yolobox.<tailnet>.ts.net:3773` must work. The tailnet ACLs for the node are not reviewed (see `TODO.md`).
@@ -44,21 +57,18 @@ A changed `extraSetFlags` has to reach the running box on `switch`, and for a wh
 
 `--accept-dns=false` stops MagicDNS from taking over `/etc/resolv.conf`. At tailscale's default the guest's DNS would answer through the tailnet's resolver for every name, not only `*.ts.net`. That would silently change what every other process in the box resolves, including the Mac's own DNS filter that the AWS setup relies on staying in place (see [The DNS sinkhole](../docs/mac-network.md#the-dns-sinkhole)). The box's own name is still reachable as `yolobox.<tailnet>.ts.net`, because MagicDNS runs on the client end of a tailnet connection, never in this guest's resolver.
 
-On a box that opted in to the [kill switch](killswitch.md) the guest's resolver is `networking.nameservers`, set per box (see [DNS](killswitch.md#dns)), and there is a second reason for the flag: with MagicDNS enabled, tailscaled would forward the queries it cannot answer to upstream resolvers from its own sockets, and those carry the `0x80000` mark the kill switch lets out of the Lima interface. DNS would then leave the box directly, which is exactly what the kill switch exists to prevent.
-
 `disableUpstreamLogging = true` sets `TS_NO_LOGS_NO_SUPPORT=true` on tailscaled. The node uploads no logs to log.tailscale.com, and for the same reason Tailscale support will not help with this node. It is working when `yo ssh journalctl -u tailscaled -b` shows `You have disabled logging`. It takes effect on the next switch, because the variable sits in the unit's environment and a changed unit makes the switch restart tailscaled.
 
 ## Relayed contacts in the log
 
 `journalctl -u tailscaled` shows `magicsock: new contact: peer=[+1OFL] usec=... cached=false via=derp` over and over, every few seconds for as long as a burst lasts. The line is not an error and not a reconnect. In tailscale v1.104.1 (`wgengine/magicsock/magicsock.go`) it is logged each time a peer's disco call-me-maybe arrives over DERP while the box holds no direct path to that peer (`if !lastBest.ap.IsValid()`). A peer that wants a direct path with us sends one every few seconds until its pings are answered, so the line repeats exactly as long as the path stays relayed. The direct twin, `via=direct`, is logged once when a direct path is first adopted.
 
-The peer in the short form `[+1OFL]` is the first five characters of the base64 of its node key, while `tailscale status --json` prints the key as hex. Convert before matching: `python3 -c 'import base64,sys; print(base64.b64encode(bytes.fromhex(sys.argv[1])).decode()[:5])' <hex after "nodekey:">`. On the box where this was written the peer varied: two other nodes during the first hours, then the exit node itself.
+The peer in the short form `[+1OFL]` is the first five characters of the base64 of its node key, while `tailscale status --json` prints the key as hex. Convert before matching: `python3 -c 'import base64,sys; print(base64.b64encode(bytes.fromhex(sys.argv[1])).decode()[:5])' <hex after "nodekey:">`. On the box where this was written the peer varied: two other nodes during the first hours.
 
 Measured on a live box: 706 such lines in 3.7 hours (about three a minute), roughly 100 bytes each. That is about 0.04 percent of the journal's size. The 2.8 GiB journal is container output (see TODO.md), so the line is noise in `journalctl -u tailscaled` and not a disk problem. Rules out, in turn:
 
 - The Mac's own Tailscale node as the peer: it appeared twice in the whole boot.
 - The UDP 41641 collision in [lima/yolobox.md](../lima/yolobox.md#guest-udp-is-never-mirrored): that is lima's mirror on the Mac's loopback, which no packet of tailscaled's takes.
-- The kill switch: the marked-packet accept counter rises, the final reject counter stayed at 6 packets, and `journalctl -k` showed no `yolobox-killswitch` line in three hours.
 
 What decides whether a direct path exists is outside this repo. The box reaches the internet through lima's NAT on the Mac, so a peer can use only addresses the Mac's network lets through. One cause was found and it is on the Mac: a VPN that disconnects leaves lima's UDP flows bound to the VPN's vanished address, tailscaled's UDP then goes nowhere, and netcheck logs `UDP is blocked, trying HTTPS` every 25 seconds. That is described in [docs/mac-network.md](../docs/mac-network.md#a-vpn-that-disconnects-leaves-udp-flows-stuck). Clearing it needs a host agent restart on the Mac, so no setting in the guest could.
 
@@ -72,17 +82,15 @@ Login is interactive and happens once, by the operator, because no auth key exis
 
 State from the login, the node key and the tailnet identity, persists under `/var/lib/tailscale`. Like everything else under [Two accounts](../docs/accounts.md#two-accounts), it is VM-local. Recreating the VM loses it, and the new box logs in again the same way.
 
-## Exit node
-
-`yolobox.network.exitNode` (declared in `nix/killswitch.nix`) names the tailnet node all egress goes through. It is null by default, and the box then has no exit-node unit and none of the kill switch. When it is set, `yolobox-tailscale-exit-node` runs `tailscale set --exit-node=<node> --exit-node-allow-lan-access` after tailscaled is `Running`. It uses the same wait and failure messages as the serve unit, from the shared `waitForRunning` script and the shared oneshot settings in `tailscale.nix`. The kill switch is what makes the choice binding, and why the flag is needed is in [The exit node](killswitch.md#the-exit-node).
-
 ## Serve readiness
 
-A box that has never logged in, or whose login has expired, makes `yolobox-tailscale-serve` fail instead of quietly serving nothing or retrying forever. The unit runs `tailscale wait --timeout=60s`, which blocks until the backend is `Running` with a Tailscale IP, and only then serves (`TimeoutStartSec=90s`). The comments in the script give the remedy per state.
+A box that has never logged in, or whose login has expired, is a normal state: Tailscale is optional. So `yolobox-tailscale-serve` is `Type=exec` with `RemainAfterExit`, and `multi-user.target` does not wait on it. It runs `tailscale wait --timeout=60s`, which blocks until the backend is `Running` with a Tailscale IP, and only then serves. Nothing else bounds the unit, so there is no `TimeoutStartSec`; the wait bounds the script. The comments in the script give the remedy per state.
 
-The wait exists because tailscaled counts as "started" before it has loaded its state. On the first boot of the 2026-10-01 generation the oneshot ran 13 ms after start and saw `BackendState` `NoState` on a node that was in fact logged in. It failed and left `systemctl is-system-running` at `degraded` until someone restarted it by hand. A node that is not logged in never reaches `Running`, so `wait` times out after 60 s and the unit fails with "tailscale did not reach Running within 60s (state: X)". X is the `BackendState` the script reads (`tailscale status --json | jq -r .BackendState`, or `unreadable` when that fails) for that message only. It is never the readiness test, and there is no sleep loop chasing a state that a `tailscale up` run once was always going to settle.
+The wait exists because tailscaled counts as "started" before it has loaded its state. On the first boot of the 2026-10-01 generation the oneshot ran 13 ms after start and saw `BackendState` `NoState` on a node that was in fact logged in. It failed and left `systemctl is-system-running` at `degraded` until someone restarted it by hand. A node that is not logged in never reaches `Running`, so `wait` times out after 60 s. The script then reads the `BackendState` (`tailscale status --json | jq -r .BackendState`, or `unreadable` when that fails) for its message only. It is never the readiness test, and there is no sleep loop chasing a state that a `tailscale up` run once was always going to settle. `NeedsLogin` and `NeedsMachineAuth` print their remedy and exit 0, so the unit stays `active (exited)` and the boot stays `running`. Any other state, a broken tailscaled for one, prints "tailscale did not reach Running within 60s (state: X)" and exits 1, which leaves the unit `failed`.
 
-`yo status` shows the same pair, `BackendState` and the serve unit's state, on its `tailscale:` line, so an expired login is visible from the Mac. t3 itself never depends on any of this. It keeps listening on loopback whether or not the tailnet is up, so t3 reached from inside the VM or through lima's Mac-side forward is unaffected by a login that has not happened yet.
+Because the unit is `Type=exec`, `systemctl restart yolobox-tailscale-serve` returns at once, before the wait is over. After `tailscale up`, check the result with `yo status` or `yo ssh journalctl -u yolobox-tailscale-serve`.
+
+`yo status` shows the same pair, `BackendState` and the serve unit's state, on its `tailscale:` line. A node that is not logged in or awaits approval is reported as optional, with the commands to join a tailnet; any other state that is not `Running` is a WARNING. t3 itself never depends on any of this. It keeps listening on loopback whether or not the tailnet is up, so t3 reached from inside the VM or through lima's Mac-side forward is unaffected by a login that has not happened yet.
 
 ## Box-local routes
 

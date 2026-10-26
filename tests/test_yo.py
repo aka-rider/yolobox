@@ -2146,9 +2146,26 @@ class TestTailscaleStatusLine(unittest.TestCase):
         line = yo.tailscale_status_line(self.probe("Running", "active"), "")
         self.assertEqual(line, "tailscale: Running, serve active")
 
-    def test_not_logged_in_names_login_and_serve_restart(self):
-        line = yo.tailscale_status_line(self.probe("NeedsLogin", "failed"), "")
-        self.assertIn("WARNING NeedsLogin, serve failed", line)
+    def test_not_logged_in_is_optional_and_names_login_then_serve_restart(self):
+        line = yo.tailscale_status_line(self.probe("NeedsLogin", "active"), "")
+        self.assertEqual(
+            line,
+            "tailscale: not logged in (optional) — to join a tailnet: "
+            "yo ssh sudo tailscale up, then: "
+            "yo ssh sudo systemctl restart yolobox-tailscale-serve",
+        )
+
+    def test_awaiting_approval_is_optional_and_names_serve_restart(self):
+        line = yo.tailscale_status_line(self.probe("NeedsMachineAuth", "active"), "")
+        self.assertEqual(
+            line,
+            "tailscale: awaiting approval in the tailnet admin console (optional)"
+            " — then: yo ssh sudo systemctl restart yolobox-tailscale-serve",
+        )
+
+    def test_a_stopped_backend_is_still_a_warning(self):
+        line = yo.tailscale_status_line(self.probe("Stopped", "failed"), "")
+        self.assertIn("WARNING Stopped, serve failed", line)
         self.assertIn("yo ssh sudo tailscale up", line)
         self.assertIn("yo ssh sudo systemctl restart yolobox-tailscale-serve", line)
 
