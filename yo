@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""yo — thin Mac-side CLI for the NixOS-VM yolobox (lima/vz).
+"""yo — thin host-side CLI for the NixOS-VM yolobox (lima/vz).
 
 Run `yo --help` for the command reference.
 """
@@ -950,7 +950,7 @@ def resolve_guest_operand(operand: str, cwd_mirror: Optional[str]) -> str:
         return guest_path(spelling, CP_GUEST_ROOTS)
     if cwd_mirror is None:
         raise YoError(
-            'guest path "%s" is relative, and the Mac cwd is outside $HOME; '
+            'guest path "%s" is relative, and the host cwd is outside $HOME; '
             'spell it as ":~/..." instead' % operand
         )
     if spelling == "":
@@ -973,7 +973,7 @@ def resolve_cp_operands(operands: List[str], cwd_mirror: Optional[str]) -> CpPla
     dest_is_guest = operand_is_guest(dest)
     if len(set(source_guest_flags)) > 1:
         raise YoError(
-            "sources are split between the Mac and the guest; every source must be on one side"
+            "sources are split between the host and the guest; every source must be on one side"
         )
     sources_are_guest = source_guest_flags[0]
     if sources_are_guest and dest_is_guest:
@@ -1296,7 +1296,7 @@ def broker_needs_restart(
 
 def ensure_aws_broker() -> bool:
     if shutil.which("aws") is None:
-        err("yo: 'aws' is not on this Mac's PATH — no AWS credentials broker started")
+        err("yo: 'aws' is not on this host's PATH — no AWS credentials broker started")
         disable_aws_broker()
         return False
     allowed = aws_allowlist()
@@ -1339,7 +1339,7 @@ def ensure_herdr_machine() -> None:
     herdr = shutil.which("herdr")
     if herdr is None:
         err(
-            "yo: herdr not found on this Mac's PATH — skipping herdr machine registration"
+            "yo: herdr not found on this host's PATH — skipping herdr machine registration"
         )
         return
     listing = run([herdr, "machine", "list", "--json"], check=True)
@@ -1630,7 +1630,7 @@ UNITS_MISSING_NOTE = "box predates the 1Password/AWS forwards; run `yo bootstrap
 IN_PLACE_ENCRYPTION_WARNING = (
     "yo: the next boot encrypts %s in place. The box is unusable until it finishes "
     "(about ten to fifteen minutes at this disk's size; a fuller disk takes longer), "
-    "and the first minutes, an offline filesystem shrink, must not be interrupted: do not stop the VM or the Mac until yo up "
+    "and the first minutes, an offline filesystem shrink, must not be interrupted: do not stop the VM or the host until yo up "
     'reports "unlocked". yo gc --deep --yes first shrinks the work.' % LUKS_DEVICE
 )
 
@@ -2296,7 +2296,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     image_kib = du_kib(os.path.join(lima_dir(), "disk"))
     if image_kib is not None:
         out(
-            "disk: image ~/.lima/%s/disk allocates %dGiB on this Mac"
+            "disk: image ~/.lima/%s/disk allocates %dGiB on this host"
             % (INSTANCE, image_kib // 1024 // 1024)
         )
 
@@ -2342,7 +2342,8 @@ def cmd_status(args: argparse.Namespace) -> None:
                 health = aws_broker_health()
                 if health is None:
                     out(
-                        "aws: broker not reachable on this Mac's %s" % aws_broker_sock()
+                        "aws: broker not reachable on this host's %s"
+                        % aws_broker_sock()
                     )
                 elif pid is not None and checked_pid(health.get("watch_pid")) == pid:
                     out("aws: broker healthy (watching hostagent pid %s)" % pid)
@@ -2357,7 +2358,7 @@ def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
     if guest is None or host == "dev" or host == guest:
         return None
     return (
-        "yo: this Mac's yo is %s but the box was built by %s — rebuild it: yo bootstrap"
+        "yo: this host's yo is %s but the box was built by %s — rebuild it: yo bootstrap"
         % (host, guest)
     )
 
@@ -3034,7 +3035,7 @@ def cmd_aws_check(args: argparse.Namespace) -> None:
         raise YoError(UNITS_MISSING_NOTE)
     if not ensure_aws_broker():
         raise YoError(
-            "AWS is disabled on this Mac (no 'aws' CLI, or no SSO profiles in ~/.aws/config) — nothing to check"
+            "AWS is disabled on this host (no 'aws' CLI, or no SSO profiles in ~/.aws/config) — nothing to check"
         )
     if not heal_reverse_forward(aws_broker_forward()):
         raise YoError(
@@ -3069,7 +3070,7 @@ DIRECTORY_RESOLUTION_EPILOG = (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="yo",
-        description="yo — thin Mac-side CLI for the NixOS-VM yolobox (lima/vz).",
+        description="yo — thin host-side CLI for the NixOS-VM yolobox (lima/vz).",
         epilog=DIRECTORY_RESOLUTION_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         allow_abbrev=False,
@@ -3104,7 +3105,7 @@ def build_parser() -> argparse.ArgumentParser:
         "status",
         "Describe the VM.",
         "Describe the VM. Also reports disk usage on both sides and warns\n"
-        "when this Mac's yo version differs from the box's.",
+        "when this host's yo version differs from the box's.",
     )
     status.set_defaults(func=cmd_status)
 
@@ -3146,7 +3147,7 @@ def build_parser() -> argparse.ArgumentParser:
         "named, because the name alone does not prove it is build\n"
         "output. A removed .venv comes back with the project's own uv sync or\n"
         "devbox, and until then basedpyright has no environment for it. Run this\n"
-        "from the Mac; in-VM tools die first.",
+        "from the host; in-VM tools die first.",
     )
     gc.add_argument(
         "--deep", action="store_true", help="also reclaim per-project build output"
@@ -3193,14 +3194,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     cp = add(
         "cp",
-        "Copy files between the Mac and the agent account.",
-        "Copy files between the Mac and the VM's agent account, as scp. A guest\n"
+        "Copy files between the host and the agent account.",
+        "Copy files between the host and the VM's agent account, as scp. A guest\n"
         'path is any operand starting with ":": ":" alone is the guest twin of\n'
         'the current directory, ":rel/path" extends it, ":~" and ":~/x" are the\n'
         'guest home and a path under it, and ":/abs" is an absolute guest path\n'
         "(refused unless it is under the guest home or under /tmp, where agents'\n"
         "scratch output lives). Every source must be on\n"
-        "the Mac or every source must be in the guest, never mixed, and the\n"
+        "the host or every source must be in the guest, never mixed, and the\n"
         "destination must be on the other side.",
     )
     cp.add_argument("paths", nargs="+", metavar="path")
