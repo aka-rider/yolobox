@@ -667,10 +667,18 @@ class TestTailscaleSocketIsOperatorOnly(unittest.TestCase):
             nix_code(REPO / "nix" / "tailscale.nix"),
         )
 
-    def test_the_socket_directory_is_handed_to_wheel(self):
+    def test_the_socket_directory_is_handed_to_wheel_after_start(self):
+        # systemd re-applies root:root to the runtime directory for every command
+        # it spawns, so only ExecStartPost survives (the v1.7.0 regression).
         self.assertIn(
-            "chgrp wheel /run/tailscale",
+            'serviceConfig.ExecStartPost = [ "+${pkgs.coreutils}/bin/chgrp wheel /run/tailscale" ];',
             nix_code(REPO / "nix" / "tailscale.nix"),
+        )
+
+    def test_the_chgrp_is_not_in_exec_start_pre(self):
+        self.assertNotRegex(
+            nix_code(REPO / "nix" / "tailscale.nix"),
+            r"ExecStartPre[^\n]*chgrp",
         )
 
 

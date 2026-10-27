@@ -20,10 +20,12 @@
 
   # tailscaled makes its socket 0666 itself, so the directory mode is what keeps
   # the agent, which is not in wheel, off it. The operator is in wheel and keeps
-  # `tailscale status` working. The list merges with other modules' ExecStartPre.
-  # See nix/tailscale.md.
+  # `tailscale status` working. The chgrp must be ExecStartPost: systemd re-applies
+  # the unit's owner (root:root) to /run/tailscale for every command it spawns, so
+  # a chgrp in ExecStartPre is undone by the next gate and by ExecStart. A restart
+  # re-runs the whole sequence, ExecStartPost included. See nix/tailscale.md.
   systemd.services.tailscaled.serviceConfig.RuntimeDirectoryMode = "0750";
-  systemd.services.tailscaled.serviceConfig.ExecStartPre = [ "+${pkgs.coreutils}/bin/chgrp wheel /run/tailscale" ];
+  systemd.services.tailscaled.serviceConfig.ExecStartPost = [ "+${pkgs.coreutils}/bin/chgrp wheel /run/tailscale" ];
 
   # Its NAT-PMP, PCP and SSDP go only to the host and the LAN, which
   # nix/egress.nix rejects. Peers fall back to public endpoints, then DERP.
