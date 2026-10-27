@@ -85,3 +85,9 @@ Between the two loads, on a restart of the unit during a switch, the recovery ta
 - `journalctl -k | grep 'yolobox-egress: blocked:'` lists rejected packets, rate-limited to 6 a minute with a burst of 3.
 - `journalctl -k | grep 'yolobox-egress: recovery:'` lists the packets rejected in recovery mode.
 - `systemctl is-active yolobox-egress` prints `active` only when the full rules are loaded.
+
+## How the rules are tested
+
+The tests read the rendered rule files, not the Nix, because the rendered text is what the kernel runs. `tests/egress_rules.py` parses a file line by line and fails on the first missing property: the table and hook priority, the first rule, DHCP only to the broadcast and the gateway, DNS as the only other thing the gateway gets, every blocked range rejected after the accepts, and a recovery file that accepts only `lo`, replies, DHCP and neighbour discovery and then rejects. `tests/test_egress_rules.py` runs it on copies of the rendered files in `tests/fixtures/` and on broken variants of them that must fail.
+
+The host has no nix, so those copies are made in the guest: `nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRules` (and `egressRecoveryRules`) prints a store path, and the file at that path replaces `tests/fixtures/egress.nft` (and `egress-recovery.nft`). CI renders the same two files from the commit, runs the checker on them and diffs them against the copies, so a copy cannot drift from `egress.nix`. That job fails after any edit of the rules until the copies are refreshed. The unit's own properties (no `ExecStop`, `tailscaled` gated, `dhcpcd` not) are not in a rule file and stay source checks in `tests/test_consistency.py`.

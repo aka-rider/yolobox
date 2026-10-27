@@ -682,42 +682,12 @@ class TestTailscaleSocketIsOperatorOnly(unittest.TestCase):
         )
 
 
-class TestEgressTableClosesTheHost(unittest.TestCase):
-    """nix/egress.nix is the rule that keeps the guest off the host and the LAN."""
+class TestEgressUnitNeverOpensTheBox(unittest.TestCase):
+    """The unit that loads nix/egress.nix's rules. The rules themselves are
+    checked in their rendered form (tests/test_egress_rules.py); these are the
+    unit properties no rule file shows."""
 
     CODE = nix_code(REPO / "nix" / "egress.nix")
-    BLOCKED_V4 = {
-        "10.0.0.0/8",
-        "100.64.0.0/10",
-        "169.254.0.0/16",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "224.0.0.0/4",
-        "255.255.255.255",
-    }
-    DHCP = (
-        "udp sport 68 udp dport 67 ip daddr { 255.255.255.255, ${limaGateway} } accept"
-    )
-    BLOCKED_V6 = {"fc00::/7", "fe80::/10", "ff00::/8"}
-
-    def binding(self, name):
-        found = re.search(r'^\s*%s = "([^"]*)";$' % name, self.CODE, re.M)
-        self.assertIsNotNone(found, "egress.nix does not bind %s" % name)
-        return found.group(1)
-
-    def rule_file(self, name):
-        found = re.search(
-            r"%s = builtins\.toFile \"[^\"]+\" ''\n(.*?)\n  '';" % name,
-            self.CODE,
-            re.S,
-        )
-        self.assertIsNotNone(found, "egress.nix has no %s" % name)
-        return found.group(1)
-
-    def rules(self, name):
-        """The lines of the output chain, in order."""
-        chain = self.rule_file(name).split("policy accept;\n", 1)[1]
-        return [line.strip() for line in chain.splitlines()[:-2] if line.strip()]
 
     def service_block(self, name):
         found = re.search(
@@ -726,96 +696,14 @@ class TestEgressTableClosesTheHost(unittest.TestCase):
         self.assertIsNotNone(found, "egress.nix has no unit %s" % name)
         return found.group(1)
 
+    def test_the_unit_is_the_one_yo_inspects(self):
+        self.assertIn("systemd.services.%s = {" % yo.EGRESS_UNIT, self.CODE)
+
     def test_the_unit_has_no_stop_hook(self):
         # A stop hook would open the box whenever the unit stops or restarts.
         for hook in ("ExecStop", "preStop", "postStop"):
             with self.subTest(hook=hook):
                 self.assertNotIn(hook, self.CODE)
-
-    def test_the_reject_set_names_every_private_range(self):
-        self.assertEqual(set(self.binding("blockedV4").split(", ")), self.BLOCKED_V4)
-        self.assertEqual(set(self.binding("blockedV6").split(", ")), self.BLOCKED_V6)
-
-    def test_the_rule_file_rejects_exactly_the_blocked_sets(self):
-        rules = self.rules("ruleFile")
-        self.assertIn(
-            "ip daddr { ${blockedV4} } counter reject with icmpx type admin-prohibited",
-            rules,
-        )
-        self.assertIn(
-            "ip6 daddr { ${blockedV6} } counter reject with icmpx type admin-prohibited",
-            rules,
-        )
-
-    def test_dhcp_goes_to_the_broadcast_and_the_gateway_only(self):
-        # The agent may bind port 68, so a DHCP rule without a destination would
-        # let it send UDP to port 67 of the host or the LAN.
-        for name in ("ruleFile", "recoveryFile"):
-            with self.subTest(file=name):
-                dhcp = [r for r in self.rules(name) if "dport 67" in r]
-                self.assertEqual(dhcp, [self.DHCP])
-
-    def test_the_gateway_is_reachable_for_dns_and_dhcp_and_nothing_else(self):
-        gateway = self.binding("limaGateway")
-        self.assertEqual(self.CODE.count(gateway), 1, "the gateway is spelled once")
-        about_gateway = [r for r in self.rules("ruleFile") if "${limaGateway}" in r]
-        self.assertCountEqual(
-            about_gateway,
-            [
-                self.DHCP,
-                "ip daddr ${limaGateway} udp dport 53 accept",
-                "ip daddr ${limaGateway} tcp dport 53 accept",
-            ],
-        )
-
-    def test_the_way_out_over_lo_and_the_tailnet_is_the_first_rule(self):
-        self.assertEqual(
-            self.rules("ruleFile")[0],
-            'oifname { "lo", "${tailnetIface}" } accept',
-        )
-        self.assertEqual(self.binding("tailnetIface"), "tailscale0")
-
-    def test_the_hook_runs_strictly_before_a_kill_switch_at_minus_10(self):
-        self.assertEqual(self.binding("hookPriority"), "-20")
-        for name in ("ruleFile", "recoveryFile"):
-            with self.subTest(file=name):
-                self.assertIn(
-                    "type filter hook output priority ${hookPriority}; policy accept;",
-                    self.rule_file(name),
-                )
-
-    def test_every_copy_names_the_table_and_unit_yo_names(self):
-        self.assertEqual(self.binding("table"), yo.EGRESS_TABLE)
-        for name in ("ruleFile", "recoveryFile"):
-            with self.subTest(file=name):
-                head = [line.strip() for line in self.rule_file(name).splitlines()]
-                self.assertEqual(
-                    head[:3],
-                    [
-                        "table ${table}",
-                        "delete table ${table}",
-                        "table ${table} {",
-                    ],
-                )
-        self.assertIn("systemd.services.%s = {" % yo.EGRESS_UNIT, self.CODE)
-
-    def test_recovery_mode_accepts_only_lo_replies_dhcp_and_nd_then_rejects(self):
-        rules = self.rules("recoveryFile")
-        self.assertEqual(
-            [r for r in rules if r.endswith(" accept")],
-            [
-                'oifname "lo" accept',
-                "ct direction reply accept",
-                self.DHCP,
-                "icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept",
-            ],
-        )
-        self.assertEqual(rules[-1], "counter reject with icmpx type admin-prohibited")
-
-    def test_recovery_mode_names_nothing_from_the_options(self):
-        body = self.rule_file("recoveryFile")
-        self.assertNotIn("cfg", body)
-        self.assertNotIn("lan", body)
 
     def test_the_unit_loads_recovery_first_and_the_full_rules_to_replace_it(self):
         unit = self.service_block("yolobox-egress")

@@ -106,6 +106,19 @@ jobs:
             sudo nft --check --file "$file"
           done
 
+      # The rendered files are what the kernel runs, so the egress tests read
+      # them, not the Nix. The host has no nix, so the unit tests run on copies
+      # in tests/fixtures; this step runs the same checker on the fresh render
+      # and diffs the copies against it, so a fixture cannot drift. A diff
+      # failure means: copy the fresh render over the fixture (nix/egress.md).
+      - name: Check the egress rules close the host
+        run: |
+          rules="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRules)"
+          recovery="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRecoveryRules)"
+          python3 tests/egress_rules.py "$rules" "$recovery"
+          diff -u tests/fixtures/egress.nft "$rules"
+          diff -u tests/fixtures/egress-recovery.nft "$recovery"
+
       # lanAllow goes into the rule files as text, so a bad entry must fail the
       # evaluation: nft would reject it at load and drop the box into recovery
       # mode. The assertions run on a configuration extended with one entry.

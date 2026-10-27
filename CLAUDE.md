@@ -124,6 +124,9 @@ Tests, all under `tests/`:
   fact equal.
 - `test_guest_script.py`: runs the guest script's functions under bash.
 - `test_yo_luks.py`: the passphrase derivation and the ssh agent protocol.
+- `test_egress_rules.py`: runs `tests/egress_rules.py` on the rendered egress
+  rule files in `tests/fixtures/`, and on broken copies. CI diffs the fixtures
+  against a fresh render. `nix/egress.md`.
 - `test_luks_scripts.py`: runs the three initrd scripts under bash.
 
 ## Build, test, release
