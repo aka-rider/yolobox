@@ -342,11 +342,10 @@ in
     zoxide
     eza
     btop
+    traceroute
     (callPackage ./pkgs/far2l.nix { })
     delta
     gh
-    # Client only: the box runs no Forgejo server. A box that once ran one
-    # keeps /var/lib/forgejo, which can be deleted by hand.
     forgejo-cli
     shellcheck
     shfmt

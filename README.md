@@ -8,12 +8,12 @@ A development sanbox virtual machine. It's a NixOS Linux run by Lima.
 - A supply chain attack.
 - macOS `systempolicyd` write scans, which make builds slow.
 
-### How it works
+It limits what an agent can do. It doesn't lock the agent in.
 
 - The agent runs as its own user with no `sudo`. The filesystem is airgaped. Files move only through git, scp, or rsync.
 - The VM can use your 1Password SSH agent. You must approve the access (TouchID or similarly).
-- The VM reaches the internet, but not your computer or your local network. To let it reach one address, such as a package cache on your LAN, name it in `/etc/yolobox/local.nix`, for example `yolobox.network.lanAllow = [ "192.168.1.20/32" ];`. The one door the VM does not close is Tailscale: if your computer is on your tailnet, the tailnet's access policy decides whether the VM can reach it, so write a policy that keeps the VM away from it.
-- Open VM ports from 1024 to 49151 are mapped on the host, except a few login-callback ports such as 8085 (you can open `http://localhost:3000` directly in your browser)
+- The VM reaches the internet, but not your computer or your local network. To let it reach one address, such as a package cache on your LAN, name it in `/etc/yolobox/local.nix`, for example `yolobox.network.lanAllow = [ "192.168.1.20/32" ];`.
+- Open VM ports from 1024 to 49151 are mapped on the host, except a few login-callback ports such as 8085 (you can open `http://localhost:<port>` directly in your browser)
 
 
 ## Quickstart
