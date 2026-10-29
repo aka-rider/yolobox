@@ -234,7 +234,7 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         err_patcher.start()
         self.addCleanup(err_patcher.stop)
 
-    def run_bootstrap(self, generations):
+    def run_bootstrap_with_real_generations(self):
         calls = []
 
         def fake_run(argv, **kwargs):
@@ -243,9 +243,33 @@ class TestBootstrapRebootDecision(unittest.TestCase):
 
         args = yo.build_parser().parse_args(["bootstrap"])
         with mock.patch.object(yo, "run", side_effect=fake_run):
-            with mock.patch.object(yo, "guest_generations", side_effect=generations):
-                yo.cmd_bootstrap(args)
+            yo.cmd_bootstrap(args)
         return calls
+
+    def run_bootstrap(self, generations):
+        with mock.patch.object(yo, "guest_generations", side_effect=generations):
+            return self.run_bootstrap_with_real_generations()
+
+    def test_a_box_without_the_helper_still_reaches_its_reboot(self):
+        # The plain nixos-lima image a first bootstrap starts from has no
+        # yolobox-guest; the generations are read over plain ssh.
+        reads = iter(["/store/g1\n/store/g0\n", "/store/g1\n/store/g1\n"])
+        asked = []
+
+        def fake_ssh_run(role, argv, **kwargs):
+            asked.append(list(argv))
+            if argv[0] == yo.HELPER:
+                return mock.Mock(
+                    returncode=127, stdout="", stderr="%s: not found" % yo.HELPER
+                )
+            if argv[0] == "sh":
+                return mock.Mock(returncode=0, stdout=next(reads), stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        yo.ssh_run.side_effect = fake_ssh_run
+        calls = self.run_bootstrap_with_real_generations()
+        self.assertEqual(calls, [["limactl", "stop", "yolobox"]])
+        self.assertFalse([argv for argv in asked if argv[0] == yo.HELPER])
 
     def test_no_restart_when_already_running_the_built_generation(self):
         calls = self.run_bootstrap([("g1", "g1")])

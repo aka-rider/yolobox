@@ -2424,8 +2424,17 @@ def luks_device_fstype() -> str:
 
 
 def guest_generations() -> Tuple[str, str]:
-    proc = guest_helper(OPERATOR, "generations")
-    return guest_field(proc.stdout, "profile"), guest_field(proc.stdout, "booted")
+    # Not through yolobox-guest: bootstrap reads this on a fresh nixos-lima image,
+    # which has no helper yet. The same pair as the helper's generations().
+    lines = guest_out(
+        [
+            "sh",
+            "-c",
+            "readlink -f /nix/var/nix/profiles/system && readlink -f /run/current-system",
+        ],
+        check=False,
+    ).splitlines()
+    return (lines[0] if lines else ""), (lines[1] if len(lines) > 1 else "")
 
 
 def cmd_bootstrap(args: argparse.Namespace) -> None:

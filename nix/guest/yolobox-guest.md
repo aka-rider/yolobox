@@ -4,14 +4,14 @@
 
 ## One helper, one PATH
 
-`nix/guest.nix` builds the script into the `yolobox-guest` package, and it sits on both accounts' `PATH`. It holds the project walk, the gitconfig-root walk, the landing-dir ancestor walk, `ensure-repo`, `generations`, both `gc` tiers and the AWS probe. Before this it was about 200 lines of bash trapped inside Python string constants (`PROJECT_FIND`, `GC_MACHINE` and the rest), and nothing checked any of it. There was no shellcheck, no `bash -n`, and no test that ever exercised a single find expression.
+`nix/guest.nix` builds the script into the `yolobox-guest` package, and it sits on both accounts' `PATH`. It holds the project walk, the gitconfig-root walk, the landing-dir ancestor walk, `ensure-repo`, both `gc` tiers and the AWS probe. Before this it was about 200 lines of bash trapped inside Python string constants (`PROJECT_FIND`, `GC_MACHINE` and the rest), and nothing checked any of it. There was no shellcheck, no `bash -n`, and no test that ever exercised a single find expression.
 
 `writeShellApplication` buys three things a Python string literal never could. A build-time shellcheck pass turns a bad find expression into a build error instead of a runtime one. It sets `set -euo pipefail`. And it pins a `runtimeInputs` PATH.
 
 `yo` reaches every subcommand the same way, `ssh ... yolobox-guest <sub> [args]`, with one account per subcommand:
 
 - `projects`, `landing-dir`, `ensure-repo`, `gc-user` and `aws-check` run as the agent.
-- `generations` and `gc-machine` run as the operator, because ext4's root reserve, which makes any of this recoverable on a genuinely full disk, is the operator's alone.
+- `gc-machine` runs as the operator, because ext4's root reserve, which makes any of this recoverable on a genuinely full disk, is the operator's alone.
 - `net-check` runs as the operator too, the one account every box has, however far its agent setup got.
 
 `aws-creds` is covered in [docs/aws.md](../../docs/aws.md#aws-creds).

@@ -3,8 +3,7 @@
 # find expressions, the gc tiers and the AWS probe are shellchecked at build
 # time instead of living in yo's Python string literals where nothing checks
 # them. Subcommands: projects, landing-dir,
-# ensure-repo, generations, gc-machine, gc-user, aws-creds, aws-check,
-# net-check.
+# ensure-repo, gc-machine, gc-user, aws-creds, aws-check, net-check.
 #
 # writeShellApplication prepends `set -o errexit -o nounset -o pipefail`. The
 # gc tiers below were written for a shell with none of that — a cleanup step
@@ -118,9 +117,9 @@ measure() {
 # ones (see nix/base.md#the-esp-holds-one-kernel), so a nixos-rebuild that runs out of space there
 # advances the system profile and then dies installing the bootloader,
 # leaving the booted generation and the profile pointing at different
-# closures. Both `generations` (the subcommand) and gc-machine's
-# half-failed-switch guard read this same pair, so the two can never
-# disagree on which path is which.
+# closures. gc-machine's half-failed-switch guard reads this pair. `yo
+# bootstrap` reads the same two paths over plain ssh (guest_generations), because
+# a fresh nixos-lima image has no yolobox-guest yet; keep the two in step.
 generations() {
     local profile="" booted=""
     profile="$(readlink -f /nix/var/nix/profiles/system)" || true
@@ -782,7 +781,6 @@ main() {
     projects) cmd_projects ;;
     landing-dir) cmd_landing_dir "$@" ;;
     ensure-repo) cmd_ensure_repo "$@" ;;
-    generations) generations ;;
     gc-machine) cmd_gc_machine "$@" ;;
     gc-user) cmd_gc_user "$@" ;;
     aws-creds) cmd_aws_creds "$@" ;;

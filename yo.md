@@ -89,6 +89,8 @@ Starting the VM is no longer one `limactl start`. The root disk is encrypted, an
 
 ## The guest helper
 
+`yo bootstrap` reads the profile and booted generations without the helper, over plain ssh (`guest_generations`), because the nixos-lima image a first bootstrap starts from has no `yolobox-guest` yet. Reading them through the helper made that first bootstrap die with a version-skew error before its reboot into LUKS. That was a regression from `212f5e9`.
+
 `guest_helper(role, sub, args)` runs a `yolobox-guest` subcommand over ssh as the operator or the agent, and turns a missing helper or subcommand into a version-skew note instead of a bare exit code. Nothing in it asks for root. The reasons are in [nix/guest/yolobox-guest.md](nix/guest/yolobox-guest.md#version-skew).
 
 ## The network line and the gateway-blocked marker
