@@ -708,6 +708,20 @@ class TestUnlockOutcomes(UnlockScript):
         self.assertIn("journalctl -b", err)
         self.assertNotIn("unlocked", out)
 
+    def test_a_root_mounted_only_on_retry_after_emergency_mode_exits_5(self):
+        self.set_unit("systemd-cryptsetup@root.service", "active")
+        self.set_unit("emergency.target", "active")
+        self.journal_tail.write_text("Failed to mount /sysroot\n")
+        self.start()
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 5, err)
+        self.assertIn("sysroot.mount mounted only on retry", err)
+        self.assertIn("emergency mode", err)
+        self.assertIn("Failed to mount /sysroot", err)
+        self.assertIn("journalctl -b", err)
+        self.assertIn("stop and start the instance", err)
+        self.assertNotIn("unlocked", out)
+
     def test_the_root_mount_is_not_awaited_while_the_disk_is_still_closed(self):
         self.set_unit("systemd-cryptsetup@root.service", "failed")
         self.start()

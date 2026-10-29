@@ -71,12 +71,12 @@ File events alone do not say a unit changed state: a failing unit posts no file 
 
 The helper reports its outcome by exit code, and `yo` reads it.
 
-- 0: `systemd-cryptsetup@root.service` is active and `sysroot.mount` succeeded. The disk is unlocked and mounted.
+- 0: `systemd-cryptsetup@root.service` is active, `sysroot.mount` succeeded and the initrd is not in emergency mode. The disk is unlocked and mounted.
 - 1: that unit failed. The passphrase does not open the device, which means a different key encrypted this disk.
 - 2: the migration unit failed. The helper prints the last 20 journal lines on stderr. The plaintext is still intact.
 - 3: the helper could not set up its ask-password watch, or lost it, or was started without `YOLOBOX_UNLOCK_UNTIL_UNIT` (the cryptsetup unit to wait for, which `nix/luks/apps.nix` derives from the mapper name).
 - 4: no passphrase arrived on stdin.
-- 5: the disk opened but `sysroot.mount` failed, so the box sits in initrd emergency mode. The helper prints the journal of `systemd-fsck-root.service` and `sysroot.mount` on stderr and `yo` names the command that reads the whole initrd journal. After the open the helper runs `systemctl start sysroot.mount`, which blocks on systemd's own job and returns its result, so there is no polling and no timeout of its own. Before this change the helper stopped at "the cryptsetup unit is active" and said "unlocked" over a box that never mounted its root.
+- 5: the disk opened but `sysroot.mount` failed, so the box sits in initrd emergency mode. The helper prints the journal of `systemd-fsck-root.service` and `sysroot.mount` on stderr and `yo` names the command that reads the whole initrd journal. After the open the helper runs `systemctl start sysroot.mount`, which blocks on systemd's own job and returns its result, so there is no polling and no timeout of its own. If `sysroot.mount` had already failed, that `start` retries the mount, and a retry that works is still exit 5: `emergency.target` is active, nothing restarts `initrd.target`, and the box would never switch root. The helper checks `systemctl is-active emergency.target` after a successful start (`rescue.target` is not reached by a failed mount, so it is not checked) and prints the journal, `journalctl -b`, and the recovery, which is to stop and start the instance. Before this change the helper stopped at "the cryptsetup unit is active" and said "unlocked" over a box that never mounted its root.
 
 It checks the migration unit first. A migration that failed would otherwise leave the cryptsetup unit failed too (it requires the migrate unit), and that would read as a wrong key.
 

@@ -8,7 +8,8 @@
 #   exit 3  the ask-password watch could not be set up or ended on its own, or
 #           the helper was started without YOLOBOX_UNLOCK_UNTIL_UNIT
 #   exit 4  no passphrase on stdin
-#   exit 5  the disk opened but the root filesystem did not mount
+#   exit 5  the disk opened but the root filesystem did not mount, or mounted
+#           only on this helper's retry after the initrd had reached emergency mode
 shopt -s nullglob
 
 # The unit that opens the disk; nix/luks/apps.nix sets it from the mapper name
@@ -24,6 +25,9 @@ MIGRATE_UNIT="${YOLOBOX_UNLOCK_MIGRATE_UNIT:-yolobox-luks-migrate.service}"
 # The unit that mounts the opened disk as the new root, and the fsck before it.
 ROOT_MOUNT_UNIT=sysroot.mount
 ROOT_FSCK_UNIT=systemd-fsck-root.service
+# What the systemd initrd reaches when a required mount fails ("Reached target
+# Emergency Mode"); nothing leaves it, so a mount that came back late is too late.
+EMERGENCY_UNIT=emergency.target
 ASK_DIR="${YOLOBOX_ASK_DIR:-/run/systemd/ask-password}"
 # Journal lines shown on a failed migration and replayed when the watch starts.
 journal_tail_lines=20
@@ -63,12 +67,20 @@ answer_pending() {
 # An open disk is not a booted one: systemd still fscks and mounts it. Blocks on
 # systemd's own job for the mount, so a mount that fails is reported now and not
 # after lima's ten-minute wait. The job already exists by now (initrd.target
-# pulls it in), so this joins it and does not start a second mount.
+# pulls it in), so this joins it and does not start a second mount. If the mount
+# had already failed, start retries it, and a retry that works is no success:
+# initrd.target is not restarted, so the box stays in emergency mode.
 wait_for_root_mount() {
   if ! systemctl start "$ROOT_MOUNT_UNIT"; then
     journalctl -u "$ROOT_FSCK_UNIT" -u "$ROOT_MOUNT_UNIT" -o cat --no-pager | tail -n "$journal_tail_lines" >&2
     echo "yolobox-unlock: ${LUKS_DEVICE} opened but ${ROOT_MOUNT_UNIT} failed; the box waits in its initrd emergency mode" >&2
     echo "yolobox-unlock: read the whole initrd journal with: journalctl -b" >&2
+    exit 5
+  fi
+  if systemctl is-active --quiet "$EMERGENCY_UNIT"; then
+    journalctl -u "$ROOT_FSCK_UNIT" -u "$ROOT_MOUNT_UNIT" -o cat --no-pager | tail -n "$journal_tail_lines" >&2
+    echo "yolobox-unlock: ${ROOT_MOUNT_UNIT} mounted only on retry and the initrd is in emergency mode (${EMERGENCY_UNIT}), so the boot will not continue" >&2
+    echo "yolobox-unlock: read the initrd journal with: journalctl -b; to recover, stop and start the instance" >&2
     exit 5
   fi
 }
