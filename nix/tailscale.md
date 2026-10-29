@@ -79,7 +79,7 @@ tailscaled has no switch for this line, and its verbosity flags only add lines. 
 
 ## Exit nodes
 
-`--exit-node-allow-lan-access` is in `extraSetFlags`. When an exit node is selected, tailscaled sends all traffic through table 52 to the exit node, and without this flag that includes the replies to Lima's ssh on 192.168.5.0/24, so `yo ssh` drops. The flag keeps that subnet out of table 52. It does nothing until an exit node is chosen. It does not open the LAN: the [egress table](egress.md) still rejects private ranges, and only replies to connections the outside started (`ct direction reply`) pass.
+`--exit-node-allow-lan-access` is in `extraSetFlags`. When an exit node is selected, tailscaled sends all traffic through table 52 to the exit node, and without this flag that includes the replies to Lima's ssh on 192.168.5.0/24, so `yo ssh` drops. The flag is expected to keep that subnet out of table 52. It does nothing until an exit node is chosen. It does not open the LAN: the [egress table](egress.md) still rejects private ranges except the networks named in `yolobox.network.lanAllow`, which are reachable as before. Lima's ssh replies on 192.168.5.0/24 pass as replies to connections the outside started (`ct direction reply`).
 
 Not yet verified on a live box. To check, run `yo ssh sudo tailscale set --exit-node=<node>` and see whether `yo ssh` stays up. Without the flag, the expectation is that it drops once an exit node is selected.
 

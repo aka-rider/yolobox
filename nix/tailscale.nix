@@ -15,10 +15,10 @@
     # --netfilter-mode=off: nixos-fw owns the rules; tailscaled must not insert
     # its own (its default puts "-A INPUT -j ts-input" ahead of nixos-fw).
     # --accept-dns=false: MagicDNS must not take over the guest's resolver.
-    # --exit-node-allow-lan-access: with an exit node selected it keeps
-    # 192.168.5.0/24 (Lima's ssh replies) out of tailscale's table 52. It does
-    # nothing until an exit node is chosen, and egress.nix still rejects the
-    # private ranges, so the LAN stays closed. See nix/tailscale.md.
+    # --exit-node-allow-lan-access: expected to keep 192.168.5.0/24 (Lima's ssh
+    # replies) out of tailscale's table 52 once an exit node is selected. Not
+    # yet verified on a live box; see nix/tailscale.md. egress.nix still rejects
+    # the private ranges, except the networks in lanAllow.
     extraSetFlags = [ "--accept-dns=false" "--ssh=false" "--netfilter-mode=off" "--exit-node-allow-lan-access" "--hostname=${config.networking.hostName}" ];
   };
 
