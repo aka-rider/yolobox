@@ -1357,7 +1357,7 @@ def herdr_machine_exists(listing_json: str) -> bool:
     )
 
 
-def ensure_herdr_machine() -> None:
+def ensure_herdr_machine(ssh_config_includes_the_vm: bool) -> None:
     herdr = shutil.which("herdr")
     if herdr is None:
         err(
@@ -1366,6 +1366,16 @@ def ensure_herdr_machine() -> None:
         return
     listing = run([herdr, "machine", "list", "--json"], check=True)
     if herdr_machine_exists(listing.stdout):
+        return
+    if not ssh_config_includes_the_vm:
+        # herdr runs `ssh <alias>`, and the alias exists only in the file that
+        # ~/.ssh/config includes; without the line ssh cannot resolve it.
+        err(
+            "yo: not saving the herdr machine %s: ~/.ssh/config does not include the VM's"
+            " ssh config, so herdr cannot resolve the host." % HERDR_SSH_ALIAS
+        )
+        err("    Add this line to ~/.ssh/config, then run yo bootstrap again:")
+        err("        %s" % INCLUDE_LINE)
         return
     added = run([herdr, "machine", "add", HERDR_SSH_ALIAS, "--label", HERDR_SSH_ALIAS])
     if added.returncode != 0:
@@ -2581,9 +2591,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
             )
         report.ok("rebooted into the built generation")
 
-    ensure_ssh_config_include(refuse=False)
+    include_present = ensure_ssh_config_include(refuse=False)
     ensure_guest_known_hosts()
-    ensure_herdr_machine()
+    ensure_herdr_machine(include_present)
 
     vm_services()
 
@@ -2963,9 +2973,10 @@ def add_ssh_config_include() -> None:
     atomic_write(config_path, INCLUDE_LINE + "\n" + current, mode)
 
 
-def ensure_ssh_config_include(refuse: bool) -> None:
+def ensure_ssh_config_include(refuse: bool) -> bool:
+    """True when ~/.ssh/config includes the VM's file; False when declined and not refusing."""
     if ssh_config_include_line() is not None:
-        return
+        return True
 
     if sys.stdin.isatty():
         err(
@@ -2980,7 +2991,7 @@ def ensure_ssh_config_include(refuse: bool) -> None:
         if answer in ("y", "yes"):
             add_ssh_config_include()
             out("yo: added '%s' to ~/.ssh/config" % INCLUDE_LINE)
-            return
+            return True
 
     err(
         "yo: add this line to ~/.ssh/config so ssh %s, Zed and VS Code can find the VM:"
@@ -2989,6 +3000,7 @@ def ensure_ssh_config_include(refuse: bool) -> None:
     err("    %s" % INCLUDE_LINE)
     if refuse:
         raise YoError(None, code=1)
+    return False
 
 
 def editor_uri_path(guest_dir: str) -> str:

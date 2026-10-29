@@ -353,6 +353,15 @@ class TestBootstrapRebootDecision(unittest.TestCase):
         self.assertIn("limactl stop failed", messages)
         self.assertIn("yo bootstrap", messages)
 
+    def test_herdr_is_told_whether_the_ssh_include_is_in_place(self):
+        for included in (True, False):
+            with self.subTest(included=included):
+                with mock.patch.object(
+                    yo, "ensure_ssh_config_include", return_value=included
+                ):
+                    self.run_bootstrap([("g1", "g1")])
+                yo.ensure_herdr_machine.assert_called_with(included)
+
     def test_ssh_include_and_herdr_run_before_vm_services(self):
         # M1: an optional-service failure in vm_services must never skip
         # the ssh config include or herdr registration —
@@ -791,7 +800,7 @@ class TestEnsureHerdrMachine(unittest.TestCase):
         with mock.patch.object(yo.shutil, "which", return_value=None):
             with mock.patch.object(yo, "run") as fake_run:
                 with mock.patch.object(yo, "err") as fake_err:
-                    yo.ensure_herdr_machine()
+                    yo.ensure_herdr_machine(True)
         fake_run.assert_not_called()
         fake_err.assert_called_once()
 
@@ -807,7 +816,7 @@ class TestEnsureHerdrMachine(unittest.TestCase):
             yo.shutil, "which", return_value="/opt/homebrew/bin/herdr"
         ):
             with mock.patch.object(yo, "run", side_effect=fake_run) as tracked:
-                yo.ensure_herdr_machine()
+                yo.ensure_herdr_machine(True)
         calls = [call.args[0] for call in tracked.call_args_list]
         self.assertTrue(all(argv[2:3] != ["add"] for argv in calls))
 
@@ -824,7 +833,7 @@ class TestEnsureHerdrMachine(unittest.TestCase):
             yo.shutil, "which", return_value="/opt/homebrew/bin/herdr"
         ):
             with mock.patch.object(yo, "run", side_effect=fake_run):
-                yo.ensure_herdr_machine()
+                yo.ensure_herdr_machine(True)
         self.assertIn(
             [
                 "/opt/homebrew/bin/herdr",
@@ -837,6 +846,22 @@ class TestEnsureHerdrMachine(unittest.TestCase):
             calls,
         )
 
+    def test_a_declined_ssh_include_skips_the_add_with_one_note_naming_the_line(self):
+        def fake_run(argv, **kwargs):
+            if argv[1:3] == ["machine", "list"]:
+                return mock.Mock(returncode=0, stdout="[]", stderr="")
+            raise AssertionError("herdr cannot resolve the host: %r" % (argv,))
+
+        with mock.patch.object(
+            yo.shutil, "which", return_value="/opt/homebrew/bin/herdr"
+        ):
+            with mock.patch.object(yo, "run", side_effect=fake_run):
+                with mock.patch.object(yo, "err") as fake_err:
+                    yo.ensure_herdr_machine(False)
+        notes = " ".join(call.args[0] for call in fake_err.call_args_list)
+        self.assertIn("~/.ssh/config does not include", notes)
+        self.assertIn(yo.INCLUDE_LINE, notes)
+
     def test_add_failure_raises_with_herdrs_stderr(self):
         def fake_run(argv, **kwargs):
             if argv[1:3] == ["machine", "list"]:
@@ -848,7 +873,7 @@ class TestEnsureHerdrMachine(unittest.TestCase):
         ):
             with mock.patch.object(yo, "run", side_effect=fake_run):
                 with self.assertRaises(yo.YoError) as caught:
-                    yo.ensure_herdr_machine()
+                    yo.ensure_herdr_machine(True)
         self.assertIn("boom", caught.exception.message)
 
 

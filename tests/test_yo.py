@@ -1002,8 +1002,13 @@ class TestEnsureSshConfigInclude(FakeHome):
         self.write_config(original)
         with isatty(True):
             with mock.patch("builtins.input", return_value="n"):
-                yo.ensure_ssh_config_include(refuse=False)
+                present = yo.ensure_ssh_config_include(refuse=False)
+        self.assertFalse(present)
         self.assertEqual(self.read_config(), original)
+
+    def test_the_answer_says_whether_the_include_is_in_place(self):
+        self.write_config(INCLUDE)
+        self.assertTrue(yo.ensure_ssh_config_include(refuse=False))
 
     def test_end_of_input_at_the_prompt_is_a_no(self):
         original = "Host other\n"
