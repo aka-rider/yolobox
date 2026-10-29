@@ -415,10 +415,12 @@ class UnlockScript(unittest.TestCase):
             bin_dir,
             "systemctl",
             """
-state=$(cat "$FAKE_STATE/$3" 2>/dev/null || echo inactive)
+for unit; do :; done
+state=$(cat "$FAKE_STATE/$unit" 2>/dev/null || echo inactive)
 case "$1" in
   is-failed) [ "$state" = failed ] ;;
   is-active) [ "$state" = active ] ;;
+  start) echo "$unit" >> "$FAKE_START_LOG"; [ "$state" != failed ] ;;
 esac
 """,
         )
@@ -476,6 +478,7 @@ printf 'reply %s %s [%s]\\n' "$1" "$2" "$body" >> "$FAKE_REPLY_LOG"
             "YOLOBOX_UNLOCK_UNTIL_UNIT": "systemd-cryptsetup@root.service",
             "YOLOBOX_ASK_DIR": str(self.ask_dir),
             "FAKE_STATE": str(self.state),
+            "FAKE_START_LOG": str(self.tmp / "start.log"),
             "FAKE_JOURNAL_FIFO": str(self.tmp / "journal.fifo"),
             "FAKE_INOTIFY_FIFO": str(self.tmp / "inotify.fifo"),
             "FAKE_READY_FIFO": str(self.tmp / "ready.fifo"),
@@ -555,6 +558,10 @@ printf 'reply %s %s [%s]\\n' "$1" "$2" "$body" >> "$FAKE_REPLY_LOG"
             "[Ask]\nPID=1\nSocket=%s\nId=%s\nMessage=Enter passphrase\n"
             % (socket, ask_id or self.ASK_ID)
         )
+
+    def started_units(self):
+        log = self.tmp / "start.log"
+        return log.read_text().splitlines() if log.exists() else []
 
     def replies(self):
         if not self.reply_log.exists():
@@ -679,6 +686,31 @@ class TestUnlockOutcomes(UnlockScript):
         self.assertEqual(rc, 1, err)
         self.assertIn("the passphrase does not open /dev/fake", err)
         self.assertNotIn("unlocked", out)
+
+    def test_an_unlocked_disk_is_reported_only_once_the_root_is_mounted(self):
+        self.set_unit("systemd-cryptsetup@root.service", "active")
+        self.start()
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.started_units(), ["sysroot.mount"])
+
+    def test_a_root_mount_that_fails_exits_5_naming_the_unit_and_its_journal(self):
+        self.set_unit("systemd-cryptsetup@root.service", "active")
+        self.set_unit("sysroot.mount", "failed")
+        self.journal_tail.write_text("mount: /sysroot: Can't open blockdev\n")
+        self.start()
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 5, err)
+        self.assertIn("/dev/fake opened but sysroot.mount failed", err)
+        self.assertIn("mount: /sysroot: Can't open blockdev", err)
+        self.assertIn("journalctl -b", err)
+        self.assertNotIn("unlocked", out)
+
+    def test_the_root_mount_is_not_awaited_while_the_disk_is_still_closed(self):
+        self.set_unit("systemd-cryptsetup@root.service", "failed")
+        self.start()
+        self.finish()
+        self.assertEqual(self.started_units(), [])
 
     def test_an_empty_passphrase_is_refused_before_anything_starts(self):
         for stdin in ("", "\n"):

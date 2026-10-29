@@ -1723,6 +1723,19 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
             box.up()
         self.assertIn("lost its watch", caught.exception.message)
 
+    def test_a_root_mount_that_failed_is_reported_at_once_naming_sysroot_mount(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Running"],
+            helpers=[([], 5, "yolobox-unlock: sysroot.mount failed")],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        message = caught.exception.message
+        self.assertIn("sysroot.mount failed", message)
+        self.assertIn("journalctl -b", message)
+        self.assertIn("-p %d root@127.0.0.1" % yo.ssh_port(), message)
+
     def test_an_empty_passphrase_at_the_helper_is_reported_as_such(self):
         box = FakeBox(self, statuses=["Stopped", "Running"], helpers=[([], 4, "")])
         with self.assertRaises(yo.YoError) as caught:

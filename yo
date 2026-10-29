@@ -73,6 +73,7 @@ HELPER_EXIT_WRONG_KEY = 1
 HELPER_EXIT_MIGRATION_FAILED = 2
 HELPER_EXIT_WATCH_LOST = 3
 HELPER_EXIT_NO_PASSPHRASE = 4
+HELPER_EXIT_ROOT_MOUNT_FAILED = 5
 FZF_NO_MATCH = 1
 FZF_CANCELLED = 130
 HELPER_MARKER = "unknown subcommand"
@@ -1927,6 +1928,14 @@ def judge_helper_run(attempt: HelperRun) -> Verdict:
     return Verdict.NOT_LISTENING
 
 
+def initrd_root_ssh_command(remote_command: str) -> str:
+    return (
+        "ssh -F /dev/null -i ~/.lima/_config/user -o IdentitiesOnly=yes "
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p %d "
+        "root@127.0.0.1 %s" % (ssh_port(), remote_command)
+    )
+
+
 def helper_failure_message(attempt: HelperRun) -> str:
     code, stderr = attempt.returncode, attempt.stderr
     if code == SSH_UNREACHABLE:
@@ -1937,10 +1946,15 @@ def helper_failure_message(attempt: HelperRun) -> str:
     if code == HELPER_EXIT_MIGRATION_FAILED:
         return (
             "encrypting the disk failed in the initrd; the box is still in its initrd "
-            "with the plaintext intact. Inspect it as root: ssh -F /dev/null -i "
-            "~/.lima/_config/user -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "
-            "-o UserKnownHostsFile=/dev/null -p %d root@127.0.0.1 journalctl -u "
-            "yolobox-luks-migrate\n%s" % (ssh_port(), stderr)
+            "with the plaintext intact. Inspect it as root: %s\n%s"
+            % (initrd_root_ssh_command("journalctl -u yolobox-luks-migrate"), stderr)
+        )
+    if code == HELPER_EXIT_ROOT_MOUNT_FAILED:
+        return (
+            "the disk unlocked but the initrd could not mount it as /sysroot "
+            "(sysroot.mount failed); the box waits in its initrd emergency mode. "
+            "Inspect it as root: %s\n%s"
+            % (initrd_root_ssh_command("journalctl -b"), stderr)
         )
     if code == HELPER_EXIT_WRONG_KEY:
         return (

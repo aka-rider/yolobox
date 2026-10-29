@@ -2,12 +2,13 @@
 # Runs in the initrd over ssh, started by `yo up`: reads the passphrase on
 # stdin, answers every systemd password ask with it, and reports how the
 # unlock ended through its exit code. Event-driven, no polling. See nix/luks.nix.
-#   exit 0  the cryptsetup unit is active
+#   exit 0  the cryptsetup unit is active and the root filesystem is mounted
 #   exit 1  the cryptsetup unit failed (the passphrase does not open the disk)
 #   exit 2  the migration unit failed
 #   exit 3  the ask-password watch could not be set up or ended on its own, or
 #           the helper was started without YOLOBOX_UNLOCK_UNTIL_UNIT
 #   exit 4  no passphrase on stdin
+#   exit 5  the disk opened but the root filesystem did not mount
 shopt -s nullglob
 
 # The unit that opens the disk; nix/luks/apps.nix sets it from the mapper name
@@ -20,6 +21,9 @@ if [ -z "$UNTIL_UNIT" ]; then
   exit 3
 fi
 MIGRATE_UNIT="${YOLOBOX_UNLOCK_MIGRATE_UNIT:-yolobox-luks-migrate.service}"
+# The unit that mounts the opened disk as the new root, and the fsck before it.
+ROOT_MOUNT_UNIT=sysroot.mount
+ROOT_FSCK_UNIT=systemd-fsck-root.service
 ASK_DIR="${YOLOBOX_ASK_DIR:-/run/systemd/ask-password}"
 # Journal lines shown on a failed migration and replayed when the watch starts.
 journal_tail_lines=20
@@ -56,6 +60,19 @@ answer_pending() {
   done
 }
 
+# An open disk is not a booted one: systemd still fscks and mounts it. Blocks on
+# systemd's own job for the mount, so a mount that fails is reported now and not
+# after lima's ten-minute wait. The job already exists by now (initrd.target
+# pulls it in), so this joins it and does not start a second mount.
+wait_for_root_mount() {
+  if ! systemctl start "$ROOT_MOUNT_UNIT"; then
+    journalctl -u "$ROOT_FSCK_UNIT" -u "$ROOT_MOUNT_UNIT" -o cat --no-pager | tail -n "$journal_tail_lines" >&2
+    echo "yolobox-unlock: ${LUKS_DEVICE} opened but ${ROOT_MOUNT_UNIT} failed; the box waits in its initrd emergency mode" >&2
+    echo "yolobox-unlock: read the whole initrd journal with: journalctl -b" >&2
+    exit 5
+  fi
+}
+
 check_units() {
   if systemctl is-failed --quiet "$MIGRATE_UNIT"; then
     journalctl -u "$MIGRATE_UNIT" -o cat --no-pager | tail -n "$journal_tail_lines" >&2
@@ -63,6 +80,7 @@ check_units() {
     exit 2
   fi
   if systemctl is-active --quiet "$UNTIL_UNIT"; then
+    wait_for_root_mount
     echo "yolobox-unlock: unlocked"
     exit 0
   fi

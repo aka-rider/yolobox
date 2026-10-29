@@ -276,6 +276,7 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
             yo.HELPER_EXIT_MIGRATION_FAILED,
             yo.HELPER_EXIT_WATCH_LOST,
             yo.HELPER_EXIT_NO_PASSPHRASE,
+            yo.HELPER_EXIT_ROOT_MOUNT_FAILED,
         }
         self.assertEqual(table, yo_codes)
         self.assertEqual(used, table)
