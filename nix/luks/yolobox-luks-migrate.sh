@@ -121,31 +121,36 @@ resume() {
   echo "yolobox-luks-migrate: resume done"
 }
 
+# Finalize opens the partition under a private name, never `$mapper`. The
+# initrd's systemd starts its fsck and sysroot.mount the moment
+# /dev/mapper/<mapper> exists, so opening the real name here would let them race
+# the e2fsck and resize2fs below for the device (docs/disk-encryption.md,
+# "The root mount raced the finalize"). Only systemd-cryptsetup opens `$mapper`.
 finalize() {
-  local rc
+  local rc scratch="${mapper}-finalize"
   echo "yolobox-luks-migrate: finalize ${device}"
-  printf '%s' "$key" | cryptsetup open --allow-discards --key-file - "$device" "$mapper"
+  printf '%s' "$key" | cryptsetup open --allow-discards --key-file - "$device" "$scratch"
   # `( ... ) || rc=$?` would run the subshell with errexit off.
   set +e
   (
     set -euo pipefail
-    offset_sectors=$(cryptsetup status "$mapper" | awk '/offset:/ {print $2}')
-    mapper_bs=$(fs_block_size "/dev/mapper/${mapper}")
-    fs_bytes=$(($(fs_block_count "/dev/mapper/${mapper}") * mapper_bs))
+    offset_sectors=$(cryptsetup status "$scratch" | awk '/offset:/ {print $2}')
+    mapper_bs=$(fs_block_size "/dev/mapper/${scratch}")
+    fs_bytes=$(($(fs_block_count "/dev/mapper/${scratch}") * mapper_bs))
     plaintext_tail=$((offset_sectors * sector_bytes + fs_bytes))
     total=$(blockdev --getsize64 "$device")
     # The never-shrunk tail and reencrypt's temporary copy still hold plaintext.
     if [ "$plaintext_tail" -lt "$total" ]; then
       blkdiscard -f --offset "$plaintext_tail" --length $((total - plaintext_tail)) "$device"
     fi
-    fsck_ok "/dev/mapper/${mapper}"
-    resize2fs "/dev/mapper/${mapper}"
+    fsck_ok "/dev/mapper/${scratch}"
+    resize2fs "/dev/mapper/${scratch}"
   )
   rc=$?
   set -e
-  # Closed in every case: systemd-cryptsetup would report a half-finalized
-  # device as "already active".
-  cryptsetup close "$mapper"
+  # Closed in every case: systemd-cryptsetup cannot open the device while the
+  # scratch mapping holds it.
+  cryptsetup close "$scratch"
   if [ "$rc" -ne 0 ]; then
     echo "yolobox: finalize failed (exit $rc), ${device} left closed" >&2
     exit 5

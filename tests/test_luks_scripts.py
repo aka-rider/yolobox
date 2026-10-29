@@ -43,6 +43,8 @@ DEVICE = "/dev/fake"
 LABEL = "yolobox-luks"
 # Not "root": a mapper name that leaked from the script would fail here.
 MAPPER = "mapped"
+# The private name finalize opens the partition under.
+SCRATCH = MAPPER + "-finalize"
 SSH_PORT = "60099"
 PASSPHRASE = "k" * 64
 
@@ -174,9 +176,9 @@ class TestMigrateEncryptsPlainExt4(MigrateScript):
             "cryptsetup reencrypt",
             "cryptsetup open",
             "blkdiscard -f --offset %d" % TAIL,
-            "e2fsck -f -y /dev/mapper/" + MAPPER,
-            "resize2fs /dev/mapper/" + MAPPER,
-            "cryptsetup close " + MAPPER,
+            "e2fsck -f -y /dev/mapper/" + SCRATCH,
+            "resize2fs /dev/mapper/" + SCRATCH,
+            "cryptsetup close " + SCRATCH,
             "cryptsetup config --label %s %s" % (LABEL, DEVICE),
         )
 
@@ -250,7 +252,7 @@ class TestMigrateStates(MigrateScript):
             calls,
             "cryptsetup reencrypt --batch-mode --progress-frequency 30 --resume-only",
             "cryptsetup open",
-            "cryptsetup close " + MAPPER,
+            "cryptsetup close " + SCRATCH,
             "cryptsetup config --label",
         )
         self.assertFalse([c for c in calls if c.startswith("resize2fs -P")])
@@ -272,8 +274,8 @@ class TestMigrateStates(MigrateScript):
             calls,
             "cryptsetup open",
             "blkdiscard",
-            "resize2fs /dev/mapper/" + MAPPER,
-            "cryptsetup close " + MAPPER,
+            "resize2fs /dev/mapper/" + SCRATCH,
+            "cryptsetup close " + SCRATCH,
             "cryptsetup config --label %s %s" % (LABEL, DEVICE),
         )
         self.assertFalse([c for c in calls if c.startswith("cryptsetup reencrypt")])
@@ -317,6 +319,43 @@ class TestMigrateStates(MigrateScript):
                 self.assertEqual(self.calls(), [])
 
 
+class TestMigrateNeverOpensTheRealMapping(MigrateScript):
+    """systemd starts fsck and sysroot.mount as soon as /dev/mapper/<mapper> exists."""
+
+    def assertOnlyTheScratchNameIsUsed(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mapping_calls = [
+            c
+            for c in self.calls()
+            if c.startswith(("cryptsetup open", "cryptsetup close", "cryptsetup status"))
+            or "/dev/mapper/" in c
+        ]
+        self.assertTrue(mapping_calls)
+        for call in mapping_calls:
+            self.assertRegex(call, r"\b%s\b" % SCRATCH)
+            self.assertNotRegex(call, r"(^|[ /])%s\b(?!-)" % MAPPER)
+
+    def test_every_state_that_finalizes_uses_a_private_mapper_name(self):
+        for name, dump, env in (
+            ("encrypt", None, {}),
+            ("resume", "Requirements:  online-reencrypt-v2\n", {}),
+            ("finalize", "LUKS header information\n", {"FAKE_BLKID_LABEL": "other"}),
+        ):
+            with self.subTest(state=name):
+                self.log.write_text("")
+                if dump is not None:
+                    self.luks(dump)
+                self.assertOnlyTheScratchNameIsUsed(self.run_migrate(**env))
+
+    def test_a_failed_finalize_has_not_opened_the_real_mapping_either(self):
+        self.luks("LUKS header information\n")
+        result = self.run_migrate(FAKE_BLKID_LABEL="other", FAKE_RESIZE2FS_RC="1")
+        self.assertEqual(result.returncode, 5, result.stderr)
+        opened = [c for c in self.calls() if c.startswith("cryptsetup open")]
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].endswith(" " + SCRATCH), opened)
+
+
 class TestMigrateFinalizeFailures(MigrateScript):
     def setUp(self):
         super().setUp()
@@ -327,7 +366,7 @@ class TestMigrateFinalizeFailures(MigrateScript):
         self.assertEqual(result.returncode, 5, result.stderr)
         self.assertIn("left closed", result.stderr)
         calls = self.calls()
-        self.assertIn("cryptsetup close " + MAPPER, calls)
+        self.assertIn("cryptsetup close " + SCRATCH, calls)
         self.assertFalse([c for c in calls if c.startswith("cryptsetup config")])
 
     def test_a_failing_grow_closes_the_mapping_and_does_not_label(self):
