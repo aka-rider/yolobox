@@ -103,7 +103,7 @@ A name follows lima's rule (letters and digits joined by single `.`, `_` or `-`)
 limactl create --name <name> --set '.ssh.localPort=<port>' lima/yolobox.yaml
 ```
 
-Add `--cpus`, `--memory` and `--disk` to size it; `yo` never sizes an instance. Give every instance its own free `<port>`. `yo` has to know the port that reaches an instance's initrd sshd before the first start, and `ssh_port()` is the one place that answers: 60022 for the default instance, and for any other the `ssh.localPort` that `limactl list <name> --json` reports. A port of 0, which makes lima pick a new one on every start, or a missing or malformed one, is an error. `yo` never guesses: the default box answers on 60022 and accepts the same lima key, so a fallback would probe, and unlock, the wrong machine.
+Add `--cpus`, `--memory` and `--disk` to size it; `yo` never sizes an instance. Give it at least 8 GiB of memory: the system is evaluated and built inside the instance, and a 4 GiB instance had the nix evaluator OOM-killed at about 2.8 GiB RSS, with no swap. Give every instance its own free `<port>`. `yo` has to know the port that reaches an instance's initrd sshd before the first start, and `ssh_port()` is the one place that answers: 60022 for the default instance, and for any other the `ssh.localPort` that `limactl list <name> --json` reports. A port of 0, which makes lima pick a new one on every start, or a missing or malformed one, is an error. `yo` never guesses: the default box answers on 60022 and accepts the same lima key, so a fallback would probe, and unlock, the wrong machine.
 
 **What bootstrap adds per instance**, for removing one by hand after `limactl delete <name>`:
 
