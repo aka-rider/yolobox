@@ -327,7 +327,9 @@ class TestMigrateNeverOpensTheRealMapping(MigrateScript):
         mapping_calls = [
             c
             for c in self.calls()
-            if c.startswith(("cryptsetup open", "cryptsetup close", "cryptsetup status"))
+            if c.startswith(
+                ("cryptsetup open", "cryptsetup close", "cryptsetup status")
+            )
             or "/dev/mapper/" in c
         ]
         self.assertTrue(mapping_calls)
