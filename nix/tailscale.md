@@ -77,11 +77,17 @@ tailscaled has no switch for this line, and its verbosity flags only add lines. 
 
 `nix/tailscale.nix` sets `TS_DISABLE_PORTMAPPER=1` on tailscaled. Its port mapper sends NAT-PMP and PCP to 192.168.5.2:5351 and SSDP to 239.255.255.250, and both go only to the host and the LAN, which the [egress table](egress.md) rejects. Without the setting tailscaled would keep probing a path that cannot answer. A peer on the same LAN then connects through public endpoints and then DERP, which is slower (tailscale.com/kb/1257).
 
+## Exit nodes
+
+`--exit-node-allow-lan-access` is in `extraSetFlags`. When an exit node is selected, tailscaled sends all traffic through table 52 to the exit node, and without this flag that includes the replies to Lima's ssh on 192.168.5.0/24, so `yo ssh` drops. The flag keeps that subnet out of table 52. It does nothing until an exit node is chosen. It does not open the LAN: the [egress table](egress.md) still rejects private ranges, and only replies to connections the outside started (`ct direction reply`) pass.
+
+Not yet verified on a live box. To check, run `yo ssh sudo tailscale set --exit-node=<node>` and see whether `yo ssh` stays up. Without the flag, the expectation is that it drops once an exit node is selected.
+
 ## Login
 
 Login is interactive and happens once, by the operator, because no auth key exists anywhere in this repo: `yo ssh sudo tailscale up`. It takes no `--hostname`. `extraSetFlags` pins the tailnet name to `networking.hostName`, so every box joins as `yolobox`, and a hand-typed `--hostname` is overwritten by the next `tailscaled-set` run.
 
-`--netfilter-mode=off`, `--accept-dns=false` and `--hostname` are all non-default, so a bare `tailscale up` on an already logged-in node may refuse with "changing settings via 'tailscale up' requires mentioning all non-default flags". Do not answer that with `tailscale up --reset`, which clears them. Run `yo ssh sudo tailscale up`, then `yo ssh sudo systemctl restart tailscaled-set`, so the unit re-applies the flags.
+`--netfilter-mode=off`, `--accept-dns=false`, `--exit-node-allow-lan-access` and `--hostname` are all non-default, so a bare `tailscale up` on an already logged-in node may refuse with "changing settings via 'tailscale up' requires mentioning all non-default flags". Do not answer that with `tailscale up --reset`, which clears them. Run `yo ssh sudo tailscale up`, then `yo ssh sudo systemctl restart tailscaled-set`, so the unit re-applies the flags.
 
 State from the login, the node key and the tailnet identity, persists under `/var/lib/tailscale`. Like everything else under [Two accounts](../docs/accounts.md#two-accounts), it is VM-local. Recreating the VM loses it, and the new box logs in again the same way.
 
