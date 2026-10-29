@@ -38,9 +38,30 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 # Rewritten at build time: nix substituteInPlace, Homebrew inreplace.
 YO_VERSION = "dev"
 
-INSTANCE = "yolobox"
-VM_HOST = "lima-yolobox"
-HERDR_SSH_ALIAS = "yolobox"
+DEFAULT_INSTANCE = "yolobox"
+# Lima's own rule for an instance name (identifiers.Validate): it becomes a
+# directory under ~/.lima, an ssh host name and an ssh config pattern.
+INSTANCE_NAME_RE = re.compile(r"^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$")
+
+
+def instance_from_env(value: Optional[str]) -> str:
+    """The lima instance `yo` drives: YOLOBOX_INSTANCE, or the box itself."""
+    if value is None:
+        return DEFAULT_INSTANCE
+    if not INSTANCE_NAME_RE.match(value) or value.startswith("lima-"):
+        # "lima-" is excluded because instance "lima-x" would give its herdr alias
+        # the name of instance "x"'s ssh host.
+        raise SystemExit(
+            "yo: YOLOBOX_INSTANCE=%r is not a usable instance name (letters and "
+            "digits, joined by single '.', '_' or '-', not starting with 'lima-')"
+            % value
+        )
+    return value
+
+
+INSTANCE = instance_from_env(os.environ.get("YOLOBOX_INSTANCE"))
+VM_HOST = "lima-" + INSTANCE
+HERDR_SSH_ALIAS = INSTANCE
 AGENT_USER = "agent"
 AGENT_HOME = "/home/agent"
 HELPER = "yolobox-guest"
@@ -167,7 +188,8 @@ SSH_AGENT_IDENTITIES_ANSWER = 12
 SSH_AGENT_SIGN_REQUEST = 13
 SSH_AGENT_SIGN_RESPONSE = 14
 
-# ssh.localPort in lima/yolobox.yaml: where lima's hostagent listens on the Mac.
+# ssh.localPort in lima/yolobox.yaml: where lima's hostagent listens on the Mac
+# for the default instance. ssh_port() answers for any instance.
 SSH_LOCAL_PORT = 60022
 # The script in the initrd that answers the disk's password asks (nix/luks).
 INITRD_UNLOCK_HELPER = "yolobox-unlock"
@@ -1363,6 +1385,7 @@ class LimaInfo:
     over_vsock: Optional[bool]
     propagate_proxy_env: Optional[bool]
     load_dot_ssh_pub_keys: Optional[bool]
+    ssh_local_port: object  # as limactl reports it: 0 means lima picks per start
 
 
 def lima_instance_info() -> Optional[LimaInfo]:
@@ -1387,7 +1410,42 @@ def lima_instance_info() -> Optional[LimaInfo]:
         over_vsock=ssh.get("overVsock"),
         propagate_proxy_env=config.get("propagateProxyEnv"),
         load_dot_ssh_pub_keys=ssh.get("loadDotSSHPubKeys"),
+        ssh_local_port=ssh.get("localPort"),
     )
+
+
+def lima_create_command() -> str:
+    return "limactl create --name %s --set '.ssh.localPort=<free port>' %s" % (
+        INSTANCE,
+        SCRIPT_DIR / "lima" / "yolobox.yaml",
+    )
+
+
+def ssh_port() -> int:
+    """Where lima's hostagent listens on the Mac for this instance's sshd.
+
+    The default instance is created from lima/yolobox.yaml, which fixes the port.
+    Any other instance has whatever `ssh.localPort` it was created with, and a
+    guess would probe a different box: the default one answers on SSH_LOCAL_PORT.
+    """
+    if INSTANCE == DEFAULT_INSTANCE:
+        return SSH_LOCAL_PORT
+    info = lima_instance_info()
+    if info is None:
+        raise YoError(
+            "limactl cannot show instance %s (limactl list %s --json failed), so yo "
+            "cannot learn its ssh port — create it with:\n    %s"
+            % (INSTANCE, INSTANCE, lima_create_command())
+        )
+    port = info.ssh_local_port
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+        raise YoError(
+            "%s has ssh.localPort %r, which is not a fixed port. With 0 lima picks a "
+            "new port on every start, and yo must know it before the first one. "
+            "Create the instance with:\n    %s"
+            % (INSTANCE, port, lima_create_command())
+        )
+    return port
 
 
 def ha_pid() -> Optional[int]:
@@ -1700,7 +1758,7 @@ def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:
     except OSError as failure:
         raise YoError("cannot read %s: %s" % (ssh_cfg(), failure.strerror))
     hostname = values["Hostname"] if values else "127.0.0.1"
-    port = values["Port"] if values else str(SSH_LOCAL_PORT)
+    port = values["Port"] if values else str(ssh_port())
     identity = (
         values["IdentityFile"]
         if values
@@ -1863,7 +1921,7 @@ def helper_failure_message(attempt: HelperRun) -> str:
     code, stderr = attempt.returncode, attempt.stderr
     if code == SSH_UNREACHABLE:
         return stderr or "ssh to 127.0.0.1:%d failed with exit %d and no message" % (
-            SSH_LOCAL_PORT,
+            ssh_port(),
             code,
         )
     if code == HELPER_EXIT_MIGRATION_FAILED:
@@ -1872,7 +1930,7 @@ def helper_failure_message(attempt: HelperRun) -> str:
             "with the plaintext intact. Inspect it as root: ssh -F /dev/null -i "
             "~/.lima/_config/user -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "
             "-o UserKnownHostsFile=/dev/null -p %d root@127.0.0.1 journalctl -u "
-            "yolobox-luks-migrate\n%s" % (SSH_LOCAL_PORT, stderr)
+            "yolobox-luks-migrate\n%s" % (ssh_port(), stderr)
         )
     if code == HELPER_EXIT_WRONG_KEY:
         return (
@@ -1906,12 +1964,12 @@ def initrd_timeout_error(key_was_refused: bool) -> YoError:
             "the sshd on 127.0.0.1:%d refused lima's key for root and for %s — if %s "
             "is in its initrd, reading the key from cidata failed; see "
             "docs/disk-encryption.md#recognising-failures"
-            % (SSH_LOCAL_PORT, host_user(), INSTANCE)
+            % (ssh_port(), host_user(), INSTANCE)
         )
     return YoError(
         "%s never offered its initrd sshd on 127.0.0.1:%d within %d s of lima "
         "reporting it Running — limactl list, ~/.lima/%s/serialv.log"
-        % (INSTANCE, SSH_LOCAL_PORT, INITRD_WAIT_SECONDS, INSTANCE)
+        % (INSTANCE, ssh_port(), INITRD_WAIT_SECONDS, INSTANCE)
     )
 
 
@@ -2033,6 +2091,13 @@ def vm_up(
     if gaps:
         err("yo: %s" % lima_config_gap_message(gaps))
     info = lima_instance_info()
+    if info is None and INSTANCE != DEFAULT_INSTANCE:
+        # Only the default instance is created here, from lima/yolobox.yaml. Any
+        # other needs a port yo can know, which only its creator can choose.
+        raise YoError(
+            "instance %s does not exist (limactl list %s --json failed) — create "
+            "it with:\n    %s" % (INSTANCE, INSTANCE, lima_create_command())
+        )
     running = info is not None and info.status == "Running"
     if not running:
         passphrase = passphrase or luks_passphrase()
@@ -2041,7 +2106,7 @@ def vm_up(
         if not initrd_waiting():
             raise YoError(
                 "%s is Running but neither its initrd nor its sshd answers on 127.0.0.1:%d "
-                "— limactl list, yo status" % (INSTANCE, SSH_LOCAL_PORT)
+                "— limactl list, yo status" % (INSTANCE, ssh_port())
             )
         passphrase = passphrase or luks_passphrase()
         unlock_disk(passphrase)

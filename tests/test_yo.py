@@ -17,12 +17,21 @@ from unittest import mock
 YO_PATH = str(Path(__file__).resolve().parent.parent / "yo")
 
 
-def load_yo():
-    loader = importlib.machinery.SourceFileLoader("yo", YO_PATH)
-    spec = importlib.util.spec_from_loader("yo", loader)
+def load_yo(name="yo", instance=None):
+    """Execute yo's source as module `name`, with YOLOBOX_INSTANCE set to `instance`.
+
+    The instance names are read from the environment at import, so a test that
+    needs another instance loads another copy. The default is the unset variable.
+    """
+    loader = importlib.machinery.SourceFileLoader(name, YO_PATH)
+    spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["yo"] = module
-    loader.exec_module(module)
+    sys.modules[name] = module
+    with mock.patch.dict(os.environ):
+        os.environ.pop("YOLOBOX_INSTANCE", None)
+        if instance is not None:
+            os.environ["YOLOBOX_INSTANCE"] = instance
+        loader.exec_module(module)
     return module
 
 
@@ -2276,6 +2285,7 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
             over_vsock=False,
             propagate_proxy_env=False,
             load_dot_ssh_pub_keys=False,
+            ssh_local_port=yo.SSH_LOCAL_PORT,
         )
         with (
             mock.patch.object(yo, "lima_config_gaps", return_value=gaps),

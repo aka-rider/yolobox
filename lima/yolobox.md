@@ -8,6 +8,12 @@ Lima copies `lima/yolobox.yaml` into `~/.lima/yolobox/lima.yaml` when it creates
 
 Restating `portForwards` means stopping the VM and restating the whole array, because lima's own yq cannot read the repo file. The array is `LIMA_PORT_FORWARDS`, and it also carries the two reverse socket rules. Do not hand-write it. A hand-written copy went stale once, and run as written it dropped the socket rules. Run the `limactl edit` command that `yo up` prints, which `lima_config_gap_message()` builds from the constant.
 
+## One port per instance
+
+`ssh.localPort: 60022` in `lima/yolobox.yaml` is fixed on purpose. `yo` must know where lima's hostagent will listen before the first start, because the initrd's sshd, which unlocks the disk, answers there and nowhere else (see [docs/disk-encryption.md](../docs/disk-encryption.md)). With `0`, lima would choose a new port on every start.
+
+Any other instance (`YOLOBOX_INSTANCE=<name>`, see [yo.md](../yo.md#several-instances)) must be created with its own fixed port, different from every other instance's, since each hostagent binds its port on the host: `limactl create --name <name> --set '.ssh.localPort=<port>' lima/yolobox.yaml`. `yo` reads it back from `limactl list <name> --json` (`ssh_port()`) and refuses 0, a missing value and a malformed one. It never falls back to 60022, which belongs to the default instance. The yaml keeps 60022, so the default instance is unchanged.
+
 ## Checking a running instance
 
 Before it starts the VM, `vm_up()` runs `limactl list yolobox --json` and reads the running instance's own `config.portForwards`. It never searches the text of `lima/yolobox.yaml`. For each of `OP_GUEST_SOCK` and `AWS_BROKER_GUEST_SOCK`, it looks for an entry whose `guestSocket`, `hostSocket` and `reverse: true` all match.

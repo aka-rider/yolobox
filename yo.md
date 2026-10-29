@@ -87,6 +87,32 @@ The staging directory is removed on every path, a refusal, an scp failure and a 
 
 Starting the VM is no longer one `limactl start`. The root disk is encrypted, and lima's own start blocks until its ssh works, which needs the disk unlocked. So `vm_up` derives the passphrase first (`luks_passphrase`, which asks 1Password for the `yolobox-disk` key and so shows a Touch ID prompt), starts `limactl start` in the background, and hands the passphrase to the initrd with `unlock_disk` once the initrd's sshd answers. It then waits for the stage-2 sshd to accept the operator. A VM that is running and already accepts the operator needs no passphrase and no prompt. `lima_stop()` is the one place that runs `limactl stop`, with a timeout and the recovery text for its known hang. Every pre-unlock probe goes through `initrd_ssh_argv()` and `sshd_answers`, never a pinned ssh role. The reasons, the protocol and the failure shapes are in [docs/disk-encryption.md](docs/disk-encryption.md).
 
+## Several instances
+
+`YOLOBOX_INSTANCE=<name>` makes `yo` drive the lima instance `<name>` instead of `yolobox`. Any number of instances can exist and run side by side, each addressed by its own `YOLOBOX_INSTANCE`. Unset, nothing changes. Every per-instance name derives from that one value in one place at the top of `yo`:
+
+- the lima directory `~/.lima/<name>` (ssh config, `known_hosts`, the multiplexing sockets), and every `limactl` call;
+- the ssh host `lima-<name>`, and the herdr machine and ssh alias `<name>`;
+- the `Include ~/.lima/<name>/ssh.config` line in `~/.ssh/config`.
+
+A name follows lima's rule (letters and digits joined by single `.`, `_` or `-`) and must not start with `lima-`. Otherwise instance `lima-x` would name its herdr alias `lima-x`, which is the ssh host of instance `x`. `yo` refuses any other spelling at start.
+
+**The instance must exist.** `yo` creates only the default instance, from `lima/yolobox.yaml`. For any other it stops in `vm_up`, before it asks 1Password for the disk key and before it starts anything, and prints the command to run:
+
+```sh
+limactl create --name <name> --set '.ssh.localPort=<port>' lima/yolobox.yaml
+```
+
+Add `--cpus`, `--memory` and `--disk` to size it; `yo` never sizes an instance. Give every instance its own free `<port>`. `yo` has to know the port that reaches an instance's initrd sshd before the first start, and `ssh_port()` is the one place that answers: 60022 for the default instance, and for any other the `ssh.localPort` that `limactl list <name> --json` reports. A port of 0, which makes lima pick a new one on every start, or a missing or malformed one, is an error. `yo` never guesses: the default box answers on 60022 and accepts the same lima key, so a fallback would probe, and unlock, the wrong machine.
+
+**What bootstrap adds per instance**, for removing one by hand after `limactl delete <name>`:
+
+- one `Include ~/.lima/<name>/ssh.config` line at the top of `~/.ssh/config`. `yo` asks first when it has a terminal, and otherwise prints the line;
+- a herdr machine with the target `<name>` (`herdr machine list --json` shows it);
+- inside `~/.lima/<name>/`, which `limactl delete` removes: the editor block `Match host lima-<name> user agent`, the host-key pin block and the herdr alias `Host <name>` (all re-applied to `ssh.config` on every `yo` run), and `known_hosts` with the guest's host keys.
+
+Each instance's blocks live in that instance's own `ssh.config`, so writing one never rewrites another, and a second bootstrap of the same instance changes nothing. `TODO.md` lists the host-global state that several running boxes still share: the LUKS key, the AWS broker, the `yolobox` remote of `yo link` and the mirrored host ports.
+
 ## The guest helper
 
 `yo bootstrap` reads the profile and booted generations without the helper, over plain ssh (`guest_generations`), because the nixos-lima image a first bootstrap starts from has no `yolobox-guest` yet. Reading them through the helper made that first bootstrap die with a version-skew error before its reboot into LUKS. That was a regression from `212f5e9`.
