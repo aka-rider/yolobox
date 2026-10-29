@@ -17,7 +17,10 @@ TABLE = "inet yolobox-egress"
 HOOK = "type filter hook output priority -20; policy accept;"
 GATEWAY = "192.168.5.2"
 
-LO_AND_TAILNET = 'oifname { "lo", "tailscale0" } accept'
+# lo and the tailnet, then any yolobox.network.tunnelInterfaces.
+LO_AND_TAILNET = re.compile(
+    r'oifname \{ "lo", "tailscale0"(, "[a-zA-Z0-9_.-]{1,15}")* \} accept'
+)
 LO = 'oifname "lo" accept'
 REPLY = "ct direction reply accept"
 DHCP = "udp sport 68 udp dport 67 ip daddr { 255.255.255.255, %s } accept" % GATEWAY
@@ -88,7 +91,7 @@ def check_rules(text):
     require(len(rules) >= 4, "the file has no reject tail")
     accepts, tail = rules[:-4], rules[-4:]
     require(
-        accepts[:1] == [LO_AND_TAILNET],
+        accepts and LO_AND_TAILNET.fullmatch(accepts[0]) is not None,
         "the first rule is not the lo+tailscale0 accept",
     )
     require(REPLY in accepts, "replies are not accepted")
@@ -98,7 +101,7 @@ def check_rules(text):
     )
     require(all(d in accepts for d in DNS), "the gateway's DNS is not accepted")
     for rule in accepts:
-        known = rule in [LO_AND_TAILNET, REPLY, DHCP, ND, MLD, *DNS]
+        known = LO_AND_TAILNET.fullmatch(rule) or rule in [REPLY, DHCP, ND, MLD, *DNS]
         lan = LAN.fullmatch(rule) is not None and GATEWAY not in rule
         require(known or lan, "unexpected rule before the rejects: %s" % rule)
     require(

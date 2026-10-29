@@ -97,6 +97,21 @@ class TestFullRules(unittest.TestCase):
         with self.assertRaisesRegex(egress_rules.RuleError, "first rule"):
             egress_rules.check_rules(swapped)
 
+    def test_a_tunnel_interface_may_join_lo_and_tailnet_in_the_first_rule(self):
+        egress_rules.check_rules(
+            broken(RULES, FIRST_RULE, 'oifname { "lo", "tailscale0", "wg0" } accept\n')
+        )
+
+    def test_the_first_rule_must_keep_lo_and_tailnet(self):
+        for rule in (
+            'oifname { "tailscale0", "wg0" } accept\n',
+            'oifname { "lo", "wg0" } accept\n',
+            'oifname { "lo", "tailscale0", "w g" } accept\n',
+        ):
+            with self.subTest(rule=rule):
+                with self.assertRaisesRegex(egress_rules.RuleError, "first rule"):
+                    egress_rules.check_rules(broken(RULES, FIRST_RULE, rule))
+
     def test_a_missing_reply_accept_fails(self):
         with self.assertRaisesRegex(egress_rules.RuleError, "replies"):
             egress_rules.check_rules(

@@ -6,6 +6,15 @@ let
   table = "inet yolobox-egress";
   tailnetIface = "tailscale0";
 
+  # The first rule accepts what leaves by these. A private egress module (a
+  # tunnel that owns egress) DNATs DNS to an in-tunnel resolver, which sits in
+  # a private range, and the rejects below would refuse it on any interface.
+  # Like tailscale0, traffic out of a listed interface is not judged here.
+  acceptedIfaces = [ "lo" tailnetIface ] ++ cfg.tunnelInterfaces;
+  ifaceSet = lib.concatMapStringsSep ", " (name: "\"${name}\"") acceptedIfaces;
+  # Like lanAllow, a bad name fails the evaluation and never reaches nft.
+  badIfaces = builtins.filter (name: builtins.match "[a-zA-Z0-9_.-]{1,15}" name == null) cfg.tunnelInterfaces;
+
   # Lima's gateway is gvproxy's NAT to the host's own loopback, so it is the one
   # address on the host the guest may speak to, and only for DNS.
   limaGateway = "192.168.5.2";
@@ -70,7 +79,7 @@ let
     table ${table} {
       chain output {
         type filter hook output priority ${hookPriority}; policy accept;
-        oifname { "lo", "${tailnetIface}" } accept
+        oifname { ${ifaceSet} } accept
         ct direction reply accept
         udp sport 68 udp dport 67 ip daddr { 255.255.255.255, ${limaGateway} } accept
         ip daddr ${limaGateway} udp dport 53 accept
@@ -118,11 +127,32 @@ in
     '';
   };
 
+  options.yolobox.network.tunnelInterfaces = lib.mkOption {
+    type = lib.types.listOf lib.types.str;
+    default = [ ];
+    example = [ "wg0" ];
+    description = ''
+      Interfaces whose outgoing traffic this table does not judge, besides lo
+      and tailscale0. For a module that sends the box's egress through a tunnel
+      and rejects what bypasses it: the tunnel is then the gate.
+    '';
+  };
+
   config = {
-    assertions = [{
-      assertion = notCidr == [ ];
-      message = "yolobox.network.lanAllow: not a CIDR: ${lib.concatStringsSep ", " notCidr}";
-    }];
+    assertions = [
+      {
+        assertion = notCidr == [ ];
+        message = "yolobox.network.lanAllow: not a CIDR: ${lib.concatStringsSep ", " notCidr}";
+      }
+      {
+        assertion = badIfaces == [ ];
+        message = "yolobox.network.tunnelInterfaces: not an interface name (1 to 15 of A-Z a-z 0-9 _ . -): ${lib.concatStringsSep ", " badIfaces}";
+      }
+      {
+        assertion = lib.unique acceptedIfaces == acceptedIfaces;
+        message = "yolobox.network.tunnelInterfaces: repeats an interface, or names lo or ${tailnetIface}, which are always accepted: ${lib.concatStringsSep ", " cfg.tunnelInterfaces}";
+      }
+    ];
 
     system.build.egressRules = ruleFile;
     system.build.egressRecoveryRules = recoveryFile;

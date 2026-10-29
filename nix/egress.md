@@ -11,7 +11,7 @@ Lima's gateway, 192.168.5.2, is gvproxy's NAT to the host's own loopback, on eve
 
 These are accepted before the rejects are judged:
 
-- anything that leaves by `lo` or `tailscale0`. The tailnet carries CGNAT and `fd7a:115c:a1e0::/48` addresses, so this rule must come first. It also means the table never judges tailnet traffic, see [The tailnet is an entrance](#the-tailnet-is-an-entrance);
+- anything that leaves by `lo`, `tailscale0` or an interface in `yolobox.network.tunnelInterfaces`. The tailnet carries CGNAT and `fd7a:115c:a1e0::/48` addresses, so this rule must come first. It also means the table never judges tailnet traffic, see [The tailnet is an entrance](#the-tailnet-is-an-entrance), and likewise for a tunnel interface, see [`tunnelInterfaces`](#tunnelinterfaces);
 - replies to flows the outside started (`ct direction reply`), which keeps Lima's inbound ssh to 192.168.5.15:22 working;
 - DHCP (`udp sport 68 udp dport 67`), and only to `255.255.255.255` and the gateway. Port 68 is not privileged for the agent (`net.ipv4.ip_unprivileged_port_start=0` comes from nixos-lima), so a rule that named no destination would let it send UDP to port 67 of any host;
 - DNS, UDP and TCP port 53, to 192.168.5.2 and nothing else on it. This is the one exception on a plain box. DNS goes through the gateway because the lease names it as the resolver;
@@ -42,9 +42,19 @@ IPv4 entries become one `ip daddr { … } accept` and IPv6 entries one `ip6 dadd
 
 An entry that covers the Lima gateway (`192.168.5.2/32`, `192.168.5.0/24`, `192.168.0.0/16`), or `0.0.0.0/0` or `::/0`, cancels the protection: it is accepted before the rejects, so the guest again reaches every port of the host's loopback through the gateway, or every address at all. The evaluation accepts such entries on purpose. Only the root-owned `local.nix` can set the option, so this is the operator's explicit choice, and the table does not second-guess it.
 
+## `tunnelInterfaces`
+
+`yolobox.network.tunnelInterfaces` is a list of interface names, empty by default. Each one joins `lo` and `tailscale0` in the first rule, so with `[ "wg0" ]` the rule renders as `oifname { "lo", "tailscale0", "wg0" } accept`. With the default, the rendered file is byte-identical to one without the option. Traffic out of a listed interface is not judged by this table, exactly like `tailscale0`: the tunnel, and whatever module owns it, is the gate for what goes through.
+
+It exists for a private egress module, a separate nft table that makes a tunnel (WireGuard, Tor or similar) the box's only way out. Such a module redirects DNS to a resolver inside the tunnel, and that resolver sits in a private range. The redirect happens at dstnat (-100), before this table's hook at -20, so the packet this table sees is addressed to the private resolver, and the blocked-destination rejects would refuse it on any interface. Accepting the tunnel interface first lets it through, while a packet that leaves by `enp0s1` for a private address is still rejected.
+
+The module's own table sits at priority -10, after this one at -20. A packet must pass both, and a reject in either is final, so they compose without knowing each other: this table keeps the guest off the host and the LAN, and the private table rejects whatever does not leave by the tunnel.
+
+A name is checked when the box is evaluated: 1 to 15 characters of `A-Za-z0-9_.-` (the kernel's limit is 15), and not a repeat of another entry, `lo` or `tailscale0`. Anything else fails with `yolobox.network.tunnelInterfaces: …`, because the string goes into the rule file and a bad one must not reach `nft`, where it would drop the box into recovery mode. The recovery file never reads the option.
+
 ## The tailnet is an entrance
 
-`oifname { "lo", "tailscale0" } accept` is the first rule, so the table never judges what leaves by `tailscale0`. If the host is itself a node on the tailnet, which it is when the host runs Tailscale, the guest can connect to the host's tailnet address and reach every host service bound to `0.0.0.0` or to that address. The firewall does not stop it. On a default tailnet policy, which allows everything, nothing does. A box with a kill switch module accepts `tailscale0` too.
+`oifname { "lo", "tailscale0" } accept` is the first rule (with any `tunnelInterfaces` after `tailscale0`), so the table never judges what leaves by `tailscale0`. If the host is itself a node on the tailnet, which it is when the host runs Tailscale, the guest can connect to the host's tailnet address and reach every host service bound to `0.0.0.0` or to that address. The firewall does not stop it. On a default tailnet policy, which allows everything, nothing does. A box with a kill switch module accepts `tailscale0` too.
 
 That is by design: the tailnet access policy is the gate. Close it there, with a policy that does not let the box's tag or user reach the host's node. Do not expect this table to.
 
@@ -88,6 +98,6 @@ Between the two loads, on a restart of the unit during a switch, the recovery ta
 
 ## How the rules are tested
 
-The tests read the rendered rule files, not the Nix, because the rendered text is what the kernel runs. `tests/egress_rules.py` parses a file line by line and fails on the first missing property: the table and hook priority, the first rule, DHCP only to the broadcast and the gateway, DNS as the only other thing the gateway gets, every blocked range rejected after the accepts, and a recovery file that accepts only `lo`, replies, DHCP and neighbour discovery and then rejects. `tests/test_egress_rules.py` runs it on copies of the rendered files in `tests/fixtures/` and on broken variants of them that must fail.
+The tests read the rendered rule files, not the Nix, because the rendered text is what the kernel runs. `tests/egress_rules.py` parses a file line by line and fails on the first missing property: the table and hook priority, the first rule (`lo` and `tailscale0`, then any extra interface names), DHCP only to the broadcast and the gateway, DNS as the only other thing the gateway gets, every blocked range rejected after the accepts, and a recovery file that accepts only `lo`, replies, DHCP and neighbour discovery and then rejects. `tests/test_egress_rules.py` runs it on copies of the rendered files in `tests/fixtures/` and on broken variants of them that must fail.
 
 The host has no nix, so those copies are made in the guest: `nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRules` (and `egressRecoveryRules`) prints a store path, and the file at that path replaces `tests/fixtures/egress.nft` (and `egress-recovery.nft`). CI renders the same two files from the commit, runs the checker on them and diffs them against the copies, so a copy cannot drift from `egress.nix`. That job fails after any edit of the rules until the copies are refreshed. The unit's own properties (no `ExecStop`, `tailscaled` gated, `dhcpcd` not) are not in a rule file and stay source checks in `tests/test_consistency.py`.
