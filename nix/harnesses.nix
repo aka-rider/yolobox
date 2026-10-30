@@ -207,7 +207,7 @@ let
       # Scripts ON: agent-browser's postinstall IS the download of
       # its prebuilt binary. That download fails silently, so the version call
       # below is the hard check rather than a courtesy. Pinned to the version
-      # pi-agent-browser-native 0.8.2 recommends; it accepts 0.35.0 and newer,
+      # pi-agent-browser-native 0.9.6 recommends; it accepts 0.35.0 and newer,
       # and refuses browser-backed calls below that floor, at call time, not here.
       install_agent_browser() {
         agent-browser --version >/dev/null 2>&1 || npm install -g agent-browser@0.38.1
