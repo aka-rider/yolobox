@@ -13,8 +13,8 @@ let
 in
 {
   # The unlock relies on stage 1 being systemd: password agents, unit ordering
-  # and the migration unit all assume it.
-  boot.initrd.systemd.enable = true;
+  # and the migration unit all assume it. nixpkgs removed the scripted initrd
+  # and with it `boot.initrd.systemd.enable`: systemd stage 1 is the only one.
 
   # The cidata ISO is mounted in the initrd to read lima's key.
   boot.initrd.kernelModules = [ "isofs" ];
