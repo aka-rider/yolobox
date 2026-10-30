@@ -126,7 +126,8 @@ Tests, all under `tests/`:
 - `test_yo_luks.py`: the passphrase derivation and the ssh agent protocol.
 - `test_egress_rules.py`: runs `tests/egress_rules.py` on the rendered egress
   rule files in `tests/fixtures/`, and on broken copies. CI diffs the fixtures
-  against a fresh render. `nix/egress.md`.
+  against a fresh render; `render-tunnel-egress.sh` renders the one with
+  `tunnelInterfaces`. `nix/egress.md`.
 - `test_luks_scripts.py`: runs the three initrd scripts under bash.
 
 ## Build, test, release

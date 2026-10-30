@@ -28,7 +28,7 @@ jobs:
         run: ./yo --help
 
       - name: Shellcheck the guest helper
-        run: shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh
+        run: shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh tests/render-tunnel-egress.sh
 
   # 3.9 is the floor yo promises; the newest 3.x catches the other direction.
   # The 3.9 leg is pinned to ubuntu-24.04 because setup-python has no 3.9 build
@@ -105,6 +105,7 @@ jobs:
             file="$(nix eval --impure --raw ".#nixosConfigurations.yolobox.config.system.build.$rules")"
             sudo nft --check --file "$file"
           done
+          sudo nft --check --file "$(tests/render-tunnel-egress.sh)"
 
       # The rendered files are what the kernel runs, so the egress tests read
       # them, not the Nix. The host has no nix, so the unit tests run on copies
@@ -115,9 +116,11 @@ jobs:
         run: |
           rules="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRules)"
           recovery="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRecoveryRules)"
-          python3 tests/egress_rules.py "$rules" "$recovery"
+          tunnel="$(tests/render-tunnel-egress.sh)"
+          python3 tests/egress_rules.py "$rules" "$recovery" "$tunnel"
           diff -u tests/fixtures/egress.nft "$rules"
           diff -u tests/fixtures/egress-recovery.nft "$recovery"
+          diff -u tests/fixtures/egress-tunnel.nft "$tunnel"
 
       # lanAllow goes into the rule files as text, so a bad entry must fail the
       # evaluation: nft would reject it at load and drop the box into recovery

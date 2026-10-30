@@ -25,10 +25,13 @@ let
   blockedV4 = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255";
   blockedV6 = "fc00::/7, fe80::/10, ff00::/8";
 
-  # Runs after every rerouting hook (mangle -150, dstnat -100), so the oif
-  # judged here is the final one. -20 is strictly before a kill switch module's
-  # -10: with equal priorities the kernel orders chains by load order, which is
-  # not fixed. Either table's reject is final.
+  # Runs after the hooks that change a packet (mangle -150, dstnat -100), so
+  # the destination judged here is the final one. The oif is not: every chain
+  # of the output hook sees the interface of the route taken before the hook,
+  # and a DNAT that reroutes does not update it (nix/egress.md). -20 is
+  # strictly before a kill switch module's -10: with equal priorities the
+  # kernel orders chains by load order, which is not fixed. Either table's
+  # reject is final.
   hookPriority = "-20";
 
   logRate = "6/minute burst 3 packets";
@@ -68,6 +71,26 @@ let
     (lib.optional (lanV4 != [ ]) "ip daddr { ${lib.concatStringsSep ", " lanV4} } accept"
       ++ lib.optional (lanV6 != [ ]) "ip6 daddr { ${lib.concatStringsSep ", " lanV6} } accept");
 
+  # With tunnel interfaces, a packet a DNAT rerouted into the tunnel would be
+  # judged by the interface of its first route. So the output chain leaves a
+  # rewritten packet to a postrouting chain, where the oif is the one it leaves
+  # by, and judges it there: the same accepted interfaces, the same blocked
+  # ranges, and drop, because reject is not allowed in postrouting. Without
+  # tunnel interfaces nothing is rendered: the box rewrites nothing.
+  hasTunnels = cfg.tunnelInterfaces != [ ];
+  rewrittenDefer = lib.optionalString hasTunnels "\n    ct status dnat accept";
+  rewrittenChain = lib.optionalString hasTunnels (lib.concatMapStrings (line: "\n  " + line) [
+    "chain postrouting {"
+    "  type filter hook postrouting priority ${hookPriority}; policy accept;"
+    "  ct direction reply accept"
+    "  ct status dnat oifname { ${ifaceSet} } accept"
+    "  ct status dnat ip daddr { ${blockedV4} } limit rate ${logRate} log prefix \"yolobox-egress: blocked: \" level warn"
+    "  ct status dnat ip daddr { ${blockedV4} } counter drop"
+    "  ct status dnat ip6 daddr { ${blockedV6} } limit rate ${logRate} log prefix \"yolobox-egress: blocked: \" level warn"
+    "  ct status dnat ip6 daddr { ${blockedV6} } counter drop"
+    "}"
+  ]);
+
   # One atomic nft transaction: `table`, `delete table` and `table {..}` in one
   # file, so a reload swaps the rules with no instant at which the table is
   # missing. builtins.toFile, not pkgs.writeText: the text names no store path,
@@ -80,7 +103,7 @@ let
       chain output {
         type filter hook output priority ${hookPriority}; policy accept;
         oifname { ${ifaceSet} } accept
-        ct direction reply accept
+        ct direction reply accept${rewrittenDefer}
         udp sport 68 udp dport 67 ip daddr { 255.255.255.255, ${limaGateway} } accept
         ip daddr ${limaGateway} udp dport 53 accept
         ip daddr ${limaGateway} tcp dport 53 accept
@@ -92,7 +115,7 @@ let
         ip daddr { ${blockedV4} } counter reject with icmpx type admin-prohibited
         ip6 daddr { ${blockedV6} } limit rate ${logRate} log prefix "yolobox-egress: blocked: " level warn
         ip6 daddr { ${blockedV6} } counter reject with icmpx type admin-prohibited
-      }
+      }${rewrittenChain}
     }
   '';
 

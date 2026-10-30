@@ -15,6 +15,7 @@ from test_yo import yo
 FIXTURES = Path(__file__).parent / "fixtures"
 RULES = (FIXTURES / "egress.nft").read_text()
 RECOVERY = (FIXTURES / "egress-recovery.nft").read_text()
+TUNNEL = (FIXTURES / "egress-tunnel.nft").read_text()
 
 FIRST_RULE = 'oifname { "lo", "tailscale0" } accept\n'
 V4_REJECT = (
@@ -97,20 +98,29 @@ class TestFullRules(unittest.TestCase):
         with self.assertRaisesRegex(egress_rules.RuleError, "first rule"):
             egress_rules.check_rules(swapped)
 
-    def test_a_tunnel_interface_may_join_lo_and_tailnet_in_the_first_rule(self):
-        egress_rules.check_rules(
-            broken(RULES, FIRST_RULE, 'oifname { "lo", "tailscale0", "wg0" } accept\n')
-        )
+    def test_a_tunnel_interface_judged_only_by_its_oif_fails(self):
+        # The design of 279f822: a DNAT into the tunnel kept the oif of its
+        # first route, so the accept missed the packets it was for.
+        with self.assertRaisesRegex(egress_rules.RuleError, "first rule"):
+            egress_rules.check_rules(
+                broken(
+                    RULES, FIRST_RULE, 'oifname { "lo", "tailscale0", "wg0" } accept\n'
+                )
+            )
 
-    def test_the_first_rule_must_keep_lo_and_tailnet(self):
-        for rule in (
-            'oifname { "tailscale0", "wg0" } accept\n',
-            'oifname { "lo", "wg0" } accept\n',
-            'oifname { "lo", "tailscale0", "w g" } accept\n',
-        ):
-            with self.subTest(rule=rule):
-                with self.assertRaisesRegex(egress_rules.RuleError, "first rule"):
-                    egress_rules.check_rules(broken(RULES, FIRST_RULE, rule))
+    def test_the_default_file_does_not_wave_dnat_through(self):
+        with self.assertRaisesRegex(egress_rules.RuleError, "unexpected rule"):
+            egress_rules.check_rules(
+                broken(
+                    RULES,
+                    "    ct direction reply accept\n",
+                    "    ct direction reply accept\n    ct status dnat accept\n",
+                )
+            )
+
+    def test_the_tunnel_file_is_not_the_default_file(self):
+        with self.assertRaises(egress_rules.RuleError):
+            egress_rules.check_rules(TUNNEL)
 
     def test_a_missing_reply_accept_fails(self):
         with self.assertRaisesRegex(egress_rules.RuleError, "replies"):
@@ -142,6 +152,73 @@ class TestFullRules(unittest.TestCase):
 
     def test_the_table_is_the_one_yo_inspects(self):
         self.assertEqual(egress_rules.TABLE, yo.EGRESS_TABLE)
+
+
+TUNNEL_FIRST = 'oifname { "lo", "tailscale0", "wg0" } accept\n'
+DEFER = "    ct status dnat accept\n"
+POST_ACCEPT = 'ct status dnat oifname { "lo", "tailscale0", "wg0" } accept\n'
+POST_V4_DROP = (
+    "    ct status dnat ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16,"
+    " 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter drop\n"
+)
+
+
+class TestTunnelRules(unittest.TestCase):
+    def test_the_rendered_file_passes(self):
+        egress_rules.check_tunnel_rules(TUNNEL)
+
+    def test_the_first_rule_must_keep_lo_and_tailnet(self):
+        for rule in (
+            'oifname { "tailscale0", "wg0" } accept\n',
+            'oifname { "lo", "wg0" } accept\n',
+            'oifname { "lo", "tailscale0", "w g" } accept\n',
+            FIRST_RULE,
+        ):
+            with self.subTest(rule=rule):
+                with self.assertRaisesRegex(egress_rules.RuleError, "first rule"):
+                    egress_rules.check_tunnel_rules(broken(TUNNEL, TUNNEL_FIRST, rule))
+
+    def test_a_dnat_judged_only_in_output_fails(self):
+        # Without the postrouting chain a DNS query DNATed into the tunnel is
+        # rejected by the oif of its first route (nix/egress.md).
+        without = broken(TUNNEL, DEFER, "")
+        without = without[: without.index("  chain postrouting")] + "}\n"
+        with self.assertRaisesRegex(egress_rules.RuleError, "chains are"):
+            egress_rules.check_tunnel_rules(without)
+        with self.assertRaisesRegex(egress_rules.RuleError, "postrouting"):
+            egress_rules.check_tunnel_rules(broken(TUNNEL, DEFER, ""))
+
+    def test_postrouting_judges_by_the_same_interfaces(self):
+        for new in (
+            'ct status dnat oifname { "lo", "tailscale0", "wg0", "enp0s1" } accept\n',
+            'ct status dnat oifname { "lo", "tailscale0" } accept\n',
+            "ct status dnat accept\n",
+            'oifname { "lo", "tailscale0", "wg0" } accept\n',
+        ):
+            with self.subTest(new=new):
+                with self.assertRaisesRegex(egress_rules.RuleError, "postrouting"):
+                    egress_rules.check_tunnel_rules(broken(TUNNEL, POST_ACCEPT, new))
+
+    def test_postrouting_drops_every_blocked_range(self):
+        for old, new in (
+            (POST_V4_DROP, POST_V4_DROP.replace("169.254.0.0/16, ", "")),
+            (POST_V4_DROP, POST_V4_DROP.replace("ct status dnat ", "")),
+            (POST_V4_DROP, POST_V4_DROP.replace("drop", "accept")),
+            (POST_V4_DROP, ""),
+        ):
+            with self.subTest(new=new):
+                with self.assertRaises(egress_rules.RuleError):
+                    egress_rules.check_tunnel_rules(broken(TUNNEL, old, new))
+
+    def test_postrouting_runs_with_the_output_chain_at_minus_20(self):
+        with self.assertRaisesRegex(egress_rules.RuleError, "priority -20"):
+            egress_rules.check_tunnel_rules(
+                broken(TUNNEL, "postrouting priority -20", "postrouting priority -10")
+            )
+
+    def test_the_output_chain_keeps_its_rejects(self):
+        with self.assertRaises(egress_rules.RuleError):
+            egress_rules.check_tunnel_rules(broken(TUNNEL, V4_REJECT, ""))
 
 
 class TestRecoveryRules(unittest.TestCase):

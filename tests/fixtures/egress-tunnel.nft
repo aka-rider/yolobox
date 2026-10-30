@@ -1,0 +1,30 @@
+table inet yolobox-egress
+delete table inet yolobox-egress
+table inet yolobox-egress {
+  chain output {
+    type filter hook output priority -20; policy accept;
+    oifname { "lo", "tailscale0", "wg0" } accept
+    ct direction reply accept
+    ct status dnat accept
+    udp sport 68 udp dport 67 ip daddr { 255.255.255.255, 192.168.5.2 } accept
+    ip daddr 192.168.5.2 udp dport 53 accept
+    ip daddr 192.168.5.2 tcp dport 53 accept
+    
+    icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+    # MLD reports go to link-local groups; ff02::/16 stops the accept passing one off the link.
+    icmpv6 type { mld-listener-report, mld2-listener-report } ip6 daddr ff02::/16 accept
+    ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
+    ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter reject with icmpx type admin-prohibited
+    ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
+    ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } counter reject with icmpx type admin-prohibited
+  }
+  chain postrouting {
+    type filter hook postrouting priority -20; policy accept;
+    ct direction reply accept
+    ct status dnat oifname { "lo", "tailscale0", "wg0" } accept
+    ct status dnat ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
+    ct status dnat ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter drop
+    ct status dnat ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
+    ct status dnat ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } counter drop
+  }
+}
