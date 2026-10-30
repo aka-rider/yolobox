@@ -34,4 +34,5 @@ Sibling `.md` files are safe to add. No package installs them: `nix/pkgs/yolobox
 | [../nix/tailscale.md](../nix/tailscale.md) | The optional tailnet: why `tailscale0` is trusted and what that opens, sshd on two interfaces, `tailscaled-set`, DNS and logging, relayed-contact log lines, login, box-local routes. |
 | [../nix/guest/yolobox-guest.md](../nix/guest/yolobox-guest.md) | The guest helper script: `net-check` and the gateway-blocked marker, the project walk, `BUILD_DIRS` and `LOCAL_CACHES`, guards, version skew, and the gc tiers. |
 | [../nix/pkgs/far2l.md](../nix/pkgs/far2l.md) | The far2l build and S3 through the broker. |
+| [../nix/pkgs/tailscale.md](../nix/pkgs/tailscale.md) | Why tailscale is pinned ahead of nixpkgs, the assertion that removes the pin, and how to bump it. |
 | [../.github/workflows/release.md](../.github/workflows/release.md) | Moving the release tag, `bump-tap` and `actions/checkout`, the early refusals, `verify.yml`, and pinned actions. |

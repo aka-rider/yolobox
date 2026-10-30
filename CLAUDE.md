@@ -104,7 +104,9 @@ Box configuration (Nix):
   - `basedpyright.nix`: the Python language-server definition.
 - `nix/pkgs/`: packages nixpkgs lacks or lags on.
   - `far2l.nix` (`nix/pkgs/far2l.md`), `herdr-bin.nix` (the pinned herdr
-    release asset) and `yolobox.nix` (`yo` itself, with the version baked in).
+    release asset), `tailscale.nix` (a pin ahead of nixpkgs that removes itself
+    when nixpkgs catches up, `nix/pkgs/tailscale.md`) and `yolobox.nix` (`yo`
+    itself, with the version baked in).
 
 Release and repo plumbing:
 

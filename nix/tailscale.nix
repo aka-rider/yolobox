@@ -7,6 +7,8 @@
 
   services.tailscale = {
     enable = true;
+    # nixos-unstable lags tailscale's releases; see nix/pkgs/tailscale.md.
+    package = pkgs.callPackage ./pkgs/tailscale.nix { };
     openFirewall = true;
     # TS_NO_LOGS_NO_SUPPORT=true: no log uploads to log.tailscale.com, and with
     # them no Tailscale support for this node.
