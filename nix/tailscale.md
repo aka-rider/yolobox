@@ -79,9 +79,11 @@ tailscaled has no switch for this line, and its verbosity flags only add lines. 
 
 ## Exit nodes
 
-`--exit-node-allow-lan-access` is in `extraSetFlags`. When an exit node is selected, tailscaled sends all traffic through table 52 to the exit node, and without this flag that includes the replies to Lima's ssh on 192.168.5.0/24, so `yo ssh` drops. The flag is expected to keep that subnet out of table 52. It does nothing until an exit node is chosen. It does not open the LAN: the [egress table](egress.md) still rejects private ranges except the networks named in `yolobox.network.lanAllow`, which are reachable as before. Lima's ssh replies on 192.168.5.0/24 pass as replies to connections the outside started (`ct direction reply`).
+`--exit-node-allow-lan-access` is in `extraSetFlags`. When an exit node is selected, tailscaled sends all traffic through table 52 to the exit node, and without this flag that includes the replies to Lima's ssh on 192.168.5.0/24, so `yo ssh` drops. The flag keeps that subnet out of table 52. It does nothing until an exit node is chosen. It does not open the LAN: the [egress table](egress.md) still rejects private ranges except the networks named in `yolobox.network.lanAllow`, which are reachable as before. Lima's ssh replies on 192.168.5.0/24 pass as replies to connections the outside started (`ct direction reply`).
 
-Not yet verified on a live box. To check, run `yo ssh sudo tailscale set --exit-node=<node>` and see whether `yo ssh` stays up. Without the flag, the expectation is that it drops once an exit node is selected.
+Verified live on 2026-10-30, on a second instance built from local `main` at commit `57607a8` (tailscale 1.104.4), with egress off and the tailnet exit node `komora` (100.64.0.1) selected. `tailscale debug prefs` showed `ExitNodeAllowLANAccess: true`, `ip route show table 52` held `throw 192.168.5.0/24` and `throw 127.0.0.0/8`, and `yo ssh` kept working for the whole time the exit node was selected.
+
+Not tested: whether `yo ssh` drops without the flag. The expectation is that it does, because table 52 then carries the replies to Lima's ssh. To check, build a box without the flag, run `yo ssh sudo tailscale set --exit-node=<node>`, and see whether `yo ssh` stays up.
 
 ## Login
 
