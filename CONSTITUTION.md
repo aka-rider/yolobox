@@ -89,6 +89,7 @@ Identify whether you are running on the host (macOS) or the guest (Linux).
 - ALWAYS glob-escape a guest source in `yo cp`, and NEVER escape a guest destination. scp expands wildcards in remote sources only, so escaping a destination creates a file named with backslashes. [story](yo.md#yo-cp)
 - NEVER upload a symlink with `yo cp`. `scp -r` follows it and copies the target, which can be a private file the user never named. [story](yo.md#yo-cp)
 - ALWAYS stage a `yo cp` download beside its destination and plan the merge before anything moves. scp writes through a symlink at the destination, and the agent controls what a pulled repo contains. [story](yo.md#yo-cp)
+- NEVER let a `yo cp` download land a version-control or auto-exec control path. `.git`, `.hg`, `.svn`, `.envrc`, `.vscode` and `.idea`, matched case-insensitively at any depth, are skipped and reported, because the agent writes them and the host would run them as the operator on the next git command, `cd` or editor open. [story](yo.md#downloads-never-land-control-paths)
 
 ## Paths
 

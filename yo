@@ -2780,6 +2780,10 @@ def local_cp_operand(operand: str) -> str:
     return os.path.join(os.getcwd(), operand)
 
 
+def walk_failure(failure: OSError) -> None:
+    raise YoError("cannot read %s: %s" % (failure.filename, failure.strerror))
+
+
 def refuse_symlinks_in(source: str) -> None:
     # scp -r follows symlinks and uploads what they point at, so a link the
     # agent pushed into a repo (leak -> ~/.ssh/id_ed25519) would copy a file
@@ -2789,9 +2793,6 @@ def refuse_symlinks_in(source: str) -> None:
             'refusing to upload symlink "%s": scp would copy its target "%s", not the link'
             % (link, os.readlink(link))
         )
-
-    def fail(failure: OSError) -> None:
-        raise YoError("cannot read %s: %s" % (failure.filename, failure.strerror))
 
     # lstat of "link/" follows the link, so a trailing slash would hide it.
     source = source.rstrip("/") or "/"
@@ -2803,7 +2804,8 @@ def refuse_symlinks_in(source: str) -> None:
         refuse(source)
     if not stat.S_ISDIR(mode):
         return
-    for directory, subdirs, files in os.walk(source, onerror=fail, followlinks=False):
+    walk = os.walk(source, onerror=walk_failure, followlinks=False)
+    for directory, subdirs, files in walk:
         for name in subdirs + files:
             path = os.path.join(directory, name)
             if os.path.islink(path):
@@ -2872,24 +2874,126 @@ def unlock_tree(path: str) -> None:
     # scp -p keeps a guest directory's mode, and sftp-mode scp adds only u+wx
     # to it: a read-only directory (a Go module cache) refuses to lose its
     # children, and an agent-side chmod 300 leaves one nobody can list. Top
-    # down, so each directory is readable before it is entered. Symlinks are
-    # never followed: chmod would reach the Mac file they point at.
-    os.chmod(path, 0o700)
+    # down, so each directory is readable before it is entered. It adds u+rwx
+    # so the tree can be walked and removed; group and other bits stay as scp
+    # made them, so a landed directory keeps the mode scp -p gave it. Symlinks
+    # are never followed: chmod would reach the Mac file they point at.
+    mode = os.lstat(path).st_mode
+    if stat.S_ISLNK(mode):
+        return
+    os.chmod(path, stat.S_IMODE(mode) | 0o700)
     with os.scandir(path) as entries:
         subdirs = [e.path for e in entries if e.is_dir(follow_symlinks=False)]
     for subdir in subdirs:
         unlock_tree(subdir)
 
 
+def remove_tree(path: str) -> None:
+    unlock_tree(path)
+    shutil.rmtree(path)
+
+
 def remove_staging(path: str) -> None:
     try:
-        unlock_tree(path)
-        shutil.rmtree(path)
+        remove_tree(path)
     except OSError as failure:
         raise YoError(
             'cannot remove the staging directory "%s": %s; delete it by hand'
             % (path, failure.strerror or failure)
         )
+
+
+# Names that make git, an editor or direnv execute what a tree says the next
+# time the operator touches it. A pulled guest tree never lands these: the
+# agent writes them (yo.md, "Downloads never land control paths").
+# Compared with casefold(), because APFS folds names with Unicode case folding
+# (.GIT and .vſcode are .git and .vscode).
+LANDING_CONTROL_NAMES = frozenset({".git", ".hg", ".svn", ".envrc", ".vscode", ".idea"})
+
+
+def is_control_name(name: str) -> bool:
+    return name.casefold() in LANDING_CONTROL_NAMES
+
+
+# Build output and dependency installs a pulled tree never lands: the project's
+# own tooling recreates them, and they dwarf the source. The same names the
+# guest's gc knows (BUILD_DIRS, REMOVED_OUTRIGHT and NEEDS_MANIFEST in
+# nix/guest/yolobox-guest.sh); tests/test_consistency.py keeps them equal. A
+# value names the manifest that must sit beside the directory, because the
+# name alone proves nothing: a `target` with no Cargo.toml may hold data.
+BUILD_OUTPUT: Dict[str, Optional[str]] = {
+    "node_modules": None,
+    ".venv": None,
+    "target": "Cargo.toml",
+    ".next": "package.json",
+}
+
+CONTROL_PATH_NOTE = (
+    "version-control and editor/direnv control paths are never copied to the "
+    "host, because they run code as you"
+)
+BUILD_OUTPUT_NOTE = (
+    "build output is never copied to the host; the project's tooling recreates it"
+)
+
+
+def is_build_output(directory: str, name: str) -> bool:
+    # Only a real directory counts: a file or a link called node_modules is not
+    # build output. The manifest must be a regular file beside it, so a
+    # manifest that is itself a directory proves nothing either.
+    path = os.path.join(directory, name)
+    if name not in BUILD_OUTPUT or os.path.islink(path) or not os.path.isdir(path):
+        return False
+    manifest = BUILD_OUTPUT[name]
+    if manifest is None:
+        return True
+    try:
+        mode = os.lstat(os.path.join(directory, manifest)).st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode)
+
+
+def drop_from_staging(staging: str) -> None:
+    # The one place a staged tree is judged. It prunes the staging tree, not
+    # the move list, because a directory with no counterpart on the Mac moves
+    # as one rename and never reaches plan_merge's per-entry walk.
+    # Every entry is judged once, and a dropped directory is never entered, so
+    # a control path inside build output is not reported on its own.
+    # The entries of the staging directory itself are the sources the operator
+    # named, so they are never judged as build output; control names are.
+    skipped: List[Tuple[str, str]] = []
+
+    unlock_tree(staging)
+    for directory, subdirs, files in os.walk(staging, onerror=walk_failure):
+        at_top = directory == staging
+        judged = {
+            name: CONTROL_PATH_NOTE for name in subdirs + files if is_control_name(name)
+        }
+        if not at_top:
+            judged.update(
+                {
+                    name: BUILD_OUTPUT_NOTE
+                    for name in subdirs
+                    if is_build_output(directory, name)
+                }
+            )
+        for name in sorted(judged):
+            path = os.path.join(directory, name)
+            skipped.append((os.path.relpath(path, staging), judged[name]))
+            try:
+                if os.path.islink(path) or not os.path.isdir(path):
+                    os.unlink(path)
+                else:
+                    remove_tree(path)
+            except OSError as failure:
+                raise YoError(
+                    'cannot drop "%s" from the download: %s'
+                    % (path, failure.strerror or failure)
+                )
+        subdirs[:] = [d for d in subdirs if d not in judged]
+    for relative, note in skipped:
+        err('yo: skipped "%s": %s' % (relative, note))
 
 
 def land_staged(moves: Sequence[Tuple[str, str]]) -> None:
@@ -2926,6 +3030,7 @@ def download_from_guest(sources: Sequence[str], dest: str) -> None:
         )
     try:
         scp_to(sources, staging)
+        drop_from_staging(staging)
         moves: List[Tuple[str, str]] = []
         for name in sorted(os.listdir(staging)):
             target = os.path.join(dest, name) if dest_is_dir else new_name

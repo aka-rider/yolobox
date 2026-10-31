@@ -469,6 +469,21 @@ class TestGcHelpNamesEverythingItDeletes(unittest.TestCase):
                 f"`yo gc --help` does not name the manifest '{manifest}'",
             )
 
+    def test_yo_cp_drops_exactly_the_names_gc_knows(self):
+        gc_names = set(self.script_array("BUILD_DIRS")) | set(
+            self.script_array("REMOVED_OUTRIGHT")
+        )
+        self.assertEqual(set(yo.BUILD_OUTPUT), gc_names)
+
+    def test_yo_cp_requires_the_same_manifests_gc_requires(self):
+        gc_manifests = dict(
+            entry.split(":") for entry in self.script_array("NEEDS_MANIFEST")
+        )
+        yo_manifests = {
+            name: manifest for name, manifest in yo.BUILD_OUTPUT.items() if manifest
+        }
+        self.assertEqual(yo_manifests, gc_manifests)
+
     def clean_commands_the_script_runs(self):
         # `in_project_env "${root}" make clean`: the tool and `clean` straight
         # after the root. `make -n clean`, the dry run, has `-n` in between
@@ -717,6 +732,43 @@ class TestEgressUnitNeverOpensTheBox(unittest.TestCase):
         self.assertNotIn("ExecStartPre", dhcpcd)
         self.assertNotIn("list table", dhcpcd)
         self.assertIn('after = [ "yolobox-egress.service" ];', dhcpcd)
+
+
+def backticked_dot_names(text):
+    return set(re.findall(r"`(\.[a-z]+)`", text))
+
+
+class TestLandingControlNamesMatchTheirTwoStories(unittest.TestCase):
+    """The names `yo cp` refuses to land are spelled in three places."""
+
+    def constitution_rule(self):
+        (rule,) = [
+            line
+            for line in (REPO / "CONSTITUTION.md").read_text().splitlines()
+            if "download land a version-control" in line
+        ]
+        return rule
+
+    def yo_md_sentence(self):
+        text = (REPO / "yo.md").read_text()
+        (sentence,) = [
+            sentence
+            for sentence in re.split(r"(?<=\.) (?=[A-Z])", text)
+            if "LANDING_CONTROL_NAMES" in sentence
+        ]
+        return sentence
+
+    def test_the_constitution_rule_lists_exactly_the_names_yo_drops(self):
+        self.assertEqual(
+            backticked_dot_names(self.constitution_rule()),
+            set(yo.LANDING_CONTROL_NAMES),
+        )
+
+    def test_yo_md_lists_exactly_the_names_yo_drops(self):
+        self.assertEqual(
+            backticked_dot_names(self.yo_md_sentence()),
+            set(yo.LANDING_CONTROL_NAMES),
+        )
 
 
 class TestThereIsNoDirenvInTheBox(unittest.TestCase):

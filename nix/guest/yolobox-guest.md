@@ -48,6 +48,8 @@ Pruning `BUILD_DIRS` opens a failure shape that looks exactly like the old maxde
 
 `LOCAL_CACHES` is the single spelling of the cache names `gc --yes` deletes under `~/.cache`. Its rule: only caches a tool rebuilds or refetches by itself belong in it. Model weights and app data never do (`~/.cache/huggingface`, `modelscope`, `ms-playwright`, and `~/.cache/rune`, which is a macOS SDK), because losing them costs a download the box cannot necessarily repeat, or breaks a tool outright. Rust and Go caches are dropped by plain `--yes` even though a module cache needs the network to come back, because they are the bulk of the space. Cargo's `registry` and `git` are fixed paths spelled once in `cache_targets`. The Go caches have no fixed path at all; see "Guards" below.
 
+The host-side `yo cp` download drops the union of `BUILD_DIRS` and `REMOVED_OUTRIGHT`, under the `NEEDS_MANIFEST` rule, from a pulled tree before it lands (see `yo.md`, "Downloads never land build output"). The spellings are kept equal by the consistency tests, so a new name goes into the shell arrays and `yo`'s `BUILD_OUTPUT` together.
+
 `yo gc --help` names every entry of both arrays, and every directory and clean command the `--deep` tier can act on. `TestGcHelpNamesEverythingItDeletes` fails when the help stops naming one.
 
 ## Guards

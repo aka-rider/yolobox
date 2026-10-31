@@ -15,7 +15,9 @@
 
 # The one place the project walk's and the Go-cache walk's pruned directory
 # names are spelled: a repo inside node_modules is not a project. gc --deep
-# walks these names too, plus REMOVED_OUTRIGHT.
+# walks these names too, plus REMOVED_OUTRIGHT. `yo cp` downloads drop the same
+# names on the host side (BUILD_OUTPUT in `yo`), kept equal by
+# tests/test_consistency.py.
 BUILD_DIRS=(node_modules target .next)
 
 # Directories gc --deep removes with remove_tree, each only if git ignores it.

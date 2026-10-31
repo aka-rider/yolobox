@@ -357,7 +357,7 @@ class TestCpArgv(CpHarness):
         self.assertIn("lima-yolobox:/home/agent/x", calls["run"])
 
 
-class TestCpFromGuestNeverWritesThroughSymlinks(CpHarness):
+class CpFromGuestHarness(CpHarness):
     """scp is faked by a function that writes files into whatever directory
     cmd_cp told it to download into, like the real one would."""
 
@@ -365,8 +365,9 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpHarness):
         super().setUp()
         self.scp_destinations = []
 
-    def copy(self, paths, guest_files, scp_fails=False):
+    def copy(self, paths, guest_files, scp_fails=False, guest_modes=None):
         # guest_files: {relative path inside the download dir: content}
+        # guest_modes: {relative directory: mode scp -p would have kept}
         def fake_run(argv, **kwargs):
             destination = argv[-1]
             self.scp_destinations.append(destination)
@@ -377,6 +378,8 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpHarness):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w") as handle:
                     handle.write(content)
+            for relative, mode in (guest_modes or {}).items():
+                os.chmod(os.path.join(destination, relative), mode)
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         with (
@@ -396,6 +399,22 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpHarness):
     def leftovers(self, directory):
         return [n for n in os.listdir(directory) if n.startswith(".yo-cp-")]
 
+    def pull(self, guest_files, source=":~/proj", guest_modes=None):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            yo, "err", side_effect=lambda line="": stderr.write(line + "\n")
+        ):
+            self.copy([source, "dest/"], guest_files, guest_modes=guest_modes)
+        return stderr.getvalue()
+
+    def landed(self):
+        found = []
+        for directory, _, files in os.walk("dest"):
+            found += [os.path.join(directory, f) for f in files]
+        return sorted(found)
+
+
+class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
     def test_a_symlink_inside_an_existing_destination_tree_is_not_written_through(
         self,
     ):
@@ -639,6 +658,213 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpHarness):
 
 
 STALE_REMOTE = "ssh://lima-yolobox/home/alice.guest/wrk/rune"
+
+
+class TestCpFromGuestNeverLandsControlPaths(CpFromGuestHarness):
+    """A pulled .git/config (fsmonitor, pager, core.hooksPath) or .envrc runs
+    as the operator on the next git or shell command, so none of them lands."""
+
+    def test_control_paths_are_skipped_and_reported_but_ordinary_files_land(self):
+        os.makedirs("dest/proj")
+        Path("dest/proj/main.py").write_text("old")
+        reported = self.pull(
+            {
+                "proj/.git/config": "[core]\nfsmonitor = evil",
+                "proj/.envrc": "evil",
+                "proj/.vscode/settings.json": "{}",
+                "proj/main.py": "new",
+                "proj/src/lib.py": "lib",
+            }
+        )
+        self.assertEqual(self.landed(), ["dest/proj/main.py", "dest/proj/src/lib.py"])
+        self.assertEqual(self.read("dest/proj/main.py"), "new")
+        for skipped in (".git", ".envrc", ".vscode"):
+            self.assertIn('skipped "proj/%s"' % skipped, reported)
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_control_names_are_matched_case_insensitively(self):
+        # APFS folds .GIT into .git, so the spelling must not matter.
+        os.makedirs("dest")
+        reported = self.pull({"proj/.GIT/config": "evil", "proj/Ok.txt": "ok"})
+        self.assertEqual(self.landed(), ["dest/proj/Ok.txt"])
+        self.assertIn('skipped "proj/.GIT"', reported)
+
+    def test_a_nested_control_path_in_a_tree_new_to_the_host_is_caught(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {"proj/a/.git/hooks/pre-commit": "evil", "proj/a/ok.txt": "ok"}
+        )
+        self.assertEqual(self.landed(), ["dest/proj/a/ok.txt"])
+        self.assertIn('skipped "proj/a/.git"', reported)
+
+    def test_a_control_name_that_is_only_a_prefix_is_ordinary(self):
+        os.makedirs("dest")
+        self.pull({"proj/.gitignore": "x", "proj/.github/ci.yml": "y"})
+        self.assertEqual(
+            self.landed(), ["dest/proj/.github/ci.yml", "dest/proj/.gitignore"]
+        )
+
+    def test_a_control_file_on_the_host_is_never_overwritten(self):
+        os.makedirs("dest/proj/.git")
+        Path("dest/proj/.git/config").write_text("[core]\nhooksPath = mine")
+        reported = self.pull({"proj/.git/config": "evil", "proj/ok.txt": "ok"})
+        self.assertEqual(self.read("dest/proj/.git/config"), "[core]\nhooksPath = mine")
+        self.assertEqual(self.read("dest/proj/ok.txt"), "ok")
+        self.assertIn('skipped "proj/.git"', reported)
+
+    def test_every_version_control_editor_and_direnv_name_is_skipped(self):
+        for name in (".hg", ".svn", ".idea", ".ENVRC", ".Vscode"):
+            with self.subTest(name=name):
+                shutil.rmtree("dest", ignore_errors=True)
+                os.makedirs("dest")
+                reported = self.pull({"proj/%s/x" % name: "evil", "proj/ok": "ok"})
+                self.assertEqual(self.landed(), ["dest/proj/ok"])
+                self.assertIn('skipped "proj/%s"' % name, reported)
+
+    def test_names_that_apfs_folds_to_a_control_name_are_skipped(self):
+        # U+017F (long s) folds to "s" on APFS, but str.lower() leaves it alone.
+        os.makedirs("dest")
+        reported = self.pull({"proj/.vſcode/settings.json": "{}", "proj/ok": "ok"})
+        self.assertEqual(self.landed(), ["dest/proj/ok"])
+        self.assertIn('skipped "proj/.vſcode"', reported)
+
+    def test_a_gitfile_is_skipped_like_a_git_directory(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/.git": "gitdir: ../x", "proj/ok": "ok"})
+        self.assertEqual(self.landed(), ["dest/proj/ok"])
+        self.assertIn('skipped "proj/.git"', reported)
+
+    def test_names_that_merely_resemble_control_names_land_as_ordinary_files(self):
+        os.makedirs("dest")
+        names = [".gitx", "x.git", ".envrc.bak", ".gitmodules"]
+        self.pull({"proj/%s" % name: "data" for name in names})
+        self.assertEqual(self.landed(), sorted("dest/proj/%s" % name for name in names))
+
+    def test_a_control_path_inside_a_control_path_is_reported_once(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/.git/.git/x": "evil", "proj/ok": "ok"})
+        self.assertEqual(self.landed(), ["dest/proj/ok"])
+        self.assertEqual(reported.count('skipped "proj/.git"'), 1)
+        self.assertNotIn("proj/.git/.git", reported)
+
+    def test_a_download_source_that_is_a_control_path_lands_nothing(self):
+        os.makedirs("dest")
+        reported = self.pull({".git/config": "evil"}, source=":~/proj/.git")
+        self.assertEqual(self.landed(), [])
+        self.assertIn('skipped ".git"', reported)
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_a_control_path_under_an_unreadable_staged_directory_is_removed(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {"proj/sub/.git/config": "evil", "proj/sub/ok": "ok"},
+            guest_modes={"proj/sub": 0o300},
+        )
+        self.assertEqual(self.landed(), ["dest/proj/sub/ok"])
+        self.assertIn('skipped "proj/sub/.git"', reported)
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_directory_modes_scp_kept_survive_the_landing(self):
+        os.makedirs("dest")
+        self.pull(
+            {"proj/pub/x": "1", "proj/priv/x": "2"},
+            guest_modes={"proj/pub": 0o755, "proj/priv": 0o700},
+        )
+        for name, mode in (("pub", 0o755), ("priv", 0o700)):
+            landed_mode = stat.S_IMODE(os.stat("dest/proj/%s" % name).st_mode)
+            self.assertEqual(landed_mode, mode, name)
+
+
+class TestCpFromGuestNeverLandsBuildOutput(CpFromGuestHarness):
+    """node_modules, .venv, Rust target and Next.js .next dwarf the source and
+    the project's tooling recreates them, so a pulled tree does not carry them."""
+
+    def skipped_lines(self, reported):
+        return [line for line in reported.splitlines() if "skipped" in line]
+
+    def test_dependency_installs_are_skipped_and_reported_once_each(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {
+                "proj/node_modules/x/index.js": "js",
+                "proj/.venv/bin/python": "py",
+                "proj/src/a.py": "a",
+            }
+        )
+        self.assertEqual(self.landed(), ["dest/proj/src/a.py"])
+        for skipped in ("node_modules", ".venv"):
+            self.assertEqual(reported.count('skipped "proj/%s"' % skipped), 1)
+        self.assertEqual(len(self.skipped_lines(reported)), 2)
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_rust_target_beside_its_cargo_toml_is_skipped(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/target/debug/bin": "elf", "proj/Cargo.toml": "c"})
+        self.assertEqual(self.landed(), ["dest/proj/Cargo.toml"])
+        self.assertIn('skipped "proj/target"', reported)
+
+    def test_a_target_without_cargo_toml_is_a_data_directory_and_lands(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/target/data.csv": "1,2"})
+        self.assertEqual(self.landed(), ["dest/proj/target/data.csv"])
+        self.assertEqual(self.skipped_lines(reported), [])
+
+    def test_next_output_beside_its_package_json_is_skipped(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/.next/x": "built", "proj/package.json": "{}"})
+        self.assertEqual(self.landed(), ["dest/proj/package.json"])
+        self.assertIn('skipped "proj/.next"', reported)
+
+    def test_a_dot_next_without_package_json_lands(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/.next/x": "data"})
+        self.assertEqual(self.landed(), ["dest/proj/.next/x"])
+        self.assertEqual(self.skipped_lines(reported), [])
+
+    def test_a_manifest_that_is_a_directory_does_not_count(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/Cargo.toml/x": "1", "proj/target/y": "2"})
+        self.assertEqual(
+            self.landed(), ["dest/proj/Cargo.toml/x", "dest/proj/target/y"]
+        )
+        self.assertEqual(self.skipped_lines(reported), [])
+
+    def test_build_output_nested_in_the_tree_is_skipped(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/web/node_modules/a": "dep", "proj/web/src/b": "b"})
+        self.assertEqual(self.landed(), ["dest/proj/web/src/b"])
+        self.assertIn('skipped "proj/web/node_modules"', reported)
+
+    def test_a_source_the_operator_named_lands_even_when_it_is_build_output(self):
+        os.makedirs("dest")
+        reported = self.pull({"node_modules/a": "x"}, source=":~/proj/node_modules")
+        self.assertEqual(self.landed(), ["dest/node_modules/a"])
+        self.assertEqual(self.skipped_lines(reported), [])
+
+    def test_a_file_called_node_modules_lands(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/node_modules": "not a directory"})
+        self.assertEqual(self.landed(), ["dest/proj/node_modules"])
+        self.assertEqual(self.skipped_lines(reported), [])
+
+    def test_a_control_path_inside_build_output_is_reported_only_as_build_output(
+        self,
+    ):
+        os.makedirs("dest")
+        reported = self.pull({"proj/node_modules/.git/config": "evil", "proj/ok": "1"})
+        self.assertEqual(self.landed(), ["dest/proj/ok"])
+        self.assertEqual(
+            self.skipped_lines(reported),
+            ['yo: skipped "proj/node_modules": ' + yo.BUILD_OUTPUT_NOTE],
+        )
+
+    def test_build_output_already_on_the_host_is_left_untouched(self):
+        os.makedirs("dest/proj/node_modules")
+        Path("dest/proj/node_modules/keep").write_text("mine")
+        self.pull({"proj/node_modules/new": "agent", "proj/ok": "1"})
+        self.assertEqual(self.read("dest/proj/node_modules/keep"), "mine")
+        self.assertFalse(os.path.lexists("dest/proj/node_modules/new"))
+        self.assertEqual(self.read("dest/proj/ok"), "1")
 
 
 class TestCpRefusesSymlinks(CpHarness):
