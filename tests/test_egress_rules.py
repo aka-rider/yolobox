@@ -7,12 +7,10 @@ fixture cannot drift from nix/egress.nix.
 """
 
 import unittest
-from pathlib import Path
 
 import egress_rules
-from test_yo import yo
+from test_yo import FIXTURES, yo
 
-FIXTURES = Path(__file__).parent / "fixtures"
 RULES = (FIXTURES / "egress.nft").read_text()
 RECOVERY = (FIXTURES / "egress-recovery.nft").read_text()
 TUNNEL = (FIXTURES / "egress-tunnel.nft").read_text()

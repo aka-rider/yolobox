@@ -15,6 +15,10 @@ from pathlib import Path
 from unittest import mock
 
 YO_PATH = str(Path(__file__).resolve().parent.parent / "yo")
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+FIXTURE_EGRESS = (FIXTURES / "egress.nft").read_text()
+FIXTURE_EGRESS_TUNNEL = (FIXTURES / "egress-tunnel.nft").read_text()
+FIXTURE_EMPTY_TABLE = "table inet yolobox-egress {\n}\n"
 
 
 def load_yo(name="yo", instance=None):
@@ -2633,19 +2637,31 @@ class TestEgressStatusLine(unittest.TestCase):
     def probe(self, stdout="", stderr="", returncode=0):
         return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
+    def table(self, stdout="", stderr="", returncode=0):
+        # What `sudo nft list table` answered; the unit branches below it
+        # that never look at the table pass a probe that must not be called.
+        return lambda: self.probe(stdout, stderr, returncode)
+
+    def never_read(self):
+        self.fail("the table must not be read for this unit state")
+
     def answer(self, load_state, active_state):
         return self.probe("LoadState=%s\nActiveState=%s\n" % (load_state, active_state))
 
     def test_a_loaded_active_unit_says_the_host_and_lan_are_blocked(self):
         self.assertEqual(
-            yo.egress_status_line(self.answer("loaded", "active")),
+            yo.egress_status_line(
+                self.answer("loaded", "active"), self.table(FIXTURE_EGRESS)
+            ),
             "egress: host and LAN blocked",
         )
 
     def test_a_loaded_unit_in_any_other_state_is_recovery_mode_naming_the_state(self):
         for state in ("failed", "inactive", "activating", "lizard"):
             with self.subTest(state=state):
-                line = yo.egress_status_line(self.answer("loaded", state))
+                line = yo.egress_status_line(
+                    self.answer("loaded", state), self.never_read
+                )
                 self.assertTrue(line.startswith("egress: WARNING recovery mode"))
                 self.assertIn("(yolobox-egress %s)" % state, line)
                 self.assertIn("yo ssh sudo nixos-rebuild switch --rollback", line)
@@ -2654,19 +2670,22 @@ class TestEgressStatusLine(unittest.TestCase):
     def test_a_unit_the_box_does_not_know_means_the_box_predates_the_table(self):
         # systemctl prints ActiveState=inactive for an unknown unit.
         self.assertEqual(
-            yo.egress_status_line(self.answer("not-found", "inactive")),
+            yo.egress_status_line(
+                self.answer("not-found", "inactive"), self.never_read
+            ),
             "egress: box predates the egress table; run yo bootstrap",
         )
 
     def test_a_silent_probe_is_not_checked_rather_than_recovery_mode(self):
-        line = yo.egress_status_line(self.probe())
+        line = yo.egress_status_line(self.probe(), self.never_read)
         self.assertEqual(line, "egress: not checked — the probe answered '' (exit 0)")
 
     def test_a_failed_ssh_is_not_checked_and_says_why(self):
         line = yo.egress_status_line(
             self.probe(
                 stderr="ssh: connect to host lima-yolobox: refused\n", returncode=255
-            )
+            ),
+            self.never_read,
         )
         self.assertEqual(
             line,
@@ -2677,7 +2696,9 @@ class TestEgressStatusLine(unittest.TestCase):
     def test_an_unrecognised_load_state_is_not_checked(self):
         for load_state in ("lizard", "error"):
             with self.subTest(load_state=load_state):
-                line = yo.egress_status_line(self.answer(load_state, "active"))
+                line = yo.egress_status_line(
+                    self.answer(load_state, "active"), self.never_read
+                )
                 self.assertTrue(line.startswith("egress: not checked"))
                 self.assertIn("LoadState=%s" % load_state, line)
 
@@ -2685,14 +2706,68 @@ class TestEgressStatusLine(unittest.TestCase):
         for active_state in ("inactive", "active"):
             with self.subTest(active_state=active_state):
                 self.assertEqual(
-                    yo.egress_status_line(self.answer("masked", active_state)),
+                    yo.egress_status_line(
+                        self.answer("masked", active_state), self.never_read
+                    ),
                     "egress: WARNING the egress table is masked — the box may reach "
                     "the host; unmask with: yo ssh sudo systemctl unmask yolobox-egress",
                 )
 
     def test_a_loaded_unit_with_no_active_state_is_not_checked(self):
-        line = yo.egress_status_line(self.probe("LoadState=loaded\n"))
+        line = yo.egress_status_line(self.probe("LoadState=loaded\n"), self.never_read)
         self.assertTrue(line.startswith("egress: not checked"))
+
+    def active_line(self, table):
+        return yo.egress_status_line(self.answer("loaded", "active"), table)
+
+    def test_a_tunnel_profile_table_is_not_a_false_alarm(self):
+        # lanAllow / tunnelInterfaces boxes carry extra accepts and a
+        # postrouting chain; only the invariants are checked.
+        self.assertEqual(
+            self.active_line(self.table(FIXTURE_EGRESS_TUNNEL)),
+            "egress: host and LAN blocked",
+        )
+
+    def test_an_active_unit_over_a_wrong_table_gets_its_own_warning(self):
+        wrong = {
+            "empty": FIXTURE_EMPTY_TABLE,
+            "no output chain": FIXTURE_EGRESS_TUNNEL.replace("chain output", "chain x"),
+            "no output hook": FIXTURE_EGRESS_TUNNEL.replace(
+                "hook output", "hook input"
+            ),
+            "no local accept": FIXTURE_EGRESS_TUNNEL.replace('"tailscale0", ', ""),
+            "no v4 private reject": FIXTURE_EGRESS_TUNNEL.replace(
+                "10.0.0.0/8", "11.0.0.0/8"
+            ),
+            "no v6 private reject": FIXTURE_EGRESS_TUNNEL.replace(
+                "fc00::/7", "fd00::/8"
+            ),
+            "no reject": FIXTURE_EGRESS_TUNNEL.replace("reject", "accept"),
+            "gibberish": "lizard\n",
+        }
+        for name, listing in wrong.items():
+            with self.subTest(name=name):
+                line = self.active_line(self.table(listing))
+                self.assertTrue(
+                    line.startswith("egress: WARNING unit active but table looks wrong")
+                )
+
+    def test_a_missing_table_under_an_active_unit_is_the_wrong_table_warning(self):
+        line = self.active_line(
+            self.table(stderr="Error: No such file or directory\n", returncode=1)
+        )
+        self.assertIn("table looks wrong", line)
+
+    def test_a_failed_table_probe_falls_back_to_the_unit_state(self):
+        for stderr, code in (
+            ("sudo: a password is required\n", 1),
+            ("ssh: connect to host lima-yolobox: refused\n", 255),
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(
+                    self.active_line(self.table(stderr=stderr, returncode=code)),
+                    "egress: host and LAN blocked",
+                )
 
 
 class TestStatusWithVmDown(unittest.TestCase):

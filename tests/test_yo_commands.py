@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from test_yo import FakeHome, Reached, yo
+from test_yo import FIXTURES, FakeHome, Reached, yo
 
 
 @contextlib.contextmanager
@@ -1175,6 +1175,8 @@ class TestCmdStatus(unittest.TestCase):
                 stdout = fstype
             elif argv == yo.EGRESS_PROBE:
                 stdout = egress_probe
+            elif argv == yo.EGRESS_TABLE_PROBE:
+                stdout = (FIXTURES / "egress.nft").read_text()
             return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
         with (

@@ -2208,9 +2208,62 @@ EGRESS_PROBE = [
     "ActiveState",
     EGRESS_UNIT,
 ]
+# The live table, read over the operator channel. A flushed, replaced or emptied
+# table leaves the unit "active", so the unit state alone cannot vouch for it.
+# -n: sudo must never wait for a password on a channel with no terminal.
+EGRESS_TABLE_PROBE = ["sudo", "-n", "nft", "list", "table"] + EGRESS_TABLE.split()
+NFT_MISSING_TABLE = "No such file or directory"
+EGRESS_PRIVATE_V4 = "10.0.0.0/8"
+EGRESS_PRIVATE_V6 = "fc00::/7"
 
 
-def egress_status_line(probe: subprocess.CompletedProcess) -> str:
+def egress_table_holds(listing: str) -> bool:
+    # Structural invariants only. lanAllow and tunnelInterfaces boxes add
+    # accepts and a postrouting chain, so comparing rule content would raise
+    # a false alarm on exactly those boxes.
+    lines = [line.strip() for line in listing.splitlines()]
+    has_output_hook = any(
+        line.startswith("type filter hook output") for line in lines
+    ) and any(line.startswith("chain output") for line in lines)
+    has_local_accept = any(
+        line.startswith("oifname {")
+        and line.endswith("} accept")
+        and '"lo"' in line
+        and '"tailscale0"' in line
+        for line in lines
+    )
+    rejects_v4 = any(
+        "ip daddr" in line and EGRESS_PRIVATE_V4 in line and "reject" in line
+        for line in lines
+    )
+    rejects_v6 = any(
+        "ip6 daddr" in line and EGRESS_PRIVATE_V6 in line and "reject" in line
+        for line in lines
+    )
+    return has_output_hook and has_local_accept and rejects_v4 and rejects_v6
+
+
+def egress_active_line(table: subprocess.CompletedProcess) -> str:
+    # The unit says active; ask the kernel. A probe that failed for any reason
+    # other than "no such table" (ssh, sudo) says nothing about the table, so
+    # the unit state stands.
+    blocked = "egress: host and LAN blocked"
+    if table.returncode != 0:
+        if NFT_MISSING_TABLE not in table.stderr:
+            return blocked
+    elif egress_table_holds(table.stdout):
+        return blocked
+    return (
+        "egress: WARNING unit active but table looks wrong — the box may reach "
+        "the host; restart it with: yo ssh sudo systemctl restart %s, "
+        "or run yo bootstrap" % EGRESS_UNIT
+    )
+
+
+def egress_status_line(
+    probe: subprocess.CompletedProcess,
+    read_table: Callable[[], subprocess.CompletedProcess],
+) -> str:
     load_state = guest_field(probe.stdout, "LoadState")
     active_state = guest_field(probe.stdout, "ActiveState")
     if load_state == "not-found":
@@ -2228,7 +2281,7 @@ def egress_status_line(probe: subprocess.CompletedProcess) -> str:
             ": " + stderr if stderr else "",
         )
     if active_state == "active":
-        return "egress: host and LAN blocked"
+        return egress_active_line(read_table())
     return (
         "egress: WARNING recovery mode — the egress rules failed to load "
         "(%s %s), the box has no network; roll back with: "
@@ -2336,7 +2389,12 @@ def status_guest_services() -> None:
     tailscale_probe = ssh_run(OPERATOR, ["sh", "-c", TAILSCALE_PROBE], check=False)
     out(tailscale_status_line(tailscale_probe.stdout, tailscale_probe.stderr))
 
-    out(egress_status_line(ssh_run(OPERATOR, EGRESS_PROBE, check=False)))
+    out(
+        egress_status_line(
+            ssh_run(OPERATOR, EGRESS_PROBE, check=False),
+            lambda: ssh_run(OPERATOR, EGRESS_TABLE_PROBE, check=False),
+        )
+    )
 
     out(guest_network_line())
 
