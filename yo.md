@@ -177,6 +177,8 @@ Filtering at one chokepoint, instead of at each call site that happens to print 
 
 Output streamed live goes through it too. `yo gc` and `yo aws-check` show the guest tiers as they run, and the tiers print project paths and whatever a project's `make -n clean` or `make clean` recipe prints. So `run_filtered()` pumps their stdout and stderr line by line into `out()` and `err()` instead of handing ssh the terminal.
 
+`pick_project()` runs each guest-listed project name through `TERMINAL_CONTROL_RE` before handing the list to `fzf --read0`, so the picker's safety does not depend on the installed fzf stripping control bytes (0.74.5 happens to). A name that contained one comes back from the picker with `?` in its place and so names no real directory.
+
 ## YO_VERSION
 
 `YO_VERSION = "dev"` must survive as that exact literal assignment, unreformatted. `nix/pkgs/yolobox.nix` overwrites it with `--replace-fail` and `homebrew/yolobox.rb` with `inreplace`. Both match the literal text, and either patch is how a release build gets its real version baked in.

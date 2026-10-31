@@ -583,6 +583,22 @@ class TestTerminalSanitising(unittest.TestCase):
                 )
 
 
+class TestPickProjectSanitisesWhatFzfSees(unittest.TestCase):
+    def test_a_guest_controlled_name_reaches_fzf_without_control_bytes(self):
+        picker = mock.Mock(returncode=0, stdout=b"ok")
+        with (
+            mock.patch.object(yo, "require_tool"),
+            mock.patch.object(
+                yo,
+                "agent_paths",
+                return_value=["/home/agent/ok", "/home/agent/a\x1b]52;c;eA==\x07b"],
+            ),
+            mock.patch.object(yo.subprocess, "run", return_value=picker) as run,
+        ):
+            yo.pick_project("")
+        self.assertEqual(run.call_args.kwargs["input"], b"a?]52;c;eA==?b\0ok")
+
+
 class TestStreamedOutputIsFiltered(unittest.TestCase):
     # yo gc streams the guest tiers live; a Makefile recipe they echo must not
     # reach the terminal as an escape sequence.

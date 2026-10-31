@@ -1046,6 +1046,9 @@ def pick_project(query: str) -> str:
     )
     if not projects:
         raise YoError("no projects in the VM")
+    # fzf draws these names on the terminal, and a repo directory name is
+    # guest-controlled; do not depend on the installed fzf stripping controls.
+    projects = [TERMINAL_CONTROL_RE.sub("?", project) for project in projects]
     picker = subprocess.run(
         ["fzf", "--read0", "--print0", "--select-1", "--exit-0", "--query=" + query],
         input="\0".join(projects).encode(),
