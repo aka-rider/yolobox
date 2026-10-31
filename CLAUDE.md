@@ -65,7 +65,7 @@ Mac side:
 - `lima/yolobox.yaml`: instance config, read once at creation.
   `lima/yolobox.md`.
 - `homebrew/yolobox.rb`: the brew formula, rendered into the tap on release.
-- `templates/default/`: `devbox.json` and `.envrc` for a new project.
+- `templates/default/`: `devbox.json` for a new project.
 
 Box configuration (Nix):
 

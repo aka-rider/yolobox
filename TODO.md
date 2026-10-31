@@ -17,6 +17,7 @@ Posted 2026-10-02, awaiting review. The reasoning behind it is in lima/yolobox.m
 
 # Known problems
 
+- pi's LSP (pi-lens) finds basedpyright on PATH only. direnv is gone, so a project's devbox is on pi's PATH only when pi runs inside `devbox shell`; pi started from a plain shell has no basedpyright. Check whether pi-lens can be given a launch command (then point it at `lspWrapper` in `nix/lsp.nix`), or whether herdr should start pi panes through `devbox run`.
 - The throwaway-instance rescue for a box stuck in its initrd (a second lima instance with this instance's `disk` file attached) is untested. See `docs/disk-encryption.md#recognising-failures`.
 - Verify on a live box that `yo ssh` drops when an exit node is selected without `--exit-node-allow-lan-access`. The flag itself is verified (see `nix/tailscale.md#exit-nodes`); the no-flag half is still only an expectation. Check on a box built without the flag: `yo ssh sudo tailscale set --exit-node=<node>`, then see whether `yo ssh` survives.
 - `limactl stop yolobox` hangs on the vz driver (lima 2.2.0 and 2.2.1); see the lima entry under Upstream.

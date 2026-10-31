@@ -129,6 +129,8 @@ devbox run -- bun --version
 devbox shell   # or work inside it
 ```
 
+Devbox is entered explicitly, with `devbox shell` or `devbox run`. Nothing loads a project's tools just because you changed into its directory. The editors' language servers pick up the project's tools through devbox on their own.
+
 `devbox search <name>` finds packages.
 
 Zed's own language servers don't run on NixOS. Add them explicitly to the project's `devbox.json` instead.

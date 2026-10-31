@@ -25,7 +25,8 @@ Sibling `.md` files are safe to add. No package installs them: `nix/pkgs/yolobox
 | [distribution.md](distribution.md) | Building the box from a flake ref instead of a checkout, the bootstrap reboot decision, and the failure shapes that follow. |
 | [../yo.md](../yo.md) | The Mac-side CLI: the path mirror, `yo link`, `yo cp`, the guest helper, the `network:` line, the single parser, the output filter and the `YO_VERSION` literal. |
 | [../lima/yolobox.md](../lima/yolobox.md) | `lima/yolobox.yaml` as read-once config, checking a running instance, why guest UDP is never mirrored, which guest ports reach the host, pinned settings, and the forwarder bug. |
-| [../nix/base.md](../nix/base.md) | The ESP size, same-uid ptrace, memory pressure, and growing the root disk. |
+| [../nix/base.md](../nix/base.md) | The ESP size, same-uid ptrace, memory pressure, growing the root disk, NAT and IP forwarding, and the wheel-only sudo wrapper. |
+| [../nix/lsp.md](../nix/lsp.md) | Why the box has no direnv, `lspWrapper` and its walk up to the project's `devbox.json`, how Zed, claude-code and opencode are wired, and why pi is outside it. |
 | [../nix/harnesses.md](../nix/harnesses.md) | The `claude` launcher, the version keeper, install phases, pi, the plugins, lingering, and herdr's pi integration. |
 | [../nix/herd-server.md](../nix/herd-server.md) | The VM's own herdr server, machine panes, capability gating, `HERDR_AGENT`, and host keys for the `yolobox` alias. |
 | [../nix/display.md](../nix/display.md) | The virtual display, browsers, the Playwright output hook, the clipboard, and lessons learned. |

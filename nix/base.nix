@@ -27,10 +27,6 @@ let
       };
     };
   };
-  # Where the agent's own direnv config lives: agent-env.nix exports it as
-  # DIRENV_CONFIG for agent processes only.
-  agentDirenvDir = lib.removePrefix "/etc/" agentEnv.env.DIRENV_CONFIG;
-  agentHome = config.users.users.${agentUser}.home;
 
   opProxies = map opProxy [
     { name = "yolobox-op-agent"; listen = agentEnv.env.SSH_AUTH_SOCK; target = "agent.sock"; }
@@ -281,21 +277,10 @@ in
   '';
 
   security.sudo.wheelNeedsPassword = false;
+  # Drops other-execute from the setuid sudo wrapper, so the non-wheel agent
+  # cannot even exec it. Only the operator, who is in wheel, runs sudo.
+  security.sudo.execWheelOnly = true;
   programs.zsh.enable = true;
-
-  # The module's DIRENV_CONFIG=/etc/direnv is what root and the operator get,
-  # and it carries no whitelist: an .envrc is arbitrary code the agent
-  # writes, and auto-trusting it in the operator's shell would hand over the
-  # operator's sudo on the first cd. The agent alone gets /etc/direnv-agent
-  # (DIRENV_CONFIG in nix/lib/agent-env.nix, which also reaches herdr panes),
-  # whose direnv.toml whitelists its home. direnv reads direnvrc and
-  # lib/*.sh from the same directory, so those two are the /etc/direnv files
-  # themselves, keeping nix-direnv. An XDG ~/.config file is never read.
-  programs.direnv.enable = true;
-  environment.etc."${agentDirenvDir}/direnv.toml".source =
-    (pkgs.formats.toml { }).generate "direnv.toml" { whitelist.prefix = [ agentHome ]; };
-  environment.etc."${agentDirenvDir}/direnvrc".source = config.environment.etc."direnv/direnvrc".source;
-  environment.etc."${agentDirenvDir}/lib/zz-user.sh".source = config.environment.etc."direnv/lib/zz-user.sh".source;
 
   # .NET binaries, such as pi-lens's downloaded marksman, abort without ICU
   # ("Couldn't find a valid ICU package"); that crash-looped into 259

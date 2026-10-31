@@ -223,22 +223,19 @@ remove_tree() {
 }
 
 # Runs CMD with cwd ROOT, in the environment the project itself declares:
-# through devbox when ROOT/devbox.json exists, else through direnv when
-# ROOT/.envrc exists, else directly. cargo, go and make are on no box-wide
-# PATH; each project's environment provides them. devbox joins its arguments
-# into one script string that its own bash runs, so a `$`, a quote or a
-# backtick in an argument is expanded or broken there, not passed on; every
-# caller passes plain words. -q drops devbox's own `Info:` lines while its
-# `Error:` lines and the command's stderr still show. stdin is /dev/null: the
-# callers sit inside `while read` loops over a file, and a tool that reads
-# stdin would otherwise eat the rest of the list.
+# through devbox when ROOT/devbox.json exists, else directly. cargo, go and
+# make are on no box-wide PATH; each project's environment provides them.
+# devbox joins its arguments into one script string that its own bash runs,
+# so a `$`, a quote or a backtick in an argument is expanded or broken there,
+# not passed on; every caller passes plain words. -q drops devbox's own
+# `Info:` lines while its `Error:` lines and the command's stderr still show.
+# stdin is /dev/null: the callers sit inside `while read` loops over a file,
+# and a tool that reads stdin would otherwise eat the rest of the list.
 in_project_env() {
     local root="$1"
     shift
     if [ -f "${root}/devbox.json" ]; then
         (cd "${root}" && devbox run -q -- "$@") </dev/null
-    elif [ -f "${root}/.envrc" ]; then
-        (cd "${root}" && direnv exec "${root}" "$@") </dev/null
     else
         (cd "${root}" && "$@") </dev/null
     fi
@@ -254,7 +251,7 @@ require_tool() {
         return 0
     fi
     fail "kept ${what}: ${tool} is not in ${root}'s environment" \
-        "Add ${tool} to the project's devbox.json (or its .envrc), or clean it by hand."
+        "Add ${tool} to the project's devbox.json, or clean it by hand."
     return 1
 }
 

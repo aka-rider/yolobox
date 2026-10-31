@@ -102,9 +102,9 @@ The guard runs when a directory's turn comes, after the cleans before it. A Make
 
 ### The project's own environment
 
-`cargo`, `go` and `make` are on no box-wide PATH, because the box has no toolchain of its own. Each project's devbox supplies one, so each command runs through `in_project_env`: `devbox run -q -- <cmd>` when the root has a `devbox.json`, else `direnv exec <root> <cmd>` when it has an `.envrc`, else the command directly. `devbox run` takes about half a second per project when its packages are installed, and needs network when they are not. Stdin is `/dev/null` for all three forms. The plan is built inside `while read` loops over a NUL-separated file, and a tool that reads stdin would otherwise eat the roots after its own.
+`cargo`, `go` and `make` are on no box-wide PATH, because the box has no toolchain of its own. Each project's devbox supplies one, so each command runs through `in_project_env`: `devbox run -q -- <cmd>` when the root has a `devbox.json`, else the command directly. A project's `devbox.json` is the only project environment the box knows; there is no `.envrc` or direnv. `devbox run` takes about half a second per project when its packages are installed, and needs network when they are not. Stdin is `/dev/null` for both forms. The plan is built inside `while read` loops over a NUL-separated file, and a tool that reads stdin would otherwise eat the roots after its own.
 
-A tool that does not resolve in that environment is a `FAIL` line naming the tool and the root. Only that tool's action in that root is skipped: a missing `cargo` keeps the `target`, while the same root's `make clean`, `go clean` and `node_modules` removal still run. The remedy is adding the tool to the project's `devbox.json` or `.envrc`, or cleaning by hand.
+A tool that does not resolve in that environment is a `FAIL` line naming the tool and the root. Only that tool's action in that root is skipped: a missing `cargo` keeps the `target`, while the same root's `make clean`, `go clean` and `node_modules` removal still run. The remedy is adding the tool to the project's `devbox.json`, or cleaning by hand.
 
 ### Report mode versus apply
 
@@ -116,5 +116,5 @@ Report mode runs no clean, but it does enter each project's environment for the 
 
 - `kept <path>: no Cargo.toml beside it, so it is not cargo's build output` for a directory that happens to be called `target`. It is a data directory, and the tier has declined to guess. The same holds for a `.next` with no `package.json`.
 - `kept <path>: not inside a git repository` for a directory that sits in no repo at all, which no project owns and no `.gitignore` vouches for.
-- A `FAIL` line naming a tool and a root, saying the tool is not in that root's environment. The project's `devbox.json` or `.envrc` lacks the tool, and only that tool's action in that project was skipped.
+- A `FAIL` line naming a tool and a root, saying the tool is not in that root's environment. The project's `devbox.json` lacks the tool, and only that tool's action in that project was skipped.
 - `make clean` output appearing inside `yo gc`. That is the Makefile's own recipe running, so whatever the project's clean prints is what the operator sees.

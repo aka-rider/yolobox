@@ -3237,7 +3237,7 @@ def build_parser() -> argparse.ArgumentParser:
         "and needs network. Model weights and other app data are never\n"
         "touched. /tmp scratchpads are reported only. --deep adds per-project\n"
         "build output under the guest home, cleaned by the project's own tools\n"
-        "run in its devbox or direnv environment: make clean where the Makefile\n"
+        "run in its devbox environment: make clean where the Makefile\n"
         "has a clean target, cargo clean for a target beside a Cargo.toml, go\n"
         "clean beside a go.mod. node_modules, .venv and a .next beside a\n"
         "package.json are removed outright. Those removals and cargo clean\n"

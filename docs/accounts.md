@@ -8,7 +8,7 @@ Lima creates a guest account named and uid-matched after the Mac account that st
 
 Lima >= 2.1.0 names the operator's home `/home/<user>.guest` (it was `/home/<user>.linux` before; lima-vm/lima#4578).
 
-Every AI coding session runs as a second account, `agent`, a constant in `flake.nix` that is never threaded in from the host. Its uid is 1000, its home is `/home/agent`, its only group is `users`, and it is in neither `wheel` nor any sudoers rule. It has no `sudo` at all. `yo enter`, `yo code`, and `yo zed` land there.
+Every AI coding session runs as a second account, `agent`, a constant in `flake.nix` that is never threaded in from the host. Its uid is 1000, its home is `/home/agent`, its only group is `users`, and it is in neither `wheel` nor any sudoers rule. It has no `sudo` at all, and with `security.sudo.execWheelOnly` it cannot even execute the sudo wrapper. `yo enter`, `yo code`, and `yo zed` land there.
 
 Three assertions in `nix/base.nix` check `username` at evaluation time, because it reaches sshd config, tmpfiles rules and shell scripts. It must differ from `agent`, it must not be `root`, and it must match `[a-z_][a-z0-9_-]*`. A Mac account that fails one of these stops `nixos-rebuild` with a message naming `YOLOBOX_USERNAME`, instead of building a box that quietly merges the two accounts.
 

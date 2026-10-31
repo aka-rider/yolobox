@@ -717,3 +717,60 @@ class TestEgressUnitNeverOpensTheBox(unittest.TestCase):
         self.assertNotIn("ExecStartPre", dhcpcd)
         self.assertNotIn("list table", dhcpcd)
         self.assertIn('after = [ "yolobox-egress.service" ];', dhcpcd)
+
+
+class TestThereIsNoDirenvInTheBox(unittest.TestCase):
+    """An .envrc is code the agent writes and the operator would run on `cd`.
+
+    The patterns are specific on purpose: nix/lsp.nix says "There is no
+    direnv" and says ".envrc" in comments, which are not read here, and
+    `load_direnv = "disabled"` is the allowed spelling.
+    """
+
+    FORBIDDEN = (
+        "programs.direnv",
+        "DIRENV_CONFIG",
+        "direnv exec",
+        'load_direnv = "direct"',
+        "envrc",
+    )
+
+    def box_files(self):
+        files = sorted((REPO / "nix").rglob("*.nix"))
+        files += sorted(p for p in (REPO / "templates").rglob("*") if p.is_file())
+        files.append(REPO / "flake.nix")
+        self.assertTrue(files)
+        return files
+
+    def test_no_nix_module_or_template_loads_or_mentions_direnv_machinery(self):
+        for path in self.box_files():
+            text = nix_code(path) if path.suffix == ".nix" else path.read_text()
+            for pattern in self.FORBIDDEN:
+                with self.subTest(file=str(path.relative_to(REPO)), pattern=pattern):
+                    self.assertNotIn(pattern, text)
+
+    def test_the_default_template_ships_no_envrc(self):
+        self.assertFalse((REPO / "templates" / "default" / ".envrc").exists())
+
+
+class TestSudoIsReachableByWheelOnly(unittest.TestCase):
+    def test_base_nix_sets_exec_wheel_only(self):
+        self.assertIn(
+            "security.sudo.execWheelOnly = true;",
+            nix_code(REPO / "nix" / "base.nix"),
+        )
+
+
+class TestEveryLspRenderGoesThroughTheWrapper(unittest.TestCase):
+    ETC_PATHS = (
+        "yolobox/lsp/zed-settings.json",
+        "yolobox/lsp/claude-basedpyright/.lsp.json",
+        "yolobox/lsp/opencode.json",
+    )
+
+    def test_zed_claude_and_opencode_renders_name_the_wrapper(self):
+        code = nix_code(REPO / "nix" / "lsp.nix")
+        for etc_path in self.ETC_PATHS:
+            with self.subTest(etc_path=etc_path):
+                self.assertIn('environment.etc."%s"' % etc_path, code)
+        self.assertGreaterEqual(code.count('"${lspWrapper}"'), len(self.ETC_PATHS))

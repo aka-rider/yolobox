@@ -1,6 +1,6 @@
 # nix/base.nix: the stories behind its settings
 
-`nix/base.nix` carries the short reason beside each setting. This file keeps the incidents and the ways to recognise them. It covers the boot partition, debugger access, memory pressure, disk growth and IP forwarding. Two accounts, locked passwords and the journal group are in [docs/accounts.md](../docs/accounts.md#two-accounts). The disk-full incidents are in [docs/disk.md](../docs/disk.md).
+`nix/base.nix` carries the short reason beside each setting. This file keeps the incidents and the ways to recognise them. It covers the boot partition, debugger access, memory pressure, disk growth, IP forwarding and the sudo wrapper. Two accounts, locked passwords and the journal group are in [docs/accounts.md](../docs/accounts.md#two-accounts). The disk-full incidents are in [docs/disk.md](../docs/disk.md).
 
 ## The ESP holds one kernel
 
@@ -49,3 +49,7 @@ Skipping the partition step is silent. The backing file grows, the guest boots c
 ## NAT and IP forwarding
 
 nixos-lima's `lima-init.nix` sets `networking.nat.enable = true`, and nixpkgs' nat module turns that into `net.ipv4.ip_forward=1`. That makes the guest a router, so a packet from the host side could cross the guest into the tailnet. `nix/base.nix` turns NAT off with `mkForce`. Nothing in the box routes for others: rootless podman uses pasta, and tailscale runs only as a client, so no feature needs forwarding. The check is `yo ssh sysctl -n net.ipv4.ip_forward`, which must print `0`.
+
+## sudo is wheel-only
+
+`nix/base.nix` sets `security.sudo.execWheelOnly = true`. It drops other-execute from the setuid `sudo` wrapper, so the agent, which is not in `wheel`, cannot exec it at all. The agent could not authenticate anyway, because its password is locked and it is in no sudoers rule. But a setuid root binary that anyone can run is attack surface, and the wrapper should not be reachable by the account that has no use for it. It was set on 2026-10-31 in the security hardening pass, together with the removal of direnv (see [nix/lsp.md](lsp.md#no-direnv)). The check is `ls -l /run/wrappers/bin/sudo`, which must show no `x` for others, and `sudo -n true` as the agent must fail with permission denied, not with a password prompt.

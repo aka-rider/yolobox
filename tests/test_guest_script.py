@@ -234,13 +234,6 @@ fi
 exec "$BASH" -c "$script"
 """
 
-# direnv exec DIR CMD...
-FAKE_DIRENV = """#!/bin/sh
-echo "direnv $(pwd) $*" >> "$FAKE_LOG"
-shift 2
-exec "$@"
-"""
-
 FAKE_CARGO = """#!/bin/sh
 echo "cargo $(pwd) $*" >> "$FAKE_LOG"
 if [ "$1" = clean ]; then rm -rf ./target; fi
@@ -290,7 +283,6 @@ class TestGcUserDeep(GuestScript):
             ("podman", FAKE_NOOP),
             ("npm", FAKE_NOOP),
             ("devbox", FAKE_DEVBOX),
-            ("direnv", FAKE_DIRENV),
             ("cargo", FAKE_CARGO),
             ("make", FAKE_MAKE),
             ("go", FAKE_NOOP),
@@ -404,13 +396,6 @@ class TestGcUserDeep(GuestScript):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("make %s clean" % root, self.log_lines())
 
-    def test_make_clean_runs_through_direnv_when_only_an_envrc_exists(self):
-        root = self.project("p", {"Makefile": CLEAN_MAKEFILE, ".envrc": ""})
-        result = self.apply()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("direnv %s exec %s make clean" % (root, root), self.log_lines())
-        self.assertFalse(any(line.startswith("devbox ") for line in self.log_lines()))
-
     def test_a_makefile_without_a_clean_rule_gets_no_make_clean_and_no_message(self):
         root = self.project("p", {"Makefile": "all:\n\ttrue\n"})
         result = self.apply()
@@ -418,6 +403,15 @@ class TestGcUserDeep(GuestScript):
         self.assertNotIn("make %s clean" % root, self.log_lines())
         self.assertNotIn(str(root), result.stdout)
         self.assertNotIn("FAIL", result.stderr)
+
+    def test_an_envrc_beside_a_makefile_is_ignored_and_make_clean_runs_directly(self):
+        root = self.project("p", {"Makefile": CLEAN_MAKEFILE, ".envrc": ""})
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("make %s clean" % root, self.log_lines())
+        self.assertFalse(
+            any(line.startswith(("devbox ", "direnv ")) for line in self.log_lines())
+        )
 
     def test_a_go_mod_root_gets_go_clean(self):
         root = self.project("p", {"go.mod": "module p\n"})
