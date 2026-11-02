@@ -5,3 +5,6 @@
 !.github/
 !.gitignore
 !.version
+
+# Python bytecode.
+__pycache__/

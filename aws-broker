@@ -128,26 +128,33 @@ def unlink_if_same_identity(path, identity):
 
 
 def register_pid_watch_event(pid):
-    """Register a kqueue watch for process exit, without waiting for it."""
-    kq = select.kqueue()
-    event = select.kevent(
-        pid,
-        filter=select.KQ_FILTER_PROC,
-        flags=select.KQ_EV_ADD,
-        fflags=select.KQ_NOTE_EXIT,
-    )
+    """Watch a pid for exit, without waiting for it yet.
+
+    Returns a function that blocks until the process has exited: a kqueue on
+    macOS, a pidfd on Linux (os.pidfd_open, Python 3.9 and a 5.3 kernel).
+    """
     try:
-        kq.control([event], 0)
+        if hasattr(select, "kqueue"):
+            kq = select.kqueue()
+            event = select.kevent(
+                pid,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            kq.control([event], 0)
+            return lambda: kq.control([], 1)
+        pidfd = os.pidfd_open(pid)
+        return lambda: select.select([pidfd], [], [])
     except ProcessLookupError:
         fail(f"watched pid {pid} is not running")
     except OSError as e:
-        fail(f"kqueue registration for watched pid {pid} failed: {e}")
-    return kq
+        fail(f"registration of a watch on pid {pid} failed: {e}")
 
 
-def wait_for_pid_exit(pid, socket_path, identity, kq):
+def wait_for_pid_exit(pid, socket_path, identity, wait_for_exit):
     try:
-        kq.control([], 1)
+        wait_for_exit()
     except OSError:
         pass
     log(f"watched pid {pid} exited; shutting down")
@@ -467,7 +474,7 @@ def main():
 
     server, identity = bind_server(args.socket, states, args.watch_pid)
 
-    kq = register_pid_watch_event(args.watch_pid)
+    wait_for_exit = register_pid_watch_event(args.watch_pid)
 
     print("READY")
     sys.stdout.flush()
@@ -478,7 +485,7 @@ def main():
 
     threading.Thread(
         target=wait_for_pid_exit,
-        args=(args.watch_pid, args.socket, identity, kq),
+        args=(args.watch_pid, args.socket, identity, wait_for_exit),
         daemon=True,
     ).start()
 

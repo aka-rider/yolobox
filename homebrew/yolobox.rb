@@ -13,6 +13,10 @@ class Yolobox < Formula
   def install
     libexec.install "yo", "aws-broker"
     (libexec/"lima").install "lima/yolobox.yaml"
+    (libexec/"libvirt").install "libvirt/domain.xml"
+    (libexec/"linux").install "linux/yolobox-host.nft"
+    (libexec/"linux").install "linux/yolobox-host.service"
+    (libexec/"linux").install "linux/host-setup.sh"
     inreplace libexec/"yo", 'YO_VERSION = "dev"', "YO_VERSION = \"#{version}\""
     bin.install_symlink libexec/"yo"
   end

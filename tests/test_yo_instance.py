@@ -320,6 +320,32 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
         stubs["start_and_unlock"].assert_called_once()
 
 
+class TestVmUpOnALimaConfigGap(unittest.TestCase):
+    def test_a_gap_is_a_note_and_the_box_still_starts(self):
+        notes = []
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(as_instance(yo.DEFAULT_INSTANCE))
+            for name in (
+                "luks_passphrase",
+                "ensure_agent_ssh_config",
+                "ensure_guest_known_hosts",
+                "vm_services",
+            ):
+                stack.enter_context(mock.patch.object(yo, name))
+            stack.enter_context(
+                mock.patch.object(yo, "lima_config_gaps", return_value=[yo.GAP_MOUNTS])
+            )
+            stack.enter_context(
+                mock.patch.object(yo, "lima_instance_info", return_value=None)
+            )
+            stack.enter_context(mock.patch.object(yo, "err", side_effect=notes.append))
+            start = stack.enter_context(mock.patch.object(yo, "start_and_unlock"))
+            yo.vm_up()
+        start.assert_called_once()
+        self.assertEqual(len(notes), 1)
+        self.assertIn(yo.GAP_MOUNTS, notes[0])
+
+
 class TestRemediesNameTheMachine(FakeHome):
     def test_the_default_machine_prints_bare_yo(self):
         self.assertEqual(yo.yo_cmd("up"), "yo up")

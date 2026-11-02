@@ -1,4 +1,4 @@
-{ config, pkgs, modulesPath, username, agentUser, lib, version, ... }:
+{ config, pkgs, modulesPath, username, agentUser, lib, version, hostOs, ... }:
 let
   agentEnv = import ./lib/agent-env.nix {
     agentHome = config.users.users.${agentUser}.home;
@@ -117,6 +117,9 @@ in
   # the next boot, which is when the host agent is recreated anyway.
   systemd.services.lima-guestagent.restartIfChanged = false;
   systemd.services.lima-init.restartIfChanged = lib.mkForce false;
+  # Under libvirt no Lima hostagent exists to talk to, and the unit fails
+  # for lack of its binary.
+  systemd.services.lima-guestagent.enable = lib.mkIf (hostOs == "linux") (lib.mkForce false);
 
   # Upstream's user@.service ships OOMScoreAdjust=100, making the per-user
   # manager a preferred kernel-OOM victim over every system service; killing
@@ -232,6 +235,24 @@ in
     KbdInteractiveAuthentication = false;
     PermitRootLogin = "prohibit-password";
   };
+  # On Linux the operator's key is served by the host's 1Password agent,
+  # which the agent account also reaches through the forwarded socket. The
+  # operator may therefore log in only from the gateway address, 192.168.5.2,
+  # which is where the host's forwarded ssh port arrives from; the agent
+  # account logs in from anywhere. The firewall rule drops any packet that
+  # claims to come from that address on an interface other than enp0s1, so
+  # the agent cannot spoof it over loopback. The story is in nix/base.md, in
+  # its Host OS gates section.
+  services.openssh.settings.AllowUsers = lib.mkIf (hostOs == "linux")
+    [ "${username}@192.168.5.2" agentUser ];
+  networking.firewall.extraCommands = lib.mkIf (hostOs == "linux") ''
+    iptables -I nixos-fw 1 ! -i enp0s1 -s 192.168.5.2 -j DROP
+  '';
+  networking.firewall.extraStopCommands = lib.mkIf (hostOs == "linux") ''
+    if iptables -C nixos-fw ! -i enp0s1 -s 192.168.5.2 -j DROP; then
+      iptables -D nixos-fw ! -i enp0s1 -s 192.168.5.2 -j DROP
+    fi
+  '';
   # The default (~agent/.ssh/authorized_keys) must not be honoured: it is
   # agent-writable, so the agent could mint its own persistent login.
   # lima-init writes /etc/ssh/authorized_keys.d/${username} every boot
@@ -305,7 +326,9 @@ in
   # and .cargo/config.toml, so this caps dev/test DWARF for every project.
   environment.variables.CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
 
-  virtualisation.rosetta = {
+  # Rosetta is a vz feature of Lima on a Mac; a libvirt guest has no such
+  # device to mount.
+  virtualisation.rosetta = lib.mkIf (hostOs == "darwin") {
     enable = true;
     mountTag = "vz-rosetta";
   };

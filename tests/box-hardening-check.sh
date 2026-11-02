@@ -12,6 +12,10 @@
 #   compat half ("nothing the agent needs broke") is the one to iterate on
 #   against a box that is not hardened yet.
 #
+# On a libvirt guest (x86_64 under kvm) it also checks that the agent cannot
+# log in as the operator with the forwarded 1Password agent, and that the
+# firewall rule behind that is loaded.
+#
 # It stops at the first broken property and names it. There is no python in
 # the box, so socket probes use perl and JSON uses jq.
 set -Eeuo pipefail
@@ -23,6 +27,10 @@ set -f
 readonly WRAPPER_ALLOWLIST="sudo sudoedit unix_chkpwd newuidmap newgidmap"
 readonly AGENT_UID=1000
 readonly HK_NET=hk-test
+# The addresses of the box's own network (nix/egress.nix, libvirt/domain.xml):
+# the gateway is the host's loopback, the guest's address is enp0s1's.
+readonly GATEWAY_ADDR=192.168.5.2
+readonly GUEST_ADDR=192.168.5.15
 
 WORK=""
 SLEEPER_PID=""
@@ -150,6 +158,26 @@ my $fd = syscall(425, 1, $params);
 if ($fd == -1 && $!{EPERM}) { print "refused: $!\n"; exit 0; }
 print "io_uring_setup returned $fd ($!)\n";
 exit 3;
+EOF
+
+    # Probe exit codes (see agent_probe): 0 no TCP connection, 3 it connected.
+    # Any failure to connect counts, a reject, a drop (the 5 s alarm) or a
+    # timeout alike.
+    cat >"${WORK}/tcp.pl" <<'EOF'
+use Socket;
+my ($host, $port) = @ARGV;
+socket(my $s, PF_INET, SOCK_STREAM, 0) or die "socket: $!\n";
+my $connected = eval {
+    local $SIG{ALRM} = sub { die "timed out\n" };
+    alarm 5;
+    my $ok = connect($s, sockaddr_in($port, inet_aton($host)));
+    alarm 0;
+    die "$!\n" unless $ok;
+    1;
+};
+if ($connected) { print "connected\n"; exit 3; }
+print "no connection: $@";
+exit 0;
 EOF
 
     # Starts a long sleep detached from this script and prints its pid.
@@ -286,6 +314,51 @@ check_net() {
     ok "net-check: egress=ok"
 }
 
+# The gateway is the host's own loopback, so a connection to its port 22 would
+# reach the host's sshd. The egress table must refuse it for the agent.
+check_gateway_ssh_closed() {
+    agent_probe "the agent connected to ${GATEWAY_ADDR}:22, the host's loopback" \
+        "${WORK}/tcp.pl" "${GATEWAY_ADDR}" 22
+    ok "the agent cannot reach ${GATEWAY_ADDR}:22 (${PROBE_OUT})"
+}
+
+# A libvirt guest: the operator's key is served by the host's 1Password agent,
+# which the agent account reaches through its forwarded socket. sshd must
+# therefore refuse the operator from every address but the gateway's, and the
+# firewall must stop the agent claiming that address over loopback.
+# $1 is the operator's account name.
+check_operator_login_refused() {
+    local operator=$1 addr out
+    out=$(as_agent printenv SSH_AUTH_SOCK) ||
+        fail "the agent has no SSH_AUTH_SOCK, so a login probe would prove nothing"
+    [ -n "${out}" ] || fail "the agent's SSH_AUTH_SOCK is empty"
+    for addr in 127.0.0.1 "${GUEST_ADDR}"; do
+        if out=$(as_agent ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+            "${operator}@${addr}" true 2>&1); then
+            fail "the agent logged in as ${operator} at ${addr} with its forwarded agent"
+        fi
+        case ${out} in
+        *"Permission denied"*) ;;
+        *) fail "ssh as ${operator} at ${addr} failed, but not with Permission denied: ${out}" ;;
+        esac
+        ok "the agent cannot log in as ${operator} at ${addr}"
+    done
+    # -C matches the rule by meaning; `iptables -S` prints its options in
+    # another order than the one the unit adds them in.
+    sudo -n iptables -C nixos-fw ! -i enp0s1 -s "${GATEWAY_ADDR}" -j DROP ||
+        fail "nixos-fw has no rule dropping ${GATEWAY_ADDR} off enp0s1: $(sudo -n iptables -S nixos-fw)"
+    ok "nixos-fw drops packets claiming ${GATEWAY_ADDR} on any interface but enp0s1"
+}
+
+# True on a libvirt guest, the Linux host's way of running the box. `|| true`
+# because systemd-detect-virt exits 1 and prints "none" on bare metal.
+is_libvirt_guest() {
+    local virt
+    virt=$(systemd-detect-virt || true)
+    [ "$(uname -m)" = x86_64 ] && [ "${virt}" = kvm ]
+}
+
 check_podman() {
     # Clear a leftover from an interrupted run; -f makes a missing one fine.
     as_agent podman network rm -f "${HK_NET}" >/dev/null
@@ -355,12 +428,20 @@ check_rosetta() {
 
 compat_checks() {
     check_net
+    check_gateway_ssh_closed
     check_podman
     check_chromium
     check_nix_build
     check_strace
     check_vendors
-    check_rosetta
+    # An aarch64 box is a Lima/vz one and must have rosetta, so a missing
+    # binfmt entry fails there. A libvirt box is x86_64 and has none.
+    if [ "$(uname -m)" = aarch64 ]; then
+        check_rosetta
+    fi
+    if is_libvirt_guest; then
+        check_operator_login_refused "$(id -un)"
+    fi
 }
 
 main() {

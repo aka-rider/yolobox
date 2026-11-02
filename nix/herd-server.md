@@ -64,13 +64,18 @@ exactly. That is coarser than the version string, so the VM's herdr and the
 host's herdr may run different versions as long as the generation agrees.
 
 The VM's herdr is pinned regardless, through the
-`yolobox.harness.herdr.version` and `.hash` valve in `flake.nix`, which holds
+`yolobox.harness.herdr.version` and `.hashes` valve in `flake.nix`, which holds
 the current pin and the reason for it. The pinned nixpkgs lags the host's
 herdr, and the host's herdr, not nixpkgs, sets the generation the guest must
-speak. The pin fetches the published `herdr-linux-aarch64` release asset
-directly (`pkgs/herdr-bin.nix`). That binary has no `PT_INTERP` and no
-`PT_DYNAMIC`, so it is statically linked and runs on NixOS unpatched, with
-none of the nix-ld setup a dynamically linked upstream binary would need.
+speak. The pin fetches the published `herdr-linux-aarch64` or
+`herdr-linux-x86_64` release asset directly, chosen by the guest's system
+(`pkgs/herdr-bin.nix`), and `.hashes` holds one hash per system. Both binaries
+are statically linked, so they run on NixOS unpatched, with none of the nix-ld
+setup a dynamically linked upstream binary would need. The aarch64 one has no
+`PT_INTERP` and no `PT_DYNAMIC`; the x86_64 one is a static-PIE, so it has a
+`PT_DYNAMIC` but no `PT_INTERP` and no `DT_NEEDED`. Check both with
+`readelf -l` and `readelf -d` when bumping the pin, because a `PT_INTERP`
+means the asset needs `autoPatchelfHook`.
 
 ### A saved machine sits stuck
 
@@ -79,7 +84,7 @@ refused one of the four capabilities, almost always
 `endpoint_protocol_generation`. A host herdr and a VM herdr that both look
 like "0.9.x" in `herdr status` can still disagree on generation, so read the
 generation, not the version string beside it. The remedy is the pin's own
-escape hatch: bump `yolobox.harness.herdr.version` and `.hash` to the
+escape hatch: bump `yolobox.harness.herdr.version` and `.hashes` to the
 generation the host's herdr now speaks.
 
 ## HERDR_AGENT

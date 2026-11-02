@@ -340,6 +340,36 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
         self.assertTrue(os.path.exists(real))
 
 
+class WaitingChild(unittest.TestCase):
+    """A child process that lives until its stdin closes."""
+
+    def setUp(self):
+        self.child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+        )
+        self.addCleanup(self.child.wait)
+        self.addCleanup(self.child.stdin.close)
+
+
+class TestPidWatch(WaitingChild):
+    def test_the_wait_returns_once_the_watched_process_exits(self):
+        wait = broker.register_pid_watch_event(self.child.pid)
+        waiter = threading.Thread(target=wait, daemon=True)
+        waiter.start()
+        waiter.join(0)
+        self.assertTrue(waiter.is_alive(), "the wait returned while the process ran")
+        self.child.stdin.close()
+        waiter.join(30)
+        self.assertFalse(waiter.is_alive(), "the wait never saw the process exit")
+
+    def test_a_pid_that_is_gone_refuses_to_register(self):
+        self.child.stdin.close()
+        self.child.wait()
+        with self.assertRaises(SystemExit):
+            broker.register_pid_watch_event(self.child.pid)
+
+
 class TestBindServer(SocketDirCase):
     def test_socket_is_mode_0600_and_umask_is_restored(self):
         before = os.umask(0o022)

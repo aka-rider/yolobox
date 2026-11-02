@@ -51,7 +51,7 @@ Workflow permissions are `contents: read` at the top and `contents: write` only 
 
 - `lint` runs `ruff check`, `ruff format --check`, the `yo --help` smoke test, and shellcheck at warning severity on `nix/guest/yolobox-guest.sh`.
 - `unit` runs the unit tests on Python 3.9 and the newest 3.x. 3.9 is the floor `yo` promises, because the Mac's Xcode Python is that. The newest catches the other direction. The 3.9 leg runs on `ubuntu-24.04`, because setup-python has no 3.9 for `ubuntu-latest`'s 26.04 image; [TODO.md](../../TODO.md) says what replaces the pin.
-- `eval` runs `YOLOBOX_USERNAME=ci nix eval --impure --raw --option allow-import-from-derivation false .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath` on `cachix/install-nix-action@v31`.
+- `eval` runs `YOLOBOX_USERNAME=ci YOLOBOX_HOST_OS=linux nix eval --impure --raw --option allow-import-from-derivation false .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath` on `cachix/install-nix-action@v31`, then the same with `YOLOBOX_HOST_OS=darwin` and `--system aarch64-linux`, the Mac box's guest.
 
 `eval` evaluates the whole box configuration without building it, so an invalid option fails CI before a tag is moved, not on a user's `yo bootstrap`. An option that no nixpkgs branch defines, such as a misspelled `programs.<name>.enable`, would otherwise make a release that cannot be rebuilt. It needs no aarch64 builder because the derivation path is computed and never realised, and forbidding import-from-derivation keeps it so.
 

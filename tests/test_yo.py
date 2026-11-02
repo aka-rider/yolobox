@@ -26,12 +26,19 @@ def load_yo(name="yo"):
 
     A test that needs another machine loads a copy and calls its
     `set_instance`, so it never disturbs the shared `yo`.
+
+    The copy drives the Lima driver on the default machine, whatever host runs
+    the tests, so `main()` and every function that reads the driver behave as
+    they do on a Mac.
     """
     loader = importlib.machinery.SourceFileLoader(name, YO_PATH)
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     loader.exec_module(module)
+    module.HOST_PLATFORM = "darwin"
+    module.set_driver(module.driver_for(module.HOST_PLATFORM))
+    module.set_instance(module.DEFAULT_INSTANCE)
     return module
 
 
@@ -1930,6 +1937,32 @@ class TestEnsureAwsBrokerStaleBroker(FakeHome):
         self.assertTrue(result)
         self.assertEqual(killed, [111])
         fake_start.assert_called_once_with(555, ["work"])
+
+
+class TestPidExitsWithin(unittest.TestCase):
+    def setUp(self):
+        self.child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+        )
+        self.addCleanup(self.child.wait)
+        self.addCleanup(self.child.stdin.close)
+
+    def test_a_running_process_has_not_exited(self):
+        self.assertFalse(yo.pid_exits_within(self.child.pid, 0))
+
+    def test_a_process_that_exits_is_seen(self):
+        self.child.stdin.close()
+        self.assertTrue(yo.pid_exits_within(self.child.pid, 30))
+
+    def test_a_pid_that_is_gone_has_exited(self):
+        self.child.stdin.close()
+        self.child.wait()
+        self.assertTrue(yo.pid_exits_within(self.child.pid, 0))
+
+    def test_waiting_for_a_running_process_names_the_stale_broker(self):
+        with self.assertRaisesRegex(yo.YoError, "did not exit within 0s"):
+            yo.wait_for_pid_exit(self.child.pid, 0)
 
 
 class TestStaleBrokerPidIsValidated(FakeHome):

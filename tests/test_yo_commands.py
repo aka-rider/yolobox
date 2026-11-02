@@ -79,6 +79,13 @@ class TestFlakeRef(FakeHome):
         self.assertEqual(shlex.split(flake_arg), [ref + "#yolobox"])
         self.assertNotIn("'; touch", hint.replace(shlex.quote(ref + "#yolobox"), ""))
 
+    def test_the_hint_names_the_host_os_beside_the_username(self):
+        self.remember("github:x/y")
+        self.assertIn(
+            "sudo YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=darwin nixos-rebuild",
+            yo.rebuild_hint(),
+        )
+
     def test_dev_build_falls_back_to_a_hint_naming_version_flag(self):
         with mock.patch.object(yo, "YO_VERSION", "dev"):
             with mock.patch.object(yo, "err") as fake_err:
@@ -263,8 +270,9 @@ class TestMainPreflight(unittest.TestCase):
 
 
 class TestSshRemainderPassthrough(unittest.TestCase):
-    # rebuild_hint() prints "yo ssh sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild
-    # switch --impure --flake '<ref>#yolobox'" as the documented remedy for a
+    # rebuild_hint() prints "yo ssh sudo YOLOBOX_USERNAME=$(id -un)
+    # YOLOBOX_HOST_OS=<os> nixos-rebuild switch --impure --flake '<ref>#yolobox'"
+    # as the documented remedy for a
     # box that has drifted from the host's yo. If argparse ever ate --impure or
     # --flake off that line, the tool's own printed advice would silently stop
     # working.
@@ -277,6 +285,7 @@ class TestSshRemainderPassthrough(unittest.TestCase):
                 "ssh",
                 "sudo",
                 "YOLOBOX_USERNAME=x",
+                "YOLOBOX_HOST_OS=darwin",
                 "nixos-rebuild",
                 "switch",
                 "--impure",
@@ -289,6 +298,7 @@ class TestSshRemainderPassthrough(unittest.TestCase):
             [
                 "sudo",
                 "YOLOBOX_USERNAME=x",
+                "YOLOBOX_HOST_OS=darwin",
                 "nixos-rebuild",
                 "switch",
                 "--impure",
@@ -612,6 +622,18 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
         self.assertEqual(len(rebuilds), 1)
         self.assertIn("encrypts /dev/vda2 in place", self.stderr)
         self.assertIn("must not be interrupted", self.stderr)
+
+    def test_the_rebuild_names_the_username_and_the_host_os(self):
+        rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /\n")
+        self.assertEqual(
+            rebuilds[0][:4],
+            [
+                "sudo",
+                "YOLOBOX_USERNAME=%s" % yo.host_user(),
+                "YOLOBOX_HOST_OS=darwin",
+                "nixos-rebuild",
+            ],
+        )
 
     def test_an_encrypted_disk_gets_no_warning(self):
         rebuilds = self.run_bootstrap(

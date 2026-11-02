@@ -1,0 +1,27 @@
+# Host-side egress filter for the Linux host. Everything the guest sends out
+# leaves through passt, which turns a guest connection into an ordinary
+# socket on the host. libvirt starts passt and QEMU as the system user
+# yolobox-vm, so those sockets carry that uid and this table can judge them.
+# The guest cannot undo it: it is a host table, loaded before virtqemud.
+#
+# The first rule lets every other uid through untouched. After it, the host's
+# loopback (where passt maps the guest's gateway) is reachable on DNS only,
+# and the private and link-local ranges that nix/egress.nix blocks inside the
+# guest are rejected here too. Keep the two address sets equal to that file.
+# The table is defined, deleted and defined again in one file, so a reload
+# replaces it atomically and a failed load leaves the old table in place.
+# See linux/host-setup.md.
+
+table inet yolobox-host {}
+delete table inet yolobox-host
+table inet yolobox-host {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    meta skuid != "yolobox-vm" accept
+    ct state established,related accept
+    oifname "lo" ip daddr 127.0.0.0/8 meta l4proto { tcp, udp } th dport 53 accept
+    oifname "lo" reject
+    ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } reject
+    ip6 daddr { fc00::/7, fe80::/10, ff00::/8, ::1 } reject
+  }
+}

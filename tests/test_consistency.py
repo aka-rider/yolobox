@@ -13,6 +13,7 @@ import re
 import unittest
 from pathlib import Path
 
+import egress_rules
 from test_yo import yo
 
 REPO = Path(yo.__file__).parent
@@ -918,3 +919,133 @@ class TestEveryLspRenderGoesThroughTheWrapper(unittest.TestCase):
             with self.subTest(etc_path=etc_path):
                 self.assertIn('environment.etc."%s"' % etc_path, code)
         self.assertGreaterEqual(code.count('"${lspWrapper}"'), len(self.ETC_PATHS))
+
+
+DOMAIN_XML = REPO / "libvirt" / "domain.xml"
+HOST_NFT = REPO / "linux" / "yolobox-host.nft"
+EGRESS_NIX = REPO / "nix" / "egress.nix"
+LIBVIRT_CHECK = REPO / "tests" / "box-libvirt-check.sh"
+
+
+def nix_binding(path: Path, name: str) -> str:
+    """The string a nix file binds `name` to, as `name = "value";`."""
+    found = re.search(r'^\s*%s = "([^"]*)";' % re.escape(name), path.read_text(), re.M)
+    assert found, "%s binds no string named %s" % (path, name)
+    return found.group(1)
+
+
+def shell_constant(path: Path, name: str) -> str:
+    found = re.search(r"^readonly %s=(\S+)$" % re.escape(name), path.read_text(), re.M)
+    assert found, "%s has no readonly %s" % (path, name)
+    return found.group(1)
+
+
+def address_set(text: str) -> set:
+    return {item.strip() for item in text.split(",")}
+
+
+class TestLibvirtNetworkMirrorsLima(unittest.TestCase):
+    """libvirt/domain.xml gives the guest Lima's address plan, so nix/egress.nix
+    and its fixtures, which spell the gateway, need no change on a Linux host."""
+
+    GUEST = "192.168.5.15"
+
+    def domain(self):
+        return DOMAIN_XML.read_text()
+
+    def test_the_route_is_the_gateway_egress_nix_exempts(self):
+        found = re.search(r"<route [^>]*gateway='([^']+)'", self.domain())
+        self.assertIsNotNone(found, "the domain template has no route")
+        self.assertEqual(found.group(1), nix_binding(EGRESS_NIX, "limaGateway"))
+        self.assertEqual(found.group(1), egress_rules.GATEWAY)
+
+    def test_the_guest_address_is_the_one_the_guest_checks_use(self):
+        found = re.search(r"<ip [^>]*address='([^']+)'", self.domain())
+        self.assertIsNotNone(found, "the domain template has no ip")
+        self.assertEqual(found.group(1), self.GUEST)
+        for script in (HARDENING_CHECK, LIBVIRT_CHECK):
+            with self.subTest(script=script.name):
+                self.assertEqual(
+                    shell_constant(script, "GATEWAY_ADDR"), egress_rules.GATEWAY
+                )
+        self.assertEqual(shell_constant(HARDENING_CHECK, "GUEST_ADDR"), self.GUEST)
+
+    def test_the_operator_may_log_in_from_the_gateway_only(self):
+        text = (REPO / "nix" / "base.nix").read_text()
+        allowed = re.search(
+            r'AllowUsers\s*=[^;]*"\$\{username\}@([0-9.]+)"', text, re.S
+        )
+        self.assertIsNotNone(allowed, "base.nix has no operator AllowUsers entry")
+        self.assertEqual(allowed.group(1), egress_rules.GATEWAY)
+        for rule in re.findall(r"iptables -[ICD] nixos-fw ! -i enp0s1 -s (\S+)", text):
+            self.assertEqual(rule, egress_rules.GATEWAY)
+
+
+class TestHostTableBlocksWhatTheGuestTableBlocks(unittest.TestCase):
+    """linux/yolobox-host.nft rejects the ranges nix/egress.nix does, so a guest
+    that deletes its own table is still kept off them."""
+
+    def host_set(self, family):
+        found = re.search(
+            r"^\s*%s daddr \{ ([^}]*) \} reject$" % family,
+            HOST_NFT.read_text(),
+            re.M,
+        )
+        self.assertIsNotNone(found, "the host table has no %s reject" % family)
+        return address_set(found.group(1))
+
+    def test_blocked_v4_ranges_are_equal(self):
+        self.assertEqual(
+            self.host_set("ip"), address_set(nix_binding(EGRESS_NIX, "blockedV4"))
+        )
+
+    def test_blocked_v6_ranges_are_equal_plus_the_loopback(self):
+        self.assertEqual(
+            self.host_set("ip6"),
+            address_set(nix_binding(EGRESS_NIX, "blockedV6")) | {"::1"},
+        )
+
+
+class TestHostOsValuesHaveOneSpelling(unittest.TestCase):
+    def test_flake_accepts_exactly_the_host_os_of_the_drivers(self):
+        text = (REPO / "flake.nix").read_text()
+        accepted = re.search(r'if h == "(\w+)" \|\| h == "(\w+)" then h', text)
+        self.assertIsNotNone(accepted, "flake.nix does not check YOLOBOX_HOST_OS")
+        self.assertEqual(
+            set(accepted.groups()),
+            {yo.LimaDriver.host_os, yo.LibvirtDriver.host_os},
+        )
+
+    def test_yo_names_the_variable_flake_reads(self):
+        self.assertIn(
+            'builtins.getEnv "%s"' % yo.NIX_ENV_HOST_OS,
+            (REPO / "flake.nix").read_text(),
+        )
+
+
+class TestCidataDescribesTheOperatorBaseNixDeclares(unittest.TestCase):
+    """lima-init creates the operator from lima.env, and base.nix declares the
+    same account. A different uid or home would split it into two accounts."""
+
+    USER = "alice"
+
+    def lima_env(self):
+        text = yo.cidata_files(self.USER, "ssh-ed25519 AAAA", "x")["lima.env"]
+        return dict(line.split("=", 1) for line in text.splitlines())
+
+    def operator_block(self):
+        text = (REPO / "nix" / "base.nix").read_text()
+        found = re.search(r"users\.users\.\$\{username\} = \{(.*?)\n  \};", text, re.S)
+        self.assertIsNotNone(found, "base.nix declares no operator account")
+        return found.group(1)
+
+    def test_uid_is_equal(self):
+        uid = re.search(r"uid = (\d+);", self.operator_block())
+        self.assertEqual(self.lima_env()["LIMA_CIDATA_UID"], uid.group(1))
+
+    def test_home_is_equal(self):
+        home = re.search(r'home = "([^"]+)";', self.operator_block())
+        self.assertEqual(
+            self.lima_env()["LIMA_CIDATA_HOME"],
+            home.group(1).replace("${username}", self.USER),
+        )

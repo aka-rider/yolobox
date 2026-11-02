@@ -1,6 +1,6 @@
 # yolobox
 
-A development sanbox virtual machine. It's a NixOS Linux run by Lima.
+A development sanbox virtual machine. It's a NixOS Linux run by Lima on a Mac, or by libvirt on a Linux PC.
 
 ## To protect against
 
@@ -13,7 +13,7 @@ It limits what an agent can do. It doesn't lock the agent in.
 - The agent runs as its own user with no `sudo`. The filesystem is airgaped. Files move only through git, scp, or rsync.
 - The VM can use your 1Password SSH agent. You must approve the access (TouchID or similarly).
 - The VM reaches the internet, but not your computer or your local network. To let it reach one address, such as a package cache on your LAN, name it in `/etc/yolobox/local.nix`, for example `yolobox.network.lanAllow = [ "192.168.1.20/32" ];`.
-- Open VM ports from 1024 to 49151 are mapped on the host, except a few login-callback ports such as 8085 (you can open `http://localhost:<port>` directly in your browser)
+- On a Mac, open VM ports from 1024 to 49151 are mapped on the host, except a few login-callback ports such as 8085 (you can open `http://localhost:<port>` directly in your browser). On Linux nothing is mapped on its own: `yo port <guest-port>` opens one.
 
 
 ## Quickstart
@@ -45,6 +45,29 @@ Then add this line to `~/.ssh/config`:
 ```
 Include ~/.lima/yolobox/ssh.config
 ```
+
+### Linux host
+
+A Linux PC (Fedora, x86_64, with KVM) runs the box under libvirt instead of Lima. The guest and the way you use it are the same. How the host side works, and why, is in [docs/linux-host.md](docs/linux-host.md).
+
+1. In 1Password, create a second `SSH Key` item, Ed25519, titled `yolobox-operator`, in a vault the 1Password agent serves, next to `yolobox-disk`. It is the key `yo` uses to log in to the VM as you, so no private key file is written on the host.
+2. Once per host, from a checkout of this repo, set the host up. It installs libvirt and passt, adds a host firewall table and an account `yolobox-vm`, and lets your account manage libvirt. Read [linux/host-setup.md](linux/host-setup.md) first:
+
+   ```bash
+   sudo bash linux/host-setup.sh
+   ```
+
+3. Create and start the VM, then build it:
+
+   ```bash
+   yo up
+   yo bootstrap
+   ```
+
+4. Add `Include ~/.local/state/yolobox/instances/yolobox/ssh.config` to `~/.ssh/config` (`yo bootstrap` offers to).
+5. To open a VM port on the host, run `yo port <guest-port>`. It prints the `127.0.0.1` port it chose.
+
+A host whose sshd listens on the tailnet should read the tailnet section of the linux-host story first.
 
 ## Daily use
 
@@ -142,8 +165,10 @@ Fork it and change whatever you like.
 To add tools you use every day, like `helix` or `neovim`, put them in `/etc/yolobox/local.nix` inside the VM and rebuild:
 
 ```bash
-sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake 'github:aka-rider/yolobox/v<version>#yolobox'
+sudo YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=darwin nixos-rebuild switch --impure --flake 'github:aka-rider/yolobox/v<version>#yolobox'
 ```
+
+`YOLOBOX_HOST_OS` names the OS that runs the VM: `darwin` for a Mac, `linux` for a Linux PC.
 
 Lima reads `lima/yolobox.yaml` only once, when it creates the VM, so editing that file later changes nothing. To give an existing VM more memory or CPUs:
 

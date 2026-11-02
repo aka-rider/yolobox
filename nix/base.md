@@ -53,3 +53,9 @@ nixos-lima's `lima-init.nix` sets `networking.nat.enable = true`, and nixpkgs' n
 ## sudo is wheel-only
 
 `nix/base.nix` sets `security.sudo.execWheelOnly = true`. It drops other-execute from the setuid `sudo` wrapper, so the agent, which is not in `wheel`, cannot exec it at all. The agent could not authenticate anyway, because its password is locked and it is in no sudoers rule. But a setuid root binary that anyone can run is attack surface, and the wrapper should not be reachable by the account that has no use for it. The box also has no direnv (see [nix/lsp.md](lsp.md#no-direnv)). The check is `ls -l /run/wrappers/bin/sudo`, which must show no `x` for others, and `sudo -n true` as the agent must fail with permission denied, not with a password prompt.
+
+## Host OS gates
+
+`flake.nix` passes `hostOs` (`darwin` or `linux`, from `YOLOBOX_HOST_OS`) to this module, because the same box runs under two hypervisor stacks. Lima/vz on a Mac gives the guest a rosetta share and a Lima hostagent to talk to. A libvirt guest on a Linux PC has neither, so `virtualisation.rosetta` is on only for `darwin` and `lima-guestagent` is disabled for `linux` (it fails for lack of its binary there). The CPU is a separate fact: it is the system of the nix that evaluates, so the Mac box is `aarch64-linux` and a Linux PC's box is `x86_64-linux`.
+
+On `linux` two more rules apply, so that the agent cannot use the forwarded 1Password agent to log in as the operator from inside the guest. `AllowUsers` admits the operator only from `192.168.5.2`, the gateway address the host's forwarded ssh port arrives from, and the agent from anywhere. A firewall rule drops packets that claim that source on any interface but `enp0s1`, so the agent cannot fake the address over loopback. The full Linux story is written with the Linux host docs.

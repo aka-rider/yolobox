@@ -40,4 +40,4 @@ The guest does not ship `yo`, because every `yo` subcommand but `--version` need
 
 ### `nix flake check` throws with no explanation
 
-`flake.nix` reads `YOLOBOX_USERNAME` from the environment and `throw`s when it is unset, because Nix has no pure way to learn the host username (see [Two accounts](accounts.md#two-accounts)). A bare `nix flake check` hits that throw at once. It needs `--impure` with `YOLOBOX_USERNAME=$(id -un)`, like every `nixos-rebuild` here.
+`flake.nix` reads `YOLOBOX_USERNAME` and `YOLOBOX_HOST_OS` from the environment and `throw`s when either is unset, because Nix has no pure way to learn the host username or the host OS (see [Two accounts](accounts.md#two-accounts)). A bare `nix flake check` hits that throw at once. It needs `--impure` with `YOLOBOX_USERNAME=$(id -un)` and `YOLOBOX_HOST_OS=darwin` or `linux`, like every `nixos-rebuild` here. `YOLOBOX_HOST_OS` is separate from the CPU: the guest's system is the evaluating nix's own (`aarch64-linux` or `x86_64-linux`), so `--system aarch64-linux` picks the Mac box's guest on any machine.

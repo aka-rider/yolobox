@@ -1,0 +1,14 @@
+[Unit]
+Description=Reject yolobox guest traffic to the host and private networks
+Before=virtqemud.service
+
+# No ExecStop, on purpose: stopping the unit must never open the host. The
+# table stays loaded until someone deletes it by hand.
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/yolobox/yolobox-host.nft
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=virtqemud.service

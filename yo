@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""yo — thin host-side CLI for the NixOS-VM yolobox (lima/vz).
+"""yo — thin host-side CLI for the NixOS-VM yolobox (lima/vz on macOS, libvirt on Linux).
 
 Run `yo --help` for the command reference.
 """
@@ -7,8 +7,12 @@ Run `yo --help` for the command reference.
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
+import contextlib
 import enum
+import errno
+import fcntl
 import hashlib
 import hmac
 import http.client
@@ -24,16 +28,30 @@ import shutil
 import signal
 import socket
 import stat
+import string
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 # Rewritten at build time: nix substituteInPlace, Homebrew inreplace.
 YO_VERSION = "dev"
@@ -91,7 +109,9 @@ AWS_BROKER_GUEST_SOCK = "/run/yolobox-op/aws-broker.sock"
 AGENT_AWS_BROKER_SOCK = "/run/yolobox/aws-broker.sock"
 
 # The guest TCP ports lima mirrors onto the host's 127.0.0.1: unprivileged and
-# below the macOS ephemeral range (49152). A Linux host would need [1024, 32767].
+# below the macOS ephemeral range (49152). A Linux host mirrors nothing: it has no
+# fixed range to give away, so `yo port` hands out host ports from
+# host_port_window(), the ports above the kernel's ephemeral range.
 MIRRORED_TCP_PORTS = [1024, 49151]
 
 # Fixed OAuth callback ports inside MIRRORED_TCP_PORTS that are never mirrored:
@@ -221,24 +241,42 @@ GUEST_AWS_CONFIG_PATH = AGENT_HOME + "/.config/yolobox/aws-config"
 PROXY_SOCKET_UNITS = ("yolobox-op-agent.socket", "yolobox-aws-broker.socket")
 
 
+# The host OS as sys.platform spells it: the one place yo asks. main() turns it
+# into a driver with driver_for(), and nothing else looks at the host OS.
+HOST_PLATFORM = sys.platform
+
+# The host driver, read by every function that touches the VM's host side.
+# Unset until main() chooses, so a code path that forgets to choose fails with a
+# NameError, never with a guess.
+DRIVER: Driver
+
+
+def set_driver(driver: Driver) -> None:
+    global DRIVER
+    DRIVER = driver
+
+
 def set_instance(name: str) -> None:
     # The machine comes from -m/--machine, and every per-machine name is derived
-    # here, so one flag switches all of them.
+    # here, so one flag switches all of them. The driver says where its
+    # instances live, so set_driver comes first.
     global INSTANCE, VM_HOST, HERDR_SSH_ALIAS
     global EDITOR_SSH_BLOCK, INCLUDE_LINE, INCLUDE_RE
     INSTANCE = name
     VM_HOST = "lima-" + name
     HERDR_SSH_ALIAS = name
+    instance_dir = "~/%s/%s" % (DRIVER.instances_dir, INSTANCE)
     # ssh keeps the first value it sees per keyword, so this block beats both lima's
     # Host block below it and a user's own "Host lima-yolobox / ForwardAgent yes"
     # included after it: the agent role never forwards the Mac's agent.
     EDITOR_SSH_BLOCK = (
-        "Match host %s user %s\n  ControlPath ~/.lima/%s/ssh-agent.sock\n"
-        "  ForwardAgent no" % (VM_HOST, AGENT_USER, INSTANCE)
+        "Match host %s user %s\n  ControlPath %s/ssh-agent.sock\n"
+        "  ForwardAgent no" % (VM_HOST, AGENT_USER, instance_dir)
     )
-    INCLUDE_LINE = "Include ~/.lima/%s/ssh.config" % INSTANCE
+    INCLUDE_LINE = "Include %s/ssh.config" % instance_dir
     INCLUDE_RE = re.compile(
-        r"^\s*Include\s+.*\.lima/%s/ssh\.config" % re.escape(INSTANCE),
+        r"^\s*Include\s+.*%s/%s/ssh\.config"
+        % (re.escape(DRIVER.instances_dir), re.escape(INSTANCE)),
         re.IGNORECASE,
     )
 
@@ -251,12 +289,13 @@ def yo_cmd(*words: str) -> str:
     return "yo -m %s %s" % (INSTANCE, " ".join(words))
 
 
-set_instance(DEFAULT_INSTANCE)
-
 AGENT_SSH_CONFIG_MARKER = (
     "# yolobox: re-applied by yo; lima rewrites this file on every start"
 )
 LIMA_SSH_ALIAS_FIELDS = ("Hostname", "Port", "IdentityFile")
+# Read when the instance's Host block has it (the libvirt driver's names the
+# 1Password socket, because its IdentityFile is only a public key).
+SSH_ALIAS_OPTIONAL_FIELDS = ("IdentityAgent",)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -266,7 +305,8 @@ def home() -> str:
 
 
 def lima_dir() -> str:
-    return os.path.join(home(), ".lima", INSTANCE)
+    """This instance's directory under the driver's instances root."""
+    return os.path.join(home(), DRIVER.instances_dir, INSTANCE)
 
 
 def ssh_cfg() -> str:
@@ -307,7 +347,7 @@ def parse_lima_ssh_block(text: str, host: str) -> Optional[Dict[str, str]]:
         if line and not line[0].isspace():
             break
         key, _, value = line.strip().partition(" ")
-        if key in LIMA_SSH_ALIAS_FIELDS:
+        if key in LIMA_SSH_ALIAS_FIELDS + SSH_ALIAS_OPTIONAL_FIELDS:
             values[key] = value.strip().strip('"')
     if not all(values.get(field) for field in LIMA_SSH_ALIAS_FIELDS):
         return None
@@ -315,6 +355,11 @@ def parse_lima_ssh_block(text: str, host: str) -> Optional[Dict[str, str]]:
 
 
 def herdr_alias_block(lima_values: Dict[str, str]) -> str:
+    identity_agent = (
+        ['  IdentityAgent "%s"' % lima_values["IdentityAgent"]]
+        if "IdentityAgent" in lima_values
+        else []
+    )
     return "\n".join(
         [
             "Host %s" % HERDR_SSH_ALIAS,
@@ -330,6 +375,7 @@ def herdr_alias_block(lima_values: Dict[str, str]) -> str:
             '  UserKnownHostsFile "%s"' % known_hosts_path(),
             "  IdentitiesOnly yes",
         ]
+        + identity_agent
     )
 
 
@@ -449,9 +495,7 @@ def ensure_guest_known_hosts() -> None:
 
 
 def op_sock() -> str:
-    return os.path.join(
-        home(), "Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
-    )
+    return DRIVER.op_sock()
 
 
 def ssh_string(data: bytes) -> bytes:
@@ -511,24 +555,30 @@ def derive_luks_passphrase(raw_signature: bytes) -> bytes:
     )
 
 
-def pick_luks_key(identities: Sequence[Tuple[bytes, str]]) -> bytes:
-    blobs = [blob for blob, comment in identities if comment == LUKS_KEY_ITEM]
+def unique_key_titled(identities: Sequence[Tuple[bytes, str]], title: str) -> bytes:
+    """The one agent key whose comment is `title`; none or several is an error."""
+    blobs = [blob for blob, comment in identities if comment == title]
     if not blobs:
         raise YoError(
             "1Password's ssh agent has no key titled %s — create an SSH Key item "
-            "(Ed25519) with exactly that title in 1Password" % LUKS_KEY_ITEM
+            "(Ed25519) with exactly that title in 1Password" % title
         )
     if len(blobs) > 1:
         raise YoError(
             "1Password's ssh agent offers %d keys titled %s — keep exactly one"
-            % (len(blobs), LUKS_KEY_ITEM)
-        )
-    if key_type(blobs[0]) != "ssh-ed25519":
-        raise YoError(
-            "the %s item in 1Password must be an Ed25519 key, not %s"
-            % (LUKS_KEY_ITEM, key_type(blobs[0]))
+            % (len(blobs), title)
         )
     return blobs[0]
+
+
+def pick_luks_key(identities: Sequence[Tuple[bytes, str]]) -> bytes:
+    blob = unique_key_titled(identities, LUKS_KEY_ITEM)
+    if key_type(blob) != "ssh-ed25519":
+        raise YoError(
+            "the %s item in 1Password must be an Ed25519 key, not %s"
+            % (LUKS_KEY_ITEM, key_type(blob))
+        )
+    return blob
 
 
 def recv_exact(conn: socket.socket, count: int) -> bytes:
@@ -925,7 +975,7 @@ def require_agent_account() -> None:
             "    Every AI session runs as that account, and this VM has no working one —"
         )
         err("    it predates the operator/agent split. Rebuild it:")
-        err("        limactl delete %s && %s" % (INSTANCE, yo_cmd("bootstrap")))
+        err("        %s && %s" % (DRIVER.delete_command(), yo_cmd("bootstrap")))
     else:
         if detail:
             err(detail)
@@ -1213,7 +1263,7 @@ def aws_broker_health(timeout: float = 2.0) -> Optional[dict]:
         return None
 
 
-def wait_for_pid_exit(pid: int, timeout: float) -> None:
+def kqueue_pid_exits_within(pid: int, timeout: float) -> bool:
     try:
         kq = select.kqueue()
     except OSError as failure:
@@ -1228,14 +1278,39 @@ def wait_for_pid_exit(pid: int, timeout: float) -> None:
             fflags=select.KQ_NOTE_EXIT,
         )
         kq.control([event], 0)
-        if not kq.control(None, 1, timeout):
-            raise YoError(
-                "stale aws-broker (pid %d) did not exit within %gs" % (pid, timeout)
-            )
+        return bool(kq.control(None, 1, timeout))
     except ProcessLookupError:
-        pass
+        return True
     finally:
         kq.close()
+
+
+def pidfd_pid_exits_within(pid: int, timeout: float) -> bool:
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    except OSError as failure:
+        raise YoError("cannot watch pid %d for its exit: %s" % (pid, failure))
+    try:
+        return bool(select.select([pidfd], [], [], timeout)[0])
+    finally:
+        os.close(pidfd)
+
+
+def pid_exits_within(pid: int, timeout: float) -> bool:
+    """Whether `pid` has exited, or exits within `timeout` seconds: a kqueue on
+    macOS, a pidfd on Linux."""
+    if hasattr(select, "kqueue"):
+        return kqueue_pid_exits_within(pid, timeout)
+    return pidfd_pid_exits_within(pid, timeout)
+
+
+def wait_for_pid_exit(pid: int, timeout: float) -> None:
+    if not pid_exits_within(pid, timeout):
+        raise YoError(
+            "stale aws-broker (pid %d) did not exit within %gs" % (pid, timeout)
+        )
 
 
 def kill_stale_broker(pid: int) -> None:
@@ -1358,10 +1433,7 @@ def ensure_aws_broker() -> bool:
 
     pid = ha_pid()
     if pid is None:
-        raise YoError(
-            "cannot read %s's host agent pid (limactl list %s --json) — is it up? %s"
-            % (INSTANCE, INSTANCE, yo_cmd("status"))
-        )
+        raise YoError(DRIVER.keepalive_pid_error())
 
     allowed_names = sorted(name for name, _ in allowed)
     health = aws_broker_health()
@@ -1417,6 +1489,495 @@ def ensure_herdr_machine(ssh_config_includes_the_vm: bool) -> None:
         )
 
 
+def ssh_port() -> int:
+    return DRIVER.ssh_port()
+
+
+def ha_pid() -> Optional[int]:
+    return DRIVER.keepalive_pid()
+
+
+def op_probe_alive(proc: subprocess.CompletedProcess) -> bool:
+    if proc.returncode == 0:
+        return True
+    return proc.returncode == 1 and "The agent has no identities" in proc.stdout
+
+
+def aws_broker_probe_alive(proc: subprocess.CompletedProcess) -> bool:
+    return proc.returncode == 0
+
+
+@dataclass(frozen=True)
+class ReverseForward:
+    name: str
+    guest_path: str
+    host_path: str
+    probe: Tuple[str, ...]
+    alive: Callable[[subprocess.CompletedProcess], bool]
+
+
+def one_password_forward() -> ReverseForward:
+    return ReverseForward(
+        "1password", OP_GUEST_SOCK, op_sock(), ("ssh-add", "-l"), op_probe_alive
+    )
+
+
+def aws_broker_forward() -> ReverseForward:
+    return ReverseForward(
+        "aws-broker",
+        AWS_BROKER_GUEST_SOCK,
+        aws_broker_sock(),
+        ("curl", "-sS", "--unix-socket", AGENT_AWS_BROKER_SOCK, "http://broker/health"),
+        aws_broker_probe_alive,
+    )
+
+
+def forward_control_cmd(action: str, forward: ReverseForward) -> List[str]:
+    return ssh_base(OPERATOR, mux=True) + [
+        "-O",
+        action,
+        "-R",
+        "%s:%s" % (forward.guest_path, forward.host_path),
+        VM_HOST,
+    ]
+
+
+def heal_reverse_forward(forward: ReverseForward) -> bool:
+    probe = ssh_run(AGENT, list(forward.probe))
+    if forward.alive(probe):
+        return True
+    run(forward_control_cmd("cancel", forward), check=False)
+    ssh_run(OPERATOR, ["rm", "-f", forward.guest_path], mux=True, check=True)
+    run(forward_control_cmd("forward", forward), check=True)
+    probe = ssh_run(AGENT, list(forward.probe))
+    return forward.alive(probe)
+
+
+def heal_forward_collecting_errors(forward: ReverseForward, errors: List[str]) -> None:
+    try:
+        healed = heal_reverse_forward(forward)
+    except YoError as failure:
+        errors.append(
+            "the %s forward into the VM failed while healing it: %s"
+            % (forward.name, failure.message or "unknown error")
+        )
+        return
+    if not healed:
+        errors.append(
+            "the %s forward into the VM is still dead after re-issuing it"
+            % forward.name
+        )
+
+
+def ensure_op_forward(aws_enabled: bool) -> List[str]:
+    errors: List[str] = []
+    if not os.path.exists(op_sock()):
+        err(
+            "yo: 1Password not running on this host (no socket at %s) — skipping its VM forward"
+            % op_sock()
+        )
+    else:
+        heal_forward_collecting_errors(one_password_forward(), errors)
+    if aws_enabled:
+        heal_forward_collecting_errors(aws_broker_forward(), errors)
+    return errors
+
+
+def units_missing_note() -> str:
+    return "box predates the 1Password/AWS forwards; run `%s`" % yo_cmd("bootstrap")
+
+
+def in_place_encryption_warning() -> str:
+    return (
+        "yo: the next boot encrypts %s in place. The box is unusable until it finishes "
+        "(this can take many minutes on a large disk), "
+        "and the first minutes, an offline filesystem shrink, must not be interrupted: "
+        'do not stop the VM or the host until %s reports "unlocked". '
+        "%s first shrinks the work."
+        % (LUKS_DEVICE, yo_cmd("up"), yo_cmd("gc", "--deep", "--yes"))
+    )
+
+
+def vm_units_present() -> bool:
+    return (
+        ssh_run(
+            OPERATOR, ["systemctl", "cat", PROXY_SOCKET_UNITS[0]], check=False
+        ).returncode
+        == 0
+    )
+
+
+def vm_services() -> None:
+    status, _ = account_status()
+    if status == "unreachable":
+        err(
+            "yo: cannot reach %s as operator — is the VM up? %s"
+            % (INSTANCE, yo_cmd("status"))
+        )
+        return
+    if not vm_units_present():
+        err("yo: %s" % units_missing_note())
+        return
+
+    errors: List[str] = []
+    aws_enabled = False
+    try:
+        aws_enabled = ensure_aws_broker()
+    except YoError as failure:
+        errors.append(failure.message or "aws-broker failed")
+
+    errors += ensure_op_forward(aws_enabled)
+
+    if errors:
+        raise YoError(
+            "; ".join(errors)
+            + " — recreate the master: %s && %s" % (DRIVER.stop_command(), yo_cmd("up"))
+        )
+
+
+class InitrdEndpoint(NamedTuple):
+    """Where, and as whom, the pre-unlock probes reach the initrd's sshd."""
+
+    hostname: str
+    port: int
+    identity: str
+
+
+def initrd_endpoint() -> InitrdEndpoint:
+    values: Optional[Dict[str, str]] = None
+    try:
+        with open(ssh_cfg(), "r", errors="surrogateescape") as handle:
+            values = parse_lima_ssh_block(handle.read(), VM_HOST)
+    except FileNotFoundError:
+        pass  # a first start: lima has not written it yet, the defaults below are what it will write
+    except OSError as failure:
+        raise YoError("cannot read %s: %s" % (ssh_cfg(), failure.strerror))
+    if not values:
+        return InitrdEndpoint(
+            "127.0.0.1", ssh_port(), os.path.join(home(), DRIVER.initrd_identity)
+        )
+    if not is_ascii_number(values["Port"]):
+        raise YoError(
+            "%s names the port %r, not a number" % (ssh_cfg(), values["Port"])
+        )
+    return InitrdEndpoint(
+        values["Hostname"], int(values["Port"]), values["IdentityFile"]
+    )
+
+
+def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:
+    # Before the disk is unlocked only the initrd's sshd answers, with a host key
+    # it generated this boot. Nothing is pinned, so whoever holds the loopback
+    # port is trusted with the answer: on macOS that is lima's hostagent, running
+    # as the host user; on Linux it is passt, running as the yolobox-vm account,
+    # and DRIVER.verify_initrd_listener() checks the owner before every
+    # passphrase is sent. And no pinned role may be used here: accept-new would
+    # write the initrd's key into known_hosts, and every stage-2 connection after
+    # it would be refused.
+    hostname, port, identity = initrd_endpoint()
+    return (
+        [
+            "ssh",
+            "-F",
+            "/dev/null",
+            "-i",
+            identity,
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityAgent=%s" % DRIVER.initrd_identity_agent(),
+            "-o",
+            "User=%s" % user,
+            "-o",
+            "Port=%d" % port,
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=%d" % SSH_CONNECT_TIMEOUT_SECONDS,
+            "-o",
+            "ServerAliveInterval=%d" % SSH_ALIVE_INTERVAL_SECONDS,
+            "-o",
+            "LogLevel=ERROR",
+        ]
+        + FIRST_CONTACT_OPTS
+        + [hostname, remote]
+    )
+
+
+NOT_LISTENING_MARKERS = (
+    "Connection refused",
+    "Connection reset",
+    "kex_exchange_identification",
+    "Connection closed",
+    "closed by remote host",
+    "Broken pipe",
+    "Connection timed out",
+    "Operation timed out",
+)
+
+
+class SshOutcome(enum.Enum):
+    """What one ssh attempt at the initrd's or stage 2's sshd came to."""
+
+    ANSWERED = "answered"  # the command ran and exited 0
+    RAN = "ran"  # the command ran and exited non-zero
+    REFUSED = "refused"  # sshd answered and refused the key
+    NOT_LISTENING = "not-listening"  # no sshd behind the port (yet)
+    ERROR = "error"  # ssh failed in a way yo has no name for
+
+
+def classify_initrd_attempt(returncode: int, stderr: str) -> SshOutcome:
+    if returncode != SSH_UNREACHABLE:
+        return SshOutcome.RAN
+    if "Permission denied" in stderr:
+        return SshOutcome.REFUSED
+    if any(marker in stderr for marker in NOT_LISTENING_MARKERS):
+        return SshOutcome.NOT_LISTENING
+    return SshOutcome.ERROR
+
+
+def sshd_answers(user: str) -> SshOutcome:
+    proc = run(initrd_ssh_argv("true", user=user), stdin=b"")
+    if proc.returncode == 0:
+        return SshOutcome.ANSWERED
+    return classify_initrd_attempt(proc.returncode, proc.stderr)
+
+
+def stage2_up() -> bool:
+    return sshd_answers(host_user()) is SshOutcome.ANSWERED
+
+
+def initrd_waiting() -> bool:
+    return sshd_answers("root") is SshOutcome.ANSWERED
+
+
+@dataclass(frozen=True)
+class HelperRun:
+    """One run of the initrd's yolobox-unlock over ssh."""
+
+    returncode: int
+    stderr: str
+    migrated: bool
+    streamed: bool  # the helper's stdout reached the terminal before the session ended
+
+
+def run_initrd_helper(passphrase: bytes) -> HelperRun:
+    stderr_lines: List[str] = []
+
+    def collect(source: io.BufferedReader) -> None:
+        for raw in iter(source.readline, b""):
+            stderr_lines.append(raw.decode("utf-8", "replace").rstrip("\n"))
+
+    migrated = False
+    streamed = False
+    DRIVER.verify_initrd_listener(initrd_endpoint().port)
+    try:
+        helper = subprocess.Popen(
+            initrd_ssh_argv(INITRD_UNLOCK_HELPER),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise YoError("ssh not found on PATH")
+    with helper as proc:
+        collector = threading.Thread(target=collect, args=(proc.stderr,))
+        collector.start()
+        try:
+            proc.stdin.write(passphrase + b"\n")
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass  # ssh already ended; its exit code and stderr, returned below, say why
+        for raw in iter(proc.stdout.readline, b""):
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            streamed = True
+            migrated = migrated or "id=%s" % MIGRATE_ASK_ID in line
+            out(line)
+        collector.join()
+        returncode = proc.wait()
+    return HelperRun(returncode, "\n".join(stderr_lines), migrated, streamed)
+
+
+class Verdict(enum.Enum):
+    """What unlock_disk does after one helper run.
+
+    UNLOCKED: the helper finished its job. FAILED: a failure retrying cannot
+    fix. DROPPED: the session ran and then ended (switch-root, or a migration
+    that outlived the connection). REFUSED: sshd refused the key, and stage 2's
+    sshd may be about to accept it. NOT_LISTENING: nothing to talk to yet.
+    """
+
+    UNLOCKED = "unlocked"
+    FAILED = "failed"
+    DROPPED = "dropped"
+    REFUSED = "refused"
+    NOT_LISTENING = "not-listening"
+
+
+def judge_helper_run(attempt: HelperRun) -> Verdict:
+    outcome = classify_initrd_attempt(attempt.returncode, attempt.stderr)
+    if outcome is SshOutcome.RAN:
+        return Verdict.UNLOCKED if attempt.returncode == 0 else Verdict.FAILED
+    if attempt.streamed:
+        return Verdict.DROPPED
+    if outcome is SshOutcome.ERROR:
+        return Verdict.FAILED
+    if outcome is SshOutcome.REFUSED:
+        return Verdict.REFUSED
+    return Verdict.NOT_LISTENING
+
+
+def initrd_root_ssh_command(remote_command: str) -> str:
+    return (
+        "ssh -F /dev/null -i ~/%s -o IdentitiesOnly=yes -o IdentityAgent=%s "
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p %d "
+        "root@127.0.0.1 %s"
+        % (
+            DRIVER.initrd_identity,
+            shlex.quote(DRIVER.initrd_identity_agent()),
+            ssh_port(),
+            remote_command,
+        )
+    )
+
+
+def helper_failure_message(attempt: HelperRun) -> str:
+    code, stderr = attempt.returncode, attempt.stderr
+    if code == SSH_UNREACHABLE:
+        return stderr or "ssh to 127.0.0.1:%d failed with exit %d and no message" % (
+            ssh_port(),
+            code,
+        )
+    if code == HELPER_EXIT_MIGRATION_FAILED:
+        return (
+            "encrypting the disk failed in the initrd; the box is still in its initrd "
+            "with the plaintext intact. Inspect it as root: %s\n%s"
+            % (initrd_root_ssh_command("journalctl -u yolobox-luks-migrate"), stderr)
+        )
+    if code == HELPER_EXIT_ROOT_MOUNT_FAILED:
+        return (
+            "the disk unlocked but the initrd could not mount it as /sysroot "
+            "(sysroot.mount failed); the box waits in its initrd emergency mode. "
+            "Inspect it as root: %s\n%s"
+            % (initrd_root_ssh_command("journalctl -b"), stderr)
+        )
+    if code == HELPER_EXIT_WRONG_KEY:
+        return (
+            "the %s key in 1Password does not open %s — a different key encrypted "
+            "this disk, and there is no recovery slot" % (LUKS_KEY_ITEM, LUKS_DEVICE)
+        )
+    if code == HELPER_EXIT_WATCH_LOST:
+        return "the initrd helper lost its watch:\n%s" % stderr
+    if code == HELPER_EXIT_NO_PASSPHRASE:
+        return "no passphrase reached the initrd helper"
+    return "the initrd helper failed with exit %d: %s" % (code, stderr)
+
+
+def deadline_after(
+    deadline: Optional[float], status: str, lima_is_starting: bool, now: float
+) -> Optional[float]:
+    """The unlock budget after seeing lima's status: it starts when lima says Running."""
+    if status == "Running":
+        return deadline or now + INITRD_WAIT_SECONDS
+    if lima_is_starting and status in LIMA_PRE_BOOT_STATUSES:
+        # Lima is still creating, downloading or booting.
+        return None
+    raise YoError(
+        "%s is %s, not Running — %s"
+        % (INSTANCE, status or "not listed", DRIVER.list_command())
+    )
+
+
+def initrd_timeout_error(key_was_refused: bool) -> YoError:
+    if key_was_refused:
+        return YoError(
+            "the sshd on 127.0.0.1:%d refused %s's key for root and for %s — if %s "
+            "is in its initrd, reading the key from cidata failed; see "
+            "docs/disk-encryption.md#recognising-failures"
+            % (ssh_port(), DRIVER.name, host_user(), INSTANCE)
+        )
+    return YoError(
+        "%s never offered its initrd sshd on 127.0.0.1:%d within %d s of %s "
+        "reporting it Running — %s, %s"
+        % (
+            INSTANCE,
+            ssh_port(),
+            INITRD_WAIT_SECONDS,
+            DRIVER.name,
+            DRIVER.list_command(),
+            DRIVER.boot_log(),
+        )
+    )
+
+
+def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -> bool:
+    """Answer the initrd's passphrase ask; True when this boot migrated the disk."""
+    migrated_any = False
+    session_ran = False
+    deadline: Optional[float] = None
+    refused_since: Optional[float] = None
+    err("yo: waiting for %s's initrd to ask for its disk passphrase" % INSTANCE)
+    while True:
+        attempt = run_initrd_helper(passphrase)
+        migrated_any = migrated_any or attempt.migrated
+        verdict = judge_helper_run(attempt)
+        if verdict in (Verdict.UNLOCKED, Verdict.DROPPED):
+            for line in attempt.stderr.splitlines():
+                err(line)
+        if verdict is Verdict.UNLOCKED:
+            return migrated_any
+        if verdict is Verdict.FAILED:
+            raise YoError(helper_failure_message(attempt))
+        if verdict is Verdict.DROPPED:
+            # Switch-root, or a migration that outlived the connection. A fresh
+            # budget, since the old one may have expired while the session streamed.
+            session_ran = True
+            deadline = time.monotonic() + INITRD_WAIT_SECONDS
+        if verdict in (Verdict.DROPPED, Verdict.REFUSED) and stage2_up():
+            return migrated_any
+        if verdict is Verdict.REFUSED:
+            # A fresh instance's first plain boot writes the operator's key
+            # moments after its sshd starts, so a refusal is retried.
+            refused_since = refused_since or time.monotonic()
+
+        starter_alive = starter is not None and starter.poll() is None
+        if starter is not None and not starter_alive and not session_ran:
+            if starter.returncode != 0:
+                raise YoError(
+                    "%s exited %d before %s offered its initrd sshd"
+                    % (DRIVER.start_command, starter.returncode, INSTANCE)
+                )
+            # Lima's own ssh worked, so this was a plain boot: stage 2 is up.
+            if stage2_up():
+                return migrated_any
+        deadline = deadline_after(
+            deadline,
+            DRIVER.vm_status() or "",
+            starter_alive and not session_ran,
+            time.monotonic(),
+        )
+        if deadline is not None and time.monotonic() > deadline:
+            raise initrd_timeout_error(refused_since is not None)
+        time.sleep(INITRD_POLL_SECONDS)
+
+
+def wait_for_operator() -> None:
+    deadline = time.monotonic() + OPERATOR_WAIT_SECONDS
+    while not stage2_up():
+        if time.monotonic() > deadline:
+            raise YoError(
+                "the disk is unlocked but %s is not reachable as the operator — %s"
+                % (INSTANCE, yo_cmd("status"))
+            )
+        time.sleep(OPERATOR_POLL_SECONDS)
+
+
+# The host drivers. Everything from here to the libvirt block is the macOS side:
+# what limactl reports and does, behind LimaDriver. The functions stay module-level
+# so that `yo.lima_stop` and the rest are the names tests and printed remedies
+# use; callers outside this block reach them only through DRIVER.
 @dataclass(frozen=True)
 class LimaInfo:
     host_agent_pid: Optional[int]
@@ -1454,45 +2015,6 @@ def lima_instance_info() -> Optional[LimaInfo]:
         load_dot_ssh_pub_keys=ssh.get("loadDotSSHPubKeys"),
         ssh_local_port=ssh.get("localPort"),
     )
-
-
-def lima_create_command() -> str:
-    return "limactl create --name %s --set '.ssh.localPort=<free port>' %s" % (
-        INSTANCE,
-        SCRIPT_DIR / "lima" / "yolobox.yaml",
-    )
-
-
-def ssh_port() -> int:
-    """Where lima's hostagent listens on the Mac for this instance's sshd.
-
-    The default instance is created from lima/yolobox.yaml, which fixes the port.
-    Any other instance has whatever `ssh.localPort` it was created with, and a
-    guess would probe a different box: the default one answers on SSH_LOCAL_PORT.
-    """
-    if INSTANCE == DEFAULT_INSTANCE:
-        return SSH_LOCAL_PORT
-    info = lima_instance_info()
-    if info is None:
-        raise YoError(
-            "limactl cannot show instance %s (limactl list %s --json failed), so yo "
-            "cannot learn its ssh port — create it with:\n    %s"
-            % (INSTANCE, INSTANCE, lima_create_command())
-        )
-    port = info.ssh_local_port
-    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
-        raise YoError(
-            "%s has ssh.localPort %r, which is not a fixed port. With 0 lima picks a "
-            "new port on every start, and yo must know it before the first one. "
-            "Create the instance with:\n    %s"
-            % (INSTANCE, port, lima_create_command())
-        )
-    return port
-
-
-def ha_pid() -> Optional[int]:
-    info = lima_instance_info()
-    return info.host_agent_pid if info else None
 
 
 def ignores_all_guest_udp(forward: object) -> bool:
@@ -1641,144 +2163,6 @@ def lima_config_gap_message(gaps: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
-def op_probe_alive(proc: subprocess.CompletedProcess) -> bool:
-    if proc.returncode == 0:
-        return True
-    return proc.returncode == 1 and "The agent has no identities" in proc.stdout
-
-
-def aws_broker_probe_alive(proc: subprocess.CompletedProcess) -> bool:
-    return proc.returncode == 0
-
-
-@dataclass(frozen=True)
-class ReverseForward:
-    name: str
-    guest_path: str
-    host_path: str
-    probe: Tuple[str, ...]
-    alive: Callable[[subprocess.CompletedProcess], bool]
-
-
-def one_password_forward() -> ReverseForward:
-    return ReverseForward(
-        "1password", OP_GUEST_SOCK, op_sock(), ("ssh-add", "-l"), op_probe_alive
-    )
-
-
-def aws_broker_forward() -> ReverseForward:
-    return ReverseForward(
-        "aws-broker",
-        AWS_BROKER_GUEST_SOCK,
-        aws_broker_sock(),
-        ("curl", "-sS", "--unix-socket", AGENT_AWS_BROKER_SOCK, "http://broker/health"),
-        aws_broker_probe_alive,
-    )
-
-
-def forward_control_cmd(action: str, forward: ReverseForward) -> List[str]:
-    return ssh_base(OPERATOR, mux=True) + [
-        "-O",
-        action,
-        "-R",
-        "%s:%s" % (forward.guest_path, forward.host_path),
-        VM_HOST,
-    ]
-
-
-def heal_reverse_forward(forward: ReverseForward) -> bool:
-    probe = ssh_run(AGENT, list(forward.probe))
-    if forward.alive(probe):
-        return True
-    run(forward_control_cmd("cancel", forward), check=False)
-    ssh_run(OPERATOR, ["rm", "-f", forward.guest_path], mux=True, check=True)
-    run(forward_control_cmd("forward", forward), check=True)
-    probe = ssh_run(AGENT, list(forward.probe))
-    return forward.alive(probe)
-
-
-def heal_forward_collecting_errors(forward: ReverseForward, errors: List[str]) -> None:
-    try:
-        healed = heal_reverse_forward(forward)
-    except YoError as failure:
-        errors.append(
-            "the %s forward into the VM failed while healing it: %s"
-            % (forward.name, failure.message or "unknown error")
-        )
-        return
-    if not healed:
-        errors.append(
-            "the %s forward into the VM is still dead after re-issuing it"
-            % forward.name
-        )
-
-
-def ensure_op_forward(aws_enabled: bool) -> List[str]:
-    errors: List[str] = []
-    if not os.path.exists(op_sock()):
-        err(
-            "yo: 1Password not running on this host (no socket at %s) — skipping its VM forward"
-            % op_sock()
-        )
-    else:
-        heal_forward_collecting_errors(one_password_forward(), errors)
-    if aws_enabled:
-        heal_forward_collecting_errors(aws_broker_forward(), errors)
-    return errors
-
-
-def units_missing_note() -> str:
-    return "box predates the 1Password/AWS forwards; run `%s`" % yo_cmd("bootstrap")
-
-
-def in_place_encryption_warning() -> str:
-    return (
-        "yo: the next boot encrypts %s in place. The box is unusable until it finishes "
-        "(this can take many minutes on a large disk), "
-        "and the first minutes, an offline filesystem shrink, must not be interrupted: "
-        'do not stop the VM or the host until %s reports "unlocked". '
-        "%s first shrinks the work."
-        % (LUKS_DEVICE, yo_cmd("up"), yo_cmd("gc", "--deep", "--yes"))
-    )
-
-
-def vm_units_present() -> bool:
-    return (
-        ssh_run(
-            OPERATOR, ["systemctl", "cat", PROXY_SOCKET_UNITS[0]], check=False
-        ).returncode
-        == 0
-    )
-
-
-def vm_services() -> None:
-    status, _ = account_status()
-    if status == "unreachable":
-        err(
-            "yo: cannot reach %s as operator — is the VM up? %s"
-            % (INSTANCE, yo_cmd("status"))
-        )
-        return
-    if not vm_units_present():
-        err("yo: %s" % units_missing_note())
-        return
-
-    errors: List[str] = []
-    aws_enabled = False
-    try:
-        aws_enabled = ensure_aws_broker()
-    except YoError as failure:
-        errors.append(failure.message or "aws-broker failed")
-
-    errors += ensure_op_forward(aws_enabled)
-
-    if errors:
-        raise YoError(
-            "; ".join(errors)
-            + " — recreate the master: limactl stop %s && %s" % (INSTANCE, yo_cmd("up"))
-        )
-
-
 def lima_stop() -> None:
     try:
         run(
@@ -1799,312 +2183,6 @@ def lima_stop() -> None:
                 yo_cmd("up"),
             )
         )
-
-
-def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:
-    # Before the disk is unlocked only the initrd's sshd answers, with a host key
-    # it generated this boot. Nothing is pinned: the only party on the loopback
-    # path to lima's port is lima's hostagent, running as the host user. And no
-    # pinned role may be used here: accept-new would write the initrd's key into
-    # known_hosts, and every stage-2 connection after it would be refused.
-    values: Optional[Dict[str, str]] = None
-    try:
-        with open(ssh_cfg(), "r", errors="surrogateescape") as handle:
-            values = parse_lima_ssh_block(handle.read(), VM_HOST)
-    except FileNotFoundError:
-        pass  # a first start: lima has not written it yet, the defaults below are what it will write
-    except OSError as failure:
-        raise YoError("cannot read %s: %s" % (ssh_cfg(), failure.strerror))
-    hostname = values["Hostname"] if values else "127.0.0.1"
-    port = values["Port"] if values else str(ssh_port())
-    identity = (
-        values["IdentityFile"]
-        if values
-        else os.path.join(home(), ".lima", "_config", "user")
-    )
-    return (
-        [
-            "ssh",
-            "-F",
-            "/dev/null",
-            "-i",
-            identity,
-            "-o",
-            "IdentitiesOnly=yes",
-            "-o",
-            "IdentityAgent=none",
-            "-o",
-            "User=%s" % user,
-            "-o",
-            "Port=%s" % port,
-            "-o",
-            "ControlPath=none",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=%d" % SSH_CONNECT_TIMEOUT_SECONDS,
-            "-o",
-            "ServerAliveInterval=%d" % SSH_ALIVE_INTERVAL_SECONDS,
-            "-o",
-            "LogLevel=ERROR",
-        ]
-        + FIRST_CONTACT_OPTS
-        + [hostname, remote]
-    )
-
-
-NOT_LISTENING_MARKERS = (
-    "Connection refused",
-    "Connection reset",
-    "kex_exchange_identification",
-    "Connection closed",
-    "closed by remote host",
-    "Broken pipe",
-    "Connection timed out",
-    "Operation timed out",
-)
-
-
-class SshOutcome(enum.Enum):
-    """What one ssh attempt at the initrd's or stage 2's sshd came to."""
-
-    ANSWERED = "answered"  # the command ran and exited 0
-    RAN = "ran"  # the command ran and exited non-zero
-    REFUSED = "refused"  # sshd answered and refused the key
-    NOT_LISTENING = "not-listening"  # no sshd behind the port (yet)
-    ERROR = "error"  # ssh failed in a way yo has no name for
-
-
-def classify_initrd_attempt(returncode: int, stderr: str) -> SshOutcome:
-    if returncode != SSH_UNREACHABLE:
-        return SshOutcome.RAN
-    if "Permission denied" in stderr:
-        return SshOutcome.REFUSED
-    if any(marker in stderr for marker in NOT_LISTENING_MARKERS):
-        return SshOutcome.NOT_LISTENING
-    return SshOutcome.ERROR
-
-
-def sshd_answers(user: str) -> SshOutcome:
-    proc = run(initrd_ssh_argv("true", user=user), stdin=b"")
-    if proc.returncode == 0:
-        return SshOutcome.ANSWERED
-    return classify_initrd_attempt(proc.returncode, proc.stderr)
-
-
-def stage2_up() -> bool:
-    return sshd_answers(host_user()) is SshOutcome.ANSWERED
-
-
-def initrd_waiting() -> bool:
-    return sshd_answers("root") is SshOutcome.ANSWERED
-
-
-@dataclass(frozen=True)
-class HelperRun:
-    """One run of the initrd's yolobox-unlock over ssh."""
-
-    returncode: int
-    stderr: str
-    migrated: bool
-    streamed: bool  # the helper's stdout reached the terminal before the session ended
-
-
-def run_initrd_helper(passphrase: bytes) -> HelperRun:
-    stderr_lines: List[str] = []
-
-    def collect(source: io.BufferedReader) -> None:
-        for raw in iter(source.readline, b""):
-            stderr_lines.append(raw.decode("utf-8", "replace").rstrip("\n"))
-
-    migrated = False
-    streamed = False
-    try:
-        helper = subprocess.Popen(
-            initrd_ssh_argv(INITRD_UNLOCK_HELPER),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        raise YoError("ssh not found on PATH")
-    with helper as proc:
-        collector = threading.Thread(target=collect, args=(proc.stderr,))
-        collector.start()
-        try:
-            proc.stdin.write(passphrase + b"\n")
-            proc.stdin.close()
-        except BrokenPipeError:
-            pass  # ssh already ended; its exit code and stderr, returned below, say why
-        for raw in iter(proc.stdout.readline, b""):
-            line = raw.decode("utf-8", "replace").rstrip("\n")
-            streamed = True
-            migrated = migrated or "id=%s" % MIGRATE_ASK_ID in line
-            out(line)
-        collector.join()
-        returncode = proc.wait()
-    return HelperRun(returncode, "\n".join(stderr_lines), migrated, streamed)
-
-
-class Verdict(enum.Enum):
-    """What unlock_disk does after one helper run.
-
-    UNLOCKED: the helper finished its job. FAILED: a failure retrying cannot
-    fix. DROPPED: the session ran and then ended (switch-root, or a migration
-    that outlived the connection). REFUSED: sshd refused the key, and stage 2's
-    sshd may be about to accept it. NOT_LISTENING: nothing to talk to yet.
-    """
-
-    UNLOCKED = "unlocked"
-    FAILED = "failed"
-    DROPPED = "dropped"
-    REFUSED = "refused"
-    NOT_LISTENING = "not-listening"
-
-
-def judge_helper_run(attempt: HelperRun) -> Verdict:
-    outcome = classify_initrd_attempt(attempt.returncode, attempt.stderr)
-    if outcome is SshOutcome.RAN:
-        return Verdict.UNLOCKED if attempt.returncode == 0 else Verdict.FAILED
-    if attempt.streamed:
-        return Verdict.DROPPED
-    if outcome is SshOutcome.ERROR:
-        return Verdict.FAILED
-    if outcome is SshOutcome.REFUSED:
-        return Verdict.REFUSED
-    return Verdict.NOT_LISTENING
-
-
-def initrd_root_ssh_command(remote_command: str) -> str:
-    return (
-        "ssh -F /dev/null -i ~/.lima/_config/user -o IdentitiesOnly=yes "
-        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p %d "
-        "root@127.0.0.1 %s" % (ssh_port(), remote_command)
-    )
-
-
-def helper_failure_message(attempt: HelperRun) -> str:
-    code, stderr = attempt.returncode, attempt.stderr
-    if code == SSH_UNREACHABLE:
-        return stderr or "ssh to 127.0.0.1:%d failed with exit %d and no message" % (
-            ssh_port(),
-            code,
-        )
-    if code == HELPER_EXIT_MIGRATION_FAILED:
-        return (
-            "encrypting the disk failed in the initrd; the box is still in its initrd "
-            "with the plaintext intact. Inspect it as root: %s\n%s"
-            % (initrd_root_ssh_command("journalctl -u yolobox-luks-migrate"), stderr)
-        )
-    if code == HELPER_EXIT_ROOT_MOUNT_FAILED:
-        return (
-            "the disk unlocked but the initrd could not mount it as /sysroot "
-            "(sysroot.mount failed); the box waits in its initrd emergency mode. "
-            "Inspect it as root: %s\n%s"
-            % (initrd_root_ssh_command("journalctl -b"), stderr)
-        )
-    if code == HELPER_EXIT_WRONG_KEY:
-        return (
-            "the %s key in 1Password does not open %s — a different key encrypted "
-            "this disk, and there is no recovery slot" % (LUKS_KEY_ITEM, LUKS_DEVICE)
-        )
-    if code == HELPER_EXIT_WATCH_LOST:
-        return "the initrd helper lost its watch:\n%s" % stderr
-    if code == HELPER_EXIT_NO_PASSPHRASE:
-        return "no passphrase reached the initrd helper"
-    return "the initrd helper failed with exit %d: %s" % (code, stderr)
-
-
-def deadline_after(
-    deadline: Optional[float], status: str, lima_is_starting: bool, now: float
-) -> Optional[float]:
-    """The unlock budget after seeing lima's status: it starts when lima says Running."""
-    if status == "Running":
-        return deadline or now + INITRD_WAIT_SECONDS
-    if lima_is_starting and status in LIMA_PRE_BOOT_STATUSES:
-        # Lima is still creating, downloading or booting.
-        return None
-    raise YoError(
-        "%s is %s, not Running — limactl list" % (INSTANCE, status or "not listed")
-    )
-
-
-def initrd_timeout_error(key_was_refused: bool) -> YoError:
-    if key_was_refused:
-        return YoError(
-            "the sshd on 127.0.0.1:%d refused lima's key for root and for %s — if %s "
-            "is in its initrd, reading the key from cidata failed; see "
-            "docs/disk-encryption.md#recognising-failures"
-            % (ssh_port(), host_user(), INSTANCE)
-        )
-    return YoError(
-        "%s never offered its initrd sshd on 127.0.0.1:%d within %d s of lima "
-        "reporting it Running — limactl list, ~/.lima/%s/serialv.log"
-        % (INSTANCE, ssh_port(), INITRD_WAIT_SECONDS, INSTANCE)
-    )
-
-
-def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -> bool:
-    """Answer the initrd's passphrase ask; True when this boot migrated the disk."""
-    migrated_any = False
-    session_ran = False
-    deadline: Optional[float] = None
-    refused_since: Optional[float] = None
-    err("yo: waiting for %s's initrd to ask for its disk passphrase" % INSTANCE)
-    while True:
-        attempt = run_initrd_helper(passphrase)
-        migrated_any = migrated_any or attempt.migrated
-        verdict = judge_helper_run(attempt)
-        if verdict in (Verdict.UNLOCKED, Verdict.DROPPED):
-            for line in attempt.stderr.splitlines():
-                err(line)
-        if verdict is Verdict.UNLOCKED:
-            return migrated_any
-        if verdict is Verdict.FAILED:
-            raise YoError(helper_failure_message(attempt))
-        if verdict is Verdict.DROPPED:
-            # Switch-root, or a migration that outlived the connection. A fresh
-            # budget, since the old one may have expired while the session streamed.
-            session_ran = True
-            deadline = time.monotonic() + INITRD_WAIT_SECONDS
-        if verdict in (Verdict.DROPPED, Verdict.REFUSED) and stage2_up():
-            return migrated_any
-        if verdict is Verdict.REFUSED:
-            # A fresh instance's first plain boot writes the operator's key
-            # moments after its sshd starts, so a refusal is retried.
-            refused_since = refused_since or time.monotonic()
-
-        starter_alive = starter is not None and starter.poll() is None
-        if starter is not None and not starter_alive and not session_ran:
-            if starter.returncode != 0:
-                raise YoError(
-                    "limactl start exited %d before %s offered its initrd sshd"
-                    % (starter.returncode, INSTANCE)
-                )
-            # Lima's own ssh worked, so this was a plain boot: stage 2 is up.
-            if stage2_up():
-                return migrated_any
-        info = lima_instance_info()
-        deadline = deadline_after(
-            deadline,
-            info.status if info is not None else "",
-            starter_alive and not session_ran,
-            time.monotonic(),
-        )
-        if deadline is not None and time.monotonic() > deadline:
-            raise initrd_timeout_error(refused_since is not None)
-        time.sleep(INITRD_POLL_SECONDS)
-
-
-def wait_for_operator() -> None:
-    deadline = time.monotonic() + OPERATOR_WAIT_SECONDS
-    while not stage2_up():
-        if time.monotonic() > deadline:
-            raise YoError(
-                "the disk is unlocked but %s is not reachable as the operator — %s"
-                % (INSTANCE, yo_cmd("status"))
-            )
-        time.sleep(OPERATOR_POLL_SECONDS)
 
 
 def spawn_limactl_start(argv: Sequence[str]) -> subprocess.Popen:
@@ -2155,29 +2233,1245 @@ def start_and_unlock(passphrase: bytes) -> None:
         raise
 
 
+class Driver(Protocol):
+    """The host side of the box: everything that differs between host OSes.
+
+    main() picks one with driver_for() and set_driver(), and nothing else asks
+    which OS it runs on. Methods read the machine from INSTANCE, like the rest
+    of yo. Statuses use Lima's words: "Running" when the VM is up.
+    """
+
+    # The value of YOLOBOX_HOST_OS for nix commands: "darwin" or "linux".
+    host_os: str
+    # What this driver is called in messages ("lima: ...").
+    name: str
+    # Where the driver keeps instance directories, relative to $HOME.
+    instances_dir: str
+
+    # The ssh identity file, relative to $HOME, that the pre-unlock probes use
+    # before the instance's own ssh.config exists.
+    @property
+    def initrd_identity(self) -> str: ...
+
+    # The background process unlock_disk watches, as messages name it.
+    start_command: str
+    # Whether vm_up refuses to run an instance with config_gaps() (True), or
+    # only warns (False).
+    gaps_are_fatal: bool
+
+    def require_tool(self) -> None:
+        """Raise YoError when the host lacks the tool this driver shells out to."""
+        ...
+
+    def op_sock(self) -> str:
+        """The host's 1Password agent socket."""
+        ...
+
+    def initrd_identity_agent(self) -> str:
+        """The IdentityAgent the pre-unlock probes use: "none", or an agent socket."""
+        ...
+
+    def ssh_port(self) -> int:
+        """The host loopback port that reaches the instance's sshd, initrd included."""
+        ...
+
+    def forward_port(self, guest_port: int) -> int:
+        """Forward a guest port onto the host's loopback; return the host port."""
+        ...
+
+    def keepalive_pid(self) -> Optional[int]:
+        """The pid the AWS broker watches to live exactly as long as the VM."""
+        ...
+
+    def keepalive_pid_error(self) -> str:
+        """Why keepalive_pid() came back empty, as a message."""
+        ...
+
+    def vm_status(self) -> Optional[str]:
+        """ "Running", another status, or None when the instance does not exist."""
+        ...
+
+    def creation_refusal(self) -> Optional[str]:
+        """Why start() will not create this missing instance, or None when it will."""
+        ...
+
+    def config_gaps(self) -> List[str]:
+        """The ways the live instance breaks the box's guarantees."""
+        ...
+
+    def config_gap_message(self, gaps: Sequence[str]) -> str:
+        """What to tell the operator about config_gaps(), with the fixing commands."""
+        ...
+
+    def verify_initrd_listener(self, port: int) -> None:
+        """Raise YoError unless whoever listens on host loopback `port` is the VM's.
+
+        Called before every send of the disk passphrase to the initrd's sshd.
+        """
+        ...
+
+    def start(self, passphrase: bytes) -> None:
+        """Start the VM, unlock its disk and wait for the operator's ssh."""
+        ...
+
+    def stop(self) -> None:
+        """Stop the VM; raise YoError when it will not."""
+        ...
+
+    def stop_command(self) -> str:
+        """The command line that stops the instance, for a printed remedy."""
+        ...
+
+    def stop_failed(self, detail: str) -> str:
+        """The first line of a bootstrap abort after stop() failed."""
+        ...
+
+    def stop_recovery(self) -> List[str]:
+        """The lines that say how to stop a VM that stop() could not."""
+        ...
+
+    def delete_command(self) -> str:
+        """The command line that deletes the instance, for a printed remedy."""
+        ...
+
+    def list_command(self) -> str:
+        """The command line that shows the instance's state, for a printed remedy."""
+        ...
+
+    def boot_log(self) -> str:
+        """Where the VM's console log is, for a printed remedy."""
+        ...
+
+    def show_status(self) -> None:
+        """Print the driver's own view of the instance (the head of `yo status`)."""
+        ...
+
+    def disk_image(self) -> Optional[Tuple[str, int]]:
+        """A label for the disk image and the KiB it allocates on the host."""
+        ...
+
+    def disk_ceiling_gib(self) -> int:
+        """The disk's size ceiling in GiB; raise YoError when it cannot be read."""
+        ...
+
+    def grow_disk(self, current_gib: int, wanted_gib: int) -> None:
+        """Stop the VM and raise the ceiling, leaving it stopped."""
+        ...
+
+
+class LimaDriver:
+    """macOS: one Lima instance per machine, run by the vz driver."""
+
+    host_os = "darwin"
+    name = "lima"
+    instances_dir = ".lima"
+    initrd_identity = ".lima/_config/user"
+    start_command = "limactl start"
+    # The healing step adds a missing forward live, so a gap is a note, not a stop.
+    gaps_are_fatal = False
+
+    def require_tool(self) -> None:
+        require_tool("limactl", "brew install lima")
+
+    def op_sock(self) -> str:
+        return os.path.join(
+            home(), "Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+        )
+
+    def initrd_identity_agent(self) -> str:
+        return "none"
+
+    def forward_port(self, guest_port: int) -> int:
+        raise YoError(
+            "lima already mirrors the guest's TCP ports %d-%d onto the host's "
+            "127.0.0.1; yo port is for Linux hosts" % tuple(MIRRORED_TCP_PORTS),
+            code=HELPER_NO_SUBCOMMAND,
+        )
+
+    def create_command(self) -> str:
+        return "limactl create --name %s --set '.ssh.localPort=<free port>' %s" % (
+            INSTANCE,
+            SCRIPT_DIR / "lima" / "yolobox.yaml",
+        )
+
+    def ssh_port(self) -> int:
+        """Where lima's hostagent listens on the Mac for this instance's sshd.
+
+        The default instance is created from lima/yolobox.yaml, which fixes the port.
+        Any other instance has whatever `ssh.localPort` it was created with, and a
+        guess would probe a different box: the default one answers on SSH_LOCAL_PORT.
+        """
+        if INSTANCE == DEFAULT_INSTANCE:
+            return SSH_LOCAL_PORT
+        info = lima_instance_info()
+        if info is None:
+            raise YoError(
+                "limactl cannot show instance %s (limactl list %s --json failed), so yo "
+                "cannot learn its ssh port — create it with:\n    %s"
+                % (INSTANCE, INSTANCE, self.create_command())
+            )
+        port = info.ssh_local_port
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+            raise YoError(
+                "%s has ssh.localPort %r, which is not a fixed port. With 0 lima picks a "
+                "new port on every start, and yo must know it before the first one. "
+                "Create the instance with:\n    %s"
+                % (INSTANCE, port, self.create_command())
+            )
+        return port
+
+    def keepalive_pid(self) -> Optional[int]:
+        info = lima_instance_info()
+        return info.host_agent_pid if info else None
+
+    def keepalive_pid_error(self) -> str:
+        return "cannot read %s's host agent pid (%s %s --json) — is it up? %s" % (
+            INSTANCE,
+            self.list_command(),
+            INSTANCE,
+            yo_cmd("status"),
+        )
+
+    def vm_status(self) -> Optional[str]:
+        info = lima_instance_info()
+        return info.status if info is not None else None
+
+    def creation_refusal(self) -> Optional[str]:
+        # Only the default instance is created here, from lima/yolobox.yaml. Any
+        # other needs a port yo can know, which only its creator can choose.
+        if INSTANCE == DEFAULT_INSTANCE:
+            return None
+        return (
+            "instance %s does not exist (limactl list %s --json failed) — create "
+            "it with:\n    %s" % (INSTANCE, INSTANCE, self.create_command())
+        )
+
+    def config_gaps(self) -> List[str]:
+        return lima_config_gaps()
+
+    def config_gap_message(self, gaps: Sequence[str]) -> str:
+        return lima_config_gap_message(gaps)
+
+    def verify_initrd_listener(self, port: int) -> None:
+        pass  # lima's hostagent, which owns the port, runs as the host user
+
+    def start(self, passphrase: bytes) -> None:
+        start_and_unlock(passphrase)
+
+    def stop(self) -> None:
+        lima_stop()
+
+    def stop_command(self) -> str:
+        return "limactl stop %s" % INSTANCE
+
+    def stop_failed(self, detail: str) -> str:
+        return "limactl stop failed: %s" % detail
+
+    def stop_recovery(self) -> List[str]:
+        return [
+            "Recover with: %s" % self.stop_command(),
+            "If the stop hangs too: %s, and kill -9 any leftover"
+            % yo_cmd("ssh", "sudo", "systemctl", "reboot"),
+            "`limactl hostagent` process for %s." % INSTANCE,
+        ]
+
+    def delete_command(self) -> str:
+        return "limactl delete %s" % INSTANCE
+
+    def list_command(self) -> str:
+        return "limactl list"
+
+    def boot_log(self) -> str:
+        return "~/%s/%s/serialv.log" % (self.instances_dir, INSTANCE)
+
+    def show_status(self) -> None:
+        run(["limactl", "list", INSTANCE], capture=False)
+
+    def disk_image(self) -> Optional[Tuple[str, int]]:
+        kib = du_kib(os.path.join(lima_dir(), "disk"))
+        if kib is None:
+            return None
+        return "~/%s/%s/disk" % (self.instances_dir, INSTANCE), kib
+
+    def disk_ceiling_gib(self) -> int:
+        probe = run(["limactl", "list", INSTANCE, "--format", "{{.Disk}}"])
+        current_bytes = probe.stdout.strip() if probe.returncode == 0 else ""
+        if not current_bytes.isdigit():
+            raise YoError(
+                "limactl reports no disk size for %s — does the instance exist? (%s)"
+                % (INSTANCE, yo_cmd("status"))
+            )
+        return int(current_bytes) // 1024 // 1024 // 1024
+
+    def grow_disk(self, current_gib: int, wanted_gib: int) -> None:
+        free_kib = (
+            shutil.disk_usage(os.path.join(home(), self.instances_dir)).free // 1024
+        )
+        image_kib = du_kib(os.path.join(lima_dir(), "disk")) or 0
+        out(
+            "host: ~/%s has %dGiB free; the disk image allocates %dGiB today"
+            % (self.instances_dir, free_kib // 1024 // 1024, image_kib // 1024 // 1024)
+        )
+        out(
+            "lima: raising %s from %dGiB to %dGiB" % (INSTANCE, current_gib, wanted_gib)
+        )
+
+        lima_stop()
+        resize = run(
+            ["limactl", "edit", "--yes", INSTANCE, "--disk", str(wanted_gib)],
+            capture=False,
+        )
+        if resize.returncode != 0:
+            raise YoError(
+                "limactl refused the resize and %s is left stopped — start it again with: %s"
+                % (INSTANCE, yo_cmd("up"))
+            )
+
+
+LIMA = LimaDriver()
+
+
+# The libvirt driver: Linux hosts. One KVM domain per machine on the system
+# connection, with passt for the network and an SELinux/DAC label from the host
+# layer (see linux/host-setup.md). Pure helpers first,
+# then the driver, which calls them and virsh by name at call time.
+LIBVIRT_URI = "qemu:///system"
+LIBVIRT_MIN_VERSION = (12, 2, 0)
+LIBVIRT_POOL = "default"
+# The static account every domain runs as, and the unit that loads its table.
+VM_USER = "yolobox-vm"
+HOST_UNIT = "yolobox-host.service"
+# The namespace of the domain metadata that marks a domain as a yolobox's.
+DOMAIN_NS = "https://github.com/aka-rider/yolobox"
+# The 1Password item whose public key is the operator's login, in cidata.
+OPERATOR_KEY_ITEM = "yolobox-operator"
+# lima-init's cidata account: the operator inside the guest (nix/base.nix).
+OPERATOR_GUEST_UID = 501
+OPERATOR_ACCOUNT_RE = re.compile(r"^[a-z_][a-z0-9_-]*$")
+LIBVIRT_DISK_SIZE = "100G"
+LIBVIRT_STOP_TIMEOUT = 300
+# virsh domstate words. "in shutdown" is a guest still going down, and the only
+# word besides "shut off" that a stop waits through ("blocked" is a running guest
+# idling on I/O).
+STATE_OFF = "shut off"
+STATE_SHUTTING_DOWN = "in shutdown"
+STATES_STOPPING = ("running", "blocked", STATE_SHUTTING_DOWN)
+STATE_HINTS = {
+    "paused": "resume it with `virsh resume`",
+    "pmsuspended": "wake it with `virsh dompmwakeup`",
+}
+# Devices a domain never has: each is a path between the guest and the host.
+LIBVIRT_FORBIDDEN_DEVICES = (
+    "graphics",
+    "vsock",
+    "filesystem",
+    "channel",
+    "hostdev",
+    "tpm",
+)
+LOOPBACK = "127.0.0.1"
+GUEST_SSH_PORT = 22
+PORT_RANGE_FILE = "/proc/sys/net/ipv4/ip_local_port_range"
+PORT_LOCK_NAME = ".port.lock"
+MAX_PORT = 65535
+SEED_NAME = "nixos-lima-v0.2.2-x86_64.qcow2"
+SEED_URL = (
+    "https://github.com/nixos-lima/nixos-lima/releases/download/v0.2.2/" + SEED_NAME
+)
+SEED_SHA512 = (
+    "cdf15475c6f799d3a355da50147fa81316e43e159b1b2e76eb21046f9fe8499770840ef876daaf85a2f5eb"
+    "3a73445c4fa87d0337533fdf6f116d80c40806fbc9"
+)
+SEED_CHUNK_BYTES = 1 << 20
+SEED_CONNECT_TIMEOUT = 60
+CIDATA_FILES = ("user-data", "meta-data", "lima.env", "etc_environment")
+GAP_DEVICE = "device:%s"
+GAP_SELINUX_SECLABEL = "seclabel.selinux"
+GAP_DAC_SECLABEL = "seclabel.dac"
+GAP_METADATA = "metadata"
+GAP_FORWARD_ADDRESS = "portForward.address"
+GAP_INTERFACE = "interface"
+MASTER_PID_RE = re.compile(r"Master running \(pid=(\d+)\)")
+SIZE_LINE_RE = re.compile(r"^(Capacity|Allocation):\s+(\d+) bytes\s*$", re.M)
+
+
+def host_setup_hint() -> str:
+    return "run: sudo bash %s" % (SCRIPT_DIR / "linux" / "host-setup.sh")
+
+
+def domain_name() -> str:
+    return "yolobox-" + INSTANCE
+
+
+def disk_volume() -> str:
+    return "yolobox-%s.qcow2" % INSTANCE
+
+
+def cidata_volume() -> str:
+    return "yolobox-%s-cidata.iso" % INSTANCE
+
+
+def virsh(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
+    return run(["virsh", "-c", LIBVIRT_URI, *args], check=check, **kwargs)
+
+
+def spawn_virsh(*args: str) -> subprocess.Popen:
+    try:
+        return subprocess.Popen(
+            ["virsh", "-c", LIBVIRT_URI, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise YoError("virsh not found on PATH")
+
+
+def parse_version(text: str) -> Tuple[int, ...]:
+    word = text.strip()
+    if not re.fullmatch(r"\d+(\.\d+)*", word):
+        raise YoError("cannot read a version from %r" % text)
+    return tuple(int(field) for field in word.split("."))
+
+
+DAEMON_VERSION_RE = re.compile(r"^\s*Running against daemon:\s*(\S+)\s*$", re.M | re.I)
+
+
+def parse_daemon_version(version_output: str) -> Tuple[int, ...]:
+    """The libvirt daemon's version, from `virsh version --daemon`.
+
+    The daemon is what starts passt and reads the domain XML, so its version is
+    the one that counts; the client library may be newer than the daemon.
+    """
+    found = DAEMON_VERSION_RE.search(version_output)
+    if found is None:
+        raise YoError(
+            "cannot find the daemon's version in `virsh version --daemon`: %r"
+            % version_output
+        )
+    return parse_version(found.group(1))
+
+
+def is_ascii_number(text: str) -> bool:
+    """Whether text is only the digits 0-9 (str.isdigit also admits "²" and "１２")."""
+    return text.isascii() and text.isdigit()
+
+
+def host_port_window(range_text: str) -> range:
+    """The host ports yo may bind: the ones above the kernel's ephemeral range.
+
+    Nothing the kernel hands out as a source port, and no registered service,
+    lives there, so a port picked from it cannot collide with either.
+    """
+    fields = range_text.split()
+    if len(fields) != 2 or not all(is_ascii_number(field) for field in fields):
+        raise YoError(
+            "%s holds %r, not two port numbers" % (PORT_RANGE_FILE, range_text)
+        )
+    first = int(fields[1]) + 1
+    if first > MAX_PORT:
+        raise YoError(
+            "the kernel's ephemeral port range ends at %s (%s), so no host port is "
+            "left above it for the box's ssh forward; lower the range's end with "
+            "sysctl net.ipv4.ip_local_port_range" % (fields[1], PORT_RANGE_FILE)
+        )
+    return range(first, MAX_PORT + 1)
+
+
+def read_port_window() -> range:
+    try:
+        with open(PORT_RANGE_FILE, "r") as handle:
+            return host_port_window(handle.read())
+    except OSError as failure:
+        raise YoError("cannot read %s: %s" % (PORT_RANGE_FILE, failure.strerror))
+
+
+def loopback_port_bound(port: int) -> bool:
+    """Whether something already holds 127.0.0.1:port (a bind probe)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((LOOPBACK, port))
+        except OSError as failure:
+            if failure.errno == errno.EADDRINUSE:
+                return True
+            raise YoError("cannot probe %s:%d: %s" % (LOOPBACK, port, failure.strerror))
+    return False
+
+
+def lowest_free_port(
+    window: range, taken: Sequence[int], is_bound: Callable[[int], bool]
+) -> int:
+    for port in window:
+        if port not in taken and not is_bound(port):
+            return port
+    raise YoError(
+        "no free host port in %d-%d: every one is bound or belongs to a box; stop a "
+        "box or end a forward" % (window.start, window[-1])
+    )
+
+
+class Seclabel(NamedTuple):
+    """One <seclabel> of a domain."""
+
+    type: str
+    model: str
+    relabel: str
+    label: str  # the <label> text, empty when there is none
+
+
+class Interface(NamedTuple):
+    """One <interface> of a domain."""
+
+    type: str
+    backend: str  # the <backend type=...>, empty when there is none
+
+
+@dataclass(frozen=True)
+class DomainInfo:
+    """What yo reads from a domain's XML."""
+
+    instance: Optional[str]  # the yolobox:instance metadata, None when absent
+    devices: Tuple[str, ...]  # the tag of every child of <devices>
+    seclabels: Tuple[Seclabel, ...]
+    interfaces: Tuple[Interface, ...]
+    forward_addresses: Tuple[Optional[str], ...]  # of each <portForward>
+    forward_ports: Tuple[int, ...]  # the host port of each forwarded range
+    ssh_port: Optional[int]  # the host port forwarded to guest port 22
+
+
+def domain_root(xml_text: str) -> ET.Element:
+    try:
+        return ET.fromstring(xml_text)
+    except ET.ParseError as failure:
+        raise YoError("virsh dumpxml printed unparseable XML: %s" % failure)
+
+
+def domain_marker(root: ET.Element) -> Optional[str]:
+    """The yolobox:instance metadata, None for a domain that is not a yolobox's."""
+    marker = root.find("metadata/{%s}instance" % DOMAIN_NS)
+    return (marker.text or "").strip() if marker is not None else None
+
+
+def domain_info(root: ET.Element) -> DomainInfo:
+    forwards = root.findall("devices/interface/portForward")
+    ranges = [rng for forward in forwards for rng in forward.findall("range")]
+    try:
+        ports = tuple(int(rng.get("start", "")) for rng in ranges)
+        ssh = next(
+            (
+                int(rng.get("start", ""))
+                for rng in ranges
+                if rng.get("to") == str(GUEST_SSH_PORT)
+            ),
+            None,
+        )
+    except ValueError:
+        raise YoError("a portForward range has no numeric start")
+    return DomainInfo(
+        instance=domain_marker(root),
+        devices=tuple(child.tag for child in root.findall("devices/*")),
+        seclabels=tuple(
+            Seclabel(
+                label.get("type", ""),
+                label.get("model", ""),
+                label.get("relabel", ""),
+                (label.findtext("label") or "").strip(),
+            )
+            for label in root.findall("seclabel")
+        ),
+        interfaces=tuple(
+            Interface(
+                interface.get("type", ""),
+                (
+                    interface.find("backend").get("type", "")
+                    if interface.find("backend") is not None
+                    else ""
+                ),
+            )
+            for interface in root.findall("devices/interface")
+        ),
+        forward_addresses=tuple(forward.get("address") for forward in forwards),
+        forward_ports=ports,
+        ssh_port=ssh,
+    )
+
+
+def parse_domain(xml_text: str) -> DomainInfo:
+    return domain_info(domain_root(xml_text))
+
+
+def seclabel_holds(
+    info: DomainInfo, kind: str, model: str, label: Optional[str]
+) -> bool:
+    """Whether the domain has exactly one such seclabel, relabelling, with `label`."""
+    found = [
+        seclabel
+        for seclabel in info.seclabels
+        if (seclabel.type, seclabel.model) == (kind, model)
+    ]
+    return (
+        len(found) == 1
+        and found[0].relabel == "yes"
+        and (label is None or found[0].label == label)
+    )
+
+
+def domain_gaps(info: DomainInfo, instance: str, uid: int, gid: int) -> List[str]:
+    """How the domain differs from what libvirt/domain.xml makes, as gap names."""
+    gaps = [
+        GAP_DEVICE % tag for tag in LIBVIRT_FORBIDDEN_DEVICES if tag in info.devices
+    ]
+    if not seclabel_holds(info, "dynamic", "selinux", None):
+        gaps.append(GAP_SELINUX_SECLABEL)
+    if not seclabel_holds(info, "static", "dac", "+%d:+%d" % (uid, gid)):
+        gaps.append(GAP_DAC_SECLABEL)
+    if info.instance != instance:
+        gaps.append(GAP_METADATA)
+    if not info.forward_addresses or any(
+        address != LOOPBACK for address in info.forward_addresses
+    ):
+        gaps.append(GAP_FORWARD_ADDRESS)
+    if info.interfaces != (Interface("user", "passt"),):
+        gaps.append(GAP_INTERFACE)
+    return gaps
+
+
+def domain_xml(instance: str, ssh_port: int, uid: int, gid: int) -> str:
+    template = string.Template(
+        (SCRIPT_DIR / "libvirt" / "domain.xml").read_text(encoding="utf-8")
+    )
+    return template.substitute(name=instance, ssh_port=ssh_port, uid=uid, gid=gid)
+
+
+def operator_account(username: str) -> str:
+    """The guest account the cidata creates for the operator, checked."""
+    if not OPERATOR_ACCOUNT_RE.match(username):
+        raise YoError(
+            "the host account name %r cannot name the operator's account in the "
+            "box: it must match %s" % (username, OPERATOR_ACCOUNT_RE.pattern)
+        )
+    if username == AGENT_USER:
+        raise YoError(
+            "the host account is named %r, which is the box's agent account; "
+            "the operator needs a different name" % AGENT_USER
+        )
+    return username
+
+
+def public_key_line(blob: bytes) -> str:
+    return "%s %s %s" % (
+        key_type(blob),
+        base64.b64encode(blob).decode("ascii"),
+        OPERATOR_KEY_ITEM,
+    )
+
+
+def cidata_files(username: str, public_key: str, instance: str) -> Dict[str, str]:
+    """The files of the cidata ISO lima-init and the initrd read, by name."""
+    account = operator_account(username)
+    return {
+        "user-data": (
+            "#cloud-config\n"
+            "users:\n"
+            "  - name: %s\n"
+            "    ssh-authorized-keys:\n"
+            '      - "%s"\n' % (account, public_key)
+        ),
+        "meta-data": (
+            "instance-id: yolobox-%s\nlocal-hostname: lima-%s\n" % (instance, instance)
+        ),
+        # Read line by line with `export "$line"`: no blank lines.
+        "lima.env": (
+            "LIMA_CIDATA_USER=%s\n"
+            "LIMA_CIDATA_UID=%d\n"
+            "LIMA_CIDATA_HOME=/home/%s.guest\n"
+            "LIMA_CIDATA_IID=yolobox-%s\n"
+            % (account, OPERATOR_GUEST_UID, account, instance)
+        ),
+        "etc_environment": "",
+    }
+
+
+def libvirt_ssh_config(
+    host: str, port: int, user: str, identity_agent: str, instance_dir: str
+) -> str:
+    """The instance's ssh.config, in the shape lima writes for its own."""
+    return "\n".join(
+        [
+            "Host %s" % host,
+            "  Hostname %s" % LOOPBACK,
+            "  Port %d" % port,
+            "  User %s" % user,
+            '  IdentityAgent "%s"' % identity_agent,
+            '  IdentityFile "%s"' % os.path.join(instance_dir, "operator.pub"),
+            "  IdentitiesOnly yes",
+            "  BatchMode yes",
+            "  PreferredAuthentications publickey",
+            "  PasswordAuthentication no",
+            "  KbdInteractiveAuthentication no",
+            "  GSSAPIAuthentication no",
+            "  AddKeysToAgent no",
+            "  ForwardAgent no",
+            "  Compression no",
+            "  ControlMaster auto",
+            '  ControlPath "%s"' % os.path.join(instance_dir, "ssh.sock"),
+            "  ControlPersist yes",
+            "  StrictHostKeyChecking no",
+            "  UserKnownHostsFile /dev/null",
+            "  NoHostAuthenticationForLocalhost yes",
+            "",
+        ]
+    )
+
+
+def file_sha512(path: str) -> str:
+    digest = hashlib.sha512()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(SEED_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_seed(path: str) -> None:
+    part = path + ".part"
+    digest = hashlib.sha512()
+    try:
+        with urllib.request.urlopen(SEED_URL, timeout=SEED_CONNECT_TIMEOUT) as reply:
+            with open(part, "wb") as handle:
+                for chunk in iter(lambda: reply.read(SEED_CHUNK_BYTES), b""):
+                    digest.update(chunk)
+                    handle.write(chunk)
+        if digest.hexdigest() != SEED_SHA512:
+            raise YoError(
+                "the download of %s has sha512 %s, not the pinned %s"
+                % (SEED_URL, digest.hexdigest(), SEED_SHA512)
+            )
+        os.replace(part, path)
+    except (urllib.error.URLError, OSError) as failure:
+        raise YoError("cannot download %s: %s" % (SEED_URL, failure))
+    finally:
+        if os.path.exists(part):
+            os.unlink(part)
+
+
+def ensure_seed() -> str:
+    """The pinned seed image, downloaded once and verified on every use."""
+    cache = os.path.join(home(), ".cache", "yolobox")
+    os.makedirs(cache, exist_ok=True)
+    path = os.path.join(cache, SEED_NAME)
+    if os.path.exists(path):
+        if file_sha512(path) == SEED_SHA512:
+            return path
+        err("yo: %s fails its sha512 check; downloading it again" % path)
+        os.unlink(path)
+    err("yo: downloading the seed image %s" % SEED_URL)
+    download_seed(path)
+    return path
+
+
+def domain_names() -> List[str]:
+    listing = virsh("list", "--all", "--name").stdout.splitlines()
+    return [line.strip() for line in listing if line.strip()]
+
+
+def dump_domain(name: str) -> DomainInfo:
+    return parse_domain(virsh("dumpxml", name).stdout)
+
+
+def yolobox_domains() -> List[DomainInfo]:
+    """Every domain on the system connection that carries yolobox's metadata.
+
+    A foreign domain is only checked for the tag: its XML is never read strictly,
+    so one odd domain of another tool cannot stop yo.
+    """
+    roots = [domain_root(virsh("dumpxml", name).stdout) for name in domain_names()]
+    return [domain_info(root) for root in roots if domain_marker(root) is not None]
+
+
+def volume_names() -> List[str]:
+    rows = virsh("vol-list", "--pool", LIBVIRT_POOL).stdout.splitlines()
+    separators = [number for number, row in enumerate(rows) if row.startswith("---")]
+    if not separators:
+        raise YoError("virsh vol-list printed no table: %s" % "\n".join(rows))
+    return [row.split()[0] for row in rows[separators[0] + 1 :] if row.strip()]
+
+
+def vm_account() -> Tuple[int, int]:
+    try:
+        account = pwd.getpwnam(VM_USER)
+    except KeyError:
+        raise YoError(
+            "the account %s does not exist — %s" % (VM_USER, host_setup_hint())
+        )
+    return account.pw_uid, account.pw_gid
+
+
+LISTENER_UID_RE = re.compile(r"\buid:(\d+)\b")
+
+
+def listener_uids(ss_output: str) -> List[int]:
+    """The owner uid of each socket in `ss -ltnHe` output (root is not needed)."""
+    uids = []
+    for line in ss_output.splitlines():
+        if not line.strip():
+            continue
+        found = LISTENER_UID_RE.search(line)
+        if found is None:
+            raise YoError("cannot read the owner of a listener from ss: %r" % line)
+        uids.append(int(found.group(1)))
+    return uids
+
+
+def check_libvirt_host() -> None:
+    """Raise YoError, naming the setup script, for the first thing the host lacks."""
+    setup = host_setup_hint()
+    if shutil.which("virsh") is None:
+        raise YoError("virsh not found — %s" % setup)
+    connect = virsh("uri", check=False)
+    if connect.returncode != 0:
+        raise YoError(
+            "cannot connect to %s (%s) — %s"
+            % (LIBVIRT_URI, (connect.stderr or "").strip(), setup)
+        )
+    version = parse_daemon_version(virsh("version", "--daemon").stdout)
+    if version < LIBVIRT_MIN_VERSION:
+        raise YoError(
+            "the libvirt daemon %s is older than %s; passt needs the interface route "
+            "option (after an upgrade, restart virtqemud) — %s"
+            % (
+                ".".join(map(str, version)),
+                ".".join(map(str, LIBVIRT_MIN_VERSION)),
+                setup,
+            )
+        )
+    unit = run(["systemctl", "is-active", HOST_UNIT])
+    if unit.stdout.strip() != "active":
+        raise YoError(
+            "%s is %s, so the host's firewall table for the box is not loaded — %s"
+            % (HOST_UNIT, unit.stdout.strip() or "not active", setup)
+        )
+    vm_account()
+    read_port_window()
+
+
+class LibvirtDriver:
+    """Linux: one libvirt domain per machine, on the system connection."""
+
+    host_os = "linux"
+    name = "libvirt"
+    instances_dir = ".local/state/yolobox/instances"
+    start_command = "virsh start"
+    # A domain that is not what the template made may hold a path to the host.
+    gaps_are_fatal = True
+
+    @property
+    def initrd_identity(self) -> str:
+        return "%s/%s/operator.pub" % (self.instances_dir, INSTANCE)
+
+    def initrd_identity_agent(self) -> str:
+        return self.op_sock()
+
+    def require_tool(self) -> None:
+        check_libvirt_host()
+
+    def op_sock(self) -> str:
+        return os.path.join(home(), ".1password/agent.sock")
+
+    def domain_exists(self) -> bool:
+        return domain_name() in domain_names()
+
+    def require_domain(self) -> None:
+        if not self.domain_exists():
+            raise YoError(
+                "domain %s does not exist — create it with: %s"
+                % (domain_name(), yo_cmd("up"))
+            )
+
+    def ssh_port(self) -> int:
+        self.require_domain()
+        port = dump_domain(domain_name()).ssh_port
+        if port is None:
+            raise YoError(
+                "domain %s forwards no host port to guest port %d"
+                % (domain_name(), GUEST_SSH_PORT)
+            )
+        return port
+
+    def allocate_host_port(self) -> int:
+        taken = [port for info in yolobox_domains() for port in info.forward_ports]
+        return lowest_free_port(read_port_window(), taken, loopback_port_bound)
+
+    @contextlib.contextmanager
+    def port_lock(self) -> Iterator[None]:
+        """Hold the host-wide lock that makes picking a port and taking it one step.
+
+        Two `yo` processes would otherwise both pick the lowest free port, and
+        one of the two forwards would fail or, worse, land on the other's port.
+        """
+        directory = os.path.join(home(), self.instances_dir)
+        os.makedirs(directory, exist_ok=True)
+        fd = os.open(
+            os.path.join(directory, PORT_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # closing the descriptor drops the lock
+
+    def forward_port(self, guest_port: int) -> int:
+        self.ensure_master()
+        with self.port_lock():
+            host_port = self.allocate_host_port()
+            run(
+                ssh_base(OPERATOR, mux=True)
+                + [
+                    "-O",
+                    "forward",
+                    "-L",
+                    "%s:%d:%s:%d" % (LOOPBACK, host_port, LOOPBACK, guest_port),
+                    VM_HOST,
+                ],
+                check=True,
+            )
+        return host_port
+
+    def ensure_master(self) -> None:
+        """Open the operator's multiplexed ssh connection, if it is not open."""
+        ssh_run(OPERATOR, ["true"], mux=True, check=True)
+
+    def keepalive_pid(self) -> Optional[int]:
+        self.ensure_master()
+        check = run(ssh_base(OPERATOR, mux=True) + ["-O", "check", VM_HOST])
+        found = MASTER_PID_RE.search(check.stderr + check.stdout)
+        return checked_pid(int(found.group(1))) if found else None
+
+    def keepalive_pid_error(self) -> str:
+        return (
+            "cannot read the pid of %s's ssh master (ssh -O check) — is it up? %s"
+            % (
+                INSTANCE,
+                yo_cmd("status"),
+            )
+        )
+
+    def vm_status(self) -> Optional[str]:
+        if not self.domain_exists():
+            return None
+        state = self.domain_state()
+        return "Running" if state == "running" else state
+
+    def domain_state(self) -> str:
+        """virsh's own word for the state: "running", "in shutdown", "shut off"..."""
+        return virsh("domstate", domain_name()).stdout.strip()
+
+    def creation_refusal(self) -> Optional[str]:
+        return None
+
+    def config_gaps(self) -> List[str]:
+        if not self.domain_exists():
+            return []
+        uid, gid = vm_account()
+        return domain_gaps(dump_domain(domain_name()), INSTANCE, uid, gid)
+
+    def config_gap_message(self, gaps: Sequence[str]) -> str:
+        return (
+            "domain %s breaks the box's guarantees (%s) — stop it with %s, remove its "
+            "definition with `virsh -c %s undefine --nvram %s` (the disk volume "
+            "stays), then run %s to define it again from libvirt/domain.xml"
+            % (
+                domain_name(),
+                ", ".join(gaps),
+                yo_cmd("down"),
+                LIBVIRT_URI,
+                domain_name(),
+                yo_cmd("up"),
+            )
+        )
+
+    def verify_initrd_listener(self, port: int) -> None:
+        # No listener at all is fine: ssh finds nothing and the passphrase goes
+        # nowhere. Any listener on the port must be the domain's passt.
+        listing = run(["ss", "-ltnHe", "sport = :%d" % port], check=True).stdout
+        uid, _ = vm_account()
+        strangers = [owner for owner in listener_uids(listing) if owner != uid]
+        if strangers:
+            raise YoError(
+                "%s:%d is held by uid %s, not by the account %s (uid %d) that runs "
+                "the box's passt, so the disk passphrase is not sent there. Find "
+                "the holder with `ss -ltnp 'sport = :%d'`, stop it, and run %s again"
+                % (
+                    LOOPBACK,
+                    port,
+                    ", ".join(map(str, strangers)),
+                    VM_USER,
+                    uid,
+                    port,
+                    yo_cmd("up"),
+                )
+            )
+
+    def operator_key(self) -> bytes:
+        sock_path = self.op_sock()
+        if not os.path.exists(sock_path):
+            raise YoError(
+                "1Password is not running on this host (no socket at %s); it holds "
+                "the %s key that logs in to the box" % (sock_path, OPERATOR_KEY_ITEM)
+            )
+        return unique_key_titled(ssh_agent_identities(sock_path), OPERATOR_KEY_ITEM)
+
+    def volume_exists(self, volume: str) -> bool:
+        return volume in volume_names()
+
+    def create_volume(self, volume: str, size: int, fmt: str, source: str) -> None:
+        """A pool volume holding the file `source`; never left half-filled."""
+        virsh("vol-create-as", LIBVIRT_POOL, volume, str(size), "--format", fmt)
+        try:
+            virsh("vol-upload", "--pool", LIBVIRT_POOL, volume, source)
+        except YoError as failure:
+            cleanup = virsh("vol-delete", "--pool", LIBVIRT_POOL, volume, check=False)
+            note = (
+                ""
+                if cleanup.returncode == 0
+                else "; removing the partial volume failed too: %s"
+                % cleanup.stderr.strip()
+            )
+            raise YoError((failure.message or "") + note)
+
+    def ensure_disk_volume(self) -> None:
+        if self.volume_exists(disk_volume()):
+            return
+        seed = ensure_seed()
+        self.create_volume(disk_volume(), os.stat(seed).st_size, "qcow2", seed)
+        virsh("vol-resize", "--pool", LIBVIRT_POOL, disk_volume(), LIBVIRT_DISK_SIZE)
+
+    def sync_cidata(self, files: Dict[str, str]) -> None:
+        """Make the pool's cidata volume carry `files`; rebuilt only on change."""
+        staging = os.path.join(lima_dir(), "cidata")
+        staged: Dict[str, str] = {}
+        for name in CIDATA_FILES:
+            try:
+                with open(os.path.join(staging, name), "r") as handle:
+                    staged[name] = handle.read()
+            except FileNotFoundError:
+                break
+        if staged == files and self.volume_exists(cidata_volume()):
+            return
+        private_dir(staging)
+        for name, text in files.items():
+            atomic_write(os.path.join(staging, name), text, 0o644)
+        iso = os.path.join(lima_dir(), "cidata.iso")
+        try:
+            run(
+                ["xorriso", "-as", "mkisofs", "-V", "cidata", "-J", "-R", "-o", iso]
+                + [staging],
+                check=True,
+            )
+            if self.volume_exists(cidata_volume()):
+                virsh("vol-delete", "--pool", LIBVIRT_POOL, cidata_volume())
+            self.create_volume(cidata_volume(), os.stat(iso).st_size, "raw", iso)
+        finally:
+            if os.path.exists(iso):
+                os.unlink(iso)
+
+    def write_ssh_config(self, port: int) -> None:
+        wanted = libvirt_ssh_config(
+            VM_HOST, port, host_user(), self.op_sock(), lima_dir()
+        )
+        try:
+            with open(ssh_cfg(), "r", errors="surrogateescape") as handle:
+                current = handle.read()
+        except FileNotFoundError:
+            current = ""
+        except OSError as failure:
+            raise YoError("cannot read %s: %s" % (ssh_cfg(), failure.strerror))
+        if lima_part_of(current) != wanted:
+            atomic_write(ssh_cfg(), wanted, 0o600)
+
+    def create_domain(self) -> int:
+        """Define the domain on the lowest free host port; return that port."""
+        uid, gid = vm_account()
+        with self.port_lock():
+            port = self.allocate_host_port()
+            path = os.path.join(lima_dir(), "domain.xml")
+            atomic_write(path, domain_xml(INSTANCE, port, uid, gid), 0o644)
+            virsh("define", path)
+        return port
+
+    def start(self, passphrase: bytes) -> None:
+        public_key = public_key_line(self.operator_key())
+        files = cidata_files(host_user(), public_key, INSTANCE)
+        os.makedirs(os.path.dirname(lima_dir()), exist_ok=True)
+        private_dir(lima_dir())
+        atomic_write(os.path.join(lima_dir(), "operator.pub"), public_key + "\n", 0o644)
+        existing = self.domain_exists()
+        if not existing:
+            self.ensure_disk_volume()
+        self.sync_cidata(files)
+        # The port is chosen last: the volume upload above is slow, and the port
+        # lock is held from choosing until the domain claims the port.
+        port = self.ssh_port() if existing else self.create_domain()
+        self.write_ssh_config(port)
+        virsh("start", domain_name())
+        # libvirt starts no foreground process: the domain is Running as soon as
+        # `virsh start` returns, and unlock_disk judges it by its state alone.
+        unlock_disk(passphrase)
+        wait_for_operator()
+
+    def stop(self) -> None:
+        if not self.domain_exists():
+            raise YoError("domain %s does not exist" % domain_name())
+        state = self.domain_state()
+        if state == STATE_OFF:
+            return
+        self.require_stoppable(state)
+        deadline = time.monotonic() + LIBVIRT_STOP_TIMEOUT
+        # Armed before the shutdown is asked for, so its event cannot be missed.
+        watcher = self.watch_lifecycle()
+        try:
+            if state != STATE_SHUTTING_DOWN:
+                virsh("shutdown", domain_name())
+            state = self.domain_state()
+            while state != STATE_OFF:
+                self.require_stoppable(state)
+                self.wait_for_event(watcher, deadline)
+                state = self.domain_state()
+                if state in STATES_STOPPING:
+                    # An event, but not the stop (libvirt also reports a shutdown
+                    # notice first): watch again, then look at the state once
+                    # more, since a stop between the two had no watcher.
+                    watcher = self.watch_lifecycle()
+                    state = self.domain_state()
+        finally:
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.communicate()
+
+    def require_stoppable(self, state: str) -> None:
+        """Raise YoError for a state in which a guest shutdown will never finish."""
+        if state in STATES_STOPPING:
+            return
+        raise YoError(
+            "domain %s is %r, so it will not shut down by itself — %s; or force "
+            "it off with: virsh -c %s destroy %s"
+            % (
+                domain_name(),
+                state,
+                STATE_HINTS.get(state, "its state is not one yo knows how to stop"),
+                LIBVIRT_URI,
+                domain_name(),
+            )
+        )
+
+    def wait_for_event(self, watcher: subprocess.Popen, deadline: float) -> None:
+        try:
+            _, stderr = watcher.communicate(timeout=max(deadline - time.monotonic(), 0))
+        except subprocess.TimeoutExpired:
+            raise YoError(
+                "%s did not shut down within %d s — force it off with: "
+                "virsh -c %s destroy %s"
+                % (domain_name(), LIBVIRT_STOP_TIMEOUT, LIBVIRT_URI, domain_name())
+            )
+        if watcher.returncode != 0:
+            raise YoError("virsh event failed: %s" % stderr.strip())
+
+    def watch_lifecycle(self) -> subprocess.Popen:
+        return spawn_virsh(
+            "event", domain_name(), "lifecycle", "--timeout", str(LIBVIRT_STOP_TIMEOUT)
+        )
+
+    def stop_command(self) -> str:
+        return yo_cmd("down")
+
+    def stop_failed(self, detail: str) -> str:
+        return "virsh shutdown failed: %s" % detail
+
+    def stop_recovery(self) -> List[str]:
+        return [
+            "Recover with: virsh -c %s destroy %s (a hard power-off)"
+            % (LIBVIRT_URI, domain_name()),
+            "then start it again with: %s" % yo_cmd("up"),
+        ]
+
+    def delete_command(self) -> str:
+        virsh_ = "virsh -c %s" % LIBVIRT_URI
+        return " && ".join(
+            [
+                yo_cmd("down"),
+                "%s undefine --nvram %s" % (virsh_, domain_name()),
+                "%s vol-delete --pool %s %s" % (virsh_, LIBVIRT_POOL, disk_volume()),
+                "%s vol-delete --pool %s %s" % (virsh_, LIBVIRT_POOL, cidata_volume()),
+                "rm -r ~/%s/%s" % (self.instances_dir, INSTANCE),
+            ]
+        )
+
+    def list_command(self) -> str:
+        return "virsh -c %s list --all" % LIBVIRT_URI
+
+    def boot_log(self) -> str:
+        return "virsh -c %s console %s" % (LIBVIRT_URI, domain_name())
+
+    def show_status(self) -> None:
+        virsh("dominfo", domain_name(), check=False, capture=False)
+
+    def volume_sizes(self) -> Dict[str, int]:
+        """Capacity and Allocation of the disk volume, in bytes."""
+        info = virsh("vol-info", "--bytes", "--pool", LIBVIRT_POOL, disk_volume())
+        sizes = {name: int(size) for name, size in SIZE_LINE_RE.findall(info.stdout)}
+        if set(sizes) != {"Capacity", "Allocation"}:
+            raise YoError("virsh vol-info printed no sizes: %s" % info.stdout.strip())
+        return sizes
+
+    def disk_image(self) -> Optional[Tuple[str, int]]:
+        if not self.volume_exists(disk_volume()):
+            return None
+        allocation = self.volume_sizes()["Allocation"]
+        return "pool %s volume %s" % (LIBVIRT_POOL, disk_volume()), allocation // 1024
+
+    def disk_ceiling_gib(self) -> int:
+        raise self.disk_grow_unsupported()
+
+    def disk_grow_unsupported(self) -> YoError:
+        return YoError("growing a libvirt box's disk is not implemented yet (TODO.md)")
+
+    def grow_disk(self, current_gib: int, wanted_gib: int) -> None:
+        raise self.disk_grow_unsupported()
+
+
+LIBVIRT = LibvirtDriver()
+
+
+def driver_for(platform: str) -> Driver:
+    """The driver for a host OS, spelled as sys.platform does."""
+    if platform == "darwin":
+        return LIMA
+    if platform == "linux":
+        return LIBVIRT
+    raise YoError("yo drives the box from macOS or Linux, not %r" % platform)
+
+
 def vm_up(
     run_services: bool = True, passphrase: Optional[bytes] = None
 ) -> Optional[bytes]:
-    gaps = lima_config_gaps()
+    gaps = DRIVER.config_gaps()
+    if gaps and DRIVER.gaps_are_fatal:
+        raise YoError(DRIVER.config_gap_message(gaps))
     if gaps:
-        err("yo: %s" % lima_config_gap_message(gaps))
-    info = lima_instance_info()
-    if info is None and INSTANCE != DEFAULT_INSTANCE:
-        # Only the default instance is created here, from lima/yolobox.yaml. Any
-        # other needs a port yo can know, which only its creator can choose.
-        raise YoError(
-            "instance %s does not exist (limactl list %s --json failed) — create "
-            "it with:\n    %s" % (INSTANCE, INSTANCE, lima_create_command())
-        )
-    running = info is not None and info.status == "Running"
-    if not running:
+        err("yo: %s" % DRIVER.config_gap_message(gaps))
+    status = DRIVER.vm_status()
+    if status is None:
+        refusal = DRIVER.creation_refusal()
+        if refusal is not None:
+            raise YoError(refusal)
+    if status != "Running":
         passphrase = passphrase or luks_passphrase()
-        start_and_unlock(passphrase)
+        DRIVER.start(passphrase)
     elif not stage2_up():
         if not initrd_waiting():
             raise YoError(
                 "%s is Running but neither its initrd nor its sshd answers on 127.0.0.1:%d "
-                "— limactl list, %s" % (INSTANCE, ssh_port(), yo_cmd("status"))
+                "— %s, %s"
+                % (INSTANCE, ssh_port(), DRIVER.list_command(), yo_cmd("status"))
             )
         passphrase = passphrase or luks_passphrase()
         unlock_disk(passphrase)
@@ -2194,7 +3488,7 @@ def cmd_up(args: argparse.Namespace) -> None:
 
 
 def cmd_down(args: argparse.Namespace) -> None:
-    lima_stop()
+    DRIVER.stop()
 
 
 def second_line(text: str) -> str:
@@ -2390,7 +3684,7 @@ def network_status_line(check: NetCheck) -> str:
         )
     return (
         "network: WARNING the guest reaches neither the internet nor lima's gateway DNS — "
-        "check %s's lima line and the host's VPN" % yo_cmd("status")
+        "check %s's %s line and the host's VPN" % (yo_cmd("status"), DRIVER.name)
     )
 
 
@@ -2459,7 +3753,7 @@ def status_guest_services() -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    run(["limactl", "list", INSTANCE], capture=False)
+    DRIVER.show_status()
 
     # Every guest probe below fails the same way on a VM that is down, so ask
     # once and say it once instead of printing a warning per probe.
@@ -2504,21 +3798,22 @@ def cmd_status(args: argparse.Namespace) -> None:
                 "disk: %s is %s — NOT encrypted; rebuild and reboot: %s"
                 % (LUKS_DEVICE, fstype, yo_cmd("bootstrap"))
             )
-    image_kib = du_kib(os.path.join(lima_dir(), "disk"))
-    if image_kib is not None:
+    image = DRIVER.disk_image()
+    if image is not None:
+        label, image_kib = image
         out(
-            "disk: image ~/.lima/%s/disk allocates %dGiB on this host"
-            % (INSTANCE, image_kib // 1024 // 1024)
+            "disk: image %s allocates %dGiB on this host"
+            % (label, image_kib // 1024 // 1024)
         )
 
     if vm_reachable:
         status_guest_services()
 
-    gaps = lima_config_gaps()
+    gaps = DRIVER.config_gaps()
     if gaps:
-        out("lima: %s" % lima_config_gap_message(gaps))
+        out("%s: %s" % (DRIVER.name, DRIVER.config_gap_message(gaps)))
     else:
-        out("lima: reverse forwards ok")
+        out("%s: reverse forwards ok" % DRIVER.name)
 
     if shutil.which("aws") is None:
         out("aws: disabled (no 'aws' CLI or no SSO profiles in ~/.aws/config)")
@@ -2644,9 +3939,10 @@ def rebuild_hint() -> str:
             return "run %s with a flake ref the box should build from, then retry" % (
                 yo_cmd("bootstrap", "--version", "<ref>")
             )
-    return (
-        "%s sudo YOLOBOX_USERNAME=$(id -un) nixos-rebuild switch --impure --flake %s"
-        % (yo_cmd("ssh"), shlex.quote(ref + "#yolobox"))
+    return "%s sudo %s nixos-rebuild switch --impure --flake %s" % (
+        yo_cmd("ssh"),
+        " ".join(nix_env("$(id -un)")),
+        shlex.quote(ref + "#yolobox"),
     )
 
 
@@ -2662,6 +3958,19 @@ def helper_skew(what: str) -> str:
 
 def host_user() -> str:
     return pwd.getpwuid(os.getuid()).pw_name
+
+
+# The two variables every nix command on the box needs: flake.nix throws without
+# either. `username` is a value or a shell expression, as the caller needs.
+NIX_ENV_USERNAME = "YOLOBOX_USERNAME"
+NIX_ENV_HOST_OS = "YOLOBOX_HOST_OS"
+
+
+def nix_env(username: str) -> List[str]:
+    return [
+        "%s=%s" % (NIX_ENV_USERNAME, username),
+        "%s=%s" % (NIX_ENV_HOST_OS, DRIVER.host_os),
+    ]
 
 
 class DiskState(enum.Enum):
@@ -2736,7 +4045,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         OPERATOR,
         [
             "sudo",
-            "YOLOBOX_USERNAME=%s" % host_user(),
+            *nix_env(host_user()),
             "nixos-rebuild",
             "boot",
             "--impure",
@@ -2773,16 +4082,13 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         # Derived before the VM stops, so a missing 1Password key leaves the box running.
         passphrase = passphrase or luks_passphrase()
         try:
-            lima_stop()
+            DRIVER.stop()
         except YoError as e:
             raise report.abort(
-                "limactl stop failed: %s" % e.message,
+                DRIVER.stop_failed(e.message),
                 "The built generation is installed but not booted; the herdr machine",
                 "and the 1Password/AWS forwards did not run.",
-                "Recover with: limactl stop %s" % INSTANCE,
-                "If the stop hangs too: %s, and kill -9 any leftover"
-                % yo_cmd("ssh", "sudo", "systemctl", "reboot"),
-                "`limactl hostagent` process for %s." % INSTANCE,
+                *DRIVER.stop_recovery(),
                 "Then re-run %s: it boots the new generation, sees the two agree, "
                 "and finishes." % yo_cmd("bootstrap"),
             )
@@ -2851,18 +4157,11 @@ def require_growable_guest() -> None:
 def cmd_disk_grow(args: argparse.Namespace) -> None:
     wanted = args.size
 
-    probe = run(["limactl", "list", INSTANCE, "--format", "{{.Disk}}"])
-    current_bytes = probe.stdout.strip() if probe.returncode == 0 else ""
-    if not current_bytes.isdigit():
-        raise YoError(
-            "limactl reports no disk size for %s — does the instance exist? (%s)"
-            % (INSTANCE, yo_cmd("status"))
-        )
-    current_gib = int(current_bytes) // 1024 // 1024 // 1024
+    current_gib = DRIVER.disk_ceiling_gib()
     if wanted < current_gib:
         raise YoError(
-            "%s's ceiling is already %dGiB and lima can only grow it — ask for at least %d"
-            % (INSTANCE, current_gib, current_gib)
+            "%s's ceiling is already %dGiB and %s can only grow it — ask for at least %d"
+            % (INSTANCE, current_gib, DRIVER.name, current_gib)
         )
     # The ceiling edit is the one step that cannot be repeated, so asking for
     # the ceiling the instance already has finishes a grow that failed after it.
@@ -2870,8 +4169,8 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
 
     if finishing:
         out(
-            "lima: %s already has a %dGiB ceiling; finishing a previous grow"
-            % (INSTANCE, current_gib)
+            "%s: %s already has a %dGiB ceiling; finishing a previous grow"
+            % (DRIVER.name, INSTANCE, current_gib)
         )
         # Derived first: the box may be stopped or waiting in its initrd.
         passphrase = luks_passphrase()
@@ -2886,24 +4185,7 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
     blocks_before = df_blocks(guest_out(["df", "-k", "/"], check=False))
 
     if not finishing:
-        free_kib = shutil.disk_usage(os.path.join(home(), ".lima")).free // 1024
-        image_kib = du_kib(os.path.join(lima_dir(), "disk")) or 0
-        out(
-            "host: ~/.lima has %dGiB free; the disk image allocates %dGiB today"
-            % (free_kib // 1024 // 1024, image_kib // 1024 // 1024)
-        )
-        out("lima: raising %s from %dGiB to %dGiB" % (INSTANCE, current_gib, wanted))
-
-        lima_stop()
-        resize = run(
-            ["limactl", "edit", "--yes", INSTANCE, "--disk", str(wanted)],
-            capture=False,
-        )
-        if resize.returncode != 0:
-            raise YoError(
-                "limactl refused the resize and %s is left stopped — start it again with: %s"
-                % (INSTANCE, yo_cmd("up"))
-            )
+        DRIVER.grow_disk(current_gib, wanted)
         vm_up(passphrase=passphrase)
     # systemd-growfs cannot resize a keyring-keyed LUKS2 mapping, so the
     # mapping and then the filesystem are grown here, with the passphrase.
@@ -3436,11 +4718,23 @@ def cmd_aws_check(args: argparse.Namespace) -> None:
     if not heal_reverse_forward(aws_broker_forward()):
         raise YoError(
             "the aws-broker forward into the VM is still dead after re-issuing it — "
-            "recreate the master: limactl stop %s && %s" % (INSTANCE, yo_cmd("up"))
+            "recreate the master: %s && %s" % (DRIVER.stop_command(), yo_cmd("up"))
         )
     proc = guest_helper(AGENT, "aws-check", stream=True)
     if proc.returncode != 0:
         raise YoError(None, code=proc.returncode)
+
+
+def cmd_port(args: argparse.Namespace) -> None:
+    out("%s:%d" % (LOOPBACK, DRIVER.forward_port(args.guest_port)))
+
+
+def guest_port_number(value: str) -> int:
+    if not is_ascii_number(value) or not 0 < int(value) <= MAX_PORT:
+        raise argparse.ArgumentTypeError(
+            "guest port must be a number from 1 to %d, got '%s'" % (MAX_PORT, value)
+        )
+    return int(value)
 
 
 def disk_grow_size(value: str) -> int:
@@ -3480,10 +4774,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         type=instance_name,
         default=DEFAULT_INSTANCE,
-        help="lima instance to drive (default: %s); accepted before or after "
+        help="machine to drive (default: %s); accepted before or after "
         "the command" % DEFAULT_INSTANCE,
     )
-    parser.set_defaults(needs_lima=True)
+    parser.set_defaults(needs_driver=True)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, help_text: str, description: str) -> argparse.ArgumentParser:
@@ -3501,7 +4795,7 @@ def build_parser() -> argparse.ArgumentParser:
             metavar="NAME",
             type=instance_name,
             default=argparse.SUPPRESS,
-            help="lima instance to drive (default: %s)" % DEFAULT_INSTANCE,
+            help="machine to drive (default: %s)" % DEFAULT_INSTANCE,
         )
         return sub
 
@@ -3662,6 +4956,19 @@ def build_parser() -> argparse.ArgumentParser:
     zed.add_argument("project", nargs="?")
     zed.set_defaults(func=cmd_zed)
 
+    port = add(
+        "port",
+        "Forward a guest port onto the host's loopback (Linux hosts).",
+        "Forward a guest TCP port onto this host's 127.0.0.1, over the operator's\n"
+        "ssh connection, and print the address, 127.0.0.1:HOST_PORT. HOST_PORT is\n"
+        "the lowest free port above the kernel's ephemeral range\n"
+        "(/proc/sys/net/ipv4/ip_local_port_range). The forward lasts as long as the\n"
+        "ssh connection. On macOS lima mirrors guest ports by itself, so this\n"
+        "command exits 64 there.",
+    )
+    port.add_argument("guest_port", type=guest_port_number, metavar="GUEST_PORT")
+    port.set_defaults(func=cmd_port)
+
     aws_check = add(
         "aws-check",
         "Heal the AWS broker and check every allow-listed profile from the guest.",
@@ -3683,16 +4990,17 @@ def build_parser() -> argparse.ArgumentParser:
         target = parser if args.topic is None else subparsers.choices[args.topic]
         out(target.format_help().rstrip("\n"))
 
-    help_.set_defaults(func=cmd_help, needs_lima=False)
+    help_.set_defaults(func=cmd_help, needs_driver=False)
 
     return parser
 
 
 def main(argv: Sequence[str]) -> int:
     args = build_parser().parse_args(argv)
-    set_instance(args.machine)
-    if args.needs_lima:
-        require_tool("limactl", "brew install lima")
+    if args.needs_driver:
+        set_driver(driver_for(HOST_PLATFORM))
+        set_instance(args.machine)
+        DRIVER.require_tool()
     args.func(args)
     return 0
 

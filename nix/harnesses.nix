@@ -272,6 +272,14 @@ let
   herdrPkg = import ./lib/herdr-pkg.nix { inherit pkgs; cfg = cfg.herdr; };
 in
 {
+  # The option was one hash for the one guest system; a box on either CPU needs
+  # one per system. An old local.nix that still sets it must fail with this text,
+  # not with "option does not exist".
+  imports = [
+    (lib.mkRemovedOptionModule [ "yolobox" "harness" "herdr" "hash" ]
+      "use yolobox.harness.herdr.hashes = { <system> = \"sha256-...\"; }, one SRI hash per guest system (aarch64-linux, x86_64-linux)")
+  ];
+
   options.yolobox.harness = {
     herdr = {
       # Defaulting to null means the guest tracks nixpkgs' herdr, so the
@@ -284,7 +292,7 @@ in
       # client's own constant exactly, coarser than the version string
       # (see nix/herd-server.md#capability-gating).
       #
-      # Setting version+hash here re-pins the guest to a GitHub release
+      # Setting version+hashes here re-pins the guest to a GitHub release
       # (nix/pkgs/herdr-bin.nix) — the escape hatch for when nixpkgs lags a
       # herdr release the Mac has already taken.
       version = lib.mkOption {
@@ -292,10 +300,10 @@ in
         default = null;
         description = "herdr release fetched via nix/pkgs/herdr-bin.nix, bypassing nixpkgs' pin.";
       };
-      hash = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
+      hashes = lib.mkOption {
+        type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
         default = null;
-        description = "SRI hash of the herdr release binary at yolobox.harness.herdr.version. Setting this activates the override.";
+        description = "SRI hash of the herdr release binary at yolobox.harness.herdr.version, per guest system (aarch64-linux, x86_64-linux). Setting this activates the override.";
       };
     };
   };
@@ -417,8 +425,8 @@ in
 
     assertions = [
       {
-        assertion = (cfg.herdr.version == null) == (cfg.herdr.hash == null);
-        message = "yolobox.harness.herdr: version and hash must both be null or both be set.";
+        assertion = (cfg.herdr.version == null) == (cfg.herdr.hashes == null);
+        message = "yolobox.harness.herdr: version and hashes must both be null or both be set.";
       }
     ];
   };

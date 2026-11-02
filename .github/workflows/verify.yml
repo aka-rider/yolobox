@@ -28,7 +28,7 @@ jobs:
         run: ./yo --help
 
       - name: Shellcheck the guest helper
-        run: shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh
+        run: shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh tests/box-libvirt-check.sh
 
   # 3.9 is the floor yo promises; the newest 3.x catches the other direction.
   # The 3.9 leg is pinned to ubuntu-24.04 because setup-python has no 3.9 build
@@ -64,8 +64,9 @@ jobs:
   eval:
     runs-on: ubuntu-latest
     env:
-      # flake.nix throws without it; any non-empty name evaluates the same.
+      # flake.nix throws without them; any non-empty name evaluates the same.
       YOLOBOX_USERNAME: ci
+      YOLOBOX_HOST_OS: linux
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -81,6 +82,15 @@ jobs:
       - name: Evaluate nixosConfigurations.yolobox
         run: >
           nix eval --impure --raw
+          --option allow-import-from-derivation false
+          .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
+
+      # The Mac box's guest: the guest system is the evaluating nix's own, so
+      # --system aarch64-linux, with the host OS a Mac has, covers the
+      # Lima/vz side of every hostOs gate in the modules.
+      - name: Evaluate the Mac box (aarch64-linux guest, darwin host)
+        run: >
+          YOLOBOX_HOST_OS=darwin nix eval --impure --system aarch64-linux --raw
           --option allow-import-from-derivation false
           .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
 

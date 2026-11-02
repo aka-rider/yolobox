@@ -11,7 +11,8 @@ repo follows, and each rule links to the story that earned it.
 ## What the box is
 
 yolobox is one NixOS VM on a Mac, run by Lima, where coding agents work with
-no host mounts. Git is the only bridge between the Mac and the VM. The
+no host mounts. A Linux PC runs the same box as a libvirt domain instead (see
+`docs/linux-host.md`). Git is the only bridge between the host and the VM. The
 README gets a person from nothing to a working project; this file is for
 people who change the repo itself. Version 1 was Docker-based.
 
@@ -49,6 +50,12 @@ people who change the repo itself. Version 1 was Docker-based.
 - **The box builds from a published flake ref.** `yo bootstrap` runs
   `nixos-rebuild` against `github:aka-rider/yolobox/v<version>`. The VM holds
   no checkout of this repo. See `docs/distribution.md`.
+- **Two hosts, one box.** `yo` picks a driver once, from the host OS: Lima on
+  macOS, libvirt on Linux (`qemu:///system`, passt for the network, SELinux
+  sVirt). The guest is the same, with its address plan copied from Lima's, and
+  the OS that runs it is passed to nix as `YOLOBOX_HOST_OS`, never guessed from
+  the CPU. A Linux host adds a host-side nft table the guest cannot undo. See
+  `docs/linux-host.md`.
 - **Secrets reach the agent only over reverse unix sockets.** Lima forwards
   the Mac's 1Password socket and the AWS broker's socket into the VM, and
   `systemd-socket-proxyd` hands each to the agent. Nothing sensitive is
@@ -65,6 +72,16 @@ Mac side:
   `lima/yolobox.md`.
 - `homebrew/yolobox.rb`: the brew formula, rendered into the tap on release.
 - `templates/default/`: `devbox.json` for a new project.
+
+Linux host side (the libvirt driver is part of `yo`, see the driver section of
+`yo.md`):
+
+- `linux/host-setup.sh`: the one script that changes the Linux host
+  system-wide, run with sudo. `linux/yolobox-host.nft` and
+  `linux/yolobox-host.service` are the host egress table and its unit.
+  `linux/host-setup.md`, `docs/linux-host.md`.
+- `libvirt/domain.xml`: the domain template `yo` fills in. It must stay free
+  of graphics, vsock, filesystem, channel, hostdev and tpm devices.
 
 Box configuration (Nix):
 
@@ -141,6 +158,14 @@ Tests, all under `tests/`:
   `ONLY=hardening|compat`. The second, `box-hardening-e2e.sh <instance> [EXTRA_WRAPPERS...]`,
   runs on the host against a throwaway lima instance and drives the first
   across a reboot. Run them by hand, `unittest` does not. `nix/hardening.md`.
+  On a libvirt guest the first also checks that the agent cannot log in as
+  the operator.
+- `box-libvirt-check.sh NAME`: runs on a Linux host against a running box. It
+  checks the sVirt and DAC confinement, the domain's devices and the host
+  layer (it deletes the guest egress table for a while and restores it).
+  Never run it against a box mid-work. `docs/linux-host.md`.
+- `test_yo_libvirt.py`: the libvirt driver against a fake host.
+  `test_yo_instance.py`: `-m/--machine`.
 
 ## Build, test, release
 
@@ -148,7 +173,7 @@ Tests, all under `tests/`:
 python3 -m unittest discover -s tests        # CI runs 3.9 and the newest 3.x
 uvx ruff@0.17.2 check . && uvx ruff@0.17.2 format --check .   # see below
 shellcheck -S warning nix/guest/yolobox-guest.sh
-YOLOBOX_USERNAME=$(id -un) nix flake check --impure
+YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=linux nix flake check --impure
 ```
 
 - `ruff.toml` pins `required-version`, and `verify.yml` installs that same
@@ -162,9 +187,12 @@ YOLOBOX_USERNAME=$(id -un) nix flake check --impure
 - `nix/base.nix` imports `/etc/yolobox/local.nix` when it exists, so a flake
   check inside a box also evaluates that file. CI's `eval` job in
   `.github/workflows/verify.yml` proves a box without it evaluates.
-- Nix needs `YOLOBOX_USERNAME=$(id -un)` and `--impure` on every command,
-  because the flake has no pure way to learn the host username. `flake.nix`
-  throws if it is unset.
+- Nix needs `YOLOBOX_USERNAME=$(id -un)`, `YOLOBOX_HOST_OS` (`darwin` or
+  `linux`, the OS that runs the VM) and `--impure` on every command, because
+  the flake has no pure way to learn either host fact. `flake.nix` throws if
+  one is unset. The guest's CPU is the evaluating nix's own system, so check
+  the Mac box's aarch64 guest from an x86_64 machine with
+  `YOLOBOX_HOST_OS=darwin nix eval --impure --system aarch64-linux ...`.
 - On a local clone, `git add` new files before running nix, which ignores
   untracked files in a git tree.
 - A new `yolobox-guest` subcommand does not exist on a box until the box is
@@ -180,14 +208,15 @@ YOLOBOX_USERNAME=$(id -un) nix flake check --impure
 `docs/README.md` states the convention and lists every story file. A story
 lives in `<stem>.md` beside the file it explains, and cross-cutting ones live
 in `docs/<topic>.md` (`accounts`, `ssh`, `aws`, `disk`, `disk-encryption`,
-`host-network`, `distribution`). Before editing a file, check whether its `<stem>.md`
+`host-network`, `linux-host`, `distribution`). Before editing a file, check whether its `<stem>.md`
 exists and read it. A short "why" stays in the code comment; the story file
 holds the incident, the evidence and how to recognise the failure.
 
 ## Host or guest?
 
-Check before you run anything. `uname` prints `Darwin` on the Mac and
-`Linux` inside the VM. `yo`, `limactl` and `~/.lima` exist only on the Mac.
-`yolobox-guest` and `/etc/yolobox/version` exist only in the guest, which has
-no `yo` at all. Commands here that name `yo ssh` or `yo enter` run from the
-Mac and land in the guest.
+Check before you run anything. `uname` prints `Darwin` on a Mac host, and
+`Linux` both on a Linux host and inside the VM, so on Linux do not trust it.
+Test for `yolobox-guest` or `/etc/yolobox/version`: they exist only in the
+guest, which has no `yo` at all. `yo` exists only on a host, with `limactl`
+and `~/.lima` on a Mac and `virsh -c qemu:///system` on Linux. Commands here
+that name `yo ssh` or `yo enter` run from the host and land in the guest.

@@ -3,9 +3,9 @@
 # guest-side herdr server) — keeps the pkgs.herdr vs. herdr-bin.nix override
 # valve defined exactly once.
 { pkgs, cfg }:
-if cfg.hash != null then
+if cfg.hashes != null then
   pkgs.callPackage ../pkgs/herdr-bin.nix {
-    inherit (cfg) version hash;
+    inherit (cfg) version hashes;
   }
 else
   pkgs.herdr
