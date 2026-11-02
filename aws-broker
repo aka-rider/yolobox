@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+import argparse
+import http.server
+import json
+import os
+import re
+import select
+import socket
+import socketserver
+import stat
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from datetime import datetime, timezone
+
+
+# The one spelling of a valid profile name on the broker side. `yo` carries the
+# same literal as AWS_PROFILE_NAME_RE (a test asserts the two agree). A name
+# must start with an alphanumeric, so it can never read as an option.
+PROFILE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+PROFILE_NAME_RE = re.compile(PROFILE_NAME_PATTERN)
+
+# At most this many requests are served at once; the next one is told 503
+# immediately instead of queueing a thread behind a stuck mint.
+MAX_CONCURRENT_REQUESTS = 32
+REQUEST_TIMEOUT_SECONDS = 10
+REQUEST_QUEUE_SIZE = 64
+# http.server's own cap on a request line.
+MAX_REQUEST_LINE = 65536
+# A guest-chosen request path is cut to this many characters in broker.log, so
+# a loop of long requests cannot grow the log by 64 KB a line.
+LOGGED_PATH_MAX = 256
+
+
+# Request paths come from the guest, so they can carry terminal escape
+# sequences; `yo` tells the user to read this log. Every line goes through here.
+CONTROL_BYTES_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def sanitize(text):
+    return CONTROL_BYTES_RE.sub("?", text)
+
+
+def clip(text):
+    if len(text) <= LOGGED_PATH_MAX:
+        return text
+    return f"{text[:LOGGED_PATH_MAX]}...({len(text) - LOGGED_PATH_MAX} more)"
+
+
+def log(msg):
+    print(sanitize(msg), file=sys.stderr, flush=True)
+
+
+def fail(msg):
+    print(f"ERROR={msg}")
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--socket", required=True, metavar="PATH")
+    p.add_argument("--watch-pid", type=int, required=True)
+    p.add_argument("--allow", nargs="+", required=True, metavar="PROFILE")
+    p.add_argument("--min-remint-interval", type=float, default=5.0)
+    args = p.parse_args()
+    for name in args.allow:
+        if not PROFILE_NAME_RE.fullmatch(name):
+            fail(f"invalid profile name {name!r}: must match {PROFILE_NAME_PATTERN}")
+    return args
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def reclaim_socket_path(path):
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        fail(f"cannot stat existing path {path}: {e}")
+    if not stat.S_ISSOCK(mode):
+        fail(f"{path} exists and is not a socket; refusing to remove it")
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(path)
+    except ConnectionRefusedError:
+        pass
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        fail(f"cannot probe existing socket {path}: {e}")
+    else:
+        fail(f"another aws-broker is already serving {path}")
+    finally:
+        probe.close()
+
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        fail(f"cannot remove stale socket {path}: {e}")
+
+
+def unlink_if_same_identity(path, identity):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if (st.st_dev, st.st_ino) == identity:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def register_pid_watch_event(pid):
+    """Register a kqueue watch for process exit, without waiting for it."""
+    kq = select.kqueue()
+    event = select.kevent(
+        pid,
+        filter=select.KQ_FILTER_PROC,
+        flags=select.KQ_EV_ADD,
+        fflags=select.KQ_NOTE_EXIT,
+    )
+    try:
+        kq.control([event], 0)
+    except ProcessLookupError:
+        fail(f"watched pid {pid} is not running")
+    except OSError as e:
+        fail(f"kqueue registration for watched pid {pid} failed: {e}")
+    return kq
+
+
+def wait_for_pid_exit(pid, socket_path, identity, kq):
+    try:
+        kq.control([], 1)
+    except OSError:
+        pass
+    log(f"watched pid {pid} exited; shutting down")
+    unlink_if_same_identity(socket_path, identity)
+    os._exit(0)
+
+
+EXPIRATION_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?"
+)
+
+
+# Different botocore versions of `export-credentials --format process` return
+# "2024-01-01T00:00:00Z", "...+00:00", with or without fractional seconds of
+# any width, or no zone at all. fromisoformat (3.9) accepts only a colon
+# offset and a 3 or 6 digit fraction, so the string is rebuilt in that shape;
+# a zone-less timestamp is UTC. Raises ValueError on anything else.
+def parse_expiration(expiration):
+    m = EXPIRATION_RE.fullmatch(expiration)
+    if m is None:
+        raise ValueError(f"unrecognised expiration timestamp {expiration!r}")
+    day, clock, fraction, zone = m.groups()
+    fraction = (fraction or "")[:6].ljust(6, "0")
+    if zone is None or zone == "Z":
+        zone = "+00:00"
+    elif ":" not in zone:
+        zone = zone[:3] + ":" + zone[3:]
+    return datetime.fromisoformat(f"{day}T{clock}.{fraction}{zone}")
+
+
+def seconds_to_expiry(expiration):
+    return (parse_expiration(expiration) - datetime.now(timezone.utc)).total_seconds()
+
+
+# Runs the host's full credential resolution for the profile (including any
+# credential_process) and returns the
+# process-format JSON, or (None, <one-line error>) on any failure. Never
+# raises: every caller turns a failure into ERROR=/500 output instead.
+def export_credentials(profile):
+    try:
+        proc = subprocess.run(
+            [
+                "aws",
+                "configure",
+                "export-credentials",
+                "--profile",
+                profile,
+                "--format",
+                "process",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "'aws configure export-credentials' timed out after 30s"
+    except FileNotFoundError:
+        return None, "'aws' is not on PATH"
+
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        return (
+            None,
+            f"'aws configure export-credentials --profile {profile}' failed: {detail}",
+        )
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        return None, f"unparseable export-credentials output: {e}"
+
+    if not isinstance(data, dict):
+        return (
+            None,
+            f"export-credentials output is a {type(data).__name__}, not an object",
+        )
+
+    if not data.get("SessionToken"):
+        return None, (
+            f"profile '{profile}' returned no SessionToken — these are long-lived keys and "
+            "must never be served to the guest. Remove it from the broker's --allow list, or "
+            "point its aws config at a role_arn/credential_process instead of a static IAM user."
+        )
+
+    # Names only, never values: this message reaches broker.log.
+    for field in ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration"):
+        value = data.get(field)
+        if not isinstance(value, str) or not value:
+            return (
+                None,
+                f"export-credentials field {field} is missing or not a non-empty string",
+            )
+    try:
+        parse_expiration(data["Expiration"])
+    except ValueError as e:
+        return None, f"export-credentials field Expiration is unusable: {e}"
+
+    return {
+        "AccessKeyId": data["AccessKeyId"],
+        "SecretAccessKey": data["SecretAccessKey"],
+        "SessionToken": data["SessionToken"],
+        "Expiration": data["Expiration"],
+    }, None
+
+
+class State:
+    def __init__(self, profile, min_remint_interval):
+        self.profile = profile
+        self.min_remint_interval = min_remint_interval
+        self.lock = threading.Lock()
+        self.creds = None
+        self.last_mint_attempt = None
+        self.last_mint_error = None
+
+    def _remint_locked(self):
+        log(f"{self.profile}: minting credentials")
+        creds, err = export_credentials(self.profile)
+        self.last_mint_attempt = time.monotonic()
+        if err:
+            self.last_mint_error = err
+            log(f"{self.profile}: mint failed: {err}")
+            return
+        self.creds = creds
+        self.last_mint_error = None
+        log(f"{self.profile}: minted, expires {creds['Expiration']}")
+
+    # Returns fresh-enough creds, or None when nothing usable is left.
+    # Re-mints synchronously (holding the lock) when the cache is within
+    # 10 minutes of expiry, throttled to at most one attempt per
+    # min-remint-interval — a mint failure while the cache is still
+    # genuinely unexpired keeps serving the stale cache rather than 500ing.
+    def get(self):
+        with self.lock:
+            needs_remint = (
+                self.creds is None or seconds_to_expiry(self.creds["Expiration"]) < 600
+            )
+            throttled = (
+                self.last_mint_attempt is not None
+                and (time.monotonic() - self.last_mint_attempt)
+                < self.min_remint_interval
+            )
+            if needs_remint and not throttled:
+                self._remint_locked()
+            if self.creds is None or seconds_to_expiry(self.creds["Expiration"]) <= 0:
+                return None
+            return self.creds
+
+
+class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    request_queue_size = REQUEST_QUEUE_SIZE
+
+
+# The 500 body the guest sees. Everything that could carry detail (aws
+# stderr, Mac paths, account ids) stays in broker.log.
+def mint_failed_body(profile):
+    return (
+        f"mint failed: run `aws sso login --profile {profile}` on the Mac; "
+        "the detail is in broker.log\n"
+    )
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    timeout = REQUEST_TIMEOUT_SECONDS
+
+    def __init__(self, states, watch_pid, slots, *args, **kwargs):
+        self.states = states
+        self.watch_pid = watch_pid
+        self.slots = slots
+        super().__init__(*args, **kwargs)
+
+    # Bounded concurrency: every request holds one slot for its whole life,
+    # and a request that finds none is turned away at once with 503 rather
+    # than queued behind a mint that may take 30 s.
+    def handle(self):
+        if not self.slots.acquire(blocking=False):
+            log("too many concurrent requests; replying 503")
+            # The request is read before the answer: closing a socket the
+            # client is still writing to resets the connection, and the client
+            # would never see the 503.
+            try:
+                self.raw_requestline = self.rfile.readline(MAX_REQUEST_LINE + 1)
+            except OSError as failure:
+                log(f"503 not sent: reading the request failed: {failure}")
+                return
+            if self.parse_request():
+                self._send_text(503, "broker busy; retry\n")
+            return
+        try:
+            super().handle()
+        finally:
+            self.slots.release()
+
+    # AF_UNIX hands back '' as client_address (there is no peer host/port),
+    # so the base class's address_string(), which indexes it as
+    # client_address[0], would raise. The path is only reachable by the
+    # agent account anyway (the socket is 0600), so a fixed label is enough.
+    def address_string(self):
+        return "unix-socket"
+
+    def log_message(self, fmt, *args):
+        log(
+            f"{self.address_string()} - {self.log_date_time_string()} - {clip(fmt % args)}"
+        )
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, status, body):
+        encoded = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _route(self):
+        """Return (status, kind, payload) for GET self.path; may raise."""
+        if self.path == "/health":
+            return (
+                200,
+                "json",
+                {
+                    "pid": os.getpid(),
+                    "watch_pid": self.watch_pid,
+                    "allow": sorted(self.states),
+                },
+            )
+
+        if self.path.startswith("/creds/"):
+            profile = self.path[len("/creds/") :]
+
+            state = self.states.get(profile)
+            if state is None:
+                allowed = ", ".join(sorted(self.states)) or "(none)"
+                return (
+                    403,
+                    "text",
+                    f"profile '{profile}' is not allowlisted; allowed: {allowed}\n",
+                )
+
+            creds = state.get()
+            if creds is None:
+                log(
+                    f"{profile}: no credentials: {state.last_mint_error or 'none available'}"
+                )
+                return 500, "text", mint_failed_body(profile)
+
+            return 200, "json", {"Version": 1, **creds}
+
+        return 404, "text", ""
+
+    def do_GET(self):
+        try:
+            status, kind, payload = self._route()
+        except Exception:
+            # A bug or an unexpected shape must become a clean 500, never a
+            # dropped connection. The traceback carries the exception's own
+            # message, so no code on this path may put a credential in one.
+            log(f"{clip(self.path)}: request failed:\n{traceback.format_exc()}")
+            profile = (
+                self.path[len("/creds/") :] if self.path.startswith("/creds/") else ""
+            )
+            status, kind = 500, "text"
+            payload = (
+                mint_failed_body(profile)
+                if profile
+                else "request failed; the detail is in broker.log\n"
+            )
+        if kind == "json":
+            self._send_json(status, payload)
+        else:
+            self._send_text(status, payload)
+
+
+def bind_server(socket_path, states, watch_pid, max_concurrent=MAX_CONCURRENT_REQUESTS):
+    """Bind the 0600 unix socket and return (server, (st_dev, st_ino))."""
+    slots = threading.BoundedSemaphore(max_concurrent)
+    # Only the socket file's own mode governs who can connect: no bearer
+    # token guards these requests, and this file only ever runs on the Mac,
+    # which has no separate agent account — 0600 restricts the socket to
+    # this user's own processes, with no window where it is
+    # world-connectable. bind() creates the socket file at mode 0777 &
+    # ~umask, so clearing every group/other/execute bit needs umask 0o177,
+    # not the 0o077 that a regular file's 0666 default would call for.
+    old_umask = os.umask(0o177)
+    try:
+        server = UnixHTTPServer(
+            socket_path,
+            lambda *a, **kw: Handler(states, watch_pid, slots, *a, **kw),
+        )
+    except OSError as e:
+        fail(f"cannot bind unix socket {socket_path}: {e}")
+    finally:
+        os.umask(old_umask)
+
+    st = os.lstat(socket_path)
+    return server, (st.st_dev, st.st_ino)
+
+
+def main():
+    args = parse_args()
+
+    if not pid_alive(args.watch_pid):
+        fail(f"watched pid {args.watch_pid} is not running")
+
+    reclaim_socket_path(args.socket)
+
+    states = {
+        profile: State(profile, args.min_remint_interval) for profile in args.allow
+    }
+
+    server, identity = bind_server(args.socket, states, args.watch_pid)
+
+    kq = register_pid_watch_event(args.watch_pid)
+
+    print("READY")
+    sys.stdout.flush()
+
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, 1)
+    os.close(devnull_fd)
+
+    threading.Thread(
+        target=wait_for_pid_exit,
+        args=(args.watch_pid, args.socket, identity, kq),
+        daemon=True,
+    ).start()
+
+    try:
+        server.serve_forever()
+    finally:
+        unlink_if_same_identity(args.socket, identity)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,119 @@
+# yolobox VM, derived from nixos-lima's nixos.yaml (v0.2.2)
+images:
+  - location: "https://github.com/nixos-lima/nixos-lima/releases/download/v0.2.2/nixos-lima-v0.2.2-aarch64.qcow2"
+    arch: "aarch64"
+    digest: "sha512:bfcb703cdbad28cfd27438dc009408a859f3c4f575d3598d9627ea712c66128e0fa015de2010ce42bb724abc49f45029a4fc81891fb1a04c567378a6fdf31903"
+
+# Apple's Virtualization.framework; the rosetta block below only applies to vz.
+vmType: vz
+
+# Keep the host's HTTP(S)_PROXY out of the guest: a proxy the VM cannot reach
+# would break every fetch the box makes.
+propagateProxyEnv: false
+
+mounts: []
+
+memory: 16GiB
+cpus: 8
+disk: 100GiB
+
+ssh:
+  localPort: 60022
+  # Lima would copy every ~/.ssh/*.pub into the guest's authorized keys. Only
+  # the key lima itself generates may enter the box.
+  loadDotSSHPubKeys: false
+  # Lima picks vsock or TCP for 60022 once per start, when guest port 22 first
+  # answers. The initrd sshd that unlocks the disk only speaks TCP, so the
+  # choice must not depend on who answers first.
+  overVsock: false
+
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true
+      binfmt: true
+
+portForwards:
+  # Lima takes the first rule that matches a listener, so the order is:
+  # deny-list, dev-port range, sockets, catch-alls. Lima mirrors onto the
+  # host's 127.0.0.1 only. See lima/yolobox.md.
+
+  # The fixed OAuth callback ports of common CLIs are never mirrored: a guest
+  # listener on one would squat the port a host-side login tool expects to
+  # bind itself.
+  # Each guestIP line is load-bearing, as for the UDP rule below.
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [1455, 1457]
+    ignore: true
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [8020, 8020]
+    ignore: true
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [8085, 8085]
+    ignore: true
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [9005, 9005]
+    ignore: true
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    guestPortRange: [18000, 18000]
+    ignore: true
+
+  # Mirror guest TCP listeners onto the host's 127.0.0.1 for the unprivileged
+  # dev ports only, below the macOS ephemeral range (49152). Same port on both
+  # sides; guestIP and hostIP stay at lima's loopback defaults.
+  - guestPortRange: [1024, 49151]
+    proto: tcp
+
+  # Reverses the Mac's 1Password agent socket into the guest, so the VM
+  # never carries any 1Password credential of its own.
+  - guestSocket: "/run/yolobox-op/agent.sock"
+    hostSocket: "{{.Home}}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+    reverse: true
+
+  # Same shape, for the AWS broker: a VPN owning the host's default route
+  # blackholes the guest's TCP path to 192.168.5.2 (gvproxy's NAT to host
+  # loopback), so the broker is reached as a reversed unix socket instead of
+  # a forwarded port, exactly like 1Password above.
+  - guestSocket: "/run/yolobox-op/aws-broker.sock"
+    hostSocket: "{{.Home}}/.local/state/yolobox/aws-broker.sock"
+    reverse: true
+
+  # Forward no guest UDP listener to the host. Lima mirrors every guest
+  # listener onto the host's localhost, and nothing here needs a UDP one: the
+  # secrets are unix sockets. The mirror only collides or intercepts.
+  # tailscaled's UDP 41641 loses to a host's own Tailscale, if it runs one, which holds that
+  # port ("failed to listen udp: 127.0.0.1:41641: address already in use"), and
+  # port 68 would intercept the host's DHCP packets, which is an
+  # issue with NixOS that other distros do not show
+  # (https://github.com/nixos-lima/nixos-lima/issues/50).
+  # Both guestIP lines are load-bearing. Lima skips an ignore rule for a
+  # listener bound to 0.0.0.0 or :: unless the rule's guestIP is unspecified
+  # too, and treats guestIP 0.0.0.0 as an exact match unless guestIPMustBeZero
+  # is false. Without them the rule (default guestIP 127.0.0.1) matches only
+  # loopback listeners. See lima/yolobox.md.
+  - proto: udp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    ignore: true
+
+  # Everything else over TCP (ports below 1024 and above 49151) is ignored.
+  # Lima's own default rule would mirror it, ports below 1024 included.
+  # Same guestIP lines as the UDP rule above.
+  - proto: tcp
+    guestIP: 0.0.0.0
+    guestIPMustBeZero: false
+    ignore: true
+
+containerd:
+  system: false
+  user: false

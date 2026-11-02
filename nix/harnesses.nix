@@ -1,0 +1,425 @@
+{ config, lib, pkgs, agentUser, ... }:
+let
+  cfg = config.yolobox.harness;
+
+  claudeHooksFile = import ./lib/claude-hooks-file.nix;
+  homeDir = config.users.users.${agentUser}.home;
+  homeTmpfiles = import ./lib/home-tmpfiles.nix;
+  nixLdEnv = import ./lib/nix-ld-env.nix;
+
+  launcherPath = "/etc/yolobox/bin/claude";
+  launcherLink = "${homeDir}/.local/bin/claude";
+  claudeVersionsDir = "${homeDir}/.local/share/claude/versions";
+
+  # Claude Code >= 2.1.207 documents that a custom ~/.local/bin/claude is left
+  # alone: `claude update` and the background updater only drop new binaries
+  # into ~/.local/share/claude/versions/. That guarantee is the whole delivery
+  # channel for claude's settings file (nix/display.nix), which reaches
+  # claude as `--settings <file>` and nowhere else (see nix/display.nix for
+  # why the enterprise settings tier can't carry it). The box therefore OWNS
+  # that path with a launcher of its own rather than putting a wrapper on the
+  # system PATH and racing it: the agent's shell rc files may prepend $HOME/.local/bin,
+  # so any wrapper behind it loses in every interactive shell, silently.
+  #
+  # --settings sits before "$@" so a user's own later --settings still wins.
+  #
+  # No runtimeInputs: that would prepend store paths to PATH, and this script
+  # execs claude, whose children (the project's own tools) must keep the PATH
+  # the project's shell gave them. The few external tools are named by store
+  # path instead.
+  claudeLauncher = pkgs.writeShellApplication {
+    name = "claude";
+    runtimeInputs = [ ];
+    text = ''
+      versions="${claudeVersionsDir}"
+
+      # Newest executable under $versions. Extra find tests go in "$@". No
+      # versions directory is no install; any other find error is shown.
+      newest_version() {
+        [ -d "$versions" ] || return 0
+        ${pkgs.findutils}/bin/find "$versions" -maxdepth 1 -type f -perm -u+x "$@" -printf '%f\n' \
+          | ${pkgs.coreutils}/bin/sort -V | ${pkgs.coreutils}/bin/tail -n 1 || true
+      }
+
+      # A binary modified in the last minute may still be downloading; skip it
+      # unless it is all there is (a first install would otherwise have no
+      # claude for a minute).
+      newest="$(newest_version ! -mmin -1)"
+      if [ -z "$newest" ]; then
+        newest="$(newest_version)"
+      fi
+
+      if [ -z "$newest" ]; then
+        echo "claude: no installed version under $versions" >&2
+        echo "  the vendor install runs as a user unit: systemctl --user status yolobox-harness-install" >&2
+        echo "  its output: journalctl --user -u yolobox-harness-install" >&2
+        exit 127
+      fi
+
+      # The playwright plugin's stdio server inherits this process's
+      # environment and reads PLAYWRIGHT_MCP_OUTPUT_DIR once at start, so the
+      # launcher is the only place left that can make it per project. The
+      # project comes from the logical cwd, not git's physical toplevel: a
+      # symlinked project directory is mirrored by its logical path, so
+      # show-toplevel would resolve the symlink away. The root is the nearest logical ancestor that resolves to git's physical one,
+      # yo's logical_toplevel(): counting --show-cdup's `../` up the logical
+      # path climbs elsewhere when a symlink sits below the root.
+      top="$PWD"
+      physical_top="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
+      if [ -n "$physical_top" ]; then
+        d="$PWD"
+        while [ -n "$d" ] && [ "$(cd "$d" 2>/dev/null && pwd -P)" != "$physical_top" ]; do
+          d="''${d%/*}"
+        done
+        top="''${d:-$physical_top}"
+      fi
+      default_output_dir="$HOME/artifacts"
+      output_dir="''${PLAYWRIGHT_MCP_OUTPUT_DIR:-$default_output_dir}"
+      case "$top" in
+        "$HOME"/*)
+          project="''${top#"$HOME/"}"
+          project="''${project//\//--}"
+          if [ "$output_dir" = "$default_output_dir" ]; then
+            output_dir="$default_output_dir/$project"
+          fi
+          ;;
+      esac
+      export PLAYWRIGHT_MCP_OUTPUT_DIR="$output_dir"
+      ${pkgs.coreutils}/bin/mkdir -p "$output_dir"
+
+      # herdr's classification keys off the foreground process name, but the
+      # exec'd binary here is named after its version directory (e.g.
+      # "2.1.268"), not "claude" - so herdr never recognises it without help.
+      export HERDR_AGENT=claude
+      exec "$versions/$newest" --settings ${claudeHooksFile.path} "$@"
+    '';
+  };
+
+  claudeLauncherKeeper = pkgs.writeShellApplication {
+    name = "yolobox-claude-launcher-keep";
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils ];
+    text = ''
+      keep_versions=2
+      settle_minutes=10
+
+      if [ "$(readlink "${launcherLink}" || true)" != "${launcherPath}" ]; then
+        mkdir -p "$(dirname "${launcherLink}")"
+        ln -sfn "${launcherPath}" "${launcherLink}.tmp"
+        mv -T "${launcherLink}.tmp" "${launcherLink}"
+        echo "relinked ${launcherLink} -> ${launcherPath}"
+      fi
+
+      # Rank every version first, so a fresh download counts toward the
+      # $keep_versions kept (the launcher runs the newest, which ranking
+      # always spares). Only then does settling filter the rest: one the
+      # updater finished with more than $settle_minutes minutes ago, so a
+      # download in flight is never a pruning target. Nothing else prunes
+      # them: keeping every version is precisely what the custom launcher
+      # buys, at ~330 MB each.
+      older=""
+      if [ -d "${claudeVersionsDir}" ]; then
+        older="$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -printf '%f\n' | sort -V | head -n "-$keep_versions" || true)"
+      fi
+      if [ -n "$older" ]; then
+        while IFS= read -r version; do
+          if [ -n "$(find "${claudeVersionsDir}/$version" -maxdepth 0 -mmin "+$settle_minutes" -print)" ]; then
+            rm -f "${claudeVersionsDir}/$version"
+            echo "pruned ${claudeVersionsDir}/$version"
+          fi
+        done <<< "$older"
+      fi
+    '';
+  };
+
+  harnessInstall = pkgs.writeShellApplication {
+    name = "yolobox-harness-install";
+    text = ''
+      cd "$HOME"
+      mkdir -p "$HOME/.local/bin"
+
+      # Atomic: a reader never sees the link missing.
+      link_bin() {
+        ln -sfn "$2" "${homeDir}/.local/bin/$1.tmp"
+        mv -T "${homeDir}/.local/bin/$1.tmp" "${homeDir}/.local/bin/$1"
+      }
+
+      # Each vendor is an independent phase: one vendor's outage (a down
+      # download host, a bad config file) must not keep the others from
+      # installing. A phase runs in its own errexit subshell, so its first
+      # failing command ends that phase and nothing else; the failure is
+      # recorded, and the unit still exits non-zero at the very end so
+      # Restart=on-failure retries. Every phase is idempotent, so a retry
+      # redoes only what is missing.
+      failed=()
+      phase() {
+        local name="$1" status=0
+        shift
+        set +e
+        ( set -e; "$@" )
+        status=$?
+        set -e
+        if [ "$status" -ne 0 ]; then
+          echo "yolobox-harness-install: phase '$name' failed (exit $status)" >&2
+          failed+=("$name")
+        fi
+      }
+
+      # grep -q exits at its first match, and a producer still writing then
+      # dies of SIGPIPE, which pipefail turns into a failed probe. So the
+      # producer's whole output is captured first.
+      probe_has() {
+        local pattern="$1" out
+        shift
+        out="$("$@" 2>/dev/null || true)"
+        grep -q -- "$pattern" <<<"$out"
+      }
+
+      install_claude() {
+        if [ -z "$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null || true)" ]; then
+          curl -fsSL https://claude.ai/install.sh | bash -s latest
+        fi
+        # Unconditional: the guarantee upstream documents covers updates, not
+        # the initial `claude install` the installer script runs.
+        ${lib.getExe claudeLauncherKeeper}
+
+        probe_has claude-plugins-official claude plugin marketplace list \
+          || claude plugin marketplace add anthropics/claude-plugins-official
+        for plugin in context7 playwright; do
+          probe_has "$plugin@claude-plugins-official" claude plugin list \
+            || claude plugin install "$plugin@claude-plugins-official" --scope user
+        done
+      }
+
+      # No tty under systemd, so pi's installer takes its defaults and never
+      # edits an rc file. `pi update` self-updates. The boot-time L+ link has
+      # already replaced an npm pi's bin link, so the installer cannot see it
+      # to migrate; the npm package is removed here instead.
+      install_pi() {
+        [ -x "$HOME/.pi/agent/bin/pi" ] \
+          || curl -fsSL https://pi.dev/install.sh | bash
+        [ ! -d "$HOME/.local/lib/node_modules/@earendil-works/pi-coding-agent" ] \
+          || npm uninstall -g @earendil-works/pi-coding-agent
+        link_bin pi "$HOME/.pi/agent/bin/pi"
+      }
+
+      # Scripts ON: agent-browser's postinstall IS the download of
+      # its prebuilt binary. That download fails silently, so the version call
+      # below is the hard check rather than a courtesy. Pinned to the version
+      # pi-agent-browser-native 0.9.6 recommends; it accepts 0.35.0 and newer,
+      # and refuses browser-backed calls below that floor, at call time, not here.
+      install_agent_browser() {
+        agent-browser --version >/dev/null 2>&1 || npm install -g agent-browser@0.38.1
+        agent-browser --version
+      }
+
+      install_pi_packages() {
+        for package in @upstash/context7-pi pi-agent-browser-native; do
+          probe_has "$package" pi list || pi install "npm:$package"
+        done
+        probe_has '^pi: current' herdr integration status || herdr integration install pi
+      }
+
+      # pi-agent-browser-native ships a `pi-agent-browser-config` helper, but
+      # its own README states that `pi install npm:...` does not put it on
+      # PATH and names writing this file as the equivalent route. The shape is
+      # the helper's own: {version:1, browser:{executablePath}}. Merged with
+      # jq rather than overwritten, because the same file also holds the
+      # extension's webSearch settings. A file that is not a JSON object is an
+      # error, never something to overwrite: it may hold those settings.
+      configure_agent_browser() {
+        local browser_config_dir="$HOME/.pi/config/pi-agent-browser-native"
+        local browser_config="$browser_config_dir/config.json"
+        mkdir -p "$browser_config_dir"
+        [ -e "$browser_config" ] || echo '{}' > "$browser_config"
+        jq -e 'type == "object"' "$browser_config" >/dev/null \
+          || { echo "yolobox-harness-install: $browser_config is not a JSON object; fix or remove it" >&2; return 1; }
+        if ! jq -e --arg path "${lib.getExe pkgs.chromium}" \
+          '.version == 1 and .browser.executablePath == $path' \
+          "$browser_config" >/dev/null; then
+          jq --arg path "${lib.getExe pkgs.chromium}" \
+            '.version = 1 | .browser.executablePath = $path' \
+            "$browser_config" > "$browser_config.tmp"
+          mv -f "$browser_config.tmp" "$browser_config"
+        fi
+      }
+
+      # --no-modify-path: no installer may edit the agent's rc files. The
+      # opencode installer has no install-dir override, hence the fixed link.
+      install_opencode() {
+        [ -x "$HOME/.opencode/bin/opencode" ] \
+          || curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
+        link_bin opencode "$HOME/.opencode/bin/opencode"
+      }
+
+      phase claude install_claude
+      phase pi install_pi
+      phase agent-browser install_agent_browser
+      phase pi-packages install_pi_packages
+      phase pi-agent-browser-config configure_agent_browser
+      phase opencode install_opencode
+
+      for tool in claude pi opencode agent-browser node; do
+        phase "$tool --version" "$tool" --version
+      done
+
+      if [ "''${#failed[@]}" -gt 0 ]; then
+        printf 'yolobox-harness-install: failed phase: %s\n' "''${failed[@]}" >&2
+        exit 1
+      fi
+    '';
+  };
+
+  herdrPkg = import ./lib/herdr-pkg.nix { inherit pkgs; cfg = cfg.herdr; };
+in
+{
+  options.yolobox.harness = {
+    herdr = {
+      # Defaulting to null means the guest tracks nixpkgs' herdr, so the
+      # version is not a hand-copied duplicate of a host fact that nobody
+      # remembers to re-copy.
+      #
+      # The invariant it has to satisfy: `herdr machine add` gates a saved
+      # connection on capability, not exact version equality — the guest
+      # server's endpoint_protocol_generation has to match the Mac
+      # client's own constant exactly, coarser than the version string
+      # (see nix/herd-server.md#capability-gating).
+      #
+      # Setting version+hash here re-pins the guest to a GitHub release
+      # (nix/pkgs/herdr-bin.nix) — the escape hatch for when nixpkgs lags a
+      # herdr release the Mac has already taken.
+      version = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "herdr release fetched via nix/pkgs/herdr-bin.nix, bypassing nixpkgs' pin.";
+      };
+      hash = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "SRI hash of the herdr release binary at yolobox.harness.herdr.version. Setting this activates the override.";
+      };
+    };
+  };
+
+  config = {
+    environment.systemPackages = [
+      # pi shells out to npm to install the packages listed in its settings.
+      pkgs.nodejs
+      herdrPkg
+    ];
+
+    # A copy, not a store symlink: the link in the agent's home must point at a
+    # path that survives every rebuild, so that the keeper below can compare
+    # `readlink` against one constant.
+    environment.etc."yolobox/bin/claude" = {
+      source = lib.getExe claudeLauncher;
+      mode = "0555";
+    };
+
+    systemd.tmpfiles.rules = homeTmpfiles {
+      home = homeDir;
+      user = agentUser;
+      dirs = [ ".local" ".local/bin" ];
+      links = [
+        { path = ".local/bin/claude"; argument = launcherPath; }
+        { path = ".local/bin/opencode"; argument = "${homeDir}/.opencode/bin/opencode"; }
+        { path = ".local/bin/pi"; argument = "${homeDir}/.pi/agent/bin/pi"; }
+      ];
+    };
+
+    # tmpfiles only fires at boot and on switch, which is a window wide enough
+    # for a self-updating claude to install its own launcher over ours and go
+    # unnoticed until the next rebuild. This closes it at the moment it opens.
+    # The service writes only when something is actually wrong, so the write it
+    # makes retriggers the watch exactly once and then settles.
+    systemd.user.paths.yolobox-claude-launcher = {
+      description = "Watch the agent's claude launcher and version store";
+      unitConfig.ConditionUser = agentUser;
+      wantedBy = [ "paths.target" ];
+      pathConfig.PathModified = [ "%h/.local/bin" "%h/.local/share/claude/versions" ];
+    };
+    # The path unit only fires on a change, and a version too fresh to prune
+    # then becomes prunable with nothing left to change, so the same service
+    # also runs hourly.
+    systemd.user.timers.yolobox-claude-launcher = {
+      description = "Periodically prune the agent's old claude versions";
+      unitConfig.ConditionUser = agentUser;
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = "hourly";
+        Persistent = true;
+      };
+    };
+    # StartLimitIntervalSec = 0 because the path unit above fires on every
+    # write into the version store, and one ~330 MB download is thousands of
+    # them: systemd's default burst limit would trip and leave the path unit
+    # failed.
+    systemd.user.services.yolobox-claude-launcher = {
+      description = "Re-assert the box's claude launcher and prune old versions";
+      unitConfig = {
+        ConditionUser = agentUser;
+        StartLimitIntervalSec = 0;
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = lib.getExe claudeLauncherKeeper;
+      };
+    };
+
+    # The harnesses install themselves from their vendors, so the box needs no
+    # nixpkgs version of any of them — and gets their self-updates for free.
+    # StartLimitIntervalSec = 0 because the only expected failure is "no
+    # network yet", which Restart must keep retrying past systemd's default
+    # burst limit.
+    systemd.user.services.yolobox-harness-install = {
+      description = "Install claude, pi, opencode and their plugins from their vendors";
+      unitConfig = {
+        ConditionUser = agentUser;
+        StartLimitIntervalSec = 0;
+      };
+      wantedBy = [ "default.target" ];
+      after = [ "yolobox-claude-launcher.path" ];
+      # "${homeDir}/.local" first so `claude` here is the launcher, and so pi
+      # (through the box's ~/.local/bin/pi link) and the npm-installed
+      # agent-browser resolve as soon as they land.
+      path = [
+        "${homeDir}/.local"
+        pkgs.bash
+        pkgs.coreutils
+        pkgs.curl
+        pkgs.gnutar
+        pkgs.gzip
+        pkgs.zstd
+        pkgs.git
+        pkgs.nodejs
+        pkgs.findutils
+        pkgs.gawk
+        pkgs.gnugrep
+        pkgs.jq
+        herdrPkg
+      ];
+      # NIX_LD/NIX_LD_LIBRARY_PATH are spelled out rather than inherited: this
+      # unit must not depend on PAM having reached the user manager with a
+      # login environment. The vendor-downloaded binaries (claude, pi,
+      # opencode) are dynamically linked glibc programs and need them at
+      # install time, where the version checks run them.
+      environment = {
+        NPM_CONFIG_PREFIX = "${homeDir}/.local";
+      } // nixLdEnv;
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        Restart = "on-failure";
+        RestartSec = 20;
+        TimeoutStartSec = "20min";
+        ExecStart = lib.getExe harnessInstall;
+      };
+    };
+
+    assertions = [
+      {
+        assertion = (cfg.herdr.version == null) == (cfg.herdr.hash == null);
+        message = "yolobox.harness.herdr: version and hash must both be null or both be set.";
+      }
+    ];
+  };
+}

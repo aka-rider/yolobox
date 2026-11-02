@@ -1,0 +1,13 @@
+table inet yolobox-egress
+delete table inet yolobox-egress
+table inet yolobox-egress {
+  chain output {
+    type filter hook output priority -20; policy accept;
+    oifname "lo" accept
+    ct direction reply accept
+    udp sport 68 udp dport 67 ip daddr { 255.255.255.255, 192.168.5.2 } accept
+    icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+    limit rate 6/minute burst 3 packets log prefix "yolobox-egress: recovery: " level warn
+    counter reject with icmpx type admin-prohibited
+  }
+}

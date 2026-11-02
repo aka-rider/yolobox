@@ -1,0 +1,7 @@
+# Hidden files are ignored by default. Track one by negating it below.
+.*
+
+# Tracked hidden files, re-included explicitly.
+!.github/
+!.gitignore
+!.version
