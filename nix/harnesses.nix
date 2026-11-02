@@ -11,6 +11,11 @@ let
   launcherLink = "${homeDir}/.local/bin/claude";
   claudeVersionsDir = "${homeDir}/.local/share/claude/versions";
 
+  # Exists while the system's network is up. A user unit cannot order itself
+  # after a system unit, so the system side drops this flag and a user path
+  # unit waits for it (nix/harnesses.md#install-phases).
+  networkReadyFlag = "/run/yolobox-network-ready";
+
   # Claude Code >= 2.1.207 documents that a custom ~/.local/bin/claude is left
   # alone: `claude update` and the background updater only drop new binaries
   # into ~/.local/share/claude/versions/. That guarantee is the whole delivery
@@ -373,10 +378,41 @@ in
       };
     };
 
+    # The system half of the install's gate. dhcpcd is configured with `waitip`
+    # and forks only once the lease is applied and resolvconf has written the
+    # resolver, so "dhcpcd.service started" is the event "the network works".
+    # Nothing else pulls in network-online.target, so this unit wants dhcpcd
+    # itself. RemainAfterExit keeps the flag for the whole boot; the stop
+    # removes it, so a flag never outlives the network state it describes.
+    systemd.services.yolobox-network-ready = {
+      description = "Flag that the network is up, for the agent's install unit";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "dhcpcd.service" ];
+      after = [ "dhcpcd.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${lib.getExe' pkgs.coreutils "touch"} ${networkReadyFlag}";
+        ExecStop = "${lib.getExe' pkgs.coreutils "rm"} -f ${networkReadyFlag}";
+      };
+    };
+
+    # The user half: the install starts when the flag appears (inotify, no
+    # polling). The agent's user manager starts at boot, in parallel with the
+    # network, and an install that ran first would fail on DNS and wait out
+    # its RestartSec. The service has no wantedBy of its own: this path unit
+    # is what starts it.
+    systemd.user.paths.yolobox-harness-install = {
+      description = "Start the harness install once the network is up";
+      unitConfig.ConditionUser = agentUser;
+      wantedBy = [ "default.target" ];
+      pathConfig.PathExists = networkReadyFlag;
+    };
+
     # The harnesses install themselves from their vendors, so the box needs no
     # nixpkgs version of any of them — and gets their self-updates for free.
-    # StartLimitIntervalSec = 0 because the only expected failure is "no
-    # network yet", which Restart must keep retrying past systemd's default
+    # StartLimitIntervalSec = 0 because a vendor outage or a dropped connection
+    # mid-download must keep being retried by Restart past systemd's default
     # burst limit.
     systemd.user.services.yolobox-harness-install = {
       description = "Install claude, pi, opencode and their plugins from their vendors";
@@ -384,7 +420,6 @@ in
         ConditionUser = agentUser;
         StartLimitIntervalSec = 0;
       };
-      wantedBy = [ "default.target" ];
       after = [ "yolobox-claude-launcher.path" ];
       # "${homeDir}/.local" first so `claude` here is the launcher, and so pi
       # (through the box's ~/.local/bin/pi link) and the npm-installed

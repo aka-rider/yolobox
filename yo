@@ -1753,6 +1753,26 @@ def initrd_waiting() -> bool:
     return sshd_answers("root") is SshOutcome.ANSWERED
 
 
+class BootStage(enum.Enum):
+    """Which sshd, if any, answers on the box's port."""
+
+    STAGE2 = "stage2"  # the disk is unlocked and the operator can log in
+    INITRD = "initrd"  # locked: waiting in the initrd for the passphrase
+    NONE = "none"  # nothing answers
+
+
+def boot_stage() -> BootStage:
+    # The one place that tells the two sshds apart. Ask for stage 2 first: a
+    # caller must never run a pinned ssh against the initrd, whose per-boot host
+    # key differs from the pin and makes ssh print REMOTE HOST IDENTIFICATION
+    # HAS CHANGED. Both probes go through initrd_ssh_argv(), which pins nothing.
+    if stage2_up():
+        return BootStage.STAGE2
+    if initrd_waiting():
+        return BootStage.INITRD
+    return BootStage.NONE
+
+
 @dataclass(frozen=True)
 class HelperRun:
     """One run of the initrd's yolobox-unlock over ssh."""
@@ -3466,16 +3486,18 @@ def vm_up(
     if status != "Running":
         passphrase = passphrase or luks_passphrase()
         DRIVER.start(passphrase)
-    elif not stage2_up():
-        if not initrd_waiting():
+    else:
+        stage = boot_stage()
+        if stage is BootStage.NONE:
             raise YoError(
                 "%s is Running but neither its initrd nor its sshd answers on 127.0.0.1:%d "
                 "— %s, %s"
                 % (INSTANCE, ssh_port(), DRIVER.list_command(), yo_cmd("status"))
             )
-        passphrase = passphrase or luks_passphrase()
-        unlock_disk(passphrase)
-        wait_for_operator()
+        if stage is BootStage.INITRD:
+            passphrase = passphrase or luks_passphrase()
+            unlock_disk(passphrase)
+            wait_for_operator()
     ensure_agent_ssh_config()
     ensure_guest_known_hosts()
     if run_services:
@@ -3757,13 +3779,19 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     # Every guest probe below fails the same way on a VM that is down, so ask
     # once and say it once instead of printing a warning per probe.
-    status, detail = account_status()
+    # A box locked in its initrd answers with a per-boot host key that the pinned
+    # probes in account_status() would warn about, so tell the stages apart first.
+    stage = boot_stage()
+    if stage is BootStage.INITRD:
+        status, detail = "unreachable", ""
+    else:
+        status, detail = account_status()
     vm_reachable = status != "unreachable"
     if not vm_reachable:
         if detail:
             err(detail)
         out("vm: unreachable — is it up? start it with: %s" % yo_cmd("up"))
-        if initrd_waiting():
+        if stage is BootStage.INITRD:
             out(
                 "disk: locked — %s is waiting in its initrd for the passphrase; unlock it with: %s"
                 % (INSTANCE, yo_cmd("up"))

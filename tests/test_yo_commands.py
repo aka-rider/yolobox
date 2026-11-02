@@ -1507,20 +1507,41 @@ class TestCmdStatus(unittest.TestCase):
             )
         )
 
-    def test_a_box_waiting_in_its_initrd_says_it_is_locked(self):
-        outs = []
+    def test_a_box_waiting_in_its_initrd_says_it_is_locked_and_never_meets_the_pin(
+        self,
+    ):
+        # Only the initrd's sshd answers, and only to root: the stage-2 login is
+        # refused. Any pinned ssh would meet the initrd's per-boot host key and
+        # print the changed-host-key warning, so one is a failure.
+        outs, errs, pinned_ssh = [], [], []
+
+        def initrd_run(argv, **kwargs):
+            if "User=root" in argv:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(
+                returncode=yo.SSH_UNREACHABLE, stdout="", stderr="Permission denied"
+            )
+
+        def pinned_ssh_run(role, argv, **kwargs):
+            pinned_ssh.append(argv)
+            return mock.Mock(
+                returncode=yo.SSH_UNREACHABLE,
+                stdout="",
+                stderr="WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+            )
+
         with (
-            mock.patch.object(yo, "run", return_value=mock.Mock(returncode=0)),
-            mock.patch.object(yo, "account_status", return_value=("unreachable", "")),
-            mock.patch.object(yo, "initrd_waiting", return_value=True) as waiting,
+            mock.patch.object(yo, "run", side_effect=initrd_run),
+            mock.patch.object(yo, "ssh_run", side_effect=pinned_ssh_run),
             mock.patch.object(yo, "lima_config_gaps", return_value=[]),
             mock.patch.object(yo, "du_kib", return_value=None),
             mock.patch.object(yo.shutil, "which", return_value=None),
             mock.patch.object(yo, "out", side_effect=outs.append),
-            mock.patch.object(yo, "err"),
+            mock.patch.object(yo, "err", side_effect=errs.append),
         ):
             yo.cmd_status(yo.build_parser().parse_args(["status"]))
-        waiting.assert_called_once_with()
+        self.assertEqual(pinned_ssh, [])
+        self.assertEqual(errs, [])
         self.assertTrue(
             any(line.startswith("disk: locked") and "yo up" in line for line in outs)
         )

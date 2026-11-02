@@ -406,8 +406,23 @@ check_strace() {
     SLEEPER_PID=""
 }
 
+# The first-boot install is a user oneshot (nix/harnesses.nix). `systemctl
+# start` on a oneshot returns when its run ends, nonzero if it failed: it joins
+# a run in progress, and it runs a unit that is waiting out Restart=on-failure
+# at once. So the versions below are checked after the install, never during it.
+# The network flag and the user manager are started first for the same reason:
+# each start blocks until its unit is up, and is a no-op when it already is.
+await_harness_install() {
+    sudo systemctl start yolobox-network-ready.service "user@${AGENT_UID}.service" ||
+        fail "the network flag or the agent's user manager did not start"
+    sudo systemctl --user -M "agent@" start yolobox-harness-install.service ||
+        fail "yolobox-harness-install failed; see: journalctl --user -u yolobox-harness-install"
+    ok "yolobox-harness-install finished"
+}
+
 check_vendors() {
     local tool
+    await_harness_install
     for tool in claude opencode pi; do
         as_agent "${tool}" --version >/dev/null || fail "${tool} --version failed as the agent"
         ok "${tool} --version"

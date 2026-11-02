@@ -107,10 +107,37 @@ agent. At most two entries should be there.
 
 ## Install phases
 
-`yolobox-harness-install` is a user oneshot gated `ConditionUser=agent` and
-wanted by `default.target`, so it runs at boot rather than at the first `yo
-enter`. Each phase is idempotent and checks before it acts. The commands and
-their guards are in `harnesses.nix`. What needs recording here:
+`yolobox-harness-install` is a user oneshot gated `ConditionUser=agent`. It
+runs at boot rather than at the first `yo enter`, started by a path unit of the
+same name once the network is up. Each phase is idempotent and checks before it
+acts. The commands and their guards are in `harnesses.nix`. What needs recording
+here:
+
+- **The install waits for the network, by an event.** The agent's user manager
+  starts at boot (lingering), in parallel with dhcpcd, and a user unit cannot
+  order itself after a system unit. An install wanted by `default.target` ran
+  at once, hit `curl: (6) Could not resolve host` for every vendor, and waited
+  out `RestartSec` (20 s) before the retry that worked. A `claude --version`
+  check run in that window failed. The fix has two halves.
+  The system unit `yolobox-network-ready` wants and follows `dhcpcd.service`.
+  dhcpcd runs with `waitip`, so it forks, and the unit counts as started, only
+  after the lease is applied and resolvconf has written the resolver; the boot
+  log shows `leased 192.168.5.15` a moment before `Started DHCP Client`. Nothing
+  else activates `network-online.target` on this box, so the unit names dhcpcd
+  itself. It is a `RemainAfterExit` oneshot that creates
+  `/run/yolobox-network-ready` and removes it when stopped. The agent's path
+  unit `yolobox-harness-install.path` has `PathExists` on that file, wanted by
+  `default.target`; systemd watches it with inotify and starts the service when
+  it appears. The service has no `wantedBy` of its own. `Restart=on-failure`
+  stays, for a vendor that is down. Recognise a regression by
+  `journalctl --user -u yolobox-harness-install` showing `Could not resolve
+  host` at the first start after a boot.
+- **Joining the install from a script.** The service is `Type=oneshot` with
+  `RemainAfterExit`, so `sudo systemctl --user -M agent@ start
+  yolobox-harness-install` returns when a run ends and exits non-zero when it
+  failed. It joins a run already in progress, and it runs a unit that is
+  waiting out `Restart=` at once. `tests/box-hardening-check.sh` does this
+  before it checks the harness versions.
 
 - **No vendor installer edits an rc file.** pi's and opencode's run with the
   defaults or with `--no-modify-path`.

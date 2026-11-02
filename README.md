@@ -57,15 +57,22 @@ A Linux PC (Fedora, x86_64, with KVM) runs the box under libvirt instead of Lima
    sudo bash linux/host-setup.sh
    ```
 
-3. Create and start the VM, then build it:
+3. Install `yo`. With Nix, the package puts `yo` on your `PATH` with its tools, `xorriso` included (it builds the VM's cloud-init disk):
+
+   ```bash
+   nix profile install github:aka-rider/yolobox/<version>
+   ```
+
+   Or run it from the checkout as `./yo`. Step 2 installed `xorriso`; Python 3.9 or newer, `git`, `ssh`, `curl` and `fzf` must already be on your `PATH`.
+4. Create and start the VM, then build it:
 
    ```bash
    yo up
    yo bootstrap
    ```
 
-4. Add `Include ~/.local/state/yolobox/instances/yolobox/ssh.config` to `~/.ssh/config` (`yo bootstrap` offers to).
-5. To open a VM port on the host, run `yo port <guest-port>`. It prints the `127.0.0.1` port it chose.
+5. Add `Include ~/.local/state/yolobox/instances/yolobox/ssh.config` to `~/.ssh/config` (`yo bootstrap` offers to).
+6. To open a VM port on the host, run `yo port <guest-port>`. It prints the `127.0.0.1` port it chose.
 
 A host whose sshd listens on the tailnet should read the tailnet section of the linux-host story first.
 
