@@ -437,6 +437,12 @@ class LibvirtDriver:
     def initrd_identity_agent(self) -> str:
         return self.op_sock()
 
+    def require_login_key(self) -> None:
+        # Both accounts log in with the operator's key (the agent account's
+        # AuthorizedKeysCommand serves the operator's keys), and so does root
+        # in the initrd.
+        self.operator_key()
+
     def require_tool(self) -> None:
         libvirt_host.check_libvirt_host()
 
@@ -639,14 +645,23 @@ class LibvirtDriver:
 
     def operator_key(self) -> bytes:
         sock_path = self.op_sock()
-        if not os.path.exists(sock_path):
-            raise YoError(
-                "1Password is not running on this host (no socket at %s); it holds "
-                "the %s key that logs in to the box" % (sock_path, OPERATOR_KEY_ITEM)
-            )
-        return agent.unique_key_titled(
-            agent.ssh_agent_identities(sock_path), OPERATOR_KEY_ITEM
+        dead = (
+            "1Password's SSH agent at %s is not running (or locked) — start or "
+            "unlock 1Password; its %s key logs in to the box"
+            % (sock_path, OPERATOR_KEY_ITEM)
         )
+        if not os.path.exists(sock_path):
+            raise YoError(dead)
+        try:
+            identities = agent.ssh_agent_identities(sock_path)
+        except YoError as failure:
+            raise YoError("%s (%s)" % (dead, failure.message))
+        # An agent that lists no key at all cannot serve the login now, which
+        # is the shape a locked or half-started 1Password may take; one that
+        # lists others but not this key gets unique_key_titled's own message.
+        if not identities:
+            raise YoError(dead)
+        return agent.unique_key_titled(identities, OPERATOR_KEY_ITEM)
 
     def volume_exists(self, volume: str) -> bool:
         return volume in volume_names()
@@ -794,10 +809,13 @@ class LibvirtDriver:
         files = cidata_files(release.host_user(), public_key, state.box.name)
         os.makedirs(os.path.dirname(state.instance_dir()), exist_ok=True)
         proc.private_dir(state.instance_dir())
+        # 0600 though it is public: when the agent is gone, ssh tries the
+        # IdentityFile as a private key and warns UNPROTECTED PRIVATE KEY FILE
+        # on any other mode, which misnames the failure (docs/linux-host.md).
         proc.atomic_write(
             os.path.join(state.instance_dir(), "operator.pub"),
             public_key + "\n",
-            FILE_MODE_READABLE,
+            FILE_MODE_PRIVATE,
         )
         memory_gib, disk_gib = domain_size(size)
         if not existing:

@@ -14,6 +14,7 @@ import json
 import os
 import select
 import shutil
+import socket
 import stat
 import socketserver
 import subprocess
@@ -3880,6 +3881,7 @@ class TestStatusWithVmDown(unittest.TestCase):
             mock.patch.object(
                 yo.unlock, "sshd_answers", lambda user: yo.SshOutcome.NOT_LISTENING
             ),
+            mock.patch.object(yo.unlock, "ssh_banner", lambda: ""),
             mock.patch.object(yo.shutil, "which", lambda name: None),
         ):
             with self.assertRaises(yo.YoError) as caught:
@@ -3889,6 +3891,88 @@ class TestStatusWithVmDown(unittest.TestCase):
         self.assertEqual(guest_calls, [])
         self.assertEqual(stdout.getvalue().count("unreachable"), 1)
         self.assertIn("yo up", stdout.getvalue())
+
+
+# How long a test's fake server waits for the connection the code under test
+# should make; a run that never connects ends the server, not the suite.
+ACCEPT_TIMEOUT_SECONDS = 10
+
+
+class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
+    """boot_stage reads a real TCP banner and asks for root only off stage 2:
+    root there is an invalid user, which sshd penalises per source address,
+    and every host connection shares the gateway's (nix/base.md)."""
+
+    STAGE2 = "SSH-2.0-OpenSSH_10.6 %s\r\n" % yo.STAGE2_SSH_BANNER_MARK
+
+    def serve(self, banner):
+        """A port whose sshd sends `banner`, or that nothing listens on (None)."""
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        port = server.getsockname()[1]
+        if banner is None:
+            server.close()
+            return port
+        self.addCleanup(server.close)
+        server.listen(1)
+        # Bounded, so a boot_stage that never connects fails its test instead
+        # of hanging the suite in the cleanup's join.
+        server.settimeout(ACCEPT_TIMEOUT_SECONDS)
+
+        def answer():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                return
+            with conn:
+                conn.sendall(banner.encode())
+
+        thread = threading.Thread(target=answer)
+        thread.start()
+        self.addCleanup(thread.join)
+        return port
+
+    def boot_stage(self, banner, operator=yo.SshOutcome.REFUSED):
+        port = self.serve(banner)
+        asked = []
+
+        def answers(user):
+            asked.append(user)
+            return operator if user != "root" else yo.SshOutcome.ANSWERED
+
+        with (
+            mock.patch.object(
+                yo.sshconfig,
+                "initrd_endpoint",
+                return_value=yo.sshconfig.InitrdEndpoint("127.0.0.1", port, "/k"),
+            ),
+            mock.patch.object(yo.unlock, "sshd_answers", answers),
+            mock.patch.object(yo.release, "host_user", return_value="op"),
+        ):
+            return yo.boot_stage(), asked
+
+    def test_a_marked_stage2_that_refuses_the_operator_is_never_asked_for_root(self):
+        self.assertEqual(self.boot_stage(self.STAGE2), (yo.BootStage.NONE, ["op"]))
+
+    def test_an_unmarked_sshd_is_asked_for_root_as_the_initrd(self):
+        for banner in (
+            "SSH-2.0-OpenSSH_10.6\r\n",
+            "SSH-2.0-OpenSSH_10.6 %s-old\r\n" % yo.STAGE2_SSH_BANNER_MARK,
+            "",
+        ):
+            with self.subTest(banner=banner):
+                self.assertEqual(
+                    self.boot_stage(banner), (yo.BootStage.INITRD, ["op", "root"])
+                )
+
+    def test_a_port_nothing_listens_on_is_asked_for_root_too(self):
+        self.assertEqual(self.boot_stage(None), (yo.BootStage.INITRD, ["op", "root"]))
+
+    def test_a_stage2_that_admits_the_operator_is_stage2_without_a_banner_read(self):
+        self.assertEqual(
+            self.boot_stage(None, operator=yo.SshOutcome.ANSWERED),
+            (yo.BootStage.STAGE2, ["op"]),
+        )
 
 
 class TestClassifyDisk(unittest.TestCase):

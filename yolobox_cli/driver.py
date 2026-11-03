@@ -52,6 +52,10 @@ class Driver(Protocol):
     def require_tool(self) -> None: ...  # YoError when the host lacks the tool
     def op_sock(self) -> str: ...  # the host's 1Password agent socket
     def initrd_identity_agent(self) -> str: ...  # "none", or an agent socket
+    # YoError naming the agent when the key every ssh to the box logs in with is
+    # not on offer. Runs before every ssh, so a dead agent is never misread as
+    # an unreachable box, nor costs sshd penalties on the gateway's address.
+    def require_login_key(self) -> None: ...
     def ssh_port(self) -> int: ...  # loopback port reaching sshd, initrd included
     def forward_port(self, guest_port: int) -> int: ...  # the host port forwarded
     def keepalive_pid(self) -> Optional[int]: ...  # pid the AWS broker lives with

@@ -325,6 +325,7 @@ class TestVmUpOnARunningBoxWithoutSshd(unittest.TestCase):
             mock.patch.object(
                 yo.unlock, "sshd_answers", return_value=yo.SshOutcome.NOT_LISTENING
             ),
+            mock.patch.object(yo.unlock, "ssh_banner", return_value=""),
         ):
             with self.assertRaises(yo.YoError) as caught:
                 yo.vm_up()

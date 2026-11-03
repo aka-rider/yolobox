@@ -309,6 +309,9 @@ class LimaDriver:
     def initrd_identity_agent(self) -> str:
         return "none"
 
+    def require_login_key(self) -> None:
+        pass  # lima's own key file under ~/.lima logs in; no agent is involved
+
     def forward_port(self, guest_port: int) -> int:
         raise YoError(
             "lima already mirrors the guest's TCP ports %d-%d onto the host's "

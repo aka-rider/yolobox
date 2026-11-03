@@ -160,6 +160,22 @@ jobs:
       # literals restate base.nix on purpose: this step only proves the two
       # rules are not conditional, i.e. present on both legs. What they do is
       # tests/box-hardening-check.sh's check_operator_login_refused.
+      # yo tells stage 2's sshd from the initrd's by the banner word alone
+      # (yolobox_cli/unlock.py), so stage 2 must render it and the initrd's
+      # sshd, which copies a few of stage 2's settings, must not. The gateway
+      # is exempt from per-source penalties (nix/base.md, "sshd penalties").
+      # tests/test_consistency.py keeps the word equal to yo's constant.
+      - name: Check the stage-2 banner mark and the gateway's penalty exemption
+        run: |
+          box=.#nixosConfigurations.yolobox.config
+          test "$($NIX_EVAL --raw "$box.services.openssh.settings.VersionAddendum")" = yolobox-stage2
+          test "$($NIX_EVAL --raw "$box.services.openssh.settings.PerSourcePenaltyExemptList")" = 192.168.5.2
+          $NIX_EVAL --raw "$box.boot.initrd.systemd.contents.\"/etc/ssh/sshd_config\".text" > initrd-sshd.conf
+          grep -F 'PerSourcePenalties no' initrd-sshd.conf
+          if grep -F yolobox-stage2 initrd-sshd.conf; then
+            echo "the initrd's sshd carries the stage-2 banner mark"; exit 1
+          fi
+
       - name: Check the operator rules are on every box
         run: |
           box=.#nixosConfigurations.yolobox.config

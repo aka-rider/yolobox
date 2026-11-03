@@ -883,6 +883,37 @@ class TestGuestRebuildMatchesYoAndTheBox(unittest.TestCase):
             self.assertIn('environment.etc."yolobox/%s".text' % name, base)
 
 
+class TestStage2SshdIsToldApartWithoutALogin(unittest.TestCase):
+    """yo reads the stage-2 sshd's banner word instead of logging in as root,
+    and the gateway, where every host connection comes from, is exempt from
+    sshd's per-source penalties (nix/base.md, "sshd penalties")."""
+
+    def base(self):
+        return nix_code(REPO / "nix" / "base.nix")
+
+    def setting(self, name):
+        found = re.search(
+            r'services\.openssh\.settings\.%s = "([^"]+)";' % name, self.base()
+        )
+        self.assertIsNotNone(found, "base.nix does not set %s" % name)
+        return found.group(1)
+
+    def test_stage2_appends_the_word_yo_reads(self):
+        self.assertEqual(
+            self.setting("VersionAddendum"), yo.config.STAGE2_SSH_BANNER_MARK
+        )
+
+    def test_the_initrds_sshd_carries_no_banner_word(self):
+        luks = nix_code(REPO / "nix" / "luks.nix")
+        self.assertNotIn("VersionAddendum", luks)
+        self.assertNotIn(yo.config.STAGE2_SSH_BANNER_MARK, luks)
+
+    def test_the_exempt_address_is_the_one_the_operator_logs_in_from(self):
+        allow = re.search(r'AllowUsers = \[ "\$\{username\}@([0-9.]+)"', self.base())
+        self.assertIsNotNone(allow, "base.nix admits the operator from no address")
+        self.assertEqual(self.setting("PerSourcePenaltyExemptList"), allow.group(1))
+
+
 class TestGuestProfilePatternMatchesYo(unittest.TestCase):
     def test_aws_creds_accepts_exactly_the_profile_names_yo_allow_lists(self):
         found = re.findall(

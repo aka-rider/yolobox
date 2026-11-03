@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import io
 import shlex
+import socket
 import subprocess
 import threading
 import time
@@ -12,7 +13,12 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from . import proc, release, sshconfig, state, ui
-from .config import LUKS_DEVICE, LUKS_KEY_ITEM, SSH_UNREACHABLE
+from .config import (
+    LUKS_DEVICE,
+    LUKS_KEY_ITEM,
+    SSH_UNREACHABLE,
+    STAGE2_SSH_BANNER_MARK,
+)
 from .driver import RUNNING
 from .ui import YoError
 
@@ -48,6 +54,9 @@ LIMA_PRE_BOOT_STATUSES: Tuple[Optional[str], ...] = (
     "Stopped",
 )
 
+# RFC 4253 caps the identification line at 255 bytes.
+SSH_BANNER_MAX_BYTES = 255
+
 NOT_LISTENING_MARKERS = (
     "Connection refused",
     "Connection reset",
@@ -80,9 +89,16 @@ def classify_initrd_attempt(returncode: int, stderr: str) -> SshOutcome:
     return SshOutcome.ERROR
 
 
+def initrd_ssh_run_argv(remote: str, user: str = "root") -> List[str]:
+    """initrd_ssh_argv for an ssh about to run: the one place it checks that
+    the key it logs in with is on offer (Driver.require_login_key)."""
+    state.driver().require_login_key()
+    return sshconfig.initrd_ssh_argv(remote, user=user)
+
+
 def probe_sshd(user: str) -> Tuple[SshOutcome, str]:
     """One `true` over the unpinned initrd channel as `user`, and ssh's stderr."""
-    completed = proc.run(sshconfig.initrd_ssh_argv("true", user=user), stdin=b"")
+    completed = proc.run(initrd_ssh_run_argv("true", user=user), stdin=b"")
     if completed.returncode == 0:
         return SshOutcome.ANSWERED, completed.stderr
     return (
@@ -107,6 +123,19 @@ class BootStage(enum.Enum):
     NONE = "none"  # nothing answers
 
 
+def ssh_banner() -> str:
+    """The identification line the sshd on the box's port sends before any
+    login; "" when nothing answers. Reading it authenticates as nobody."""
+    host, port, _ = sshconfig.initrd_endpoint()
+    try:
+        with socket.create_connection(
+            (host, port), timeout=sshconfig.SSH_CONNECT_TIMEOUT_SECONDS
+        ) as conn:
+            return conn.recv(SSH_BANNER_MAX_BYTES).decode("ascii", "replace")
+    except OSError:
+        return ""
+
+
 def boot_stage() -> BootStage:
     # The one place that tells the two sshds apart. Ask for stage 2 first: a
     # caller must never run a pinned ssh against the initrd, whose per-boot host
@@ -114,6 +143,11 @@ def boot_stage() -> BootStage:
     # HAS CHANGED. Both probes go through initrd_ssh_argv(), which pins nothing.
     if stage2_up():
         return BootStage.STAGE2
+    # Stage 2 answered and refused the operator. Logging in there as root
+    # would be an invalid user, which OpenSSH penalises per source address, and
+    # every host connection shares the gateway's (nix/base.md).
+    if STAGE2_SSH_BANNER_MARK in ssh_banner().split():
+        return BootStage.NONE
     if sshd_answers("root") is SshOutcome.ANSWERED:
         return BootStage.INITRD
     return BootStage.NONE
@@ -241,7 +275,7 @@ def classify_initrd_probe(output: str) -> InitrdState:
 
 
 def initrd_state() -> InitrdReading:
-    completed = proc.run(sshconfig.initrd_ssh_argv(INITRD_PROBE_COMMAND), stdin=b"")
+    completed = proc.run(initrd_ssh_run_argv(INITRD_PROBE_COMMAND), stdin=b"")
     if completed.returncode != 0:
         return InitrdReading(
             InitrdState.UNKNOWN,
@@ -286,7 +320,7 @@ def run_initrd_helper(passphrase: bytes) -> HelperRun:
         streamed = False
         state.driver().verify_initrd_listener(sshconfig.initrd_endpoint().port)
         helper = proc.spawn(
-            sshconfig.initrd_ssh_argv(INITRD_UNLOCK_HELPER),
+            initrd_ssh_run_argv(INITRD_UNLOCK_HELPER),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

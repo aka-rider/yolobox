@@ -18,6 +18,10 @@ HOSTNAME_LABEL_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 # The operator's uid inside the guest on every host: lima-init's cidata
 # account, declared in nix/base.nix and checked by yolobox-guest rebuild.
 OPERATOR_GUEST_UID = 501
+# The word the box's stage-2 sshd appends to its SSH banner (VersionAddendum in
+# nix/base.nix). The initrd's sshd has none, so yo tells the two apart without
+# logging in, and never offers stage 2 a user it rejects (nix/base.md).
+STAGE2_SSH_BANNER_MARK = "yolobox-stage2"
 AGENT_USER = "agent"
 AGENT_HOME = "/home/agent"
 HELPER = "yolobox-guest"

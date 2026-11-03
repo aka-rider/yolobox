@@ -18,14 +18,17 @@ import os
 import re
 import shutil
 import socket
+import stat
+import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
-from test_yo import FakeHome, load_yo, unload_yo
+from test_yo import ACCEPT_TIMEOUT_SECONDS, FakeHome, load_yo, unload_yo
 
 REPO = Path(__file__).resolve().parent.parent
 INITRD_KEYS_SCRIPT = REPO / "nix" / "luks" / "yolobox-initrd-authorized-keys.sh"
@@ -315,6 +318,19 @@ class LibvirtCase(FakeHome):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.driver = self.box.box.driver
+        # Every ssh checks the operator's key is on offer first, so the host has
+        # a 1Password agent that holds it; TestOperatorKey takes it away.
+        sock = Path(self.driver.op_sock())
+        sock.parent.mkdir(parents=True)
+        sock.touch()
+        self.real_agent_identities = self.box.agent.ssh_agent_identities
+        patcher = mock.patch.object(
+            self.box.agent,
+            "ssh_agent_identities",
+            return_value=[(KEY_BLOB, "yolobox-operator")],
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def host_memory(self, kib):
         """The host's MemTotal, as /proc/meminfo prints it."""
@@ -923,36 +939,116 @@ class TestYoPort(LibvirtCase):
 
 
 class TestOperatorKey(LibvirtCase):
+    """The operator's key, read from a real unix socket that plays the agent."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(
+            self.box.agent, "ssh_agent_identities", self.real_agent_identities
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.sock = Path(self.driver.op_sock())
+        self.sock.unlink()
+
     def agent(self, identities):
-        sock = Path(self.driver.op_sock())
-        sock.parent.mkdir(parents=True)
-        sock.touch()
-        return mock.patch.object(
-            self.box.agent, "ssh_agent_identities", return_value=identities
+        """An agent on the socket that answers one key listing with `identities`."""
+        ssh_string = self.box.agent.ssh_string
+        reply = (
+            bytes([self.box.agent.SSH_AGENT_IDENTITIES_ANSWER])
+            + struct.pack(">I", len(identities))
+            + b"".join(
+                ssh_string(blob) + ssh_string(comment.encode())
+                for blob, comment in identities
+            )
+        )
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(str(self.sock))
+        server.listen(1)
+        # Bounded, so code that never asks fails its test instead of hanging
+        # the suite in the cleanup's join.
+        server.settimeout(ACCEPT_TIMEOUT_SECONDS)
+
+        def answer():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                return
+            with conn:
+                (length,) = struct.unpack(">I", conn.recv(4))
+                conn.recv(length)
+                conn.sendall(ssh_string(reply))
+
+        thread = threading.Thread(target=answer)
+        thread.start()
+        self.addCleanup(thread.join)
+
+    def dead_agent(self):
+        """A socket file nobody listens on: connect() is refused, as it is when
+        1Password quits and leaves its socket behind."""
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(self.sock))
+        server.close()
+
+    def assert_named_dead(self, message):
+        self.assertTrue(
+            message.startswith(
+                "1Password's SSH agent at %s is not running (or locked) — start or "
+                "unlock 1Password" % self.sock
+            ),
+            message,
         )
 
     def test_the_one_key_with_the_title_is_chosen(self):
-        with self.agent([(OTHER_BLOB, "yolobox-disk"), (KEY_BLOB, "yolobox-operator")]):
-            self.assertEqual(self.driver.operator_key(), KEY_BLOB)
+        self.agent([(OTHER_BLOB, "yolobox-disk"), (KEY_BLOB, "yolobox-operator")])
+        self.assertEqual(self.driver.operator_key(), KEY_BLOB)
 
     def test_no_key_with_the_title_is_an_error_naming_it(self):
-        with self.agent([(OTHER_BLOB, "yolobox-disk")]):
-            with self.assertRaises(self.box.YoError) as caught:
-                self.driver.operator_key()
+        self.agent([(OTHER_BLOB, "yolobox-disk")])
+        with self.assertRaises(self.box.YoError) as caught:
+            self.driver.operator_key()
         self.assertIn("no key titled yolobox-operator", caught.exception.message)
 
     def test_two_keys_with_the_title_are_an_error_not_a_guess(self):
-        with self.agent(
-            [(KEY_BLOB, "yolobox-operator"), (OTHER_BLOB, "yolobox-operator")]
-        ):
-            with self.assertRaises(self.box.YoError) as caught:
-                self.driver.operator_key()
-        self.assertIn("offers 2 keys titled yolobox-operator", caught.exception.message)
-
-    def test_a_missing_agent_socket_names_it(self):
+        self.agent([(KEY_BLOB, "yolobox-operator"), (OTHER_BLOB, "yolobox-operator")])
         with self.assertRaises(self.box.YoError) as caught:
             self.driver.operator_key()
-        self.assertIn(".1password/agent.sock", caught.exception.message)
+        self.assertIn("offers 2 keys titled yolobox-operator", caught.exception.message)
+
+    def test_a_missing_agent_socket_is_a_dead_agent(self):
+        with self.assertRaises(self.box.YoError) as caught:
+            self.driver.operator_key()
+        self.assert_named_dead(caught.exception.message)
+
+    def test_an_agent_that_refuses_connections_is_named_dead_with_the_cause(self):
+        self.dead_agent()
+        with self.assertRaises(self.box.YoError) as caught:
+            self.driver.operator_key()
+        self.assert_named_dead(caught.exception.message)
+        self.assertIn("Connection refused", caught.exception.message)
+
+    def test_an_agent_that_lists_no_key_is_named_dead(self):
+        self.agent([])
+        with self.assertRaises(self.box.YoError) as caught:
+            self.driver.operator_key()
+        self.assert_named_dead(caught.exception.message)
+
+    def test_a_dead_agent_stops_every_ssh_before_it_runs(self):
+        self.dead_agent()
+        for call in (
+            lambda: self.box.sshx.ssh_run(self.box.OPERATOR, ["true"]),
+            lambda: self.box.sshx.ssh_run(self.box.AGENT, ["true"]),
+            self.box.unlock.boot_stage,
+            self.box.unlock.initrd_state,
+        ):
+            with self.subTest(call=call):
+                with self.assertRaises(self.box.YoError) as caught:
+                    call()
+                self.assert_named_dead(caught.exception.message)
+        self.assertEqual(
+            [argv for argv in self.host.calls if argv[0] in ("ssh", "scp")], []
+        )
 
     def test_the_public_key_line_carries_the_key_and_the_title_only(self):
         self.assertEqual(self.box.public_key_line(KEY_BLOB), PUBLIC_KEY)
@@ -2063,6 +2159,15 @@ class TestStart(LibvirtCase):
                 self.assertNotIn(
                     base64.b64encode(OTHER_BLOB).decode(), path.read_text()
                 )
+
+    def test_the_public_key_is_private_to_the_user_so_ssh_never_calls_it_unprotected(
+        self,
+    ):
+        # ssh reads an IdentityFile as a private key when its agent is gone,
+        # and warns UNPROTECTED PRIVATE KEY FILE on any mode but 0600.
+        self.start()
+        mode = (Path(self.box.instance_dir()) / "operator.pub").stat().st_mode
+        self.assertEqual(stat.S_IMODE(mode), 0o600)
 
     def test_a_second_start_changes_nothing_that_did_not_change(self):
         self.start()

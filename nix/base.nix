@@ -242,6 +242,10 @@ in
   # The operator logs in only from the gateway, which the agent cannot spoof
   # off enp0s1, so its 1Password agent is no way in (nix/base.md, "No host OS ...").
   services.openssh.settings.AllowUsers = [ "${username}@192.168.5.2" agentUser ];
+  # Every host connection arrives from the gateway, so a penalty on it locks
+  # the host out; yo reads the banner mark (nix/base.md, "sshd penalties").
+  services.openssh.settings.PerSourcePenaltyExemptList = "192.168.5.2";
+  services.openssh.settings.VersionAddendum = "yolobox-stage2";
   networking.firewall.extraCommands = ''
     iptables -I nixos-fw 1 ! -i enp0s1 -s 192.168.5.2 -j DROP
   '';
