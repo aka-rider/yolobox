@@ -1726,31 +1726,90 @@ class TestHome(unittest.TestCase):
                 self.assertEqual(yo.home(), "/Users/x")
 
 
-INCLUDE = "Include ~/.lima/yolobox/ssh.config\n"
+@unittest.skipIf(shutil.which("ssh") is None, "no ssh")
+class TestSshConfigReachesBox(FakeHome):
+    """Real `ssh -G` against a ~/.ssh/config in the fake home. Include paths are
+    absolute, so the tests hold whichever home an ssh expands ~ against (OpenSSH
+    10.2 takes $HOME, the fake one; older ones may take pw_dir)."""
 
+    def setUp(self):
+        super().setUp()
+        self.instance_cfg = yo.ssh_cfg()
+        os.makedirs(os.path.dirname(self.instance_cfg))
+        with open(self.instance_cfg, "w") as handle:
+            handle.write(
+                'Host %s\n  UserKnownHostsFile "%s"\n'
+                % (yo.box.vm_host, yo.known_hosts_path())
+            )
+        self.config = os.path.join(self.home, ".ssh", "config")
 
-class TestSshConfigIncludeLine(FakeHome):
-    def write_config(self, text):
-        ssh_dir = os.path.join(self.home, ".ssh")
-        os.makedirs(ssh_dir, exist_ok=True)
-        with open(os.path.join(ssh_dir, "config"), "w") as handle:
+    def write_config(self, text, mode=0o600):
+        os.makedirs(os.path.dirname(self.config), exist_ok=True)
+        with open(self.config, "w") as handle:
             handle.write(text)
+        os.chmod(self.config, mode)
 
-    def test_missing_file_is_none(self):
-        self.assertIsNone(yo.ssh_config_include_line())
+    def test_no_config_does_not_reach_the_box(self):
+        self.assertFalse(yo.ssh_config_reaches_box())
 
-    def test_absent_include_is_none(self):
-        self.write_config("Host other\n  User x\n")
-        self.assertIsNone(yo.ssh_config_include_line())
+    def test_the_per_instance_line_reaches_it(self):
+        self.write_config("Include %s\n" % self.instance_cfg)
+        self.assertTrue(yo.ssh_config_reaches_box())
 
-    def test_present_include_is_its_line_number(self):
-        self.write_config("Host other\n  User x\n" + INCLUDE)
-        self.assertEqual(yo.ssh_config_include_line(), 3)
+    def test_the_glob_for_both_hosts_reaches_it(self):
+        self.write_config(
+            yo.SSH_CONFIG_INCLUDE_LINE.replace("~", self.home) + "\nHost other\n"
+        )
+        self.assertTrue(yo.ssh_config_reaches_box())
 
-    def test_an_unreadable_file_is_an_error_not_a_missing_include(self):
-        os.makedirs(os.path.join(self.home, ".ssh", "config"))
-        with self.assertRaisesRegex(yo.YoError, "cannot read .*/.ssh/config"):
-            yo.ssh_config_include_line()
+    def test_an_include_naming_two_paths_reaches_it(self):
+        self.write_config("Include /nonexistent/x.config %s\n" % self.instance_cfg)
+        self.assertTrue(yo.ssh_config_reaches_box())
+
+    def test_an_earlier_block_that_widens_the_pin_does_not(self):
+        # ssh keeps the first value: here the pin plus another file, not ours.
+        self.write_config(
+            'Host *\n  UserKnownHostsFile "%s" /tmp/other\nInclude %s\n'
+            % (yo.known_hosts_path(), self.instance_cfg)
+        )
+        self.assertFalse(yo.ssh_config_reaches_box())
+
+    def test_a_commented_line_does_not(self):
+        self.write_config("# Include %s\n" % self.instance_cfg)
+        self.assertFalse(yo.ssh_config_reaches_box())
+
+    def test_an_include_after_a_host_block_applies_only_to_that_block(self):
+        self.write_config("Host other\n  User x\nInclude %s\n" % self.instance_cfg)
+        self.assertFalse(yo.ssh_config_reaches_box())
+
+    def test_a_path_relative_to_home_misses_because_ssh_reads_it_from_ssh_dir(self):
+        # `Include .lima/yolobox/ssh.config` reads ~/.ssh/.lima/..., not ~/.lima/...
+        relative = os.path.relpath(self.instance_cfg, self.home)
+        self.write_config("Include %s\n" % relative)
+        self.assertFalse(yo.ssh_config_reaches_box())
+
+    def test_a_config_ssh_refuses_is_an_error_naming_why(self):
+        for text, mode, needle in (
+            ("Lizard yes\n", 0o600, "Bad configuration option"),
+            ("Include %s\n" % self.instance_cfg, 0o664, "bad owner or permissions"),
+            ("Include %s\n" % self.instance_cfg, 0o602, "bad owner or permissions"),
+        ):
+            with self.subTest(needle=needle):
+                self.write_config(text, mode)
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.ssh_config_reaches_box()
+                self.assertIn(
+                    "ssh cannot read %s" % self.config, caught.exception.message
+                )
+                self.assertIn(needle, caught.exception.message)
+
+
+def proc_read(path):
+    try:
+        with open(path, errors="replace") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
 
 
 def isatty(value):
@@ -1759,13 +1818,33 @@ def isatty(value):
     return mock.patch.object(yo.sys, "stdin", fake_stdin)
 
 
+INCLUDE = yo.SSH_CONFIG_INCLUDE_LINE + "\n"
+
+
 class TestEnsureSshConfigInclude(FakeHome):
+    """Prompting and writing; whether ssh then reaches the box is
+    TestSshConfigReachesBox's, so here it reaches it once the line is there."""
+
     def setUp(self):
         super().setUp()
         for name in ("err", "out"):
             patcher = mock.patch.object(yo.ui, name)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+        def reaches():
+            # As the real check: a file ssh cannot read is an error.
+            try:
+                text = proc_read(self.config_path())
+            except PermissionError as failure:
+                raise yo.YoError(
+                    "ssh cannot read %s: %s" % (self.config_path(), failure)
+                )
+            return text is not None and yo.SSH_CONFIG_INCLUDE_LINE in text
+
+        patcher = mock.patch.object(yo.sshconfig, "ssh_config_reaches_box", reaches)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def config_path(self):
         return os.path.join(self.home, ".ssh", "config")
@@ -1793,7 +1872,7 @@ class TestEnsureSshConfigInclude(FakeHome):
             with mock.patch("builtins.input", return_value="y"):
                 yo.ensure_ssh_config_include(refuse=True)
         self.assertEqual(
-            self.read_config(), yo.box.include_line + "\nHost other\n  User x\n"
+            self.read_config(), yo.SSH_CONFIG_INCLUDE_LINE + "\nHost other\n  User x\n"
         )
 
     def test_accepted_creates_ssh_dir_and_config_when_absent(self):
@@ -1803,7 +1882,7 @@ class TestEnsureSshConfigInclude(FakeHome):
         ssh_dir = os.path.join(self.home, ".ssh")
         self.assertEqual(stat.S_IMODE(os.stat(ssh_dir).st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(os.stat(self.config_path()).st_mode), 0o600)
-        self.assertEqual(self.read_config(), yo.box.include_line + "\n")
+        self.assertEqual(self.read_config(), yo.SSH_CONFIG_INCLUDE_LINE + "\n")
 
     def test_a_dangling_config_symlink_is_a_yo_error_naming_the_target(self):
         os.makedirs(os.path.join(self.home, ".ssh"))
@@ -1828,7 +1907,9 @@ class TestEnsureSshConfigInclude(FakeHome):
                 yo.ensure_ssh_config_include(refuse=True)
         self.assertTrue(os.path.islink(self.config_path()))
         with open(target) as handle:
-            self.assertEqual(handle.read(), yo.box.include_line + "\nHost other\n")
+            self.assertEqual(
+                handle.read(), yo.SSH_CONFIG_INCLUDE_LINE + "\nHost other\n"
+            )
 
     def test_accepted_keeps_the_existing_mode(self):
         path = self.write_config("Host other\n")
@@ -1848,7 +1929,7 @@ class TestEnsureSshConfigInclude(FakeHome):
         with open(path, "rb") as handle:
             self.assertEqual(
                 handle.read(),
-                yo.box.include_line.encode() + b"\n# caf\xe9\nHost other\n",
+                yo.SSH_CONFIG_INCLUDE_LINE.encode() + b"\n# caf\xe9\nHost other\n",
             )
 
     def test_an_unreadable_config_is_an_error_not_an_empty_file(self):
@@ -1870,7 +1951,7 @@ class TestEnsureSshConfigInclude(FakeHome):
             with mock.patch("builtins.input", return_value="y"):
                 yo.ensure_ssh_config_include(refuse=True)
                 yo.ensure_ssh_config_include(refuse=True)
-        self.assertEqual(self.read_config().count(yo.box.include_line), 1)
+        self.assertEqual(self.read_config().count(yo.SSH_CONFIG_INCLUDE_LINE), 1)
 
     def test_declined_leaves_the_file_untouched_and_refuses(self):
         original = "Host other\n"

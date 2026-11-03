@@ -14,6 +14,7 @@ from .config import (
     AGENT_AWS_BROKER_SOCK,
     AWS_BROKER_GUEST_SOCK,
     OP_GUEST_SOCK,
+    SSH_CONFIG_INCLUDE_LINE,
 )
 from .sshx import AGENT, OPERATOR
 from .ui import YoError
@@ -46,14 +47,14 @@ def ensure_herdr_machine(ssh_config_includes_the_vm: bool) -> None:
         # herdr runs `ssh <alias>`, and the alias exists only in the file that
         # ~/.ssh/config includes; without the line ssh cannot resolve it.
         ui.err(
-            "yo: not saving the herdr machine %s: ~/.ssh/config does not include the VM's"
+            "yo: not saving the herdr machine %s: ~/.ssh/config does not reach the VM's"
             " ssh config, so herdr cannot resolve the host." % state.box.herdr_alias
         )
         ui.err(
-            "    Add this line to ~/.ssh/config, then run %s again:"
+            "    Add this line to the top of ~/.ssh/config, then run %s again:"
             % state.yo_cmd("bootstrap")
         )
-        ui.err("        %s" % state.box.include_line)
+        ui.err("        %s" % SSH_CONFIG_INCLUDE_LINE)
         return
     added = proc.run(
         [

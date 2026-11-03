@@ -125,12 +125,8 @@ DIRECTORY_RESOLUTION_EPILOG = (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    # Help is built before any machine is chosen, so the Include line names
-    # the driver's instances directory and a literal <machine>.
-    include_line = (
-        '"Include ~/%s/<machine>/ssh.config"'
-        % driver_for(config.HOST_PLATFORM).instances_dir
-    )
+    # One line serves every machine on both hosts, so the help can name it.
+    include_line = '"%s"' % config.SSH_CONFIG_INCLUDE_LINE
     parser = argparse.ArgumentParser(
         prog="yo",
         description="yo — thin host-side CLI for the NixOS-VM yolobox.",

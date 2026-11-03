@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import unittest
 from unittest import mock
 
@@ -41,7 +42,6 @@ class TestNamesFollowTheMachine(unittest.TestCase):
         self.assertEqual(yo.box.name, "yolobox")
         self.assertEqual(yo.box.vm_host, "lima-yolobox")
         self.assertEqual(yo.box.herdr_alias, "yolobox")
-        self.assertEqual(yo.box.include_line, "Include ~/.lima/yolobox/ssh.config")
         self.assertEqual(yo.SSH_LOCAL_PORT, 60022)
         self.assertIn("Match host lima-yolobox user agent", yo.box.editor_ssh_block)
 
@@ -55,7 +55,6 @@ class TestNamesFollowTheMachine(unittest.TestCase):
         self.assertEqual(other.box.name, INSTANCE_B)
         self.assertEqual(other.box.vm_host, "lima-second")
         self.assertEqual(other.box.herdr_alias, INSTANCE_B)
-        self.assertEqual(other.box.include_line, "Include ~/.lima/second/ssh.config")
         self.assertTrue(other.instance_dir().endswith(".lima/second"))
         self.assertIn("Match host lima-second user agent", other.box.editor_ssh_block)
         self.assertIn("~/.lima/second/ssh-agent.sock", other.box.editor_ssh_block)
@@ -165,7 +164,6 @@ class TestSeveralInstancesCoexist(FakeHome):
             lambda box: box.instance_dir(),
             lambda box: box.known_hosts_path(),
             lambda box: box.agent_control_path(),
-            lambda box: box.box.include_line,
             lambda box: box.box.editor_ssh_block,
         ):
             values = [derive(box) for box in self.boxes]
@@ -199,15 +197,19 @@ class TestSeveralInstancesCoexist(FakeHome):
             box.ensure_agent_ssh_config()
         self.assertEqual([self.read_ssh_config(box) for box in self.boxes], before)
 
-    def test_each_include_line_is_found_only_by_its_own_instance(self):
+    @unittest.skipIf(shutil.which("ssh") is None, "no ssh")
+    def test_one_glob_line_reaches_every_machine_through_real_ssh(self):
+        for box in self.boxes:
+            box.ensure_agent_ssh_config()
         ssh_dir = os.path.join(self.home, ".ssh")
         os.mkdir(ssh_dir)
-        for box in self.boxes[:2]:
-            box.add_ssh_config_include()
-        found = [box.ssh_config_include_line() is not None for box in self.boxes]
-        self.assertEqual(found, [True, True, False])
-        with open(os.path.join(ssh_dir, "config")) as handle:
-            self.assertEqual(len(handle.read().splitlines()), 2)
+        with open(os.path.join(ssh_dir, "config"), "w") as handle:
+            # Absolute, so the test holds whichever home ssh expands ~ against.
+            handle.write(yo.SSH_CONFIG_INCLUDE_LINE.replace("~", self.home) + "\n")
+        self.assertEqual(
+            [box.ssh_config_reaches_box() for box in self.boxes],
+            [True] * len(self.boxes),
+        )
 
 
 class TestSshPort(unittest.TestCase):

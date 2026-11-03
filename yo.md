@@ -190,7 +190,7 @@ Every per-machine name derives from that one value through `Box`, the one place 
 
 - the lima directory `~/.lima/<name>` (ssh config, `known_hosts`, the multiplexing sockets), and every `limactl` call;
 - the ssh host `lima-<name>`, and the herdr machine and ssh alias `<name>`;
-- the `Include ~/.lima/<name>/ssh.config` line in `~/.ssh/config`;
+- the instance's own `ssh.config`, which the one `Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config` line in `~/.ssh/config` reaches for every machine;
 - the guest's hostname and tailnet node name: `yolobox` for the default machine, `yolobox-<name>` for any other (`hostname_for()`, passed to nix as `YOLOBOX_HOSTNAME`). Lowercased, because DNS labels are case-insensitive and tailscale lowercases them, so `-m Work` and `-m work` would collide on the tailnet (the libvirt domain stays `yolobox-Work`, `Box.vm_name`).
 
 A name follows lima's rule (letters and digits joined by single `.`, `_` or `-`), narrowed to what also makes the hostname `yolobox-<name>` a DNS label: only single `-` joins, at most 55 characters. It must not start with `lima-`. Otherwise instance `lima-x` would name its herdr alias `lima-x`, which is the ssh host of instance `x`. `yo` refuses any other spelling while it parses the command line, with exit 2 and the usage text, before anything runs. An instance made earlier with a `.` or `_` in its name is refused too, because no DNS label holds them; `limactl` still manages it.
@@ -207,7 +207,7 @@ Add `--cpus`, `--memory` and `--disk` to size it; `yo` never sizes a lima instan
 
 **What bootstrap adds per instance**, for removing one by hand after `limactl delete <name>`:
 
-- one `Include ~/.lima/<name>/ssh.config` line at the top of `~/.ssh/config`. `yo` asks first when it has a terminal, and otherwise prints the line;
+- the `Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config` line at the top of `~/.ssh/config`, once for every machine on the host, and only when `ssh_config_reaches_box()` finds the box unreachable. `yo` asks first when it has a terminal, and otherwise prints the line;
 - a herdr machine with the target `<name>` (`herdr machine list --json` shows it);
 - inside `~/.lima/<name>/`, which `limactl delete` removes: the editor block `Match host lima-<name> user agent`, the host-key pin block and the herdr alias `Host <name>` (all re-applied to `ssh.config` on every `yo` run), and `known_hosts` with the guest's host keys.
 

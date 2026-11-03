@@ -8,7 +8,7 @@ import sys
 from typing import Dict, List, NamedTuple, Optional
 
 from . import proc, state, ui
-from .config import AGENT_USER, FILE_MODE_PRIVATE
+from .config import AGENT_USER, FILE_MODE_PRIVATE, SSH_CONFIG_INCLUDE_LINE
 from .ui import YoError
 
 
@@ -246,15 +246,39 @@ def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:
     )
 
 
-def ssh_config_include_line() -> Optional[int]:
-    path = os.path.join(state.home(), ".ssh", "config")
-    text = proc.read_text_file(path, errors="replace")
-    if text is None:
-        return None
-    for number, line in enumerate(text.splitlines(), 1):
-        if state.box.include_re.search(line):
-            return number
-    return None
+def ssh_config_reaches_box() -> bool:
+    """Whether a bare `ssh <vm_host>` uses this machine's ssh.config: ssh itself
+    reads ~/.ssh/config and says which known_hosts it would pin against.
+
+    Asking ssh, not grepping, gets right what a grep cannot: a commented line,
+    a glob, several paths on one Include, and an Include after a Host or Match
+    line, which applies only to that block. False when the file is missing; an
+    ssh that refuses the file (a bad keyword, loose permissions) is an error."""
+    config_path = os.path.join(state.home(), ".ssh", "config")
+    try:
+        info = os.stat(config_path)
+    except FileNotFoundError:
+        return False
+    # A bare ssh refuses a ~/.ssh/config that is group- or world-writable or
+    # owned by another account, but `ssh -F` checks no permissions, so the
+    # rule is ssh's own (secure_permissions in OpenSSH's misc.c), applied here.
+    if (info.st_uid not in (0, os.getuid())) or (info.st_mode & 0o022):
+        raise YoError(
+            "ssh cannot read %s: bad owner or permissions (mode %04o) — a bare ssh "
+            "refuses it; fix it with: chmod go-w %s"
+            % (config_path, stat.S_IMODE(info.st_mode), config_path)
+        )
+    completed = proc.run(["ssh", "-F", config_path, "-G", state.box.vm_host])
+    if completed.returncode != 0:
+        raise YoError(
+            "ssh cannot read %s: %s"
+            % (
+                config_path,
+                completed.stderr.strip() or "exit %d" % completed.returncode,
+            )
+        )
+    wanted = "userknownhostsfile %s" % state.known_hosts_path()
+    return wanted in completed.stdout.splitlines()
 
 
 def add_ssh_config_include() -> None:
@@ -279,37 +303,41 @@ def add_ssh_config_include() -> None:
         mode = FILE_MODE_PRIVATE
     except OSError as failure:
         raise YoError("cannot read %s: %s" % (config_path, failure.strerror))
-    proc.atomic_write(config_path, state.box.include_line + "\n" + current, mode)
+    proc.atomic_write(config_path, SSH_CONFIG_INCLUDE_LINE + "\n" + current, mode)
 
 
 def ensure_ssh_config_include(refuse: bool) -> bool:
-    """True when ~/.ssh/config includes the VM's file; False when declined and not refusing."""
-    if ssh_config_include_line() is not None:
+    """True when ~/.ssh/config reaches the VM's file; False when declined and not refusing."""
+    if ssh_config_reaches_box():
         return True
 
     if sys.stdin.isatty():
         ui.err(
-            "yo: ~/.ssh/config does not include the VM's ssh config, so Zed, VS Code and a"
+            "yo: ~/.ssh/config does not reach the VM's ssh config, so Zed, VS Code, herdr"
         )
         ui.err(
-            "    bare `ssh %s` cannot resolve the host. yo can add one line:"
+            "    and a bare `ssh %s` cannot resolve the host. yo can add one line, at the"
             % state.box.vm_host
         )
-        ui.err("        %s" % state.box.include_line)
+        ui.err(
+            "    top, that serves every machine on this host (an Include below a Host or"
+        )
+        ui.err("    Match line applies only to that block):")
+        ui.err("        %s" % SSH_CONFIG_INCLUDE_LINE)
         try:
             answer = input("    Add it to ~/.ssh/config now? [y/N] ").strip().lower()
         except EOFError:
             answer = ""
         if answer in ("y", "yes"):
             add_ssh_config_include()
-            ui.out("yo: added '%s' to ~/.ssh/config" % state.box.include_line)
+            ui.out("yo: added '%s' to ~/.ssh/config" % SSH_CONFIG_INCLUDE_LINE)
             return True
 
     ui.err(
-        "yo: add this line to ~/.ssh/config so ssh %s, Zed and VS Code can find the VM:"
-        % state.box.vm_host
+        "yo: add this line to the top of ~/.ssh/config, above any Host or Match line, so"
+        " ssh %s, Zed, VS Code and herdr can find the VM:" % state.box.vm_host
     )
-    ui.err("    %s" % state.box.include_line)
+    ui.err("    %s" % SSH_CONFIG_INCLUDE_LINE)
     if refuse:
         raise YoError(None, code=1)
     return False

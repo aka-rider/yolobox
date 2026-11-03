@@ -334,17 +334,15 @@ class TestMainPreflight(unittest.TestCase):
                     text=True,
                 )
                 self.assertEqual((done.returncode, done.stderr), (0, ""))
-        self.assertRegex(done.stdout, r'"Include ~/\S+/<machine>/ssh\.config"')
+        self.assertIn('"%s"' % yo.SSH_CONFIG_INCLUDE_LINE, done.stdout)
 
-    def test_the_editor_help_names_the_hosts_instances_directory(self):
-        for platform, directory in (
-            ("darwin", "~/.lima/<machine>/ssh.config"),
-            ("linux", "~/.local/state/yolobox/instances/<machine>/ssh.config"),
-        ):
+    def test_the_editor_help_names_the_one_line_for_every_machine_on_both_hosts(self):
+        for platform in ("darwin", "linux"):
             with self.subTest(platform=platform):
                 with mock.patch.object(yo.config, "HOST_PLATFORM", platform):
                     for command in ("code", "zed"):
-                        self.assertIn(directory, self.help_text(["help", command]))
+                        help_text = " ".join(self.help_text(["help", command]).split())
+                        self.assertIn(yo.SSH_CONFIG_INCLUDE_LINE, help_text)
 
     def help_text(self, argv):
         """What `yo.main(argv)` prints, however it ends, with no limactl preflight."""
@@ -445,8 +443,6 @@ class TestMainPreflight(unittest.TestCase):
             seen.update(
                 instance=yo.box.name,
                 vm_host=yo.box.vm_host,
-                include_line=yo.box.include_line,
-                include_re=yo.box.include_re.pattern,
                 editor_block=yo.box.editor_ssh_block,
             )
 
@@ -462,8 +458,6 @@ class TestMainPreflight(unittest.TestCase):
         seen = self.derived_names_seen_by_status(["-m", "box2", "status"])
         self.assertEqual(seen["instance"], "box2")
         self.assertEqual(seen["vm_host"], "lima-box2")
-        self.assertIn("box2", seen["include_line"])
-        self.assertIn("box2", seen["include_re"])
         self.assertIn("lima-box2", seen["editor_block"])
 
     def test_machine_flag_is_accepted_after_the_command(self):
@@ -700,7 +694,7 @@ class TestBootstrapRebootDecision(FakeHome):
         self.addCleanup(ssh_run_patcher.stop)
 
         include_patcher = mock.patch.object(
-            yo.sshconfig, "ssh_config_include_line", return_value=1
+            yo.sshconfig, "ssh_config_reaches_box", return_value=True
         )
         include_patcher.start()
         self.addCleanup(include_patcher.stop)
@@ -1727,8 +1721,8 @@ class TestEnsureHerdrMachine(unittest.TestCase):
                 with mock.patch.object(yo.ui, "err") as fake_err:
                     yo.ensure_herdr_machine(False)
         notes = " ".join(call.args[0] for call in fake_err.call_args_list)
-        self.assertIn("~/.ssh/config does not include", notes)
-        self.assertIn(yo.box.include_line, notes)
+        self.assertIn("~/.ssh/config does not reach", notes)
+        self.assertIn(yo.SSH_CONFIG_INCLUDE_LINE, notes)
 
     def test_add_failure_raises_with_herdrs_stderr(self):
         def fake_run(argv, **kwargs):

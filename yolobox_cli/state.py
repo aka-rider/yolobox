@@ -6,7 +6,6 @@ import contextlib
 import fcntl
 import os
 import pwd
-import re
 import sys
 from dataclasses import dataclass
 from typing import Iterator
@@ -79,18 +78,6 @@ class Box:
         return (
             "Match host %s user %s\n  ControlPath %s/ssh-agent.sock\n"
             "  ForwardAgent no" % (self.vm_host, AGENT_USER, self.tilde_dir)
-        )
-
-    @property
-    def include_line(self) -> str:
-        return "Include %s/ssh.config" % self.tilde_dir
-
-    @property
-    def include_re(self) -> re.Pattern[str]:
-        return re.compile(
-            r"^\s*Include\s+.*%s/%s/ssh\.config"
-            % (re.escape(self.driver.instances_dir), re.escape(self.name)),
-            re.IGNORECASE,
         )
 
 

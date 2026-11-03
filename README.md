@@ -40,10 +40,10 @@ nix run github:aka-rider/yolobox/<version>
 yo bootstrap
 ```
 
-Then add this line to `~/.ssh/config`:
+Then add this line at the top of `~/.ssh/config`, above any `Host` or `Match` line (`yo bootstrap` offers to). It serves every machine on a Mac and on a Linux host:
 
 ```
-Include ~/.lima/yolobox/ssh.config
+Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config
 ```
 
 ### Linux host
@@ -73,7 +73,7 @@ A Linux PC (Fedora, x86_64, with KVM) runs the box under libvirt instead of Lima
 
    The box gets 16 GiB of memory and a 100 GiB disk. To size it, pass the sizes in GiB to the first `yo up` (or to `yo bootstrap`, if it creates the box): `yo up --memory 24 --disk 250`. The size is set only when the box is created, so choose the disk before the first boot. See [Sizing a box](docs/linux-host.md#sizing-a-box).
 
-5. Add `Include ~/.local/state/yolobox/instances/yolobox/ssh.config` to `~/.ssh/config` (`yo bootstrap` offers to).
+5. Add `Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config` at the top of `~/.ssh/config` (`yo bootstrap` offers to). The one line serves every machine.
 6. To open a VM port on the host, run `yo port <guest-port>`. It prints the `127.0.0.1` port it chose.
 
 A host whose sshd listens on the tailnet should read the tailnet section of the linux-host story first.

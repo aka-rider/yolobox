@@ -2928,8 +2928,8 @@ class TestDriverChoice(unittest.TestCase):
             box.box.driver.initrd_identity,
             ".local/state/yolobox/instances/e2e/operator.pub",
         )
-        self.assertIn(
-            "~/.local/state/yolobox/instances/e2e/ssh.config", box.box.include_line
+        self.assertTrue(
+            box.ssh_cfg().endswith("/.local/state/yolobox/instances/e2e/ssh.config")
         )
 
     def test_an_unknown_platform_is_refused(self):

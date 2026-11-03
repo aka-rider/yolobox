@@ -22,6 +22,12 @@ OPERATOR_GUEST_UID = 501
 # nix/base.nix). The initrd's sshd has none, so yo tells the two apart without
 # logging in, and never offers stage 2 a user it rejects (nix/base.md).
 STAGE2_SSH_BANNER_MARK = "yolobox-stage2"
+# The one ~/.ssh/config line that reaches every machine on both hosts: libvirt's
+# instance files and Lima's. An Include applies only to the Host or Match block
+# it follows, so it belongs above the first one (ssh_config_reaches_box()).
+SSH_CONFIG_INCLUDE_LINE = (
+    "Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config"
+)
 AGENT_USER = "agent"
 AGENT_HOME = "/home/agent"
 HELPER = "yolobox-guest"

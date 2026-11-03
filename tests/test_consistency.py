@@ -923,6 +923,19 @@ class TestStage2SshdIsToldApartWithoutALogin(unittest.TestCase):
         self.assertEqual(self.setting("PerSourcePenaltyExemptList"), allow.group(1))
 
 
+class TestTheIncludeLineServesBothDrivers(unittest.TestCase):
+    def test_it_globs_exactly_each_drivers_instance_files(self):
+        words = yo.config.SSH_CONFIG_INCLUDE_LINE.split()
+        self.assertEqual(words[0], "Include")
+        self.assertEqual(
+            sorted(words[1:]),
+            sorted(
+                "~/%s/*/ssh.config" % driver.instances_dir
+                for driver in (yo.LimaDriver, yo.LibvirtDriver)
+            ),
+        )
+
+
 class TestGuestProfilePatternMatchesYo(unittest.TestCase):
     def test_aws_creds_accepts_exactly_the_profile_names_yo_allow_lists(self):
         found = re.findall(
