@@ -3,6 +3,9 @@ images:
   - location: "https://github.com/nixos-lima/nixos-lima/releases/download/v0.2.2/nixos-lima-v0.2.2-aarch64.qcow2"
     arch: "aarch64"
     digest: "sha512:bfcb703cdbad28cfd27438dc009408a859f3c4f575d3598d9627ea712c66128e0fa015de2010ce42bb724abc49f45029a4fc81891fb1a04c567378a6fdf31903"
+  - location: "https://github.com/nixos-lima/nixos-lima/releases/download/v0.2.2/nixos-lima-v0.2.2-x86_64.qcow2"
+    arch: "x86_64"
+    digest: "sha512:cdf15475c6f799d3a355da50147fa81316e43e159b1b2e76eb21046f9fe8499770840ef876daaf85a2f5eb3a73445c4fa87d0337533fdf6f116d80c40806fbc9"
 
 # Apple's Virtualization.framework; the rosetta block below only applies to vz.
 vmType: vz

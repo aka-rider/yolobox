@@ -1326,8 +1326,12 @@ class TestStatusAndGaps(LibvirtCase):
             self.assertIn("TODO.md", caught.exception.message)
 
     def test_the_nix_commands_name_the_linux_host(self):
-        self.assertIn("YOLOBOX_HOST_OS=linux", self.box.nix_env("alice"))
-        self.assertIn("YOLOBOX_HOSTNAME=yolobox-box", self.box.nix_env("alice"))
+        self.assertIn(
+            "YOLOBOX_HOST_OS=linux", self.box.nix_env("alice", "github:x/y/z")
+        )
+        self.assertIn(
+            "YOLOBOX_HOSTNAME=yolobox-box", self.box.nix_env("alice", "github:x/y/z")
+        )
 
 
 class TestKeepalive(LibvirtCase):

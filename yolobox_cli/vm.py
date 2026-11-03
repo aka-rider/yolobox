@@ -290,7 +290,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         OPERATOR,
         [
             "sudo",
-            *release.nix_env(release.host_user()),
+            *release.nix_env(release.host_user(), ref),
             "nixos-rebuild",
             "boot",
             "--impure",

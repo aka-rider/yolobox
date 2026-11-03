@@ -1365,6 +1365,56 @@ class TestHostnameHasOneSpelling(unittest.TestCase):
         self.assertIn(yo.NIX_ENV_HOSTNAME, (REPO / "CLAUDE.md").read_text())
 
 
+class TestFlakeRefHasOneSpelling(unittest.TestCase):
+    """flake.nix validates YOLOBOX_FLAKE_REF and yo builds it; the rule and the
+    name must be the same on both sides."""
+
+    def flake_text(self):
+        return (REPO / "flake.nix").read_text()
+
+    def test_yo_names_the_variable_flake_reads(self):
+        self.assertIn('builtins.getEnv "%s"' % yo.NIX_ENV_FLAKE_REF, self.flake_text())
+
+    def test_flake_throws_when_the_ref_is_unset_and_names_the_variable(self):
+        thrown = re.search(
+            r'else throw "(%s) is ' % yo.NIX_ENV_FLAKE_REF, self.flake_text()
+        )
+        self.assertIsNotNone(thrown, "flake.nix does not throw on YOLOBOX_FLAKE_REF")
+
+    def test_the_box_stamps_the_ref_unconditionally(self):
+        stamp = re.search(
+            r'environment\.etc\."yolobox/flake-ref"(.*)',
+            (REPO / "nix/base.nix").read_text(),
+        )
+        self.assertIsNotNone(stamp, "base.nix does not stamp the flake ref")
+        self.assertTrue(stamp.group(1).lstrip().startswith(".text"), stamp.group(1))
+
+    def test_flake_matches_the_ref_shape_yo_accepts(self):
+        matched = re.search(r'builtins\.match "([^"]+)" r', self.flake_text())
+        self.assertIsNotNone(matched, "flake.nix does not match YOLOBOX_FLAKE_REF")
+        self.assertEqual(matched.group(1), yo.GITHUB_FLAKE_RE.pattern)
+
+
+class TestLimaImagesMatchTheLibvirtSeed(unittest.TestCase):
+    """Lima picks the images: entry for the Mac's CPU and libvirt downloads its
+    own copy of the x86_64 one; both must name the same file and digest."""
+
+    def images(self):
+        return parse_yaml_list_entries(yaml_block(YOLOBOX_YAML.read_text(), "images"))
+
+    def test_every_image_pins_a_sha512_digest(self):
+        images = self.images()
+        self.assertTrue(images)
+        for image in images:
+            with self.subTest(arch=image.get("arch")):
+                self.assertRegex(image.get("digest", ""), r"sha512:[0-9a-f]{128}")
+
+    def test_the_x86_64_image_is_the_libvirt_seed(self):
+        (image,) = [i for i in self.images() if i.get("arch") == "x86_64"]
+        self.assertEqual(image["digest"], "sha512:" + yo.SEED_SHA512)
+        self.assertEqual(image["location"].rsplit("/", 1)[1], yo.SEED_NAME)
+
+
 class TestCidataDescribesTheOperatorBaseNixDeclares(unittest.TestCase):
     """lima-init creates the operator from lima.env, and base.nix declares the
     same account. A different uid or home would split it into two accounts."""

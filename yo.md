@@ -150,7 +150,7 @@ One libvirt domain per machine on `qemu:///system`, named `yolobox-NAME` and tag
 
 ### The nix environment
 
-Every nix command on the box needs the operator's name and the host OS: `flake.nix` throws without either. It also takes the machine's hostname, which defaults to `yolobox` when unset, and `yo` always sets it, because a named machine rebuilt without it would be renamed back to `yolobox`. `nix_env()` builds the three words from `NIX_ENV_USERNAME`, `NIX_ENV_HOST_OS` and `NIX_ENV_HOSTNAME`, and `cmd_bootstrap` and `rebuild_hint()` both use it, so the two spellings cannot drift. The host OS value is `state.driver().host_os`, decided from the host OS when the driver was chosen and never from the CPU architecture.
+Every nix command on the box needs the operator's name, the host OS and the flake ref: `flake.nix` throws without any of them. It also takes the machine's hostname, which defaults to `yolobox` when unset, and `yo` always sets it, because a named machine rebuilt without it would be renamed back to `yolobox`. The fourth word is the flake ref the rebuild builds from (`YOLOBOX_FLAKE_REF`, a full `github:OWNER/REPO/REF` as `flake_ref()` returns it). It is required, not optional, because the box stamps it into `/etc/yolobox/flake-ref` and a rebuild without it would delete the stamp, so a later rebuild from inside the box would guess `v<version>` again. `nix_env(username, ref)` builds the four words from `NIX_ENV_USERNAME`, `NIX_ENV_HOST_OS`, `NIX_ENV_HOSTNAME` and `NIX_ENV_FLAKE_REF`, and `cmd_bootstrap` and `rebuild_hint()` both use it, so the two spellings cannot drift. The host OS value is `state.driver().host_os`, decided from the host OS when the driver was chosen and never from the CPU architecture.
 
 ## Starting and unlocking
 
@@ -269,7 +269,7 @@ One declaration means no second list can drift from it (a hand-written usage str
 
 ### `yo ssh` keeps `REMAINDER`
 
-`yo ssh`'s trailing arguments are declared `nargs=argparse.REMAINDER`, and the choice is load-bearing. `rebuild_hint()` prints `yo ssh sudo YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=<darwin|linux> nixos-rebuild switch --impure --flake '…'` as the documented remedy for a stale generation. If argparse ever parsed `--impure` as its own flag instead of passing it through, the tool's own printed advice would stop working.
+`yo ssh`'s trailing arguments are declared `nargs=argparse.REMAINDER`, and the choice is load-bearing. `rebuild_hint()` prints `yo ssh sudo YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=<darwin|linux> … nixos-rebuild switch --impure --flake '…'` as the documented remedy for a stale generation. If argparse ever parsed `--impure` as its own flag instead of passing it through, the tool's own printed advice would stop working.
 
 Verified against real argparse: every invocation whose first token is not option-like passes through untouched, `yo ssh sudo … --impure --flake …` included. A leading-dash first token is handled by argparse before REMAINDER starts. `yo ssh --help` and `yo ssh -h` print `yo`'s own ssh help and exit 0. Any other leading option, such as `yo ssh -v`, exits 2 without reaching the VM. Nothing here changes what ssh receives, because REMAINDER only hands the tokens after the first non-option word to ssh as the remote command.
 

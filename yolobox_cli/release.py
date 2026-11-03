@@ -113,7 +113,7 @@ def rebuild_hint() -> str:
             )
     return "%s sudo %s nixos-rebuild switch --impure --flake %s" % (
         state.yo_cmd("ssh"),
-        " ".join(nix_env("$(id -un)")),
+        " ".join(nix_env("$(id -un)", ref)),
         shlex.quote(ref + "#yolobox"),
     )
 
@@ -138,17 +138,21 @@ def host_user() -> str:
 
 
 # The variables every nix command on the box needs: flake.nix throws without the
-# first two, and falls back to "yolobox" without the third, which would rename an
-# -m machine back at its next rebuild. `username` is a value or a shell
-# expression, as the caller needs.
+# first two and the fourth (the fourth is stamped into /etc/yolobox/flake-ref),
+# and falls back to "yolobox" without the third, which would rename an -m
+# machine back at its next rebuild. `username` is a value or a shell
+# expression, as the caller needs; `ref` is a full github:OWNER/REPO/REF, as
+# flake_ref returns.
 NIX_ENV_USERNAME = "YOLOBOX_USERNAME"
 NIX_ENV_HOST_OS = "YOLOBOX_HOST_OS"
 NIX_ENV_HOSTNAME = "YOLOBOX_HOSTNAME"
+NIX_ENV_FLAKE_REF = "YOLOBOX_FLAKE_REF"
 
 
-def nix_env(username: str) -> List[str]:
+def nix_env(username: str, ref: str) -> List[str]:
     return [
         "%s=%s" % (NIX_ENV_USERNAME, username),
         "%s=%s" % (NIX_ENV_HOST_OS, state.driver().host_os),
         "%s=%s" % (NIX_ENV_HOSTNAME, state.box.hostname),
+        "%s=%s" % (NIX_ENV_FLAKE_REF, ref),
     ]

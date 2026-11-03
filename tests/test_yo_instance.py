@@ -91,7 +91,11 @@ class TestHostnameFollowsTheMachine(unittest.TestCase):
     """Each machine's box gets its own hostname, so its own tailnet node."""
 
     def hostname_env(self):
-        (entry,) = [e for e in yo.nix_env("alice") if e.startswith("YOLOBOX_HOSTNAME=")]
+        (entry,) = [
+            e
+            for e in yo.nix_env("alice", "github:x/y/z")
+            if e.startswith("YOLOBOX_HOSTNAME=")
+        ]
         return entry
 
     def test_the_default_machine_keeps_the_name_every_box_had(self):

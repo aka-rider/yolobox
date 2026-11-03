@@ -1,4 +1,4 @@
-{ config, pkgs, modulesPath, username, agentUser, lib, version, hostOs, hostname, ... }:
+{ config, pkgs, modulesPath, username, agentUser, lib, version, hostOs, hostname, flakeRef, ... }:
 let
   agentEnv = import ./lib/agent-env.nix {
     agentHome = config.users.users.${agentUser}.home;
@@ -332,9 +332,9 @@ in
   # and .cargo/config.toml, so this caps dev/test DWARF for every project.
   environment.variables.CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
 
-  # Rosetta is a vz feature of Lima on a Mac; a libvirt guest has no such
-  # device to mount.
-  virtualisation.rosetta = lib.mkIf (hostOs == "darwin") {
+  # Rosetta is a vz feature of Lima on an Apple-silicon Mac; vz cannot emulate,
+  # so an Intel Mac has no rosetta share to mount, and nor has a libvirt guest.
+  virtualisation.rosetta = lib.mkIf (hostOs == "darwin" && pkgs.stdenv.hostPlatform.isAarch64) {
     enable = true;
     mountTag = "vz-rosetta";
   };
@@ -367,6 +367,10 @@ in
   ];
 
   environment.etc."yolobox/version".text = version + "\n";
+  # What built the box, so a later rebuild reuses it instead of guessing:
+  # which hypervisor stack provisioned it and the flake ref it was built from.
+  environment.etc."yolobox/host-os".text = hostOs + "\n";
+  environment.etc."yolobox/flake-ref".text = flakeRef + "\n";
 
   nix.settings.experimental-features = [ "nix-command" "flakes" "fetch-closure" "ca-derivations" ];
   nix.settings.auto-optimise-store = true;

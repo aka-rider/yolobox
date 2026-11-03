@@ -12,7 +12,7 @@
 #   compat half ("nothing the agent needs broke") is the one to iterate on
 #   against a box that is not hardened yet.
 #
-# On a libvirt guest (x86_64 under kvm) it also checks that the agent cannot
+# On a libvirt guest (host-os linux) it also checks that the agent cannot
 # log in as the operator with the forwarded 1Password agent, and that the
 # firewall rule behind that is loaded.
 #
@@ -36,6 +36,7 @@ WORK=""
 SLEEPER_PID=""
 NET_CREATED=""
 PROBE_OUT=""
+HOST_OS=""
 
 fail() {
     echo "FAIL: $*" >&2
@@ -48,6 +49,20 @@ ok() {
 
 warn() {
     echo "WARN: $*" >&2
+}
+
+# The host OS running this box, from /etc/yolobox/host-os: "darwin" (Lima on a
+# Mac) or "linux" (libvirt on a Linux PC). Never guessed from the CPU: an Intel
+# Mac runs an x86_64 Lima guest. fail exits only the command substitution it
+# runs in, so callers take the result with `HOST_OS=$(host_os) || exit 1`.
+host_os() {
+    local file=/etc/yolobox/host-os host
+    [ -f "${file}" ] || fail "${file} is missing: the box does not say which host runs it"
+    host=$(cat "${file}") || fail "could not read ${file}"
+    case ${host} in
+    darwin | linux) printf '%s\n' "${host}" ;;
+    *) fail "${file} must say darwin or linux, got '${host}'" ;;
+    esac
 }
 
 trap 'echo "FAIL: unexpected error at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
@@ -400,12 +415,9 @@ check_operator_login_refused() {
     ok "nixos-fw drops packets claiming ${GATEWAY_ADDR} on any interface but enp0s1"
 }
 
-# True on a libvirt guest, the Linux host's way of running the box. `|| true`
-# because systemd-detect-virt exits 1 and prints "none" on bare metal.
+# True on a libvirt guest, the Linux host's way of running the box.
 is_libvirt_guest() {
-    local virt
-    virt=$(systemd-detect-virt || true)
-    [ "$(uname -m)" = x86_64 ] && [ "${virt}" = kvm ]
+    [ "${HOST_OS}" = linux ]
 }
 
 # The one qdisc that stays: net.core.default_qdisc is fq_codel.
@@ -509,9 +521,10 @@ compat_checks() {
     check_nix_build
     check_strace
     check_vendors
-    # An aarch64 box is a Lima/vz one and must have rosetta, so a missing
-    # binfmt entry fails there. A libvirt box is x86_64 and has none.
-    if [ "$(uname -m)" = aarch64 ]; then
+    # Rosetta exists only on Apple silicon: a darwin guest on aarch64 is a
+    # Lima/vz box and must have it. An Intel Mac's x86_64 guest and a libvirt
+    # guest have none.
+    if [ "${HOST_OS}" = darwin ] && [ "$(uname -m)" = aarch64 ]; then
         check_rosetta
     fi
     if is_libvirt_guest; then
@@ -522,6 +535,7 @@ compat_checks() {
 main() {
     [ "$(id -u)" -ne "${AGENT_UID}" ] || fail "run this as the operator, not the agent"
     sudo -n true || fail "passwordless sudo is required (run as the operator)"
+    HOST_OS=$(host_os) || exit 1
     trap cleanup EXIT
     stage_helpers
     case ${ONLY:-both} in

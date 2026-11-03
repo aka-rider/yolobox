@@ -74,7 +74,7 @@ nixos-lima's `lima-init.nix` sets `networking.nat.enable = true`, and nixpkgs' n
 
 ## Host OS gates
 
-`flake.nix` passes `hostOs` (`darwin` or `linux`, from `YOLOBOX_HOST_OS`) to this module, because the same box runs under two hypervisor stacks. Lima/vz on a Mac gives the guest a rosetta share and a Lima hostagent to talk to. A libvirt guest on a Linux PC has neither, so `virtualisation.rosetta` is on only for `darwin` and `lima-guestagent` is disabled for `linux` (it fails for lack of its binary there). The CPU is a separate fact: it is the system of the nix that evaluates, so the Mac box is `aarch64-linux` and a Linux PC's box is `x86_64-linux`.
+`flake.nix` passes `hostOs` (`darwin` or `linux`, from `YOLOBOX_HOST_OS`) to this module, because the same box runs under two hypervisor stacks. Lima/vz on a Mac gives the guest a Lima hostagent to talk to, and on Apple silicon a rosetta share. A libvirt guest on a Linux PC has neither, so `virtualisation.rosetta` is on only for `darwin` on `aarch64`, and `lima-guestagent` is disabled for `linux` (it fails for lack of its binary there). The CPU is a separate fact: it is the system of the nix that evaluates, so an Apple silicon Mac's box is `aarch64-linux`, an Intel Mac's box is `x86_64-linux`, and a Linux PC's box is `x86_64-linux`.
 
 ## Hostname
 

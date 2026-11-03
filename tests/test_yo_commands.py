@@ -119,11 +119,11 @@ class TestFlakeRef(FakeHome):
         flake_arg = hint.split("--flake ", 1)[1]
         self.assertEqual(shlex.split(flake_arg), ["github:you/yolobox/x#yolobox"])
 
-    def test_the_hint_names_the_host_os_and_hostname_beside_the_username(self):
+    def test_the_hint_names_the_host_os_hostname_and_ref_beside_the_username(self):
         self.remember("github:x/y/z")
         self.assertIn(
             "sudo YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=darwin "
-            "YOLOBOX_HOSTNAME=yolobox nixos-rebuild",
+            "YOLOBOX_HOSTNAME=yolobox YOLOBOX_FLAKE_REF=github:x/y/z nixos-rebuild",
             yo.rebuild_hint(),
         )
 
@@ -845,15 +845,16 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
         self.assertIn("encrypts /dev/vda2 in place", self.stderr)
         self.assertIn("must not be interrupted", self.stderr)
 
-    def test_the_rebuild_names_the_username_host_os_and_hostname(self):
+    def test_the_rebuild_names_the_username_host_os_hostname_and_ref(self):
         rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /")
         self.assertEqual(
-            rebuilds[0][:5],
+            rebuilds[0][:6],
             [
                 "sudo",
                 "YOLOBOX_USERNAME=%s" % yo.host_user(),
                 "YOLOBOX_HOST_OS=darwin",
                 "YOLOBOX_HOSTNAME=yolobox",
+                "YOLOBOX_FLAKE_REF=github:x/y/z",
                 "nixos-rebuild",
             ],
         )

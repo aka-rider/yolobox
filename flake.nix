@@ -18,9 +18,11 @@
       # the tagged tree. fileContents strips the trailing newline, which
       # is what YO_VERSION wants.
       version = nixpkgs.lib.fileContents ./.version;
-      # The guest's CPU follows the host's (Lima/vz on an Apple-silicon Mac
-      # runs aarch64, libvirt/KVM on a Linux PC runs x86_64), so the box
-      # evaluates for both Linux systems.
+      # The guest's CPU follows the host's: Lima/vz runs the Mac's own CPU
+      # (aarch64 on Apple silicon, x86_64 on Intel), libvirt/KVM on a Linux PC
+      # runs x86_64. So the box evaluates for both Linux systems. yo itself has
+      # no x86_64-darwin package: nixpkgs dropped that platform in 26.11, so an
+      # Intel Mac installs yo through brew.
       linuxSystems = [ "aarch64-linux" "x86_64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs ([ "aarch64-darwin" ] ++ linuxSystems);
       # The guest account must mirror whichever host user provisioned it
@@ -58,10 +60,21 @@
         in if n == "" then "yolobox"
         else if builtins.match "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?" n != null then n
         else throw "YOLOBOX_HOSTNAME is \"${n}\" — it must be one DNS label: lowercase letters, digits and '-', 1 to 63 characters, not starting or ending with '-' (leave it unset for \"yolobox\")";
+      # The flake ref the box is built from, a host fact like the two above:
+      # `yo` sets YOLOBOX_FLAKE_REF on every nixos-rebuild, and base.nix stamps
+      # it into /etc/yolobox/flake-ref so a later rebuild from inside the box
+      # builds from the same tree. It is required, because a rebuild without it
+      # would delete the stamp and send the box back to guessing v<version>.
+      # It must be exactly github:OWNER/REPO/REF (release.GITHUB_FLAKE_RE),
+      # because it names the tree the box rebuilds from.
+      flakeRef =
+        let r = builtins.getEnv "YOLOBOX_FLAKE_REF";
+        in if builtins.match "github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*" r != null then r
+        else throw "YOLOBOX_FLAKE_REF is \"${r}\" — set it to the flake ref you build from, github:OWNER/REPO/REF, and build with --impure (yo does this for you)";
       guestSystem =
         let s = builtins.currentSystem;
         in if builtins.elem s linuxSystems then s
-        else throw "the box builds for aarch64-linux or x86_64-linux, not ${s} — pass --system aarch64-linux when evaluating on a Mac";
+        else throw "the box builds for aarch64-linux or x86_64-linux, not ${s} — pass --system aarch64-linux (Apple silicon) or --system x86_64-linux (Intel Mac) when evaluating on a Mac";
     in {
       packages = forAllSystems (system:
         let
@@ -82,13 +95,13 @@
           }
         ));
 
-      # builtins.seq forces hostOs and hostname here (guestSystem is forced by
-      # `system`), so evaluating the box fails at once when one is unset or
-      # invalid, instead of only when some module happens to read it.
-      nixosConfigurations.yolobox = builtins.seq hostOs (builtins.seq hostname (nixpkgs.lib.nixosSystem {
+      # builtins.seq forces hostOs, hostname and flakeRef here (guestSystem is
+      # forced by `system`), so evaluating the box fails at once when one is
+      # unset or invalid, instead of only when some module happens to read it.
+      nixosConfigurations.yolobox = builtins.seq hostOs (builtins.seq hostname (builtins.seq flakeRef (nixpkgs.lib.nixosSystem {
         system = guestSystem;
         specialArgs = {
-          inherit username agentUser version hostOs hostname;
+          inherit username agentUser version hostOs hostname flakeRef;
         };
         modules = [
           # nixpkgs' pin can lag herdr, and a saved SSH machine needs the
@@ -119,6 +132,6 @@
           ./nix/egress.nix
           ./nix/hardening.nix
         ];
-      }));
+      })));
     };
 }

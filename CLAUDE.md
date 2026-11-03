@@ -55,10 +55,11 @@ people who change the repo itself. Version 1 was Docker-based.
   no checkout of this repo. See `docs/distribution.md`.
 - **Two hosts, one box.** `yo` picks a driver once, from the host OS: Lima on
   macOS, libvirt on Linux (`qemu:///system`, passt for the network, SELinux
-  sVirt). The guest is the same, with its address plan copied from Lima's, and
-  the OS that runs it is passed to nix as `YOLOBOX_HOST_OS`, never guessed from
-  the CPU. A Linux host adds a host-side nft table the guest cannot undo. See
-  `docs/linux-host.md`.
+  sVirt). The guest is the same, with its address plan copied from Lima's. On
+  a Mac it runs the Mac's own CPU (`aarch64` on Apple silicon, `x86_64` on
+  Intel), and the libvirt guest is `x86_64` only. The OS that runs it is passed
+  to nix as `YOLOBOX_HOST_OS`, never guessed from the CPU. A Linux host adds a
+  host-side nft table the guest cannot undo. See `docs/linux-host.md`.
 - **Secrets reach the agent only over reverse unix sockets.** Lima forwards
   the Mac's 1Password socket and the AWS broker's socket into the VM, and
   `systemd-socket-proxyd` hands each to the agent. Nothing sensitive is
@@ -188,7 +189,7 @@ Tests, all under `tests/`:
 python3 -m unittest discover -s tests        # CI runs 3.9 and the newest 3.x
 uvx ruff@0.17.2 check . && uvx ruff@0.17.2 format --check .   # see below
 shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh tests/box-libvirt-check.sh   # verify.yml's list
-YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=linux nix flake check --impure
+YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=linux YOLOBOX_FLAKE_REF=github:aka-rider/yolobox/ci nix flake check --impure
 ```
 
 - `ruff.toml` pins `required-version`, and `verify.yml` installs that same
@@ -203,13 +204,20 @@ YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=linux nix flake check --impure
   check inside a box also evaluates that file. CI's `eval` job in
   `.github/workflows/verify.yml` proves a box without it evaluates.
 - Nix needs `YOLOBOX_USERNAME=$(id -un)`, `YOLOBOX_HOST_OS` (`darwin` or
-  `linux`, the OS that runs the VM) and `--impure` on every command, because
-  the flake has no pure way to learn either host fact. `flake.nix` throws if
-  one is unset. A third, `YOLOBOX_HOSTNAME`, is optional: unset means
-  `yolobox`, and a set value must be one lowercase DNS label, else the flake
-  throws. `yo` sets it per machine (`yolobox-<name>` for `-m <name>`). The guest's CPU is the evaluating nix's own system, so check
-  the Mac box's aarch64 guest from an x86_64 machine with
-  `YOLOBOX_HOST_OS=darwin nix eval --impure --system aarch64-linux ...`.
+  `linux`, the OS that runs the VM), `YOLOBOX_FLAKE_REF` (a full
+  `github:OWNER/REPO/REF`, the tree the box is built from) and `--impure` on
+  every command, because the flake has no pure way to learn these host facts.
+  `flake.nix` throws if one is unset. `yo` sets the ref to the one it builds
+  from and the box stamps it into `/etc/yolobox/flake-ref`, which is why a hand
+  rebuild must pass it too: without it the stamp would be lost. For a check, any
+  valid ref does, e.g. `github:aka-rider/yolobox/ci`. One more variable is
+  optional. `YOLOBOX_HOSTNAME` unset means `yolobox`, and a set value must be
+  one lowercase DNS label, else the flake throws. `yo` sets it per machine
+  (`yolobox-<name>` for `-m <name>`). The guest's CPU is the evaluating nix's
+  own system, so check an Apple silicon Mac box's `aarch64` guest from an
+  x86_64 machine with
+  `YOLOBOX_HOST_OS=darwin nix eval --impure --system aarch64-linux ...`, and an
+  Intel Mac's guest with `--system x86_64-linux`.
 - On a local clone, `git add` new files before running nix, which ignores
   untracked files in a git tree.
 - A new `yolobox-guest` subcommand does not exist on a box until the box is
