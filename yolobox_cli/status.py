@@ -362,9 +362,16 @@ def parse_net_check(text: str) -> Optional[NetCheck]:
 def status_guest_services(report: Report) -> None:
     guest_version = release.built_by()
     unknown_note = "unknown (box built before /etc/yolobox/version existed)"
+    # The commit, beside the version: a box rebuilt from a moving branch shows
+    # whether the build saw its latest commit (docs/distribution.md).
     ui.out(
-        "yolobox: host yo %s, box built by %s"
-        % (config.YO_VERSION, guest_version or unknown_note)
+        "yolobox: host yo %s, box built by %s from commit %s"
+        % (
+            config.YO_VERSION,
+            guest_version or unknown_note,
+            release.built_rev()
+            or "unknown (box built before %s existed)" % release.FLAKE_REV_STAMP,
+        )
     )
     drift = release.version_drift(config.YO_VERSION, guest_version)
     if drift:

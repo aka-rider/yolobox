@@ -132,6 +132,15 @@ jobs:
               { echo "YOLOBOX_HOST_OS=$value changed the box"; exit 1; }
           done
 
+      # The box stamps the commit its ref resolved to, so a stale build of a
+      # moving branch shows in `yo status` (docs/distribution.md). A checkout
+      # is a clean tree here, so the stamp is the commit's full hash.
+      - name: Check the box stamps the commit it was built from
+        run: |
+          $NIX_EVAL --raw .#nixosConfigurations.yolobox.config.environment.etc \
+            --apply 'etc: etc."yolobox/flake-rev".text' > flake-rev
+          grep -Ex '[0-9a-f]{40}' flake-rev
+
       # vz cannot emulate, so only an Apple-silicon Mac's guest has a rosetta
       # share to mount, and only that host runs an aarch64 guest; on any other
       # box it would wait on a mount that never comes (nix/base.md).

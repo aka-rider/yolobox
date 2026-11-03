@@ -309,15 +309,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
 
     sshx.ssh_run(
         OPERATOR,
-        [
-            "sudo",
-            *release.nix_env(release.host_user(), ref),
-            "nixos-rebuild",
-            "boot",
-            "--impure",
-            "--flake",
-            "%s#yolobox" % ref,
-        ],
+        release.nixos_rebuild_argv("boot", release.host_user(), ref),
         mux=True,
         capture=False,
         check=True,
@@ -334,7 +326,10 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
             os.remove(release.flake_ref_file())
         except FileNotFoundError:
             pass
-    report.ok("built from %s" % ref)
+    # The commit the ref resolved to, read from the generation just built: a
+    # branch that did not move, or a fetch nix reused, shows here.
+    built = release.built_rev(release.BUILT_FLAKE_REV_STAMP)
+    report.ok("built %s at %s" % (ref, built or "an unrecorded commit"))
 
     profile, booted = booted_generations(report)
     if profile == booted:

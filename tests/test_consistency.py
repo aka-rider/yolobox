@@ -874,6 +874,22 @@ class TestGuestRebuildMatchesYoAndTheBox(unittest.TestCase):
         self.assertIsNotNone(block, "base.nix declares no operator account")
         self.assertEqual("uid = %d;" % uid, re.search(r"uid = \d+;", block.group(1))[0])
 
+    def test_the_rebuild_passes_exactly_yos_nixos_rebuild_flags(self):
+        found = re.search(
+            r'nixos-rebuild "\$\{action\}" (.*?) --flake',
+            guest_script_function("cmd_rebuild"),
+        )
+        self.assertIsNotNone(found, "cmd_rebuild runs no nixos-rebuild")
+        self.assertEqual(tuple(found.group(1).split()), yo.release.NIX_REBUILD_FLAGS)
+        self.assertIn("--refresh", yo.release.NIX_REBUILD_FLAGS)
+
+    def test_the_box_stamps_the_commit_where_yo_reads_it(self):
+        stamp = yo.release.FLAKE_REV_STAMP[len("/etc/") :]
+        self.assertIn(
+            'environment.etc."%s".text = flakeRev + "\\n";' % stamp,
+            nix_code(REPO / "nix" / "base.nix"),
+        )
+
     def test_the_stamps_the_rebuild_reads_are_the_ones_base_nix_writes(self):
         body = guest_script_function("cmd_rebuild")
         read = set(re.findall(r'read_stamp "\$\{YOLOBOX_STAMPS\}/([a-z-]+)"', body))

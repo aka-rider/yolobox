@@ -802,6 +802,7 @@ class TestRebuild(GuestScript):
                         "nixos-rebuild",
                         action,
                         "--impure",
+                        "--refresh",
                         "--flake",
                         REF + "#yolobox",
                     ],

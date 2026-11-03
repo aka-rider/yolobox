@@ -831,7 +831,9 @@ read_stamp() {
 # come from the stamps of the build that made the box, so a hand rebuild can
 # neither rename an -m machine nor switch trees. A different ref goes through
 # `yo bootstrap --version` on the host. Only switch and boot, because they are
-# the actions that keep the box what yo built.
+# the actions that keep the box what yo built. The flags are yo's
+# NIX_REBUILD_FLAGS: --refresh, because a stamped branch moves and nix would
+# reuse an hour-old fetch of it.
 cmd_rebuild() {
     if [ "$#" -ne 1 ] || { [ "$1" != switch ] && [ "$1" != boot ]; }; then
         printf 'yolobox-guest: rebuild: usage: rebuild switch|boot\n' >&2
@@ -853,7 +855,7 @@ cmd_rebuild() {
     host=$(read_stamp "${YOLOBOX_STAMPS}/hostname") || exit 1
     user=$(id -un)
     exec sudo env "YOLOBOX_USERNAME=${user}" "YOLOBOX_HOSTNAME=${host}" \
-        "YOLOBOX_FLAKE_REF=${ref}" nixos-rebuild "${action}" --impure --flake "${ref}#yolobox"
+        "YOLOBOX_FLAKE_REF=${ref}" nixos-rebuild "${action}" --impure --refresh --flake "${ref}#yolobox"
 }
 
 main() {

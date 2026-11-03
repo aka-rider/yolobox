@@ -195,11 +195,40 @@ def rebuild_hint() -> str:
             return "run %s with a flake ref the box should build from, then retry" % (
                 state.yo_cmd("bootstrap", "--version", "<ref>")
             )
-    return "%s sudo %s nixos-rebuild switch --impure --flake %s" % (
+    return "%s sudo %s nixos-rebuild switch %s --flake %s" % (
         state.yo_cmd("ssh"),
         " ".join(nix_env("$(id -un)", ref)),
+        " ".join(NIX_REBUILD_FLAGS),
         shlex.quote(ref + "#yolobox"),
     )
+
+
+# The flags of every nixos-rebuild yo runs or prints, and yolobox-guest's
+# `rebuild` passes the same (tests/test_consistency.py). --impure lets the
+# flake read the nix_env variables. --refresh refetches the ref: a branch
+# moves, and nix would otherwise reuse a fetch younger than tarball-ttl (an
+# hour) and silently build the commit it held then.
+NIX_REBUILD_FLAGS = ("--impure", "--refresh")
+
+
+def nixos_rebuild_argv(action: str, username: str, ref: str) -> List[str]:
+    """The box's `sudo ... nixos-rebuild ACTION` from `ref`, as one argv."""
+    return [
+        "sudo",
+        *nix_env(username, ref),
+        "nixos-rebuild",
+        action,
+        *NIX_REBUILD_FLAGS,
+        "--flake",
+        "%s#yolobox" % ref,
+    ]
+
+
+# The commit a box's system was built from (nix/base.nix). The running one is
+# under /etc; the one a `nixos-rebuild boot` just built, not booted yet, is
+# under the system profile.
+FLAKE_REV_STAMP = "/etc/yolobox/flake-rev"
+BUILT_FLAKE_REV_STAMP = "/nix/var/nix/profiles/system" + FLAKE_REV_STAMP
 
 
 def built_by() -> Optional[str]:
@@ -208,6 +237,11 @@ def built_by() -> Optional[str]:
         sshx.probe(sshx.OPERATOR, ["cat", "/etc/yolobox/version"]).stdout.strip()
         or None
     )
+
+
+def built_rev(stamp: str = FLAKE_REV_STAMP) -> Optional[str]:
+    """The commit in `stamp`; None for a system built before the stamp existed."""
+    return sshx.probe(sshx.OPERATOR, ["cat", stamp]).stdout.strip() or None
 
 
 def helper_skew(what: str) -> str:

@@ -251,7 +251,8 @@ class TestFlakeRef(FakeHome):
         self.remember("github:x/y/z")
         self.assertIn(
             "sudo YOLOBOX_USERNAME=$(id -un) "
-            "YOLOBOX_HOSTNAME=yolobox YOLOBOX_FLAKE_REF=github:x/y/z nixos-rebuild",
+            "YOLOBOX_HOSTNAME=yolobox YOLOBOX_FLAKE_REF=github:x/y/z nixos-rebuild "
+            "switch --impure --refresh --flake 'github:x/y/z#yolobox'",
             yo.rebuild_hint(),
         )
 
@@ -947,6 +948,8 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
                 return mock.Mock(returncode=0, stdout=df_output(df_line), stderr="")
             if "nixos-rebuild" in argv:
                 rebuilds.append(argv)
+            if argv == ["cat", yo.release.BUILT_FLAKE_REV_STAMP]:
+                return mock.Mock(returncode=0, stdout=self.built_rev, stderr="")
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         args = yo.build_parser().parse_args(["bootstrap", "--version", "github:x/y/z"])
@@ -958,14 +961,31 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
             mock.patch.object(yo.sshconfig, "ensure_ssh_config_include"),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=fake_ssh_run),
             mock.patch.object(yo.vm, "guest_generations", return_value=("g1", "g1")),
-            mock.patch.object(yo.ui, "out"),
+            mock.patch.object(yo.ui, "out") as fake_out,
             mock.patch.object(yo.ui, "err") as fake_err,
         ):
             try:
                 yo.cmd_bootstrap(args)
             finally:
                 self.stderr = " ".join(call.args[0] for call in fake_err.call_args_list)
+                self.stdout = [call.args[0] for call in fake_out.call_args_list]
         return rebuilds
+
+    built_rev = "0123456789abcdef0123456789abcdef01234567\n"
+
+    def test_the_build_names_the_commit_the_ref_resolved_to(self):
+        self.run_bootstrap("crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /")
+        self.assertIn(
+            "built github:x/y/z at 0123456789abcdef0123456789abcdef01234567",
+            " ".join(self.stdout),
+        )
+
+    def test_a_generation_built_before_the_stamp_says_so(self):
+        self.built_rev = ""
+        self.run_bootstrap("crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /")
+        self.assertIn(
+            "built github:x/y/z at an unrecorded commit", " ".join(self.stdout)
+        )
 
     def test_an_unencrypted_disk_gets_the_no_interruption_warning(self):
         rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /")
@@ -973,16 +993,22 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
         self.assertIn("encrypts /dev/vda2 in place", self.stderr)
         self.assertIn("must not be interrupted", self.stderr)
 
-    def test_the_rebuild_names_the_username_hostname_and_ref(self):
+    def test_the_rebuild_refetches_the_ref_and_names_the_user_hostname_and_ref(self):
+        # --refresh: a branch moves, and nix reuses an hour-old fetch of it.
         rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /")
         self.assertEqual(
-            rebuilds[0][:5],
+            rebuilds[0],
             [
                 "sudo",
                 "YOLOBOX_USERNAME=%s" % yo.host_user(),
                 "YOLOBOX_HOSTNAME=yolobox",
                 "YOLOBOX_FLAKE_REF=github:x/y/z",
                 "nixos-rebuild",
+                "boot",
+                "--impure",
+                "--refresh",
+                "--flake",
+                "github:x/y/z#yolobox",
             ],
         )
 
@@ -2491,6 +2517,35 @@ class TestCmdStatusExitCode(StatusRunner, unittest.TestCase):
             self.assertPassesTheRun(
                 ssh_answer=self.answers(["cat"], stdout=A_RELEASE + "\n")
             )
+
+    def test_the_version_line_names_the_commit_the_box_was_built_from(self):
+        def answer(role, argv):
+            stamps = {
+                "/etc/yolobox/version": A_RELEASE + "\n",
+                yo.release.FLAKE_REV_STAMP: "0123abc\n",
+            }
+            if argv[:1] == ["cat"] and argv[1] in stamps:
+                return mock.Mock(returncode=0, stdout=stamps[argv[1]], stderr="")
+            return None
+
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
+            outs = self.assertPassesTheRun(ssh_answer=answer)
+        self.assertIn(
+            "yolobox: host yo %s, box built by %s from commit 0123abc"
+            % (A_RELEASE, A_RELEASE),
+            outs,
+        )
+
+    def test_a_box_built_before_the_commit_stamp_says_so(self):
+        outs = self.run_status(ssh_answer=self.answers(["cat"], stdout=""))
+        line = [out for out in outs if out.startswith("yolobox: host yo")][0]
+        self.assertTrue(
+            line.endswith(
+                "from commit unknown (box built before %s existed)"
+                % yo.release.FLAKE_REV_STAMP
+            ),
+            line,
+        )
 
     def test_optional_or_unchecked_things_do_not_fail_the_run(self):
         optional = {
