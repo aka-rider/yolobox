@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 
 from . import agent, forwards, guest, proc, release, sshconfig, sshx, state, ui, unlock
 from .config import FILE_MODE_PRIVATE, GIB, LUKS_DEVICE
+from .driver import NO_SIZE, Size
 from .sshx import AGENT, OPERATOR
 from .ui import Report, YoError
 from .unlock import BootStage
@@ -33,7 +34,9 @@ DISK_FSTYPE_LUKS = "crypto_LUKS"
 
 
 def vm_up(
-    run_services: bool = True, passphrase: Optional[bytes] = None
+    run_services: bool = True,
+    passphrase: Optional[bytes] = None,
+    size: Size = NO_SIZE,
 ) -> Optional[bytes]:
     gaps = state.driver().config_gaps()
     if gaps and state.driver().gaps_are_fatal:
@@ -42,12 +45,15 @@ def vm_up(
         ui.err("yo: %s" % state.driver().config_gap_message(gaps))
     status = state.driver().vm_status()
     if status is None:
-        refusal = state.driver().creation_refusal()
+        refusal = state.driver().creation_refusal(size)
         if refusal is not None:
             raise YoError(refusal)
+    elif size.asked:
+        # The one place for both drivers, and before the passphrase is asked for.
+        raise YoError(state.driver().existing_size_refusal(size))
     if status != "Running":
         passphrase = passphrase or agent.luks_passphrase()
-        state.driver().start(passphrase)
+        state.driver().start(passphrase, size)
     else:
         stage = unlock.boot_stage()
         if stage is BootStage.NONE:
@@ -130,11 +136,20 @@ def in_place_encryption_warning() -> str:
     )
 
 
+def asked_size(args: argparse.Namespace) -> Size:
+    """The size the --memory and --disk of `yo up` or `yo bootstrap` ask for."""
+    return Size(args.memory, args.disk)
+
+
+def cmd_up(args: argparse.Namespace) -> None:
+    vm_up(size=asked_size(args))
+
+
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     report = Report()
     ref = args.version if args.version is not None else release.flake_ref(None)
 
-    passphrase = vm_up(run_services=False)
+    passphrase = vm_up(run_services=False, size=asked_size(args))
     report.ok("VM up")
 
     disk = classify_disk(luks_device_fstype())

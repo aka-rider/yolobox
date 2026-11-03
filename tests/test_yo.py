@@ -1910,20 +1910,15 @@ class TestDiskGrowSize(unittest.TestCase):
         with self.assertRaises(Reached):
             self.parse("10")
 
-    def test_unicode_digit_passes_validation(self):
-        with self.assertRaises(Reached):
-            self.parse("٥")  # Arabic-indic digit five
-
-    def test_rejects_non_whole_number(self):
-        self.assertIn("whole number of GiB", self.parse_error("1e3"))
-
-    def test_rejects_zero(self):
-        self.assertIn("greater than 0 GiB", self.parse_error("0"))
-
-    def test_rejects_negative(self):
-        # int("-1") parses cleanly, so this is caught by the positivity check,
-        # not the whole-number check — see the deviation note in the report.
-        self.assertIn("greater than 0 GiB", self.parse_error("-1"))
+    def test_rejects_what_is_not_a_whole_number_above_zero(self):
+        # int() takes the last four; ٥ is the Arabic-Indic five.
+        for value in ("1e3", "0", "-1", "٥", "+10", " 10 ", "1_0"):
+            with self.subTest(value=value):
+                self.assertIn(
+                    "disk-grow size must be a whole number of GiB greater than 0, "
+                    "got '%s'" % value,
+                    self.parse_error(value),
+                )
 
     def test_requires_exactly_one_argument(self):
         stderr = io.StringIO()
@@ -1931,6 +1926,65 @@ class TestDiskGrowSize(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 yo.build_parser().parse_args(["disk-grow"])
         self.assertEqual(caught.exception.code, 2)
+
+
+class TestBoxSizeFlags(unittest.TestCase):
+    """--memory and --disk of the commands that create a box."""
+
+    def parse(self, *argv):
+        return yo.build_parser().parse_args(list(argv))
+
+    def parse_error(self, *argv):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                self.parse(*argv)
+        self.assertEqual(caught.exception.code, 2)
+        return stderr.getvalue()
+
+    def test_the_smallest_box_and_a_larger_one_are_accepted(self):
+        for command in ("up", "bootstrap"):
+            with self.subTest(command=command):
+                smallest = self.parse(command, "--memory", "8", "--disk", "40")
+                self.assertEqual((smallest.memory, smallest.disk), (8, 40))
+                larger = self.parse(command, "--memory", "24", "--disk", "250")
+                self.assertEqual((larger.memory, larger.disk), (24, 250))
+
+    def test_no_flag_asks_for_nothing(self):
+        args = self.parse("up")
+        self.assertEqual((args.memory, args.disk), (None, None))
+
+    def test_what_is_not_a_whole_number_of_gib_above_zero_is_refused(self):
+        values = ("lizard", "24.5", "1e3", "", "NaN", "inf", "0", "-1")
+        # int() takes all of these, and none is how a size is written (٤٠ is
+        # 40 in Arabic-Indic digits).
+        lookalikes = ("2_4", "+24", " 24 ", "٤٠")
+        for flag in ("--memory", "--disk"):
+            for value in values + lookalikes:
+                with self.subTest(flag=flag, value=value):
+                    self.assertIn(
+                        "%s must be a whole number of GiB greater than 0, got '%s'"
+                        % (flag, value),
+                        self.parse_error("up", flag + "=" + value),
+                    )
+
+    def test_a_box_below_the_floor_is_refused_saying_why(self):
+        memory = self.parse_error("up", "--memory", "7")
+        self.assertIn("--memory must be at least 8 GiB, got 7", memory)
+        self.assertIn("OOM-killed", memory)
+        disk = self.parse_error("bootstrap", "--disk", "39")
+        self.assertIn("--disk must be at least 40 GiB, got 39", disk)
+        self.assertIn("swapfile", disk)
+
+    def test_an_abbreviated_flag_is_not_the_flag(self):
+        self.assertIn(
+            "unrecognized arguments: --mem", self.parse_error("up", "--mem", "24")
+        )
+
+    def test_only_the_commands_that_create_a_box_take_a_size(self):
+        self.assertIn(
+            "unrecognized arguments", self.parse_error("down", "--memory", "24")
+        )
 
 
 AWS_CONFIG_TEXT = """[default]

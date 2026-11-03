@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, NamedTuple, Optional, Tuple
 
 from . import proc
-from .config import LOOPBACK, MAX_PORT, SCRIPT_DIR
+from .config import KIB, LOOPBACK, MAX_PORT, SCRIPT_DIR
 from .ui import YoError
 
 
@@ -83,6 +83,8 @@ QEMU_NS = "{http://libvirt.org/schemas/domain/qemu/1.0}"
 
 GUEST_SSH_PORT = 22
 PORT_RANGE_FILE = "/proc/sys/net/ipv4/ip_local_port_range"
+MEMINFO_FILE = "/proc/meminfo"
+MEMTOTAL_RE = re.compile(r"^MemTotal:\s+(\d+) kB$", re.M)
 GAP_DEVICE = "device:%s"
 GAP_DEVICE_TYPE = "device:%s[type=%s]"
 GAP_DEVICE_BACKEND = "device:%s[backend=%s]"
@@ -154,6 +156,19 @@ def read_port_window() -> range:
             return host_port_window(handle.read())
     except OSError as failure:
         raise YoError("cannot read %s: %s" % (PORT_RANGE_FILE, failure.strerror))
+
+
+def host_memory_bytes() -> int:
+    """The host's MemTotal: the most memory a domain can be given."""
+    try:
+        with open(MEMINFO_FILE, "r") as handle:
+            text = handle.read()
+    except OSError as failure:
+        raise YoError("cannot read %s: %s" % (MEMINFO_FILE, failure.strerror))
+    found = MEMTOTAL_RE.search(text)
+    if found is None:
+        raise YoError("%s has no MemTotal line in kB" % MEMINFO_FILE)
+    return int(found.group(1)) * KIB
 
 
 class Seclabel(NamedTuple):

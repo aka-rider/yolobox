@@ -71,6 +71,8 @@ A Linux PC (Fedora, x86_64, with KVM) runs the box under libvirt instead of Lima
    yo bootstrap
    ```
 
+   The box gets 16 GiB of memory and a 100 GiB disk. To size it, pass the sizes in GiB to the first `yo up` (or to `yo bootstrap`, if it creates the box): `yo up --memory 24 --disk 250`. The size is set only when the box is created, so choose the disk before the first boot. See [Sizing a box](docs/linux-host.md#sizing-a-box).
+
 5. Add `Include ~/.local/state/yolobox/instances/yolobox/ssh.config` to `~/.ssh/config` (`yo bootstrap` offers to).
 6. To open a VM port on the host, run `yo port <guest-port>`. It prints the `127.0.0.1` port it chose.
 

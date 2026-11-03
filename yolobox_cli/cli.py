@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import re
 import signal
-from typing import Sequence
+from typing import Callable, Sequence
 
 from . import config, cp, forwards, proc, release, session, sshx, state, status, ui, vm
-from .config import DEFAULT_INSTANCE, MAX_PORT
+from .config import (
+    DEFAULT_INSTANCE,
+    MAX_PORT,
+    MIN_DISK_GIB,
+    MIN_DISK_WHY,
+    MIN_MEMORY_GIB,
+    MIN_MEMORY_WHY,
+)
 from .driver import Driver
 from .ui import YoError
 
@@ -65,16 +73,47 @@ def guest_port_number(value: str) -> int:
     return int(value)
 
 
-def disk_grow_size(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError:
+def whole_gib(label: str, value: str) -> int:
+    if not proc.is_ascii_number(value) or int(value) == 0:
         raise argparse.ArgumentTypeError(
-            "disk-grow size must be a whole number of GiB, got '%s'" % value
+            "%s must be a whole number of GiB greater than 0, got '%s'" % (label, value)
         )
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("disk-grow size must be greater than 0 GiB")
-    return parsed
+    return int(value)
+
+
+def box_gib(label: str, floor: int, why: str) -> Callable[[str], int]:
+    """argparse `type=` of a box size: whole GiB, and at least `floor` because `why`."""
+
+    def parse(value: str) -> int:
+        parsed = whole_gib(label, value)
+        if parsed < floor:
+            raise argparse.ArgumentTypeError(
+                "%s must be at least %d GiB, got %d: %s" % (label, floor, parsed, why)
+            )
+        return parsed
+
+    return parse
+
+
+def add_size_arguments(parser: argparse.ArgumentParser) -> None:
+    """--memory and --disk, for the commands that can create a box."""
+    parser.add_argument(
+        "--memory",
+        metavar="GiB",
+        type=box_gib("--memory", MIN_MEMORY_GIB, MIN_MEMORY_WHY),
+        default=None,
+        help="the memory of a box yo creates (at least %d). Refused for a box "
+        "that exists; on macOS yo prints the limactl create command to run "
+        "instead" % MIN_MEMORY_GIB,
+    )
+    parser.add_argument(
+        "--disk",
+        metavar="GiB",
+        type=box_gib("--disk", MIN_DISK_GIB, MIN_DISK_WHY),
+        default=None,
+        help="the disk of a box yo creates (at least %d), refused like --memory"
+        % MIN_DISK_GIB,
+    )
 
 
 DIRECTORY_RESOLUTION_EPILOG = (
@@ -140,7 +179,8 @@ def build_parser() -> argparse.ArgumentParser:
         "or unlocked, asks 1Password (Touch ID) for the yolobox-disk key; a box that\n"
         "is already up needs no prompt. Safe to run again.",
     )
-    up.set_defaults(func=lambda args: vm.vm_up())
+    add_size_arguments(up)
+    up.set_defaults(func=vm.cmd_up)
 
     down = add("down", "Stop the VM.", "Stop the VM.")
     down.set_defaults(func=lambda args: state.driver().stop())
@@ -176,6 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
         "aka-rider/yolobox (main) or github:OWNER/REPO/REF "
         "(github:you/yolobox/x); default: this yo's own release",
     )
+    add_size_arguments(bootstrap)
     bootstrap.set_defaults(func=vm.cmd_bootstrap)
 
     gc = add(
@@ -222,7 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
         "If a grow failed after the ceiling was raised, repeat the same size: the\n"
         "ceiling edit is skipped and only the mapping and filesystem are grown.",
     )
-    disk_grow.add_argument("size", type=disk_grow_size, metavar="GiB")
+    disk_grow.add_argument(
+        "size", type=functools.partial(whole_gib, "disk-grow size"), metavar="GiB"
+    )
     disk_grow.set_defaults(func=vm.cmd_disk_grow)
 
     ssh = add(

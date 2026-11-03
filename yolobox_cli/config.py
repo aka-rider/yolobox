@@ -51,6 +51,18 @@ KIB = 1024
 MIB = 1024 * KIB
 GIB = 1024 * MIB
 
+# The smallest box `yo up --memory/--disk` creates, and why
+# (yo.md#several-machines). The reasons are printed with a refused flag.
+MIN_MEMORY_GIB = 8
+MIN_MEMORY_WHY = (
+    "the box builds its own system, and with less the nix evaluator is OOM-killed"
+)
+MIN_DISK_GIB = 40
+MIN_DISK_WHY = (
+    "the box holds a 16 GiB swapfile plus the nix store of its first build, and "
+    "a smaller disk fills up"
+)
+
 # Modes of the files yo writes: the owner alone, or world-readable (no secrets).
 FILE_MODE_PRIVATE = 0o600
 FILE_MODE_READABLE = 0o644

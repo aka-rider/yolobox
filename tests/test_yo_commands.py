@@ -649,10 +649,33 @@ class TestBootstrapRebootDecision(FakeHome):
         self.assertEqual(
             [call.kwargs for call in yo.vm_up.call_args_list],
             [
-                {"run_services": False},
+                {"run_services": False, "size": yo.NO_SIZE},
                 {"run_services": False, "passphrase": yo.vm_up.return_value},
             ],
         )
+
+    def test_the_size_asked_for_reaches_only_the_first_vm_up(self):
+        args = yo.build_parser().parse_args(
+            [
+                "bootstrap",
+                "--version",
+                "github:x/y/z",
+                "--memory",
+                "24",
+                "--disk",
+                "250",
+            ]
+        )
+        with (
+            mock.patch.object(
+                yo.vm, "guest_generations", side_effect=[("g1", "g0"), ("g1", "g1")]
+            ),
+            mock.patch.object(yo.proc, "run"),
+        ):
+            yo.cmd_bootstrap(args)
+        first, second = yo.vm_up.call_args_list
+        self.assertEqual(first.kwargs["size"], yo.Size(memory_gib=24, disk_gib=250))
+        self.assertEqual(second.kwargs.get("size", yo.NO_SIZE), yo.NO_SIZE)
 
     def test_the_passphrase_is_derived_before_the_vm_stops(self):
         # A missing 1Password key must leave the running box alone.
@@ -673,7 +696,7 @@ class TestBootstrapRebootDecision(FakeHome):
 
     def test_vm_up_brings_the_vm_up_without_services(self):
         self.run_bootstrap([("g1", "g1")])
-        yo.vm_up.assert_called_once_with(run_services=False)
+        yo.vm_up.assert_called_once_with(run_services=False, size=yo.NO_SIZE)
 
     def test_vm_services_runs_once_after_deciding_the_generation_already_matches(self):
         self.run_bootstrap([("g1", "g1")])

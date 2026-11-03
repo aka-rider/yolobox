@@ -3,7 +3,7 @@
   <metadata>
     <yolobox:instance xmlns:yolobox='https://github.com/aka-rider/yolobox'>$name</yolobox:instance>
   </metadata>
-  <memory unit='GiB'>16</memory>
+  <memory unit='GiB'>$memory_gib</memory>
   <vcpu placement='static'>8</vcpu>
   <os firmware='efi'>
     <type arch='x86_64' machine='q35'>hvm</type>

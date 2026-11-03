@@ -319,8 +319,8 @@ class TestVmUpOnARunningBoxWithoutSshd(unittest.TestCase):
 
 
 class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
-    def vm_up(self, instance):
-        """Run vm_up on an instance limactl does not know; return error and stubs."""
+    def vm_up(self, instance, size=yo.NO_SIZE, info=None):
+        """Run vm_up on an instance limactl reports as `info`; return error and stubs."""
         stubs = {}
         with contextlib.ExitStack() as stack:
             stack.enter_context(as_instance(instance))
@@ -338,10 +338,10 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
                 mock.patch.object(yo.LIMA, "config_gaps", return_value=[])
             )
             stack.enter_context(
-                mock.patch.object(yo.lima, "lima_instance_info", return_value=None)
+                mock.patch.object(yo.lima, "lima_instance_info", return_value=info)
             )
             try:
-                yo.vm_up()
+                yo.vm_up(size=size)
             except yo.YoError as failure:
                 return failure, stubs
         return None, stubs
@@ -349,16 +349,101 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
     def test_a_missing_instance_fails_before_touch_id_and_before_limactl_start(self):
         error, stubs = self.vm_up(INSTANCE_B)
         self.assertIn("limactl create --name second", error.message)
-        stubs["luks_passphrase"].assert_not_called()
-        stubs["start"].assert_not_called()
-        stubs["spawn"].assert_not_called()
-        stubs["run"].assert_not_called()
+        self.assert_refused_before_anything(stubs)
 
     def test_the_default_instance_is_still_created_when_missing(self):
         error, stubs = self.vm_up(yo.DEFAULT_INSTANCE)
         self.assertIsNone(error)
         stubs["luks_passphrase"].assert_called_once_with()
         stubs["start"].assert_called_once()
+
+    def assert_refused_before_anything(self, stubs):
+        stubs["luks_passphrase"].assert_not_called()
+        stubs["start"].assert_not_called()
+        stubs["spawn"].assert_not_called()
+        stubs["run"].assert_not_called()
+
+    def test_a_sized_default_instance_is_left_to_limactl_create(self):
+        error, stubs = self.vm_up(yo.DEFAULT_INSTANCE, yo.Size(24, 250))
+        self.assertIn(
+            "limactl create --name yolobox --memory 24 --disk 250 %s\n"
+            % (yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
+            error.message,
+        )
+        self.assertNotIn("--set", error.message)
+        self.assertTrue(
+            error.message.endswith(
+                "then run this command again without --memory 24 --disk 250"
+            )
+        )
+        self.assert_refused_before_anything(stubs)
+
+    def test_a_sized_named_instance_also_needs_its_own_port(self):
+        error, stubs = self.vm_up(INSTANCE_B, yo.Size(None, 250))
+        self.assertIn(
+            "limactl create --name second --set '.ssh.localPort=<free port>' "
+            "--disk 250 %s" % (yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
+            error.message,
+        )
+        self.assertNotIn("--memory", error.message)
+        self.assertTrue(
+            error.message.endswith("then run this command again without --disk 250")
+        )
+        self.assert_refused_before_anything(stubs)
+
+    STOPPED = yo.LimaInfo(
+        host_agent_pid=None,
+        port_forwards=[],
+        mounts=[],
+        forward_agent=False,
+        status="Stopped",
+        over_vsock=False,
+        propagate_proxy_env=False,
+        load_dot_ssh_pub_keys=False,
+        ssh_local_port=60023,
+    )
+
+    def test_memory_for_an_instance_that_exists_names_limactl_edit(self):
+        error, stubs = self.vm_up(INSTANCE_B, yo.Size(24, None), info=self.STOPPED)
+        self.assertIn("second already exists", error.message)
+        self.assertIn("drop --memory 24", error.message)
+        self.assertIn(
+            "stop it (yo -m second down), then: limactl edit --yes second --memory 24",
+            error.message,
+        )
+        self.assertNotIn("limactl delete", error.message)
+        self.assert_refused_before_anything(stubs)
+
+    def test_a_disk_for_an_instance_that_exists_names_disk_grow_and_the_loss(self):
+        error, stubs = self.vm_up(INSTANCE_B, yo.Size(None, 250), info=self.STOPPED)
+        self.assertIn("drop --disk 250", error.message)
+        self.assertIn(
+            "keeping what is on it: yo -m second disk-grow 250", error.message
+        )
+        self.assertIn("everything on it is lost: limactl delete second", error.message)
+        self.assertNotIn("limactl edit", error.message)
+        self.assert_refused_before_anything(stubs)
+
+
+class TestLimaStartNeverDropsASize(unittest.TestCase):
+    """start() is reached with a size only when vm_up's own refusal was skipped."""
+
+    def start(self, exists):
+        with (
+            as_instance(INSTANCE_B),
+            mock.patch.object(yo.lima, "lima_instance_exists", return_value=exists),
+            mock.patch.object(yo.proc, "spawn") as spawn,
+            self.assertRaises(yo.YoError) as caught,
+        ):
+            yo.LIMA.start(b"pass", yo.Size(24, None))
+        spawn.assert_not_called()
+        return caught.exception.message
+
+    def test_an_instance_that_exists_is_refused_as_vm_up_would(self):
+        self.assertIn("limactl edit --yes second --memory 24", self.start(True))
+
+    def test_a_missing_instance_is_left_to_limactl_create(self):
+        self.assertIn("limactl create --name second", self.start(False))
 
 
 class TestVmUpOnALimaConfigGap(unittest.TestCase):

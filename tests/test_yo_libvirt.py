@@ -45,6 +45,9 @@ DAEMON_VERSION_TEXT = (
     "Running against daemon: %s\n"
 )
 PASST_DIR = "/run/libvirt/qemu/passt"
+HOST_MEMORY_GIB = 64
+# The virsh subcommands that only look.
+READS = frozenset({"list", "dumpxml", "domstate", "vol-list", "vol-info"})
 
 
 def getfacl_listing(entry="rwx", mask="rwx", comment=True):
@@ -183,7 +186,9 @@ class FakeHost:
             self.capacity[args[1]] = int(args[2])
             return completed()
         if sub == "vol-resize":
-            self.capacity[args[2]] = 100 << 30
+            gib = re.fullmatch(r"(\d+)G", args[3])
+            assert gib, args
+            self.capacity[args[2]] = int(gib.group(1)) << 30
             return completed()
         if sub == "vol-upload":
             self.volumes[args[2]] = Path(args[3]).read_bytes()
@@ -201,7 +206,9 @@ class FakeHost:
         return completed()
 
     def tagged_domain(self, name, port, address="127.0.0.1"):
-        xml = self.box.domain_xml(name, port, VM_UID, VM_GID)
+        xml = self.box.domain_xml(
+            name, port, VM_UID, VM_GID, self.box.LIBVIRT_MEMORY_GIB
+        )
         self.domains["yolobox-" + name] = xml.replace(
             "address='127.0.0.1'", "address='%s'" % address
         )
@@ -229,12 +236,22 @@ class LibvirtCase(FakeHome):
             self.addCleanup(patcher.stop)
         self.range_file = Path(self.home) / "port_range"
         self.range_file.write_text(EPHEMERAL_RANGE)
-        patcher = mock.patch.object(
-            self.box.libvirt_host, "PORT_RANGE_FILE", str(self.range_file)
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.meminfo = Path(self.home) / "meminfo"
+        self.host_memory(HOST_MEMORY_GIB << 20)
+        for name, path in (
+            ("PORT_RANGE_FILE", self.range_file),
+            ("MEMINFO_FILE", self.meminfo),
+        ):
+            patcher = mock.patch.object(self.box.libvirt_host, name, str(path))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.driver = self.box.box.driver
+
+    def host_memory(self, kib):
+        """The host's MemTotal, as /proc/meminfo prints it."""
+        self.meminfo.write_text(
+            "MemTotal:       %d kB\nMemFree:         1048576 kB\n" % kib
+        )
 
     def lock_held(self):
         """Whether another process would have to wait for the port lock."""
@@ -261,8 +278,8 @@ LIBVIRT_STORED_DOMAIN = """\
   <metadata>
     <yolobox:instance xmlns:yolobox="https://github.com/aka-rider/yolobox">yolobox</yolobox:instance>
   </metadata>
-  <memory unit='KiB'>16777216</memory>
-  <currentMemory unit='KiB'>16777216</currentMemory>
+  <memory unit='KiB'>MEMORY_KIB</memory>
+  <currentMemory unit='KiB'>MEMORY_KIB</currentMemory>
   <vcpu placement='static'>8</vcpu>
   <resource>
     <partition>/machine</partition>
@@ -390,7 +407,9 @@ LIBVIRT_STORED_DOMAIN = """\
 
 class TestDomainTemplate(LibvirtCase):
     def render(self, name="box", port=FIRST_PORT):
-        return self.box.domain_xml(name, port, VM_UID, VM_GID)
+        return self.box.domain_xml(
+            name, port, VM_UID, VM_GID, self.box.LIBVIRT_MEMORY_GIB
+        )
 
     def devices(self, xml):
         return [child.tag for child in ET.fromstring(xml).find("devices")]
@@ -466,7 +485,9 @@ class TestDomainTemplate(LibvirtCase):
         self.assertEqual(self.gaps(self.box.parse_domain(xml)), ["device:shmem"])
 
     def test_a_domain_as_libvirt_stores_it_after_define_has_no_gap(self):
-        xml = LIBVIRT_STORED_DOMAIN.replace("+955:+953", "+%d:+%d" % (VM_UID, VM_GID))
+        xml = LIBVIRT_STORED_DOMAIN.replace(
+            "+955:+953", "+%d:+%d" % (VM_UID, VM_GID)
+        ).replace("MEMORY_KIB", str(self.box.LIBVIRT_MEMORY_GIB << 20))
         self.assertEqual(self.gaps(self.box.parse_domain(xml), "yolobox"), [])
 
     def test_both_host_entropy_devices_are_no_gap(self):
@@ -695,7 +716,9 @@ class TestPortAllocation(LibvirtCase):
     def test_the_driver_skips_ports_other_boxes_forward_but_not_other_domains(self):
         self.host.tagged_domain("first", FIRST_PORT)
         self.host.tagged_domain("second", FIRST_PORT + 1)
-        untagged = self.box.domain_xml("x", FIRST_PORT + 2, VM_UID, VM_GID)
+        untagged = self.box.domain_xml(
+            "x", FIRST_PORT + 2, VM_UID, VM_GID, self.box.LIBVIRT_MEMORY_GIB
+        )
         self.host.domains["plain"] = re.sub(
             r"<metadata>.*</metadata>", "", untagged, flags=re.S
         )
@@ -1226,8 +1249,62 @@ class TestStatusAndGaps(LibvirtCase):
             self.driver.config_gap_message(["device:tpm"]),
         )
 
-    def test_any_valid_name_is_created(self):
-        self.assertIsNone(self.driver.creation_refusal())
+    def refusal(self, memory_gib=None, disk_gib=None):
+        return self.driver.creation_refusal(self.box.Size(memory_gib, disk_gib))
+
+    def finished_volume(self, gib):
+        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+        self.host.capacity["yolobox-box.qcow2"] = gib << 30
+
+    def test_any_valid_name_and_size_is_created_where_there_is_no_volume(self):
+        self.assertIsNone(self.refusal())
+        self.assertIsNone(self.refusal(memory_gib=24, disk_gib=250))
+
+    def test_memory_up_to_what_the_host_has_is_created(self):
+        self.host_memory(24 << 20)
+        self.assertIsNone(self.refusal(memory_gib=24))
+
+    def test_more_memory_than_the_host_has_is_refused(self):
+        self.host_memory((24 << 20) - 1)
+        refusal = self.refusal(memory_gib=24)
+        self.assertIn("--memory 24 is more than this host has", refusal)
+        self.assertIn("MemTotal 24.0 GiB", refusal)
+
+    def test_the_default_memory_is_not_held_to_the_host(self):
+        # A 16 GiB host reports a little under 16 GiB.
+        self.host_memory((self.box.LIBVIRT_MEMORY_GIB << 20) - 1)
+        self.assertIsNone(self.refusal())
+
+    def test_a_host_memory_yo_cannot_read_is_an_error(self):
+        for text in ("", "MemTotal: lizard kB\n", "MemTotal: 1 MB\n"):
+            with self.subTest(text=text):
+                self.meminfo.write_text(text)
+                with self.assertRaisesRegex(self.box.YoError, "no MemTotal line"):
+                    self.refusal(memory_gib=24)
+        self.meminfo.unlink()
+        with self.assertRaisesRegex(self.box.YoError, "cannot read"):
+            self.refusal(memory_gib=24)
+
+    def test_a_disk_size_the_kept_volume_does_not_have_is_refused(self):
+        self.finished_volume(100)
+        refusal = self.refusal(disk_gib=250)
+        self.assertIn("100 GiB", refusal)
+        self.assertIn("--disk 250", refusal)
+        self.assertIn("drop --disk", refusal)
+        self.assertIn(
+            "virsh -c qemu:///system vol-delete --pool default yolobox-box.qcow2",
+            refusal,
+        )
+
+    def test_the_kept_volumes_own_size_or_memory_alone_is_created(self):
+        self.finished_volume(100)
+        self.assertIsNone(self.refusal(disk_gib=100))
+        self.assertIsNone(self.refusal(memory_gib=24))
+
+    def test_an_unfinished_volume_is_rebuilt_at_any_disk_size(self):
+        self.host.volumes["yolobox-box.qcow2"] = b""
+        self.host.capacity["yolobox-box.qcow2"] = 4096
+        self.assertIsNone(self.refusal(disk_gib=250))
 
     def test_the_disk_image_is_the_pool_volumes_allocation(self):
         self.assertIsNone(self.driver.disk_image())
@@ -1444,6 +1521,38 @@ class TestStop(LibvirtCase):
             self.driver.stop()
 
 
+class TestUpWithASize(LibvirtCase):
+    """`yo up --memory/--disk` on a host where the box has no domain yet."""
+
+    def up(self, *flags):
+        with (
+            mock.patch.object(self.driver, "require_tool"),
+            mock.patch.object(self.box.agent, "luks_passphrase") as passphrase,
+            self.assertRaises(self.box.YoError) as caught,
+        ):
+            self.box.main(["-m", "box", "up", *flags])
+        passphrase.assert_not_called()
+        for write in ("vol-delete", "vol-create-as", "define", "start"):
+            self.assertNotIn(write, self.host.subcommands())
+        return caught.exception.message
+
+    def test_a_disk_the_kept_volume_does_not_have_is_refused_before_the_passphrase(
+        self,
+    ):
+        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+        self.host.capacity["yolobox-box.qcow2"] = 100 << 30
+        refusal = self.up("--disk", "250")
+        self.assertIn("finished 100 GiB disk", refusal)
+        self.assertIn("--disk 250", refusal)
+        self.assertEqual(self.host.volumes["yolobox-box.qcow2"], b"a whole disk")
+
+    def test_more_memory_than_the_host_has_is_refused_before_the_passphrase(self):
+        refusal = self.up("--memory", str(HOST_MEMORY_GIB + 1))
+        self.assertIn(
+            "--memory %d is more than this host has" % (HOST_MEMORY_GIB + 1), refusal
+        )
+
+
 class TestVmUpWithAGap(LibvirtCase):
     def test_a_domain_that_is_not_what_the_template_made_is_never_started(self):
         self.host.tagged_domain("box", FIRST_PORT)
@@ -1467,6 +1576,34 @@ class TestVmUpWithAGap(LibvirtCase):
         with self.assertRaises(self.box.YoError) as caught:
             self.box.vm_up()
         self.assertIn("seclabel.dac", caught.exception.message)
+
+    def test_a_size_for_a_domain_that_exists_is_refused_before_the_passphrase(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.states["yolobox-box"] = "shut off"
+        with mock.patch.object(self.box.agent, "luks_passphrase") as passphrase:
+            with self.assertRaises(self.box.YoError) as caught:
+                self.box.vm_up(size=self.box.Size(24, None))
+        self.assertIn("box already exists", caught.exception.message)
+        self.assertIn("drop --memory 24", caught.exception.message)
+        self.assertIn(
+            "keeping the disk: yo -m box down && virsh -c qemu:///system undefine "
+            "--nvram yolobox-box, then",
+            caught.exception.message,
+        )
+        self.assertNotIn("vol-delete", caught.exception.message)
+        passphrase.assert_not_called()
+        self.assertNotIn("start", self.host.subcommands())
+
+    def test_a_disk_for_a_domain_that_exists_names_the_delete_and_the_loss(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.states["yolobox-box"] = "shut off"
+        with self.assertRaises(self.box.YoError) as caught:
+            self.box.vm_up(size=self.box.Size(24, 250))
+        self.assertIn("drop --memory 24 --disk 250", caught.exception.message)
+        self.assertIn(
+            "everything on it is lost: %s" % self.driver.delete_command(),
+            caught.exception.message,
+        )
 
     def test_only_the_libvirt_driver_stops_on_a_gap(self):
         self.assertTrue(self.driver.gaps_are_fatal)
@@ -1549,7 +1686,7 @@ class TestInitrdListener(LibvirtCase):
 
 
 class TestStart(LibvirtCase):
-    def start(self):
+    def start(self, memory_gib=None, disk_gib=None):
         seed = Path(self.home) / "seed.qcow2"
         seed.write_bytes(b"Q" * 4096)
         with (
@@ -1564,7 +1701,7 @@ class TestStart(LibvirtCase):
                 self.box.libvirt, "loopback_port_bound", return_value=False
             ),
         ):
-            self.driver.start(b"pass")
+            self.driver.start(b"pass", self.box.Size(memory_gib, disk_gib))
         return unlock
 
     def test_a_new_instance_gets_its_volumes_then_its_domain_then_starts(self):
@@ -1593,6 +1730,40 @@ class TestStart(LibvirtCase):
             set(self.host.volumes), {"yolobox-box.qcow2", "yolobox-box-cidata.iso"}
         )
         unlock.assert_called_once_with(b"pass")
+
+    def memory(self):
+        """The <memory> of the defined domain, as (unit, value)."""
+        element = ET.fromstring(self.host.domains["yolobox-box"]).find("memory")
+        return element.get("unit"), element.text
+
+    def test_a_box_given_no_size_gets_the_default_memory_and_disk(self):
+        self.start()
+        self.assertEqual(self.memory(), ("GiB", str(self.box.LIBVIRT_MEMORY_GIB)))
+        self.assertEqual(
+            self.host.capacity["yolobox-box.qcow2"], self.box.LIBVIRT_DISK_GIB << 30
+        )
+
+    def test_a_box_is_created_at_the_size_asked_for(self):
+        self.start(memory_gib=24, disk_gib=250)
+        self.assertEqual(self.memory(), ("GiB", "24"))
+        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 250 << 30)
+
+    def test_memory_alone_leaves_the_disk_at_its_default(self):
+        self.start(memory_gib=24)
+        self.assertEqual(self.memory(), ("GiB", "24"))
+        self.assertEqual(
+            self.host.capacity["yolobox-box.qcow2"], self.box.LIBVIRT_DISK_GIB << 30
+        )
+
+    def test_a_size_for_a_domain_that_appeared_since_vm_up_looked_is_refused(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.states["yolobox-box"] = "shut off"
+        with self.assertRaises(self.box.YoError) as caught:
+            self.start(memory_gib=24)
+        self.assertIn("box already exists", caught.exception.message)
+        self.assertEqual(
+            [sub for sub in self.host.subcommands() if sub not in READS], []
+        )
 
     def test_a_passt_directory_the_vm_user_cannot_write_in_refuses_the_start(self):
         self.host.acl = getfacl_listing(mask="r-x")
@@ -1646,7 +1817,7 @@ class TestStart(LibvirtCase):
         self.assertFalse(os.path.exists(built_from))
         self.assertEqual(
             sorted(os.listdir(self.box.instance_dir())),
-            ["cidata", "disk.done", "domain.xml", "operator.pub", "ssh.config"],
+            ["cidata", "domain.xml", "operator.pub", "ssh.config"],
         )
         staged = Path(self.box.instance_dir()) / "cidata"
         self.assertEqual(
@@ -1763,7 +1934,7 @@ class TestStart(LibvirtCase):
                 self.start()
         self.assertEqual(
             sorted(os.listdir(self.box.instance_dir())),
-            ["cidata", "disk.done", "domain.xml", "operator.pub", "ssh.config"],
+            ["cidata", "domain.xml", "operator.pub", "ssh.config"],
         )
         self.assertIn(
             "LIMA_CIDATA_USER=alice",
@@ -1798,7 +1969,6 @@ class TestDiskVolume(LibvirtCase):
     def setUp(self):
         super().setUp()
         os.makedirs(self.box.instance_dir())
-        self.marker = Path(self.box.instance_dir()) / "disk.done"
         seed = Path(self.home) / "seed.qcow2"
         seed.write_bytes(b"Q" * 4096)
         patcher = mock.patch.object(
@@ -1809,16 +1979,7 @@ class TestDiskVolume(LibvirtCase):
 
     def ensure(self):
         with contextlib.redirect_stderr(io.StringIO()):
-            self.driver.ensure_disk_volume()
-
-    def test_a_new_volume_is_marked_done_only_after_the_resize(self):
-        self.host.fail["vol-resize"] = "no space"
-        with self.assertRaisesRegex(self.box.YoError, "no space"):
-            self.ensure()
-        self.assertFalse(self.marker.exists())
-        self.host.fail.clear()
-        self.ensure()
-        self.assertTrue(self.marker.exists())
+            self.driver.ensure_disk_volume(100)
 
     def test_a_volume_whose_resize_failed_is_deleted_and_rebuilt(self):
         self.host.fail["vol-resize"] = "no space"
@@ -1842,28 +2003,24 @@ class TestDiskVolume(LibvirtCase):
         self.host.capacity["yolobox-box.qcow2"] = 4096
         self.ensure()
         self.assertIn("vol-delete", self.host.subcommands())
-        self.assertTrue(self.marker.exists())
+        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 100 << 30)
 
-    def test_a_marked_volume_is_left_alone(self):
-        self.host.volumes["yolobox-box.qcow2"] = b"data"
-        self.marker.write_text("")
-        self.ensure()
-        self.assertEqual(self.host.subcommands(), ["vol-list"])
-        self.assertEqual(self.host.volumes["yolobox-box.qcow2"], b"data")
-
-    def test_a_full_size_volume_from_before_the_marker_is_adopted_not_deleted(self):
+    def test_a_volume_of_the_smallest_box_size_is_adopted_as_it_is(self):
         self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+        self.host.capacity["yolobox-box.qcow2"] = 40 << 30
         self.ensure()
-        self.assertNotIn("vol-delete", self.host.subcommands())
+        self.assertEqual(
+            [sub for sub in self.host.subcommands() if sub not in READS], []
+        )
         self.assertEqual(self.host.volumes["yolobox-box.qcow2"], b"a whole disk")
-        self.assertTrue(self.marker.exists())
+        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 40 << 30)
 
-    def test_a_marker_without_its_volume_does_not_vouch_for_the_next_one(self):
-        self.marker.write_text("")
-        self.host.fail["vol-resize"] = "no space"
-        with self.assertRaisesRegex(self.box.YoError, "no space"):
-            self.ensure()
-        self.assertFalse(self.marker.exists())
+    def test_a_volume_below_the_smallest_box_size_is_rebuilt(self):
+        self.host.volumes["yolobox-box.qcow2"] = b"half a disk"
+        self.host.capacity["yolobox-box.qcow2"] = 39 << 30
+        self.ensure()
+        self.assertIn("vol-delete", self.host.subcommands())
+        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 100 << 30)
 
 
 class FakeReply(io.BytesIO):

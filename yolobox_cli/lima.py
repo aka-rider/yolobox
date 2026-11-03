@@ -22,6 +22,7 @@ from .config import (
     SCRIPT_DIR,
     USAGE_EXIT,
 )
+from .driver import NO_SIZE, Size
 from .ui import RunTimeout, YoError
 
 
@@ -309,10 +310,23 @@ class LimaDriver:
             code=USAGE_EXIT,
         )
 
-    def create_command(self) -> str:
-        return "limactl create --name %s --set '.ssh.localPort=<free port>' %s" % (
-            state.box.name,
-            SCRIPT_DIR / "lima" / "yolobox.yaml",
+    def create_command(self, size: Size) -> str:
+        # lima/yolobox.yaml fixes the default instance's port; any other needs its own.
+        port = (
+            []
+            if state.box.name == DEFAULT_INSTANCE
+            else ["--set", ".ssh.localPort=<free port>"]
+        )
+        return shlex.join(
+            [
+                "limactl",
+                "create",
+                "--name",
+                state.box.name,
+                *port,
+                *size.flags(),
+                str(SCRIPT_DIR / "lima" / "yolobox.yaml"),
+            ]
         )
 
     def ssh_port(self) -> int:
@@ -328,7 +342,7 @@ class LimaDriver:
         if info is None:
             raise YoError(
                 "instance %s does not exist, so yo cannot learn its ssh port — create "
-                "it with:\n    %s" % (state.box.name, self.create_command())
+                "it with:\n    %s" % (state.box.name, self.create_command(NO_SIZE))
             )
         port = info.ssh_local_port
         if (
@@ -340,7 +354,7 @@ class LimaDriver:
                 "%s has ssh.localPort %r, which is not a fixed port. With 0 lima picks a "
                 "new port on every start, and yo must know it before the first one. "
                 "Create the instance with:\n    %s"
-                % (state.box.name, port, self.create_command())
+                % (state.box.name, port, self.create_command(NO_SIZE))
             )
         return port
 
@@ -358,14 +372,43 @@ class LimaDriver:
         info = lima_instance_info()
         return info.status if info is not None else None
 
-    def creation_refusal(self) -> Optional[str]:
-        # Only the default instance is created here, from lima/yolobox.yaml. Any
-        # other needs a port yo can know, which only its creator can choose.
+    def creation_refusal(self, size: Size) -> Optional[str]:
+        # Only the default instance is created here, from lima/yolobox.yaml, and
+        # at its size. Any other needs a port yo can know, which only its creator
+        # can choose, and a size is limactl's to set.
+        if size.asked:
+            return self.sized_creation_refusal(size)
         if state.box.name == DEFAULT_INSTANCE:
             return None
         return "instance %s does not exist — create it with:\n    %s" % (
             state.box.name,
-            self.create_command(),
+            self.create_command(NO_SIZE),
+        )
+
+    def sized_creation_refusal(self, size: Size) -> str:
+        return (
+            "yo does not size a lima instance — create %s with:\n    %s\n"
+            "then run this command again without %s"
+            % (state.box.name, self.create_command(size), " ".join(size.flags()))
+        )
+
+    def existing_size_refusal(self, size: Size) -> str:
+        ways = []
+        if size.memory_gib is not None:
+            ways.append(
+                "for the memory, stop it (%s), then: limactl edit --yes %s --memory %d"
+                % (state.yo_cmd("down"), state.box.name, size.memory_gib)
+            )
+        if size.disk_gib is not None:
+            ways.append(
+                "to grow the disk, keeping what is on it: %s (a smaller disk means "
+                "deleting the box, and everything on it is lost: %s)"
+                % (state.yo_cmd("disk-grow", str(size.disk_gib)), self.delete_command())
+            )
+        return (
+            "%s already exists, and limactl sized it when it was created — drop %s, "
+            "or:\n    %s\nthen run this command again without them"
+            % (state.box.name, " ".join(size.flags()), "\n    ".join(ways))
         )
 
     def config_gaps(self) -> List[str]:
@@ -440,7 +483,16 @@ class LimaDriver:
     def verify_initrd_listener(self, port: int) -> None:
         pass  # lima's hostagent, which owns the port, runs as the host user
 
-    def start(self, passphrase: bytes) -> None:
+    def start(self, passphrase: bytes, size: Size) -> None:
+        # lima/yolobox.yaml or limactl sizes the instance, never yo: vm_up has
+        # refused any size before the passphrase, and this keeps one from
+        # being dropped should a caller skip that.
+        if size.asked:
+            raise YoError(
+                self.existing_size_refusal(size)
+                if lima_instance_exists()
+                else self.sized_creation_refusal(size)
+            )
         if lima_instance_exists():
             start_argv = ["limactl", "start", "--yes", state.box.name]
         else:
