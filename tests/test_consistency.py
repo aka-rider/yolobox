@@ -6,7 +6,9 @@ to one side alone fails here instead of on a user's box.
 """
 
 import ast
+import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -921,6 +923,38 @@ class TestStage2SshdIsToldApartWithoutALogin(unittest.TestCase):
         allow = re.search(r'AllowUsers = \[ "\$\{username\}@([0-9.]+)"', self.base())
         self.assertIsNotNone(allow, "base.nix admits the operator from no address")
         self.assertEqual(self.setting("PerSourcePenaltyExemptList"), allow.group(1))
+
+
+class TestGithubHostKeysAreThePublishedOnes(unittest.TestCase):
+    """nix/base.nix pins github.com's host keys; each must have the fingerprint
+    GitHub publishes, computed as ssh-keygen -l does (SHA-256 of the key blob,
+    base64 without padding)."""
+
+    PUBLISHED = {
+        "ssh-ed25519": "+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
+        "ecdsa-sha2-nistp256": "p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM",
+        "ssh-rsa": "uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s",
+    }
+
+    def keys(self):
+        found = re.findall(
+            r'hostNames = \[ "github\.com" \];\s*publicKey = "(\S+) (\S+)";',
+            nix_code(REPO / "nix" / "base.nix"),
+        )
+        self.assertTrue(found, "base.nix pins no github.com host key")
+        return found
+
+    def test_every_published_key_type_is_pinned_once(self):
+        self.assertEqual(
+            sorted(kind for kind, _ in self.keys()), sorted(self.PUBLISHED)
+        )
+
+    def test_each_key_has_its_published_fingerprint(self):
+        for kind, blob in self.keys():
+            with self.subTest(kind=kind):
+                digest = hashlib.sha256(base64.b64decode(blob)).digest()
+                fingerprint = base64.b64encode(digest).decode().rstrip("=")
+                self.assertEqual(fingerprint, self.PUBLISHED[kind])
 
 
 class TestTheIncludeLineServesBothDrivers(unittest.TestCase):

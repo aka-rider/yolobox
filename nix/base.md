@@ -98,6 +98,18 @@ Three changes close it:
 
 Recognise it: every `yo` command fails with `kex_exchange_identification: Connection reset by peer` for a few seconds to minutes, `yo status` says `unreachable`, and `journalctl -u sshd` in the box shows `activating ipv4 penalty` for 192.168.5.2. On a box built before the exemption, wait out the penalty (at most 600 s); then rebuild.
 
+## github.com host keys
+
+The bring-up ends with each account cloning its dotfiles from GitHub over ssh on its first login. Without a pinned key, ssh stops that first clone at a trust-on-first-use prompt, and a script that runs it unattended fails with `Host key verification failed`. So `programs.ssh.knownHosts` pins github.com's three published host keys, and NixOS writes them to `/etc/ssh/ssh_known_hosts`, which ssh reads for every account, the operator's and the agent's alike.
+
+The keys are GitHub's published ones, with these fingerprints (GitHub's documentation lists the same):
+
+- ED25519 `SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`
+- ECDSA `SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM`
+- RSA `SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s`
+
+`TestGithubHostKeysAreThePublishedOnes` computes each key's fingerprint as `ssh-keygen -l` does and compares it with this list, and CI's eval job runs `ssh-keygen -lf` on the evaluated keys. `tests/box-hardening-check.sh` has the agent connect to github.com with an empty user `known_hosts` and strict checking, so only this file can vouch. When GitHub rotates a key, ssh reports the host key as changed until it is replaced here; replace the key and its fingerprint in the list and the test together.
+
 ## Hostname
 
 `networking.hostName` is the `hostname` that `flake.nix` threads in, from the optional `YOLOBOX_HOSTNAME` (default `yolobox`, one lowercase DNS label, see [docs/distribution.md](../docs/distribution.md#nix-flake-check-throws-with-no-explanation)). `yo` passes `yolobox` for the default machine and `yolobox-<name>` for `-m <name>`, so two boxes on one tailnet do not fight over the node name `yolobox`. The same name goes to `tailscale set --hostname` (see [nix/tailscale.md](tailscale.md)). A manual `nixos-rebuild` of a named machine without `YOLOBOX_HOSTNAME` renames the box back to `yolobox`; `rebuild_hint()` prints the variable for that reason. The box stamps its hostname into `/etc/yolobox/hostname`, and `yolobox-guest rebuild switch`, the rebuild to run inside the box, reads it from there (see [nix/guest/yolobox-guest.md](guest/yolobox-guest.md#rebuild)).

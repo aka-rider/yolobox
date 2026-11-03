@@ -132,6 +132,21 @@ jobs:
               { echo "YOLOBOX_HOST_OS=$value changed the box"; exit 1; }
           done
 
+      # The guest trusts github.com through these pinned keys, so each must
+      # be the key GitHub publishes (nix/base.md, "github.com host keys").
+      - name: Check the github.com host keys have the published fingerprints
+        run: |
+          $NIX_EVAL --json .#nixosConfigurations.yolobox.config.programs.ssh.knownHosts \
+            | python3 -c 'import json, sys; [print(" ".join(h["hostNames"]), h["publicKey"]) for h in json.load(sys.stdin).values()]' \
+            > known_hosts
+          ssh-keygen -lf known_hosts | awk '{print $2, $3}' | sort > fingerprints
+          printf '%s\n' \
+            'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU github.com' \
+            'SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM github.com' \
+            'SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s github.com' \
+            | sort > published
+          diff -u published fingerprints
+
       # A commit that changes only docs must not change the box's system: a new
       # generation costs every box a reboot (and a 1Password approval) at its
       # next bootstrap. A commit stamp in /etc did exactly that, so yo

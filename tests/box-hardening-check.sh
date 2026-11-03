@@ -431,6 +431,24 @@ check_guestagent() {
     ok "${unit} is skipped: the cidata has no guest agent binary"
 }
 
+# The agent's first `git clone git@github.com:...` must not stop at a
+# trust-on-first-use prompt: /etc/ssh/ssh_known_hosts pins github.com
+# (nix/base.md). An empty user known_hosts leaves only that file to vouch.
+check_github_host_keys() {
+    local out status=0
+    ssh-keygen -F github.com -f /etc/ssh/ssh_known_hosts >/dev/null ||
+        fail "/etc/ssh/ssh_known_hosts has no github.com key"
+    out=$(as_agent ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -T git@github.com 2>&1) || status=$?
+    case ${out} in
+    *"Host key verification failed"*)
+        fail "the agent does not trust github.com's host key from /etc/ssh/ssh_known_hosts: ${out}" ;;
+    *"successfully authenticated"* | *"Permission denied"*) ;;
+    *) fail "ssh to github.com as the agent ended neither in auth nor a refusal (exit ${status}): ${out}" ;;
+    esac
+    ok "the agent trusts github.com's host key without a prompt"
+}
+
 # The in-box rebuild chokepoint exists and refuses a call without an action.
 check_rebuild_helper() {
     local status=0 out
@@ -550,6 +568,7 @@ compat_checks() {
     check_no_host_os_stamp
     check_guestagent
     check_rebuild_helper
+    check_github_host_keys
 }
 
 main() {
