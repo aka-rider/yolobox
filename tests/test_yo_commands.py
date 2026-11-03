@@ -671,6 +671,10 @@ class TestHelpExitsZero(unittest.TestCase):
 class TestBootstrapRebootDecision(FakeHome):
     def setUp(self):
         super().setUp()
+        # Resolving the ref is TestBootstrapWarnsBeforeEncryptingInPlace's.
+        locked = mock.patch.object(yo.release, "locked_rev", return_value="0" * 40)
+        locked.start()
+        self.addCleanup(locked.stop)
         for module, name in (
             (yo.vm, "vm_up"),
             (yo.forwards, "vm_services"),
@@ -938,6 +942,7 @@ class TestBootstrapRebootDecision(FakeHome):
 class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
     def run_bootstrap(self, fstype, df_line):
         rebuilds = self.rebuilds = []
+        self.resolved = []
 
         def fake_ssh_run(role, argv, **kwargs):
             if argv[:2] == ["lsblk", "-dno"]:
@@ -948,8 +953,9 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
                 return mock.Mock(returncode=0, stdout=df_output(df_line), stderr="")
             if "nixos-rebuild" in argv:
                 rebuilds.append(argv)
-            if argv == ["cat", yo.release.BUILT_FLAKE_REV_STAMP]:
-                return mock.Mock(returncode=0, stdout=self.built_rev, stderr="")
+            if argv[:3] == ["nix", "flake", "metadata"]:
+                self.resolved.append(argv)
+                return self.metadata
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         args = yo.build_parser().parse_args(["bootstrap", "--version", "github:x/y/z"])
@@ -971,21 +977,42 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
                 self.stdout = [call.args[0] for call in fake_out.call_args_list]
         return rebuilds
 
-    built_rev = "0123456789abcdef0123456789abcdef01234567\n"
+    REV = "0123456789abcdef0123456789abcdef01234567"
+    metadata = mock.Mock(
+        returncode=0, stdout=json.dumps({"locked": {"rev": REV}}), stderr=""
+    )
 
-    def test_the_build_names_the_commit_the_ref_resolved_to(self):
+    def test_the_build_names_the_commit_the_ref_resolves_to_before_it_runs(self):
         self.run_bootstrap("crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /")
-        self.assertIn(
-            "built github:x/y/z at 0123456789abcdef0123456789abcdef01234567",
-            " ".join(self.stdout),
+        self.assertIn("building github:x/y/z at %s" % self.REV, " ".join(self.stdout))
+        # --refresh, or nix would answer from an old fetch of a moving branch.
+        self.assertEqual(
+            self.resolved,
+            [["nix", "flake", "metadata", "--json", "--refresh", "github:x/y/z"]],
         )
 
-    def test_a_generation_built_before_the_stamp_says_so(self):
-        self.built_rev = ""
-        self.run_bootstrap("crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /")
-        self.assertIn(
-            "built github:x/y/z at an unrecorded commit", " ".join(self.stdout)
-        )
+    def test_a_ref_the_box_cannot_resolve_stops_before_the_build(self):
+        for metadata, needle in (
+            (mock.Mock(returncode=1, stdout="", stderr="no such ref"), "no such ref"),
+            (mock.Mock(returncode=0, stdout="{}", stderr=""), "no locked commit"),
+            (mock.Mock(returncode=0, stdout="lizard", stderr=""), "no locked commit"),
+            (
+                mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"locked": {"rev": "main"}}),
+                    stderr="",
+                ),
+                "not a commit",
+            ),
+        ):
+            with self.subTest(needle=needle):
+                self.metadata = metadata
+                with self.assertRaises(yo.YoError) as caught:
+                    self.run_bootstrap(
+                        "crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /"
+                    )
+                self.assertIn(needle, caught.exception.message)
+                self.assertEqual(self.rebuilds, [])
 
     def test_an_unencrypted_disk_gets_the_no_interruption_warning(self):
         rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /")
@@ -2517,35 +2544,6 @@ class TestCmdStatusExitCode(StatusRunner, unittest.TestCase):
             self.assertPassesTheRun(
                 ssh_answer=self.answers(["cat"], stdout=A_RELEASE + "\n")
             )
-
-    def test_the_version_line_names_the_commit_the_box_was_built_from(self):
-        def answer(role, argv):
-            stamps = {
-                "/etc/yolobox/version": A_RELEASE + "\n",
-                yo.release.FLAKE_REV_STAMP: "0123abc\n",
-            }
-            if argv[:1] == ["cat"] and argv[1] in stamps:
-                return mock.Mock(returncode=0, stdout=stamps[argv[1]], stderr="")
-            return None
-
-        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
-            outs = self.assertPassesTheRun(ssh_answer=answer)
-        self.assertIn(
-            "yolobox: host yo %s, box built by %s from commit 0123abc"
-            % (A_RELEASE, A_RELEASE),
-            outs,
-        )
-
-    def test_a_box_built_before_the_commit_stamp_says_so(self):
-        outs = self.run_status(ssh_answer=self.answers(["cat"], stdout=""))
-        line = [out for out in outs if out.startswith("yolobox: host yo")][0]
-        self.assertTrue(
-            line.endswith(
-                "from commit unknown (box built before %s existed)"
-                % yo.release.FLAKE_REV_STAMP
-            ),
-            line,
-        )
 
     def test_optional_or_unchecked_things_do_not_fail_the_run(self):
         optional = {

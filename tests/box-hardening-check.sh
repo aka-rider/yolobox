@@ -431,15 +431,6 @@ check_guestagent() {
     ok "${unit} is skipped: the cidata has no guest agent binary"
 }
 
-# The box names the commit it was built from, so a stale build of a moving
-# branch shows (docs/distribution.md).
-check_flake_rev_stamp() {
-    local file=/etc/yolobox/flake-rev rev
-    rev=$(cat "${file}") || fail "${file} is missing: the box does not name its commit"
-    [[ ${rev} =~ ^[0-9a-f]{40}(-dirty)?$ ]] || fail "${file} holds '${rev}', not a commit"
-    ok "the box was built from commit ${rev}"
-}
-
 # The in-box rebuild chokepoint exists and refuses a call without an action.
 check_rebuild_helper() {
     local status=0 out
@@ -557,7 +548,6 @@ compat_checks() {
     fi
     check_operator_login_refused "$(id -un)"
     check_no_host_os_stamp
-    check_flake_rev_stamp
     check_guestagent
     check_rebuild_helper
 }

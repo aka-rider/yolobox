@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pwd
 import re
@@ -224,13 +225,6 @@ def nixos_rebuild_argv(action: str, username: str, ref: str) -> List[str]:
     ]
 
 
-# The commit a box's system was built from (nix/base.nix). The running one is
-# under /etc; the one a `nixos-rebuild boot` just built, not booted yet, is
-# under the system profile.
-FLAKE_REV_STAMP = "/etc/yolobox/flake-rev"
-BUILT_FLAKE_REV_STAMP = "/nix/var/nix/profiles/system" + FLAKE_REV_STAMP
-
-
 def built_by() -> Optional[str]:
     """The yolobox version the box was built by; None for a box that predates the file."""
     return (
@@ -239,9 +233,35 @@ def built_by() -> Optional[str]:
     )
 
 
-def built_rev(stamp: str = FLAKE_REV_STAMP) -> Optional[str]:
-    """The commit in `stamp`; None for a system built before the stamp existed."""
-    return sshx.probe(sshx.OPERATOR, ["cat", stamp]).stdout.strip() or None
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def locked_rev(ref: str) -> str:
+    """The commit `ref` names now, fetched afresh by the box's own nix.
+
+    A branch moves, and the rebuild that follows refetches it too (--refresh),
+    so this is the commit it builds, barring a push in the seconds between.
+    Not stamped into the system: a stamp would make every commit a new
+    generation, and with it a reboot, even for one that changes only docs."""
+    completed = sshx.probe(
+        sshx.OPERATOR,
+        ["nix", "flake", "metadata", "--json", "--refresh", ref],
+    )
+    if completed.returncode != 0:
+        raise YoError(
+            "the box could not resolve %s (nix flake metadata, exit %d): %s"
+            % (ref, completed.returncode, completed.stderr.strip() or "no output")
+        )
+    try:
+        rev = json.loads(completed.stdout)["locked"]["rev"]
+    except (ValueError, KeyError, TypeError):
+        raise YoError(
+            "nix flake metadata printed no locked commit for %s: %s"
+            % (ref, completed.stdout.strip()[:200] or "no output")
+        )
+    if not isinstance(rev, str) or not COMMIT_RE.fullmatch(rev):
+        raise YoError("nix flake metadata locked %s at %r, not a commit" % (ref, rev))
+    return rev
 
 
 def helper_skew(what: str) -> str:

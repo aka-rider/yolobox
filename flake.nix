@@ -66,12 +66,6 @@
         let r = builtins.getEnv "YOLOBOX_FLAKE_REF";
         in if builtins.match "github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*" r != null then r
         else throw "YOLOBOX_FLAKE_REF is \"${r}\" — set it to the flake ref you build from, github:OWNER/REPO/REF, and build with --impure (yo does this for you)";
-      # The exact commit the box is built from. A ref may name a branch that
-      # moves, and nix reuses a fetched branch for tarball-ttl, so the ref alone
-      # cannot tell a stale build from a fresh one. A github: flake and a clean
-      # checkout have rev; a dirty checkout has dirtyRev (`<rev>-dirty`); a
-      # plain path has neither.
-      flakeRev = self.rev or self.dirtyRev or "unknown";
       guestSystem =
         let s = builtins.currentSystem;
         in if builtins.elem s linuxSystems then s
@@ -102,7 +96,7 @@
       nixosConfigurations.yolobox = builtins.seq hostname (builtins.seq flakeRef (nixpkgs.lib.nixosSystem {
         system = guestSystem;
         specialArgs = {
-          inherit username agentUser version hostname flakeRef flakeRev;
+          inherit username agentUser version hostname flakeRef;
         };
         modules = [
           # nixpkgs' pin can lag herdr, and a saved SSH machine needs the

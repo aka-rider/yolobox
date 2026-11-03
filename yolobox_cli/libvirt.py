@@ -543,9 +543,15 @@ class LibvirtDriver:
         a live master serves `yo port` and the forwards without 1Password.
         `-O check` proves only that the master process answers, so a session
         through it proves the connection; a master that fails it is dropped.
-        The lock keeps two yo from racing through this; the exit is only ever
-        aimed at a master this call saw answer and fail, never at one that
-        appeared after its check."""
+
+        master.lock orders only the yo processes that run this. Any other mux
+        ssh (ControlMaster auto, as every `mux=True` session is) can still open
+        a master without it. `-O exit` stops whatever master holds the control
+        socket when it runs, so one window is left: the dead master quits on its
+        own after the failed session, and another yo's mux ssh opens a new one,
+        both before this exit. While the dead master still holds the socket, a
+        mux ssh joins it rather than replacing it, so the window is that gap
+        alone; the other yo's session then fails, and its command reports it."""
         with self.master_lock():
             if self.master_alive():
                 if sshx.ssh_run(OPERATOR, ["true"], mux=True).returncode == 0:

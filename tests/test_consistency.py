@@ -883,13 +883,6 @@ class TestGuestRebuildMatchesYoAndTheBox(unittest.TestCase):
         self.assertEqual(tuple(found.group(1).split()), yo.release.NIX_REBUILD_FLAGS)
         self.assertIn("--refresh", yo.release.NIX_REBUILD_FLAGS)
 
-    def test_the_box_stamps_the_commit_where_yo_reads_it(self):
-        stamp = yo.release.FLAKE_REV_STAMP[len("/etc/") :]
-        self.assertIn(
-            'environment.etc."%s".text = flakeRev + "\\n";' % stamp,
-            nix_code(REPO / "nix" / "base.nix"),
-        )
-
     def test_the_stamps_the_rebuild_reads_are_the_ones_base_nix_writes(self):
         body = guest_script_function("cmd_rebuild")
         read = set(re.findall(r'read_stamp "\$\{YOLOBOX_STAMPS\}/([a-z-]+)"', body))
@@ -928,22 +921,6 @@ class TestStage2SshdIsToldApartWithoutALogin(unittest.TestCase):
         allow = re.search(r'AllowUsers = \[ "\$\{username\}@([0-9.]+)"', self.base())
         self.assertIsNotNone(allow, "base.nix admits the operator from no address")
         self.assertEqual(self.setting("PerSourcePenaltyExemptList"), allow.group(1))
-
-
-class TestMigrateConsoleLineIsTheUnitsDescription(unittest.TestCase):
-    """yo tells a person to read the console for the migrate unit's line, so the
-    line it quotes is the unit's description with the device filled in."""
-
-    def test_the_quoted_line_is_how_the_unit_describes_itself(self):
-        found = re.search(
-            r'description = "(Encrypt or finish encrypting \$\{device\} in place)',
-            nix_code(REPO / "nix" / "luks.nix"),
-        )
-        self.assertIsNotNone(found, "luks.nix has no migrate unit description")
-        self.assertEqual(
-            found.group(1).replace("${device}", yo.LUKS_DEVICE),
-            yo.unlock.MIGRATE_CONSOLE_LINE,
-        )
 
 
 class TestGuestProfilePatternMatchesYo(unittest.TestCase):

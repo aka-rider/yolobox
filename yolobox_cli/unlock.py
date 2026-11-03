@@ -54,10 +54,6 @@ LIMA_PRE_BOOT_STATUSES: Tuple[Optional[str], ...] = (
     "Stopped",
 )
 
-# What the console shows while the first boot encrypts the disk in place: the
-# description of the yolobox-luks-migrate unit (nix/luks.nix).
-MIGRATE_CONSOLE_LINE = "Encrypt or finish encrypting %s in place" % LUKS_DEVICE
-
 # RFC 4253 caps the identification line at 255 bytes.
 SSH_BANNER_MAX_BYTES = 255
 

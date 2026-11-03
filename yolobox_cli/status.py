@@ -362,16 +362,9 @@ def parse_net_check(text: str) -> Optional[NetCheck]:
 def status_guest_services(report: Report) -> None:
     guest_version = release.built_by()
     unknown_note = "unknown (box built before /etc/yolobox/version existed)"
-    # The commit, beside the version: a box rebuilt from a moving branch shows
-    # whether the build saw its latest commit (docs/distribution.md).
     ui.out(
-        "yolobox: host yo %s, box built by %s from commit %s"
-        % (
-            config.YO_VERSION,
-            guest_version or unknown_note,
-            release.built_rev()
-            or "unknown (box built before %s existed)" % release.FLAKE_REV_STAMP,
-        )
+        "yolobox: host yo %s, box built by %s"
+        % (config.YO_VERSION, guest_version or unknown_note)
     )
     drift = release.version_drift(config.YO_VERSION, guest_version)
     if drift:
@@ -567,8 +560,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         if detail:
             ui.err(detail)
         if stage is BootStage.UNKNOWN:
-            # The login line above already named a dead agent, if that is it.
-            report.warn("vm: %s" % vm.unknown_stage_message(None))
+            report.warn("vm: %s" % vm.unknown_stage_message(login))
         else:
             report.warn(
                 "vm: unreachable — is it up? start it with: %s" % state.yo_cmd("up")

@@ -1954,10 +1954,23 @@ class TestADeadAgent(LibvirtCase):
                 self.box.main(["-m", "box", "down"])
         message = caught.exception.message
         self.assertTrue(message.startswith("not stopping it: "), message)
-        self.assertIn("First fix the login: " + self.dead(), message)
+        self.assertIn("The login is the cause: " + self.dead(), message)
+        # The passphrase may have gone in earlier this boot: no force offered.
+        self.assertNotIn(self.driver.force_stop_command(), message)
         self.assertNotIn("shutdown", self.host.subcommands())
         self.assertNotIn("destroy", self.host.subcommands())
         self.assertEqual(self.driver.vm_status(), "Running")
+
+    def test_status_on_an_unidentified_sshd_offers_no_force_without_the_key(self):
+        # The passphrase may have gone in before 1Password died: fix it first.
+        with mock.patch.object(
+            self.box.unlock, "ssh_banner", return_value="SSH-2.0-OpenSSH_10.6"
+        ):
+            with self.assertRaises(self.box.YoError):
+                self.box.main(["-m", "box", "status"])
+        (vm_line,) = [line for line in self.lines if line.startswith("vm: ")]
+        self.assertIn("The login is the cause: " + self.dead(), vm_line)
+        self.assertNotIn(self.driver.force_stop_command(), vm_line)
 
     def test_a_reboot_with_a_cached_passphrase_still_names_the_agent(self):
         # bootstrap's second vm_up: the box stopped, the passphrase in hand.
@@ -2049,10 +2062,8 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
             self.addCleanup(patcher.stop)
 
     def assert_names_the_way_out(self, text):
-        # How to tell an encrypting initrd, and the force that is then safe;
-        # never "see yo status" or "yo up", which would only refuse again.
-        self.assertIn(self.driver.boot_log(), text)
-        self.assertIn(self.box.unlock.MIGRATE_CONSOLE_LINE, text)
+        # With the key on offer the refusal held all boot, so the force is
+        # safe; never "see yo status", which would only refuse again.
         self.assertIn(self.driver.force_stop_command(), text)
         self.assertNotIn("yo -m box status", text)
         self.assertNotIn("1Password", text)

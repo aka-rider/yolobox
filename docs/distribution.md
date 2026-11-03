@@ -44,9 +44,11 @@ Running `./yo` straight out of an unreleased clone gives no version to pin a ref
 
 A ref can name a branch, and a branch moves. nix caches a fetched `github:` ref for `tarball-ttl`, an hour by default, so a rebuild within that hour builds the commit the branch held at the first fetch. That once made `yo bootstrap --version <branch>` exit 0 with "already running the built generation" while the branch had moved on, and nothing in the box said which commit it was built from, because `/etc/yolobox/flake-ref` names only the ref.
 
-Two changes close it. Every rebuild `yo` runs or prints, and `yolobox-guest rebuild`, passes `--refresh` (`NIX_REBUILD_FLAGS` in `yolobox_cli/release.py`; the guest script spells the same flags, and a consistency test keeps them equal), so nix refetches the ref. And `nix/base.nix` stamps the commit the ref resolved to into `/etc/yolobox/flake-rev`, from the flake's `self.rev` (`<rev>-dirty` from `self.dirtyRev` for a dirty checkout, `unknown` for a plain path). `yo bootstrap` prints `built <ref> at <rev>`, read from the generation it just built, and `yo status` names the running commit in its version line. The stamp is a fact about the source, not the host, so the box is still the same derivation whatever host OS an older `yo` passes.
+Two changes close it. Every rebuild `yo` runs or prints, and `yolobox-guest rebuild`, passes `--refresh` (`NIX_REBUILD_FLAGS` in `yolobox_cli/release.py`; the guest script spells the same flags, and a consistency test keeps them equal), so nix refetches the ref. And before it builds, `yo bootstrap` resolves the ref in the box with `nix flake metadata --json --refresh <ref>` (`release.locked_rev()`) and prints `building <ref> at <commit>`. A ref the box cannot resolve stops the bootstrap there, with nix's own message, before anything is built.
 
-Recognise a stale build: `yo status` names a commit that is not the branch's tip (`ls-remote` against the repository on the host shows the tip).
+The commit is not stamped into the system. A stamp in `/etc` was tried: it made every commit a new generation, so a commit that changed only docs cost each box a reboot, and a 1Password approval, at its next bootstrap. CI's eval job checks that a docs-only change keeps the system derivation. The price is that a running box does not say which commit it came from; `yo bootstrap`'s line says it at build time, and the build, with `--refresh`, follows that line within the seconds between the two.
+
+Recognise a stale build: the `building <ref> at <commit>` line names a commit that is not the branch's tip (`ls-remote` against the repository on the host shows the tip).
 
 ### A ref older than the host-OS-free flake
 

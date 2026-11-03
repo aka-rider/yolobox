@@ -1,4 +1,4 @@
-{ config, pkgs, modulesPath, username, agentUser, lib, version, hostname, flakeRef, flakeRev, ... }:
+{ config, pkgs, modulesPath, username, agentUser, lib, version, hostname, flakeRef, ... }:
 let
   agentEnv = import ./lib/agent-env.nix {
     agentHome = config.users.users.${agentUser}.home;
@@ -369,9 +369,6 @@ in
   # them (nix/guest/yolobox-guest.md).
   environment.etc."yolobox/flake-ref".text = flakeRef + "\n";
   environment.etc."yolobox/hostname".text = hostname + "\n";
-  # The commit the ref resolved to at build time, so a stale build of a moving
-  # branch shows (`yo status`, `yo bootstrap`; docs/distribution.md).
-  environment.etc."yolobox/flake-rev".text = flakeRev + "\n";
 
   nix.settings.experimental-features = [ "nix-command" "flakes" "fetch-closure" "ca-derivations" ];
   nix.settings.auto-optimise-store = true;

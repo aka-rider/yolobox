@@ -238,29 +238,33 @@ def login_problem() -> Optional[str]:
 
 
 def unknown_stage_message(login: Optional[str]) -> str:
-    """What BootStage.UNKNOWN means and the way out of it; `login` is the login
-    problem to name first, None when there is none or it was said already."""
-    cause = (
-        "First fix the login: %s. Then yo can tell the two apart again. " % login
-        if login
-        else ""
-    )
-    return (
+    """What BootStage.UNKNOWN means and the way out of it, given the login
+    problem (login_problem()) or None when the login key is on offer.
+
+    The passphrase reaches an initrd only through yo's root login on the very
+    sshd that refused root now, and that initrd reads root's key once, as its
+    sshd starts. So a refusal while the key is on offer has held for the whole
+    boot: yo never handed this boot the passphrase, and nothing on it can be
+    encrypting. A refusal for want of the key proves nothing of the kind, as
+    the key may have worked earlier in the boot."""
+    seen = (
         "an sshd answers on 127.0.0.1:%d without the stage-2 banner and refused both "
         "the operator's key and root's, so yo cannot tell whether %s waits in its "
-        "initrd or runs. %sIts console tells which: %s. While it shows '%s' started "
-        "and not finished, the initrd is encrypting the disk and must not be powered "
-        "off. Once it shows the passphrase prompt with that unit finished or never "
-        "started, it is safe to force it off: %s, then %s"
-        % (
-            state.driver().ssh_port(),
-            state.box.name,
-            cause,
-            state.driver().boot_log(),
-            unlock.MIGRATE_CONSOLE_LINE,
-            state.driver().force_stop_command(),
-            state.yo_cmd("up"),
+        "initrd or runs" % (state.driver().ssh_port(), state.box.name)
+    )
+    if login is not None:
+        return (
+            "%s. The login is the cause: %s. Fix it, then run the command again: "
+            "yo then looks inside the initrd and stops it only while nothing is "
+            "encrypting its disk" % (seen, login)
         )
+    return (
+        "%s. It refused a key it is offered for its whole boot, so yo never gave "
+        "this boot the disk passphrase and nothing on it can be encrypting: it is "
+        "safe to force it off with %s, then %s (on a stage 2 built before the "
+        "banner mark that is a power cut of a running system, still no harm to "
+        "the encryption)"
+        % (seen, state.driver().force_stop_command(), state.yo_cmd("up"))
     )
 
 
@@ -337,6 +341,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
             )
         ui.err(in_place_encryption_warning())
 
+    # Resolved in the box first, so a branch that did not move, or one nix
+    # would have served from an old fetch, shows before the build.
+    report.ok("building %s at %s" % (ref, release.locked_rev(ref)))
     sshx.ssh_run(
         OPERATOR,
         release.nixos_rebuild_argv("boot", release.host_user(), ref),
@@ -356,10 +363,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
             os.remove(release.flake_ref_file())
         except FileNotFoundError:
             pass
-    # The commit the ref resolved to, read from the generation just built: a
-    # branch that did not move, or a fetch nix reused, shows here.
-    built = release.built_rev(release.BUILT_FLAKE_REV_STAMP)
-    report.ok("built %s at %s" % (ref, built or "an unrecorded commit"))
+    report.ok("built from %s" % ref)
 
     profile, booted = booted_generations(report)
     if profile == booted:
