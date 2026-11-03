@@ -230,18 +230,7 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
                 "device": yo.LUKS_DEVICE,
                 "label": self.LABEL,
                 "mapper": yo.LUKS_MAPPER,
-                "sshLocalPort": yo.SSH_LOCAL_PORT,
             },
-        )
-        self.assertEqual(
-            yaml_scalar(
-                dict(
-                    line.strip().split(":", 1)
-                    for line in yaml_block(self.text("lima", "yolobox.yaml"), "ssh")
-                    if ":" in line and not line.strip().startswith("#")
-                )["localPort"]
-            ),
-            facts["sshLocalPort"],
         )
 
     def test_luks_nix_takes_device_label_and_mapper_from_facts_nix(self):
@@ -287,7 +276,9 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
             'YOLOBOX_UNLOCK_UNTIL_UNIT = "systemd-cryptsetup@${facts.mapper}.service";',
             text,
         )
-        self.assertIn("YOLOBOX_SSH_LOCAL_PORT = toString facts.sshLocalPort;", text)
+        # The port differs per instance, so no initrd script may bake one in.
+        self.assertNotIn("SSH_LOCAL_PORT", text)
+        self.assertNotIn("sshLocalPort", text)
 
     def test_the_unlock_header_table_and_yo_agree_on_the_exit_codes(self):
         script = self.text("nix", "luks", "yolobox-unlock.sh")

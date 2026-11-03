@@ -182,6 +182,23 @@ print "no connection: $@";
 exit 0;
 EOF
 
+    # Runs as root of the agent's own user and network namespace (unshare -Urn).
+    # fq_codel must attach (it is the one qdisc that stays), then a u32
+    # classifier on it must be refused by the kernel. Exits 0 on that refusal,
+    # 3 when the classifier attached, 4 when fq_codel did not, 5 when the
+    # refusal is not "classifier not found" (so unshare or tc broke instead).
+    cat >"${WORK}/netsched.sh" <<'EOF'
+tc qdisc add dev lo root handle 1: fq_codel || exit 4
+if out=$(tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip dst 0.0.0.0/0 flowid 1:1 2>&1); then
+    echo "u32 attached"
+    exit 3
+fi
+case $out in
+*"TC classifier not found"*) echo "refused: $out"; exit 0 ;;
+*) echo "$out"; exit 5 ;;
+esac
+EOF
+
     # Starts a long sleep detached from this script and prints its pid.
     cat >"${WORK}/sleeper.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -247,6 +264,35 @@ check_modules() {
     ok "explicit modprobe of bluetooth is routed to bin/false"
 }
 
+# The agent is root of its own user and network namespace and can attach
+# traffic-control objects there, which autoloads the module behind each one.
+# The net/sched modules are blocked (nix/hardening.nix), except sch_fq_codel.
+check_net_sched() {
+    local out status=0 loaded
+    if out=$(as_agent unshare -Urn tc qdisc add dev lo root netem delay 1ms 2>&1); then
+        fail "the agent attached a netem qdisc in its own namespace (sch_netem autoloads)"
+    fi
+    case ${out} in
+    *"Specified qdisc kind is unknown"*) ;;
+    *) fail "tc qdisc add netem failed, but not with the kernel refusing the qdisc kind: ${out}" ;;
+    esac
+    ok "the agent cannot attach a netem qdisc (${out})"
+    out=$(as_agent unshare -Urn bash "${WORK}/netsched.sh" 2>&1) || status=$?
+    case ${status} in
+    0) ;;
+    3) fail "the agent attached a u32 classifier in its own namespace (cls_u32 autoloads): ${out}" ;;
+    4) fail "fq_codel did not attach in the agent's namespace, so the kept qdisc is broken: ${out}" ;;
+    *) fail "netsched.sh exited ${status}, not with the kernel refusing the classifier: ${out}" ;;
+    esac
+    ok "the agent cannot attach a u32 classifier (${out})"
+    loaded=$(lsmod | awk '$1 ~ /^(cls|act|sch)_/ && $1 != "sch_fq_codel" {print $1}')
+    [ -z "${loaded}" ] || fail "net/sched modules are loaded: $(echo ${loaded})"
+    out=$(modprobe -n -v cls_u32 2>&1) || fail "modprobe -n -v cls_u32 failed: ${out}"
+    printf '%s\n' "${out}" | grep -q 'bin/false' ||
+        fail "modprobe -n -v cls_u32 does not hit the install rule (want install ... bin/false): ${out}"
+    ok "no cls_, act_ or sch_ module is loaded but sch_fq_codel, and cls_u32 is routed to bin/false"
+}
+
 check_wrappers() {
     local want have name out caps expected_caps
     have=$(ls /run/wrappers/bin | sort -u)
@@ -302,6 +348,7 @@ hardening_checks() {
     check_sysctls
     check_cmdline
     check_modules
+    check_net_sched
     check_io_uring
     check_wrappers
     check_no_su
@@ -359,6 +406,16 @@ is_libvirt_guest() {
     local virt
     virt=$(systemd-detect-virt || true)
     [ "$(uname -m)" = x86_64 ] && [ "${virt}" = kvm ]
+}
+
+# The one qdisc that stays: net.core.default_qdisc is fq_codel.
+check_default_qdisc() {
+    local qdisc
+    qdisc=$(sysctl -n net.core.default_qdisc) || fail "could not read net.core.default_qdisc"
+    [ "${qdisc}" = fq_codel ] || fail "net.core.default_qdisc is '${qdisc}', not fq_codel"
+    as_agent unshare -Urn tc qdisc add dev lo root fq_codel ||
+        fail "the agent could not attach fq_codel in its own namespace"
+    ok "default qdisc is fq_codel and the agent can attach it"
 }
 
 check_podman() {
@@ -446,6 +503,7 @@ check_rosetta() {
 compat_checks() {
     check_net
     check_gateway_ssh_closed
+    check_default_qdisc
     check_podman
     check_chromium
     check_nix_build

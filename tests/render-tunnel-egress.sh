@@ -3,9 +3,9 @@
 # yolobox.network.tunnelInterfaces = [ "wg0" ], the render behind
 # tests/fixtures/egress-tunnel.nft. Run from the repo root with
 # YOLOBOX_USERNAME and YOLOBOX_HOST_OS set, in CI or in the guest
-# (nix/egress.md).
+# (nix/egress.md). Arguments go to nix eval, e.g. --system aarch64-linux.
 set -euo pipefail
-nix eval --impure --raw --expr '
+nix eval --impure --raw "$@" --expr '
   ((builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
     modules = [ { yolobox.network.tunnelInterfaces = [ "wg0" ]; } ];
   }).config.system.build.egressRules'

@@ -8,6 +8,14 @@
 
 Two facts make it survivable. First, ext4 reserves a share of the blocks for root (5% unless tuned), and `df`'s "Avail" column does not count them. The operator's `sudo`, over `yo ssh`, therefore still works while every unprivileged command dies. The agent has no `sudo` at all, so an agent session dying is not evidence either way about how full the disk actually is. Second, `yo ssh` reaches in from the host, which the full disk cannot hurt. That is why the remedy, `yo gc`, lives on the host, and why its machine tier runs first, as the operator.
 
+### A full disk looks like a DNS failure
+
+Symptom: name resolution fails on a box whose network is fine. When no block is left even for root, `dhcpcd` cannot write its lease or `/etc/resolv.conf` (`ENOSPC` in its log), so `resolv.conf` is empty, and `tailscaled` loops on DNS errors. Egress is dead while lima's gateway still answers DNS, which is also the shape of a VPN that owns the host's default route (see [host-network.md](host-network.md#vpn-shapes)). The root reserve above does not help here: the services that break run as root and use the reserve first.
+
+`yolobox-guest net-check` prints `rootdisk=full` when `/` has under 64 MiB left for root, and `yo status` then prints `network: WARNING the guest's root disk is full ...` instead of a VPN verdict. By hand: `df -h /` shows `Use%` near 100 and `stat -f /` shows `Free blocks` near 0. The remedy is `yo gc --yes`, which frees space by tier, and, if `/etc/resolv.conf` is still empty afterwards, `sudo systemctl restart dhcpcd` as the operator.
+
+The 16 GiB swapfile counts against this. A box on a small disk sets `yolobox.swapSizeMiB` in its `/etc/yolobox/local.nix` ([nix/base.md](../nix/base.md#memory-pressure)).
+
 ## Incidents
 
 Each entry below is a place that fills the disk, how to recognise it, and what the box does about it.

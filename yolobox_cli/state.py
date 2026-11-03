@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import pwd
 import re
+import sys
 from dataclasses import dataclass
+from typing import Iterator
 
-from .config import AGENT_USER, DEFAULT_INSTANCE
+from . import proc
+from .config import AGENT_USER, DEFAULT_INSTANCE, FILE_MODE_PRIVATE
 from .driver import Driver
+from .ui import YoError
+
+# sizeof(sockaddr_un.sun_path): a unix socket path of this many bytes or more cannot be bound.
+UNIX_SOCKET_PATH_LIMIT = 104 if sys.platform == "darwin" else 108
+# OpenSSH binds a master's socket at "<ControlPath>.<16 random characters>" and
+# renames it into place (mux.c, muxserver_listen), so that is the path the limit
+# applies to: the dot and the 16 characters come on top of the ControlPath.
+SSH_MUX_TEMP_SUFFIX_LENGTH = len(".") + 16
 
 
 def hostname_for(name: str) -> str:
@@ -129,9 +142,59 @@ def agent_control_path() -> str:
     return os.path.join(instance_dir(), "ssh-agent.sock")
 
 
+def require_control_path_fits() -> None:
+    """Raise a YoError naming the limit when the agent's ControlPath cannot be a unix
+    socket. ssh would exit 255 on it, which reads as a box that cannot be reached."""
+    path = agent_control_path()
+    length = len(os.fsencode(path)) + SSH_MUX_TEMP_SUFFIX_LENGTH
+    if length >= UNIX_SOCKET_PATH_LIMIT:
+        raise YoError(
+            "%s plus the %d bytes of ssh's temporary socket name is %d bytes, and a "
+            "unix socket path must be shorter than %d: "
+            "$HOME (%s) is too long for yo's ssh master socket"
+            % (
+                path,
+                SSH_MUX_TEMP_SUFFIX_LENGTH,
+                length,
+                UNIX_SOCKET_PATH_LIMIT,
+                home(),
+            )
+        )
+
+
 def known_hosts_path() -> str:
     return os.path.join(instance_dir(), "known_hosts")
 
 
 def state_dir() -> str:
     return os.path.join(home(), ".local/state/yolobox")
+
+
+class UnlockBusy(Exception):
+    """Another yo holds this box's unlock lock."""
+
+
+@contextlib.contextmanager
+def unlock_lock(wait: bool) -> Iterator[None]:
+    """Hold this box's exclusive host-side lock on its initrd's passphrase ask.
+
+    The one chokepoint between the yo that answers the ask and the yo that
+    powers the box off: whoever sends the passphrase holds it while sending, and
+    `yo down` holds it from its probe to the power-off, so the answer can never
+    land between the two. With `wait` False a held lock raises UnlockBusy
+    instead of blocking, which `yo down` turns into a refusal.
+    """
+    proc.private_dir(state_dir())
+    fd = os.open(
+        os.path.join(state_dir(), "%s.unlock.lock" % box.name),
+        os.O_RDWR | os.O_CREAT,
+        FILE_MODE_PRIVATE,
+    )
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise UnlockBusy()
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor drops the lock

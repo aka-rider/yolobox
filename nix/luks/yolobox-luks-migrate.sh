@@ -3,8 +3,6 @@
 # opened: encrypts the plain ext4 root in place, resumes an interrupted
 # encryption, or finishes one, depending on what it finds. A disk that already
 # carries the label is left alone and nothing is asked. See nix/luks.nix.
-# YOLOBOX_SSH_LOCAL_PORT (the Mac-side port of the initrd sshd) comes from
-# nix/luks/facts.nix through apps.nix.
 if [ "$#" -ne 3 ]; then
   echo "usage: yolobox-luks-migrate <device> <label> <mapper>" >&2
   exit 2
@@ -112,7 +110,7 @@ encrypt() {
   if [ "$need" -gt "$total" ]; then
     {
       echo "yolobox: ${device} is too full to encrypt in place: the shrunken filesystem plus LUKS headers need ${need} bytes of ${total}."
-      echo "The box stays in its initrd until space is freed by hand: ssh in as root on port ${YOLOBOX_SSH_LOCAL_PORT} (docs/disk-encryption.md#recognising-failures),"
+      echo "The box stays in its initrd until space is freed by hand: ssh in as root with the command yo printed above (docs/disk-encryption.md#recognising-failures),"
       echo "mount ${device} on /sysroot, delete build output, umount, then:"
       echo "  systemctl reset-failed yolobox-luks-migrate; systemctl start --no-block systemd-cryptsetup@${mapper}.service"
       echo "and run yo up again on the Mac."

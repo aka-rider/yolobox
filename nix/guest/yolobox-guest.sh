@@ -3,7 +3,7 @@
 # find expressions, the gc tiers and the AWS probe are shellchecked at build
 # time instead of living in yo's Python string literals where nothing checks
 # them. Subcommands: projects, landing-dir,
-# ensure-repo, gc-machine, gc-user, aws-creds, aws-check, net-check.
+# gc-machine, gc-user, aws-creds, aws-check, net-check.
 #
 # writeShellApplication prepends `set -o errexit -o nounset -o pipefail`. The
 # gc tiers below were written for a shell with none of that — a cleanup step
@@ -354,13 +354,12 @@ deep_plan() {
     rm -f "${TARGETS_FILE}"
 }
 
-# Deleting or cleaning a path git does not ignore dirties the VM worktree,
-# and receive.denyCurrentBranch=updateInstead then refuses every later `git
-# push yolobox` — a breakage that surfaces much later with no link back to
-# here. The name alone does not settle it: an anchored /node_modules in
-# .gitignore leaves a nested one tracked. A directory that ignores itself
-# (uv and venv write a `*` .gitignore into a .venv) is not reported ignored, but
-# git neither tracks nor sees anything in it, which is the same promise.
+# Deleting or cleaning a path git does not ignore dirties the VM worktree:
+# tracked files vanish from it, to be noticed much later. The name alone does
+# not settle it: an anchored /node_modules in .gitignore leaves a nested one
+# tracked. A directory that ignores itself (uv and venv write a `*` .gitignore
+# into a .venv) is not reported ignored, but git neither tracks nor sees
+# anything in it, which is the same promise.
 git_ignores() {
     local parent="${1%/*}" seen
     if git -C "${parent}" check-ignore -q "$1"; then
@@ -373,9 +372,9 @@ git_ignores() {
 
 fail_not_ignored() {
     fail "kept $1: git does not ignore it" \
-        "Deleting it would dirty the worktree and block every later" \
-        "push to the yolobox remote. Add it to that repo's .gitignore" \
-        "(or remove it by hand and commit) if it really is build output."
+        "Deleting it would dirty the worktree. Add it to that repo's" \
+        ".gitignore (or remove it by hand and commit) if it really is" \
+        "build output."
 }
 
 report_deep_plan() {
@@ -469,29 +468,6 @@ cmd_landing_dir() {
     esac
     while [ -n "${d}" ] && [ ! -d "${d}" ]; do d="${d%/*}"; done
     printf '%s\n' "${d:-$HOME}"
-}
-
-# ensure-repo <dir> [branch]: <dir> becomes a repo of its own that accepts a push
-# to its checked-out branch, HEAD on <branch> (default main) while it has no
-# commit. A push of another branch name would otherwise leave HEAD on an unborn
-# branch and the worktree empty, with no error. The check is on the toplevel,
-# not on --git-dir: that walks up, so a directory inside another repo (or $HOME
-# as a repo) would pass and the push would land in the wrong place. An existing
-# repo is configured too, and its unborn HEAD moved: an earlier yo link left one.
-cmd_ensure_repo() {
-    local dir="${1:?ensure-repo requires a directory argument}"
-    local branch="${2:-main}"
-    local real top
-    mkdir -p "${dir}"
-    real=$(cd "${dir}" && pwd -P)
-    # Failing outside any repo is the expected answer here, not an error.
-    top=$(git -C "${dir}" rev-parse --show-toplevel 2>/dev/null) || top=
-    if [ "${top}" != "${real}" ]; then
-        git -C "${dir}" init -b "${branch}"
-    elif ! git -C "${dir}" rev-parse -q --verify HEAD >/dev/null; then
-        git -C "${dir}" symbolic-ref HEAD "refs/heads/${branch}"
-    fi
-    git -C "${dir}" config receive.denyCurrentBranch updateInstead
 }
 
 cmd_gc_machine() {
@@ -762,17 +738,45 @@ probe_gateway_dns() {
     [[ "${reply}" == *'->>HEADER<<-'* ]]
 }
 
+# Free space on / below which net-check reports the disk full. `stat -f` counts
+# the blocks ext4 reserves for root (%f), which `df`'s Avail column leaves out:
+# dhcpcd and tailscaled run as root, and only when those are gone does a full
+# disk look like a DNS failure (empty resolv.conf, ENOSPC in dhcpcd).
+ROOT_MIN_FREE_MIB=64
+
+# Prints the whole MiB free on / for root. A stat that fails or prints anything
+# but two numbers is an error, never "not full": the caller must not run this
+# as an `if` condition, where errexit would swallow the failure.
+root_free_mib() {
+    local blocks free_blocks block_bytes
+    blocks=$(stat -f -c '%f %S' /) || return 1
+    read -r free_blocks block_bytes <<<"${blocks}"
+    case "${free_blocks}${block_bytes}" in
+    '' | *[!0-9]*)
+        printf 'yolobox-guest: stat -f / answered %q, not two numbers\n' "${blocks}" >&2
+        return 1
+        ;;
+    esac
+    printf '%s\n' "$((free_blocks * block_bytes / 1024 / 1024))"
+}
+
 # Tells apart the two host-VPN shapes (docs/host-network.md#vpn-shapes): a VPN
 # that owns the host's default route kills egress while the gateway still
 # answers DNS; a VPN that blackholes lima's gateway leaves egress working
 # while the gateway's DNS goes silent. Both probes only classify, so this
-# exits 0 whatever the network state.
+# exits 0 whatever the network state. A third line, rootdisk=, names a full
+# root disk, which breaks name resolution and would otherwise be blamed on the
+# network (docs/disk.md#a-full-disk-looks-like-a-dns-failure).
 cmd_net_check() {
     if [ "$#" -ne 0 ]; then
         printf 'yolobox-guest: net-check: usage: net-check (takes no arguments)\n' >&2
         exit 2
     fi
-    local egress=dead gateway=dead
+    local egress=dead gateway=dead rootdisk=ok free_mib
+    free_mib=$(root_free_mib)
+    if [ "${free_mib}" -lt "${ROOT_MIN_FREE_MIB}" ]; then
+        rootdisk=full
+    fi
     if probe_egress; then
         egress=ok
     fi
@@ -784,7 +788,7 @@ cmd_net_check() {
     elif probe_gateway_dns; then
         gateway=ok
     fi
-    printf 'egress=%s\ngateway=%s\n' "${egress}" "${gateway}"
+    printf 'egress=%s\ngateway=%s\nrootdisk=%s\n' "${egress}" "${gateway}" "${rootdisk}"
 }
 
 main() {
@@ -793,7 +797,6 @@ main() {
     case "${sub}" in
     projects) cmd_projects ;;
     landing-dir) cmd_landing_dir "$@" ;;
-    ensure-repo) cmd_ensure_repo "$@" ;;
     gc-machine) cmd_gc_machine "$@" ;;
     gc-user) cmd_gc_user "$@" ;;
     aws-creds) cmd_aws_creds "$@" ;;

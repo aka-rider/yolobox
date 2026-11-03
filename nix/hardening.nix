@@ -6,7 +6,7 @@ let
   # Autoloading a protocol module needs only a socket() call by the agent,
   # and most network-protocol kernel CVEs arrive that way. vsock, virtiofs,
   # binfmt_misc, overlay, fuse, tun, bridge, veth, nf_*/xt_*, dm_crypt,
-  # af_alg and the filesystems must stay loadable. See nix/hardening.md.
+  # af_alg, sch_fq_codel and the filesystems must stay loadable. See nix/hardening.md.
   blockedModules = [
     # wireless and bluetooth: vz has no such hardware
     "cfg80211" "mac80211" "bluetooth" "btusb"
@@ -15,6 +15,21 @@ let
     "phonet" "nfc" "af_key"
     # more socket families that autoload from a socket() call
     "rxrpc" "kcm" "smc" "qrtr" "pppoe" "l2tp_ppp"
+    # net/sched: a user namespace's root can attach any of these to its own
+    # netns. Nothing on the box shapes traffic; sch_fq_codel, the default
+    # qdisc, is the one that stays.
+    "cls_basic" "cls_bpf" "cls_cgroup" "cls_flow" "cls_flower" "cls_fw"
+    "cls_matchall" "cls_route" "cls_u32"
+    "act_bpf" "act_connmark" "act_csum" "act_ct" "act_ctinfo" "act_gact"
+    "act_gate" "act_ife" "act_meta_mark" "act_meta_skbprio"
+    "act_meta_skbtcindex" "act_mirred" "act_mpls" "act_nat" "act_pedit"
+    "act_police" "act_sample" "act_simple" "act_skbedit" "act_skbmod"
+    "act_tunnel_key" "act_vlan"
+    "sch_cake" "sch_cbs" "sch_choke" "sch_codel" "sch_drr" "sch_dualpi2"
+    "sch_etf" "sch_ets" "sch_fq" "sch_fq_pie" "sch_gred" "sch_hfsc"
+    "sch_hhf" "sch_htb" "sch_ingress" "sch_mqprio" "sch_multiq" "sch_netem"
+    "sch_pie" "sch_plug" "sch_prio" "sch_qfq" "sch_red" "sch_sfb" "sch_sfq"
+    "sch_skbprio" "sch_taprio" "sch_tbf" "sch_teql"
   ];
 
   # Setuid and capability wrappers the box keeps. See nix/hardening.md.

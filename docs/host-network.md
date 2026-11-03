@@ -26,12 +26,14 @@ A host VPN that disconnects can leave lima's guest UDP flows bound to a tunnel a
 
 Recognise the two by those patterns, and on a macOS host run `scutil --nc list` before debugging anything inside the VM.
 
-`yo status` tells them apart on its `network:` line. It runs `yolobox-guest net-check` as the operator, which takes no arguments and prints two results:
+`yo status` tells them apart on its `network:` line. It runs `yolobox-guest net-check` as the operator, which takes no arguments and prints three results, the third being a root disk check that comes before any network verdict:
 
 - `egress=`, an HTTPS fetch of github.com.
 - `gateway=`, a DNS query for the root name servers sent to `192.168.5.2` with `dig +time=2 +tries=1`. DNS is the one gateway path the [egress table](../nix/egress.md) leaves open on a plain box, and it rides the NAT path above, so a reply proves gvproxy really reaches the host. The probe counts a reply by the `->>HEADER<<-` line `dig` prints, whatever the reply's status, and never by `dig`'s exit code, which bind9 reports as 0 on an ICMP unreachable or a reset connection. `skipped` when `/etc/yolobox/gateway-blocked` exists, see [above](#a-box-that-blocks-the-gateway-on-purpose).
 
-`network_status_line()` maps the pair. Egress dead with the gateway answering is a VPN that owns the host's default route. Egress ok with the gateway silent is a VPN that blackholes lima's gateway, or a DNS filter on the host that drops the query. Both dead means the guest network itself is down, or both faults at once. A box whose `yolobox-guest` still wants the old `PORT` argument exits 2 when `yo` sends none, and `yo` prints `network: not checked` with the reason. The rest of `yo status` still runs.
+- `rootdisk=`, `full` when `/` has under 64 MiB left for root. A full disk is not a network fault, but it looks like one: dhcpcd cannot write `resolv.conf`, so egress is dead while the gateway answers, exactly the first VPN shape. When it is `full`, `yo` prints that instead of any VPN verdict (see [disk.md](disk.md#a-full-disk-looks-like-a-dns-failure)).
+
+`network_status_line()` maps the first two (when the disk has room). Egress dead with the gateway answering is a VPN that owns the host's default route. Egress ok with the gateway silent is a VPN that blackholes lima's gateway, or a DNS filter on the host that drops the query. Both dead means the guest network itself is down, or both faults at once. A box whose `yolobox-guest` still wants the old `PORT` argument exits 2 when `yo` sends none, and `yo` prints `network: not checked` with the reason. The rest of `yo status` still runs.
 
 ### A fake-IP proxy on the host
 

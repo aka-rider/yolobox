@@ -18,6 +18,12 @@ The trade is that no rollback generation survives a kernel bump. That is accepta
 
 `/boot` stays on its own partition and is not moved onto the root filesystem. That would give unlimited space, but it would make `nix/base.nix` diverge from the image, so every fresh instance would need a manual mount migration before its first switch.
 
+## Sysctl keys the kernel lacks
+
+`systemd-sysctl` logged `Couldn't write '1' to 'kernel/unprivileged_userns_clone'` on every boot. The key is not ours and not podman's: `lima-init.nix` in nixos-lima sets `kernel.unprivileged_userns_clone = 1`, a knob that only the removed `-hardened` kernels had. Mainline (`boot.kernelPackages = pkgs.linuxPackages_latest`) has no such file, so the write failed and was only a warning. nixpkgs removed its own `security.unprivilegedUsernsClone` option for the same reason, so there is nothing to turn off there. `nix/base.nix` sets the key to `lib.mkForce null`, which NixOS drops when it renders `/etc/sysctl.d/60-nixos.conf`.
+
+Unprivileged user namespaces are not affected. A mainline kernel allows them by default, bounded by `user.max_user_namespaces`, which the chromium sandbox, rootless podman and the nix build sandbox rely on (see [hardening.md](hardening.md#sysctls)). Recognise a regression by that warning coming back in `journalctl -b -u systemd-sysctl`, or by `unprivileged_userns_clone` appearing in the rendered file (`.github/workflows/verify.yml` checks it).
+
 ## Same-uid ptrace
 
 `py-spy dump --pid N` against an already-running agent process died with permission denied. Nothing in the repo set ptrace, so the kernel's Yama default applied: `kernel.yama.ptrace_scope = 1`. That lets a process ptrace only its own descendants, or a process that declared the tracer through `prctl(PR_SET_PTRACER)`, which py-spy cannot arrange from outside. That is why `py-spy record -- python app.py` worked all along (the target is py-spy's child) and attaching to a server started elsewhere did not.
@@ -36,7 +42,19 @@ Recognise a regression by `sysctl kernel.yama.ptrace_scope` printing `1` again. 
 
 Without swap, memory pressure goes straight to the kernel's global OOM killer with no warning stage. A `nixos-rebuild switch` on a box already low on available memory can tip it over. Symptom: every rootless container dies with exit 137 during the switch. The journal shows the kernel killer, not `systemd-oomd`, picking browser and application worker processes first, and eventually the uid-501 user manager: `user@501.service` fails with result `signal`. The agents themselves survive, because ssh session scopes hang off `user.slice` directly, not under `user@.service`. So the blast radius of a user-manager kill is exactly the rootless containers.
 
-Two changes address the two halves. `swapDevices` in `nix/base.nix` declares a 16 GiB `/var/swapfile`, so reclaim has somewhere to go before the killer runs, and `lima/yolobox.yaml` sets the box to 16 GiB and 8 cpus. Then systemd's upstream `user@.service` ships `OOMScoreAdjust=100` (verified with `systemctl show user@1000.service -p OOMScoreAdjust`), which makes the per-user manager a preferred victim over every system service at 0. A drop-in (`overrideStrategy = "asDropin"`, so upstream's unit text is kept, not replaced) sets it to -500. Podman sets its own `oom_score_adj` on containers (200), so they stay individually killable. What the drop-in changes is that the kernel takes one container worker, or the agent's own link job, before it takes the manager that holds all of them.
+Two changes address the two halves. `nix/swap.nix` declares a `/var/swapfile` of `yolobox.swapSizeMiB` MiB, 16 GiB by default, so reclaim has somewhere to go before the killer runs, and `lima/yolobox.yaml` sets the box to 16 GiB and 8 cpus. Then systemd's upstream `user@.service` ships `OOMScoreAdjust=100` (verified with `systemctl show user@1000.service -p OOMScoreAdjust`), which makes the per-user manager a preferred victim over every system service at 0. A drop-in (`overrideStrategy = "asDropin"`, so upstream's unit text is kept, not replaced) sets it to -500. Podman sets its own `oom_score_adj` on containers (200), so they stay individually killable. What the drop-in changes is that the kernel takes one container worker, or the agent's own link job, before it takes the manager that holds all of them.
+
+The swapfile is allocated in full on the root disk, and a full root disk breaks name resolution (see [docs/disk.md](../docs/disk.md#a-full-disk-looks-like-a-dns-failure)). A box with a small disk sets `yolobox.swapSizeMiB = 4096;` in its `/etc/yolobox/local.nix`, with no `mkForce`, and `0` declares no swap at all. NixOS's `mkswap-var-swapfile` unit recreates the file when its size differs from the configured one, so a switch applies a new size. With `0` the unit no longer exists and the old `/var/swapfile` stays on the disk, unused, until it is deleted by hand.
+
+## Pushing into a VM checkout
+
+Code reaches the VM by `git push` into a checkout there, over a remote the operator adds by hand (the ssh host is `lima-yolobox`, or `lima-<name>` for an instance). Nothing in `yo` sets the remote up, so `programs.git.config` in `nix/base.nix` sets `receive.denyCurrentBranch = "updateInstead"` system-wide, and every repo in the VM accepts a push to its checked-out branch. Git applies it by updating the worktree, and refuses the push when the worktree or index differs from HEAD, so nothing uncommitted is overwritten.
+
+Two things follow. A VM checkout that was dirtied (a deleted tracked directory, an agent's half-finished edit) refuses every later push, with an error that does not point back at the cause. That is why `yolobox-guest gc` removes only git-ignored directories. Second, the VM commits `devbox.lock` itself, so its branch moves ahead of the Mac's, and a push from a Mac that has not pulled lands on a diverged branch and is refused. Pull first.
+
+The pull is also where the sandbox's trust boundary sits. The agent can write to the VM checkout, so the commits it authored there are untrusted input the moment they reach the Mac, where the operator builds and runs them. Review them before running anything.
+
+Recognise the setting being lost by `git push` answering `refusing to update checked out branch`.
 
 ## Growing the root disk
 

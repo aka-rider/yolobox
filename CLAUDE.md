@@ -42,10 +42,11 @@ people who change the repo itself. Version 1 was Docker-based.
   creates `/etc/yolobox/gateway-blocked`, and `net-check` then skips its
   gateway probe. See `nix/egress.md`, `nix/tailscale.md` and
   `docs/host-network.md`.
-- **Git is the bridge.** `yo link` makes the VM side of a repo a
-  push-to-checkout target (`receive.denyCurrentBranch = updateInstead`), so
-  the VM refuses a push when its worktree differs from HEAD. The VM commits
-  `devbox.lock`, so pull before you push again.
+- **Git is the bridge.** The operator adds a git remote to the VM by hand
+  (ssh host `lima-yolobox`, or `lima-<name>`). `nix/base.nix` sets
+  `receive.denyCurrentBranch = updateInstead` system-wide, so the VM refuses
+  a push when its worktree differs from HEAD. The VM commits `devbox.lock`,
+  so pull before you push again. `nix/base.md#pushing-into-a-vm-checkout`.
 - **The root disk is encrypted.** `/dev/vda2` is LUKS2; `yo up` derives the
   passphrase from a 1Password SSH key and feeds it to an sshd inside the
   initrd. See `docs/disk-encryption.md`.
@@ -96,6 +97,8 @@ Box configuration (Nix):
 - `nix/base.nix`: filesystems, boot, sshd, tmpfiles, git defaults, the lima
   units and core packages. It declares both accounts, `users.users.${username}`
   and the agent's. `nix/base.md`, `docs/accounts.md`.
+- `nix/swap.nix`: the `yolobox.swapSizeMiB` option (default 16384, 0 for no swap)
+  and the swapfile it sizes. `nix/base.md#memory-pressure`.
 - `nix/luks.nix` and `nix/luks/`: the root disk's encryption. `luks.nix` is
   the initrd configuration, `apps.nix` defines the three scripts that run
   there. `docs/disk-encryption.md`.

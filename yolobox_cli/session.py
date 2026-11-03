@@ -1,4 +1,4 @@
-"""Interactive commands: ssh, enter, code, zed, link, port, aws-check and project picking."""
+"""Interactive commands: ssh, enter, code, zed, port, aws-check and project picking."""
 
 from __future__ import annotations
 
@@ -55,15 +55,17 @@ def target_dir(project: Optional[str]) -> str:
     return paths.dir_for_cwd()
 
 
+def on_terminal() -> bool:
+    """Whether both ends are terminals: ssh -t on redirected output turns every newline into CRLF."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def cmd_ssh(args: argparse.Namespace) -> None:
-    # A pty only when both ends are terminals: ssh -t on redirected output
-    # turns every newline into CRLF.
-    interactive = sys.stdin.isatty() and sys.stdout.isatty()
     proc.exec_process(
         sshx.ssh_argv(
             OPERATOR,
             *sshx.forward_agent_opts(),
-            *(["-t"] if interactive else []),
+            *(["-t"] if on_terminal() else []),
             state.box.vm_host,
             *args.ssh_cmd,
         )
@@ -71,6 +73,13 @@ def cmd_ssh(args: argparse.Namespace) -> None:
 
 
 def cmd_enter(args: argparse.Namespace) -> None:
+    # enter exists to give an interactive shell; without a terminal ssh would
+    # print "Pseudo-terminal will not be allocated" and run it without a pty.
+    if not on_terminal():
+        raise YoError(
+            "%s opens an interactive shell, and stdin or stdout is not a terminal"
+            % state.yo_cmd("enter")
+        )
     sshx.require_agent_account()
     if os.environ.get("HERDR_ENV") == "1":
         ui.err(
@@ -127,76 +136,6 @@ def cmd_zed(args: argparse.Namespace) -> None:
             "zed",
             "ssh://%s@%s%s" % (AGENT_USER, state.box.vm_host, editor_uri_path(target)),
         ]
-    )
-
-
-def link_remote_action(existing_url: Optional[str], wanted_url: str) -> str:
-    if not existing_url:
-        return "add"
-    if existing_url == wanted_url:
-        return "keep"
-    # urlsplit lowercases the host it reports, and -m names keep their case.
-    if urllib.parse.urlsplit(existing_url).hostname == state.box.vm_host.lower():
-        return "update"
-    raise YoError(
-        "remote 'yolobox' points at %s, which is not this VM — "
-        'run "git remote remove yolobox" or fix it by hand' % existing_url
-    )
-
-
-def current_branch(toplevel: str) -> str:
-    branch = proc.run(["git", "-C", toplevel, "symbolic-ref", "--short", "HEAD"])
-    if branch.returncode != 0 or not branch.stdout.strip():
-        raise YoError(
-            "HEAD is detached in %s — check out the branch to push first, so the "
-            "VM's copy starts on it" % toplevel
-        )
-    return branch.stdout.strip()
-
-
-def cmd_link(args: argparse.Namespace) -> None:
-    sshx.require_agent_account()
-    physical_top = proc.run(["git", "rev-parse", "--show-toplevel"])
-    if physical_top.returncode != 0 or not physical_top.stdout.strip():
-        raise YoError("link must run inside a git repo")
-    toplevel = paths.logical_toplevel(physical_top.stdout.strip(), paths.logical_cwd())
-
-    vmdir = paths.mirror(toplevel)
-    if vmdir is None:
-        raise YoError("repo must be under $HOME (it is at %s)" % toplevel)
-    if vmdir == AGENT_HOME:
-        raise YoError("refusing to link $HOME itself")
-    vmdir = paths.guest_path(vmdir)
-    branch = current_branch(toplevel)
-    url = "ssh://%s@%s%s" % (AGENT_USER, state.box.vm_host, vmdir)
-
-    probe = proc.run(["git", "-C", toplevel, "remote", "get-url", "yolobox"])
-    existing = probe.stdout.strip() if probe.returncode == 0 else None
-    action = link_remote_action(existing, url)
-
-    guest.guest_helper_check(
-        guest.guest_helper(AGENT, "ensure-repo", [vmdir, branch]), "ensure-repo"
-    )
-
-    if action == "add":
-        proc.run(["git", "-C", toplevel, "remote", "add", "yolobox", url], check=True)
-    elif action == "update":
-        proc.run(
-            ["git", "-C", toplevel, "remote", "set-url", "yolobox", url], check=True
-        )
-        ui.err("yo: remote 'yolobox' pointed at %s; updated to %s" % (existing, url))
-    else:
-        ui.err("yo: remote 'yolobox' already points at %s" % url)
-    proc.run(
-        [
-            "git",
-            "-C",
-            toplevel,
-            "config",
-            "remote.yolobox.sshCommand",
-            shlex.join(sshx.ssh_argv(OPERATOR)),
-        ],
-        check=True,
     )
 
 

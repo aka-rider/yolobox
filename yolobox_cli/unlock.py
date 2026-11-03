@@ -105,6 +105,145 @@ def boot_stage() -> BootStage:
     return BootStage.NONE
 
 
+class InitrdState(enum.Enum):
+    """What the initrd is doing, as far as the facts below prove it.
+
+    WAITING_FOR_PASSPHRASE is the only state in which nothing is being written
+    to the disk and nobody is answering the ask, so it is the only one `yo down`
+    may power off by itself. The others are named apart because what to do about
+    them differs, and `yo down` says so.
+    """
+
+    WAITING_FOR_PASSPHRASE = "waiting for the passphrase"
+    MIGRATING = "encrypting the disk in place"
+    UNLOCKING = "unlocking the disk, or holding the leftover of an unlock"
+    MIGRATION_FAILED = "stopped after a failed in-place encryption"
+    UNLOCKED_IDLE = "unlocked, with nothing asking and nothing running"
+    UNKNOWN = "in a state yo cannot prove idle"
+
+
+@dataclass(frozen=True)
+class InitrdReading:
+    """One probe's verdict, and why when the probe could not be judged."""
+
+    state: InitrdState
+    cause: str  # empty unless the state is UNKNOWN
+
+
+ASK_PASSWORD_DIR = "/run/systemd/ask-password"
+UNLOCK_FIFO_GLOB = "/tmp/yolobox-unlock.*"
+PROBE_MIGRATE_PREFIX = "migrate="
+PROBE_FIFO_PREFIX = "unlock-fifo="
+PROBE_ASK_BEGIN = "ask-begin"
+PROBE_ASK_END = "ask-end"
+PROBE_END = "probe=end"
+ASK_ID_PREFIX = "Id="
+# systemd-cryptsetup posts its ask as "cryptsetup:<device>".
+CRYPTSETUP_ASK_ID_PREFIX = "cryptsetup:"
+# The oneshot unit of nix/luks/yolobox-luks-migrate.sh is "activating" for the
+# whole run of the script, from waiting for its passphrase through the last write.
+MIGRATE_UNIT_RUNNING = "activating"
+MIGRATE_UNIT_FINISHED = "active"
+MIGRATE_UNIT_FAILED = "failed"
+
+
+def initrd_probe_command(ask_dir: str, fifo_glob: str) -> str:
+    """One command for the initrd's root shell: shell builtins, cat and systemctl.
+
+    Sed, grep and ls are not on the initrd's PATH. Every section announces
+    itself with a marker line, so the classifier never depends on whether a file
+    ends in a newline: the migration unit's state; one `unlock-fifo=` line per
+    FIFO that a running yolobox-unlock keeps in /tmp (nix/luks/yolobox-unlock.sh);
+    each pending ask file between `ask-begin` and `ask-end`; and a last line
+    that shows the command ran to its end.
+    """
+    return (
+        "echo %(migrate)s$(systemctl is-active yolobox-luks-migrate.service); "
+        'for f in %(fifos)s; do [ -e "$f" ] && echo "%(fifo)s$f"; done; '
+        'for f in %(asks)s/ask.*; do [ -e "$f" ] || continue; '
+        'echo %(begin)s; cat "$f"; echo; echo %(end)s; done; '
+        "echo %(final)s"
+    ) % {
+        "migrate": PROBE_MIGRATE_PREFIX,
+        "fifos": fifo_glob,
+        "fifo": PROBE_FIFO_PREFIX,
+        "asks": ask_dir,
+        "begin": PROBE_ASK_BEGIN,
+        "end": PROBE_ASK_END,
+        "final": PROBE_END,
+    }
+
+
+INITRD_PROBE_COMMAND = initrd_probe_command(ASK_PASSWORD_DIR, UNLOCK_FIFO_GLOB)
+
+
+def classify_initrd_probe(output: str) -> InitrdState:
+    """Judge the output of INITRD_PROBE_COMMAND; anything unexpected is UNKNOWN."""
+    migrate_states: List[str] = []
+    ask_ids: List[str] = []
+    unlock_running = False
+    in_ask = False
+    ended = False
+    for line in output.splitlines():
+        if ended:
+            return InitrdState.UNKNOWN
+        if in_ask:
+            if line == PROBE_ASK_END:
+                in_ask = False
+            elif line.startswith(ASK_ID_PREFIX):
+                ask_ids.append(line[len(ASK_ID_PREFIX) :])
+        elif line == PROBE_ASK_BEGIN:
+            in_ask = True
+        elif line.startswith(PROBE_MIGRATE_PREFIX):
+            migrate_states.append(line[len(PROBE_MIGRATE_PREFIX) :])
+        elif line.startswith(PROBE_FIFO_PREFIX):
+            unlock_running = True
+        elif line == PROBE_END:
+            ended = True
+        else:
+            return InitrdState.UNKNOWN
+    if not ended or in_ask or len(migrate_states) != 1:
+        return InitrdState.UNKNOWN
+    migrate = migrate_states[0]
+    migrate_ask_pending = MIGRATE_ASK_ID in ask_ids
+    # The ask is the single moment the migration is provably before its first write.
+    if migrate == MIGRATE_UNIT_RUNNING and not migrate_ask_pending:
+        return InitrdState.MIGRATING
+    if unlock_running:
+        return InitrdState.UNLOCKING
+    if migrate == MIGRATE_UNIT_FAILED:
+        return InitrdState.MIGRATION_FAILED
+    if migrate not in (MIGRATE_UNIT_RUNNING, MIGRATE_UNIT_FINISHED):
+        return InitrdState.UNKNOWN
+    if not ask_ids:
+        # Only a finished unit gets here (a running one with no ask is MIGRATING).
+        return InitrdState.UNLOCKED_IDLE
+    if all(
+        ask_id == MIGRATE_ASK_ID or ask_id.startswith(CRYPTSETUP_ASK_ID_PREFIX)
+        for ask_id in ask_ids
+    ):
+        return InitrdState.WAITING_FOR_PASSPHRASE
+    return InitrdState.UNKNOWN
+
+
+def initrd_state() -> InitrdReading:
+    completed = proc.run(sshconfig.initrd_ssh_argv(INITRD_PROBE_COMMAND), stdin=b"")
+    if completed.returncode != 0:
+        return InitrdReading(
+            InitrdState.UNKNOWN,
+            "the probe's ssh exited %d: %s"
+            % (completed.returncode, completed.stderr.strip() or "no message"),
+        )
+    verdict = classify_initrd_probe(completed.stdout)
+    if verdict is InitrdState.UNKNOWN:
+        return InitrdReading(
+            verdict,
+            "the probe printed %r, which no known initrd state matches"
+            % completed.stdout.strip(),
+        )
+    return InitrdReading(verdict, "")
+
+
 @dataclass(frozen=True)
 class HelperRun:
     """One run of the initrd's yolobox-unlock over ssh."""
@@ -116,37 +255,44 @@ class HelperRun:
 
 
 def run_initrd_helper(passphrase: bytes) -> HelperRun:
-    stderr_lines: List[str] = []
+    """Send the passphrase to the initrd's helper and stream what it prints.
 
-    def collect(source: io.BufferedReader) -> None:
-        for raw in iter(source.readline, b""):
-            stderr_lines.append(raw.decode("utf-8", "replace").rstrip("\n"))
+    The unlock lock is held for the whole run: `yo down` must never power the
+    box off between the moment this answers the ask and the moment the probe
+    can see that it did.
+    """
+    with state.unlock_lock(wait=True):
+        stderr_lines: List[str] = []
 
-    migrated = False
-    streamed = False
-    state.driver().verify_initrd_listener(sshconfig.initrd_endpoint().port)
-    helper = proc.spawn(
-        sshconfig.initrd_ssh_argv(INITRD_UNLOCK_HELPER),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    with helper as child:
-        collector = threading.Thread(target=collect, args=(child.stderr,))
-        collector.start()
-        try:
-            child.stdin.write(passphrase + b"\n")
-            child.stdin.close()
-        except BrokenPipeError:
-            pass  # ssh already ended; its exit code and stderr, returned below, say why
-        for raw in iter(child.stdout.readline, b""):
-            line = raw.decode("utf-8", "replace").rstrip("\n")
-            streamed = True
-            migrated = migrated or "id=%s" % MIGRATE_ASK_ID in line
-            ui.out(line)
-        collector.join()
-        returncode = child.wait()
-    return HelperRun(returncode, "\n".join(stderr_lines), migrated, streamed)
+        def collect(source: io.BufferedReader) -> None:
+            for raw in iter(source.readline, b""):
+                stderr_lines.append(raw.decode("utf-8", "replace").rstrip("\n"))
+
+        migrated = False
+        streamed = False
+        state.driver().verify_initrd_listener(sshconfig.initrd_endpoint().port)
+        helper = proc.spawn(
+            sshconfig.initrd_ssh_argv(INITRD_UNLOCK_HELPER),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        with helper as child:
+            collector = threading.Thread(target=collect, args=(child.stderr,))
+            collector.start()
+            try:
+                child.stdin.write(passphrase + b"\n")
+                child.stdin.close()
+            except BrokenPipeError:
+                pass  # ssh already ended; its exit code and stderr, returned below, say why
+            for raw in iter(child.stdout.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                streamed = True
+                migrated = migrated or "id=%s" % MIGRATE_ASK_ID in line
+                ui.out(line)
+            collector.join()
+            returncode = child.wait()
+        return HelperRun(returncode, "\n".join(stderr_lines), migrated, streamed)
 
 
 class Verdict(enum.Enum):

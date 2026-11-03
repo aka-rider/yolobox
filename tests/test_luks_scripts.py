@@ -47,7 +47,6 @@ LABEL = "yolobox-luks"
 MAPPER = "mapped"
 # The private name finalize opens the partition under.
 SCRATCH = MAPPER + "-finalize"
-SSH_PORT = "60099"
 PASSPHRASE = "k" * 64
 
 
@@ -129,7 +128,6 @@ class MigrateScript(unittest.TestCase):
             "FAKE_DEVICE_BYTES": str(DEVICE_BYTES),
             "FAKE_ISLUKS_RC": "1",
             "FAKE_BLKID_TYPE": "ext4",
-            "YOLOBOX_SSH_LOCAL_PORT": SSH_PORT,
         }
 
     def run_migrate(self, *args, **env):
@@ -223,7 +221,8 @@ class TestMigrateEncryptsPlainExt4(MigrateScript):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertIn("too full", result.stderr)
         self.assertIn("systemd-cryptsetup@%s.service" % MAPPER, result.stderr)
-        self.assertIn("port " + SSH_PORT, result.stderr)
+        # The port differs per instance; the script must not guess one.
+        self.assertNotRegex(result.stderr, r"\bport\b")
         calls = self.calls()
         self.assertFalse([c for c in calls if c.startswith("resize2fs " + DEVICE)])
         self.assertFalse([c for c in calls if c.startswith("cryptsetup reencrypt")])
@@ -430,7 +429,7 @@ class UnlockScript(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name).resolve()
-        bin_dir = self.tmp / "bin"
+        bin_dir = self.bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
         self.state = self.tmp / "state"
         self.state.mkdir()
@@ -886,11 +885,24 @@ class TestUnlockAfterAFailedAttempt(UnlockScript):
 
 class TestUnlockAskFileRace(UnlockScript):
     def test_an_ask_entry_that_cannot_be_read_is_skipped_and_the_others_answered(self):
-        # sed exits 4 on a directory, a code the helper documents for another
-        # outcome; a vanished file fails the same way.
-        (self.ask_dir / "ask.a").mkdir()
+        # A sed that fails the way GNU sed does on an entry it cannot read (exit
+        # 4, a code the helper documents for another outcome; a vanished file
+        # fails the same way). BSD sed shrugs at a directory, so the failure is
+        # scripted instead of provoked with a real file.
+        write_fake(
+            self.bin_dir,
+            "sed",
+            "for last; do :; done\n"
+            'if [ "$last" = "$FAKE_UNREADABLE" ]; then\n'
+            '  echo "sed: couldn\'t read $last" >&2\n'
+            "  exit 4\n"
+            "fi\n"
+            'exec "$REAL_SED" "$@"\n',
+        )
+        unreadable = self.ask_dir / "ask.a"
+        unreadable.write_text("")
         self.write_ask("ask.b", socket="/run/fake/b.sock")
-        self.start()
+        self.start(FAKE_UNREADABLE=str(unreadable), REAL_SED=shutil.which("sed"))
         self.wait_until_streams_are_up()
         self.sync_with_the_loop()
         self.assertIsNone(self.proc.poll(), "exited on an unreadable ask entry")

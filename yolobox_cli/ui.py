@@ -27,6 +27,20 @@ def err(line: str = "") -> None:
     print(common.sanitize(line), file=sys.stderr, flush=True)
 
 
+def shown(text: str) -> str:
+    """`text`, a name that came from the guest, as one printable line inside a message.
+
+    A plain name is returned as it is. One with a control character, a newline
+    (which could start a forged message line), a bidi override or an undecodable
+    byte gets python's backslash escapes, so the reader sees what it holds.
+    Messages that name a guest file go through this; out() and err() still
+    replace control characters, but only as an unreadable "?".
+    """
+    if text.isprintable():
+        return text
+    return repr(text)[1:-1]
+
+
 class StatusLine(NamedTuple):
     """One line of a report, and whether it is a warning that fails the run."""
 

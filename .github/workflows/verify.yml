@@ -61,12 +61,32 @@ jobs:
   # invalid option (a name that is no NixOS option in any nixpkgs branch) fails
   # here instead of on a user's `yo bootstrap`. Evaluation needs no aarch64 builder: the drv
   # path is computed, never realised, and IFD is disallowed to keep it so.
+  #
+  # Both boxes are evaluated and every check below runs on each: the Linux
+  # host's x86_64 guest, and the Mac box, an aarch64 guest with the host OS a
+  # Mac has, which covers the Lima/vz side of every hostOs gate in the modules.
+  # The rule files are builtins.toFile, so they print without a builder on
+  # either system.
   eval:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host_os: linux
+            system: x86_64-linux
+          - host_os: darwin
+            system: aarch64-linux
     env:
       # flake.nix throws without them; any non-empty name evaluates the same.
       YOLOBOX_USERNAME: ci
-      YOLOBOX_HOST_OS: linux
+      YOLOBOX_HOST_OS: ${{ matrix.host_os }}
+      GUEST_SYSTEM: ${{ matrix.system }}
+      # The guest system is the evaluating nix's own, so every evaluation goes
+      # through this one command. It is not NIX_CONFIG: that would make the
+      # job's builds and runs target the guest's system too, and an aarch64
+      # binary cannot run on this x86_64 runner.
+      NIX_EVAL: nix eval --impure --system ${{ matrix.system }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -81,16 +101,7 @@ jobs:
       # /etc/yolobox/local.nix evaluates.
       - name: Evaluate nixosConfigurations.yolobox
         run: >
-          nix eval --impure --raw
-          --option allow-import-from-derivation false
-          .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
-
-      # The Mac box's guest: the guest system is the evaluating nix's own, so
-      # --system aarch64-linux, with the host OS a Mac has, covers the
-      # Lima/vz side of every hostOs gate in the modules.
-      - name: Evaluate the Mac box (aarch64-linux guest, darwin host)
-        run: >
-          YOLOBOX_HOST_OS=darwin nix eval --impure --system aarch64-linux --raw
+          $NIX_EVAL --raw
           --option allow-import-from-derivation false
           .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
 
@@ -100,8 +111,8 @@ jobs:
       - name: Check container logs stay out of the journal
         run: |
           settings=.#nixosConfigurations.yolobox.config.virtualisation.containers.containersConf.settings
-          test "$(nix eval --impure --raw "$settings.containers.log_driver")" = k8s-file
-          test "$(nix eval --impure --raw "$settings.engine.events_logger")" = file
+          test "$($NIX_EVAL --raw "$settings.containers.log_driver")" = k8s-file
+          test "$($NIX_EVAL --raw "$settings.engine.events_logger")" = file
 
       # The module list and the sysctls are plain strings in the config, so a
       # dropped line would still evaluate. Pin the two that matter most
@@ -109,8 +120,46 @@ jobs:
       - name: Check the hardening settings are present
         run: |
           box=.#nixosConfigurations.yolobox.config
-          test "$(nix eval --impure --json "$box.boot.kernel.sysctl.\"kernel.io_uring_disabled\"")" = 2
-          nix eval --impure --json "$box.boot.extraModprobeConfig" | grep -F 'install bluetooth '
+          test "$($NIX_EVAL --json "$box.boot.kernel.sysctl.\"kernel.io_uring_disabled\"")" = 2
+          $NIX_EVAL --json "$box.boot.extraModprobeConfig" | grep -F 'install bluetooth '
+          # The net/sched modules stay blocked and the default qdisc does not
+          # (nix/hardening.md).
+          for module in cls_u32 act_gact sch_netem; do
+            $NIX_EVAL --json "$box.boot.extraModprobeConfig" | grep -F "install $module "
+          done
+          # `! cmd` never fails a `bash -e` step, hence the explicit exit.
+          if $NIX_EVAL --json "$box.boot.extraModprobeConfig" | grep -F 'install sch_fq_codel '; then
+            echo "sch_fq_codel, the default qdisc, is blocked"; exit 1
+          fi
+
+      # The kernel has no unprivileged_userns_clone, and systemd-sysctl warned
+      # about the key on every boot (nix/base.md). A null value in the
+      # attribute set is how it is removed, so read the rendered file.
+      - name: Check no sysctl key the kernel lacks is rendered
+        run: |
+          $NIX_EVAL --raw \
+            .#nixosConfigurations.yolobox.config.environment.etc \
+            --apply 'etc: etc."sysctl.d/60-nixos.conf".text' > sysctl.conf
+          grep -F kernel.yama.ptrace_scope sysctl.conf
+          if grep -F unprivileged_userns_clone sysctl.conf; then exit 1; fi
+
+      # yolobox.swapSizeMiB is how a box's local.nix sizes the swapfile
+      # without mkForce (nix/base.md).
+      - name: Check the swap size is an option
+        run: |
+          size() {
+            $NIX_EVAL --json --expr "
+              let
+                box = (builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
+                  modules = [ { yolobox.swapSizeMiB = $1; } ];
+                };
+              in map (sw: sw.size) box.config.swapDevices
+            "
+          }
+          default="$($NIX_EVAL --json .#nixosConfigurations.yolobox.options.yolobox.swapSizeMiB.default)"
+          test "$($NIX_EVAL --json --apply 'map (sw: sw.size)' .#nixosConfigurations.yolobox.config.swapDevices)" = "[$default]"
+          test "$(size 4096)" = '[4096]'
+          test "$(size 0)" = '[]'
 
       # nix cannot check the egress rule files (nft needs netlink, which the
       # build sandbox forbids), and a rule file that fails to load leaves the
@@ -121,10 +170,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes nftables
           for rules in egressRules egressRecoveryRules egressLastResortRules; do
-            file="$(nix eval --impure --raw ".#nixosConfigurations.yolobox.config.system.build.$rules")"
+            file="$($NIX_EVAL --raw ".#nixosConfigurations.yolobox.config.system.build.$rules")"
             sudo nft --check --file "$file"
           done
-          sudo nft --check --file "$(tests/render-tunnel-egress.sh)"
+          sudo nft --check --file "$(tests/render-tunnel-egress.sh --system "$GUEST_SYSTEM")"
 
       # The rendered files are what the kernel runs, so the egress tests read
       # them, not the Nix. The host has no nix, so the unit tests run on copies
@@ -133,10 +182,10 @@ jobs:
       # failure means: copy the fresh render over the fixture (nix/egress.md).
       - name: Check the egress rules close the host
         run: |
-          rules="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRules)"
-          recovery="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRecoveryRules)"
-          lastresort="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressLastResortRules)"
-          tunnel="$(tests/render-tunnel-egress.sh)"
+          rules="$($NIX_EVAL --raw .#nixosConfigurations.yolobox.config.system.build.egressRules)"
+          recovery="$($NIX_EVAL --raw .#nixosConfigurations.yolobox.config.system.build.egressRecoveryRules)"
+          lastresort="$($NIX_EVAL --raw .#nixosConfigurations.yolobox.config.system.build.egressLastResortRules)"
+          tunnel="$(tests/render-tunnel-egress.sh --system "$GUEST_SYSTEM")"
           python3 tests/egress_rules.py "$rules" "$recovery" "$lastresort" "$tunnel"
           diff -u tests/fixtures/egress.nft "$rules"
           diff -u tests/fixtures/egress-recovery.nft "$recovery"
@@ -149,7 +198,7 @@ jobs:
       - name: Check lanAllow rejects what nft would reject
         run: |
           check() {
-            nix eval --impure --raw --expr "
+            $NIX_EVAL --raw --expr "
               let
                 box = (builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
                   modules = [ { yolobox.network.lanAllow = [ \"$1\" ]; } ];

@@ -10,7 +10,15 @@ import tempfile
 import unittest
 from unittest import mock
 
-from test_yo import FIXTURE_EMPTY_TABLE, FIXTURES, FakeHome, Reached, df_output, yo
+from test_yo import (
+    FIXTURE_EMPTY_TABLE,
+    FIXTURES,
+    FakeHome,
+    Reached,
+    df_output,
+    initrd_probe,
+    yo,
+)
 
 
 @contextlib.contextmanager
@@ -246,7 +254,6 @@ class TestMainPreflight(unittest.TestCase):
             "ssh",
             "enter",
             "cp",
-            "link",
             "code",
             "zed",
             "aws-check",
@@ -364,12 +371,11 @@ class TestMainHealsBeforeSomeCommands(unittest.TestCase):
         (["ssh"], (yo.session, "cmd_ssh")),
         (["enter"], (yo.session, "cmd_enter")),
         (["cp", ":a", "b"], (yo.cp, "cmd_cp")),
-        (["link"], (yo.session, "cmd_link")),
         (["code"], (yo.session, "cmd_code")),
         (["zed"], (yo.session, "cmd_zed")),
     ]
     NOT_HEALING = [
-        (["down"], (yo.LIMA, "stop")),
+        (["down"], (yo.vm, "cmd_down")),
         (["status"], (yo.status, "cmd_status")),
         (["gc"], (yo.vm, "cmd_gc")),
         (["port", "8080"], (yo.session, "cmd_port")),
@@ -973,10 +979,23 @@ class TestDirForCwdLandsOnDeepestExistingAncestor(FakeHome):
                 with mock.patch.object(yo.ui, "err") as fake_err:
                     with self.assertRaisesRegex(
                         yo.YoError,
-                        'refusing to target "/etc/\u001b\\]0;pwned\u0007": no yo',
+                        r'refusing to target "/etc/\\x1b\]0;pwned\\x07": no yo',
                     ):
                         yo.dir_for_cwd()
         fake_err.assert_not_called()
+
+    def test_a_landing_dir_with_an_escape_is_reported_escaped(self):
+        landing = yo.AGENT_HOME + "/a\x1b]0;pwned\x07"
+        proc = mock.Mock(returncode=0, stdout=landing + "\n", stderr="")
+        with mock.patch.object(
+            yo.paths, "logical_cwd", return_value=self.home + "/a/b"
+        ):
+            with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
+                with mock.patch.object(yo.ui, "err") as fake_err:
+                    yo.dir_for_cwd()
+        (line,) = fake_err.call_args.args
+        self.assertIn(r'"/home/agent/a\x1b]0;pwned\x07"', line)
+        self.assertTrue(line.isprintable())
 
     def test_outside_home_lands_on_the_agent_home(self):
         with mock.patch.object(yo.paths, "logical_cwd", return_value="/etc"):
@@ -1136,6 +1155,72 @@ class TestProbe(unittest.TestCase):
         with mock.patch.object(yo.sshx, "ssh_run", side_effect=run):
             with self.assertRaises(yo.Unreachable):
                 yo.helper_skew("the box has no yolobox-guest")
+
+
+class TestGuestOutNamesALostBox(unittest.TestCase):
+    # guest_out reads a command's output as a fact about the box. A lost box
+    # (ssh exit 255) must say so, not read as the empty output of a command
+    # that found nothing.
+    def answering(self, code, stdout="", stderr=""):
+        return mock.patch.object(
+            yo.sshx,
+            "ssh_run",
+            return_value=mock.Mock(returncode=code, stdout=stdout, stderr=stderr),
+        )
+
+    def test_a_command_that_succeeded_reads_as_its_output(self):
+        with self.answering(0, "crypto_LUKS\n"):
+            self.assertEqual(yo.sshx.guest_out(["lsblk"]), "crypto_LUKS\n")
+            self.assertEqual(yo.vm.luks_device_fstype(), "crypto_LUKS")
+
+    def test_a_command_that_failed_there_is_an_error_with_its_reason(self):
+        # Its output is not an answer: an empty one would read as "nothing found".
+        with self.answering(1, "", "lsblk: /dev/vda2: not a block device\n"):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.sshx.guest_out(["lsblk", "/dev/vda2"])
+        self.assertNotIsInstance(caught.exception, yo.Unreachable)
+        self.assertEqual(
+            caught.exception.message,
+            "lsblk /dev/vda2 failed on the box (exit 1): "
+            "lsblk: /dev/vda2: not a block device",
+        )
+        with self.answering(7):
+            with self.assertRaisesRegex(yo.YoError, r"failed on the box \(exit 7\)$"):
+                yo.vm.luks_device_fstype()
+
+    def test_a_lost_box_is_unreachable_at_every_read_of_the_guest_disk(self):
+        reads = (
+            ("luks_device_fstype", yo.vm.luks_device_fstype),
+            ("guest_generations", yo.vm.guest_generations),
+            ("require_growable_guest", yo.vm.require_growable_guest),
+            (
+                "require_partition_grown",
+                lambda: yo.vm.require_partition_grown(100),
+            ),
+        )
+        for name, read in reads:
+            with self.subTest(read=name), self.answering(yo.SSH_UNREACHABLE):
+                with self.assertRaisesRegex(
+                    yo.Unreachable, "cannot reach yolobox as operator — is it up\\?"
+                ):
+                    read()
+
+    def test_status_says_why_the_type_could_not_be_read(self):
+        with self.answering(1, "", "lsblk: /dev/vda2: not a block device\n"):
+            lines = yo.status.disk_lines(vm_reachable=True)
+        unreadable = [line for line in lines if "cannot read the type" in line.text]
+        self.assertEqual(len(unreadable), 1)
+        self.assertIn("not a block device", unreadable[0].text)
+        self.assertFalse(unreadable[0].warning)
+
+    def test_status_says_the_box_was_lost_instead_of_an_unreadable_type(self):
+        with self.answering(yo.SSH_UNREACHABLE):
+            lines = yo.status.disk_lines(vm_reachable=True)
+        lost = [line for line in lines if line.text.startswith("disk: cannot reach")]
+        self.assertEqual([line.warning for line in lost], [True])
+        self.assertFalse(
+            [line for line in lines if "cannot read the type" in line.text]
+        )
 
 
 class TestGuestHelperSkew(unittest.TestCase):
@@ -1348,20 +1433,32 @@ class TestEntryExitCodes(unittest.TestCase):
 
 
 class TestCmdEnterArgv(FakeHome):
-    def enter(self):
-        captured = {}
+    def enter(self, stdin_tty=True, stdout_tty=True):
+        fake_stdin, fake_stdout = mock.Mock(), mock.Mock()
+        fake_stdin.isatty.return_value = stdin_tty
+        fake_stdout.isatty.return_value = stdout_tty
+        with (
+            mock.patch.object(yo.sys, "stdin", fake_stdin),
+            mock.patch.object(yo.sys, "stdout", fake_stdout),
+            mock.patch.object(yo.sshx, "require_agent_account") as self.agent_probe,
+            mock.patch.object(yo.session, "target_dir", return_value=yo.AGENT_HOME),
+            mock.patch.object(yo.proc, "exec_process") as self.exec,
+        ):
+            yo.cmd_enter(yo.build_parser().parse_args(["enter"]))
+        return list(self.exec.call_args[0][0])
 
-        def fake_exec(argv, env=None):
-            captured["argv"] = list(argv)
+    def test_a_pty_is_requested_on_a_terminal(self):
+        with env_without("HERDR_ENV"):
+            self.assertIn("-t", self.enter())
 
-        with mock.patch.object(yo.sshx, "require_agent_account"):
-            with mock.patch.object(
-                yo.session, "target_dir", return_value=yo.AGENT_HOME
-            ):
-                with mock.patch.object(yo.proc, "exec_process", side_effect=fake_exec):
-                    args = yo.build_parser().parse_args(["enter"])
-                    yo.cmd_enter(args)
-        return captured["argv"]
+    def test_a_shell_is_refused_unless_stdin_and_stdout_are_terminals(self):
+        for stdin_tty, stdout_tty in ((True, False), (False, True), (False, False)):
+            with self.subTest(stdin=stdin_tty, stdout=stdout_tty):
+                with env_without("HERDR_ENV"):
+                    with self.assertRaisesRegex(yo.YoError, "terminal"):
+                        self.enter(stdin_tty, stdout_tty)
+                self.exec.assert_not_called()
+                self.agent_probe.assert_not_called()
 
     def test_argv_carries_no_forward_agent(self):
         with env_without("HERDR_ENV"):
@@ -1979,17 +2076,22 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
             )
         )
 
-    def test_a_box_waiting_in_its_initrd_says_it_is_locked_and_never_meets_the_pin(
-        self,
-    ):
-        # Only the initrd's sshd answers, and only to root: the stage-2 login is
-        # refused. Any pinned ssh would meet the initrd's per-boot host key and
-        # print the changed-host-key warning, so one is a failure.
+    def status_of_an_initrd_box(self, probe):
+        """`yo status` of a box whose initrd answers the probe with `probe`.
+
+        Only the initrd's sshd answers, and only to root: the stage-2 login is
+        refused. Any pinned ssh would meet the initrd's per-boot host key and
+        print the changed-host-key warning, so one is a failure.
+        """
         outs, errs, pinned_ssh = [], [], []
 
         def initrd_run(argv, **kwargs):
             if "User=root" in argv:
-                return mock.Mock(returncode=0, stdout="", stderr="")
+                return mock.Mock(
+                    returncode=0,
+                    stdout=probe if argv[-1] == yo.INITRD_PROBE_COMMAND else "",
+                    stderr="",
+                )
             return mock.Mock(
                 returncode=yo.SSH_UNREACHABLE, stdout="", stderr="Permission denied"
             )
@@ -2016,9 +2118,24 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         self.assertEqual((caught.exception.message, caught.exception.code), (None, 1))
         self.assertEqual(pinned_ssh, [])
         self.assertEqual(errs, [])
-        self.assertTrue(
-            any(line.startswith("disk: locked") and "yo up" in line for line in outs)
-        )
+        return [line for line in outs if line.startswith("disk: locked")]
+
+    def test_a_box_waiting_in_its_initrd_says_it_is_locked_and_never_meets_the_pin(
+        self,
+    ):
+        (line,) = self.status_of_an_initrd_box(PROBE_AT_THE_PASSPHRASE_PROMPT)
+        self.assertIn("waiting for the passphrase", line)
+        self.assertIn("yo up", line)
+
+    def test_status_tells_a_box_encrypting_from_one_waiting_and_from_one_unreadable(
+        self,
+    ):
+        (migrating,) = self.status_of_an_initrd_box(initrd_probe("activating"))
+        self.assertIn("encrypting the disk in place", migrating)
+        self.assertNotIn("waiting", migrating)
+        (unknown,) = self.status_of_an_initrd_box("sh: systemctl: not found\n")
+        self.assertIn("systemctl: not found", unknown)
+        self.assertIn("yo down", unknown)
 
     def egress_lines(self, egress_probe):
         outs = self.run_status(
@@ -2065,7 +2182,10 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
             ),
         )
         self.assertIn(
-            yo.network_status_line(yo.NetCheck(True, yo.Gateway.DEAD)).text, outs
+            yo.network_status_line(
+                yo.NetCheck(True, yo.Gateway.DEAD, yo.RootDisk.NOT_REPORTED)
+            ).text,
+            outs,
         )
 
     def test_old_box_without_net_check_reports_not_checked_instead_of_raising(self):
@@ -2357,6 +2477,22 @@ class TestGuestNetworkLine(unittest.TestCase):
         self.assertTrue(line.text.startswith("network: not checked — "))
         self.assertFalse(line.warning)
 
+    def test_a_failed_net_check_shows_why(self):
+        helper = mock.Mock(
+            return_value=mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr="yolobox-guest: stat -f / answered 'x', not two numbers\n",
+            )
+        )
+        with mock.patch.object(yo.guest, "guest_helper", helper):
+            line = yo.guest_network_line()
+        self.assertEqual(
+            line.text,
+            "network: not checked — net-check answered '' (exit 1): "
+            "yolobox-guest: stat -f / answered 'x', not two numbers",
+        )
+
     def test_a_lost_box_is_not_a_not_checked_line(self):
         helper = mock.Mock(side_effect=yo.sshx.unreachable(yo.OPERATOR))
         with mock.patch.object(yo.guest, "guest_helper", helper):
@@ -2367,12 +2503,12 @@ class TestGuestNetworkLine(unittest.TestCase):
 class TestNetworkStatusLine(unittest.TestCase):
     def test_both_ok(self):
         self.assertEqual(
-            yo.network_status_line(yo.NetCheck(True, yo.Gateway.OK)),
+            yo.network_status_line(yo.NetCheck(True, yo.Gateway.OK, yo.RootDisk.OK)),
             yo.StatusLine("network: ok"),
         )
 
     def test_dead_egress_with_answering_gateway_blames_a_default_route_vpn(self):
-        line = yo.network_status_line(yo.NetCheck(False, yo.Gateway.OK))
+        line = yo.network_status_line(yo.NetCheck(False, yo.Gateway.OK, yo.RootDisk.OK))
         self.assertEqual(
             line,
             yo.StatusLine(
@@ -2385,7 +2521,9 @@ class TestNetworkStatusLine(unittest.TestCase):
     def test_a_silent_gateway_with_working_egress_blames_the_hosts_vpn_or_dns_filter(
         self,
     ):
-        line = yo.network_status_line(yo.NetCheck(True, yo.Gateway.DEAD))
+        line = yo.network_status_line(
+            yo.NetCheck(True, yo.Gateway.DEAD, yo.RootDisk.OK)
+        )
         self.assertEqual(
             line,
             yo.StatusLine(
@@ -2396,7 +2534,9 @@ class TestNetworkStatusLine(unittest.TestCase):
         )
 
     def test_both_dead_points_at_the_lima_line(self):
-        line = yo.network_status_line(yo.NetCheck(False, yo.Gateway.DEAD))
+        line = yo.network_status_line(
+            yo.NetCheck(False, yo.Gateway.DEAD, yo.RootDisk.OK)
+        )
         self.assertEqual(
             line,
             yo.StatusLine(
@@ -2406,9 +2546,57 @@ class TestNetworkStatusLine(unittest.TestCase):
             ),
         )
 
+    def test_a_full_root_disk_is_named_whatever_the_probes_blame(self):
+        for egress_ok in (True, False):
+            for gateway in yo.Gateway:
+                with self.subTest(egress_ok=egress_ok, gateway=gateway):
+                    line = yo.network_status_line(
+                        yo.NetCheck(egress_ok, gateway, yo.RootDisk.FULL)
+                    )
+                    self.assertTrue(line.warning)
+                    self.assertIn("root disk is full", line.text)
+                    self.assertIn("`yo gc --yes`", line.text)
+                    self.assertNotIn("VPN", line.text)
+
+    def test_a_full_root_disk_reports_what_the_probes_saw_not_a_certain_failure(self):
+        line = yo.network_status_line(
+            yo.NetCheck(True, yo.Gateway.OK, yo.RootDisk.FULL)
+        )
+        self.assertIn("can fail", line.text)
+        self.assertNotIn("name resolution fails", line.text)
+        self.assertIn("egress ok", line.text)
+        self.assertIn("gateway ok", line.text)
+        line = yo.network_status_line(
+            yo.NetCheck(False, yo.Gateway.DEAD, yo.RootDisk.FULL)
+        )
+        self.assertIn("egress dead", line.text)
+        self.assertIn("gateway dead", line.text)
+
+    def test_net_check_output_reads_rootdisk_and_tells_a_box_without_it_apart(self):
+        for text, root_disk in (
+            ("egress=dead\ngateway=ok\nrootdisk=full\n", yo.RootDisk.FULL),
+            ("egress=ok\ngateway=ok\nrootdisk=ok\n", yo.RootDisk.OK),
+            ("egress=ok\ngateway=ok\n", yo.RootDisk.NOT_REPORTED),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(yo.parse_net_check(text).root_disk, root_disk)
+
+    def test_a_box_that_does_not_report_its_disk_gets_no_disk_verdict(self):
+        line = yo.network_status_line(
+            yo.NetCheck(True, yo.Gateway.OK, yo.RootDisk.NOT_REPORTED)
+        )
+        self.assertEqual(line, yo.StatusLine("network: ok"))
+
+    def test_a_rootdisk_word_net_check_never_prints_is_not_checked(self):
+        self.assertIsNone(
+            yo.parse_net_check("egress=ok\ngateway=ok\nrootdisk=lizard\n")
+        )
+
     def test_a_blocked_gateway_with_working_egress_says_the_probe_was_skipped(self):
         self.assertEqual(
-            yo.network_status_line(yo.NetCheck(True, yo.Gateway.SKIPPED)),
+            yo.network_status_line(
+                yo.NetCheck(True, yo.Gateway.SKIPPED, yo.RootDisk.OK)
+            ),
             yo.StatusLine(
                 "network: ok (lima's gateway probe skipped: this box blocks it by design)"
             ),
@@ -2418,7 +2606,9 @@ class TestNetworkStatusLine(unittest.TestCase):
         self,
     ):
         self.assertEqual(
-            yo.network_status_line(yo.NetCheck(False, yo.Gateway.SKIPPED)),
+            yo.network_status_line(
+                yo.NetCheck(False, yo.Gateway.SKIPPED, yo.RootDisk.OK)
+            ),
             yo.StatusLine(
                 "network: WARNING guest egress is dead "
                 "(lima's gateway probe skipped: this box blocks it by design)",
@@ -2877,7 +3067,36 @@ class TestRunTimeout(unittest.TestCase):
         )
 
 
-class TestLimaStop(unittest.TestCase):
+PROBE_AT_THE_PASSPHRASE_PROMPT = initrd_probe("active", ["cryptsetup:/dev/vda2"])
+LIMA_FORCE_STOP = "limactl stop --force yolobox"
+# An initrd box the probe cannot prove idle: what the probe prints, the words
+# `yo down` must answer with, and whether it offers the force-stop command.
+NOT_IDLE_PROBES = {
+    "migrating": (initrd_probe("activating"), "encrypting the disk in place", False),
+    "unlocking": (
+        initrd_probe("active", ["cryptsetup:/dev/vda2"], unlock_running=True),
+        "leftover",
+        True,
+    ),
+    "a failed migration": (
+        initrd_probe("failed", ["cryptsetup:/dev/vda2"]),
+        "in-place disk encryption failed",
+        True,
+    ),
+    "an unlocked box nothing asks anything of": (
+        initrd_probe("active"),
+        "sysroot.mount failed",
+        True,
+    ),
+    "a shell that did not run the probe": (
+        "sh: systemctl: not found\n",
+        "cannot prove it is idle",
+        True,
+    ),
+}
+
+
+class TestLimaStop(FakeHome):
     def test_a_hung_stop_carries_the_recovery(self):
         expired = subprocess.TimeoutExpired(["limactl", "stop"], yo.LIMA_STOP_TIMEOUT)
         with mock.patch.object(yo.subprocess, "run", side_effect=expired):
@@ -2890,6 +3109,18 @@ class TestLimaStop(unittest.TestCase):
         self.assertIn("kill -9", caught.exception.message)
         self.assertIn("systemctl reboot", caught.exception.message)
 
+    def test_a_hung_force_stop_does_not_send_the_operator_into_the_guest(self):
+        # A box in its initrd has no guest to ssh into: only the hostagent's kill helps.
+        expired = subprocess.TimeoutExpired(
+            ["limactl", "stop", "--force"], yo.LIMA_STOP_TIMEOUT
+        )
+        with mock.patch.object(yo.subprocess, "run", side_effect=expired):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.LIMA.force_stop()
+        self.assertIn("kill -9", caught.exception.message)
+        self.assertIn("limactl hostagent", caught.exception.message)
+        self.assertNotIn("systemctl reboot", caught.exception.message)
+
     def test_a_stop_that_failed_for_another_reason_is_not_called_a_hang(self):
         failed = subprocess.CompletedProcess(["limactl", "stop"], 1, None, None)
         with mock.patch.object(yo.subprocess, "run", return_value=failed):
@@ -2898,16 +3129,125 @@ class TestLimaStop(unittest.TestCase):
         self.assertIn("failed", caught.exception.message)
         self.assertNotIn("kill -9", caught.exception.message)
 
-    def test_down_stops_the_instance_under_the_timeout(self):
-        with mock.patch.object(yo.proc, "run") as fake_run:
+    def assert_unlock_lock_held(self):
+        with self.assertRaises(yo.UnlockBusy):
+            with yo.unlock_lock(wait=False):
+                pass
+
+    def down(self, stage, probe="", ssh_result=None):
+        """Run `yo down`; the initrd, when asked, answers `probe` to the ssh probe.
+
+        Every process `yo down` starts in the initrd must find the box's unlock
+        lock held.
+        """
+        started = self.started = []
+
+        def answer(argv, **kwargs):
+            if stage is yo.BootStage.INITRD:
+                self.assert_unlock_lock_held()
+            started.append(argv)
+            if argv[0] == "ssh":
+                self.assertEqual(argv[-1], yo.INITRD_PROBE_COMMAND)
+                return ssh_result or subprocess.CompletedProcess(argv, 0, probe, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with (
+            mock.patch.object(yo.unlock, "boot_stage", return_value=stage),
+            mock.patch.object(yo.proc, "run", side_effect=answer) as fake_run,
+            mock.patch.object(yo.ui, "out"),
+        ):
             args = yo.build_parser().parse_args(["down"])
             args.func(args)
-        fake_run.assert_called_once_with(
-            ["limactl", "stop", "yolobox"],
+        return fake_run
+
+    def refused_down(self, probe="", ssh_result=None):
+        with self.assertRaises(yo.YoError) as caught:
+            self.down(yo.BootStage.INITRD, probe, ssh_result)
+        self.assertNotIn("limactl", [argv[0] for argv in self.started])
+        return caught.exception.message
+
+    def test_down_stops_the_instance_under_the_timeout(self):
+        for stage in (yo.BootStage.STAGE2, yo.BootStage.NONE):
+            with self.subTest(stage=stage):
+                self.down(stage).assert_called_once_with(
+                    ["limactl", "stop", "yolobox"],
+                    capture=False,
+                    check=True,
+                    timeout=yo.LIMA_STOP_TIMEOUT,
+                )
+
+    def test_down_forces_the_stop_of_a_box_idle_at_the_passphrase_prompt(self):
+        # The initrd has no ACPI handler: a polite stop would wait out the timeout.
+        fake_run = self.down(yo.BootStage.INITRD, PROBE_AT_THE_PASSPHRASE_PROMPT)
+        fake_run.assert_called_with(
+            ["limactl", "stop", "--force", "yolobox"],
             capture=False,
             check=True,
             timeout=yo.LIMA_STOP_TIMEOUT,
         )
+
+    def test_down_never_stops_a_box_that_is_not_provably_idle_in_its_initrd(self):
+        # A force here is a power cut mid-encryption, and a polite stop would
+        # only hang: the box is left running, and the error says why.
+        for name, (probe, reason, _) in NOT_IDLE_PROBES.items():
+            with self.subTest(name=name):
+                self.assertIn(reason, self.refused_down(probe))
+
+    def test_down_prints_the_force_command_where_a_box_may_be_stuck_for_good(self):
+        # The refusal must never be a dead end (a leftover unlock helper, a failed
+        # migration, an initrd that cannot mount the root), but a box encrypting
+        # in place gets no such command: nothing makes the kill safe.
+        for name, (probe, _, offers_force) in NOT_IDLE_PROBES.items():
+            with self.subTest(name=name):
+                message = self.refused_down(probe)
+                self.assertEqual(LIMA_FORCE_STOP in message, offers_force)
+                if offers_force:
+                    self.assertRegex(message, r"(?i)safe")
+
+    def test_down_never_stops_a_box_whose_initrd_probe_failed_and_says_why(self):
+        failed = subprocess.CompletedProcess(["ssh"], 255, "", "boom: no route")
+        message = self.refused_down(ssh_result=failed)
+        self.assertIn("exited 255", message)
+        self.assertIn("boom: no route", message)
+
+    def test_down_neither_waits_for_nor_probes_a_box_another_yo_is_unlocking(self):
+        with yo.unlock_lock(wait=True):
+            with mock.patch.object(yo.proc, "run") as fake_run:
+                with (
+                    mock.patch.object(
+                        yo.unlock, "boot_stage", return_value=yo.BootStage.INITRD
+                    ),
+                    self.assertRaisesRegex(yo.YoError, "another yo is unlocking"),
+                ):
+                    args = yo.build_parser().parse_args(["down"])
+                    args.func(args)
+        fake_run.assert_not_called()
+
+    def test_the_lock_is_free_again_after_down(self):
+        self.down(yo.BootStage.INITRD, PROBE_AT_THE_PASSPHRASE_PROMPT)
+        with yo.unlock_lock(wait=False):
+            pass
+
+    def test_sending_the_passphrase_holds_the_lock(self):
+        # The send is the other half of the exclusion with `yo down`.
+        held = []
+
+        def spawn(argv, **kwargs):
+            try:
+                with yo.unlock_lock(wait=False):
+                    held.append(False)
+            except yo.UnlockBusy:
+                held.append(True)
+            return FakeHelper(*UNLOCKED)
+
+        with (
+            mock.patch.object(yo.proc, "spawn", side_effect=spawn),
+            mock.patch.object(yo.LIMA, "verify_initrd_listener"),
+            mock.patch.object(yo.sshconfig, "initrd_endpoint"),
+            mock.patch.object(yo.sshconfig, "initrd_ssh_argv", return_value=["ssh"]),
+        ):
+            yo.run_initrd_helper(b"secret")
+        self.assertEqual(held, [True])
 
 
 class TestDiskGrowResizesTheMapping(FakeHome):
@@ -2922,6 +3262,9 @@ class TestDiskGrowResizesTheMapping(FakeHome):
 
     # A 100 GiB disk: vda2 is all of it but the 249 MiB ESP.
     FULL_VDA2 = 100 * 1024**3 - 249 * 1024**2
+
+    # What `lsblk -no SIZE /dev/vda2` answers, as (exit code, stdout, stderr).
+    vda2_listing = (0, "199.8G\n", "")
 
     def disk_grow(
         self, fstype="crypto_LUKS\n", size="200", df_k=GROWN, vda2_bytes=FULL_VDA2
@@ -2950,6 +3293,9 @@ class TestDiskGrowResizesTheMapping(FakeHome):
                 stdout = next(df_k)
             elif argv[:3] == ["lsblk", "-bdno", "SIZE"]:
                 stdout = "%s\n" % vda2_bytes
+            elif argv[:2] == ["lsblk", "-no"]:
+                code, stdout, stderr = self.vda2_listing
+                return mock.Mock(returncode=code, stdout=stdout, stderr=stderr)
             return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
         order = []
@@ -3028,6 +3374,20 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         same = self.UNGROWN
         with self.assertRaisesRegex(yo.YoError, "cannot read the size of /dev/vda2"):
             self.disk_grow(size="100", df_k=same, vda2_bytes="")
+
+    def test_the_grown_partition_size_is_reported(self):
+        self.disk_grow()
+        self.assertIn("after:  vda2 is 199.8G", self.out)
+
+    def test_a_partition_size_that_cannot_be_read_afterwards_says_why_and_the_grow_stands(
+        self,
+    ):
+        self.vda2_listing = (1, "", "lsblk: /dev/vda2: not a block device\n")
+        self.disk_grow()
+        report = [line for line in self.out if line.startswith("after:  vda2")]
+        self.assertEqual(len(report), 1)
+        self.assertIn("exit 1", report[0])
+        self.assertIn("not a block device", report[0])
 
     def test_a_new_ceiling_that_grows_nothing_is_an_error(self):
         same = self.UNGROWN

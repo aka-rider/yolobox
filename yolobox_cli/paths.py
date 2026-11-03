@@ -21,11 +21,11 @@ def guest_path(path: str, roots: Sequence[str] = (AGENT_HOME,)) -> str:
         if tuple(roots) == (AGENT_HOME,):
             raise YoError(
                 'refusing to target "%s": no yo command may leave the guest home "%s"'
-                % (path, AGENT_HOME)
+                % (ui.shown(path), AGENT_HOME)
             )
         raise YoError(
             'refusing to target "%s": outside the guest paths this command may use (%s)'
-            % (path, " and ".join('"%s"' % root for root in roots))
+            % (ui.shown(path), " and ".join('"%s"' % root for root in roots))
         )
     return normalised
 
@@ -42,11 +42,15 @@ def logical_cwd() -> str:
 
 
 def mirror(mac_path: str) -> Optional[str]:
-    host = state.home().rstrip("/")
-    if mac_path == host:
-        return AGENT_HOME
-    if mac_path.startswith(host + "/"):
-        return AGENT_HOME + "/" + mac_path[len(host) + 1 :]
+    # Both spellings of $HOME: when $HOME goes through a symlink (macOS's /var),
+    # a cwd the shell did not report (no usable $PWD) comes back from getcwd()
+    # resolved. Only the prefix is matched; the rest of the path stays as spelled.
+    home = state.home()
+    for host in dict.fromkeys((home.rstrip("/"), os.path.realpath(home).rstrip("/"))):
+        if mac_path == host:
+            return AGENT_HOME
+        if mac_path.startswith(host + "/"):
+            return AGENT_HOME + "/" + mac_path[len(host) + 1 :]
     return None
 
 
@@ -56,28 +60,12 @@ MISSING_PATH_NOTE = 'path "%s" does not exist in the yolobox you are in "%s"'
 def dir_for_cwd() -> str:
     desired = mirror(logical_cwd())
     if desired is None:
-        ui.err(MISSING_PATH_NOTE % (logical_cwd(), AGENT_HOME))
+        ui.err(MISSING_PATH_NOTE % (ui.shown(logical_cwd()), AGENT_HOME))
         return AGENT_HOME
     reported = guest.guest_helper_check(
         guest.guest_helper(AGENT, "landing-dir", [desired]), "landing-dir"
     ).stdout.strip("\n")
     landing = guest_path(reported)
     if landing != desired:
-        ui.err(MISSING_PATH_NOTE % (desired, landing))
+        ui.err(MISSING_PATH_NOTE % (ui.shown(desired), ui.shown(landing)))
     return landing
-
-
-def logical_toplevel(physical_top: str, cwd: str) -> str:
-    # git reports the repo root with symlinks resolved, but the mirror rule
-    # spells paths as the shell does (say ~/code is a link to ~/src). The
-    # root is the nearest ancestor of the logical cwd that resolves to it;
-    # cwd's ".." count cannot be used, since a symlink below the root can
-    # make the physical and logical depths differ.
-    real_top = os.path.realpath(physical_top)
-    candidate = cwd
-    while os.path.realpath(candidate) != real_top:
-        parent = os.path.dirname(candidate)
-        if parent == candidate:
-            return real_top
-        candidate = parent
-    return candidate

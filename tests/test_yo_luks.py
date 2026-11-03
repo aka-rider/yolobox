@@ -2,12 +2,13 @@ import os
 import shutil
 import socket
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
 from unittest import mock
 
-from test_yo import FakeHome, yo
+from test_yo import FakeHome, initrd_probe, yo
 
 ED25519_BLOB = yo.ssh_string(b"ssh-ed25519") + yo.ssh_string(b"\x01" * 32)
 OTHER_BLOB = yo.ssh_string(b"ssh-ed25519") + yo.ssh_string(b"\x02" * 32)
@@ -192,10 +193,12 @@ class TestSshAgentClient(FakeAgent):
             ],
         )
 
-    def test_a_declined_signature_names_the_prompt(self):
+    def test_a_declined_signature_names_the_prompt_and_no_one_command(self):
         with self.assertRaises(yo.YoError) as caught:
             yo.ssh_agent_sign(self.sock_path, RSA_BLOB, yo.LUKS_SIGN_DATA)
         self.assertIn("approve the prompt", caught.exception.message)
+        self.assertIn("run the same yo command again", caught.exception.message)
+        self.assertNotIn("yo up", caught.exception.message)
 
     def test_luks_passphrase_signs_with_the_titled_key(self):
         with (
@@ -217,7 +220,50 @@ class TestSshAgentClientFailures(FakeAgent):
         self.raw_reply = struct.pack(">I", 10) + b"\x0c"
         with self.assertRaises(yo.YoError) as caught:
             yo.ssh_agent_identities(self.sock_path)
-        self.assertIn("not answering", caught.exception.message)
+        self.assertIn("hung up", caught.exception.message)
+        self.assertNotIn("not answering", caught.exception.message)
+
+    def sign_failure(self, blob=ED25519_BLOB):
+        with self.assertRaises(yo.YoError) as caught:
+            yo.ssh_agent_sign(self.sock_path, blob, yo.LUKS_SIGN_DATA)
+        return caught.exception.message
+
+    def assert_names_the_approval(self, message):
+        self.assertIn("declined or timed out", message)
+        # Up, bootstrap and disk-grow all derive the passphrase: no one command is named.
+        self.assertIn("run the same yo command again", message)
+        self.assertNotIn("yo up", message)
+        self.assertNotIn("not answering", message)
+
+    def test_a_sign_request_the_agent_drops_says_the_approval_was_not_given(self):
+        # 1Password answers the key listing, then drops the connection of the
+        # sign request when its prompt is declined or times out.
+        self.raw_reply = b""
+        self.assert_names_the_approval(self.sign_failure())
+
+    def test_a_sign_request_the_agent_resets_says_the_same(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.side_effect = ConnectionResetError("reset by peer")
+        with mock.patch.object(yo.agent.socket, "socket", return_value=connection):
+            self.assert_names_the_approval(self.sign_failure())
+
+    def test_a_sign_request_the_agent_refuses_to_take_says_the_same(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.sendall.side_effect = BrokenPipeError("broken pipe")
+        with mock.patch.object(yo.agent.socket, "socket", return_value=connection):
+            self.assert_names_the_approval(self.sign_failure())
+
+    def test_a_key_listing_the_agent_resets_does_not_blame_an_approval(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.side_effect = ConnectionResetError("reset by peer")
+        with mock.patch.object(yo.agent.socket, "socket", return_value=connection):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.ssh_agent_identities(self.sock_path)
+        self.assertIn("hung up", caught.exception.message)
+        self.assertNotIn("declined", caught.exception.message)
 
     def test_a_missing_socket_is_refused_without_a_prompt_hint(self):
         with self.assertRaises(yo.YoError) as caught:
@@ -284,6 +330,199 @@ class TestClassifyInitrdAttempt(unittest.TestCase):
                 self.assertEqual(
                     yo.classify_initrd_attempt(255, text), yo.SshOutcome.ERROR
                 )
+
+
+class TestClassifyInitrdProbe(unittest.TestCase):
+    """Only a proved idle wait for the passphrase may be powered off by `yo down`."""
+
+    CRYPTSETUP_ASK = "cryptsetup:/dev/disk/by-uuid/1234"
+    states = yo.InitrdState
+
+    def test_a_box_idle_at_the_disks_passphrase_prompt_is_waiting(self):
+        self.assertEqual(
+            yo.classify_initrd_probe(initrd_probe("active", [self.CRYPTSETUP_ASK])),
+            self.states.WAITING_FOR_PASSPHRASE,
+        )
+
+    def test_a_migration_still_waiting_for_its_passphrase_has_written_nothing(self):
+        self.assertEqual(
+            yo.classify_initrd_probe(initrd_probe("activating", [yo.MIGRATE_ASK_ID])),
+            self.states.WAITING_FOR_PASSPHRASE,
+        )
+
+    def test_a_migration_that_has_its_passphrase_is_migrating(self):
+        # The unit runs for hours after the ask is gone; the ask is the only
+        # moment before its first write.
+        for asks in ([], [self.CRYPTSETUP_ASK]):
+            with self.subTest(asks=asks):
+                self.assertEqual(
+                    yo.classify_initrd_probe(initrd_probe("activating", asks)),
+                    self.states.MIGRATING,
+                )
+
+    def test_a_running_unlock_helper_means_someone_is_about_to_answer(self):
+        for migrate, asks in (
+            ("active", [self.CRYPTSETUP_ASK]),
+            ("activating", [yo.MIGRATE_ASK_ID]),
+        ):
+            with self.subTest(migrate=migrate):
+                self.assertEqual(
+                    yo.classify_initrd_probe(
+                        initrd_probe(migrate, asks, unlock_running=True)
+                    ),
+                    self.states.UNLOCKING,
+                )
+
+    def test_a_migration_in_progress_wins_over_a_running_unlock_helper(self):
+        self.assertEqual(
+            yo.classify_initrd_probe(initrd_probe("activating", [], True)),
+            self.states.MIGRATING,
+        )
+
+    def test_a_failed_migration_is_named_apart_whatever_else_is_pending(self):
+        for asks in ([], [self.CRYPTSETUP_ASK]):
+            with self.subTest(asks=asks):
+                self.assertEqual(
+                    yo.classify_initrd_probe(initrd_probe("failed", asks)),
+                    self.states.MIGRATION_FAILED,
+                )
+
+    def test_a_finished_migration_with_nothing_asking_is_unlocked_idle(self):
+        # What the initrd's emergency mode looks like after the root mount failed.
+        self.assertEqual(
+            yo.classify_initrd_probe(initrd_probe("active")),
+            self.states.UNLOCKED_IDLE,
+        )
+
+    def test_everything_else_is_unknown(self):
+        for name, output in (
+            ("unit not found", initrd_probe("inactive", [self.CRYPTSETUP_ASK])),
+            ("no unit state at all", initrd_probe("", [self.CRYPTSETUP_ASK])),
+            ("an ask of someone else", initrd_probe("active", ["other:thing"])),
+            (
+                "a stranger's ask beside the disk's",
+                initrd_probe("active", [self.CRYPTSETUP_ASK, "other:thing"]),
+            ),
+            ("empty output", ""),
+            ("lizard", "lizard\n"),
+            ("no end marker", "migrate=active\n"),
+            (
+                "a line outside any section",
+                "migrate=active\nlizard\nprobe=end\n",
+            ),
+            (
+                "an ask section that never ends",
+                "migrate=active\nask-begin\nId=%s\nprobe=end\n" % self.CRYPTSETUP_ASK,
+            ),
+            (
+                "output after the end marker",
+                initrd_probe("active", [self.CRYPTSETUP_ASK]) + "migrate=active\n",
+            ),
+            (
+                "two answers for the unit",
+                "migrate=active\nmigrate=active\nprobe=end\n",
+            ),
+            (
+                "an Id outside an ask section",
+                "migrate=active\nId=%s\nprobe=end\n" % self.CRYPTSETUP_ASK,
+            ),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(yo.classify_initrd_probe(output), self.states.UNKNOWN)
+
+
+class TestInitrdProbeCommand(unittest.TestCase):
+    """The command itself, run by a real sh against a stand-in initrd."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.asks = os.path.join(self.root, "ask-password")
+        os.mkdir(self.asks)
+        self.fifos = os.path.join(self.root, "yolobox-unlock.*")
+        bin_dir = os.path.join(self.root, "bin")
+        os.mkdir(bin_dir)
+        systemctl = os.path.join(bin_dir, "systemctl")
+        with open(systemctl, "w") as handle:
+            handle.write("#!/bin/sh\necho $MIGRATE_UNIT_STATE\n")
+        os.chmod(systemctl, 0o755)
+        self.bin_dir = bin_dir
+
+    def ask(self, name, text):
+        with open(os.path.join(self.asks, name), "w") as handle:
+            handle.write(text)
+
+    def probe(self, migrate="active"):
+        command = yo.initrd_probe_command(self.asks, self.fifos)
+        completed = subprocess.run(
+            ["/bin/sh", "-c", command],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": self.bin_dir + ":/bin:/usr/bin",
+                "MIGRATE_UNIT_STATE": migrate,
+            },
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return yo.classify_initrd_probe(completed.stdout)
+
+    def test_a_box_with_nothing_pending_is_unlocked_idle(self):
+        self.assertEqual(self.probe(), yo.InitrdState.UNLOCKED_IDLE)
+
+    def test_an_ask_file_without_a_final_newline_still_reads_as_the_prompt(self):
+        self.ask(
+            "ask.1", "[Ask]\nMessage=Please enter passphrase\nId=cryptsetup:/dev/x"
+        )
+        self.ask("ask.2", "[Ask]\nId=%s\nMessage=m" % yo.MIGRATE_ASK_ID)
+        self.assertEqual(self.probe(), yo.InitrdState.WAITING_FOR_PASSPHRASE)
+
+    def test_a_leftover_unlock_fifo_is_seen_beside_an_ask_without_a_final_newline(
+        self,
+    ):
+        self.ask("ask.1", "[Ask]\nId=cryptsetup:/dev/x")
+        with open(os.path.join(self.root, "yolobox-unlock.Ab12Cd"), "w"):
+            pass
+        self.assertEqual(self.probe(), yo.InitrdState.UNLOCKING)
+
+    def test_a_running_migration_with_no_ask_left_is_migrating(self):
+        self.assertEqual(self.probe("activating"), yo.InitrdState.MIGRATING)
+
+
+class TestInitrdState(FakeHome):
+    def reading_after(self, completed):
+        with mock.patch.object(yo.proc, "run", return_value=completed) as run:
+            result = yo.initrd_state()
+        self.assertEqual(run.call_args.args[0][-1], yo.INITRD_PROBE_COMMAND)
+        return result
+
+    def test_the_probe_runs_in_the_initrd_and_its_output_is_judged(self):
+        completed = subprocess.CompletedProcess([], 0, initrd_probe("activating"), "")
+        self.assertEqual(
+            self.reading_after(completed),
+            yo.InitrdReading(yo.InitrdState.MIGRATING, ""),
+        )
+
+    def test_an_ssh_that_failed_is_unknown_and_says_why(self):
+        completed = subprocess.CompletedProcess(
+            [],
+            255,
+            initrd_probe("active", ["cryptsetup:/dev/vda2"]),
+            "Host key lizard\n",
+        )
+        reading = self.reading_after(completed)
+        self.assertEqual(reading.state, yo.InitrdState.UNKNOWN)
+        self.assertIn("exited 255", reading.cause)
+        self.assertIn("Host key lizard", reading.cause)
+
+    def test_an_ssh_that_failed_in_silence_still_gives_a_cause(self):
+        reading = self.reading_after(subprocess.CompletedProcess([], 255, "", ""))
+        self.assertIn("no message", reading.cause)
+
+    def test_output_no_state_matches_is_unknown_and_quoted(self):
+        reading = self.reading_after(subprocess.CompletedProcess([], 0, "lizard\n", ""))
+        self.assertEqual(reading.state, yo.InitrdState.UNKNOWN)
+        self.assertIn("lizard", reading.cause)
 
 
 class TestInitrdSshArgv(FakeHome):

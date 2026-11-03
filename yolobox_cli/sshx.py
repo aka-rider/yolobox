@@ -103,8 +103,21 @@ def probe(role: SshRole, argv: Sequence[str], **kwargs) -> subprocess.CompletedP
     return completed
 
 
-def guest_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> str:
-    return ssh_run(OPERATOR, argv, mux=mux, check=check).stdout
+def guest_out(argv: Sequence[str]) -> str:
+    """What a command printed on the box. Unreachable when the box is lost, YoError with
+    the command's stderr when it failed there: its output is a fact only if it succeeded."""
+    completed = probe(OPERATOR, argv)
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        raise YoError(
+            "%s failed on the box (exit %d)%s"
+            % (
+                shlex.join(argv),
+                completed.returncode,
+                ": " + stderr if stderr else "",
+            )
+        )
+    return completed.stdout
 
 
 def account_status() -> Tuple[str, str]:

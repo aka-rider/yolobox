@@ -56,7 +56,7 @@ The split narrows what an agent can do. It does not isolate or contain it. The a
 
 - 1Password is reachable by every agent session for as long as the VM runs, not only during one `yo enter`. Any process in the VM can authenticate to GitHub as the operator. See [docs/ssh.md](ssh.md#1password-reaches-the-agent).
 - The AWS broker hands out real credentials for every allow-listed SSO profile to any process that asks, by design. See [docs/aws.md](aws.md#design).
-- Every commit an agent makes still rides the git push channel back to the Mac, where the operator builds and runs what it wrote.
+- Every commit an agent makes still rides git back to the Mac, where the operator builds and runs what it wrote.
 - Rootless podman's containment rests on the kernel's unprivileged user-namespace support holding, so a kernel exploit reaches exactly as far as it did before.
 - Anything an agent leaves under `/home/agent` persists across sessions, with no clean state short of recreating the VM.
 - `/etc/yolobox/local.nix` can put `wheel` back in one line, because nothing inside the box enforces the separation at runtime. Only the discipline [CONSTITUTION.md](../CONSTITUTION.md) writes down does.

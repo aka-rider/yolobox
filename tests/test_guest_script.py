@@ -163,99 +163,6 @@ class TestLandingDir(GuestScript):
         self.assertEqual(result.stdout, "%s\n" % self.home)
 
 
-class TestEnsureRepo(GuestScript):
-    def git(self, directory, *args):
-        return subprocess.run(
-            ["git", "-C", str(directory), *args],
-            capture_output=True,
-            text=True,
-            check=True,
-            env=self.env,
-        ).stdout.strip()
-
-    def head(self, directory):
-        return self.git(directory, "symbolic-ref", "--short", "HEAD")
-
-    def commit(self, directory):
-        self.git(
-            directory,
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "x",
-        )
-
-    def accepts_pushes_to_the_checked_out_branch(self, directory):
-        probe = subprocess.run(
-            ["git", "-C", str(directory), "config", "receive.denyCurrentBranch"],
-            capture_output=True,
-            text=True,
-            env=self.env,
-        )
-        return probe.stdout.strip() == "updateInstead"
-
-    def test_a_missing_directory_becomes_a_push_target_on_main(self):
-        target = self.tmp / "new" / "project"
-        result = self.run_script("ensure-repo", str(target))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.head(target), "main")
-        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(target))
-
-    def test_the_branch_the_caller_names_is_the_one_head_is_on(self):
-        target = self.tmp / "project"
-        result = self.run_script("ensure-repo", str(target), "master")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.head(target), "master")
-
-    def test_a_repo_with_commits_keeps_its_branch_and_gains_the_push_setting(self):
-        target = self.tmp / "project"
-        self.git(self.tmp, "init", "-b", "trunk", str(target))
-        self.commit(target)
-        result = self.run_script("ensure-repo", str(target), "main")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.head(target), "trunk")
-        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(target))
-
-    def test_an_empty_repo_made_for_another_branch_is_moved_to_the_callers(self):
-        # What an older yo link left behind: HEAD on an unborn main, then a
-        # push of master that is accepted and leaves the worktree empty.
-        target = self.tmp / "project"
-        self.git(self.tmp, "init", "-b", "main", str(target))
-        result = self.run_script("ensure-repo", str(target), "master")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.head(target), "master")
-        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(target))
-
-    def test_a_repo_reached_through_a_symlink_counts_as_existing(self):
-        real = self.tmp / "real"
-        self.git(self.tmp, "init", "-b", "trunk", str(real))
-        self.commit(real)
-        link = self.tmp / "link"
-        link.symlink_to(real)
-        result = self.run_script("ensure-repo", str(link))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.head(real), "trunk")
-        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(real))
-
-    def test_a_directory_inside_another_repo_gets_a_repo_of_its_own(self):
-        outer = self.tmp / "outer"
-        self.git(self.tmp, "init", "-b", "main", str(outer))
-        inner = outer / "sub" / "project"
-        result = self.run_script("ensure-repo", str(inner))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.git(inner, "rev-parse", "--show-toplevel"), str(inner))
-        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(inner))
-
-    def test_no_directory_argument_is_refused(self):
-        result = self.run_script("ensure-repo")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("ensure-repo requires a directory argument", result.stderr)
-
-
 FAKE_AWS = """#!/bin/sh
 cat >/dev/null
 echo "arn:aws:sts::1:assumed-role/r/$AWS_PROFILE"
@@ -714,6 +621,12 @@ printf '%s' "$FAKE_DIG_OUT"
 exit "$FAKE_DIG_RC"
 """
 
+# `stat -f -c '%f %S' /` answers "<free blocks> <block size>".
+FAKE_STAT = """#!/bin/sh
+printf '%s\\n' "$FAKE_STAT_OUT"
+exit "$FAKE_STAT_RC"
+"""
+
 DNS_REPLY = ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n"
 DNS_SERVFAIL = ";; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 1\n"
 
@@ -725,6 +638,9 @@ class TestNetCheckSkipsTheGatewayProbeOnlyWhenTheBoxBlocksIt(GuestScript):
         dig = bin_dir / "dig"
         dig.write_text(FAKE_DIG)
         dig.chmod(0o755)
+        stat = bin_dir / "stat"
+        stat.write_text(FAKE_STAT)
+        stat.chmod(0o755)
         self.dig_argv = self.tmp / "dig-argv"
         self.blocked = self.tmp / "gateway-blocked"
         self.env.update(
@@ -732,45 +648,79 @@ class TestNetCheckSkipsTheGatewayProbeOnlyWhenTheBoxBlocksIt(GuestScript):
             YOLOBOX_GATEWAY_BLOCKED=str(self.blocked),
         )
 
-    def net_check(self, *args, curl_rc=0, dig_out=DNS_REPLY, dig_rc=0):
+    def net_check(
+        self,
+        *args,
+        curl_rc=0,
+        dig_out=DNS_REPLY,
+        dig_rc=0,
+        stat_out="1000000 4096",
+        stat_rc=0,
+    ):
         return self.run_script(
             "net-check",
             *args,
             curl_rc=curl_rc,
-            extra_env={"FAKE_DIG_OUT": dig_out, "FAKE_DIG_RC": str(dig_rc)},
+            extra_env={
+                "FAKE_DIG_OUT": dig_out,
+                "FAKE_DIG_RC": str(dig_rc),
+                "FAKE_STAT_OUT": stat_out,
+                "FAKE_STAT_RC": str(stat_rc),
+            },
         )
 
     def test_without_the_marker_the_gateway_is_asked_for_the_root_name_servers(self):
         result = self.net_check()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=ok\n")
+        self.assertEqual(result.stdout, "egress=ok\ngateway=ok\nrootdisk=ok\n")
         argv = self.dig_argv.read_text().split("\n")
         self.assertEqual(argv[-4:-1], ["@192.168.5.2", ".", "NS"])
 
     def test_a_dns_error_reply_still_proves_the_gateway_answers(self):
         result = self.net_check(dig_out=DNS_SERVFAIL, dig_rc=0)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=ok\n")
+        self.assertEqual(result.stdout, "egress=ok\ngateway=ok\nrootdisk=ok\n")
 
     def test_a_gateway_that_sends_no_reply_is_reported_dead(self):
         result = self.net_check(dig_out=";; no servers could be reached\n", dig_rc=9)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=dead\n")
+        self.assertEqual(result.stdout, "egress=ok\ngateway=dead\nrootdisk=ok\n")
 
     def test_dig_exiting_zero_without_a_reply_is_still_dead(self):
         # bind9 #3235 and #3615: exit 0 on an ICMP unreachable.
         result = self.net_check(dig_out=";; Connection refused\n", dig_rc=0)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=dead\n")
+        self.assertEqual(result.stdout, "egress=ok\ngateway=dead\nrootdisk=ok\n")
 
     def test_egress_that_fails_is_reported_dead_whatever_the_gateway_does(self):
         result = self.net_check(curl_rc=6)
-        self.assertEqual(result.stdout, "egress=dead\ngateway=ok\n")
+        self.assertEqual(result.stdout, "egress=dead\ngateway=ok\nrootdisk=ok\n")
 
     def test_a_box_with_the_marker_skips_the_gateway_probe_without_running_it(self):
         self.blocked.write_text("")
         result = self.net_check()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=skipped\n")
+        self.assertEqual(result.stdout, "egress=ok\ngateway=skipped\nrootdisk=ok\n")
         self.assertEqual(result.stderr, "")
         self.assertFalse(self.dig_argv.exists())
+
+    def test_a_root_disk_with_no_space_left_for_root_is_named_full(self):
+        # The DNS failure a full disk causes (dhcpcd cannot write resolv.conf)
+        # leaves the gateway answering and egress dead: the shape of a VPN.
+        result = self.net_check(curl_rc=6, stat_out="0 4096")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "egress=dead\ngateway=ok\nrootdisk=full\n")
+
+    def test_the_root_disk_is_full_just_below_64_mib_free_and_not_at_64(self):
+        blocks_64_mib = 64 * 1024 * 1024 // 4096
+        for blocks, word in ((blocks_64_mib - 1, "full"), (blocks_64_mib, "ok")):
+            with self.subTest(blocks=blocks):
+                result = self.net_check(stat_out="%d 4096" % blocks)
+                self.assertIn("rootdisk=%s\n" % word, result.stdout)
+
+    def test_a_stat_that_fails_or_answers_nonsense_is_an_error_not_a_pass(self):
+        for out, rc in (("", 1), ("", 0), ("lizard 4096", 0), ("-1", 0)):
+            with self.subTest(out=out, rc=rc):
+                result = self.net_check(stat_out=out, stat_rc=rc)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
 
     def test_an_argument_is_a_usage_error(self):
         for arg in ("8080", "", "lizard"):

@@ -109,6 +109,7 @@
           }
           nixos-lima.nixosModules.lima
           ./nix/base.nix
+          ./nix/swap.nix
           ./nix/luks.nix
           ./nix/podman.nix
           ./nix/agentic.nix

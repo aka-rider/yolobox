@@ -163,6 +163,9 @@ class FakeHost:
         if sub == "shutdown":
             self.states[args[0]] = self.shutdown_state
             return completed()
+        if sub == "destroy":
+            self.states[args[0]] = "shut off"
+            return completed()
         if sub == "list":
             return completed("\n".join(self.domains) + "\n\n")
         if sub == "dumpxml":
@@ -1551,6 +1554,86 @@ class TestUpWithASize(LibvirtCase):
         self.assertIn(
             "--memory %d is more than this host has" % (HOST_MEMORY_GIB + 1), refusal
         )
+
+
+class TestDown(LibvirtCase):
+    # The initrd has no ACPI handler, so `virsh shutdown` on a box parked there
+    # would wait out the whole stop timeout.
+    def setUp(self):
+        super().setUp()
+        self.host.tagged_domain("box", FIRST_PORT)
+        for patcher in (
+            mock.patch.object(self.box.proc, "spawn", self.host.spawn),
+            mock.patch.object(self.box.ui, "out"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def down(self, stage, initrd=None):
+        initrd = initrd or self.box.unlock.InitrdState.WAITING_FOR_PASSPHRASE
+        reading = self.box.unlock.InitrdReading(initrd, "")
+        self.host.event_script = (["shut off"], "hang")
+        with (
+            mock.patch.object(self.box.unlock, "boot_stage", return_value=stage),
+            mock.patch.object(self.box.unlock, "initrd_state", return_value=reading),
+        ):
+            self.box.cmd_down(None)
+
+    def test_a_box_waiting_in_its_initrd_is_powered_off_without_a_shutdown_request(
+        self,
+    ):
+        self.down(self.box.BootStage.INITRD)
+        self.assertEqual(self.host.calls_of("destroy")[0][4:], ["yolobox-box"])
+        self.assertEqual(self.host.watchers, [])
+        self.assertNotIn("shutdown", self.host.subcommands())
+        self.assertEqual(self.driver.vm_status(), "shut off")
+
+    def test_a_box_that_is_up_or_unanswering_is_asked_to_shut_down(self):
+        for stage in (self.box.BootStage.STAGE2, self.box.BootStage.NONE):
+            with self.subTest(stage=stage):
+                self.host.watchers.clear()
+                self.host.states["yolobox-box"] = "running"
+                self.down(stage)
+                self.assertIn("shutdown", self.host.subcommands())
+                self.assertEqual(self.host.calls_of("destroy"), [])
+
+    def test_a_box_not_provably_idle_in_its_initrd_is_neither_destroyed_nor_asked_to_shut_down(
+        self,
+    ):
+        states = self.box.unlock.InitrdState
+        for initrd in set(states) - {states.WAITING_FOR_PASSPHRASE}:
+            with self.subTest(initrd=initrd):
+                with self.assertRaisesRegex(self.box.YoError, "Not stopping it"):
+                    self.down(self.box.BootStage.INITRD, initrd)
+                self.assertEqual(self.host.calls_of("destroy"), [])
+                self.assertNotIn("shutdown", self.host.subcommands())
+
+    def test_the_refusal_prints_the_destroy_command_unless_the_box_is_encrypting(self):
+        states = self.box.unlock.InitrdState
+        destroy = "virsh -c qemu:///system destroy yolobox-box"
+        for initrd in set(states) - {states.WAITING_FOR_PASSPHRASE}:
+            with self.subTest(initrd=initrd):
+                with self.assertRaises(self.box.YoError) as caught:
+                    self.down(self.box.BootStage.INITRD, initrd)
+                self.assertEqual(
+                    destroy in caught.exception.message,
+                    initrd is not states.MIGRATING,
+                )
+
+    def test_a_domain_already_off_is_not_destroyed(self):
+        self.host.states["yolobox-box"] = "shut off"
+        self.down(self.box.BootStage.INITRD)
+        self.assertEqual(self.host.calls_of("destroy"), [])
+
+    def test_a_refused_destroy_is_surfaced(self):
+        self.host.fail["destroy"] = "operation failed"
+        with self.assertRaisesRegex(self.box.YoError, "operation failed"):
+            self.down(self.box.BootStage.INITRD)
+
+    def test_a_domain_that_does_not_exist_is_an_error(self):
+        del self.host.domains["yolobox-box"]
+        with self.assertRaisesRegex(self.box.YoError, "does not exist"):
+            self.down(self.box.BootStage.INITRD)
 
 
 class TestVmUpWithAGap(LibvirtCase):

@@ -532,25 +532,40 @@ class LimaDriver:
             raise
 
     def stop(self) -> None:
+        self.limactl_stop(
+            [state.box.name],
+            "limactl stop hangs on the vz driver sometimes (TODO.md); recover with: "
+            "%s, then kill -9 any leftover 'limactl hostagent' for %s, then %s"
+            % (
+                state.yo_cmd("ssh", "sudo", "systemctl", "reboot"),
+                state.box.name,
+                state.yo_cmd("up"),
+            ),
+        )
+
+    def force_stop(self) -> None:
+        # The box is in its initrd, where `yo ssh` cannot reach it, so the
+        # recovery is the hostagent's kill alone (under vz that ends the VM).
+        self.limactl_stop(
+            ["--force", state.box.name],
+            "limactl stop hangs on the vz driver sometimes (TODO.md); recover with: "
+            "kill -9 any 'limactl hostagent' for %s (that also ends the VM) and any "
+            "child it left spinning, then %s" % (state.box.name, state.yo_cmd("up")),
+        )
+
+    def force_stop_command(self) -> str:
+        return "limactl stop --force %s" % state.box.name
+
+    def limactl_stop(self, args: List[str], hang_recovery: str) -> None:
         try:
             proc.run(
-                ["limactl", "stop", state.box.name],
+                ["limactl", "stop", *args],
                 capture=False,
                 check=True,
                 timeout=LIMA_STOP_TIMEOUT,
             )
         except RunTimeout as failure:
-            raise YoError(
-                "%s\n    limactl stop hangs on the vz driver sometimes (TODO.md); recover with: "
-                "%s, then kill -9 any leftover 'limactl hostagent' "
-                "for %s, then %s"
-                % (
-                    failure.message,
-                    state.yo_cmd("ssh", "sudo", "systemctl", "reboot"),
-                    state.box.name,
-                    state.yo_cmd("up"),
-                )
-            )
+            raise YoError("%s\n    %s" % (failure.message, hang_recovery))
 
     def stop_command(self) -> str:
         return "limactl stop %s" % state.box.name

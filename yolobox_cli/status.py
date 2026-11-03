@@ -262,13 +262,39 @@ class Gateway(enum.Enum):
 GATEWAY_WORDS = {gateway.value: gateway for gateway in Gateway}
 
 
+class RootDisk(enum.Enum):
+    # net-check's word for the root disk. NOT_REPORTED is a box built before
+    # the field existed: nothing is known about its disk, which is not "ok".
+    OK = "ok"
+    FULL = "full"
+    NOT_REPORTED = ""
+
+
+ROOT_DISK_WORDS = {root_disk.value: root_disk for root_disk in RootDisk}
+
+
 class NetCheck(NamedTuple):
     egress_ok: bool
     gateway: Gateway
+    root_disk: RootDisk
 
 
 def network_status_line(check: NetCheck) -> StatusLine:
-    egress_ok, gateway = check
+    egress_ok, gateway, root_disk = check
+    if root_disk is RootDisk.FULL:
+        # A full root disk leaves dhcpcd unable to write resolv.conf, which
+        # looks like a dead network or a VPN; name the real cause instead.
+        return StatusLine(
+            "network: WARNING the guest's root disk is full, so name resolution "
+            "can fail (dhcpcd cannot write resolv.conf); the probes saw egress %s "
+            "and lima's gateway %s — free space with `%s`; see docs/disk.md"
+            % (
+                "ok" if egress_ok else "dead",
+                gateway.value,
+                state.yo_cmd("gc", "--yes"),
+            ),
+            True,
+        )
     if gateway is Gateway.SKIPPED:
         if egress_ok:
             return StatusLine(
@@ -310,9 +336,14 @@ def guest_network_line() -> StatusLine:
         return StatusLine("network: not checked — %s" % e.message)
     check = parse_net_check(completed.stdout)
     if check is None:
+        stderr = completed.stderr.strip()
         return StatusLine(
-            "network: not checked — net-check answered %r (exit %d)"
-            % (completed.stdout.strip(), completed.returncode)
+            "network: not checked — net-check answered %r (exit %d)%s"
+            % (
+                completed.stdout.strip(),
+                completed.returncode,
+                ": " + stderr if stderr else "",
+            )
         )
     return network_status_line(check)
 
@@ -322,7 +353,10 @@ def parse_net_check(text: str) -> Optional[NetCheck]:
     gateway = guest_field(text, "gateway")
     if egress not in ("ok", "dead") or gateway not in GATEWAY_WORDS:
         return None
-    return NetCheck(egress == "ok", GATEWAY_WORDS[gateway])
+    rootdisk = guest_field(text, "rootdisk")
+    if rootdisk not in ROOT_DISK_WORDS:
+        return None
+    return NetCheck(egress == "ok", GATEWAY_WORDS[gateway], ROOT_DISK_WORDS[rootdisk])
 
 
 def status_guest_services(report: Report) -> None:
@@ -373,6 +407,27 @@ def status_guest_services(report: Report) -> None:
     report.emit(guest_network_line())
 
 
+def encryption_line() -> StatusLine:
+    try:
+        fstype = vm.luks_device_fstype()
+    except sshx.Unreachable as lost:
+        return StatusLine("disk: %s" % lost.message, True)
+    except YoError as failed:
+        return StatusLine(
+            "disk: cannot read the type of %s: %s" % (LUKS_DEVICE, failed.message)
+        )
+    disk_state = vm.classify_disk(fstype)
+    if disk_state is DiskState.UNREADABLE:
+        return StatusLine("disk: cannot read the type of %s" % LUKS_DEVICE)
+    if disk_state is DiskState.ENCRYPTED:
+        return StatusLine("disk: %s is %s" % (LUKS_DEVICE, fstype))
+    return StatusLine(
+        "disk: %s is %s — NOT encrypted; rebuild and reboot: %s"
+        % (LUKS_DEVICE, fstype, state.yo_cmd("bootstrap")),
+        True,
+    )
+
+
 def disk_lines(vm_reachable: bool) -> List[StatusLine]:
     """The root disk's lines: usage, encryption and the host's image."""
     lines: List[StatusLine] = []
@@ -400,20 +455,7 @@ def disk_lines(vm_reachable: bool) -> List[StatusLine]:
                 )
             )
     if vm_reachable:
-        fstype = vm.luks_device_fstype()
-        disk_state = vm.classify_disk(fstype)
-        if disk_state is DiskState.UNREADABLE:
-            lines.append(StatusLine("disk: cannot read the type of %s" % LUKS_DEVICE))
-        elif disk_state is DiskState.ENCRYPTED:
-            lines.append(StatusLine("disk: %s is %s" % (LUKS_DEVICE, fstype)))
-        else:
-            lines.append(
-                StatusLine(
-                    "disk: %s is %s — NOT encrypted; rebuild and reboot: %s"
-                    % (LUKS_DEVICE, fstype, state.yo_cmd("bootstrap")),
-                    True,
-                )
-            )
+        lines.append(encryption_line())
     image = state.driver().disk_image()
     if image is not None:
         label, image_kib = image
@@ -476,6 +518,24 @@ def aws_lines(vm_reachable: bool) -> List[StatusLine]:
     return lines
 
 
+def initrd_disk_line(reading: unlock.InitrdReading) -> str:
+    """The `disk:` line of a box that answers in its initrd, one line per state."""
+    initrd = unlock.InitrdState
+    if reading.state is initrd.WAITING_FOR_PASSPHRASE:
+        advice = "unlock it with: %s" % state.yo_cmd("up")
+    elif reading.state is initrd.MIGRATING:
+        advice = "do not stop it; finish the boot with: %s" % state.yo_cmd("up")
+    else:
+        advice = "%s explains how to stop it" % state.yo_cmd("down")
+        if reading.cause:
+            advice = "%s; %s" % (reading.cause, advice)
+    return "disk: locked — %s is in its initrd, %s; %s" % (
+        state.box.name,
+        reading.state.value,
+        advice,
+    )
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     report = Report()
     state.driver().show_status()
@@ -497,10 +557,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             "vm: unreachable — is it up? start it with: %s" % state.yo_cmd("up")
         )
         if stage is BootStage.INITRD:
-            ui.out(
-                "disk: locked — %s is waiting in its initrd for the passphrase; unlock it with: %s"
-                % (state.box.name, state.yo_cmd("up"))
-            )
+            ui.out(initrd_disk_line(unlock.initrd_state()))
 
     for line in disk_lines(vm_reachable):
         report.emit(line)

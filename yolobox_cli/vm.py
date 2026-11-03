@@ -98,7 +98,7 @@ def classify_disk(fstype: str) -> DiskState:
 def luks_device_fstype() -> str:
     # -d: the device alone. Without it lsblk lists the mapped child too, and on
     # the live box it printed the child's ext4 before the device's crypto_LUKS.
-    return sshx.guest_out(["lsblk", "-dno", "FSTYPE", LUKS_DEVICE], check=False).strip()
+    return sshx.guest_out(["lsblk", "-dno", "FSTYPE", LUKS_DEVICE]).strip()
 
 
 def guest_generations() -> Tuple[str, str]:
@@ -109,8 +109,7 @@ def guest_generations() -> Tuple[str, str]:
             "sh",
             "-c",
             "readlink -f /nix/var/nix/profiles/system && readlink -f /run/current-system",
-        ],
-        check=False,
+        ]
     ).splitlines()
     return (lines[0] if lines else ""), (lines[1] if len(lines) > 1 else "")
 
@@ -143,6 +142,117 @@ def asked_size(args: argparse.Namespace) -> Size:
 
 def cmd_up(args: argparse.Namespace) -> None:
     vm_up(size=asked_size(args))
+
+
+def initrd_down_refusal(reading: unlock.InitrdReading) -> str:
+    """Why `yo down` leaves a box in its initrd running, for every state but an idle wait.
+
+    Whenever the box may be stuck for good, the refusal also prints the driver's
+    own force-stop command and when it is safe to run: yo never runs it there.
+    """
+    name = state.box.name
+    initrd = unlock.InitrdState
+    force = state.driver().force_stop_command()
+    journal = unlock.initrd_root_ssh_command("journalctl -u yolobox-luks-migrate -b")
+    if reading.state is initrd.MIGRATING:
+        # No force command: nothing here can make a kill safe.
+        return (
+            "%s is in its initrd, encrypting the disk in place, and killing the VM now "
+            "can destroy the disk. Not stopping it. Wait, then finish the boot with %s "
+            "and stop it with %s. To look inside first: %s"
+            % (name, state.yo_cmd("up"), state.yo_cmd("down"), journal)
+        )
+    if reading.state is initrd.UNLOCKING:
+        return (
+            "%s is in its initrd with a yolobox-unlock helper running (its FIFO "
+            "%s exists), so yo cannot prove it is idle. Not stopping it. No yo on this host is "
+            "sending the passphrase right now, so it is usually the leftover of a "
+            "%s that died, and it stays until the initrd restarts: this refusal "
+            "would never end. Wait a minute (a live helper ends by itself) and run "
+            "%s again. If it refuses again, power it off with: %s\n"
+            "That is safe once no yo, on any machine, is unlocking this box: this "
+            "probe saw no migration running, so nothing is encrypting."
+            % (
+                name,
+                unlock.UNLOCK_FIFO_GLOB,
+                state.yo_cmd("up"),
+                state.yo_cmd("down"),
+                force,
+            )
+        )
+    if reading.state is initrd.MIGRATION_FAILED:
+        return (
+            "%s is in its initrd after its in-place disk encryption failed, and a "
+            "polite stop would hang there. Not stopping it. Read why first: %s\n"
+            "Powering off is safe from further damage: the migration script has "
+            "ended, so nothing is writing, and the disk is as the script left it (see "
+            "docs/disk-encryption.md#recognising-failures, a refusal for lack of "
+            "space leaves the plaintext intact). Power it off with: %s"
+            % (name, journal, force)
+        )
+    if reading.state is initrd.UNLOCKED_IDLE:
+        return (
+            "%s is in its initrd with the disk unlocked, and nothing is asking for a "
+            "passphrase or running. After a %s that said the initrd could not mount "
+            "the root (sysroot.mount failed), this is where the box waits in "
+            "emergency mode, and %s cannot help it. Not stopping it. Check "
+            "first: %s\n"
+            "Nothing is writing, so powering off is safe once that journal shows the "
+            "root mount failed and not a switch-root in progress. Power it off with: "
+            "%s, then start it again with %s"
+            % (
+                name,
+                state.yo_cmd("up"),
+                state.yo_cmd("down"),
+                unlock.initrd_root_ssh_command("journalctl -b"),
+                force,
+                state.yo_cmd("up"),
+            )
+        )
+    return (
+        "%s is in its initrd, and yo cannot prove it is idle: %s. Not stopping it. "
+        "Look inside first: %s\n"
+        "If it is encrypting the disk in place, killing the VM can destroy the "
+        "disk, so wait for it. Powering it off is safe only when the journal shows "
+        "no migration running: %s"
+        % (name, reading.cause or reading.state.value, journal, force)
+    )
+
+
+def cmd_down(args: argparse.Namespace) -> None:
+    if unlock.boot_stage() is not BootStage.INITRD:
+        state.driver().stop()
+        return
+    # A box parked in its initrd has no ACPI handler, so a polite shutdown would
+    # only wait out the stop timeout, and a forced one is safe only while nothing
+    # is writing: the first boot's in-place encryption runs in this same initrd.
+    # So it is powered off only when proved idle, and otherwise left alone: a
+    # polite stop would hang, and a force would be a power cut mid-encryption.
+    # The lock spans the probe and the power-off, so no yo can answer the
+    # passphrase prompt between the proof and the kill.
+    try:
+        with state.unlock_lock(wait=False):
+            reading = unlock.initrd_state()
+            if reading.state is not unlock.InitrdState.WAITING_FOR_PASSPHRASE:
+                raise YoError(initrd_down_refusal(reading))
+            ui.out(
+                "%s is waiting in its initrd for the passphrase, which cannot shut down; "
+                "powering it off" % state.box.name
+            )
+            state.driver().force_stop()
+    except state.UnlockBusy:
+        raise YoError(
+            "another yo is unlocking %s (%s, %s or %s is sending its passphrase). "
+            "Not stopping it: its answer may start the in-place encryption. Wait "
+            "for that command to finish, then run %s again"
+            % (
+                state.box.name,
+                state.yo_cmd("up"),
+                state.yo_cmd("bootstrap"),
+                state.yo_cmd("disk-grow"),
+                state.yo_cmd("down"),
+            )
+        )
 
 
 def cmd_bootstrap(args: argparse.Namespace) -> None:
@@ -263,13 +373,13 @@ def cmd_gc(args: argparse.Namespace) -> None:
 
 def require_growable_guest() -> None:
     load_state = sshx.guest_out(
-        ["systemctl", "show", "-p", "LoadState", "--value", "growpart"], check=False
+        ["systemctl", "show", "-p", "LoadState", "--value", "growpart"]
     ).splitlines()
     load_state = load_state[0] if load_state else ""
     if not load_state:
         raise YoError(
             state.not_up_hint(
-                "cannot reach the VM to ask about growpart", parenthesized=True
+                "cannot read the growpart unit from the VM", parenthesized=True
             )
         )
     if load_state != "loaded":
@@ -283,6 +393,16 @@ def require_growable_guest() -> None:
             "%s is not encrypted yet, so there is no mapping to grow — run: %s"
             % (LUKS_DEVICE, state.yo_cmd("bootstrap"))
         )
+
+
+def vda2_size_for_report() -> str:
+    """The partition's size as lsblk prints it, or why it could not be read: the grow
+    is already done, so a failed read is reported in the line, not raised."""
+    try:
+        sizes = sshx.guest_out(["lsblk", "-no", "SIZE", "/dev/vda2"]).splitlines()
+    except YoError as error:
+        return "unreadable: %s" % error.message
+    return sizes[0] if sizes else "unreadable: lsblk printed nothing"
 
 
 def cmd_disk_grow(args: argparse.Namespace) -> None:
@@ -340,12 +460,9 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
             "the ceiling is now %dGiB but the grow is unverified: %s — check with: %s"
             % (wanted, error.message, state.yo_cmd("ssh", "df", "-k", "/"))
         )
-    vda2_after = sshx.guest_out(
-        ["lsblk", "-no", "SIZE", "/dev/vda2"], check=False
-    ).splitlines()
     ui.out("before: %s" % before.human_line)
     ui.out("after:  %s" % after.human_line)
-    ui.out("after:  vda2 is %s" % (vda2_after[0] if vda2_after else ""))
+    ui.out("after:  vda2 is %s" % vda2_size_for_report())
     if after.total_kib > before.total_kib:
         return
     if finishing:
@@ -365,9 +482,7 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
 
 def require_partition_grown(ceiling_gib: int) -> None:
     """Raise unless /dev/vda2 fills the disk the ceiling describes, ESP aside."""
-    sizes = sshx.guest_out(
-        ["lsblk", "-bdno", "SIZE", LUKS_DEVICE], check=False
-    ).splitlines()
+    sizes = sshx.guest_out(["lsblk", "-bdno", "SIZE", LUKS_DEVICE]).splitlines()
     size = sizes[0].strip() if sizes else ""
     if not proc.is_ascii_number(size):
         raise YoError(

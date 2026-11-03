@@ -87,7 +87,11 @@ in
   # boundary; see nix/base.md#same-uid-ptrace.
   boot.kernel.sysctl."kernel.yama.ptrace_scope" = 0;
 
-  swapDevices = [{ device = "/var/swapfile"; size = 16384; }];
+  # nixos-lima's lima-init.nix sets kernel.unprivileged_userns_clone, a knob
+  # only the removed -hardened kernels had; mainline has none, so systemd-sysctl
+  # warned about it on every boot. User namespaces stay on through
+  # user.max_user_namespaces. See nix/base.md#sysctl-keys-the-kernel-lacks.
+  boot.kernel.sysctl."kernel.unprivileged_userns_clone" = lib.mkForce null;
 
   # A crash-looping language server (marksman, missing ICU) filled
   # /var/lib/systemd/coredump with dumps nobody read; systemd's default cap
@@ -311,6 +315,9 @@ in
     # content.
     lfs.enable = true;
     config = {
+      # A push into a project checkout in the VM updates its worktree, and
+      # git refuses it when the worktree or index differs from HEAD; see
+      # nix/base.md#pushing-into-a-vm-checkout.
       receive.denyCurrentBranch = "updateInstead";
       init.defaultBranch = "main";
     };

@@ -183,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
     up.set_defaults(func=vm.cmd_up)
 
     down = add("down", "Stop the VM.", "Stop the VM.")
-    down.set_defaults(func=lambda args: state.driver().stop())
+    down.set_defaults(func=vm.cmd_down)
 
     status_parser = add(
         "status",
@@ -304,16 +304,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cp_parser.add_argument("paths", nargs="+", metavar="path")
     cp_parser.set_defaults(func=cp.cmd_cp, heals=True)
-
-    link = add(
-        "link",
-        "Add a yolobox git remote to the current repo.",
-        'Add a "yolobox" git remote to the current repo, pointing at the same\n'
-        "$HOME-relative path in the VM (created there if missing). A stale\n"
-        "yolobox remote left by a previous box is updated in place. Then\n"
-        '"git push yolobox main" carries the project in.',
-    )
-    link.set_defaults(func=session.cmd_link, heals=True)
 
     code = add(
         "code",

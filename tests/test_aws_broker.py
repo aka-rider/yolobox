@@ -5,6 +5,7 @@ Tools whose absence skips tests: a Python with `select.kqueue` or
 """
 
 import contextlib
+import fcntl
 import importlib.machinery
 import importlib.util
 import io
@@ -536,11 +537,18 @@ class TestSigterm(SocketDirCase):
         self.assertFalse(os.path.lexists(self.sock))
 
 
-WINDOW_SCRIPT = """
+# The head of every script below: load the broker file as a module to wrap one
+# step of main(), then run main() itself.
+LOAD_BROKER = """
 import importlib.machinery, importlib.util, os, signal, sys
 loader = importlib.machinery.SourceFileLoader("aws_broker", sys.argv[1])
 broker = importlib.util.module_from_spec(importlib.util.spec_from_loader("aws_broker", loader))
 loader.exec_module(broker)
+"""
+
+WINDOW_SCRIPT = (
+    LOAD_BROKER
+    + """
 real_bind = broker.bind_server
 
 def bind_then_sigterm(*args, **kwargs):
@@ -552,6 +560,7 @@ broker.bind_server = bind_then_sigterm
 sys.argv = ["aws-broker", "--socket", sys.argv[2], "--watch-pid", sys.argv[3], "--allow", "dev"]
 broker.main()
 """
+)
 
 
 @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
@@ -573,6 +582,130 @@ class TestSigtermDuringBind(SocketDirCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertFalse(os.path.lexists(self.sock))
         self.assertIn("SIGTERM; shutting down", done.stderr)
+
+
+# A broker that stops between its reclaim and its bind until stdin says go.
+PAUSE_SCRIPT = (
+    LOAD_BROKER
+    + """
+real_bind = broker.bind_server
+
+def bind_after_go(*args, **kwargs):
+    print("IN_WINDOW", flush=True)
+    sys.stdin.readline()
+    return real_bind(*args, **kwargs)
+
+broker.bind_server = bind_after_go
+sys.argv = ["aws-broker", "--socket", sys.argv[2], "--watch-pid", sys.argv[3], "--allow", "dev"]
+broker.main()
+"""
+)
+
+# A broker that says when it is about to take the socket lock and when it starts
+# to reclaim the socket, so a test can order it against another broker.
+ANNOUNCE_SCRIPT = (
+    LOAD_BROKER
+    + """
+real_lock, real_reclaim = broker.held_socket_lock, broker.reclaim_socket_path
+
+def announce_lock(path):
+    print("ATTEMPT", flush=True)
+    return real_lock(path)
+
+def announce_reclaim(path):
+    print("RECLAIMING", flush=True)
+    return real_reclaim(path)
+
+broker.held_socket_lock = announce_lock
+broker.reclaim_socket_path = announce_reclaim
+sys.argv = ["aws-broker", "--socket", sys.argv[2], "--watch-pid", sys.argv[3], "--allow", "dev"]
+broker.main()
+"""
+)
+
+
+@unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+class TestSocketLock(SocketDirCase):
+    # reclaim (probe, then unlink) and bind are two steps; a second broker
+    # between them could unlink the first one's fresh socket. The lock makes
+    # the pair one step.
+    def lock_is_held(self):
+        fd = os.open(self.sock + ".lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)  # drops the lock when this probe got it
+        return False
+
+    def spawn(self, argv, **pipes):
+        child = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **pipes
+        )
+        for stream in (child.stdin, child.stdout, child.stderr):
+            if stream is not None:
+                self.addCleanup(stream.close)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child
+
+    def start_paused_broker(self):
+        return self.spawn(
+            [sys.executable, "-c", PAUSE_SCRIPT, BROKER_PATH, self.sock]
+            + [str(os.getpid())],
+            stdin=subprocess.PIPE,
+        )
+
+    def start_announcing_broker(self):
+        return self.spawn(
+            [sys.executable, "-c", ANNOUNCE_SCRIPT, BROKER_PATH, self.sock]
+            + [str(os.getpid())]
+        )
+
+    def test_the_lock_is_held_from_reclaim_through_bind_and_free_after(self):
+        child = self.start_paused_broker()
+        self.assertEqual(child.stdout.readline(), "IN_WINDOW\n")
+        self.assertTrue(self.lock_is_held())
+        child.stdin.write("go\n")
+        child.stdin.flush()
+        self.assertEqual(child.stdout.readline(), "READY\n")
+        self.assertFalse(self.lock_is_held())
+
+    def test_a_second_broker_cannot_reclaim_the_socket_the_first_is_about_to_bind(
+        self,
+    ):
+        first = self.start_paused_broker()
+        self.assertEqual(first.stdout.readline(), "IN_WINDOW\n")
+        # The first holds the lock between its reclaim and its bind, with no
+        # socket on disk yet. Without the lock the second would reclaim nothing,
+        # bind first, and make the first fail; with it, the second waits.
+        second = self.start_announcing_broker()
+        self.assertEqual(second.stdout.readline(), "ATTEMPT\n")
+        first.stdin.write("go\n")
+        first.stdin.flush()
+        self.assertEqual(first.stdout.readline(), "READY\n")
+        self.assertEqual(second.stdout.readline(), "RECLAIMING\n")
+        self.assertEqual(
+            second.stdout.readline(),
+            "ERROR=another aws-broker is already serving %s\n" % self.sock,
+        )
+        self.assertEqual(second.wait(30), 1)
+
+    def test_a_lock_file_that_cannot_be_opened_is_a_handshake_error(self):
+        os.mkdir(self.sock + ".lock")
+        self.addCleanup(os.rmdir, self.sock + ".lock")
+        # A subprocess with a timeout: a broker that ignored the lock file would
+        # serve forever instead of failing.
+        done = subprocess.run(
+            [sys.executable, BROKER_PATH, "--socket", self.sock]
+            + ["--watch-pid", str(os.getpid()), "--allow", "dev"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertTrue(done.stdout.startswith("ERROR=cannot open lock file"))
 
 
 class TestPidAlive(WaitingChild):

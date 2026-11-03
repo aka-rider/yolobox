@@ -4,13 +4,13 @@
 
 ## One helper, one PATH
 
-`nix/guest.nix` builds the script into the `yolobox-guest` package, and it sits on both accounts' `PATH`. It holds the project walk, the gitconfig-root walk, the landing-dir ancestor walk, `ensure-repo`, both `gc` tiers and the AWS probe.
+`nix/guest.nix` builds the script into the `yolobox-guest` package, and it sits on both accounts' `PATH`. It holds the project walk, the gitconfig-root walk, the landing-dir ancestor walk, both `gc` tiers and the AWS probe.
 
 `writeShellApplication` buys three things a Python string literal never could. A build-time shellcheck pass turns a bad find expression into a build error instead of a runtime one. It sets `set -euo pipefail`. And it pins a `runtimeInputs` PATH.
 
 `yo` reaches every subcommand the same way, `ssh ... yolobox-guest <sub> [args]`, with one account per subcommand:
 
-- `projects`, `landing-dir`, `ensure-repo`, `gc-user` and `aws-check` run as the agent.
+- `projects`, `landing-dir`, `gc-user` and `aws-check` run as the agent.
 - `gc-machine` runs as the operator, because ext4's root reserve, which makes any of this recoverable on a genuinely full disk, is the operator's alone.
 - `net-check` runs as the operator too, the one account every box has, however far its agent setup got.
 
@@ -18,13 +18,15 @@
 
 ## net-check and the gateway-blocked marker
 
-`net-check` takes no arguments and answers two questions in two lines, `egress=` (an HTTPS fetch of `https://github.com` bounded by `--max-time 5`, `probe_egress` in the script) and `gateway=` (a DNS query for the root name servers sent to lima's gateway at 192.168.5.2 with `dig +time=2 +tries=1`, `probe_gateway_dns` in the script). Together they tell a VPN on the host that owns its default route from one that blackholes the gateway; see [docs/host-network.md](../../docs/host-network.md#vpn-shapes).
+`net-check` takes no arguments and answers three questions in three lines, in this order: `egress=` (an HTTPS fetch of `https://github.com` bounded by `--max-time 5`, `probe_egress` in the script), `gateway=` (a DNS query for the root name servers sent to lima's gateway at 192.168.5.2 with `dig +time=2 +tries=1`, `probe_gateway_dns` in the script) and `rootdisk=` (below). The first two together tell a VPN on the host that owns its default route from one that blackholes the gateway; see [docs/host-network.md](../../docs/host-network.md#vpn-shapes).
 
 The gateway is `ok` when `dig`'s output contains `->>HEADER<<-`, which `dig` prints only when a DNS reply arrived, whatever its status (SERVFAIL counts). `dig`'s exit code is not read, because bind9 reports 0 on an ICMP unreachable or a reset connection (isc-projects/bind9 #3235 and #3615). Before the probe asked DNS, it connected to a TCP port on the host's loopback through the gateway; the egress table now rejects that, and DNS is the one gateway path it leaves open. A caller that passes an argument gets the usage line and exit 2, which is also what an old box answers a new `yo` that sends none; `yo` reports `network: not checked` for both.
 
 A box whose own configuration blocks the gateway by design says so by creating the file `/etc/yolobox/gateway-blocked`. Its content is not read, only its existence. When the file exists, `net-check` prints `gateway=skipped` and does not probe, because a probe that is refused on purpose would be reported as a VPN fault that is not there. `egress=` still runs. `yo` turns `skipped` into a `network:` line that says the probe was skipped because the box blocks it by design, and that line carries the verdict on egress alone. The repo creates no such file itself and names no reason for it; the marker is a hook for a box's `/etc/yolobox/local.nix` or a module it imports.
 
 `YOLOBOX_GATEWAY_BLOCKED` overrides the marker's path for the tests.
+
+`rootdisk=full` means `/` has under 64 MiB (`ROOT_MIN_FREE_MIB`) left for root, read by `root_free_mib` from `stat -f -c '%f %S' /`. That counts the blocks ext4 reserves for root, which `df`'s Avail column leaves out, because the processes a full disk breaks (dhcpcd, tailscaled) run as root and fail only when those blocks are gone too. A full disk first shows as a dead network, so `yo status` prints it instead of the network verdict (see [docs/disk.md](../../docs/disk.md#a-full-disk-looks-like-a-dns-failure)). A `stat` that fails or prints something that is not two numbers fails `net-check` with the message, and `yo` reports `network: not checked`; it is never read as "not full". A box built before this line existed prints none, and `yo` reads that as unknown, not full.
 
 ## The project walk
 
@@ -35,16 +37,6 @@ A project is any git repo at any depth under the guest home, not only `<group>/<
 Recognise that shape: `yo enter <fuzzy>` dies with a find `Permission denied` and no project list at all, even though the walk found real projects before it reached the unreadable one. A depth cap hides the hole for as long as the unreadable directory sits below it, which is why a cap is not a fix.
 
 The walk is `-mindepth 1` and prunes every top-level dotdir explicitly, rather than leaning on a maxdepth to keep it out of reach. An unreadable directory now warns, through `yo` printing find's own stderr, and the walk continues with the partial list. Only an empty list still refuses, with "no projects in the VM".
-
-## ensure-repo
-
-`ensure-repo <dir> [branch]` makes the VM side of `yo link` a repo with `receive.denyCurrentBranch = updateInstead`. Two checks decide whether it has to run `git init`, and each one was a silent failure.
-
-The branch is the caller's, `main` only when none is given. A push of `master` into a repo whose HEAD sits on an unborn `main` is accepted, HEAD stays on `main`, and the worktree stays empty with no error to see. Recognise it by `git -C <dir> symbolic-ref HEAD` naming a branch that `git branch` does not list.
-
-`yo link` always passes the Mac repo's current branch. The directory counts as a repo only when `git rev-parse --show-toplevel` equals its own `pwd -P`. `--git-dir` walks up the tree, so a directory inside another repo passed the check, got no repo of its own, and the push landed in (or failed against) the outer one. The `pwd -P` side makes a path reached through a symlink compare equal to the toplevel git prints, which is always physical.
-
-The `receive.denyCurrentBranch = updateInstead` setting is written on every run, so a repo that already existed on the VM side (made by hand, or by an earlier tool) accepts the first push instead of refusing it with `refusing to update checked out branch`. A repo with no commit yet also gets its HEAD pointed at the caller's branch, because an earlier `yo link` could leave an empty repo on `main` for a `master` push. A repo with a commit keeps whatever branch it is on.
 
 ## BUILD_DIRS and LOCAL_CACHES
 
@@ -100,7 +92,7 @@ The tier asks each project instead of matching names (the incident is in [docs/d
 - A `target` directory beside a `Cargo.toml` gets `cargo clean`, run in that directory.
 - Only `node_modules` and `.venv` are removed outright, plus a `.next` that has a `package.json` beside it.
 
-Two traps shape the guard. Deleting a build directory the project's `.gitignore` does not match dirties the checkout, and every later `git push yolobox` is refused with no obvious link back. A `.gitignore` that anchors `/node_modules` ignores only the top-level one, so a nested `web/node_modules` is tracked. Hence every directory the tier removes, or leaves for cargo to remove, passes `git check-ignore` first, and one git does not ignore fails with `kept <path>: git does not ignore it` and exit 1.
+Two traps shape the guard. Deleting a build directory the project's `.gitignore` does not match dirties the checkout, and every later push into it is refused with no obvious link back (see [nix/base.md](../base.md#pushing-into-a-vm-checkout)). A `.gitignore` that anchors `/node_modules` ignores only the top-level one, so a nested `web/node_modules` is tracked. Hence every directory the tier removes, or leaves for cargo to remove, passes `git check-ignore` first, and one git does not ignore fails with `kept <path>: git does not ignore it` and exit 1.
 
 The guard also accepts a directory that ignores itself. uv and `python -m venv` write a `.gitignore` of `*` into the `.venv`, which git does not report as ignoring the directory. So the guard asks instead whether git tracks or sees anything inside it (`git ls-files` and `git status --untracked-files=all` both empty).
 

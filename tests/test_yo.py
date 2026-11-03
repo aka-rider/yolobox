@@ -6,13 +6,13 @@ pid-exit watch).
 """
 
 import contextlib
+import errno
 import http.server
 import importlib.util
 import io
 import json
 import os
 import select
-import shlex
 import shutil
 import stat
 import socketserver
@@ -123,12 +123,49 @@ def with_home(path):
 
 class FakeHome(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        # Under /tmp, not the default temp dir: macOS's is /var/folders/xx/.../T
+        # (49 bytes), and $HOME/.lima/yolobox/ssh-agent.sock plus ssh's 17-byte
+        # temporary suffix then passes the 104-byte unix socket limit, so every
+        # test that builds an ssh argv would fail. /tmp is a symlink on macOS,
+        # and left unresolved here, the way a user's $HOME can be.
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.home = self.tmp.name
         self.addCleanup(self.tmp.cleanup)
         patcher = with_home(self.home)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+
+class TestShown(unittest.TestCase):
+    """ui.shown renders a guest-controlled name inside a message: readable when
+    it is plain, escaped when it holds anything a terminal or a reader could
+    mistake for something else."""
+
+    def test_a_plain_name_is_unchanged(self):
+        for name in ("proj/node_modules", "café ünï", 'it\'s "quoted"', "a\\b", ""):
+            with self.subTest(name=name):
+                self.assertEqual(yo.ui.shown(name), name)
+
+    def test_unprintable_characters_are_spelled_out(self):
+        cases = {
+            "a\x1b[2Jb": "a\\x1b[2Jb",
+            "a\nFAIL: forged": "a\\nFAIL: forged",
+            "a\rb": "a\\rb",
+            "a\tb": "a\\tb",
+            "a\x00b": "a\\x00b",
+            "a\x9bb": "a\\x9bb",
+            "a\u202eb": "a\\u202eb",
+            "a\udcffb": "a\\udcffb",
+            "\x1b\\n": "\\x1b\\\\n",
+        }
+        for name, shown in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(yo.ui.shown(name), shown)
+
+    def test_a_shown_name_is_one_printable_line(self):
+        for name in ("\x1b]52;c;ZXZpbA==\x07", "a\nb\rc", "\x85\u2028"):
+            with self.subTest(name=name):
+                self.assertTrue(yo.ui.shown(name).isprintable())
 
 
 class TestRunToolMissing(unittest.TestCase):
@@ -213,6 +250,40 @@ class TestMirror(FakeHome):
         self.assertEqual(yo.mirror(link + "/proj"), yo.AGENT_HOME + "/code/proj")
 
 
+class TestMirrorWithASymlinkedHome(FakeHome):
+    """$HOME spelled through a symlink (macOS's /var -> /private/var, or a home on
+    another volume): a cwd the shell did not report comes back from getcwd() resolved."""
+
+    def setUp(self):
+        super().setUp()
+        self.real = os.path.join(self.home, "volume", "alice")
+        os.makedirs(os.path.join(self.real, "proj"))
+        self.real = os.path.realpath(self.real)
+        self.link = os.path.join(self.home, "alice")
+        os.symlink(self.real, self.link)
+        patcher = with_home(self.link)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_path_in_either_spelling_of_home_mirrors_to_the_same_place(self):
+        for spelling in (self.link, self.real):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(yo.mirror(spelling), yo.AGENT_HOME)
+                self.assertEqual(yo.mirror(spelling + "/proj"), yo.AGENT_HOME + "/proj")
+
+    def test_a_path_that_only_looks_like_the_resolved_home_is_outside(self):
+        self.assertIsNone(yo.mirror(self.real + "x/proj"))
+        self.assertIsNone(yo.mirror(os.path.dirname(self.real)))
+
+    def test_a_cwd_without_a_usable_pwd_still_mirrors(self):
+        previous = os.getcwd()
+        os.chdir(os.path.join(self.link, "proj"))
+        self.addCleanup(os.chdir, previous)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PWD", None)
+            self.assertEqual(yo.mirror(yo.logical_cwd()), yo.AGENT_HOME + "/proj")
+
+
 class TestGuestPath(unittest.TestCase):
     def test_accepts_home_and_children(self):
         self.assertEqual(yo.guest_path(yo.AGENT_HOME), yo.AGENT_HOME)
@@ -265,6 +336,25 @@ class TestSshRunArgv(FakeHome):
         argv = yo.ssh_options(yo.AGENT, mux=True)
         self.assertIn("User=agent", argv)
         self.assertIn("ControlPath=%s/.lima/yolobox/ssh-agent.sock" % self.home, argv)
+
+    def test_a_home_too_long_for_the_ssh_master_socket_is_named_before_ssh_runs(self):
+        # ssh would exit 255 on it, which yo reports as a box it cannot reach.
+        # ssh binds the master at "<ControlPath>.<16 random characters>", 17
+        # bytes more than the ControlPath, so that is the length the limit
+        # applies to (measured against OpenSSH: a 87-byte path fails on macOS).
+        bound = len(os.fsencode(yo.state.agent_control_path())) + 17
+        with mock.patch.object(yo.state, "UNIX_SOCKET_PATH_LIMIT", bound + 1):
+            yo.ssh_options(yo.AGENT, mux=True)
+        with mock.patch.object(yo.state, "UNIX_SOCKET_PATH_LIMIT", bound):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.ssh_options(yo.OPERATOR)
+        self.assertIn("must be shorter than %d" % bound, caught.exception.message)
+        self.assertIn(self.home, caught.exception.message)
+
+    def test_a_real_overlong_home_is_refused(self):
+        with with_home("/" + "d" * yo.state.UNIX_SOCKET_PATH_LIMIT):
+            with self.assertRaisesRegex(yo.YoError, "unix socket path must be shorter"):
+                yo.ssh_options(yo.OPERATOR)
 
 
 class TestResolveCpOperands(unittest.TestCase):
@@ -408,7 +498,7 @@ class CpHarness(FakeHome):
 
         def fake_ssh_run(role, argv, **kwargs):
             calls["ssh_run"].append(list(argv))
-            return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(returncode=0, stdout=b"", stderr="")
 
         with (
             mock.patch.object(yo.proc, "run", fake_run),
@@ -498,42 +588,149 @@ class TestCpArgv(CpHarness):
 
     def test_no_mkdir_for_from_guest(self):
         calls = self.run_cp([":~/x", "dest.txt"])
-        self.assertEqual(calls["ssh_run"], [["true"]])
+        # The agent probe, then the one find that lists the source: no mkdir,
+        # and nothing else is run in the guest.
+        self.assertEqual([argv[0] for argv in calls["ssh_run"]], ["true", "find"])
         self.assertIn("lima-yolobox:/home/agent/x", calls["run"])
 
 
+class FakeGuest:
+    """The agent's home in the guest, answering the two commands cmd_cp sends it:
+    find over ssh and scp. Like the real scp it takes a source whole, rejects
+    glob characters unless they are escaped, and leaves a directory with its
+    mode plus u+wx."""
+
+    HOME = "/home/agent"
+    PRUNED = ("node_modules", ".venv")
+    LISTED = ("target", ".next")
+    MANIFESTS = ("Cargo.toml", "package.json")
+
+    def __init__(self, files, modes, scp_sources, scp_destinations, scp_fails):
+        self.files = {self.HOME + "/" + name: text for name, text in files.items()}
+        self.modes = {self.HOME + "/" + name: mode for name, mode in modes.items()}
+        self.scp_sources = scp_sources
+        self.scp_destinations = scp_destinations
+        self.scp_fails = scp_fails
+        self.received = []  # each scp call's source operands, as scp gets them
+        self.destination_modes = []  # the destination's mode when scp is called
+
+    def is_dir(self, path):
+        return any(name.startswith(path + "/") for name in self.files)
+
+    def exists(self, path):
+        return path in self.files or self.is_dir(path)
+
+    def children(self, path):
+        prefix = path + "/"
+        return sorted(
+            {
+                prefix + name[len(prefix) :].split("/")[0]
+                for name in self.files
+                if name.startswith(prefix)
+            }
+        )
+
+    def record(self, path):
+        kind = "d" if self.is_dir(path) else "p" if self.files[path] is None else "f"
+        mode = self.modes.get(path, 0o755 if kind == "d" else 0o644)
+        return os.fsencode("%s\t%o\t1700000000.5\t%s\0" % (kind, mode, path))
+
+    def below(self, start):
+        # find's walk under `start`, printing what the build-output expression
+        # asks for and not entering what it prunes.
+        for path in self.children(start):
+            name = path.rsplit("/", 1)[1]
+            is_dir = self.is_dir(path)
+            if is_dir and name in self.PRUNED:
+                yield path
+                continue
+            if (is_dir and name in self.LISTED) or (
+                not is_dir and name in self.MANIFESTS
+            ):
+                yield path
+            if is_dir:
+                yield from self.below(path)
+
+    def ssh_run(self, role, argv, **kwargs):
+        done = mock.Mock(returncode=0, stdout=b"", stderr="")
+        if argv[0] != "find":
+            return done
+        assert argv[1] == "-H", argv
+        assert argv[argv.index("-printf") + 1] == "%y\t%m\t%T@\t%p\\0", argv
+        options = next(i for i, arg in enumerate(argv) if i > 1 and arg.startswith("-"))
+        for start in argv[2:options]:
+            if not self.exists(start):
+                done.returncode = 1
+                done.stderr = "find: %s: No such file or directory" % start
+                return done
+            if "-maxdepth" in argv:
+                found = [start] + self.children(start)
+            else:
+                found = list(self.below(start))
+            done.stdout += b"".join(self.record(path) for path in found)
+        return done
+
+    def unescape(self, source):
+        host, _, escaped = source.partition(":")
+        assert host == "lima-yolobox", source
+        path, chars = "", iter(escaped)
+        for char in chars:
+            assert char not in "*?[", "unescaped glob character in %r" % source
+            path += next(chars) if char == "\\" else char
+        return path
+
+    def copy_into(self, path, directory):
+        target = os.path.join(directory, path.rsplit("/", 1)[1])
+        if path in self.files:
+            if self.files[path] is not None:  # None is a fifo, which scp -r passes over
+                Path(target).write_text(self.files[path])
+            return
+        os.makedirs(target, exist_ok=True)
+        for child in self.children(path):
+            self.copy_into(child, target)
+        # sftp-mode scp, like OpenSSH's download_dir: mkdir(mode | S_IRWXU).
+        os.chmod(target, self.modes.get(path, 0o755) | stat.S_IRWXU)
+        os.utime(target, (1700000000, 1700000000))
+
+    def scp(self, argv, **kwargs):
+        separator = argv.index("--")
+        sources = [self.unescape(source) for source in argv[separator + 1 : -1]]
+        self.scp_sources.append(sources)
+        self.scp_destinations.append(argv[-1])
+        self.received.append(argv[separator + 1 : -1])
+        self.destination_modes.append(stat.S_IMODE(os.stat(argv[-1]).st_mode))
+        if self.scp_fails:
+            raise yo.YoError("scp failed")
+        for path in sources:
+            if not self.exists(path):
+                raise yo.YoError("scp: %s: No such file or directory" % path)
+            self.copy_into(path, argv[-1])
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+
 class CpFromGuestHarness(CpHarness):
-    """scp is faked by a function that writes files into whatever directory
-    cmd_cp told it to download into, like the real one would."""
+    """The guest is a FakeGuest: cmd_cp lists it with find and pulls from it with
+    scp, and the files land in the download directory like the real ones would."""
 
     def setUp(self):
         super().setUp()
         self.scp_destinations = []
+        self.scp_sources = []
 
     def copy(self, paths, guest_files, scp_fails=False, guest_modes=None):
-        # guest_files: {relative path inside the download dir: content}
-        # guest_modes: {relative directory: mode scp -p would have kept}
-        def fake_run(argv, **kwargs):
-            destination = argv[-1]
-            self.scp_destinations.append(destination)
-            if scp_fails:
-                raise yo.YoError("scp failed")
-            for relative, content in guest_files.items():
-                path = os.path.join(destination, relative)
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w") as handle:
-                    handle.write(content)
-            for relative, mode in (guest_modes or {}).items():
-                os.chmod(os.path.join(destination, relative), mode)
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
+        # guest_files: {path relative to the guest home: content}
+        # guest_modes: {directory relative to the guest home: mode}
+        guest = FakeGuest(
+            guest_files,
+            guest_modes or {},
+            self.scp_sources,
+            self.scp_destinations,
+            scp_fails,
+        )
+        self.guest = guest
         with (
-            mock.patch.object(yo.proc, "run", fake_run),
-            mock.patch.object(
-                yo.sshx,
-                "ssh_run",
-                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
-            ),
+            mock.patch.object(yo.proc, "run", guest.scp),
+            mock.patch.object(yo.sshx, "ssh_run", guest.ssh_run),
         ):
             yo.cmd_cp(yo.build_parser().parse_args(["cp"] + paths))
 
@@ -543,6 +740,11 @@ class CpFromGuestHarness(CpHarness):
 
     def leftovers(self, directory):
         return [n for n in os.listdir(directory) if n.startswith(".yo-cp-")]
+
+    def unprefixed_lines(self, reported):
+        """The lines of a report that do not start a `yo: ` message: a hostile
+        name that forged one would show up here."""
+        return [line for line in reported.splitlines() if not line.startswith("yo: ")]
 
     def pull(self, guest_files, source=":~/proj", guest_modes=None):
         stderr = io.StringIO()
@@ -575,6 +777,37 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
         )
         self.assertEqual(self.read("victim"), "precious")
         self.assertEqual(self.leftovers("dest"), [])
+
+    def test_a_refusal_names_a_hostile_entry_escaped(self):
+        os.makedirs("dest/proj")
+        os.symlink("/etc/hosts", "dest/proj/n\x1b[2J\nm")
+
+        with self.assertRaises(yo.YoError) as caught:
+            self.copy([":~/proj", "dest/"], {"proj/n\x1b[2J\nm": "x"})
+
+        self.assertIn("dest/proj/n\\x1b[2J\\nm", caught.exception.message)
+        self.assertNotIn("\x1b", caught.exception.message)
+        self.assertNotIn("\n", caught.exception.message)
+
+    def test_a_file_meeting_a_directory_is_refused_with_the_name_escaped(self):
+        os.makedirs("dest/proj/n\x1b[2Jm")
+
+        with self.assertRaises(yo.YoError) as caught:
+            self.copy([":~/proj", "dest/"], {"proj/n\x1b[2Jm": "x"})
+
+        self.assertIn("dest/proj/n\\x1b[2Jm", caught.exception.message)
+        self.assertNotIn("\x1b", caught.exception.message)
+
+    def test_a_move_that_fails_names_the_entry_escaped(self):
+        os.makedirs("dest/proj")
+        failure = OSError(errno.EACCES, "Permission denied")
+
+        with mock.patch.object(yo.cp.os, "replace", side_effect=failure):
+            with self.assertRaises(yo.YoError) as caught:
+                self.copy([":~/proj", "dest/"], {"proj/n\x1b[2Jm": "x"})
+
+        self.assertIn("dest/proj/n\\x1b[2Jm", caught.exception.message)
+        self.assertNotIn("\x1b", caught.exception.message)
 
     def test_nothing_lands_when_any_entry_is_refused(self):
         os.makedirs("dest/proj")
@@ -670,7 +903,7 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
         os.makedirs("dest")
 
         with self.assertRaisesRegex(yo.YoError, "scp failed"):
-            self.copy([":~/x", "dest/"], {}, scp_fails=True)
+            self.copy([":~/x", "dest/"], {"x": "data"}, scp_fails=True)
 
         self.assertEqual(os.listdir("dest"), [])
 
@@ -690,7 +923,7 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
             mock.patch.object(
                 yo.sshx,
                 "ssh_run",
-                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+                return_value=mock.Mock(returncode=0, stdout=b"", stderr=""),
             ),
             self.assertRaisesRegex(yo.YoError, "refusing to copy over symlink"),
         ):
@@ -715,7 +948,7 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
             mock.patch.object(
                 yo.sshx,
                 "ssh_run",
-                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+                return_value=mock.Mock(returncode=0, stdout=b"", stderr=""),
             ),
         ):
             yo.cmd_cp(yo.build_parser().parse_args(["cp"] + paths))
@@ -802,9 +1035,6 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
         self.assertIn("no/such", caught.exception.message)
 
 
-STALE_REMOTE = "ssh://lima-yolobox/home/user.guest/src/myproject"
-
-
 class TestCpFromGuestNeverLandsControlPaths(CpFromGuestHarness):
     """A pulled .git/config (fsmonitor, pager, core.hooksPath) or .envrc runs
     as the operator on the next git or shell command, so none of them lands."""
@@ -826,6 +1056,36 @@ class TestCpFromGuestNeverLandsControlPaths(CpFromGuestHarness):
         for skipped in (".git", ".envrc", ".vscode"):
             self.assertIn('skipped "proj/%s"' % skipped, reported)
         self.assertEqual(self.leftovers("dest"), [])
+
+    def test_a_hostile_directory_name_is_reported_escaped(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {
+                "proj/a\x1b]0;pwned\x07\nFAIL: forged\r/.git/config": "evil",
+                "proj/ok": "ok",
+            }
+        )
+        self.assertIn(
+            'skipped "proj/a\\x1b]0;pwned\\x07\\nFAIL: forged\\r/.git"', reported
+        )
+        self.assertNotIn("\x1b", reported)
+        self.assertEqual(self.unprefixed_lines(reported), [])
+
+    def test_a_control_path_that_cannot_be_dropped_is_named_escaped(self):
+        os.makedirs("dest")
+        real_unlink = os.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path.endswith(".git"):
+                raise OSError(errno.EPERM, "Operation not permitted")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(yo.cp.os, "unlink", unlink):
+            with self.assertRaises(yo.YoError) as caught:
+                self.pull({"proj/a\x1b[2Jb/.git": "gitdir: x"})
+
+        self.assertIn("proj/a\\x1b[2Jb/.git", caught.exception.message)
+        self.assertNotIn("\x1b", caught.exception.message)
 
     def test_control_names_are_matched_case_insensitively(self):
         # APFS folds .GIT into .git, so the spelling must not matter.
@@ -894,7 +1154,7 @@ class TestCpFromGuestNeverLandsControlPaths(CpFromGuestHarness):
 
     def test_a_download_source_that_is_a_control_path_lands_nothing(self):
         os.makedirs("dest")
-        reported = self.pull({".git/config": "evil"}, source=":~/proj/.git")
+        reported = self.pull({"proj/.git/config": "evil"}, source=":~/proj/.git")
         self.assertEqual(self.landed(), [])
         self.assertIn('skipped ".git"', reported)
         self.assertEqual(self.leftovers("dest"), [])
@@ -982,7 +1242,9 @@ class TestCpFromGuestNeverLandsBuildOutput(CpFromGuestHarness):
 
     def test_a_source_the_operator_named_lands_even_when_it_is_build_output(self):
         os.makedirs("dest")
-        reported = self.pull({"node_modules/a": "x"}, source=":~/proj/node_modules")
+        reported = self.pull(
+            {"proj/node_modules/a": "x"}, source=":~/proj/node_modules"
+        )
         self.assertEqual(self.landed(), ["dest/node_modules/a"])
         self.assertEqual(self.skipped_lines(reported), [])
 
@@ -1010,6 +1272,380 @@ class TestCpFromGuestNeverLandsBuildOutput(CpFromGuestHarness):
         self.assertEqual(self.read("dest/proj/node_modules/keep"), "mine")
         self.assertFalse(os.path.lexists("dest/proj/node_modules/new"))
         self.assertEqual(self.read("dest/proj/ok"), "1")
+
+
+class TestCpFromGuestKeepsDirectoryModes(CpFromGuestHarness):
+    """A directory made beside build output gets the mode OpenSSH's sftp client
+    gives one: the guest's mode with the owner's rwx added."""
+
+    def setUp(self):
+        super().setUp()
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        os.makedirs("dest")
+
+    def test_the_owner_can_read_write_and_enter_the_directory_scp_fills(self):
+        self.pull(
+            {"proj/sub/node_modules/x": "dep", "proj/sub/a": "1"},
+            guest_modes={"proj/sub": 0o100},
+        )
+        # the directory the children are fetched into, while scp writes there
+        self.assertEqual(self.guest.destination_modes[-1], 0o700)
+
+    def test_a_read_only_directory_lands_with_the_group_and_other_bits_it_had(self):
+        for guest_files in (
+            {"proj/sub/a": "1"},
+            {"proj/sub/node_modules/x": "dep", "proj/sub/a": "1"},
+        ):
+            with self.subTest(files=sorted(guest_files)):
+                shutil.rmtree("dest")
+                os.makedirs("dest")
+                self.pull(guest_files, guest_modes={"proj/sub": 0o555})
+                self.assertEqual(stat.S_IMODE(os.stat("dest/proj/sub").st_mode), 0o755)
+
+
+class TestCpFromGuestNeverFetchesBuildOutput(CpFromGuestHarness):
+    """Build output is left out on the guest, so its bytes never cross the wire."""
+
+    def requested(self):
+        return sorted(path for call in self.scp_sources for path in call)
+
+    def test_no_build_output_byte_is_asked_of_scp(self):
+        os.makedirs("dest")
+        self.pull(
+            {
+                "proj/node_modules/x/index.js": "js",
+                "proj/web/node_modules/y": "js",
+                "proj/web/.venv/bin/python": "py",
+                "proj/web/src/a.py": "a",
+                "proj/target/debug/bin": "elf",
+                "proj/Cargo.toml": "c",
+                "proj/README": "r",
+            }
+        )
+        self.assertEqual(
+            self.requested(),
+            [
+                "/home/agent/proj/Cargo.toml",
+                "/home/agent/proj/README",
+                "/home/agent/proj/web/src",
+            ],
+        )
+        self.assertEqual(
+            self.landed(),
+            [
+                "dest/proj/Cargo.toml",
+                "dest/proj/README",
+                "dest/proj/web/src/a.py",
+            ],
+        )
+
+    def test_a_tree_without_build_output_is_one_whole_transfer(self):
+        os.makedirs("dest")
+        self.pull({"proj/a": "1", "proj/sub/b": "2"})
+        self.assertEqual(self.scp_sources, [["/home/agent/proj"]])
+
+    def test_a_nested_target_that_proves_nothing_is_still_searched(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {"proj/target/data.csv": "1,2", "proj/target/node_modules/z": "dep"}
+        )
+        self.assertEqual(self.landed(), ["dest/proj/target/data.csv"])
+        self.assertIn('skipped "proj/target/node_modules"', reported)
+        self.assertEqual(self.requested(), ["/home/agent/proj/target/data.csv"])
+
+    def test_build_output_inside_build_output_is_reported_once(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {"proj/target/debug/node_modules/x": "dep", "proj/Cargo.toml": "c"}
+        )
+        self.assertEqual(self.landed(), ["dest/proj/Cargo.toml"])
+        self.assertEqual(reported.count("skipped"), 1)
+        self.assertIn('skipped "proj/target"', reported)
+
+    def test_a_fifo_beside_build_output_is_passed_over_with_a_note(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {"proj/node_modules/x": "dep", "proj/pipe": None, "proj/a": "1"}
+        )
+        self.assertEqual(self.landed(), ["dest/proj/a"])
+        self.assertIn('skipped "proj/pipe": not a regular file', reported)
+        self.assertEqual(self.requested(), ["/home/agent/proj/a"])
+
+    def test_hostile_names_in_skip_reports_are_escaped(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {
+                "proj/a\x1b[2J\nb/node_modules/x": "dep",
+                "proj/p\rq": None,
+                "proj/node_modules/y": "dep",
+            }
+        )
+        self.assertEqual(self.unprefixed_lines(reported), [])
+        self.assertNotIn("\x1b", reported)
+        self.assertNotIn("\r", reported)
+        self.assertIn('skipped "proj/a\\x1b[2J\\nb/node_modules"', reported)
+        self.assertIn('skipped "proj/p\\rq": not a regular file', reported)
+
+    def test_the_skip_is_reported_relative_to_the_named_source(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {"proj/web/node_modules/a": "x", "proj/web/b": "1"}, ":~/proj/web"
+        )
+        self.assertIn('skipped "web/node_modules"', reported)
+        self.assertEqual(self.landed(), ["dest/web/b"])
+
+    def test_every_source_is_judged_and_the_others_still_go_whole(self):
+        os.makedirs("dest")
+        self.copy(
+            [":~/a", ":~/b", "dest/"],
+            {"a/node_modules/x": "dep", "a/keep": "1", "b/f": "2"},
+        )
+        self.assertEqual(self.landed(), ["dest/a/keep", "dest/b/f"])
+        self.assertEqual(self.requested(), ["/home/agent/a/keep", "/home/agent/b"])
+
+    def test_names_with_spaces_dashes_newlines_and_wildcards_travel_intact(self):
+        os.makedirs("dest")
+        names = ["a b.txt", "-rf", "line\nbreak", "w[1]*?\\.txt", "sp ace/in"]
+        files = {"proj/%s" % name: name for name in names}
+        files["proj/node_modules/x"] = "dep"
+        self.pull(files)
+        for name in names:
+            self.assertEqual(self.read("dest/proj/%s" % name), name)
+        self.assertFalse(os.path.exists("dest/proj/node_modules"))
+
+    def test_a_directory_beside_build_output_keeps_the_mode_and_time_scp_gave_it(self):
+        os.makedirs("dest")
+        self.pull(
+            {"proj/node_modules/x": "dep", "proj/a": "1"},
+            guest_modes={"proj": 0o750},
+        )
+        status = os.stat("dest/proj")
+        self.assertEqual(stat.S_IMODE(status.st_mode), 0o750)
+        self.assertEqual(status.st_mtime, 1700000000.5)
+
+    def test_a_read_only_directory_beside_build_output_is_made_writable_like_scp_does(
+        self,
+    ):
+        os.makedirs("dest")
+        self.pull(
+            {"proj/sub/node_modules/x": "dep", "proj/sub/a": "1"},
+            guest_modes={"proj/sub": 0o500},
+        )
+        self.assertEqual(stat.S_IMODE(os.stat("dest/proj/sub").st_mode), 0o700)
+        self.assertEqual(self.read("dest/proj/sub/a"), "1")
+
+    def test_a_directory_of_thousands_of_entries_does_not_overflow_the_command_line(
+        self,
+    ):
+        os.makedirs("dest")
+        names = ["%04d-%s" % (n, "x" * 90) for n in range(2000)]
+        files = {"proj/%s" % name: "1" for name in names}
+        files["proj/node_modules/x"] = "dep"
+        self.pull(files)
+        self.assertEqual(len(self.landed()), 2000)
+        for call in self.scp_sources:
+            self.assertLess(sum(len(path) + 1 for path in call), 100000)
+        self.assertGreater(len(self.scp_sources), 1)
+
+    def test_batches_are_measured_as_scp_receives_them_with_host_and_escapes(self):
+        os.makedirs("dest")
+        # Every character is a wildcard, so the escaped spelling is twice the path.
+        names = ["%03d-%s" % (n, "[" * 150) for n in range(400)]
+        files = {"proj/%s" % name: "1" for name in names}
+        files["proj/node_modules/x"] = "dep"
+        self.pull(files)
+        self.assertEqual(len(self.landed()), 400)
+        received = [sum(len(arg) + 1 for arg in call) for call in self.guest.received]
+        self.assertGreater(len(received), 1)
+        self.assertLessEqual(max(received), 65536)
+
+    def test_a_source_the_guest_does_not_have_is_an_error_naming_it(self):
+        os.makedirs("dest")
+        with self.assertRaisesRegex(
+            yo.YoError, "No such file.*proj|proj.*No such file"
+        ):
+            self.pull({"other/a": "1"})
+        self.assertEqual(self.scp_sources, [])
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_a_control_path_beside_build_output_is_still_dropped(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {"proj/node_modules/x": "dep", "proj/.git/config": "evil", "proj/a": "1"}
+        )
+        self.assertEqual(self.landed(), ["dest/proj/a"])
+        self.assertIn('skipped "proj/.git"', reported)
+        self.assertIn('skipped "proj/node_modules"', reported)
+
+
+class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
+    """The listing is whatever the agent's login shell prints, so every record
+    is untrusted: one that is not a clean path under a named source, or is
+    malformed, or contradicts the second listing, is an error and nothing is
+    fetched on its strength."""
+
+    FILES = {"proj/node_modules/x": "dep", "proj/a/b": "1", "z/node_modules/q": "d"}
+
+    def pull_listing_through(self, forge, files=None):
+        # forge(argv, stdout) -> stdout, applied to every find the guest answers.
+        os.makedirs("dest", exist_ok=True)
+        guest = FakeGuest(
+            files or self.FILES, {}, self.scp_sources, self.scp_destinations, False
+        )
+        real_ssh_run = guest.ssh_run
+
+        def forged(role, argv, **kwargs):
+            done = real_ssh_run(role, argv, **kwargs)
+            if argv[0] == "find":
+                done.stdout = forge(argv, done.stdout)
+            return done
+
+        with (
+            mock.patch.object(yo.proc, "run", guest.scp),
+            mock.patch.object(yo.sshx, "ssh_run", forged),
+        ):
+            yo.cmd_cp(yo.build_parser().parse_args(["cp", ":~/proj", "dest/"]))
+
+    def refused(self, forge, message, files=None):
+        with self.assertRaisesRegex(yo.YoError, message):
+            self.pull_listing_through(forge, files)
+        self.assertEqual(self.scp_sources, [])
+        self.assertEqual(os.listdir("dest"), [])
+
+    @staticmethod
+    def first_listing_adds(record):
+        def forge(argv, stdout):
+            return stdout if "-maxdepth" in argv else stdout + record
+
+        return forge
+
+    @staticmethod
+    def record(path, kind="d", mode="755", mtime="1.0"):
+        return os.fsencode("%s\t%s\t%s\t%s\0" % (kind, mode, mtime, path))
+
+    def test_a_record_that_is_not_a_clean_path_under_a_source_is_refused(self):
+        for forged in (
+            "/home/agent/proj/a/../../../z/node_modules",
+            "/home/agent/proj/../z/node_modules",
+            "/etc/node_modules",
+            "/home/agent/z/node_modules",
+            "/home/agent/projx/node_modules",
+            "/home/agent/proj//node_modules",
+            "/home/agent/proj/./node_modules",
+            "/home/agent/proj/node_modules/",
+            "/home/agent/proj",
+            "proj/node_modules",
+            "",
+        ):
+            with self.subTest(forged=forged):
+                self.refused(
+                    self.first_listing_adds(self.record(forged)), "the guest's listing"
+                )
+
+    def test_a_forged_path_names_the_record_without_letting_escapes_through(self):
+        forged = "/home/agent/proj/\x1b[31m../../x/node_modules"
+        with self.assertRaises(yo.YoError) as caught:
+            self.pull_listing_through(self.first_listing_adds(self.record(forged)))
+        self.assertIn(repr("d\t755\t1.0\t" + forged), caught.exception.message)
+        self.assertNotIn("\x1b", caught.exception.message)
+
+    def test_a_forged_listing_cannot_make_scp_leave_staging(self):
+        # Used to land /home/agent/proj/a/../../../.envrc in the download.
+        with self.assertRaises(yo.YoError):
+            self.pull_listing_through(
+                self.first_listing_adds(
+                    self.record("/home/agent/proj/a/../../../z/node_modules")
+                )
+            )
+        self.assertEqual(
+            [source for call in self.scp_sources for source in call if ".." in source],
+            [],
+        )
+
+    def test_a_malformed_record_is_refused_and_named(self):
+        for malformed in (
+            "d\t755\t1.0",
+            "d\t755",
+            "garbage",
+            "d\t999\t1.0\t/home/agent/proj/node_modules",
+            "d\t0o755\t1.0\t/home/agent/proj/node_modules",
+            "d\t-755\t1.0\t/home/agent/proj/node_modules",
+            "d\t755\tsoon\t/home/agent/proj/node_modules",
+            "d\t755\tnan\t/home/agent/proj/node_modules",
+            "d\t755\tinf\t/home/agent/proj/node_modules",
+            "d\t755\t1_0\t/home/agent/proj/node_modules",
+            "d\t755\t99999999999999999999\t/home/agent/proj/node_modules",
+            "dd\t755\t1.0\t/home/agent/proj/node_modules",
+            "\t755\t1.0\t/home/agent/proj/node_modules",
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(yo.YoError) as caught:
+                    self.pull_listing_through(
+                        self.first_listing_adds(os.fsencode(malformed) + b"\0")
+                    )
+                self.assertIn(repr(malformed), caught.exception.message)
+
+    def test_two_records_that_disagree_about_one_path_are_refused(self):
+        self.refused(
+            # the guest's own record of node_modules says 755
+            self.first_listing_adds(
+                self.record("/home/agent/proj/node_modules", mode="700")
+            ),
+            "the guest's listing",
+        )
+
+    def test_a_record_for_a_name_find_was_never_asked_for_is_refused(self):
+        self.refused(
+            self.first_listing_adds(self.record("/home/agent/proj/a")),
+            "the guest's listing",
+        )
+
+    def test_a_directory_listed_twice_by_overlapping_sources_is_not_a_forgery(self):
+        os.makedirs("dest")
+        guest = FakeGuest(
+            self.FILES, {}, self.scp_sources, self.scp_destinations, False
+        )
+        with (
+            mock.patch.object(yo.proc, "run", guest.scp),
+            mock.patch.object(yo.sshx, "ssh_run", guest.ssh_run),
+        ):
+            args = ["cp", ":~/proj", ":~/proj/a", "dest/"]
+            yo.cmd_cp(yo.build_parser().parse_args(args))
+        self.assertEqual(self.read("dest/a/b"), "1")
+        self.assertEqual(self.read("dest/proj/a/b"), "1")
+
+    def test_a_start_missing_from_the_second_listing_is_an_error_not_a_traceback(self):
+        def forge(argv, stdout):
+            if "-maxdepth" not in argv:
+                return stdout
+            return b"".join(
+                r + b"\0"
+                for r in stdout.split(b"\0")
+                if r and b"\t/home/agent/proj\0" not in r + b"\0"
+            )
+
+        self.refused(forge, "changed")
+
+    def test_a_directory_that_stopped_being_one_is_an_error_not_a_traceback(self):
+        def forge(argv, stdout):
+            if "-maxdepth" not in argv:
+                return stdout
+            return stdout.replace(
+                b"d\t755\t1700000000.5\t/home/agent/proj\0",
+                b"f\t644\t1700000000.5\t/home/agent/proj\0",
+            )
+
+        self.refused(forge, "changed")
+
+    def test_a_walked_directory_emptied_between_the_listings_is_an_error(self):
+        # npm removing node_modules between the two finds.
+        def forge(argv, stdout):
+            if "-maxdepth" not in argv:
+                return stdout
+            return stdout.split(b"\0")[0] + b"\0"
+
+        self.refused(forge, "changed")
 
 
 class TestCpRefusesSymlinks(CpHarness):
@@ -1046,7 +1682,7 @@ class TestCpRefusesSymlinks(CpHarness):
 
         def fake_ssh_run(role, argv, **kwargs):
             calls["ssh_run"].append(list(argv))
-            return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(returncode=0, stdout=b"", stderr="")
 
         with (
             mock.patch.object(yo.proc, "run", fake_run),
@@ -1080,195 +1716,11 @@ class TestCpRefusesSymlinks(CpHarness):
         self.assertTrue(os.path.islink("link"))
 
 
-class TestLinkRemoteAction(unittest.TestCase):
-    def setUp(self):
-        self.wanted = "ssh://agent@lima-yolobox/home/agent/src/myproject"
-
-    def test_no_remote_is_added(self):
-        self.assertEqual(yo.link_remote_action(None, self.wanted), "add")
-        self.assertEqual(yo.link_remote_action("", self.wanted), "add")
-
-    def test_matching_remote_is_kept(self):
-        self.assertEqual(yo.link_remote_action(self.wanted, self.wanted), "keep")
-
-    def test_stale_yolobox_remote_is_updated(self):
-        self.assertEqual(yo.link_remote_action(STALE_REMOTE, self.wanted), "update")
-
-    def test_stale_remote_of_a_machine_with_capitals_is_updated(self):
-        # urlsplit reports the host lowercased; the machine name keeps its case.
-        with mock.patch.object(yo.state, "box", yo.Box(yo.LIMA, "Work")):
-            self.assertEqual(
-                yo.link_remote_action(
-                    "ssh://lima-Work/home/user.guest/src/p",
-                    "ssh://agent@lima-Work/home/agent/src/p",
-                ),
-                "update",
-            )
-
-    def test_foreign_remote_is_refused(self):
-        with self.assertRaises(yo.YoError) as caught:
-            yo.link_remote_action("git@github.com:x/y.git", self.wanted)
-        self.assertIn("git@github.com:x/y.git", caught.exception.message)
-        self.assertIn("git remote remove yolobox", caught.exception.message)
-
-
-class TestLink(FakeHome):
-    def setUp(self):
-        super().setUp()
-        self.project = os.path.join(self.home, "src", "myproject")
-        os.makedirs(self.project)
-        self.wanted = "ssh://agent@lima-yolobox%s/src/myproject" % yo.AGENT_HOME
-        patcher = mock.patch.object(yo.paths, "logical_cwd", lambda: self.project)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(
-            yo.sshx, "require_agent_account", mock.Mock(return_value="")
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def link(self, get_url, branch="main", toplevel=None):
-        calls = self.calls = []
-
-        def fake_run(argv, **rest):
-            argv = list(argv)
-            calls.append(argv)
-            if "get-url" in argv:
-                return get_url
-            if "--show-toplevel" in argv:
-                return mock.Mock(
-                    returncode=0, stdout=(toplevel or self.project) + "\n", stderr=""
-                )
-            if "symbolic-ref" in argv:
-                if branch is None:
-                    return mock.Mock(returncode=128, stdout="", stderr="fatal: HEAD")
-                return mock.Mock(returncode=0, stdout=branch + "\n", stderr="")
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        stderr = io.StringIO()
-        args = yo.build_parser().parse_args(["link"])
-        with mock.patch.object(yo.proc, "run", fake_run):
-            with contextlib.redirect_stderr(stderr):
-                yo.cmd_link(args)
-        return calls, stderr.getvalue()
-
-    def remote_subcommands(self, calls):
-        return [argv[3:] for argv in calls if argv[3:4] == ["remote"]]
-
-    def test_stale_remote_is_updated_in_place(self):
-        calls, stderr = self.link(
-            mock.Mock(returncode=0, stdout=STALE_REMOTE + "\n", stderr="")
-        )
-        subcommands = self.remote_subcommands(calls)
-        self.assertIn(["remote", "set-url", "yolobox", self.wanted], subcommands)
-        self.assertNotIn("add", [argv[1] for argv in subcommands])
-        self.assertIn("pointed at " + STALE_REMOTE, stderr)
-        self.assertIn("updated to " + self.wanted, stderr)
-
-    def test_missing_remote_is_added(self):
-        calls, stderr = self.link(mock.Mock(returncode=128, stdout="", stderr=""))
-        subcommands = self.remote_subcommands(calls)
-        self.assertIn(["remote", "add", "yolobox", self.wanted], subcommands)
-        self.assertNotIn("set-url", [argv[1] for argv in subcommands])
-        self.assertEqual(stderr, "")
-
-    def test_matching_remote_is_reported_and_left_alone(self):
-        calls, stderr = self.link(
-            mock.Mock(returncode=0, stdout=self.wanted, stderr="")
-        )
-        subcommands = self.remote_subcommands(calls)
-        self.assertEqual([argv[1] for argv in subcommands], ["get-url"])
-        self.assertIn("already points at " + self.wanted, stderr)
-
-    def ensure_repo_calls(self, calls):
-        return [argv for argv in calls if "ensure-repo" in argv[-1]]
-
-    def test_the_current_branch_is_handed_to_the_guest_to_start_the_repo_on(self):
-        calls, _ = self.link(mock.Mock(returncode=128, stdout="", stderr=""))
-        (call,) = self.ensure_repo_calls(calls)
-        self.assertEqual(
-            call[-1], "yolobox-guest ensure-repo %s/src/myproject main" % yo.AGENT_HOME
-        )
-
-    def test_a_detached_head_is_refused_before_the_guest_or_the_remote_is_touched(
-        self,
-    ):
-        with self.assertRaisesRegex(yo.YoError, "HEAD is detached in .*myproject"):
-            self.link(mock.Mock(returncode=128, stdout="", stderr=""), branch=None)
-        self.assertEqual(self.ensure_repo_calls(self.calls), [])
-        self.assertEqual(self.remote_subcommands(self.calls), [])
-
-    def test_home_itself_is_refused_however_home_is_spelled(self):
-        for spelling in (self.home, self.home + "/", self.home + "//"):
-            with self.subTest(home=spelling), with_home(spelling):
-                with self.assertRaisesRegex(yo.YoError, "refusing to link .HOME"):
-                    self.link(
-                        mock.Mock(returncode=128, stdout="", stderr=""),
-                        toplevel=self.home,
-                    )
-
-
 class TestHome(unittest.TestCase):
     def test_home_is_normalised_so_it_equals_a_path_built_from_it(self):
         for spelled in ("/Users/x/", "/Users/x//", "/Users/./x"):
             with self.subTest(home=spelled), with_home(spelled):
                 self.assertEqual(yo.home(), "/Users/x")
-
-
-class TestLogicalToplevel(FakeHome):
-    def make(self, *parts):
-        path = os.path.join(self.home, *parts)
-        os.makedirs(path, exist_ok=True)
-        return path
-
-    def link(self, target, name):
-        os.symlink(target, os.path.join(self.home, name))
-
-    def test_a_symlinked_spelling_of_the_root_is_kept(self):
-        self.make("src", "proj", "sub")
-        self.link(os.path.join(self.home, "src"), "code")
-        top = os.path.realpath(os.path.join(self.home, "src", "proj"))
-        cwd = os.path.join(self.home, "code", "proj", "sub")
-        self.assertEqual(
-            yo.logical_toplevel(top, cwd), os.path.join(self.home, "code", "proj")
-        )
-
-    def test_the_root_itself_as_cwd(self):
-        proj = self.make("proj")
-        self.assertEqual(yo.logical_toplevel(os.path.realpath(proj), proj), proj)
-
-    def test_a_symlink_below_the_root_does_not_shift_the_root(self):
-        # cwd is p/a/ln, which resolves to p/b/c/d: three levels below the
-        # root physically, two logically.
-        self.make("p", "b", "c", "d")
-        self.make("p", "a")
-        os.symlink("../b/c/d", os.path.join(self.home, "p", "a", "ln"))
-        top = os.path.realpath(os.path.join(self.home, "p"))
-        cwd = os.path.join(self.home, "p", "a", "ln")
-        self.assertEqual(yo.logical_toplevel(top, cwd), os.path.join(self.home, "p"))
-
-    def test_a_root_with_no_logical_ancestor_falls_back_to_the_physical_path(self):
-        self.make("p", "sub")
-        self.link(os.path.join(self.home, "p", "sub"), "shortcut")
-        top = os.path.realpath(os.path.join(self.home, "p"))
-        cwd = os.path.join(self.home, "shortcut")
-        self.assertEqual(yo.logical_toplevel(top, cwd), top)
-
-    @unittest.skipUnless(shutil.which("git"), "needs git")
-    def test_matches_what_git_reports_from_inside_a_symlinked_subdirectory(self):
-        self.make("p", "b", "c", "d")
-        self.make("p", "a")
-        os.symlink("../b/c/d", os.path.join(self.home, "p", "a", "ln"))
-        subprocess.run(["git", "init", "-q", os.path.join(self.home, "p")], check=True)
-        previous = os.getcwd()
-        os.chdir(os.path.join(self.home, "p", "a", "ln"))
-        self.addCleanup(os.chdir, previous)
-        reported = yo.run(["git", "rev-parse", "--show-toplevel"], check=True)
-        cwd = os.path.join(self.home, "p", "a", "ln")
-        self.assertEqual(
-            yo.logical_toplevel(reported.stdout.strip(), cwd),
-            os.path.join(self.home, "p"),
-        )
 
 
 INCLUDE = "Include ~/.lima/yolobox/ssh.config\n"
@@ -1404,9 +1856,7 @@ class TestEnsureSshConfigInclude(FakeHome):
             with mock.patch("builtins.input", return_value="y"):
                 with self.assertRaises(yo.YoError) as raised:
                     yo.ensure_ssh_config_include(refuse=True)
-        self.assertIn(
-            "cannot read %s" % os.path.realpath(path), raised.exception.message
-        )
+        self.assertIn("cannot read %s" % path, raised.exception.message)
         os.chmod(path, 0o600)
         with open(path) as handle:
             self.assertEqual(handle.read(), "Host other\n")
@@ -1770,33 +2220,6 @@ class TestHostKeyPinning(FakeHome):
         self.assertEqual(effective["stricthostkeychecking"], "false")
         self.assertEqual(effective["userknownhostsfile"], "/dev/null")
         self.assertEqual(effective["nohostauthenticationforlocalhost"], "yes")
-
-    def test_the_push_channel_takes_its_pin_from_the_file_alone(self):
-        project = os.path.join(self.home, "src", "myproject")
-        os.makedirs(project)
-        calls = []
-
-        def fake_run(argv, **rest):
-            calls.append(list(argv))
-            missing = "get-url" in argv
-            top = project if "--show-toplevel" in argv else ""
-            top = "main\n" if "symbolic-ref" in argv else top
-            return mock.Mock(returncode=128 if missing else 0, stdout=top, stderr="")
-
-        with (
-            mock.patch.object(yo.sshx, "require_agent_account"),
-            mock.patch.object(yo.paths, "logical_cwd", lambda: project),
-            mock.patch.object(yo.guest, "guest_helper_check"),
-            mock.patch.object(yo.guest, "guest_helper"),
-            mock.patch.object(yo.sshconfig, "ensure_agent_ssh_config"),
-            mock.patch.object(yo.proc, "run", fake_run),
-        ):
-            yo.cmd_link(yo.build_parser().parse_args(["link"]))
-        ssh_command = [c for c in calls if "remote.yolobox.sshCommand" in c][0][-1]
-        self.assertEqual(
-            shlex.split(ssh_command),
-            ["ssh", "-F", yo.ssh_cfg(), "-o", "ControlPath=none"],
-        )
 
 
 class TestEnsureGuestKnownHosts(FakeHome):
@@ -2499,6 +2922,25 @@ class TestGuestAwsConfigText(unittest.TestCase):
 
 
 MISSING = object()
+
+
+def initrd_probe(migrate, ask_ids=(), unlock_running=False):
+    """What yo.unlock.INITRD_PROBE_COMMAND prints in an initrd in this state."""
+    lines = ["migrate=%s" % migrate]
+    if unlock_running:
+        lines.append("unlock-fifo=/tmp/yolobox-unlock.Ab12Cd")
+    for ask_id in ask_ids:
+        lines += [
+            "ask-begin",
+            "[Ask]",
+            "PID=170",
+            "Socket=/run/systemd/ask-password/sck.1",
+            "Id=%s" % ask_id,
+            "Message=Please enter passphrase for disk root:",
+            "",
+            "ask-end",
+        ]
+    return "\n".join(lines + ["probe=end", ""])
 
 
 def df_output(

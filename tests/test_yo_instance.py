@@ -496,6 +496,13 @@ class TestRemediesNameTheMachine(FakeHome):
             self.assertIn("yo -m box2 bootstrap", yo.version_drift("1.0.0", "0.9.0"))
             self.assertTrue(yo.rebuild_hint().startswith("yo -m box2 ssh "))
 
+    def test_the_enter_refusal_names_the_machine(self):
+        with as_instance("box2"), mock.patch.object(yo.sys, "stdin") as stdin:
+            stdin.isatty.return_value = False
+            with self.assertRaises(yo.YoError) as caught:
+                yo.cmd_enter(yo.build_parser().parse_args(["enter"]))
+        self.assertTrue(caught.exception.message.startswith("yo -m box2 enter "))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -115,12 +115,16 @@ def pick_luks_key(identities: Sequence[Tuple[bytes, str]]) -> bytes:
     return blob
 
 
+class AgentConnectionClosed(OSError):
+    """The agent hung up before it finished its reply."""
+
+
 def recv_exact(conn: socket.socket, count: int) -> bytes:
     chunks = []
     while count > 0:
         chunk = conn.recv(count)
         if not chunk:
-            raise OSError("connection closed mid-message")
+            raise AgentConnectionClosed("connection closed mid-message")
         chunks.append(chunk)
         count -= len(chunk)
     return b"".join(chunks)
@@ -133,21 +137,40 @@ def read_agent_reply(conn: socket.socket) -> bytes:
     return recv_exact(conn, length)
 
 
+class AgentHungUp(YoError):
+    """The agent took the request, then closed or reset the connection before replying."""
+
+
+# What a sign request tells the user to do after the agent hung up or refused:
+# the same yo command is running (up, bootstrap or disk-grow), so it is not named.
+REAPPROVE_HINT = "approve the prompt in 1Password and run the same yo command again"
+
+
 def ssh_agent_call(sock_path: str, payload: bytes) -> bytes:
+    """One request and its reply. AgentHungUp when the agent drops a request it took."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.settimeout(AGENT_CONNECT_TIMEOUT)
             conn.connect(sock_path)
-            conn.sendall(ssh_string(payload))
-            # A sign request is answered only after the human approves
-            # 1Password's prompt, so the reply gets minutes, not seconds.
-            conn.settimeout(AGENT_REPLY_TIMEOUT)
             try:
+                conn.sendall(ssh_string(payload))
+                # A sign request is answered only after the human approves
+                # 1Password's prompt, so the reply gets minutes, not seconds.
+                conn.settimeout(AGENT_REPLY_TIMEOUT)
                 return read_agent_reply(conn)
             except socket.timeout:
                 raise YoError(
                     "1Password's SSH agent at %s did not answer within %d s — "
                     "approve its prompt" % (sock_path, AGENT_REPLY_TIMEOUT)
+                )
+            except (
+                AgentConnectionClosed,
+                ConnectionResetError,
+                BrokenPipeError,
+            ) as failure:
+                raise AgentHungUp(
+                    "1Password's SSH agent at %s hung up before it answered: %s"
+                    % (sock_path, failure)
                 )
     except OSError as failure:
         raise YoError(
@@ -165,17 +188,26 @@ def ssh_agent_identities(sock_path: str) -> List[Tuple[bytes, str]]:
 
 
 def ssh_agent_sign(sock_path: str, blob: bytes, data: bytes) -> bytes:
-    reply = ssh_agent_call(
-        sock_path,
-        bytes([SSH_AGENT_SIGN_REQUEST])
-        + ssh_string(blob)
-        + ssh_string(data)
-        + b"\0\0\0\0",
-    )
+    try:
+        reply = ssh_agent_call(
+            sock_path,
+            bytes([SSH_AGENT_SIGN_REQUEST])
+            + ssh_string(blob)
+            + ssh_string(data)
+            + b"\0\0\0\0",
+        )
+    except AgentHungUp as failure:
+        # 1Password drops the connection of a sign request whose approval
+        # prompt is declined or left unanswered, though it answered the key
+        # listing a moment before.
+        raise YoError(
+            "%s — the approval prompt was probably declined or timed out; %s"
+            % (failure.message, REAPPROVE_HINT)
+        )
     if reply[0] == SSH_AGENT_FAILURE:
         raise YoError(
-            "1Password declined to sign with the %s key — approve the prompt and retry: %s"
-            % (LUKS_KEY_ITEM, state.yo_cmd("up"))
+            "1Password declined to sign with the %s key — %s"
+            % (LUKS_KEY_ITEM, REAPPROVE_HINT)
         )
     if reply[0] != SSH_AGENT_SIGN_RESPONSE:
         raise YoError(

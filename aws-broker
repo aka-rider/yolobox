@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
+import fcntl
 import http.server
 import json
 import os
@@ -96,6 +98,30 @@ def parse_args():
         if not PROFILE_NAME_RE.fullmatch(name):
             fail(f"invalid profile name {name!r}: must match {PROFILE_NAME_PATTERN}")
     return args
+
+
+@contextlib.contextmanager
+def held_socket_lock(socket_path):
+    """Hold an exclusive flock on the sibling `<socket>.lock` for the block.
+
+    Reclaiming a stale socket (probe, then unlink) and binding a new one are
+    two steps. Without the lock a second broker can pass the same probe, and
+    unlink the first one's fresh socket. The lock file is never removed: a
+    removed lock file would let two brokers hold two different ones.
+    """
+    lock_path = socket_path + ".lock"
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        fail(f"cannot open lock file {lock_path}: {e}")
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as e:
+            fail(f"cannot lock {lock_path}: {e}")
+        yield
+    finally:
+        os.close(fd)
 
 
 def reclaim_socket_path(path):
@@ -554,27 +580,30 @@ def main():
     if not pid_alive(args.watch_pid):
         fail(f"watched pid {args.watch_pid} is not running")
 
-    reclaim_socket_path(args.socket)
+    with held_socket_lock(args.socket):
+        reclaim_socket_path(args.socket)
 
-    states = {
-        profile: State(profile, args.min_remint_interval) for profile in args.allow
-    }
+        states = {
+            profile: State(profile, args.min_remint_interval) for profile in args.allow
+        }
 
-    # Before the bind: a failure here must not leave a socket file behind.
-    wait_for_exit = register_pid_watch_event(args.watch_pid)
+        # Before the bind: a failure here must not leave a socket file behind.
+        wait_for_exit = register_pid_watch_event(args.watch_pid)
 
-    # SIGTERM is how a replaced broker is stopped; the default action would
-    # skip the unlink that the end of serve_forever does. The handler needs
-    # the socket's identity, which exists only once the bind is done, so a
-    # SIGTERM that arrives in between is held back until the handler is in
-    # place instead of killing the broker with the socket file left behind.
-    before_bind_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-    server, identity = bind_server(args.socket, states, args.watch_pid)
-    signal.signal(
-        signal.SIGTERM,
-        lambda signum, frame: exit_cleanly("SIGTERM", args.socket, identity, EXIT_OK),
-    )
-    signal.pthread_sigmask(signal.SIG_SETMASK, before_bind_mask)
+        # SIGTERM is how a replaced broker is stopped; the default action would
+        # skip the unlink that the end of serve_forever does. The handler needs
+        # the socket's identity, which exists only once the bind is done, so a
+        # SIGTERM that arrives in between is held back until the handler is in
+        # place instead of killing the broker with the socket file left behind.
+        before_bind_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        server, identity = bind_server(args.socket, states, args.watch_pid)
+        signal.signal(
+            signal.SIGTERM,
+            lambda signum, frame: exit_cleanly(
+                "SIGTERM", args.socket, identity, EXIT_OK
+            ),
+        )
+        signal.pthread_sigmask(signal.SIG_SETMASK, before_bind_mask)
 
     print("READY")
     sys.stdout.flush()

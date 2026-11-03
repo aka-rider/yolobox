@@ -32,7 +32,6 @@ in
       pkgs.e2fsprogs
       systemd
     ];
-    runtimeEnv.YOLOBOX_SSH_LOCAL_PORT = toString facts.sshLocalPort;
     text = builtins.readFile ./yolobox-luks-migrate.sh;
   };
 }

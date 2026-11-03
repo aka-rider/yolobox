@@ -90,7 +90,7 @@ def host_key_pin_block() -> str:
     # against a throwaway sshd: a changed key still connected). ssh keeps the
     # first value per keyword, so this block, written above lima's, is the one
     # place that pins the key for every connection that reads this file: every
-    # yo role, `yo code`, `yo zed` and the push channel. Accept-new learns the
+    # yo role, `yo code` and `yo zed`. Accept-new learns the
     # key on first use when ensure_guest_known_hosts has not stored one yet.
     return "\n".join(
         [
@@ -103,6 +103,7 @@ def host_key_pin_block() -> str:
 
 
 def ensure_agent_ssh_config() -> None:
+    state.require_control_path_fits()
     path = state.ssh_cfg()
     current = proc.read_text_file(path, errors="surrogateescape")
     if current is None:

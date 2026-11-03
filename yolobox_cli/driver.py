@@ -68,6 +68,8 @@ class Driver(Protocol):
     # start raises for an asked size rather than drop it.
     def start(self, passphrase: bytes, size: Size) -> None: ...
     def stop(self) -> None: ...  # YoError when it will not stop
+    def force_stop(self) -> None: ...  # a hard power-off, for an initrd box
+    def force_stop_command(self) -> str: ...  # what force_stop() does, to paste
     def stop_command(self) -> str: ...
     def stop_failed(self, detail: str) -> str: ...  # first line of the abort
     def stop_recovery(self) -> List[str]: ...  # how to stop what stop() could not

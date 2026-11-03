@@ -762,21 +762,28 @@ class LibvirtDriver:
                 watcher.terminate()
             watcher.communicate()
 
+    def force_stop(self) -> None:
+        self.require_domain()
+        if self.domain_state() != STATE_OFF:
+            libvirt_host.virsh("destroy", domain_name())
+
+    def force_stop_command(self) -> str:
+        return "virsh -c %s destroy %s" % (LIBVIRT_URI, domain_name())
+
     def require_stoppable(self, domain_state: str) -> None:
         """Raise YoError for a state in which a guest shutdown will never finish."""
         if domain_state in STATES_STOPPING:
             return
         raise YoError(
             "domain %s is %r, so it will not shut down by itself — %s; or force "
-            "it off with: virsh -c %s destroy %s"
+            "it off with: %s"
             % (
                 domain_name(),
                 domain_state,
                 STATE_HINTS.get(
                     domain_state, "its state is not one yo knows how to stop"
                 ),
-                LIBVIRT_URI,
-                domain_name(),
+                self.force_stop_command(),
             )
         )
 
@@ -788,9 +795,8 @@ class LibvirtDriver:
         code = watcher.wait()
         if code == 1 and EVENT_TIMEOUT_LINE in (line.strip() for line in printed):
             return YoError(
-                "%s did not shut down within %d s — force it off with: "
-                "virsh -c %s destroy %s"
-                % (domain_name(), LIBVIRT_STOP_TIMEOUT, LIBVIRT_URI, domain_name())
+                "%s did not shut down within %d s — force it off with: %s"
+                % (domain_name(), LIBVIRT_STOP_TIMEOUT, self.force_stop_command())
             )
         return YoError("virsh event failed (exit %d): %s" % (code, stderr.strip()))
 
@@ -802,8 +808,7 @@ class LibvirtDriver:
 
     def stop_recovery(self) -> List[str]:
         return [
-            "Recover with: virsh -c %s destroy %s (a hard power-off)"
-            % (LIBVIRT_URI, domain_name()),
+            "Recover with: %s (a hard power-off)" % self.force_stop_command(),
             "then start it again with: %s" % state.yo_cmd("up"),
         ]
 
