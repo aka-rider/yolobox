@@ -539,6 +539,12 @@ def initrd_disk_line(reading: unlock.InitrdReading) -> str:
 def cmd_status(args: argparse.Namespace) -> None:
     report = Report()
     state.driver().show_status()
+    # Said first and once: with no login key every probe below fails, and the
+    # lines that need no login (the VM's state, the config gaps) still follow.
+    try:
+        state.driver().require_login_key()
+    except YoError as failure:
+        report.warn("login: %s" % failure.message)
 
     # Every guest probe below fails the same way on a VM that is down, so ask
     # once and say it once instead of printing a warning per probe.

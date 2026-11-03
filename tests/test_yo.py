@@ -3975,6 +3975,74 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
         )
 
 
+class TestSshBannerReadsTheWholeLine(unittest.TestCase):
+    """ssh_banner over one end of a socketpair: the other end sends the line in
+    segments, each only after the client's previous recv returned, so the split
+    is deterministic and needs no clock."""
+
+    class Client:
+        """The client end, which tells the server each time a recv returned."""
+
+        def __init__(self, sock, received):
+            self.sock = sock
+            self.received = received
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.sock.close()
+
+        def settimeout(self, timeout):
+            self.sock.settimeout(timeout)
+
+        def recv(self, size):
+            data = self.sock.recv(size)
+            self.received.set()
+            return data
+
+    def banner(self, *segments):
+        client, server = socket.socketpair()
+        received = threading.Event()
+
+        def send():
+            with server:
+                for segment in segments:
+                    received.clear()
+                    server.sendall(segment)
+                    # Bounded, so a client that stops reading ends the server.
+                    received.wait(ACCEPT_TIMEOUT_SECONDS)
+
+        thread = threading.Thread(target=send)
+        thread.start()
+        self.addCleanup(thread.join)
+        with mock.patch.object(
+            yo.unlock.socket,
+            "create_connection",
+            lambda address, timeout: self.Client(client, received),
+        ):
+            return yo.unlock.ssh_banner()
+
+    def test_a_line_sent_in_two_segments_is_read_whole(self):
+        mark = yo.STAGE2_SSH_BANNER_MARK.encode()
+        self.assertEqual(
+            self.banner(b"SSH-2.0-OpenSSH_10.6 yolo", mark[4:] + b"\r\n"),
+            "SSH-2.0-OpenSSH_10.6 %s\r" % yo.STAGE2_SSH_BANNER_MARK,
+        )
+
+    def test_only_the_first_line_is_the_banner(self):
+        self.assertEqual(
+            self.banner(b"SSH-2.0-OpenSSH_10.6\r\nSSH-2.0-x yolobox-stage2\r\n"),
+            "SSH-2.0-OpenSSH_10.6\r",
+        )
+
+    def test_a_line_without_a_newline_is_cut_at_the_rfc_cap(self):
+        self.assertEqual(self.banner(b"x" * 200, b"y" * 200), "x" * 200 + "y" * 55)
+
+    def test_a_peer_that_closes_early_leaves_what_it_sent(self):
+        self.assertEqual(self.banner(b"SSH-2.0-Open"), "SSH-2.0-Open")
+
+
 class TestClassifyDisk(unittest.TestCase):
     def test_each_filesystem_type_has_its_state(self):
         for fstype, state in (

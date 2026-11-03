@@ -515,8 +515,22 @@ class LibvirtDriver:
             )
         return host_port
 
+    def master_alive(self) -> bool:
+        return (
+            proc.run(
+                sshx.ssh_argv(OPERATOR, "-O", "check", state.box.vm_host, mux=True)
+            ).returncode
+            == 0
+        )
+
     def ensure_master(self) -> None:
-        """Open the operator's multiplexed ssh connection, if it is not open."""
+        """Open the operator's multiplexed ssh connection, if it is not open.
+
+        Only opening one logs in, so only then must the login key be on offer:
+        a live master serves `yo port` and the forwards without 1Password."""
+        if self.master_alive():
+            return
+        self.require_login_key()
         sshx.ssh_run(OPERATOR, ["true"], mux=True, check=True)
 
     def keepalive_pid(self) -> Optional[int]:

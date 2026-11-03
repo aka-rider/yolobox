@@ -150,7 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="machine to drive (default: %s); accepted before or after "
         "the command" % DEFAULT_INSTANCE,
     )
-    parser.set_defaults(needs_driver=True, heals=False)
+    # logs_in: the command cannot work without logging in to the box, so main()
+    # checks the login key is on offer first (Driver.require_login_key).
+    parser.set_defaults(needs_driver=True, heals=False, logs_in=True)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, help_text: str, description: str) -> argparse.ArgumentParser:
@@ -183,7 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     up.set_defaults(func=vm.cmd_up)
 
     down = add("down", "Stop the VM.", "Stop the VM.")
-    down.set_defaults(func=vm.cmd_down)
+    # Stopping needs no login: a box yo cannot log in to is stopped all the same.
+    down.set_defaults(func=vm.cmd_down, logs_in=False)
 
     status_parser = add(
         "status",
@@ -193,7 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
         "check found something wrong (an unreachable VM, an unencrypted disk,\n"
         "egress rules not in force, a dead forward or broker, version drift).",
     )
-    status_parser.set_defaults(func=status.cmd_status)
+    # status reports a missing login key as one of its lines.
+    status_parser.set_defaults(func=status.cmd_status, logs_in=False)
 
     bootstrap = add(
         "bootstrap",
@@ -337,7 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
         "command exits 64 there.",
     )
     port.add_argument("guest_port", type=guest_port_number, metavar="GUEST_PORT")
-    port.set_defaults(func=session.cmd_port)
+    # port rides the operator's master; ensure_master checks the key only when
+    # it has to open one.
+    port.set_defaults(func=session.cmd_port, logs_in=False)
 
     aws_check = add(
         "aws-check",
@@ -388,6 +394,8 @@ def main(argv: Sequence[str]) -> int:
     if args.needs_driver:
         state.set_box(driver_for(config.HOST_PLATFORM), args.machine)
         state.driver().require_tool()
+        if args.logs_in:
+            state.driver().require_login_key()
         if args.heals:
             heal_before_command()
     args.func(args)

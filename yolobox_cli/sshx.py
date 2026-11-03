@@ -30,7 +30,6 @@ OPERATOR_FIRST_CONTACT = SshRole(None, False, pins_host_key=False)
 
 def ssh_options(role: SshRole, mux: bool = False) -> List[str]:
     """The options every ssh and scp that yo spawns for the guest starts with."""
-    state.driver().require_login_key()
     sshconfig.ensure_agent_ssh_config()
     argv = ["-F", state.ssh_cfg()]
     if not role.pins_host_key:

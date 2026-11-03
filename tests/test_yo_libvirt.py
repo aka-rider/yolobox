@@ -108,6 +108,7 @@ class FakeHost:
         self.capacity = {}  # volume name -> bytes, as vol-create-as and vol-resize set
         self.iso_inputs = []  # (directory, file names) at each xorriso call
         self.master_output = ""
+        self.master_running = True  # whether `ssh -O check` finds the master
         self.listeners = ""  # what `ss -ltnHe` prints
         self.acl = getfacl_listing()  # what `getfacl` prints for the passt dir
         self.shutdown_state = "in shutdown"  # the state `virsh shutdown` leaves
@@ -147,7 +148,9 @@ class FakeHost:
             Path(argv[argv.index("-o") + 1]).write_bytes(b"ISO" * 100)
             result = completed()
         elif argv[0] == "ssh" and "check" in argv:
-            result = completed(stderr=self.master_output)
+            result = completed(
+                returncode=0 if self.master_running else 255, stderr=self.master_output
+            )
         elif argv[0] == "ssh" and argv[-1] == "true":
             code, stderr = self.sshd(argv)
             result = completed(returncode=code, stderr=stderr)
@@ -331,6 +334,21 @@ class LibvirtCase(FakeHome):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def dead_agent(self):
+        """The real agent client, against a socket file nobody listens on:
+        connect() is refused, as it is when 1Password quits and leaves its
+        socket behind."""
+        patcher = mock.patch.object(
+            self.box.agent, "ssh_agent_identities", self.real_agent_identities
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        sock = Path(self.driver.op_sock())
+        sock.unlink(missing_ok=True)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock))
+        server.close()
 
     def host_memory(self, kib):
         """The host's MemTotal, as /proc/meminfo prints it."""
@@ -984,13 +1002,6 @@ class TestOperatorKey(LibvirtCase):
         thread.start()
         self.addCleanup(thread.join)
 
-    def dead_agent(self):
-        """A socket file nobody listens on: connect() is refused, as it is when
-        1Password quits and leaves its socket behind."""
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(self.sock))
-        server.close()
-
     def assert_named_dead(self, message):
         self.assertTrue(
             message.startswith(
@@ -1033,22 +1044,6 @@ class TestOperatorKey(LibvirtCase):
         with self.assertRaises(self.box.YoError) as caught:
             self.driver.operator_key()
         self.assert_named_dead(caught.exception.message)
-
-    def test_a_dead_agent_stops_every_ssh_before_it_runs(self):
-        self.dead_agent()
-        for call in (
-            lambda: self.box.sshx.ssh_run(self.box.OPERATOR, ["true"]),
-            lambda: self.box.sshx.ssh_run(self.box.AGENT, ["true"]),
-            self.box.unlock.boot_stage,
-            self.box.unlock.initrd_state,
-        ):
-            with self.subTest(call=call):
-                with self.assertRaises(self.box.YoError) as caught:
-                    call()
-                self.assert_named_dead(caught.exception.message)
-        self.assertEqual(
-            [argv for argv in self.host.calls if argv[0] in ("ssh", "scp")], []
-        )
 
     def test_the_public_key_line_carries_the_key_and_the_title_only(self):
         self.assertEqual(self.box.public_key_line(KEY_BLOB), PUBLIC_KEY)
@@ -1879,6 +1874,97 @@ class TestDown(LibvirtCase):
         del self.host.domains["yolobox-box"]
         with self.assertRaisesRegex(self.box.YoError, "does not exist"):
             self.down(self.box.BootStage.INITRD)
+
+
+class TestADeadAgent(LibvirtCase):
+    """1Password's agent is gone. What needs no login still works, through
+    main() and the real boot_stage; what must log in says so before any ssh."""
+
+    DEAD = "1Password's SSH agent at %s is not running (or locked)"
+    REFUSED = "Connection closed by authenticating user op 127.0.0.1 port 1 [preauth]"
+
+    def setUp(self):
+        super().setUp()
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.dead_agent()
+        # What a login without the key gets, from either sshd.
+        self.host.sshd = lambda argv: (255, self.REFUSED)
+        self.lines = []
+        for patcher in (
+            mock.patch.object(self.box.box.driver, "require_tool"),
+            mock.patch.object(self.box.proc, "spawn", self.host.spawn),
+            mock.patch.object(self.box.ui, "out", self.lines.append),
+            mock.patch.object(
+                self.box.unlock,
+                "ssh_banner",
+                return_value="SSH-2.0-OpenSSH_10.6 " + self.box.STAGE2_SSH_BANNER_MARK,
+            ),
+            mock.patch.object(
+                self.box.libvirt, "loopback_port_bound", return_value=False
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def dead(self):
+        return self.DEAD % self.driver.op_sock()
+
+    def ssh_calls(self):
+        return [argv for argv in self.host.calls if argv[0] == "ssh"]
+
+    def test_down_stops_the_box_it_cannot_log_in_to(self):
+        self.host.event_script = (["shut off"], "hang")
+        self.box.main(["-m", "box", "down"])
+        self.assertIn("shutdown", self.host.subcommands())
+        self.assertEqual(self.driver.vm_status(), "shut off")
+        self.assertFalse(
+            [argv for argv in self.ssh_calls() if argv[-1] != "true"],
+            "down ran more than the boot-stage probes",
+        )
+
+    def test_status_names_the_agent_then_reports_the_rest(self):
+        with self.assertRaises(self.box.YoError) as caught:
+            self.box.main(["-m", "box", "status"])
+        self.assertEqual(caught.exception.code, 1)
+        self.assertTrue(
+            self.lines[0].startswith("login: " + self.dead()), self.lines[0]
+        )
+        self.assertEqual(
+            self.lines[1:3],
+            [
+                "vm: unreachable — is it up? start it with: yo -m box up",
+                "libvirt: reverse forwards ok",
+            ],
+        )
+        self.assertTrue(self.lines[3].startswith("aws: "), self.lines)
+
+    def test_a_command_that_logs_in_names_the_agent_before_any_ssh(self):
+        for argv in (["ssh"], ["enter"], ["gc"], ["aws-check"], ["code"]):
+            with self.subTest(argv=argv):
+                self.host.calls.clear()
+                with self.assertRaises(self.box.YoError) as caught:
+                    self.box.main(["-m", "box"] + argv)
+                self.assertTrue(
+                    caught.exception.message.startswith(self.dead()),
+                    caught.exception.message,
+                )
+                self.assertEqual(self.ssh_calls(), [])
+
+    def test_port_rides_a_live_master_without_the_agent(self):
+        self.box.main(["-m", "box", "port", "5173"])
+        self.assertEqual(len(self.lines), 1)
+        self.assertRegex(self.lines[0], r"^127\.0\.0\.1:\d+$")
+        self.assertTrue([argv for argv in self.host.calls if "forward" in argv])
+        self.assertFalse([argv for argv in self.ssh_calls() if argv[-1] == "true"])
+
+    def test_port_without_a_master_names_the_agent_and_logs_in_nowhere(self):
+        self.host.master_running = False
+        with self.assertRaises(self.box.YoError) as caught:
+            self.box.main(["-m", "box", "port", "5173"])
+        self.assertTrue(
+            caught.exception.message.startswith(self.dead()), caught.exception.message
+        )
+        self.assertEqual([argv for argv in self.ssh_calls() if "check" not in argv], [])
 
 
 class TestVmUpWithAGap(LibvirtCase):

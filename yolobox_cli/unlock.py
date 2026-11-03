@@ -89,16 +89,9 @@ def classify_initrd_attempt(returncode: int, stderr: str) -> SshOutcome:
     return SshOutcome.ERROR
 
 
-def initrd_ssh_run_argv(remote: str, user: str = "root") -> List[str]:
-    """initrd_ssh_argv for an ssh about to run: the one place it checks that
-    the key it logs in with is on offer (Driver.require_login_key)."""
-    state.driver().require_login_key()
-    return sshconfig.initrd_ssh_argv(remote, user=user)
-
-
 def probe_sshd(user: str) -> Tuple[SshOutcome, str]:
     """One `true` over the unpinned initrd channel as `user`, and ssh's stderr."""
-    completed = proc.run(initrd_ssh_run_argv("true", user=user), stdin=b"")
+    completed = proc.run(sshconfig.initrd_ssh_argv("true", user=user), stdin=b"")
     if completed.returncode == 0:
         return SshOutcome.ANSWERED, completed.stderr
     return (
@@ -127,13 +120,26 @@ def ssh_banner() -> str:
     """The identification line the sshd on the box's port sends before any
     login; "" when nothing answers. Reading it authenticates as nobody."""
     host, port, _ = sshconfig.initrd_endpoint()
+    timeout = sshconfig.SSH_CONNECT_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout
+    banner = b""
+    # TCP may hand the line over in pieces, so read until its newline, within
+    # the line's size cap and one deadline for the whole read. A sshd that
+    # sends nothing in time, or a port nothing listens on, leaves what came.
     try:
-        with socket.create_connection(
-            (host, port), timeout=sshconfig.SSH_CONNECT_TIMEOUT_SECONDS
-        ) as conn:
-            return conn.recv(SSH_BANNER_MAX_BYTES).decode("ascii", "replace")
+        with socket.create_connection((host, port), timeout=timeout) as conn:
+            while b"\n" not in banner and len(banner) < SSH_BANNER_MAX_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                conn.settimeout(remaining)
+                chunk = conn.recv(SSH_BANNER_MAX_BYTES - len(banner))
+                if not chunk:
+                    break
+                banner += chunk
     except OSError:
-        return ""
+        pass
+    return banner.split(b"\n", 1)[0].decode("ascii", "replace")
 
 
 def boot_stage() -> BootStage:
@@ -275,7 +281,7 @@ def classify_initrd_probe(output: str) -> InitrdState:
 
 
 def initrd_state() -> InitrdReading:
-    completed = proc.run(initrd_ssh_run_argv(INITRD_PROBE_COMMAND), stdin=b"")
+    completed = proc.run(sshconfig.initrd_ssh_argv(INITRD_PROBE_COMMAND), stdin=b"")
     if completed.returncode != 0:
         return InitrdReading(
             InitrdState.UNKNOWN,
@@ -320,7 +326,7 @@ def run_initrd_helper(passphrase: bytes) -> HelperRun:
         streamed = False
         state.driver().verify_initrd_listener(sshconfig.initrd_endpoint().port)
         helper = proc.spawn(
-            initrd_ssh_run_argv(INITRD_UNLOCK_HELPER),
+            sshconfig.initrd_ssh_argv(INITRD_UNLOCK_HELPER),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
