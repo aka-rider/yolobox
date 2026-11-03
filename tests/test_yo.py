@@ -1766,6 +1766,19 @@ class TestSshConfigReachesBox(FakeHome):
         self.write_config("Include /nonexistent/x.config %s\n" % self.instance_cfg)
         self.assertTrue(yo.ssh_config_reaches_box())
 
+    @unittest.skipIf(os.getuid() == 0, "root owns everything ssh would accept")
+    def test_a_config_owned_by_another_account_is_an_error_naming_chown(self):
+        self.write_config("Include %s\n" % self.instance_cfg)
+        with mock.patch.object(yo.sshconfig.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.ssh_config_reaches_box()
+        self.assertIn("bad owner", caught.exception.message)
+        self.assertIn(
+            "sudo chown %d %s" % (os.getuid() + 1, self.config),
+            caught.exception.message,
+        )
+        self.assertNotIn("chmod", caught.exception.message)
+
     def test_an_earlier_block_that_widens_the_pin_does_not(self):
         # ssh keeps the first value: here the pin plus another file, not ours.
         self.write_config(
@@ -1791,8 +1804,8 @@ class TestSshConfigReachesBox(FakeHome):
     def test_a_config_ssh_refuses_is_an_error_naming_why(self):
         for text, mode, needle in (
             ("Lizard yes\n", 0o600, "Bad configuration option"),
-            ("Include %s\n" % self.instance_cfg, 0o664, "bad owner or permissions"),
-            ("Include %s\n" % self.instance_cfg, 0o602, "bad owner or permissions"),
+            ("Include %s\n" % self.instance_cfg, 0o664, "chmod go-w"),
+            ("Include %s\n" % self.instance_cfg, 0o602, "chmod go-w"),
         ):
             with self.subTest(needle=needle):
                 self.write_config(text, mode)
@@ -4071,6 +4084,46 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
             self.boot_stage(None, operator=yo.SshOutcome.ANSWERED),
             (yo.BootStage.STAGE2, ["op"]),
         )
+
+
+class TestLimaStopHangOffersTheKillOnlyPastTheInitrd(unittest.TestCase):
+    def test_the_kill_is_conditional_on_ssh_answering(self):
+        with mock.patch.object(
+            yo.proc, "run", side_effect=yo.RunTimeout("limactl stop timed out")
+        ):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.LIMA.stop()
+        message = caught.exception.message
+        # "answers" would admit the initrd's host-key or permission errors.
+        self.assertIn(
+            "If yo ssh true succeeds (exits 0 and prints nothing), the box is past "
+            "its initrd",
+            message,
+        )
+        self.assertIn("If it fails in any way", message)
+        self.assertIn("do not kill the hostagent", message)
+        self.assertNotIn(yo.LIMA.force_stop_command(), message)
+
+
+class TestLimaInitrdTimeoutNamesItsBootLog(unittest.TestCase):
+    def test_serialv_log_keeps_the_boot_so_it_is_named(self):
+        text = yo.unlock.initrd_timeout_error(False).message
+        self.assertIn(
+            "its boot log shows how far it got: ~/.lima/yolobox/serialv.log", text
+        )
+
+
+class TestUnknownStageOffersNoForceOnLima(unittest.TestCase):
+    def test_the_way_out_is_lima_s_key_and_never_a_forced_stop(self):
+        for login in (None, "lizard"):
+            with self.subTest(login=login):
+                text = yo.unknown_stage_message(login, yo.vm.RERUN)
+                self.assertIn("~/.lima/_config/user", text)
+                # The next step when the key is right: Lima's own boot log.
+                self.assertIn("~/.lima/yolobox/serialv.log", text)
+                self.assertIn(yo.unlock.MIGRATE_UNIT_DESCRIPTION, text)
+                self.assertNotIn(yo.LIMA.force_stop_command(), text)
+                self.assertNotIn("--force", text)
 
 
 class TestSshBannerReadsTheWholeLine(unittest.TestCase):

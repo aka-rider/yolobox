@@ -54,6 +54,10 @@ LIMA_PRE_BOOT_STATUSES: Tuple[Optional[str], ...] = (
     "Stopped",
 )
 
+# The yolobox-luks-migrate unit's description (nix/luks.nix), which the boot
+# log shows as the unit starts and finishes encrypting the disk in place.
+MIGRATE_UNIT_DESCRIPTION = "Encrypt or finish encrypting %s in place" % LUKS_DEVICE
+
 # RFC 4253 caps the identification line at 255 bytes.
 SSH_BANNER_MAX_BYTES = 255
 
@@ -477,7 +481,7 @@ def initrd_timeout_error(key_was_refused: bool) -> YoError:
             INITRD_WAIT_SECONDS,
             state.driver().name,
             state.driver().list_command(),
-            state.driver().boot_log(),
+            state.driver().initrd_unseen_hint(),
         )
     )
 

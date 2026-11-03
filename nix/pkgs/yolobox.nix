@@ -28,6 +28,7 @@ let
     install -Dm644 linux/yolobox-host.nft "$out/libexec/yolobox/linux/yolobox-host.nft"
     install -Dm644 linux/yolobox-host.service "$out/libexec/yolobox/linux/yolobox-host.service"
     install -Dm644 linux/host-setup.sh "$out/libexec/yolobox/linux/host-setup.sh"
+    install -Dm644 linux/yolobox-libvirt-hook.sh "$out/libexec/yolobox/linux/yolobox-libvirt-hook.sh"
   '';
 in
 stdenvNoCC.mkDerivation {

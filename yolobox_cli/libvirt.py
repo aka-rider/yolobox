@@ -50,7 +50,7 @@ from .config import (
     OPERATOR_GUEST_UID,
     SCRIPT_DIR,
 )
-from .driver import RUNNING, Size
+from .driver import RUNNING, Size, StopRefused
 from .libvirt_host import GUEST_SSH_PORT, LIBVIRT_URI, VM_USER, DomainInfo
 from .sshx import OPERATOR
 from .ui import YoError
@@ -449,6 +449,19 @@ class LibvirtDriver:
 
     def initrd_identity_agent(self) -> str:
         return self.op_sock()
+
+    def login_fix(self) -> str:
+        return "1Password running and unlocked, its prompt approved"
+
+    def unknown_next_step(self) -> str:
+        # No console helps: `virsh console` shows nothing from before it
+        # attaches, and the initrd writes to tty0, which a domain without
+        # graphics shows nowhere.
+        return (
+            "Without a working login yo cannot see inside it, and it does not "
+            "force it off: nothing else tells an idle initrd from one encrypting "
+            "its disk"
+        )
 
     def require_login_key(self) -> None:
         # Both accounts log in with the operator's key (the agent account's
@@ -937,18 +950,43 @@ class LibvirtDriver:
         return "virsh -c %s destroy %s" % (LIBVIRT_URI, domain_name())
 
     def require_stoppable(self, domain_state: str) -> None:
-        """Raise YoError for a state in which a guest shutdown will never finish."""
+        """Raise YoError for a state in which a guest shutdown will never finish.
+
+        `yo down` reaches this without knowing whether the box is in its initrd,
+        maybe encrypting its disk, so it names no forced stop: only
+        initrd_state() can prove one safe (vm.initrd_down_refusal)."""
         if domain_state in STATES_STOPPING:
             return
-        raise YoError(
-            "domain %s is %r, so it will not shut down by itself — %s; or force "
-            "it off with: %s"
-            % (
-                domain_name(),
-                domain_state,
-                state_hint(domain_state) or "its state is not one yo knows how to stop",
-                self.force_stop_command(),
+        cause = ""
+        if domain_state == "paused":
+            # qemu pauses a guest whose disk image cannot grow (werror=enospc),
+            # which the first boot's in-place encryption can cause. The cause
+            # is part of the reason, so every caller, bootstrap's included,
+            # says the host disk may be full before anyone resumes it.
+            cause = (
+                ". A domain pauses when its disk image cannot grow because the "
+                "host's disk is full (check `virsh -c %s domblkerror %s`); free "
+                "space on the host first" % (LIBVIRT_URI, domain_name())
             )
+        no_force = "Do not force it off: it may be in its initrd, encrypting its disk"
+        remedy = state_hint(domain_state)
+        if remedy is None:
+            # Naming `yo down` here would loop: it meets this same refusal.
+            advice = (
+                "yo does not know how to leave that state; `virsh -c %s domstate "
+                "--reason %s` shows why. %s" % (LIBVIRT_URI, domain_name(), no_force)
+            )
+        else:
+            advice = "%s%s, then run %s again. %s" % (
+                remedy[:1].upper(),
+                remedy[1:],
+                state.yo_cmd("down"),
+                no_force,
+            )
+        raise StopRefused(
+            "domain %s is %r, so it will not shut down by itself%s"
+            % (domain_name(), domain_state, cause),
+            advice,
         )
 
     def event_stream_ended(
@@ -958,9 +996,14 @@ class LibvirtDriver:
         stderr = watcher.stderr.read()
         code = watcher.wait()
         if code == 1 and EVENT_TIMEOUT_LINE in (line.strip() for line in printed):
-            return YoError(
-                "%s did not shut down within %d s — force it off with: %s"
-                % (domain_name(), LIBVIRT_STOP_TIMEOUT, self.force_stop_command())
+            return StopRefused(
+                "%s did not shut down within %d s"
+                % (domain_name(), LIBVIRT_STOP_TIMEOUT),
+                "It may be in its initrd, which ignores the shutdown request, or busy "
+                "shutting down. Run %s again: in the initrd it looks inside and "
+                "powers off only when that is safe. If it still stays 'in shutdown', "
+                "%s shows its state; do not force it off while its disk may be "
+                "encrypting" % (state.yo_cmd("down"), state.yo_cmd("status")),
             )
         return YoError("virsh event failed (exit %d): %s" % (code, stderr.strip()))
 
@@ -968,11 +1011,14 @@ class LibvirtDriver:
         return state.yo_cmd("down")
 
     def stop_failed(self, detail: str) -> str:
-        return "virsh shutdown failed: %s" % detail
+        return "the domain did not stop: %s" % detail
 
     def stop_recovery(self) -> List[str]:
+        # Only bootstrap prints this, right after nixos-rebuild ran over ssh:
+        # the box is in stage 2, so a power-off cuts no encryption.
         return [
-            "Recover with: %s (a hard power-off)" % self.force_stop_command(),
+            "It runs stage 2 (nixos-rebuild just ran in it), so a hard power-off",
+            "cuts no disk encryption: %s" % self.force_stop_command(),
             "then start it again with: %s" % state.yo_cmd("up"),
         ]
 
@@ -990,8 +1036,20 @@ class LibvirtDriver:
     def list_command(self) -> str:
         return "virsh -c %s list --all" % LIBVIRT_URI
 
-    def boot_log(self) -> str:
-        return "virsh -c %s console %s" % (LIBVIRT_URI, domain_name())
+    def initrd_unseen_hint(self) -> str:
+        # Nothing shows what the initrd printed: `virsh console` keeps no
+        # history, and the initrd writes to tty0, which no graphics show.
+        return (
+            "check that the domain runs (`virsh -c %s domstate %s`) and see %s; if "
+            "it runs and nothing answers, its initrd sshd did not come up, which "
+            "a missing or unreadable cidata disk causes (%s)"
+            % (
+                LIBVIRT_URI,
+                domain_name(),
+                state.yo_cmd("status"),
+                cidata_volume(),
+            )
+        )
 
     def vm_lost_hint(self, status: Optional[str]) -> str:
         if status is None:

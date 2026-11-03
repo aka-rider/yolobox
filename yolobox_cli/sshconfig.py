@@ -262,10 +262,16 @@ def ssh_config_reaches_box() -> bool:
     # A bare ssh refuses a ~/.ssh/config that is group- or world-writable or
     # owned by another account, but `ssh -F` checks no permissions, so the
     # rule is ssh's own (secure_permissions in OpenSSH's misc.c), applied here.
-    if (info.st_uid not in (0, os.getuid())) or (info.st_mode & 0o022):
+    if info.st_uid not in (0, os.getuid()):
         raise YoError(
-            "ssh cannot read %s: bad owner or permissions (mode %04o) — a bare ssh "
-            "refuses it; fix it with: chmod go-w %s"
+            "ssh cannot read %s: bad owner (uid %d, not yours) — a bare ssh refuses "
+            "it; fix it with: sudo chown %d %s"
+            % (config_path, info.st_uid, os.getuid(), config_path)
+        )
+    if info.st_mode & 0o022:
+        raise YoError(
+            "ssh cannot read %s: bad permissions (mode %04o, writable by others) — "
+            "a bare ssh refuses it; fix it with: chmod go-w %s"
             % (config_path, stat.S_IMODE(info.st_mode), config_path)
         )
     completed = proc.run(["ssh", "-F", config_path, "-G", state.box.vm_host])

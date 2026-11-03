@@ -36,15 +36,25 @@ nix run github:aka-rider/yolobox/<version>
 
 ### Init the VM
 
+The whole bring-up, on a Mac or on a Linux host once it is set up (below):
+
 ```bash
 yo bootstrap
+yo ssh       # you, the operator
+git clone <your dotfiles repo> ~/.dotfiles; ~/.dotfiles/<its install script>
+exit
+yo enter     # the agent; it lands in the mirror of your current directory
+git clone <your dotfiles repo> ~/.dotfiles; ~/.dotfiles/<its install script>
+exit
 ```
 
-Then add this line at the top of `~/.ssh/config`, above any `Host` or `Match` line (`yo bootstrap` offers to). It serves every machine on a Mac and on a Linux host:
+`yo bootstrap` creates, unlocks and builds the VM. It offers to add one line at the top of `~/.ssh/config`, above any `Host` or `Match` line, which serves every machine on a Mac and on a Linux host:
 
 ```
 Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config
 ```
+
+Both accounts clone over ssh with keys from your 1Password, and the VM already trusts github.com's published host keys, so the first clone asks nothing but 1Password's approval. `yo` itself never clones dotfiles; what they install is yours.
 
 ### Linux host
 
@@ -64,17 +74,11 @@ A Linux PC (Fedora, x86_64, with KVM) runs the box under libvirt instead of Lima
    ```
 
    Or run it from the checkout as `./yo`. Step 2 installed `xorriso`; Python 3.9 or newer, `git`, `ssh`, `curl` and `fzf` must already be on your `PATH`.
-4. Create and start the VM, then build it:
+4. Bring the VM up as in [Init the VM](#init-the-vm): `yo bootstrap` creates and starts it, then builds it.
 
-   ```bash
-   yo up
-   yo bootstrap
-   ```
+   The box gets 16 GiB of memory and a 100 GiB disk. To size it, pass the sizes in GiB to the `yo bootstrap` that creates it: `yo bootstrap --memory 24 --disk 250`. The size is set only when the box is created, so choose the disk before the first boot. See [Sizing a box](docs/linux-host.md#sizing-a-box).
 
-   The box gets 16 GiB of memory and a 100 GiB disk. To size it, pass the sizes in GiB to the first `yo up` (or to `yo bootstrap`, if it creates the box): `yo up --memory 24 --disk 250`. The size is set only when the box is created, so choose the disk before the first boot. See [Sizing a box](docs/linux-host.md#sizing-a-box).
-
-5. Add `Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config` at the top of `~/.ssh/config` (`yo bootstrap` offers to). The one line serves every machine.
-6. To open a VM port on the host, run `yo port <guest-port>`. It prints the `127.0.0.1` port it chose.
+5. To open a VM port on the host, run `yo port <guest-port>`. It prints the `127.0.0.1` port it chose.
 
 A host whose sshd listens on the tailnet should read the tailnet section of the linux-host story first.
 

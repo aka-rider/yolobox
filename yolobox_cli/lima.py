@@ -22,7 +22,7 @@ from .config import (
     SCRIPT_DIR,
     USAGE_EXIT,
 )
-from .driver import NO_SIZE, Size
+from .driver import NO_SIZE, Size, StopRefused
 from .ui import RunTimeout, YoError
 
 
@@ -312,6 +312,26 @@ class LimaDriver:
     def require_login_key(self) -> None:
         pass  # lima's own key file under ~/.lima logs in; no agent is involved
 
+    def unknown_next_step(self) -> str:
+        # serialv.log keeps the whole boot, unlike a live console.
+        return (
+            "If the login is right already, its boot log tells which: %s. While "
+            "'%s' has started and not finished there, the initrd is encrypting the "
+            "disk; leave it running. A login prompt there means a stage 2 built "
+            "before the banner mark: rebuild it with %s once %s succeeds"
+            % (
+                self.boot_log(),
+                unlock.MIGRATE_UNIT_DESCRIPTION,
+                state.yo_cmd("bootstrap"),
+                state.yo_cmd("ssh", "true"),
+            )
+        )
+
+    def login_fix(self) -> str:
+        return "lima's key, ~/%s, unchanged since the box was created" % (
+            self.initrd_identity
+        )
+
     def forward_port(self, guest_port: int) -> int:
         raise YoError(
             "lima already mirrors the guest's TCP ports %d-%d onto the host's "
@@ -544,14 +564,23 @@ class LimaDriver:
             raise
 
     def stop(self) -> None:
+        # `yo down` reaches this without proof the box is past its initrd, so
+        # the hostagent's kill, which ends the VM, is offered only once `yo ssh
+        # true` succeeds: the initrd refuses that login (with a host-key or a
+        # permission error), and only stage 2 runs `true` and exits 0.
         self.limactl_stop(
             [state.box.name],
-            "limactl stop hangs on the vz driver sometimes (TODO.md); recover with: "
-            "%s, then kill -9 any leftover 'limactl hostagent' for %s, then %s"
+            "limactl stop hangs on the vz driver sometimes (TODO.md). If %s "
+            "succeeds (exits 0 and prints nothing), the box is past its initrd: "
+            "recover with %s, then kill -9 any leftover 'limactl hostagent' for %s, "
+            "then %s. If it fails in any way, the box may be in its initrd, "
+            "encrypting its disk: run %s, and do not kill the hostagent"
             % (
+                state.yo_cmd("ssh", "true"),
                 state.yo_cmd("ssh", "sudo", "systemctl", "reboot"),
                 state.box.name,
                 state.yo_cmd("up"),
+                state.yo_cmd("status"),
             ),
         )
 
@@ -577,7 +606,7 @@ class LimaDriver:
                 timeout=LIMA_STOP_TIMEOUT,
             )
         except RunTimeout as failure:
-            raise YoError("%s\n    %s" % (failure.message, hang_recovery))
+            raise StopRefused(failure.message, hang_recovery)
 
     def stop_command(self) -> str:
         return "limactl stop %s" % state.box.name
@@ -604,7 +633,11 @@ class LimaDriver:
         return "~/%s/%s/%s" % (self.instances_dir, state.box.name, name)
 
     def boot_log(self) -> str:
+        # Lima's own: serialv.log keeps the whole boot, unlike a live console.
         return self.shown_instance_file("serialv.log")
+
+    def initrd_unseen_hint(self) -> str:
+        return "its boot log shows how far it got: %s" % self.boot_log()
 
     def vm_lost_hint(self, status: Optional[str]) -> str:
         if status is None:

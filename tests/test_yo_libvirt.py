@@ -1363,8 +1363,10 @@ class TestPasstDirectory(LibvirtCase):
         message = self.gap(**kwargs)
         self.assertIn(fragment, message)
         self.assertIn(PASST_DIR, message)
-        self.assertIn("sudo setfacl -m u:yolobox-vm:rwx " + PASST_DIR, message)
-        self.assertIn("another passt domain", message)
+        self.assertIn("sudo setfacl -m u:yolobox-vm:rwx,m::rwx " + PASST_DIR, message)
+        # The fix lasts only with the hook, which re-running host-setup installs.
+        self.assertIn("install the libvirt hook: run: sudo bash", message)
+        self.assertIn("host-setup.sh", message)
 
     def test_a_mask_that_cuts_the_entry_to_read_only_is_a_gap(self):
         # What libvirt leaves behind after it starts a second passt domain.
@@ -1718,12 +1720,18 @@ class TestStop(LibvirtCase):
         self.stop(["shut off"])
         self.assertNotIn("shutdown", self.host.subcommands())
 
-    def test_a_timeout_is_an_error_with_the_hard_way_out(self):
-        with self.assertRaisesRegex(
-            self.box.YoError,
-            r"yolobox-box did not shut down within 300 s.*destroy yolobox-box",
-        ):
+    def test_a_timeout_is_an_error_that_never_offers_a_power_cut(self):
+        # yo down reaches this without proof the box is past its initrd.
+        with self.assertRaises(self.box.YoError) as caught:
             self.stop(["in shutdown"], "timeout")
+        message = caught.exception.message
+        self.assertIn("yolobox-box did not shut down within 300 s", message)
+        # No "once ssh answers", which never comes true in the initrd or in a
+        # stage 2 hung in shutdown; a repeat is made visible by yo status.
+        self.assertIn("Run yo -m box down again", message)
+        self.assertIn("yo -m box status shows its state", message)
+        self.assertNotIn("ssh answers", message)
+        self.assertNotIn("destroy", message)
         self.assertEqual(self.driver.vm_status(), "in shutdown")
 
     def test_a_domain_that_went_off_as_the_event_stream_ended_is_stopped(self):
@@ -1759,7 +1767,87 @@ class TestStop(LibvirtCase):
                 self.assertIn(
                     "`virsh -c qemu:///system %s yolobox-box`" % wake, message
                 )
-                self.assertIn("destroy yolobox-box", message)
+                self.assertIn("then run yo -m box down again", message)
+                self.assertNotIn("destroy", message)
+
+    def test_a_paused_guest_is_explained_by_a_full_host_disk(self):
+        # qemu pauses on ENOSPC, as during an in-place encryption that fills
+        # the host: free space and resume, never a power cut.
+        self.host.states["yolobox-box"] = "paused"
+        with self.assertRaises(self.box.YoError) as caught:
+            self.driver.stop()
+        message = caught.exception.message
+        self.assertIn("host's disk is full", message)
+        self.assertIn("domblkerror yolobox-box", message)
+        self.assertIn("Resume it with", message)
+        self.assertNotIn("destroy", message)
+
+    def test_bootstrap_paused_mid_reboot_says_the_disk_is_full_and_its_own_way(self):
+        # cmd_bootstrap on the fake host: the build ran (so the box is in
+        # stage 2), then the domain paused on a full host disk as it was told
+        # to shut down. The abort names the cause and bootstrap's recovery,
+        # never yo down's "do not force" beside it.
+        self.host.states["yolobox-box"] = "paused"
+        args = self.box.build_parser().parse_args(
+            ["-m", "box", "bootstrap", "--version", "github:x/y/z"]
+        )
+        errors = []
+        with (
+            mock.patch.object(self.box.vm, "vm_up"),
+            mock.patch.object(
+                self.box.vm, "luks_device_fstype", return_value="crypto_LUKS"
+            ),
+            mock.patch.object(
+                self.box.vm, "guest_generations", return_value=("g1", "g0")
+            ),
+            mock.patch.object(self.box.release, "locked_rev", return_value="0" * 40),
+            mock.patch.object(
+                self.box.sshx,
+                "ssh_run",
+                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+            ),
+            mock.patch.object(self.box.ui, "out"),
+            mock.patch.object(self.box.ui, "err", errors.append),
+        ):
+            with self.assertRaises(self.box.YoError):
+                self.box.cmd_bootstrap(args)
+        text = " ".join(errors)
+        self.assertIn(
+            "the domain did not stop: domain yolobox-box is 'paused', so it will "
+            "not shut down by itself. A domain pauses when its disk image cannot "
+            "grow because the host's disk is full",
+            text,
+        )
+        self.assertIn("domblkerror yolobox-box", text)
+        self.assertIn(self.driver.force_stop_command(), text)
+        self.assertIn("It runs stage 2", text)
+        self.assertNotIn("Do not force it off", text)
+
+    def test_no_stop_message_down_can_reach_names_a_power_cut(self):
+        for state in ("paused", "pmsuspended", "crashed", "lizard"):
+            with self.subTest(state=state):
+                self.host.states["yolobox-box"] = state
+                with self.assertRaises(self.box.YoError) as caught:
+                    self.driver.stop()
+                self.assertNotIn("destroy", caught.exception.message)
+                self.assertNotIn(
+                    self.driver.force_stop_command(), caught.exception.message
+                )
+
+    def test_a_state_yo_cannot_leave_does_not_send_the_user_back_to_down(self):
+        # `yo down` would meet the same refusal, so the message names what
+        # shows the cause instead.
+        for state in ("crashed", "lizard"):
+            with self.subTest(state=state):
+                self.host.states["yolobox-box"] = state
+                with self.assertRaises(self.box.YoError) as caught:
+                    self.driver.stop()
+                message = caught.exception.message
+                self.assertIn("does not know how to leave that state", message)
+                self.assertIn(
+                    "virsh -c qemu:///system domstate --reason yolobox-box", message
+                )
+                self.assertNotIn(self.box.yo_cmd("down"), message)
 
     def test_a_guest_that_is_paused_or_in_a_state_yo_does_not_know_is_not_asked_to_stop(
         self,
@@ -1954,7 +2042,7 @@ class TestADeadAgent(LibvirtCase):
                 self.box.main(["-m", "box", "down"])
         message = caught.exception.message
         self.assertTrue(message.startswith("not stopping it: "), message)
-        self.assertIn("The login is the cause: " + self.dead(), message)
+        self.assertIn("Found: " + self.dead(), message)
         # The passphrase may have gone in earlier this boot: no force offered.
         self.assertNotIn(self.driver.force_stop_command(), message)
         self.assertNotIn("shutdown", self.host.subcommands())
@@ -1969,7 +2057,7 @@ class TestADeadAgent(LibvirtCase):
             with self.assertRaises(self.box.YoError):
                 self.box.main(["-m", "box", "status"])
         (vm_line,) = [line for line in self.lines if line.startswith("vm: ")]
-        self.assertIn("The login is the cause: " + self.dead(), vm_line)
+        self.assertIn("Found: " + self.dead(), vm_line)
         self.assertNotIn(self.driver.force_stop_command(), vm_line)
 
     def test_a_reboot_with_a_cached_passphrase_still_names_the_agent(self):
@@ -2044,6 +2132,19 @@ class TestADeadAgent(LibvirtCase):
         self.assertEqual([argv for argv in self.ssh_calls() if "-O" not in argv], [])
 
 
+class TestAnInitrdThatNeverAnswersPointsAtWhatTheHostShows(LibvirtCase):
+    def test_the_timeout_names_the_domain_state_and_status_not_a_console(self):
+        # virsh console keeps no history and the initrd writes to tty0, so
+        # it would show nothing; the domain state and the cidata disk do.
+        self.host.tagged_domain("box", FIRST_PORT)
+        text = self.box.unlock.initrd_timeout_error(False).message
+        self.assertIn("never offered its initrd sshd", text)
+        self.assertIn("virsh -c qemu:///system domstate yolobox-box", text)
+        self.assertIn("yo -m box status", text)
+        self.assertIn("yolobox-box-cidata.iso", text)
+        self.assertNotIn("console", text)
+
+
 class TestAnSshdYoCannotIdentify(LibvirtCase):
     """The key is on offer, yet an unmarked sshd refused the operator and root:
     yo cannot tell an initrd from a stage 2, so it neither starts nor stops."""
@@ -2062,17 +2163,34 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
             self.addCleanup(patcher.stop)
 
     def assert_names_the_way_out(self, text):
-        # With the key on offer the refusal held all boot, so the force is
-        # safe; never "see yo status", which would only refuse again.
-        self.assertIn(self.driver.force_stop_command(), text)
+        # Fix the login and run again; never a force (the initrd may be
+        # encrypting), never "see yo status", which would only refuse again.
+        self.assertIn("Fix the login", text)
+        # No console can be followed here (virsh console has no history and
+        # the initrd writes to tty0), so the text says yo cannot see inside.
+        self.assertIn("Without a working login yo cannot see inside it", text)
+        self.assertIn("does not force it off", text)
+        self.assertNotIn("console", text)
+        self.assertNotIn(self.driver.force_stop_command(), text)
+        self.assertNotIn("destroy", text)
         self.assertNotIn("yo -m box status", text)
-        self.assertNotIn("1Password", text)
+        self.assertIn(self.driver.login_fix(), text)
+
+    def test_no_unknown_text_in_any_login_state_names_a_force(self):
+        # A listed key may not sign, and root's probe may only have timed out:
+        # the initrd may be encrypting whatever the login state says.
+        for login in (None, "", "lizard", self.box.vm.login_problem()):
+            with self.subTest(login=login):
+                self.assert_names_the_way_out(
+                    self.box.unknown_stage_message(login, self.box.vm.RERUN)
+                )
 
     def test_down_refuses_names_the_way_out_and_stops_nothing(self):
         with self.assertRaises(self.box.YoError) as caught:
             self.box.cmd_down(None)
         self.assertIn("not stopping it: an sshd answers", caught.exception.message)
         self.assert_names_the_way_out(caught.exception.message)
+        self.assertIn("then %s:" % self.box.vm.RERUN, caught.exception.message)
         self.assertNotIn("shutdown", self.host.subcommands())
         self.assertNotIn("destroy", self.host.subcommands())
 
@@ -2098,6 +2216,9 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
         self.assertIn("an sshd answers", vm_lines[0])
         self.assert_names_the_way_out(vm_lines[0])
         self.assertNotIn("start it with", vm_lines[0])
+        # status stops nothing, so it names the commands that do.
+        self.assertIn("then run yo -m box down or yo -m box up:", vm_lines[0])
+        self.assertNotIn(self.box.vm.RERUN, vm_lines[0])
         # Only the unpinned boot-stage probes ran; account_status's pinned ones,
         # which read the ssh.config and its known_hosts, did not.
         pinned = [

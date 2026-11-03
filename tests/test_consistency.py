@@ -925,6 +925,22 @@ class TestStage2SshdIsToldApartWithoutALogin(unittest.TestCase):
         self.assertEqual(self.setting("PerSourcePenaltyExemptList"), allow.group(1))
 
 
+class TestMigrateUnitDescriptionIsTheUnits(unittest.TestCase):
+    """yo tells a person to look for the migrate unit in the boot log, so the
+    text it quotes is the unit's description with the device filled in."""
+
+    def test_the_quoted_text_is_how_the_unit_describes_itself(self):
+        found = re.search(
+            r'description = "(Encrypt or finish encrypting \$\{device\} in place)',
+            nix_code(REPO / "nix" / "luks.nix"),
+        )
+        self.assertIsNotNone(found, "luks.nix has no migrate unit description")
+        self.assertEqual(
+            found.group(1).replace("${device}", yo.LUKS_DEVICE),
+            yo.unlock.MIGRATE_UNIT_DESCRIPTION,
+        )
+
+
 class TestGithubHostKeysAreThePublishedOnes(unittest.TestCase):
     """nix/base.nix pins github.com's host keys; each must have the fingerprint
     GitHub publishes, computed as ssh-keygen -l does (SHA-256 of the key blob,
@@ -955,6 +971,37 @@ class TestGithubHostKeysAreThePublishedOnes(unittest.TestCase):
                 digest = hashlib.sha256(base64.b64decode(blob)).digest()
                 fingerprint = base64.b64encode(digest).decode().rstrip("=")
                 self.assertEqual(fingerprint, self.PUBLISHED[kind])
+
+
+class TestThePasstHookNamesWhatYoNames(unittest.TestCase):
+    """linux/yolobox-libvirt-hook.sh spells the passt directory, the VM account
+    and the domain namespace on its own; they must be yo's and the template's."""
+
+    def hook_value(self, name):
+        found = re.search(
+            r'^readonly %s="(?:\$\{[A-Z_]+:-)?([^"}]+)\}?"$' % name,
+            (REPO / "linux" / "yolobox-libvirt-hook.sh").read_text(),
+            re.M,
+        )
+        self.assertIsNotNone(found, "the hook sets no %s" % name)
+        return found.group(1)
+
+    def test_the_directory_account_and_namespace_are_yos(self):
+        self.assertEqual(self.hook_value("PASST_DIR"), yo.libvirt_host.PASST_DIR)
+        self.assertEqual(self.hook_value("VM_USER"), yo.libvirt_host.VM_USER)
+        self.assertEqual(self.hook_value("DOMAIN_NS"), yo.libvirt_host.DOMAIN_NS)
+
+    def test_the_template_carries_the_namespace_the_hook_looks_for(self):
+        self.assertIn(
+            "xmlns:yolobox='%s'" % self.hook_value("DOMAIN_NS"),
+            (REPO / "libvirt" / "domain.xml").read_text(),
+        )
+
+    def test_host_setup_installs_the_hook_where_libvirt_reads_it(self):
+        self.assertEqual(
+            host_setup_assignment("PASST_HOOK"),
+            "/etc/libvirt/hooks/qemu.d/50-yolobox-passt",
+        )
 
 
 class TestTheIncludeLineServesBothDrivers(unittest.TestCase):

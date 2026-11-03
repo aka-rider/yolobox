@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 
 from . import agent, forwards, guest, proc, release, sshconfig, sshx, state, ui, unlock
 from .config import FILE_MODE_PRIVATE, GIB, LUKS_DEVICE
-from .driver import NO_SIZE, RUNNING, Size
+from .driver import NO_SIZE, RUNNING, Size, StopRefused
 from .sshx import AGENT, OPERATOR
 from .ui import Report, YoError
 from .unlock import BootStage
@@ -31,6 +31,9 @@ PARTITION_SLACK_BYTES = GIB
 
 DISK_FSTYPE_PLAIN = "ext4"
 DISK_FSTYPE_LUKS = "crypto_LUKS"
+
+# What unknown_stage_message tells yo up and yo down to do once the login works.
+RERUN = "run the command again"
 
 
 def vm_up(
@@ -62,8 +65,7 @@ def vm_up(
     else:
         stage = unlock.boot_stage()
         if stage is BootStage.UNKNOWN:
-            # The key passed the check above, so the cause is elsewhere.
-            raise YoError(unknown_stage_message(None))
+            raise YoError(unknown_stage_message(None, RERUN))
         if stage is BootStage.NONE:
             raise YoError(
                 "%s is Running but neither its initrd nor its sshd answers on 127.0.0.1:%d "
@@ -237,34 +239,32 @@ def login_problem() -> Optional[str]:
     return None
 
 
-def unknown_stage_message(login: Optional[str]) -> str:
-    """What BootStage.UNKNOWN means and the way out of it, given the login
-    problem (login_problem()) or None when the login key is on offer.
+def unknown_stage_message(login: Optional[str], rerun: str) -> str:
+    """What BootStage.UNKNOWN means and the way out of it; `login` is the login
+    problem login_problem() found, or None; `rerun` says what to run once the
+    login is fixed.
 
-    The passphrase reaches an initrd only through yo's root login on the very
-    sshd that refused root now, and that initrd reads root's key once, as its
-    sshd starts. So a refusal while the key is on offer has held for the whole
-    boot: yo never handed this boot the passphrase, and nothing on it can be
-    encrypting. A refusal for want of the key proves nothing of the kind, as
-    the key may have worked earlier in the boot."""
-    seen = (
+    It never offers a forced stop: a refusal proves nothing about the boot. A
+    listed key may still fail to sign (a dismissed 1Password prompt), root's
+    probe can time out or reset, and another yo may already have delivered the
+    passphrase, so the initrd may be encrypting the disk. Only initrd_state(),
+    run once yo can log in again, can tell when a stop is safe; what a person
+    can do when the login is already right is the driver's (unknown_next_step)."""
+    cause = " Found: %s." % login if login else ""
+    return (
         "an sshd answers on 127.0.0.1:%d without the stage-2 banner and refused both "
         "the operator's key and root's, so yo cannot tell whether %s waits in its "
-        "initrd or runs" % (state.driver().ssh_port(), state.box.name)
-    )
-    if login is not None:
-        return (
-            "%s. The login is the cause: %s. Fix it, then run the command again: "
-            "yo then looks inside the initrd and stops it only while nothing is "
-            "encrypting its disk" % (seen, login)
+        "initrd, perhaps encrypting its disk, or runs.%s Fix the login (%s), then "
+        "%s: yo then looks inside the initrd and stops it only when that is safe. "
+        "%s"
+        % (
+            state.driver().ssh_port(),
+            state.box.name,
+            cause,
+            state.driver().login_fix(),
+            rerun,
+            state.driver().unknown_next_step(),
         )
-    return (
-        "%s. It refused a key it is offered for its whole boot, so yo never gave "
-        "this boot the disk passphrase and nothing on it can be encrypting: it is "
-        "safe to force it off with %s, then %s (on a stage 2 built before the "
-        "banner mark that is a power cut of a running system, still no harm to "
-        "the encryption)"
-        % (seen, state.driver().force_stop_command(), state.yo_cmd("up"))
     )
 
 
@@ -274,7 +274,9 @@ def cmd_down(args: argparse.Namespace) -> None:
         # Maybe an initrd, which ignores a shutdown request and may be encrypting
         # the disk, so neither stop is safe. On libvirt a dead or locked
         # 1Password is the usual cause.
-        raise YoError("not stopping it: %s" % unknown_stage_message(login_problem()))
+        raise YoError(
+            "not stopping it: %s" % unknown_stage_message(login_problem(), RERUN)
+        )
     if stage is not BootStage.INITRD:
         state.driver().stop()
         return
@@ -342,11 +344,13 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         ui.err(in_place_encryption_warning())
 
     # Resolved in the box first, so a branch that did not move, or one nix
-    # would have served from an old fetch, shows before the build.
-    report.ok("building %s at %s" % (ref, release.locked_rev(ref)))
+    # would have served from an old fetch, shows before the build; then that
+    # very commit is built, whatever the branch does meanwhile.
+    rev = release.locked_rev(ref)
+    report.ok("building %s at %s" % (ref, rev))
     sshx.ssh_run(
         OPERATOR,
-        release.nixos_rebuild_argv("boot", release.host_user(), ref),
+        release.nixos_rebuild_argv("boot", release.host_user(), ref, rev),
         mux=True,
         capture=False,
         check=True,
@@ -371,17 +375,26 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     else:
         # Derived before the VM stops, so a missing 1Password key leaves the box running.
         passphrase = passphrase or agent.luks_passphrase()
-        try:
-            state.driver().stop()
-        except YoError as e:
-            raise report.abort(
-                state.driver().stop_failed(e.message),
+
+        def stop_aborted(detail: str) -> YoError:
+            # The box just ran nixos-rebuild, so it is in stage 2: say what
+            # happened, then this context's recovery, never `yo down`'s
+            # "do not force" advice beside a force that is safe here.
+            return report.abort(
+                state.driver().stop_failed(detail),
                 "The built generation is installed but not booted; the herdr machine",
                 "and the 1Password/AWS forwards did not run.",
                 *state.driver().stop_recovery(),
                 "Then re-run %s: it boots the new generation, sees the two agree, "
                 "and finishes." % state.yo_cmd("bootstrap"),
             )
+
+        try:
+            state.driver().stop()
+        except StopRefused as e:
+            raise stop_aborted(e.reason)
+        except YoError as e:
+            raise stop_aborted(e.message)
         vm_up(run_services=False, passphrase=passphrase)
         profile, booted = booted_generations(report)
         if profile != booted:

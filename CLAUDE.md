@@ -90,7 +90,9 @@ driver section of `yo.md`; brew ships none of this, nix ships it on Linux only):
 - `linux/host-setup.sh`: the one script that changes the Linux host
   system-wide, run with sudo. `linux/yolobox-host.nft` and
   `linux/yolobox-host.service` are the host egress table and its unit.
-  `linux/host-setup.md`, `docs/linux-host.md`.
+  `linux/host-setup.md`, `docs/linux-host.md`. `linux/yolobox-libvirt-hook.sh`
+  is the libvirt qemu hook that host-setup installs to keep the passt socket
+  directory's ACL (`linux/host-setup.md#the-passt-acl-hook`).
 - `libvirt/domain.xml`: the domain template `yo` fills in. It must stay free
   of graphics, vsock, filesystem, channel, hostdev and tpm devices.
 
@@ -181,6 +183,7 @@ Tests, all under `tests/`:
   layer (it deletes the guest egress table for a while and restores it).
   Never run it against a box mid-work. `docs/linux-host.md`.
 - `test_yo_libvirt.py`: the libvirt driver against a fake host.
+  `test_libvirt_hook.py`: runs the passt ACL hook with a fake `setfacl`.
   `test_yo_instance.py`: `-m/--machine`.
 - A few tests skip when a tool is missing (GNU find, gawk, git, ssh, nix, a
   Python with `pidfd_open` or `kqueue`). The docstring at the top of each test
@@ -191,7 +194,7 @@ Tests, all under `tests/`:
 ```sh
 python3 -m unittest discover -s tests        # CI runs 3.9 and the newest 3.x
 uvx ruff@0.17.2 check . && uvx ruff@0.17.2 format --check .   # see below
-shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh tests/box-libvirt-check.sh   # verify.yml's list
+shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh   # verify.yml's list
 YOLOBOX_USERNAME=$(id -un) YOLOBOX_FLAKE_REF=github:aka-rider/yolobox/ci nix flake check --impure
 ```
 

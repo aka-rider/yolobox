@@ -430,8 +430,9 @@ def passt_dir_gap() -> Optional[str]:
     proc.require_tool("getfacl", "install the acl package")
     listing = proc.run(["getfacl", "--absolute-names", PASST_DIR])
     remedy = (
-        "fix it with: sudo setfacl -m u:%s:rwx %s (setfacl recomputes the mask; "
-        "starting another passt domain can break it again)" % (VM_USER, PASST_DIR)
+        "fix it with: sudo setfacl -m u:%s:rwx,m::rwx %s; to keep it fixed when "
+        "libvirt starts another passt domain, install the libvirt hook: %s"
+        % (VM_USER, PASST_DIR, host_setup_hint())
     )
     if listing.returncode != 0:
         return "cannot read the ACL of %s (%s) — %s" % (

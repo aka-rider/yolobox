@@ -208,12 +208,20 @@ def rebuild_hint() -> str:
 # `rebuild` passes the same (tests/test_consistency.py). --impure lets the
 # flake read the nix_env variables. --refresh refetches the ref: a branch
 # moves, and nix would otherwise reuse a fetch younger than tarball-ttl (an
-# hour) and silently build the commit it held then.
+# hour) and silently build the commit it held then. yo bootstrap's own build
+# names a commit (nixos_rebuild_argv), so there the flag is harmless; it
+# matters for locked_rev's lookup and for the printed hint and yolobox-guest's
+# rebuild, which build the ref by name.
 NIX_REBUILD_FLAGS = ("--impure", "--refresh")
 
 
-def nixos_rebuild_argv(action: str, username: str, ref: str) -> List[str]:
-    """The box's `sudo ... nixos-rebuild ACTION` from `ref`, as one argv."""
+def nixos_rebuild_argv(action: str, username: str, ref: str, rev: str) -> List[str]:
+    """The box's `sudo ... nixos-rebuild ACTION` of `ref` at commit `rev`.
+
+    It builds the commit itself (github:OWNER/REPO/<rev>), so what yo printed
+    is what is built, even if the branch moves meanwhile. YOLOBOX_FLAKE_REF
+    stays `ref`, so the box stamps the branch it follows, and the system is the
+    same derivation either way: it depends on the source, not on its name."""
     return [
         "sudo",
         *nix_env(username, ref),
@@ -221,8 +229,13 @@ def nixos_rebuild_argv(action: str, username: str, ref: str) -> List[str]:
         action,
         *NIX_REBUILD_FLAGS,
         "--flake",
-        "%s#yolobox" % ref,
+        "%s#yolobox" % pinned_ref(ref, rev),
     ]
+
+
+def pinned_ref(ref: str, rev: str) -> str:
+    """github:OWNER/REPO/<rev> for `ref` (github:OWNER/REPO/REF), at commit `rev`."""
+    return "%s/%s" % (ref.rsplit("/", 1)[0], rev)
 
 
 def built_by() -> Optional[str]:
@@ -239,10 +252,10 @@ COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 def locked_rev(ref: str) -> str:
     """The commit `ref` names now, fetched afresh by the box's own nix.
 
-    A branch moves, and the rebuild that follows refetches it too (--refresh),
-    so this is the commit it builds, barring a push in the seconds between.
-    Not stamped into the system: a stamp would make every commit a new
-    generation, and with it a reboot, even for one that changes only docs."""
+    A branch moves, so the rebuild that follows builds this commit by name
+    (nixos_rebuild_argv), not the branch. Not stamped into the system: a
+    stamp would make every commit a new generation, and with it a reboot,
+    even for one that changes only docs."""
     completed = sshx.probe(
         sshx.OPERATOR,
         ["nix", "flake", "metadata", "--json", "--refresh", ref],

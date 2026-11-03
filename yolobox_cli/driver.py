@@ -4,6 +4,19 @@ from __future__ import annotations
 
 from typing import List, NamedTuple, Optional, Protocol, Sequence, Tuple
 
+from .ui import YoError
+
+
+class StopRefused(YoError):
+    """stop() (or force_stop()) gave up without stopping the VM. `reason` says
+    what happened; the message adds advice fit for the stop that raised it. A
+    caller that knows more about the boot stage (bootstrap, right after
+    nixos-rebuild ran in stage 2) prints `reason` with its own advice instead."""
+
+    def __init__(self, reason: str, advice: str):
+        super().__init__("%s. %s" % (reason, advice))
+        self.reason = reason
+
 
 class Size(NamedTuple):
     """What `--memory` and `--disk` asked of a box yo creates, in GiB; None: not asked.
@@ -58,6 +71,10 @@ class Driver(Protocol):
     # `yo status` reports it as a line, `yo down` only when it cannot tell an
     # initrd from stage 2, and ensure_master only to open a master.
     def require_login_key(self) -> None: ...
+    # What the operator fixes when the box refuses yo's login, for a message.
+    def login_fix(self) -> str: ...
+    # What a person can do about BootStage.UNKNOWN once the login is right.
+    def unknown_next_step(self) -> str: ...
     def ssh_port(self) -> int: ...  # loopback port reaching sshd, initrd included
     def forward_port(self, guest_port: int) -> int: ...  # the host port forwarded
     def keepalive_pid(self) -> Optional[int]: ...  # pid the AWS broker lives with
@@ -84,7 +101,9 @@ class Driver(Protocol):
     def stop_recovery(self) -> List[str]: ...  # how to stop what stop() could not
     def delete_command(self) -> str: ...
     def list_command(self) -> str: ...  # shows the instance's state
-    def boot_log(self) -> str: ...  # the VM's console log
+    # Where to look when the initrd's sshd never answered, from what the host
+    # can actually show of the boot.
+    def initrd_unseen_hint(self) -> str: ...
     # Why a VM that yo waits for is in `status`, not Running (None: it no longer
     # exists), and the way back.
     def vm_lost_hint(self, status: Optional[str]) -> str: ...

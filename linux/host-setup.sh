@@ -13,6 +13,7 @@ UNIT_DEST="/etc/systemd/system/yolobox-host.service"
 POLKIT_RULE="/etc/polkit-1/rules.d/50-yolobox-libvirt.rules"
 PASST_TMPFILES="/etc/tmpfiles.d/yolobox-passt.conf"
 PASST_DIR="/run/libvirt/qemu/passt"
+PASST_HOOK="/etc/libvirt/hooks/qemu.d/50-yolobox-passt"
 POOL_NAME="default"
 POOL_PATH="/var/lib/libvirt/images"
 VIRSH=(virsh -c qemu:///system)
@@ -129,6 +130,17 @@ chmod 0644 "$PASST_TMPFILES"
 systemd-tmpfiles --create "$PASST_TMPFILES"
 setfacl -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
 
+# libvirt recomputes that directory's ACL mask whenever it starts another passt
+# domain, which cuts yolobox-vm's entry down to r-x. A qemu hook re-applies the
+# same fixed setfacl before a yolobox domain starts and after any domain starts
+# or is released. virtqemud reads its hook directory only when it starts, so it
+# is restarted if it runs; running domains are not touched. See
+# linux/host-setup.md, "The passt ACL hook".
+step "(l) libvirt hook that keeps the passt ACL"
+install -D -m0755 "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK"
+restorecon -F "$PASST_HOOK"
+systemctl try-restart virtqemud.service
+
 step "(g) host egress table"
 [[ -x /usr/sbin/nft ]] || die "/usr/sbin/nft is missing after installing nftables"
 /usr/sbin/nft -c -f "$HERE/yolobox-host.nft"
@@ -177,7 +189,7 @@ cat <<SUMMARY
 host-setup done:
   libvirt daemon $libvirt_version, network 'default' off, daemons enabled
   polkit: $SUDO_USER may manage the system libvirt connection
-  passt socket directory $PASST_DIR writable by $VM_USER
+  passt socket directory $PASST_DIR writable by $VM_USER, kept so by $PASST_HOOK
   account $VM_USER, table 'inet yolobox-host' via yolobox-host.service
   resolver $resolver, pool $POOL_NAME at $POOL_PATH
 SUMMARY

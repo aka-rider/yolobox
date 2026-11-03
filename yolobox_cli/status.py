@@ -560,7 +560,13 @@ def cmd_status(args: argparse.Namespace) -> None:
         if detail:
             ui.err(detail)
         if stage is BootStage.UNKNOWN:
-            report.warn("vm: %s" % vm.unknown_stage_message(login))
+            report.warn(
+                "vm: %s"
+                % vm.unknown_stage_message(
+                    login,
+                    "run %s or %s" % (state.yo_cmd("down"), state.yo_cmd("up")),
+                )
+            )
         else:
             report.warn(
                 "vm: unreachable — is it up? start it with: %s" % state.yo_cmd("up")

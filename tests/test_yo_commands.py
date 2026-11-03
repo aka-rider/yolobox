@@ -889,6 +889,30 @@ class TestBootstrapRebootDecision(FakeHome):
         self.assertIn("limactl stop failed", messages)
         self.assertIn("yo bootstrap", messages)
 
+    def test_a_hung_stop_aborts_with_its_reason_and_this_contexts_advice_only(self):
+        # The box just ran nixos-rebuild, so it is in stage 2: no "do not kill
+        # the hostagent" from yo down beside the recovery that is safe here.
+        def fake_run(argv, **kwargs):
+            if argv[:2] == ["limactl", "stop"]:
+                raise yo.RunTimeout("limactl stop yolobox did not finish within 300 s")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        args = yo.build_parser().parse_args(["bootstrap", "--version", "github:x/y/z"])
+        with (
+            mock.patch.object(yo.ui, "err") as fake_err,
+            mock.patch.object(yo.proc, "run", side_effect=fake_run),
+            mock.patch.object(yo.vm, "guest_generations", return_value=("g1", "g0")),
+        ):
+            with self.assertRaises(yo.YoError):
+                yo.cmd_bootstrap(args)
+        messages = " ".join(call.args[0] for call in fake_err.call_args_list)
+        self.assertIn(
+            "limactl stop failed: limactl stop yolobox did not finish within 300 s",
+            messages,
+        )
+        self.assertNotIn("do not kill the hostagent", messages)
+        self.assertIn("kill -9 any leftover", messages)
+
     def test_herdr_is_told_whether_the_ssh_include_is_in_place(self):
         for included in (True, False):
             with self.subTest(included=included):
@@ -1014,8 +1038,9 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
         self.assertIn("encrypts /dev/vda2 in place", self.stderr)
         self.assertIn("must not be interrupted", self.stderr)
 
-    def test_the_rebuild_refetches_the_ref_and_names_the_user_hostname_and_ref(self):
-        # --refresh: a branch moves, and nix reuses an hour-old fetch of it.
+    def test_the_rebuild_builds_the_resolved_commit_and_stamps_the_ref(self):
+        # The commit yo printed is the one built, even if the branch moves in
+        # between; the box still stamps the branch it follows.
         rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /")
         self.assertEqual(
             rebuilds[0],
@@ -1029,7 +1054,7 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
                 "--impure",
                 "--refresh",
                 "--flake",
-                "github:x/y/z#yolobox",
+                "github:x/y/%s#yolobox" % self.REV,
             ],
         )
 
