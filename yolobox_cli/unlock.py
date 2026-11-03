@@ -113,7 +113,11 @@ class BootStage(enum.Enum):
 
     STAGE2 = "stage2"  # the disk is unlocked and the operator can log in
     INITRD = "initrd"  # locked: waiting in the initrd for the passphrase
-    NONE = "none"  # nothing answers
+    NONE = "none"  # nothing answers, or a marked stage 2 refused the operator
+    # An sshd answers without the stage-2 mark and refused both the operator
+    # and root, so yo cannot tell an initrd (which may be encrypting the disk)
+    # from a stage 2: a dead or locked 1Password looks exactly like this.
+    UNKNOWN = "unknown"
 
 
 def ssh_banner() -> str:
@@ -152,11 +156,12 @@ def boot_stage() -> BootStage:
     # Stage 2 answered and refused the operator. Logging in there as root
     # would be an invalid user, which OpenSSH penalises per source address, and
     # every host connection shares the gateway's (nix/base.md).
-    if STAGE2_SSH_BANNER_MARK in ssh_banner().split():
+    banner = ssh_banner()
+    if STAGE2_SSH_BANNER_MARK in banner.split():
         return BootStage.NONE
     if sshd_answers("root") is SshOutcome.ANSWERED:
         return BootStage.INITRD
-    return BootStage.NONE
+    return BootStage.UNKNOWN if banner else BootStage.NONE
 
 
 class InitrdState(enum.Enum):

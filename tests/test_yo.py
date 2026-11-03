@@ -3932,13 +3932,15 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
         self.addCleanup(thread.join)
         return port
 
-    def boot_stage(self, banner, operator=yo.SshOutcome.REFUSED):
+    def boot_stage(
+        self, banner, operator=yo.SshOutcome.REFUSED, root=yo.SshOutcome.ANSWERED
+    ):
         port = self.serve(banner)
         asked = []
 
         def answers(user):
             asked.append(user)
-            return operator if user != "root" else yo.SshOutcome.ANSWERED
+            return operator if user != "root" else root
 
         with (
             mock.patch.object(
@@ -3963,6 +3965,21 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
             with self.subTest(banner=banner):
                 self.assertEqual(
                     self.boot_stage(banner), (yo.BootStage.INITRD, ["op", "root"])
+                )
+
+    def test_an_unmarked_sshd_that_refuses_both_is_unknown_not_absent(self):
+        # A dead 1Password in front of an initrd looks exactly like this.
+        self.assertEqual(
+            self.boot_stage("SSH-2.0-OpenSSH_10.6\r\n", root=yo.SshOutcome.REFUSED),
+            (yo.BootStage.UNKNOWN, ["op", "root"]),
+        )
+
+    def test_no_banner_and_no_login_is_nothing_answering(self):
+        for banner in (None, ""):
+            with self.subTest(banner=banner):
+                self.assertEqual(
+                    self.boot_stage(banner, root=yo.SshOutcome.NOT_LISTENING),
+                    (yo.BootStage.NONE, ["op", "root"]),
                 )
 
     def test_a_port_nothing_listens_on_is_asked_for_root_too(self):

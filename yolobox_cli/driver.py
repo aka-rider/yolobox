@@ -53,9 +53,10 @@ class Driver(Protocol):
     def op_sock(self) -> str: ...  # the host's 1Password agent socket
     def initrd_identity_agent(self) -> str: ...  # "none", or an agent socket
     # YoError naming the agent when the key the box's logins use is not on offer.
-    # main() runs it for a command that must log in, so a dead agent is never
-    # misread as an unreachable box; `yo status` reports it as a line, `yo down`
-    # needs no login, and ensure_master runs it only to open a master.
+    # vm_up runs it before any start or unlock, main() for the other commands
+    # that must log in, so a dead agent is never misread as an unreachable box;
+    # `yo status` reports it as a line, `yo down` only when it cannot tell an
+    # initrd from stage 2, and ensure_master only to open a master.
     def require_login_key(self) -> None: ...
     def ssh_port(self) -> int: ...  # loopback port reaching sshd, initrd included
     def forward_port(self, guest_port: int) -> int: ...  # the host port forwarded

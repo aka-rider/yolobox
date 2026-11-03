@@ -527,9 +527,17 @@ class LibvirtDriver:
         """Open the operator's multiplexed ssh connection, if it is not open.
 
         Only opening one logs in, so only then must the login key be on offer:
-        a live master serves `yo port` and the forwards without 1Password."""
-        if self.master_alive():
+        a live master serves `yo port` and the forwards without 1Password.
+        `-O check` proves only that the master process answers, so a session
+        through it proves the connection; a master that fails it is dropped."""
+        if (
+            self.master_alive()
+            and sshx.ssh_run(OPERATOR, ["true"], mux=True).returncode == 0
+        ):
             return
+        # Its exit code is not read: with no master to stop it fails, and either
+        # way no master is left for the new session to ride.
+        proc.run(sshx.ssh_argv(OPERATOR, "-O", "exit", state.box.vm_host, mux=True))
         self.require_login_key()
         sshx.ssh_run(OPERATOR, ["true"], mux=True, check=True)
 

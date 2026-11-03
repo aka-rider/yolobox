@@ -109,6 +109,9 @@ class FakeHost:
         self.iso_inputs = []  # (directory, file names) at each xorriso call
         self.master_output = ""
         self.master_running = True  # whether `ssh -O check` finds the master
+        # What a session through that master gets: (code, stderr). A master
+        # whose connection died still answers -O check, and its sessions fail.
+        self.master_session = (0, "")
         self.listeners = ""  # what `ss -ltnHe` prints
         self.acl = getfacl_listing()  # what `getfacl` prints for the passt dir
         self.shutdown_state = "in shutdown"  # the state `virsh shutdown` leaves
@@ -151,8 +154,21 @@ class FakeHost:
             result = completed(
                 returncode=0 if self.master_running else 255, stderr=self.master_output
             )
+        elif argv[0] == "ssh" and "exit" in argv:
+            result = completed(returncode=0 if self.master_running else 255)
+            self.master_running = False
         elif argv[0] == "ssh" and argv[-1] == "true":
-            code, stderr = self.sshd(argv)
+            # A session without ControlPath=none rides the master when one runs;
+            # any other one logs in to the box's sshd, and a mux one that does
+            # becomes the master.
+            fresh = "ControlPath=none" in argv
+            if self.master_running and not fresh:
+                code, stderr = self.master_session
+            else:
+                code, stderr = self.sshd(argv)
+                if not fresh and code == 0:
+                    self.master_running = True
+                    self.master_session = (0, "")
             result = completed(returncode=code, stderr=stderr)
         elif argv[0] == "ss":
             result = completed(self.listeners)
@@ -1922,6 +1938,37 @@ class TestADeadAgent(LibvirtCase):
             "down ran more than the boot-stage probes",
         )
 
+    def test_down_refuses_an_sshd_it_cannot_identify_and_names_the_agent(self):
+        # An unmarked banner and both logins refused: an initrd, maybe encrypting
+        # the disk, or an older stage 2. Neither stop is safe on an initrd.
+        self.host.states["yolobox-box"] = "running"
+        with mock.patch.object(
+            self.box.unlock, "ssh_banner", return_value="SSH-2.0-OpenSSH_10.6"
+        ):
+            with self.assertRaises(self.box.YoError) as caught:
+                self.box.main(["-m", "box", "down"])
+        self.assertTrue(
+            caught.exception.message.startswith(self.dead()), caught.exception.message
+        )
+        self.assertNotIn("shutdown", self.host.subcommands())
+        self.assertNotIn("destroy", self.host.subcommands())
+        self.assertEqual(self.driver.vm_status(), "Running")
+
+    def test_a_reboot_with_a_cached_passphrase_still_names_the_agent(self):
+        # bootstrap's second vm_up: the box stopped, the passphrase in hand.
+        for domain_state in ("shut off", "running"):
+            with self.subTest(domain_state=domain_state):
+                self.host.calls.clear()
+                self.host.states["yolobox-box"] = domain_state
+                with self.assertRaises(self.box.YoError) as caught:
+                    self.box.vm_up(run_services=False, passphrase=b"cached")
+                self.assertTrue(
+                    caught.exception.message.startswith(self.dead()),
+                    caught.exception.message,
+                )
+                self.assertNotIn("start", self.host.subcommands())
+                self.assertEqual(self.ssh_calls(), [])
+
     def test_status_names_the_agent_then_reports_the_rest(self):
         with self.assertRaises(self.box.YoError) as caught:
             self.box.main(["-m", "box", "status"])
@@ -1955,7 +2002,20 @@ class TestADeadAgent(LibvirtCase):
         self.assertEqual(len(self.lines), 1)
         self.assertRegex(self.lines[0], r"^127\.0\.0\.1:\d+$")
         self.assertTrue([argv for argv in self.host.calls if "forward" in argv])
-        self.assertFalse([argv for argv in self.ssh_calls() if argv[-1] == "true"])
+        sessions = [argv for argv in self.ssh_calls() if argv[-1] == "true"]
+        self.assertEqual(len(sessions), 1, "no round trip through the master")
+        self.assertNotIn("ControlPath=none", sessions[0])
+        self.assertFalse([argv for argv in self.ssh_calls() if "exit" in argv])
+
+    def test_a_master_whose_connection_died_is_dropped_and_names_the_agent(self):
+        self.host.master_session = (255, "Connection to lima-box closed")
+        with self.assertRaises(self.box.YoError) as caught:
+            self.box.main(["-m", "box", "port", "5173"])
+        self.assertTrue(
+            caught.exception.message.startswith(self.dead()), caught.exception.message
+        )
+        self.assertTrue([argv for argv in self.ssh_calls() if "exit" in argv])
+        self.assertFalse([argv for argv in self.host.calls if "forward" in argv])
 
     def test_port_without_a_master_names_the_agent_and_logs_in_nowhere(self):
         self.host.master_running = False
@@ -1964,7 +2024,70 @@ class TestADeadAgent(LibvirtCase):
         self.assertTrue(
             caught.exception.message.startswith(self.dead()), caught.exception.message
         )
-        self.assertEqual([argv for argv in self.ssh_calls() if "check" not in argv], [])
+        self.assertEqual([argv for argv in self.ssh_calls() if "-O" not in argv], [])
+
+
+class TestAnSshdYoCannotIdentify(LibvirtCase):
+    """The key is on offer, yet an unmarked sshd refused the operator and root:
+    yo cannot tell an initrd from a stage 2, so it neither starts nor stops."""
+
+    def setUp(self):
+        super().setUp()
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.sshd = lambda argv: (255, "Permission denied (publickey).")
+        for patcher in (
+            mock.patch.object(self.box.proc, "spawn", self.host.spawn),
+            mock.patch.object(
+                self.box.unlock, "ssh_banner", return_value="SSH-2.0-OpenSSH_10.6"
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_down_refuses_and_stops_nothing(self):
+        with self.assertRaises(self.box.YoError) as caught:
+            self.box.cmd_down(None)
+        self.assertIn("not stopping it: an sshd answers", caught.exception.message)
+        self.assertNotIn("shutdown", self.host.subcommands())
+        self.assertNotIn("destroy", self.host.subcommands())
+
+    def test_up_refuses_instead_of_taking_it_for_stage2(self):
+        with self.assertRaises(self.box.YoError) as caught:
+            self.box.vm_up(passphrase=b"cached")
+        self.assertIn(
+            "refused both the operator's key and root's", caught.exception.message
+        )
+
+
+class TestEnsureMaster(LibvirtCase):
+    """With the key on offer, a master that answers -O check but whose
+    connection died is replaced; a healthy one is ridden as it is."""
+
+    def setUp(self):
+        super().setUp()
+        self.host.tagged_domain("box", FIRST_PORT)
+
+    def control(self, action):
+        return [
+            argv for argv in self.host.calls if argv[:1] == ["ssh"] and action in argv
+        ]
+
+    def test_a_healthy_master_is_ridden_and_kept(self):
+        self.driver.ensure_master()
+        self.assertEqual(self.control("exit"), [])
+        self.assertTrue(self.host.master_running)
+
+    def test_a_master_whose_connection_died_is_replaced_by_a_new_login(self):
+        self.host.master_session = (255, "Connection to lima-box closed")
+        self.driver.ensure_master()
+        self.assertEqual(len(self.control("exit")), 1)
+        self.assertTrue(self.host.master_running)
+        self.assertEqual(self.host.master_session, (0, ""))
+
+    def test_no_master_is_opened_by_a_login(self):
+        self.host.master_running = False
+        self.driver.ensure_master()
+        self.assertTrue(self.host.master_running)
 
 
 class TestVmUpWithAGap(LibvirtCase):

@@ -51,11 +51,18 @@ def vm_up(
     elif size.asked:
         # The one place for both drivers, and before the passphrase is asked for.
         raise YoError(state.driver().existing_size_refusal(size))
+    # The one check for every start and unlock: up, both of bootstrap's and
+    # disk-grow's. A cached passphrase needs no 1Password, but the logins that
+    # follow do, and a 1Password that quit or locked since would otherwise
+    # surface as a refused key (docs/linux-host.md#the-operators-key).
+    state.driver().require_login_key()
     if status != RUNNING:
         passphrase = passphrase or agent.luks_passphrase()
         state.driver().start(passphrase, size)
     else:
         stage = unlock.boot_stage()
+        if stage is BootStage.UNKNOWN:
+            raise YoError(unknown_stage_message())
         if stage is BootStage.NONE:
             raise YoError(
                 "%s is Running but neither its initrd nor its sshd answers on 127.0.0.1:%d "
@@ -219,8 +226,22 @@ def initrd_down_refusal(reading: unlock.InitrdReading) -> str:
     )
 
 
+def unknown_stage_message() -> str:
+    return (
+        "an sshd answers on 127.0.0.1:%d but refused both the operator's key and "
+        "root's, so yo cannot tell whether %s waits in its initrd or runs; see %s"
+        % (state.driver().ssh_port(), state.box.name, state.yo_cmd("status"))
+    )
+
+
 def cmd_down(args: argparse.Namespace) -> None:
-    if unlock.boot_stage() is not BootStage.INITRD:
+    stage = unlock.boot_stage()
+    if stage is BootStage.UNKNOWN:
+        # Maybe an initrd, which ignores a shutdown request and may be encrypting
+        # the disk, so neither stop is safe. A dead login key is the usual cause.
+        state.driver().require_login_key()
+        raise YoError("not stopping it: %s" % unknown_stage_message())
+    if stage is not BootStage.INITRD:
         state.driver().stop()
         return
     # A box parked in its initrd has no ACPI handler, so a polite shutdown would

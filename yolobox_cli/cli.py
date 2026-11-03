@@ -182,7 +182,8 @@ def build_parser() -> argparse.ArgumentParser:
         "is already up needs no prompt. Safe to run again.",
     )
     add_size_arguments(up)
-    up.set_defaults(func=vm.cmd_up)
+    # vm_up checks the login key itself, before any start or unlock.
+    up.set_defaults(func=vm.cmd_up, logs_in=False)
 
     down = add("down", "Stop the VM.", "Stop the VM.")
     # Stopping needs no login: a box yo cannot log in to is stopped all the same.
@@ -221,7 +222,8 @@ def build_parser() -> argparse.ArgumentParser:
         "(github:you/yolobox/x); default: this yo's own release",
     )
     add_size_arguments(bootstrap)
-    bootstrap.set_defaults(func=vm.cmd_bootstrap)
+    # Its first step is vm_up, which checks the login key, as its reboot's does.
+    bootstrap.set_defaults(func=vm.cmd_bootstrap, logs_in=False)
 
     gc = add(
         "gc",
