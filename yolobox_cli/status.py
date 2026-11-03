@@ -548,17 +548,17 @@ def cmd_status(args: argparse.Namespace) -> None:
     state.driver().show_status()
     # Said first and once: with no login key every probe below fails, and the
     # lines that need no login (the VM's state, the config gaps) still follow.
-    try:
-        state.driver().require_login_key()
-    except YoError as failure:
-        report.warn("login: %s" % failure.message)
+    login = vm.login_problem()
+    if login is not None:
+        report.warn("login: %s" % login)
 
     # Every guest probe below fails the same way on a VM that is down, so ask
     # once and say it once instead of printing a warning per probe.
     # A box locked in its initrd answers with a per-boot host key that the pinned
     # probes in account_status() would warn about, so tell the stages apart first.
     stage = unlock.boot_stage()
-    if stage is BootStage.INITRD:
+    if stage in (BootStage.INITRD, BootStage.UNKNOWN):
+        # No pinned probe against a box that is, or may be, in its initrd.
         status, detail = "unreachable", ""
     else:
         status, detail = sshx.account_status()
@@ -566,9 +566,13 @@ def cmd_status(args: argparse.Namespace) -> None:
     if not vm_reachable:
         if detail:
             ui.err(detail)
-        report.warn(
-            "vm: unreachable — is it up? start it with: %s" % state.yo_cmd("up")
-        )
+        if stage is BootStage.UNKNOWN:
+            # The login line above already named a dead agent, if that is it.
+            report.warn("vm: %s" % vm.unknown_stage_message(None))
+        else:
+            report.warn(
+                "vm: unreachable — is it up? start it with: %s" % state.yo_cmd("up")
+            )
         if stage is BootStage.INITRD:
             ui.out(initrd_disk_line(unlock.initrd_state()))
 

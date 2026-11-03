@@ -112,6 +112,7 @@ class FakeHost:
         # What a session through that master gets: (code, stderr). A master
         # whose connection died still answers -O check, and its sessions fail.
         self.master_session = (0, "")
+        self.forwarded = []  # the -O forward requests a live master accepted
         self.listeners = ""  # what `ss -ltnHe` prints
         self.acl = getfacl_listing()  # what `getfacl` prints for the passt dir
         self.shutdown_state = "in shutdown"  # the state `virsh shutdown` leaves
@@ -154,6 +155,12 @@ class FakeHost:
             result = completed(
                 returncode=0 if self.master_running else 255, stderr=self.master_output
             )
+        elif argv[0] == "ssh" and "-O" in argv and "forward" in argv:
+            if self.master_running and self.master_session[0] == 0:
+                self.forwarded.append(argv)
+                result = completed()
+            else:
+                result = completed(returncode=255, stderr="mux_client_forward: failed")
         elif argv[0] == "ssh" and "exit" in argv:
             result = completed(returncode=0 if self.master_running else 255)
             self.master_running = False
@@ -372,9 +379,10 @@ class LibvirtCase(FakeHome):
             "MemTotal:       %d kB\nMemFree:         1048576 kB\n" % kib
         )
 
-    def lock_held(self):
-        """Whether another process would have to wait for the port lock."""
-        path = os.path.join(
+    def lock_held(self, path=None):
+        """Whether another process would have to wait for the lock at `path`,
+        the host-wide port lock by default."""
+        path = path or os.path.join(
             self.home, self.driver.instances_dir, self.box.PORT_LOCK_NAME
         )
         fd = os.open(path, os.O_RDWR)
@@ -893,7 +901,6 @@ class TestYoPort(LibvirtCase):
         stdout = io.StringIO()
         with (
             mock.patch.object(self.box.box.driver, "require_tool"),
-            mock.patch.object(self.box.sshx, "ssh_run"),
             mock.patch.object(
                 self.box.libvirt, "loopback_port_bound", return_value=False
             ),
@@ -930,7 +937,6 @@ class TestYoPort(LibvirtCase):
                 "loopback_port_bound",
                 side_effect=lambda port: held.append(self.lock_held()) or False,
             ),
-            mock.patch.object(self.box.sshx, "ssh_run"),
         ):
             self.driver.forward_port(5173)
         self.assertEqual(held, [True, True])
@@ -1586,8 +1592,7 @@ class TestStatusAndGaps(LibvirtCase):
 class TestKeepalive(LibvirtCase):
     def pid(self, output):
         self.host.master_output = output
-        with mock.patch.object(self.box.sshx, "ssh_run"):
-            return self.driver.keepalive_pid()
+        return self.driver.keepalive_pid()
 
     def test_the_pid_is_the_masters(self):
         self.assertEqual(self.pid("Master running (pid=4242)\r\n"), 4242)
@@ -1947,9 +1952,9 @@ class TestADeadAgent(LibvirtCase):
         ):
             with self.assertRaises(self.box.YoError) as caught:
                 self.box.main(["-m", "box", "down"])
-        self.assertTrue(
-            caught.exception.message.startswith(self.dead()), caught.exception.message
-        )
+        message = caught.exception.message
+        self.assertTrue(message.startswith("not stopping it: "), message)
+        self.assertIn("First fix the login: " + self.dead(), message)
         self.assertNotIn("shutdown", self.host.subcommands())
         self.assertNotIn("destroy", self.host.subcommands())
         self.assertEqual(self.driver.vm_status(), "Running")
@@ -2001,11 +2006,11 @@ class TestADeadAgent(LibvirtCase):
         self.box.main(["-m", "box", "port", "5173"])
         self.assertEqual(len(self.lines), 1)
         self.assertRegex(self.lines[0], r"^127\.0\.0\.1:\d+$")
-        self.assertTrue([argv for argv in self.host.calls if "forward" in argv])
-        sessions = [argv for argv in self.ssh_calls() if argv[-1] == "true"]
-        self.assertEqual(len(sessions), 1, "no round trip through the master")
-        self.assertNotIn("ControlPath=none", sessions[0])
-        self.assertFalse([argv for argv in self.ssh_calls() if "exit" in argv])
+        self.assertEqual(len(self.host.forwarded), 1)
+        self.assertIn(
+            "127.0.0.1:%s:127.0.0.1:5173" % self.lines[0].split(":")[1],
+            self.host.forwarded[0],
+        )
 
     def test_a_master_whose_connection_died_is_dropped_and_names_the_agent(self):
         self.host.master_session = (255, "Connection to lima-box closed")
@@ -2014,8 +2019,7 @@ class TestADeadAgent(LibvirtCase):
         self.assertTrue(
             caught.exception.message.startswith(self.dead()), caught.exception.message
         )
-        self.assertTrue([argv for argv in self.ssh_calls() if "exit" in argv])
-        self.assertFalse([argv for argv in self.host.calls if "forward" in argv])
+        self.assertEqual(self.host.forwarded, [])
 
     def test_port_without_a_master_names_the_agent_and_logs_in_nowhere(self):
         self.host.master_running = False
@@ -2044,10 +2048,20 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_down_refuses_and_stops_nothing(self):
+    def assert_names_the_way_out(self, text):
+        # How to tell an encrypting initrd, and the force that is then safe;
+        # never "see yo status" or "yo up", which would only refuse again.
+        self.assertIn(self.driver.boot_log(), text)
+        self.assertIn(self.box.unlock.MIGRATE_CONSOLE_LINE, text)
+        self.assertIn(self.driver.force_stop_command(), text)
+        self.assertNotIn("yo -m box status", text)
+        self.assertNotIn("1Password", text)
+
+    def test_down_refuses_names_the_way_out_and_stops_nothing(self):
         with self.assertRaises(self.box.YoError) as caught:
             self.box.cmd_down(None)
         self.assertIn("not stopping it: an sshd answers", caught.exception.message)
+        self.assert_names_the_way_out(caught.exception.message)
         self.assertNotIn("shutdown", self.host.subcommands())
         self.assertNotIn("destroy", self.host.subcommands())
 
@@ -2057,6 +2071,30 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
         self.assertIn(
             "refused both the operator's key and root's", caught.exception.message
         )
+        self.assert_names_the_way_out(caught.exception.message)
+
+    def test_status_names_the_way_out_and_runs_no_pinned_probe(self):
+        lines = []
+        with (
+            mock.patch.object(self.box.box.driver, "require_tool"),
+            mock.patch.object(self.box.ui, "out", lines.append),
+        ):
+            with self.assertRaises(self.box.YoError) as caught:
+                self.box.main(["-m", "box", "status"])
+        self.assertEqual(caught.exception.code, 1)
+        vm_lines = [line for line in lines if line.startswith("vm: ")]
+        self.assertEqual(len(vm_lines), 1, lines)
+        self.assertIn("an sshd answers", vm_lines[0])
+        self.assert_names_the_way_out(vm_lines[0])
+        self.assertNotIn("start it with", vm_lines[0])
+        # Only the unpinned boot-stage probes ran; account_status's pinned ones,
+        # which read the ssh.config and its known_hosts, did not.
+        pinned = [
+            argv
+            for argv in self.host.calls
+            if argv[0] == "ssh" and "-F" in argv and "/dev/null" not in argv
+        ]
+        self.assertEqual(pinned, [])
 
 
 class TestEnsureMaster(LibvirtCase):
@@ -2067,27 +2105,53 @@ class TestEnsureMaster(LibvirtCase):
         super().setUp()
         self.host.tagged_domain("box", FIRST_PORT)
 
-    def control(self, action):
-        return [
-            argv for argv in self.host.calls if argv[:1] == ["ssh"] and action in argv
-        ]
+    def port(self):
+        """`yo port 5173`, and the host port it printed."""
+        lines = []
+        with (
+            mock.patch.object(self.box.box.driver, "require_tool"),
+            mock.patch.object(self.box.ui, "out", lines.append),
+            mock.patch.object(
+                self.box.libvirt, "loopback_port_bound", return_value=False
+            ),
+        ):
+            self.box.main(["-m", "box", "port", "5173"])
+        (line,) = lines
+        return line
 
-    def test_a_healthy_master_is_ridden_and_kept(self):
-        self.driver.ensure_master()
-        self.assertEqual(self.control("exit"), [])
-        self.assertTrue(self.host.master_running)
+    def assert_forwarded(self, printed):
+        host_port = printed.split(":")[1]
+        self.assertEqual(len(self.host.forwarded), 1)
+        self.assertIn("127.0.0.1:%s:127.0.0.1:5173" % host_port, self.host.forwarded[0])
 
-    def test_a_master_whose_connection_died_is_replaced_by_a_new_login(self):
+    def test_a_healthy_master_carries_the_forward(self):
+        self.assert_forwarded(self.port())
+
+    def test_a_master_whose_connection_died_is_replaced_and_carries_the_forward(self):
         self.host.master_session = (255, "Connection to lima-box closed")
-        self.driver.ensure_master()
-        self.assertEqual(len(self.control("exit")), 1)
-        self.assertTrue(self.host.master_running)
-        self.assertEqual(self.host.master_session, (0, ""))
+        self.assert_forwarded(self.port())
 
-    def test_no_master_is_opened_by_a_login(self):
+    def test_with_no_master_a_login_opens_one_that_carries_the_forward(self):
         self.host.master_running = False
-        self.driver.ensure_master()
-        self.assertTrue(self.host.master_running)
+        self.assert_forwarded(self.port())
+
+    def test_the_master_is_dropped_and_reopened_under_its_lock(self):
+        # Another yo taking the lock in between could otherwise lose its master.
+        self.host.master_session = (255, "Connection to lima-box closed")
+        lock = os.path.join(self.box.instance_dir(), self.box.MASTER_LOCK_NAME)
+        held = []
+        run = self.host.run
+
+        def spy(argv, **kwargs):
+            if argv[:1] == ["ssh"] and ("exit" in argv or argv[-1] == "true"):
+                held.append(self.lock_held(lock))
+            return run(argv, **kwargs)
+
+        with mock.patch.object(self.box.proc, "run", spy):
+            self.driver.ensure_master()
+        self.assertEqual(len(held), 3, "round trip, exit and reopen")
+        self.assertTrue(all(held), held)
+        self.assertFalse(self.lock_held(lock))
 
 
 class TestVmUpWithAGap(LibvirtCase):

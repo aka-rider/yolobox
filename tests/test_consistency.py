@@ -930,6 +930,22 @@ class TestStage2SshdIsToldApartWithoutALogin(unittest.TestCase):
         self.assertEqual(self.setting("PerSourcePenaltyExemptList"), allow.group(1))
 
 
+class TestMigrateConsoleLineIsTheUnitsDescription(unittest.TestCase):
+    """yo tells a person to read the console for the migrate unit's line, so the
+    line it quotes is the unit's description with the device filled in."""
+
+    def test_the_quoted_line_is_how_the_unit_describes_itself(self):
+        found = re.search(
+            r'description = "(Encrypt or finish encrypting \$\{device\} in place)',
+            nix_code(REPO / "nix" / "luks.nix"),
+        )
+        self.assertIsNotNone(found, "luks.nix has no migrate unit description")
+        self.assertEqual(
+            found.group(1).replace("${device}", yo.LUKS_DEVICE),
+            yo.unlock.MIGRATE_CONSOLE_LINE,
+        )
+
+
 class TestGuestProfilePatternMatchesYo(unittest.TestCase):
     def test_aws_creds_accepts_exactly_the_profile_names_yo_allow_lists(self):
         found = re.findall(

@@ -54,6 +54,10 @@ LIMA_PRE_BOOT_STATUSES: Tuple[Optional[str], ...] = (
     "Stopped",
 )
 
+# What the console shows while the first boot encrypts the disk in place: the
+# description of the yolobox-luks-migrate unit (nix/luks.nix).
+MIGRATE_CONSOLE_LINE = "Encrypt or finish encrypting %s in place" % LUKS_DEVICE
+
 # RFC 4253 caps the identification line at 255 bytes.
 SSH_BANNER_MAX_BYTES = 255
 
@@ -116,7 +120,9 @@ class BootStage(enum.Enum):
     NONE = "none"  # nothing answers, or a marked stage 2 refused the operator
     # An sshd answers without the stage-2 mark and refused both the operator
     # and root, so yo cannot tell an initrd (which may be encrypting the disk)
-    # from a stage 2: a dead or locked 1Password looks exactly like this.
+    # from a stage 2. On libvirt a dead or locked 1Password looks exactly like
+    # this; on Lima it is an initrd without its keys, or a stage 2 built before
+    # the mark that refuses Lima's key.
     UNKNOWN = "unknown"
 
 

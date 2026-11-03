@@ -62,7 +62,8 @@ def vm_up(
     else:
         stage = unlock.boot_stage()
         if stage is BootStage.UNKNOWN:
-            raise YoError(unknown_stage_message())
+            # The key passed the check above, so the cause is elsewhere.
+            raise YoError(unknown_stage_message(None))
         if stage is BootStage.NONE:
             raise YoError(
                 "%s is Running but neither its initrd nor its sshd answers on 127.0.0.1:%d "
@@ -226,11 +227,40 @@ def initrd_down_refusal(reading: unlock.InitrdReading) -> str:
     )
 
 
-def unknown_stage_message() -> str:
+def login_problem() -> Optional[str]:
+    """Why the box's login key is not on offer (on libvirt, 1Password's agent);
+    None when it is, and always on Lima, whose key is a file."""
+    try:
+        state.driver().require_login_key()
+    except YoError as failure:
+        return failure.message
+    return None
+
+
+def unknown_stage_message(login: Optional[str]) -> str:
+    """What BootStage.UNKNOWN means and the way out of it; `login` is the login
+    problem to name first, None when there is none or it was said already."""
+    cause = (
+        "First fix the login: %s. Then yo can tell the two apart again. " % login
+        if login
+        else ""
+    )
     return (
-        "an sshd answers on 127.0.0.1:%d but refused both the operator's key and "
-        "root's, so yo cannot tell whether %s waits in its initrd or runs; see %s"
-        % (state.driver().ssh_port(), state.box.name, state.yo_cmd("status"))
+        "an sshd answers on 127.0.0.1:%d without the stage-2 banner and refused both "
+        "the operator's key and root's, so yo cannot tell whether %s waits in its "
+        "initrd or runs. %sIts console tells which: %s. While it shows '%s' started "
+        "and not finished, the initrd is encrypting the disk and must not be powered "
+        "off. Once it shows the passphrase prompt with that unit finished or never "
+        "started, it is safe to force it off: %s, then %s"
+        % (
+            state.driver().ssh_port(),
+            state.box.name,
+            cause,
+            state.driver().boot_log(),
+            unlock.MIGRATE_CONSOLE_LINE,
+            state.driver().force_stop_command(),
+            state.yo_cmd("up"),
+        )
     )
 
 
@@ -238,9 +268,9 @@ def cmd_down(args: argparse.Namespace) -> None:
     stage = unlock.boot_stage()
     if stage is BootStage.UNKNOWN:
         # Maybe an initrd, which ignores a shutdown request and may be encrypting
-        # the disk, so neither stop is safe. A dead login key is the usual cause.
-        state.driver().require_login_key()
-        raise YoError("not stopping it: %s" % unknown_stage_message())
+        # the disk, so neither stop is safe. On libvirt a dead or locked
+        # 1Password is the usual cause.
+        raise YoError("not stopping it: %s" % unknown_stage_message(login_problem()))
     if stage is not BootStage.INITRD:
         state.driver().stop()
         return

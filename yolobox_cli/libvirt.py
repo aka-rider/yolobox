@@ -88,6 +88,8 @@ STATE_REMEDIES = {
     "pmsuspended": ("wake", "dompmwakeup"),
 }
 PORT_LOCK_NAME = ".port.lock"
+# In the instance directory: held over ensure_master's check, drop and reopen.
+MASTER_LOCK_NAME = "master.lock"
 
 SEED_NAME = "nixos-lima-v0.2.2-x86_64.qcow2"
 SEED_URL = (
@@ -423,6 +425,17 @@ def volume_names() -> List[str]:
     return [row.split()[0] for row in rows[separators[0] + 1 :] if row.strip()]
 
 
+@contextlib.contextmanager
+def held_lock(path: str) -> Iterator[None]:
+    """Hold an exclusive flock on `path`, created private if it is missing."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, FILE_MODE_PRIVATE)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor drops the lock
+
+
 class LibvirtDriver:
     """Linux: one libvirt domain per machine, on the system connection."""
 
@@ -486,16 +499,16 @@ class LibvirtDriver:
         """
         directory = os.path.join(state.home(), self.instances_dir)
         os.makedirs(directory, exist_ok=True)
-        fd = os.open(
-            os.path.join(directory, PORT_LOCK_NAME),
-            os.O_RDWR | os.O_CREAT,
-            FILE_MODE_PRIVATE,
-        )
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        with held_lock(os.path.join(directory, PORT_LOCK_NAME)):
             yield
-        finally:
-            os.close(fd)  # closing the descriptor drops the lock
+
+    @contextlib.contextmanager
+    def master_lock(self) -> Iterator[None]:
+        """Hold this machine's lock over checking, dropping and opening its
+        operator master, so one yo never drops a master another just opened."""
+        proc.private_dir(state.instance_dir())
+        with held_lock(os.path.join(state.instance_dir(), MASTER_LOCK_NAME)):
+            yield
 
     def forward_port(self, guest_port: int) -> int:
         self.ensure_master()
@@ -529,17 +542,27 @@ class LibvirtDriver:
         Only opening one logs in, so only then must the login key be on offer:
         a live master serves `yo port` and the forwards without 1Password.
         `-O check` proves only that the master process answers, so a session
-        through it proves the connection; a master that fails it is dropped."""
-        if (
-            self.master_alive()
-            and sshx.ssh_run(OPERATOR, ["true"], mux=True).returncode == 0
-        ):
-            return
-        # Its exit code is not read: with no master to stop it fails, and either
-        # way no master is left for the new session to ride.
-        proc.run(sshx.ssh_argv(OPERATOR, "-O", "exit", state.box.vm_host, mux=True))
-        self.require_login_key()
-        sshx.ssh_run(OPERATOR, ["true"], mux=True, check=True)
+        through it proves the connection; a master that fails it is dropped.
+        The lock keeps two yo from racing through this; the exit is only ever
+        aimed at a master this call saw answer and fail, never at one that
+        appeared after its check."""
+        with self.master_lock():
+            if self.master_alive():
+                if sshx.ssh_run(OPERATOR, ["true"], mux=True).returncode == 0:
+                    return
+                # What counts is that no master is left: one that died on its
+                # own since the check makes the exit fail, and that is fine.
+                exit_run = proc.run(
+                    sshx.ssh_argv(OPERATOR, "-O", "exit", state.box.vm_host, mux=True)
+                )
+                if self.master_alive():
+                    raise YoError(
+                        "%s's ssh master answers but carries no session, and "
+                        "`ssh -O exit` did not stop it: %s"
+                        % (state.box.name, exit_run.stderr.strip() or "no output")
+                    )
+            self.require_login_key()
+            sshx.ssh_run(OPERATOR, ["true"], mux=True, check=True)
 
     def keepalive_pid(self) -> Optional[int]:
         self.ensure_master()
