@@ -29,6 +29,9 @@ class Size(NamedTuple):
 
 NO_SIZE = Size(None, None)
 
+# The status of a VM that is up, in Lima's word, which every driver reports.
+RUNNING = "Running"
+
 
 class Driver(Protocol):
     """The host side of the box: everything that differs between host OSes.
@@ -76,6 +79,9 @@ class Driver(Protocol):
     def delete_command(self) -> str: ...
     def list_command(self) -> str: ...  # shows the instance's state
     def boot_log(self) -> str: ...  # the VM's console log
+    # Why a VM that yo waits for is in `status`, not Running (None: it no longer
+    # exists), and the way back.
+    def vm_lost_hint(self, status: Optional[str]) -> str: ...
     def show_status(self) -> None: ...  # the driver's view, head of `yo status`
     def disk_image(self) -> Optional[Tuple[str, int]]: ...  # label and host KiB
     def disk_ceiling_gib(self) -> int: ...  # YoError when unreadable

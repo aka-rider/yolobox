@@ -9,10 +9,11 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import proc, release, sshconfig, state, ui
 from .config import LUKS_DEVICE, LUKS_KEY_ITEM, SSH_UNREACHABLE
+from .driver import RUNNING
 from .ui import YoError
 
 
@@ -37,10 +38,15 @@ OPERATOR_WAIT_SECONDS = 600
 INITRD_POLL_SECONDS = 2
 OPERATOR_POLL_SECONDS = 3
 
-# What `limactl list` reports before the guest is running: not listed yet,
+# What `limactl list` reports before the guest is running: not listed yet (None),
 # Installing, Starting, and Stopped, which an instance still says in the moments
 # after `limactl start` is spawned and before its hostagent exists.
-LIMA_PRE_BOOT_STATUSES = ("", "Installing", "Starting", "Stopped")
+LIMA_PRE_BOOT_STATUSES: Tuple[Optional[str], ...] = (
+    None,
+    "Installing",
+    "Starting",
+    "Stopped",
+)
 
 NOT_LISTENING_MARKERS = (
     "Connection refused",
@@ -74,11 +80,19 @@ def classify_initrd_attempt(returncode: int, stderr: str) -> SshOutcome:
     return SshOutcome.ERROR
 
 
-def sshd_answers(user: str) -> SshOutcome:
+def probe_sshd(user: str) -> Tuple[SshOutcome, str]:
+    """One `true` over the unpinned initrd channel as `user`, and ssh's stderr."""
     completed = proc.run(sshconfig.initrd_ssh_argv("true", user=user), stdin=b"")
     if completed.returncode == 0:
-        return SshOutcome.ANSWERED
-    return classify_initrd_attempt(completed.returncode, completed.stderr)
+        return SshOutcome.ANSWERED, completed.stderr
+    return (
+        classify_initrd_attempt(completed.returncode, completed.stderr),
+        completed.stderr,
+    )
+
+
+def sshd_answers(user: str) -> SshOutcome:
+    return probe_sshd(user)[0]
 
 
 def stage2_up() -> bool:
@@ -367,17 +381,30 @@ def helper_failure_message(attempt: HelperRun) -> str:
 
 
 def deadline_after(
-    deadline: Optional[float], status: str, lima_is_starting: bool, now: float
+    deadline: Optional[float],
+    status: Optional[str],
+    lima_is_starting: bool,
+    now: float,
 ) -> Optional[float]:
     """The unlock budget after seeing lima's status: it starts when lima says Running."""
-    if status == "Running":
+    if status == RUNNING:
         return deadline or now + INITRD_WAIT_SECONDS
     if lima_is_starting and status in LIMA_PRE_BOOT_STATUSES:
         # Lima is still creating, downloading or booting.
         return None
-    raise YoError(
-        "%s is %s, not Running — %s"
-        % (state.box.name, status or "not listed", state.driver().list_command())
+    raise vm_lost_error(status, "its initrd to take the disk passphrase")
+
+
+def vm_lost_error(status: Optional[str], waiting_for: str) -> YoError:
+    """The VM is not Running while yo waits for it (None: no longer there)."""
+    return YoError(
+        "%s is %s, not Running, while yo waited for %s — %s"
+        % (
+            state.box.name,
+            status or "not listed",
+            waiting_for,
+            state.driver().vm_lost_hint(status),
+        )
     )
 
 
@@ -456,7 +483,7 @@ def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -
                 return migrated_any
         deadline = deadline_after(
             deadline,
-            state.driver().vm_status() or "",
+            state.driver().vm_status(),
             starter_alive and not session_ran,
             time.monotonic(),
         )
@@ -467,7 +494,25 @@ def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -
 
 def wait_for_operator() -> None:
     deadline = time.monotonic() + OPERATOR_WAIT_SECONDS
-    while not stage2_up():
+    while True:
+        # Bounded by ssh's ConnectTimeout and ServerAliveInterval.
+        outcome, stderr = probe_sshd(release.host_user())
+        if outcome is SshOutcome.ANSWERED:
+            return
+        # First the VM: one that went away or paused (the host's OOM killer, a
+        # crash) also fails a probe in shapes of its own, a keepalive timeout.
+        status = state.driver().vm_status()
+        if status != RUNNING:
+            raise vm_lost_error(status, "its sshd to accept the operator")
+        if outcome in (SshOutcome.ERROR, SshOutcome.RAN):
+            # Of no shape a boot explains: ssh failed in a way yo has no name
+            # for, or it logged in and `true` failed.
+            raise YoError(
+                "ssh to %s as the operator failed: %s"
+                % (state.box.name, stderr.strip() or "no message")
+            )
+        # Nothing listening yet, or a refused key, is retried: a fresh box
+        # writes the operator's key moments after its sshd starts.
         if time.monotonic() > deadline:
             raise YoError(
                 "the disk is unlocked but %s is not reachable as the operator — %s"

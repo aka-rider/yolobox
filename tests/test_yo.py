@@ -2039,6 +2039,32 @@ class TestEnsureAgentSshConfig(FakeHome):
         self.assertEqual(forwardagent("agent"), ["forwardagent no"])
         self.assertEqual(forwardagent("user"), ["forwardagent yes"])
 
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_every_connection_gives_up_on_a_guest_that_stops_answering(self):
+        # Whatever lima's block or a later user block says, as ssh resolves it.
+        later = "  ServerAliveInterval 0\n  ConnectTimeout 0\n"
+        self.write_config(
+            LIMA_BLOCK + "\nHost lima-yolobox\n" + later + "\nHost yolobox\n" + later
+        )
+        yo.ensure_agent_ssh_config()
+        # yo's roles as either account, and herdr through its alias.
+        for user, host in (
+            ("agent", "lima-yolobox"),
+            ("user", "lima-yolobox"),
+            ("agent", "yolobox"),
+        ):
+            with self.subTest(user=user, host=host):
+                resolved = subprocess.run(
+                    ["ssh", "-G", "-F", self.config_path(), "-o", "User=" + user]
+                    + [host],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.splitlines()
+                self.assertIn("connecttimeout 30", resolved)
+                self.assertIn("serveraliveinterval 15", resolved)
+                self.assertIn("serveralivecountmax 8", resolved)
+
     def test_a_marker_without_a_blank_line_keeps_limas_host_block(self):
         self.write_config(yo.AGENT_SSH_CONFIG_MARKER + "\n" + LIMA_BLOCK)
 

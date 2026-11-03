@@ -46,9 +46,10 @@ from .config import (
     KIB,
     LOOPBACK,
     MIN_DISK_GIB,
+    MIN_MEMORY_GIB,
     SCRIPT_DIR,
 )
-from .driver import Size
+from .driver import RUNNING, Size
 from .libvirt_host import GUEST_SSH_PORT, LIBVIRT_URI, VM_USER, DomainInfo
 from .sshx import OPERATOR
 from .ui import YoError
@@ -68,6 +69,10 @@ OPERATOR_ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]*")
 # A box's size when `yo up` is given no --memory or --disk (domain_size).
 LIBVIRT_MEMORY_GIB = 16
 LIBVIRT_DISK_GIB = 100
+# What an explicit --memory leaves the host itself: its kernel, page cache and
+# desktop. A domain has no balloon (memballoon model='none'), so its qemu grows
+# to the whole of its memory, and a host short of it OOM-kills a qemu.
+HOST_MEMORY_RESERVE_GIB = 4
 LIBVIRT_STOP_TIMEOUT = 300
 # What `virsh event --timeout` prints, then exits 1, when no more events came.
 EVENT_TIMEOUT_LINE = "event loop timed out"
@@ -77,9 +82,11 @@ EVENT_TIMEOUT_LINE = "event loop timed out"
 STATE_OFF = "shut off"
 STATE_SHUTTING_DOWN = "in shutdown"
 STATES_STOPPING = ("running", "blocked", STATE_SHUTTING_DOWN)
-STATE_HINTS = {
-    "paused": "resume it with `virsh resume`",
-    "pmsuspended": "wake it with `virsh dompmwakeup`",
+# The states a guest stays in until someone acts: the verb and virsh command
+# that bring it back (state_hint).
+STATE_REMEDIES = {
+    "paused": ("resume", "resume"),
+    "pmsuspended": ("wake", "dompmwakeup"),
 }
 PORT_LOCK_NAME = ".port.lock"
 
@@ -96,6 +103,7 @@ SEED_CONNECT_TIMEOUT = 60
 CIDATA_FILES = ("user-data", "meta-data", "lima.env", "etc_environment")
 MASTER_PID_RE = re.compile(r"Master running \(pid=(\d+)\)")
 SIZE_LINE_RE = re.compile(r"^(Capacity|Allocation):\s+(\d+) bytes\s*$", re.M)
+MAX_MEMORY_LINE_RE = re.compile(r"^Max memory:\s+(\d+) KiB\s*$", re.M)
 
 
 def domain_name() -> str:
@@ -108,15 +116,6 @@ def disk_volume() -> str:
 
 def cidata_volume() -> str:
     return state.box.vm_name + "-cidata.iso"
-
-
-def spawn_virsh(*args: str) -> subprocess.Popen:
-    return proc.spawn(
-        ["virsh", "-c", LIBVIRT_URI, *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
 
 
 def loopback_port_bound(port: int) -> bool:
@@ -290,9 +289,114 @@ def ensure_seed() -> str:
     return path
 
 
+def names_listed(listing: str) -> List[str]:
+    """The names `virsh list --name` printed, one per line."""
+    return [line.strip() for line in listing.splitlines() if line.strip()]
+
+
 def domain_names() -> List[str]:
-    listing = libvirt_host.virsh("list", "--all", "--name").stdout.splitlines()
-    return [line.strip() for line in listing if line.strip()]
+    """Every defined domain, running or not."""
+    return names_listed(libvirt_host.virsh("list", "--all", "--name").stdout)
+
+
+def active_domain_names() -> List[str]:
+    """The domains that hold their memory now: running, paused, shutting down."""
+    return names_listed(libvirt_host.virsh("list", "--name").stdout)
+
+
+def active_domains_memory() -> Dict[str, int]:
+    """The max memory, in bytes, of every active domain, from `virsh dominfo`.
+
+    A domain undefined between the listing and its dominfo is not counted; any
+    other failure of dominfo is an error.
+    """
+    memory: Dict[str, int] = {}
+    for name in active_domain_names():
+        info = libvirt_host.virsh("dominfo", name, check=False)
+        if info.returncode != 0:
+            if name not in domain_names():
+                continue
+            raise YoError(
+                "virsh dominfo %s failed (exit %d): %s"
+                % (name, info.returncode, proc.failure_detail(info))
+            )
+        found = MAX_MEMORY_LINE_RE.search(info.stdout)
+        if found is None:
+            raise YoError(
+                "virsh dominfo %s printed no Max memory in KiB: %s"
+                % (name, info.stdout.strip())
+            )
+        memory[name] = int(found.group(1)) * KIB
+    return memory
+
+
+def gib_text(size: int) -> str:
+    return "%.1f GiB" % (size / GIB)
+
+
+def memory_room(host: int, others: Dict[str, int]) -> int:
+    """What is left for a new domain, in bytes: MemTotal less the host's reserve
+    and the whole max memory of every active domain (none has a balloon)."""
+    return host - HOST_MEMORY_RESERVE_GIB * GIB - sum(others.values())
+
+
+def memory_refusal(memory_gib: int, host: int, others: Dict[str, int]) -> Optional[str]:
+    """Why a new domain of `memory_gib` does not fit beside the active `others`
+    on a host of `host` bytes, or None when it does."""
+    room = memory_room(host, others)
+    if memory_gib * GIB <= room:
+        return None
+    ways = []
+    if room >= MIN_MEMORY_GIB * GIB:
+        ways.append("ask for at most --memory %d" % (room // GIB))
+    if others:
+        ways.append("stop another domain")
+    if not ways:
+        ways.append("that is under the %d GiB a box needs" % MIN_MEMORY_GIB)
+    return (
+        "--memory %d does not fit on this host: %s reads MemTotal %s, the host "
+        "keeps %d GiB for itself, and the other active domains may take %s (%s), "
+        "which leaves %s for this box — %s"
+        % (
+            memory_gib,
+            libvirt_host.MEMINFO_FILE,
+            gib_text(host),
+            HOST_MEMORY_RESERVE_GIB,
+            gib_text(sum(others.values())),
+            ", ".join(
+                "%s %s" % (name, gib_text(others[name])) for name in sorted(others)
+            )
+            or "none",
+            gib_text(max(room, 0)),
+            " or ".join(ways),
+        )
+    )
+
+
+def state_hint(domain_state: str) -> Optional[str]:
+    """The full virsh command that brings the domain back from `domain_state`,
+    or None when yo knows none."""
+    remedy = STATE_REMEDIES.get(domain_state)
+    if remedy is None:
+        return None
+    verb, command = remedy
+    return "%s it with `virsh -c %s %s %s`" % (
+        verb,
+        LIBVIRT_URI,
+        command,
+        domain_name(),
+    )
+
+
+def redefine_command() -> str:
+    """Remove the domain's definition and keep its disk volume, for a printed
+    remedy: the next `yo up` defines it again from the template and adopts the
+    volume."""
+    return "%s && virsh -c %s undefine --nvram %s" % (
+        state.yo_cmd("down"),
+        LIBVIRT_URI,
+        domain_name(),
+    )
 
 
 def yolobox_domains() -> List[DomainInfo]:
@@ -430,7 +534,7 @@ class LibvirtDriver:
         if not self.domain_exists():
             return None
         domain_state = self.domain_state()
-        return "Running" if domain_state == "running" else domain_state
+        return RUNNING if domain_state == "running" else domain_state
 
     def domain_state(self) -> str:
         """virsh's own word for the state: "running", "in shutdown", "shut off"..."""
@@ -440,13 +544,13 @@ class LibvirtDriver:
         # Explicit values only: the default must not refuse a 16 GiB host, whose
         # MemTotal is a little under 16 GiB.
         if size.memory_gib is not None:
-            host_bytes = libvirt_host.host_memory_bytes()
-            if size.memory_gib * GIB > host_bytes:
-                return (
-                    "--memory %d is more than this host has: %s reads MemTotal "
-                    "%.1f GiB"
-                    % (size.memory_gib, libvirt_host.MEMINFO_FILE, host_bytes / GIB)
-                )
+            refusal = memory_refusal(
+                size.memory_gib,
+                libvirt_host.host_memory_bytes(),
+                active_domains_memory(),
+            )
+            if refusal is not None:
+                return refusal
         # start() adopts a finished volume as it is, so a --disk it would not get
         # is refused. A domain removed with `virsh undefine` leaves its volume.
         if size.disk_gib is None or not self.volume_exists(disk_volume()):
@@ -479,9 +583,9 @@ class LibvirtDriver:
             )
         return (
             "%s already exists, and its memory was set when yo defined its domain — "
-            "drop %s, or define the domain again, keeping the disk: %s && virsh -c %s "
-            "undefine --nvram %s, then run this command again, which adopts the disk"
-            % (state.box.name, flags, state.yo_cmd("down"), LIBVIRT_URI, domain_name())
+            "drop %s, or define the domain again, keeping the disk: %s, then run "
+            "this command again, which adopts the disk"
+            % (state.box.name, flags, redefine_command())
         )
 
     def host_gaps(self) -> List[str]:
@@ -503,17 +607,10 @@ class LibvirtDriver:
 
     def config_gap_message(self, gaps: Sequence[str]) -> str:
         return (
-            "domain %s breaks the box's guarantees (%s) — stop it with %s, remove its "
-            "definition with `virsh -c %s undefine --nvram %s` (the disk volume "
-            "stays), then run %s to define it again from libvirt/domain.xml"
-            % (
-                domain_name(),
-                ", ".join(gaps),
-                state.yo_cmd("down"),
-                LIBVIRT_URI,
-                domain_name(),
-                state.yo_cmd("up"),
-            )
+            "domain %s breaks the box's guarantees (%s) — remove its definition, "
+            "keeping the disk volume: %s, then run %s to define it again from "
+            "libvirt/domain.xml"
+            % (domain_name(), ", ".join(gaps), redefine_command(), state.yo_cmd("up"))
         )
 
     def verify_initrd_listener(self, port: int) -> None:
@@ -732,7 +829,7 @@ class LibvirtDriver:
         # a re-armed one can register after the stop it should have seen. Its
         # events only wake the loop, which judges by `domstate`, so a stop that
         # lands before the watcher registers is still seen by the first read.
-        watcher = spawn_virsh(
+        watcher = libvirt_host.spawn_virsh(
             "event",
             domain_name(),
             "lifecycle",
@@ -780,9 +877,7 @@ class LibvirtDriver:
             % (
                 domain_name(),
                 domain_state,
-                STATE_HINTS.get(
-                    domain_state, "its state is not one yo knows how to stop"
-                ),
+                state_hint(domain_state) or "its state is not one yo knows how to stop",
                 self.force_stop_command(),
             )
         )
@@ -816,8 +911,7 @@ class LibvirtDriver:
         virsh_ = "virsh -c %s" % LIBVIRT_URI
         return " && ".join(
             [
-                state.yo_cmd("down"),
-                "%s undefine --nvram %s" % (virsh_, domain_name()),
+                redefine_command(),
                 "%s vol-delete --pool %s %s" % (virsh_, LIBVIRT_POOL, disk_volume()),
                 "%s vol-delete --pool %s %s" % (virsh_, LIBVIRT_POOL, cidata_volume()),
                 "rm -r ~/%s/%s" % (self.instances_dir, state.box.name),
@@ -829,6 +923,27 @@ class LibvirtDriver:
 
     def boot_log(self) -> str:
         return "virsh -c %s console %s" % (LIBVIRT_URI, domain_name())
+
+    def vm_lost_hint(self, status: Optional[str]) -> str:
+        if status is None:
+            return (
+                "domain %s no longer exists: %s defines it again from the template "
+                "and adopts the disk volume" % (domain_name(), state.yo_cmd("up"))
+            )
+        reason = "`virsh -c %s domstate --reason %s`" % (LIBVIRT_URI, domain_name())
+        why = "%s says why" % reason
+        if status == STATE_OFF:
+            return (
+                "%s. A guest that goes off by itself was possibly killed by the "
+                "host's OOM killer: check `journalctl -k -g oom`. If it was, free "
+                "memory on the host or give the box less, keeping its disk: %s, "
+                "then %s; then run this command again"
+                % (why, redefine_command(), state.yo_cmd("up", "--memory", "N"))
+            )
+        hint = state_hint(status)
+        if hint is not None:
+            return "%s; %s, then run this command again" % (why, hint)
+        return "check why with %s, then run this command again" % reason
 
     def show_status(self) -> None:
         libvirt_host.virsh("dominfo", domain_name(), check=False, capture=False)

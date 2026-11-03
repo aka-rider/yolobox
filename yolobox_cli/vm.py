@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 
 from . import agent, forwards, guest, proc, release, sshconfig, sshx, state, ui, unlock
 from .config import FILE_MODE_PRIVATE, GIB, LUKS_DEVICE
-from .driver import NO_SIZE, Size
+from .driver import NO_SIZE, RUNNING, Size
 from .sshx import AGENT, OPERATOR
 from .ui import Report, YoError
 from .unlock import BootStage
@@ -51,7 +51,7 @@ def vm_up(
     elif size.asked:
         # The one place for both drivers, and before the passphrase is asked for.
         raise YoError(state.driver().existing_size_refusal(size))
-    if status != "Running":
+    if status != RUNNING:
         passphrase = passphrase or agent.luks_passphrase()
         state.driver().start(passphrase, size)
     else:

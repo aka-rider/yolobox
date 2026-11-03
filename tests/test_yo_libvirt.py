@@ -47,7 +47,9 @@ DAEMON_VERSION_TEXT = (
 PASST_DIR = "/run/libvirt/qemu/passt"
 HOST_MEMORY_GIB = 64
 # The virsh subcommands that only look.
-READS = frozenset({"list", "dumpxml", "domstate", "vol-list", "vol-info"})
+READS = frozenset({"list", "dumpxml", "domstate", "dominfo", "vol-list", "vol-info"})
+# What ssh prints when nothing listens behind the box's port: a domain that is off.
+SSH_REFUSED = (255, "ssh: connect to host 127.0.0.1 port 61000: Connection refused")
 
 
 def getfacl_listing(entry="rwx", mask="rwx", comment=True):
@@ -109,6 +111,15 @@ class FakeHost:
         self.event_script = ([], "hang")  # what the next `virsh event` prints
         self.off_at_eof = False  # the domain goes off as that stream ends
         self.watchers = []
+        self.max_memory_kib = {}  # domain -> the Max memory `virsh dominfo` prints
+        self.dominfo = {}  # domain -> what `virsh dominfo` prints instead
+        # Runs as `virsh dominfo NAME` starts, given NAME: another tool acting.
+        self.before_dominfo = lambda name: None
+        self.virsh_envs = []  # the environment of each `virsh` run
+        # The guest's sshds, for the `ssh ... true` probes: argv -> (code, stderr).
+        self.sshd = lambda argv: (0, "")
+        # The initrd's yolobox-unlock session: (stdout lines, exit code, stderr).
+        self.helper = None
 
     def subcommands(self):
         return [call[3] for call in self.calls if call[0] == "virsh" and len(call) > 3]
@@ -124,6 +135,9 @@ class FakeHost:
         argv = list(argv)
         self.calls.append(argv)
         if argv[0] == "virsh":
+            # yo parses what virsh prints, which virsh translates.
+            assert kwargs["env"]["LC_ALL"] == "C", "virsh run in the user's locale"
+            self.virsh_envs.append(kwargs["env"])
             result = self.virsh(argv[3], argv[4:])
         elif argv[0] == "xorriso":
             self.iso_inputs.append((argv[-1], sorted(os.listdir(argv[-1]))))
@@ -131,6 +145,9 @@ class FakeHost:
             result = completed()
         elif argv[0] == "ssh" and "check" in argv:
             result = completed(stderr=self.master_output)
+        elif argv[0] == "ssh" and argv[-1] == "true":
+            code, stderr = self.sshd(argv)
+            result = completed(returncode=code, stderr=stderr)
         elif argv[0] == "ss":
             result = completed(self.listeners)
         elif argv[0] == "getfacl":
@@ -145,10 +162,13 @@ class FakeHost:
         return result
 
     def spawn(self, argv, **kwargs):
-        """Start `virsh event`, the only process the driver leaves running."""
+        """Start `virsh event`, or the ssh session of the initrd's helper."""
         argv = list(argv)
         self.calls.append(argv)
+        if argv[0] == "ssh" and argv[-1] == "yolobox-unlock":
+            return FakeHelper(*self.helper())
         assert argv[0] == "virsh" and argv[3] == "event", argv
+        assert kwargs["env"]["LC_ALL"] == "C", "virsh run in the user's locale"
         assert not self.watchers, "virsh event was armed a second time"
         events, ending = self.event_script
         watcher = FakeEventStream(self, argv[4], events, ending, self.off_at_eof)
@@ -167,7 +187,27 @@ class FakeHost:
             self.states[args[0]] = "shut off"
             return completed()
         if sub == "list":
-            return completed("\n".join(self.domains) + "\n\n")
+            # Without --all virsh lists the active domains only.
+            names = [
+                name
+                for name in self.domains
+                if "--all" in args or self.states[name] != "shut off"
+            ]
+            return completed("".join(name + "\n" for name in names) + "\n")
+        if sub == "dominfo":
+            self.before_dominfo(args[0])
+            if args[0] not in self.domains:
+                return completed(
+                    returncode=1,
+                    stderr="error: failed to get domain '%s'\n" % args[0],
+                )
+            if args[0] in self.dominfo:
+                return completed(self.dominfo[args[0]])
+            return completed(
+                "Id:             7\nName:           %s\nState:          %s\n"
+                "Max memory:     %d KiB\nUsed memory:    1048576 KiB\n\n"
+                % (args[0], self.states[args[0]], self.max_memory_kib[args[0]])
+            )
         if sub == "dumpxml":
             return completed(self.domains[args[0]])
         if sub == "domstate":
@@ -216,6 +256,32 @@ class FakeHost:
             "address='127.0.0.1'", "address='%s'" % address
         )
         self.states["yolobox-" + name] = "running"
+        self.max_memory_kib["yolobox-" + name] = self.box.LIBVIRT_MEMORY_GIB << 20
+
+    def foreign_domain(self, name, memory_kib, domain_state="running"):
+        """A domain of another tool, which yo only lists and asks for its memory."""
+        self.domains[name] = "<domain type='kvm'><name>%s</name></domain>" % name
+        self.states[name] = domain_state
+        self.max_memory_kib[name] = memory_kib
+
+
+class FakeHelper:
+    """The initrd helper's ssh session: scripted stdout lines, exit code, stderr."""
+
+    def __init__(self, lines, code, stderr):
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO("".join(line + "\n" for line in lines).encode())
+        self.stderr = io.BytesIO(stderr.encode())
+        self.code = code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def wait(self):
+        return self.code
 
 
 class LibvirtCase(FakeHome):
@@ -1263,18 +1329,91 @@ class TestStatusAndGaps(LibvirtCase):
         self.assertIsNone(self.refusal())
         self.assertIsNone(self.refusal(memory_gib=24, disk_gib=250))
 
-    def test_memory_up_to_what_the_host_has_is_created(self):
-        self.host_memory(24 << 20)
+    def test_memory_that_fits_beside_the_reserve_and_the_active_domains_is_created(
+        self,
+    ):
+        self.host.foreign_domain("win", 6 << 20)
+        self.host_memory((24 + 6 + self.box.HOST_MEMORY_RESERVE_GIB) << 20)
         self.assertIsNone(self.refusal(memory_gib=24))
 
-    def test_more_memory_than_the_host_has_is_refused(self):
-        self.host_memory((24 << 20) - 1)
+    def test_one_kib_over_is_refused_naming_every_number(self):
+        self.host.foreign_domain("win", 6 << 20)
+        self.host_memory(((24 + 6 + self.box.HOST_MEMORY_RESERVE_GIB) << 20) - 1)
         refusal = self.refusal(memory_gib=24)
-        self.assertIn("--memory 24 is more than this host has", refusal)
-        self.assertIn("MemTotal 24.0 GiB", refusal)
+        self.assertIn("--memory 24 does not fit on this host", refusal)
+        self.assertIn("MemTotal 34.0 GiB", refusal)
+        self.assertIn("keeps 4 GiB for itself", refusal)
+        self.assertIn("may take 6.0 GiB (win 6.0 GiB)", refusal)
+        self.assertIn("leaves 24.0 GiB for this box", refusal)
+        self.assertIn("ask for at most --memory 23 or stop another domain", refusal)
+
+    def test_memory_under_memtotal_is_refused_when_another_domain_holds_the_rest(
+        self,
+    ):
+        self.host.foreign_domain("other", 8 << 20)
+        self.host_memory(32 << 20)
+        refusal = self.refusal(memory_gib=24)
+        self.assertIn("ask for at most --memory 20", refusal)
+
+    def test_every_active_domain_counts_and_a_shut_off_one_does_not(self):
+        self.host.tagged_domain("other", FIRST_PORT + 1)  # 16 GiB, running
+        self.host.foreign_domain("paused", 2 << 20, "paused")
+        self.host.foreign_domain("off", 512 << 20, "shut off")
+        self.host_memory((8 + 16 + 2 + self.box.HOST_MEMORY_RESERVE_GIB) << 20)
+        self.assertIsNone(self.refusal(memory_gib=8))
+        refusal = self.refusal(memory_gib=9)
+        self.assertIn("(paused 2.0 GiB, yolobox-other 16.0 GiB)", refusal)
+
+    def test_a_domain_undefined_while_yo_reads_the_others_is_not_counted(self):
+        self.host.foreign_domain("win", 64 << 20)
+
+        def undefine(name):
+            self.host.domains.pop(name)
+
+        self.host.before_dominfo = undefine
+        self.host_memory((8 + self.box.HOST_MEMORY_RESERVE_GIB) << 20)
+        self.assertIsNone(self.refusal(memory_gib=8))
+
+    def test_a_dominfo_that_fails_for_a_domain_still_there_is_an_error(self):
+        self.host.foreign_domain("win", 6 << 20)
+        self.host.fail["dominfo"] = "error: internal error: lizard"
+        with self.assertRaisesRegex(
+            self.box.YoError, r"virsh dominfo win failed \(exit 1\): .*lizard"
+        ):
+            self.refusal(memory_gib=8)
+
+    def test_a_host_with_no_room_for_the_smallest_box_says_so(self):
+        self.host_memory((self.box.HOST_MEMORY_RESERVE_GIB + 7) << 20)
+        refusal = self.refusal(memory_gib=8)
+        self.assertIn("other active domains may take 0.0 GiB (none)", refusal)
+        self.assertIn(
+            "leaves 7.0 GiB for this box — that is under the 8 GiB a box needs",
+            refusal,
+        )
+        self.assertNotIn("at most", refusal)
+        self.host.foreign_domain("win", 8 << 20)
+        refusal = self.refusal(memory_gib=8)
+        self.assertIn("leaves 0.0 GiB for this box — stop another domain", refusal)
+
+    def test_a_dominfo_without_a_max_memory_in_kib_is_an_error(self):
+        self.host.foreign_domain("win", 6 << 20)
+        for text in (
+            "",
+            "Max memory:     lizard KiB\n",
+            "Max memory:     6 GiB\n",
+            "Max memory:      KiB\n",
+            "Max memory:     -1 KiB\n",
+        ):
+            with self.subTest(text=text):
+                self.host.dominfo["win"] = text
+                with self.assertRaisesRegex(
+                    self.box.YoError, "virsh dominfo win printed no Max memory in KiB"
+                ):
+                    self.refusal(memory_gib=8)
 
     def test_the_default_memory_is_not_held_to_the_host(self):
         # A 16 GiB host reports a little under 16 GiB.
+        self.host.foreign_domain("win", 6 << 20)
         self.host_memory((self.box.LIBVIRT_MEMORY_GIB << 20) - 1)
         self.assertIsNone(self.refusal())
 
@@ -1495,14 +1634,17 @@ class TestStop(LibvirtCase):
         self.assertTrue(self.host.watchers[0].terminated)
 
     def test_a_guest_that_pauses_while_stopping_is_an_error_not_a_stop(self):
-        for state in ("paused", "pmsuspended"):
+        for state, wake in (("paused", "resume"), ("pmsuspended", "dompmwakeup")):
             with self.subTest(state=state):
                 self.host.watchers.clear()
                 self.host.states["yolobox-box"] = "running"
-                with self.assertRaisesRegex(
-                    self.box.YoError, r"%s.*destroy yolobox-box" % state
-                ):
+                with self.assertRaises(self.box.YoError) as caught:
                     self.stop([state])
+                message = caught.exception.message
+                self.assertIn(
+                    "`virsh -c qemu:///system %s yolobox-box`" % wake, message
+                )
+                self.assertIn("destroy yolobox-box", message)
 
     def test_a_guest_that_is_paused_or_in_a_state_yo_does_not_know_is_not_asked_to_stop(
         self,
@@ -1554,10 +1696,10 @@ class TestUpWithASize(LibvirtCase):
         self.assertEqual(self.host.volumes["yolobox-box.qcow2"], b"a whole disk")
 
     def test_more_memory_than_the_host_has_is_refused_before_the_passphrase(self):
-        refusal = self.up("--memory", str(HOST_MEMORY_GIB + 1))
-        self.assertIn(
-            "--memory %d is more than this host has" % (HOST_MEMORY_GIB + 1), refusal
-        )
+        self.host.foreign_domain("win", 6 << 20)
+        refusal = self.up("--memory", str(HOST_MEMORY_GIB - 4 - 6 + 1))
+        self.assertIn("--memory %d does not fit" % (HOST_MEMORY_GIB - 9), refusal)
+        self.assertIn("(win 6.0 GiB)", refusal)
 
 
 class TestDown(LibvirtCase):
@@ -2050,6 +2192,183 @@ class TestStart(LibvirtCase):
             with self.assertRaisesRegex(self.box.YoError, "cannot name the operator"):
                 self.start()
         self.assertEqual(self.host.volumes, {})
+
+
+class TestADomainThatDiesWhileYoWaits(LibvirtCase):
+    """The host's OOM killer ends qemu while yo waits for the guest to answer."""
+
+    MIGRATING = ["yolobox-unlock: answered id=yolobox:luks-migrate"]
+
+    def setUp(self):
+        super().setUp()
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.states["yolobox-box"] = "shut off"
+        for patcher in (
+            mock.patch.object(self.box.proc, "spawn", self.host.spawn),
+            mock.patch.object(
+                self.box.shutil, "which", return_value="/usr/bin/getfacl"
+            ),
+            mock.patch.object(self.driver, "operator_key", return_value=KEY_BLOB),
+            # A wait that polls again has missed the domain going away.
+            mock.patch.object(
+                self.box.unlock.time,
+                "sleep",
+                side_effect=AssertionError("yo waited on a domain that is off"),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for quiet in (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            quiet.__enter__()
+            self.addCleanup(quiet.__exit__, None, None, None)
+
+    def killed_on_the_next_probe(self, killed_as="shut off"):
+        """The sshd probes find nothing, and the first one finds the domain gone."""
+
+        def probe(argv):
+            self.host.states["yolobox-box"] = killed_as
+            return SSH_REFUSED
+
+        self.host.sshd = probe
+
+    def up(self):
+        with self.assertRaises(self.box.YoError) as caught:
+            self.box.vm_up(run_services=False, passphrase=b"secret")
+        return caught.exception.message
+
+    def test_a_domain_killed_after_the_unlock_is_an_error_naming_the_oom_killer(self):
+        self.host.helper = lambda: (self.MIGRATING + ["unlocked"], 0, "")
+        self.killed_on_the_next_probe()
+        message = self.up()
+        self.assertIn(
+            "box is shut off, not Running, while yo waited for its sshd to accept "
+            "the operator",
+            message,
+        )
+        self.assertIn(
+            "`virsh -c qemu:///system domstate --reason yolobox-box` says why", message
+        )
+        self.assertIn("possibly killed by the host's OOM killer", message)
+        self.assertIn("check `journalctl -k -g oom`", message)
+        self.assertIn(
+            "keeping its disk: yo -m box down && virsh -c qemu:///system undefine "
+            "--nvram yolobox-box, then yo -m box up --memory N; then run this "
+            "command again",
+            message,
+        )
+
+    def test_a_domain_killed_while_the_migration_streamed_is_an_error_at_once(self):
+        def dropped():
+            self.host.states["yolobox-box"] = "shut off"
+            return self.MIGRATING, 255, ""
+
+        self.host.helper = dropped
+        self.host.sshd = lambda argv: SSH_REFUSED
+        message = self.up()
+        self.assertIn(
+            "box is shut off, not Running, while yo waited for its initrd to take "
+            "the disk passphrase",
+            message,
+        )
+        self.assertIn("`journalctl -k -g oom`", message)
+
+    def test_a_domain_paused_under_yo_names_the_way_to_resume_it(self):
+        self.host.helper = lambda: (["unlocked"], 0, "")
+        self.killed_on_the_next_probe("paused")
+        message = self.up()
+        self.assertIn("box is paused, not Running", message)
+        self.assertIn(
+            "resume it with `virsh -c qemu:///system resume yolobox-box`, then run "
+            "this command",
+            message,
+        )
+        self.assertNotIn("oom", message)
+
+    def test_a_domain_in_a_state_yo_has_no_word_for_says_where_to_look(self):
+        self.host.helper = lambda: (["unlocked"], 0, "")
+        self.killed_on_the_next_probe("crashed")
+        message = self.up()
+        self.assertIn("box is crashed, not Running", message)
+        self.assertIn(
+            "check why with `virsh -c qemu:///system domstate --reason yolobox-box`",
+            message,
+        )
+        self.assertNotIn("oom", message)
+
+    def test_a_domain_undefined_while_yo_waits_says_yo_up_defines_it_again(self):
+        self.host.helper = lambda: (["unlocked"], 0, "")
+
+        def undefined(argv):
+            del self.host.domains["yolobox-box"], self.host.states["yolobox-box"]
+            return SSH_REFUSED
+
+        self.host.sshd = undefined
+        message = self.up()
+        self.assertIn("box is not listed, not Running", message)
+        self.assertIn(
+            "domain yolobox-box no longer exists: yo -m box up defines it again",
+            message,
+        )
+        self.assertNotIn("domstate", message)
+
+    def test_a_domain_paused_during_a_connected_probe_is_named_not_the_ssh_timeout(
+        self,
+    ):
+        self.host.helper = lambda: (["unlocked"], 0, "")
+
+        def paused(argv):
+            self.host.states["yolobox-box"] = "paused"
+            return 255, "Timeout, server 127.0.0.1 not responding."
+
+        self.host.sshd = paused
+        message = self.up()
+        self.assertIn("box is paused, not Running", message)
+        self.assertIn(
+            "resume it with `virsh -c qemu:///system resume yolobox-box`", message
+        )
+        self.assertNotIn("as the operator failed", message)
+
+    def test_an_ssh_failure_of_no_known_shape_after_the_unlock_is_surfaced(self):
+        self.host.helper = lambda: (["unlocked"], 0, "")
+        self.host.sshd = lambda argv: (255, "Bad configuration option: lizard")
+        message = self.up()
+        self.assertIn("ssh to box as the operator failed", message)
+        self.assertIn("lizard", message)
+
+    def test_a_login_whose_command_fails_after_the_unlock_is_surfaced(self):
+        self.host.helper = lambda: (["unlocked"], 0, "")
+        self.host.sshd = lambda argv: (1, "/run/current-system/sw/bin/true: lizard")
+        message = self.up()
+        self.assertIn("ssh to box as the operator failed", message)
+        self.assertIn("true: lizard", message)
+
+    def test_virsh_speaks_the_c_locale_whatever_the_users_locale(self):
+        with mock.patch.dict(
+            os.environ, {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}
+        ):
+            self.driver.vm_status()
+        envs = self.host.virsh_envs
+        self.assertTrue(envs)
+        for env in envs:
+            self.assertEqual(env["LC_ALL"], "C")
+            self.assertEqual(env["LANG"], "de_DE.UTF-8")
+
+    def test_a_domain_that_stays_up_is_waited_for_as_before(self):
+        self.host.helper = lambda: (["unlocked"], 0, "")
+        # Nothing listening yet, then the key refused while the operator's key
+        # is being written: both are a boot in progress, retried.
+        key_refused = (255, "operator@127.0.0.1: Permission denied (publickey).")
+        answers = iter([SSH_REFUSED, key_refused, (0, "")])
+        self.host.sshd = lambda argv: next(answers)
+        with mock.patch.object(self.box.unlock.time, "sleep") as sleep:
+            self.driver.start(b"secret", self.box.NO_SIZE)
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(self.box.OPERATOR_POLL_SECONDS)] * 2,
+        )
 
 
 class TestDiskVolume(LibvirtCase):

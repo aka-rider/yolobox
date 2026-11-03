@@ -15,6 +15,13 @@ from .ui import YoError
 # The ssh options of every probe of the initrd's sshd.
 SSH_CONNECT_TIMEOUT_SECONDS = 5
 SSH_ALIVE_INTERVAL_SECONDS = 15
+# Every connection to the box's two names in ssh.config (yo's roles, the
+# master, nixos-rebuild, editors through lima-NAME; herdr through its alias
+# NAME): a guest that stops answering (paused, frozen) ends the connection
+# after interval times count, 2 minutes, and a busy guest has that long to
+# answer one keepalive. Neither lima's block nor libvirt_ssh_config sets them.
+STAGE2_CONNECT_TIMEOUT_SECONDS = 30
+STAGE2_ALIVE_COUNT_MAX = 8
 
 AGENT_SSH_CONFIG_MARKER = (
     "# yolobox: re-applied by yo; lima rewrites this file on every start"
@@ -102,6 +109,19 @@ def host_key_pin_block() -> str:
     )
 
 
+def connection_bounds_block() -> str:
+    # Above the driver's Host block and the herdr alias, so these win for both
+    # names: ssh keeps the first value.
+    return "\n".join(
+        [
+            "Match host %s,%s" % (state.box.vm_host, state.box.herdr_alias),
+            "  ConnectTimeout %d" % STAGE2_CONNECT_TIMEOUT_SECONDS,
+            "  ServerAliveInterval %d" % SSH_ALIVE_INTERVAL_SECONDS,
+            "  ServerAliveCountMax %d" % STAGE2_ALIVE_COUNT_MAX,
+        ]
+    )
+
+
 def ensure_agent_ssh_config() -> None:
     state.require_control_path_fits()
     path = state.ssh_cfg()
@@ -111,7 +131,12 @@ def ensure_agent_ssh_config() -> None:
 
     rest = lima_part_of(current)
 
-    owned = [AGENT_SSH_CONFIG_MARKER, state.box.editor_ssh_block, host_key_pin_block()]
+    owned = [
+        AGENT_SSH_CONFIG_MARKER,
+        state.box.editor_ssh_block,
+        host_key_pin_block(),
+        connection_bounds_block(),
+    ]
     lima_values = parse_lima_ssh_block(rest, state.box.vm_host)
     if lima_values is None:
         ui.err(

@@ -27,6 +27,15 @@ def as_instance(name):
         yo.set_box(yo.box.driver, yo.DEFAULT_INSTANCE)
 
 
+class TestALostInstance(unittest.TestCase):
+    def test_a_deleted_named_instance_is_created_with_limactl_not_yo_up(self):
+        with as_instance(INSTANCE_B):
+            hint = yo.LIMA.vm_lost_hint(None)
+            self.assertIn("instance second no longer exists — create it with:", hint)
+            self.assertIn("limactl create --name second", hint)
+            self.assertNotIn(".log", hint)
+
+
 class TestNamesFollowTheMachine(unittest.TestCase):
     def test_the_default_machine_is_the_box_itself(self):
         self.assertEqual(yo.box.name, "yolobox")

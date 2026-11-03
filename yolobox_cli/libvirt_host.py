@@ -8,6 +8,7 @@ Only libvirt.py imports this module.
 
 from __future__ import annotations
 
+import os
 import pwd
 import re
 import shutil
@@ -100,8 +101,27 @@ def host_setup_hint() -> str:
     return "run: sudo bash %s" % (SCRIPT_DIR / "linux" / "host-setup.sh")
 
 
+def virsh_env() -> Dict[str, str]:
+    # virsh translates what it prints (`domstate` says "laufend" under de_DE),
+    # and yo parses it, so every virsh runs in the C locale.
+    return dict(os.environ, LC_ALL="C")
+
+
 def virsh(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
-    return proc.run(["virsh", "-c", LIBVIRT_URI, *args], check=check, **kwargs)
+    return proc.run(
+        ["virsh", "-c", LIBVIRT_URI, *args], check=check, env=virsh_env(), **kwargs
+    )
+
+
+def spawn_virsh(*args: str) -> subprocess.Popen:
+    """A virsh that outlives the call (`virsh event`), text on both pipes."""
+    return proc.spawn(
+        ["virsh", "-c", LIBVIRT_URI, *args],
+        env=virsh_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def parse_version(text: str) -> Tuple[int, ...]:

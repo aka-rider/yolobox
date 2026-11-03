@@ -587,8 +587,30 @@ class LimaDriver:
     def list_command(self) -> str:
         return "limactl list"
 
+    def shown_instance_file(self, name: str) -> str:
+        """A file of the instance directory, spelled from ~ for a printed hint."""
+        return "~/%s/%s/%s" % (self.instances_dir, state.box.name, name)
+
     def boot_log(self) -> str:
-        return "~/%s/%s/serialv.log" % (self.instances_dir, state.box.name)
+        return self.shown_instance_file("serialv.log")
+
+    def vm_lost_hint(self, status: Optional[str]) -> str:
+        if status is None:
+            return "instance %s no longer exists — %s" % (
+                state.box.name,
+                "%s creates it again" % state.yo_cmd("up")
+                if state.box.name == DEFAULT_INSTANCE
+                else "create it with: %s" % self.create_command(NO_SIZE),
+            )
+        return (
+            "%s shows its state, lima's hostagent log says why: %s, and the guest's "
+            "console shows how far it got: %s; then run this command again"
+            % (
+                self.list_command(),
+                self.shown_instance_file("ha.stderr.log"),
+                self.boot_log(),
+            )
+        )
 
     def show_status(self) -> None:
         proc.run(["limactl", "list", state.box.name], capture=False)
@@ -597,7 +619,7 @@ class LimaDriver:
         kib = du_kib(os.path.join(state.instance_dir(), "disk"))
         if kib is None:
             return None
-        return "~/%s/%s/disk" % (self.instances_dir, state.box.name), kib
+        return self.shown_instance_file("disk"), kib
 
     def disk_ceiling_gib(self) -> int:
         probe = proc.run(["limactl", "list", state.box.name, "--format", "{{.Disk}}"])

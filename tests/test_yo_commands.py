@@ -3026,6 +3026,33 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
         self.assertIn("not reachable as the operator", caught.exception.message)
         self.assertTrue(box.starts[0].terminated)
 
+    def test_a_vm_that_dies_after_its_unlock_is_an_error_not_a_wait(self):
+        box = FakeBox(
+            self,
+            statuses=["Stopped", "Broken"],
+            operator=[NOT_LISTENING],
+            helpers=[UNLOCKED],
+        )
+        with self.assertRaises(yo.YoError) as caught:
+            box.up()
+        message = caught.exception.message
+        self.assertIn(
+            "yolobox is Broken, not Running, while yo waited for its sshd to accept "
+            "the operator",
+            message,
+        )
+        self.assertIn("~/.lima/yolobox/ha.stderr.log", message)
+        self.assertEqual(box.sleeps, [])
+
+    def test_an_instance_deleted_while_yo_waits_names_no_log_of_it(self):
+        error = yo.vm_lost_error(None, "its sshd to accept the operator")
+        self.assertIn("yolobox is not listed, not Running", error.message)
+        self.assertIn(
+            "instance yolobox no longer exists — yo up creates it again",
+            error.message,
+        )
+        self.assertNotIn(".log", error.message)
+
 
 class TestUnlockSurvivesADroppedSession(unittest.TestCase):
     # The migration streamed for longer than lima's 10 minutes, so limactl start
