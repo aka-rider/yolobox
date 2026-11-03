@@ -11,7 +11,7 @@
 # The rules also apply on `switch`, with no reboot: systemd-tmpfiles-resetup
 # is the switch-time twin of the boot-only setup unit and re-runs every rule,
 # force-replacing "L+" links. nix/harnesses.nix relies on that to hold
-# ~/.local/bin/claude, opencode and pi at the box's own paths across the one
+# ~/.local/bin/claude and pi at the box's own paths across the one
 # window the launcher path unit cannot see on its own, an install made while
 # no user manager of the agent's was running.
 { home, user, group ? "users", dirs, links }:

@@ -47,6 +47,17 @@
         let h = builtins.getEnv "YOLOBOX_HOST_OS";
         in if h == "darwin" || h == "linux" then h
         else throw "YOLOBOX_HOST_OS is \"${h}\" — set it to darwin (Lima on a Mac) or linux (libvirt on a Linux PC) and build with --impure (yo does this for you)";
+      # The box's hostname, and with it the tailnet node name, is the one
+      # input that is optional: unset or empty means "yolobox", so CI, a bare
+      # `nix flake check` and every box built before this variable existed
+      # evaluate unchanged. `yo` sets it per machine (-m NAME gives
+      # yolobox-NAME). A set value must be one RFC 1123 label, lowercase,
+      # because it reaches the kernel, DHCP and tailscale.
+      hostname =
+        let n = builtins.getEnv "YOLOBOX_HOSTNAME";
+        in if n == "" then "yolobox"
+        else if builtins.match "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?" n != null then n
+        else throw "YOLOBOX_HOSTNAME is \"${n}\" — it must be one DNS label: lowercase letters, digits and '-', 1 to 63 characters, not starting or ending with '-' (leave it unset for \"yolobox\")";
       guestSystem =
         let s = builtins.currentSystem;
         in if builtins.elem s linuxSystems then s
@@ -71,13 +82,13 @@
           }
         ));
 
-      # builtins.seq forces hostOs here (guestSystem is forced by `system`),
-      # so evaluating the box fails at once when it is unset or unsupported,
-      # instead of only when some module happens to read it.
-      nixosConfigurations.yolobox = builtins.seq hostOs (nixpkgs.lib.nixosSystem {
+      # builtins.seq forces hostOs and hostname here (guestSystem is forced by
+      # `system`), so evaluating the box fails at once when one is unset or
+      # invalid, instead of only when some module happens to read it.
+      nixosConfigurations.yolobox = builtins.seq hostOs (builtins.seq hostname (nixpkgs.lib.nixosSystem {
         system = guestSystem;
         specialArgs = {
-          inherit username agentUser version hostOs;
+          inherit username agentUser version hostOs hostname;
         };
         modules = [
           # nixpkgs' pin can lag herdr, and a saved SSH machine needs the
@@ -107,6 +118,6 @@
           ./nix/egress.nix
           ./nix/hardening.nix
         ];
-      });
+      }));
     };
 }

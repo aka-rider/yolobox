@@ -2,7 +2,6 @@
 let
   cfg = config.yolobox.harness;
 
-  claudeHooksFile = import ./lib/claude-hooks-file.nix;
   homeDir = config.users.users.${agentUser}.home;
   homeTmpfiles = import ./lib/home-tmpfiles.nix;
   nixLdEnv = import ./lib/nix-ld-env.nix;
@@ -18,15 +17,11 @@ let
 
   # Claude Code >= 2.1.207 documents that a custom ~/.local/bin/claude is left
   # alone: `claude update` and the background updater only drop new binaries
-  # into ~/.local/share/claude/versions/. That guarantee is the whole delivery
-  # channel for claude's settings file (nix/display.nix), which reaches
-  # claude as `--settings <file>` and nowhere else (see nix/display.nix for
-  # why the enterprise settings tier can't carry it). The box therefore OWNS
-  # that path with a launcher of its own rather than putting a wrapper on the
-  # system PATH and racing it: the agent's shell rc files may prepend $HOME/.local/bin,
-  # so any wrapper behind it loses in every interactive shell, silently.
-  #
-  # --settings sits before "$@" so a user's own later --settings still wins.
+  # into ~/.local/share/claude/versions/. The box therefore OWNS that path with
+  # a launcher of its own rather than putting a wrapper on the system PATH and
+  # racing it: the agent's shell rc files may prepend $HOME/.local/bin, so any
+  # wrapper behind it loses in every interactive shell, silently. The launcher
+  # exists to export HERDR_AGENT (see below).
   #
   # No runtimeInputs: that would prepend store paths to PATH, and this script
   # execs claude, whose children (the project's own tools) must keep the PATH
@@ -61,42 +56,11 @@ let
         exit 127
       fi
 
-      # The playwright plugin's stdio server inherits this process's
-      # environment and reads PLAYWRIGHT_MCP_OUTPUT_DIR once at start, so the
-      # launcher is the only place left that can make it per project. The
-      # project comes from the logical cwd, not git's physical toplevel: a
-      # symlinked project directory is mirrored by its logical path, so
-      # show-toplevel would resolve the symlink away. The root is the nearest logical ancestor that resolves to git's physical one,
-      # yo's logical_toplevel(): counting --show-cdup's `../` up the logical
-      # path climbs elsewhere when a symlink sits below the root.
-      top="$PWD"
-      physical_top="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
-      if [ -n "$physical_top" ]; then
-        d="$PWD"
-        while [ -n "$d" ] && [ "$(cd "$d" 2>/dev/null && pwd -P)" != "$physical_top" ]; do
-          d="''${d%/*}"
-        done
-        top="''${d:-$physical_top}"
-      fi
-      default_output_dir="$HOME/artifacts"
-      output_dir="''${PLAYWRIGHT_MCP_OUTPUT_DIR:-$default_output_dir}"
-      case "$top" in
-        "$HOME"/*)
-          project="''${top#"$HOME/"}"
-          project="''${project//\//--}"
-          if [ "$output_dir" = "$default_output_dir" ]; then
-            output_dir="$default_output_dir/$project"
-          fi
-          ;;
-      esac
-      export PLAYWRIGHT_MCP_OUTPUT_DIR="$output_dir"
-      ${pkgs.coreutils}/bin/mkdir -p "$output_dir"
-
       # herdr's classification keys off the foreground process name, but the
       # exec'd binary here is named after its version directory (e.g.
       # "2.1.268"), not "claude" - so herdr never recognises it without help.
       export HERDR_AGENT=claude
-      exec "$versions/$newest" --settings ${claudeHooksFile.path} "$@"
+      exec "$versions/$newest" "$@"
     '';
   };
 
@@ -186,13 +150,6 @@ let
         # Unconditional: the guarantee upstream documents covers updates, not
         # the initial `claude install` the installer script runs.
         ${lib.getExe claudeLauncherKeeper}
-
-        probe_has claude-plugins-official claude plugin marketplace list \
-          || claude plugin marketplace add anthropics/claude-plugins-official
-        for plugin in context7 playwright; do
-          probe_has "$plugin@claude-plugins-official" claude plugin list \
-            || claude plugin install "$plugin@claude-plugins-official" --scope user
-        done
       }
 
       # No tty under systemd, so pi's installer takes its defaults and never
@@ -207,63 +164,18 @@ let
         link_bin pi "$HOME/.pi/agent/bin/pi"
       }
 
-      # Scripts ON: agent-browser's postinstall IS the download of
-      # its prebuilt binary. That download fails silently, so the version call
-      # below is the hard check rather than a courtesy. Pinned to the version
-      # pi-agent-browser-native 0.9.6 recommends; it accepts 0.35.0 and newer,
-      # and refuses browser-backed calls below that floor, at call time, not here.
-      install_agent_browser() {
-        agent-browser --version >/dev/null 2>&1 || npm install -g agent-browser@0.38.1
-        agent-browser --version
-      }
-
-      install_pi_packages() {
-        for package in @upstash/context7-pi pi-agent-browser-native; do
-          probe_has "$package" pi list || pi install "npm:$package"
-        done
+      # The integration writes into pi's extensions directory, so it needs pi
+      # installed first. Its status probe, not a file test, decides whether it
+      # is current: see nix/harnesses.md#herdrs-pi-integration.
+      install_herdr_pi() {
         probe_has '^pi: current' herdr integration status || herdr integration install pi
-      }
-
-      # pi-agent-browser-native ships a `pi-agent-browser-config` helper, but
-      # its own README states that `pi install npm:...` does not put it on
-      # PATH and names writing this file as the equivalent route. The shape is
-      # the helper's own: {version:1, browser:{executablePath}}. Merged with
-      # jq rather than overwritten, because the same file also holds the
-      # extension's webSearch settings. A file that is not a JSON object is an
-      # error, never something to overwrite: it may hold those settings.
-      configure_agent_browser() {
-        local browser_config_dir="$HOME/.pi/config/pi-agent-browser-native"
-        local browser_config="$browser_config_dir/config.json"
-        mkdir -p "$browser_config_dir"
-        [ -e "$browser_config" ] || echo '{}' > "$browser_config"
-        jq -e 'type == "object"' "$browser_config" >/dev/null \
-          || { echo "yolobox-harness-install: $browser_config is not a JSON object; fix or remove it" >&2; return 1; }
-        if ! jq -e --arg path "${lib.getExe pkgs.chromium}" \
-          '.version == 1 and .browser.executablePath == $path' \
-          "$browser_config" >/dev/null; then
-          jq --arg path "${lib.getExe pkgs.chromium}" \
-            '.version = 1 | .browser.executablePath = $path' \
-            "$browser_config" > "$browser_config.tmp"
-          mv -f "$browser_config.tmp" "$browser_config"
-        fi
-      }
-
-      # --no-modify-path: no installer may edit the agent's rc files. The
-      # opencode installer has no install-dir override, hence the fixed link.
-      install_opencode() {
-        [ -x "$HOME/.opencode/bin/opencode" ] \
-          || curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
-        link_bin opencode "$HOME/.opencode/bin/opencode"
       }
 
       phase claude install_claude
       phase pi install_pi
-      phase agent-browser install_agent_browser
-      phase pi-packages install_pi_packages
-      phase pi-agent-browser-config configure_agent_browser
-      phase opencode install_opencode
+      phase herdr-pi install_herdr_pi
 
-      for tool in claude pi opencode agent-browser node; do
+      for tool in claude pi node; do
         phase "$tool --version" "$tool" --version
       done
 
@@ -334,7 +246,6 @@ in
       dirs = [ ".local" ".local/bin" ];
       links = [
         { path = ".local/bin/claude"; argument = launcherPath; }
-        { path = ".local/bin/opencode"; argument = "${homeDir}/.opencode/bin/opencode"; }
         { path = ".local/bin/pi"; argument = "${homeDir}/.pi/agent/bin/pi"; }
       ];
     };
@@ -415,15 +326,14 @@ in
     # mid-download must keep being retried by Restart past systemd's default
     # burst limit.
     systemd.user.services.yolobox-harness-install = {
-      description = "Install claude, pi, opencode and their plugins from their vendors";
+      description = "Install claude and pi from their vendors";
       unitConfig = {
         ConditionUser = agentUser;
         StartLimitIntervalSec = 0;
       };
       after = [ "yolobox-claude-launcher.path" ];
       # "${homeDir}/.local" first so `claude` here is the launcher, and so pi
-      # (through the box's ~/.local/bin/pi link) and the npm-installed
-      # agent-browser resolve as soon as they land.
+      # (through the box's ~/.local/bin/pi link) resolves as soon as it lands.
       path = [
         "${homeDir}/.local"
         pkgs.bash
@@ -437,13 +347,12 @@ in
         pkgs.findutils
         pkgs.gawk
         pkgs.gnugrep
-        pkgs.jq
         herdrPkg
       ];
       # NIX_LD/NIX_LD_LIBRARY_PATH are spelled out rather than inherited: this
       # unit must not depend on PAM having reached the user manager with a
-      # login environment. The vendor-downloaded binaries (claude, pi,
-      # opencode) are dynamically linked glibc programs and need them at
+      # login environment. The vendor-downloaded binaries (claude, pi) are
+      # dynamically linked glibc programs and need them at
       # install time, where the version checks run them.
       environment = {
         NPM_CONFIG_PREFIX = "${homeDir}/.local";

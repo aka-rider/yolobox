@@ -28,7 +28,7 @@ jobs:
         run: ./yo --help
 
       - name: Shellcheck the guest helper
-        run: shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh tests/box-libvirt-check.sh
+        run: shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh tests/box-libvirt-check.sh
 
   # 3.9 is the floor yo promises; the newest 3.x catches the other direction.
   # The 3.9 leg is pinned to ubuntu-24.04 because setup-python has no 3.9 build
@@ -120,7 +120,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes nftables
-          for rules in egressRules egressRecoveryRules; do
+          for rules in egressRules egressRecoveryRules egressLastResortRules; do
             file="$(nix eval --impure --raw ".#nixosConfigurations.yolobox.config.system.build.$rules")"
             sudo nft --check --file "$file"
           done
@@ -135,10 +135,12 @@ jobs:
         run: |
           rules="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRules)"
           recovery="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressRecoveryRules)"
+          lastresort="$(nix eval --impure --raw .#nixosConfigurations.yolobox.config.system.build.egressLastResortRules)"
           tunnel="$(tests/render-tunnel-egress.sh)"
-          python3 tests/egress_rules.py "$rules" "$recovery" "$tunnel"
+          python3 tests/egress_rules.py "$rules" "$recovery" "$lastresort" "$tunnel"
           diff -u tests/fixtures/egress.nft "$rules"
           diff -u tests/fixtures/egress-recovery.nft "$recovery"
+          diff -u tests/fixtures/egress-lastresort.nft "$lastresort"
           diff -u tests/fixtures/egress-tunnel.nft "$tunnel"
 
       # lanAllow goes into the rule files as text, so a bad entry must fail the

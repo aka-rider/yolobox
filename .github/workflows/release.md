@@ -16,7 +16,7 @@ The workflow fires on the `released` event only, not `published`, so a prereleas
 
 ### Immutable releases
 
-Immutable releases must stay off, a deliberate cost recorded in [TODO.md](../../TODO.md). `release` re-uploads the tarball with `--clobber` and force-moves the tag, and an immutable release refuses both.
+Immutable releases must stay off. This is a deliberate cost, not an open problem: the tag is the pin every box builds from, and the release process owns moving it. `release` re-uploads the tarball with `--clobber` and force-moves the tag, and an immutable release refuses both.
 
 ## bump-tap and actions/checkout
 
@@ -49,7 +49,7 @@ Workflow permissions are `contents: read` at the top and `contents: write` only 
 
 `verify.yml` is the one workflow that `ci.yml` and `release.yml` share, and `release` declares `needs: verify`, so whatever it checks gates a tag move. It has three jobs:
 
-- `lint` runs `ruff check`, `ruff format --check`, the `yo --help` smoke test, and shellcheck at warning severity on `nix/guest/yolobox-guest.sh`.
+- `lint` runs `ruff check`, `ruff format --check`, the `yo --help` smoke test, and shellcheck at warning severity on the repo's eleven shell scripts, listed once in `verify.yml` (the guest helper, the initrd and egress scripts, `linux/host-setup.sh` and the scripts under `tests/`; `CLAUDE.md` carries the same command).
 - `unit` runs the unit tests on Python 3.9 and the newest 3.x. 3.9 is the floor `yo` promises, because the Mac's Xcode Python is that. The newest catches the other direction. The 3.9 leg runs on `ubuntu-24.04`, because setup-python has no 3.9 for `ubuntu-latest`'s 26.04 image; [TODO.md](../../TODO.md) says what replaces the pin.
 - `eval` runs `YOLOBOX_USERNAME=ci YOLOBOX_HOST_OS=linux nix eval --impure --raw --option allow-import-from-derivation false .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath` on `cachix/install-nix-action@v31`, then the same with `YOLOBOX_HOST_OS=darwin` and `--system aarch64-linux`, the Mac box's guest.
 

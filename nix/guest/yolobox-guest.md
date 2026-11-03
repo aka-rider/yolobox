@@ -36,6 +36,16 @@ Recognise that shape: `yo enter <fuzzy>` dies with a find `Permission denied` an
 
 The walk is `-mindepth 1` and prunes every top-level dotdir explicitly, rather than leaning on a maxdepth to keep it out of reach. An unreadable directory now warns, through `yo` printing find's own stderr, and the walk continues with the partial list. Only an empty list still refuses, with "no projects in the VM".
 
+## ensure-repo
+
+`ensure-repo <dir> [branch]` makes the VM side of `yo link` a repo with `receive.denyCurrentBranch = updateInstead`. Two checks decide whether it has to run `git init`, and each one was a silent failure.
+
+The branch is the caller's, `main` only when none is given. A push of `master` into a repo whose HEAD sits on an unborn `main` is accepted, HEAD stays on `main`, and the worktree stays empty with no error to see. Recognise it by `git -C <dir> symbolic-ref HEAD` naming a branch that `git branch` does not list.
+
+`yo link` always passes the Mac repo's current branch. The directory counts as a repo only when `git rev-parse --show-toplevel` equals its own `pwd -P`. `--git-dir` walks up the tree, so a directory inside another repo passed the check, got no repo of its own, and the push landed in (or failed against) the outer one. The `pwd -P` side makes a path reached through a symlink compare equal to the toplevel git prints, which is always physical.
+
+The `receive.denyCurrentBranch = updateInstead` setting is written on every run, so a repo that already existed on the VM side (made by hand, or by an earlier tool) accepts the first push instead of refusing it with `refusing to update checked out branch`. A repo with no commit yet also gets its HEAD pointed at the caller's branch, because an earlier `yo link` could leave an empty repo on `main` for a `master` push. A repo with a commit keeps whatever branch it is on.
+
 ## BUILD_DIRS and LOCAL_CACHES
 
 `BUILD_DIRS` (`node_modules`, `target`, `.next`) is the single place build-output directory names are spelled, inside the script. The project walk prunes them, because a repo living inside `node_modules` is not a project a person would pick. The Go-cache walk shares the same list. One list serves the project walk and the cache walk, so they cannot drift apart.

@@ -7,7 +7,7 @@ from test_yo import FakeHome, yo
 class TestAgentPaths(unittest.TestCase):
     def test_splits_on_nul_and_drops_empty_entries(self):
         proc = mock.Mock(returncode=0, stdout=b"/a/b\0/c/d\0\0", stderr="")
-        with mock.patch.object(yo, "ssh_run", return_value=proc) as fake_ssh_run:
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc) as fake_ssh_run:
             result = yo.agent_paths("projects")
         self.assertEqual(result, ["/a/b", "/c/d"])
         fake_ssh_run.assert_called_once_with(
@@ -16,7 +16,7 @@ class TestAgentPaths(unittest.TestCase):
 
     def test_a_newline_inside_one_entry_stays_in_that_entry(self):
         proc = mock.Mock(returncode=0, stdout=b"a/b\nwith-newline\0c/d\0", stderr="")
-        with mock.patch.object(yo, "ssh_run", return_value=proc):
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
             result = yo.agent_paths("projects")
         self.assertEqual(result, ["a/b\nwith-newline", "c/d"])
 
@@ -24,10 +24,11 @@ class TestAgentPaths(unittest.TestCase):
 class TestAgentPathsWalkFailures(unittest.TestCase):
     def test_an_unreachable_vm_is_an_error_not_a_find_failure(self):
         proc = mock.Mock(returncode=255, stdout=b"", stderr="ssh: connect refused\n")
-        with mock.patch.object(yo, "ssh_run", return_value=proc):
-            with self.assertRaises(yo.YoError) as caught:
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
+            with self.assertRaisesRegex(
+                yo.Unreachable, "cannot reach yolobox as agent — is it up\\? yo status"
+            ) as caught:
                 yo.agent_paths("projects", check=False)
-        self.assertIn("cannot reach the VM", caught.exception.message)
         self.assertNotIn("find exit", caught.exception.message)
 
     def test_the_helpers_stderr_is_shown_with_a_partial_listing(self):
@@ -36,8 +37,8 @@ class TestAgentPathsWalkFailures(unittest.TestCase):
             stdout=b"/a\0",
             stderr="find: '/x': Permission denied\n",
         )
-        with mock.patch.object(yo, "ssh_run", return_value=proc):
-            with mock.patch.object(yo, "err") as fake_err:
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
+            with mock.patch.object(yo.ui, "err") as fake_err:
                 result = yo.agent_paths("projects", check=False)
         self.assertEqual(result, ["/a"])
         shown = [call.args[0] for call in fake_err.call_args_list]
@@ -48,9 +49,9 @@ class TestPickProject(FakeHome):
     def pick_with_fzf_exit(self, code):
         projects = [yo.AGENT_HOME + "/a/normal"]
         with (
-            mock.patch.object(yo, "require_tool"),
-            mock.patch.object(yo, "agent_paths", return_value=projects),
-            mock.patch.object(yo, "err") as fake_err,
+            mock.patch.object(yo.proc, "require_tool"),
+            mock.patch.object(yo.guest, "agent_paths", return_value=projects),
+            mock.patch.object(yo.ui, "err") as fake_err,
             mock.patch.object(
                 yo.subprocess,
                 "run",
@@ -82,8 +83,10 @@ class TestPickProject(FakeHome):
         proc = mock.Mock(
             returncode=0, stdout=(yo.AGENT_HOME + "/a/normal\0").encode(), stderr=""
         )
-        with mock.patch.object(yo, "require_tool"):
-            with mock.patch.object(yo, "ssh_run", return_value=proc) as fake_ssh_run:
+        with mock.patch.object(yo.proc, "require_tool"):
+            with mock.patch.object(
+                yo.sshx, "ssh_run", return_value=proc
+            ) as fake_ssh_run:
                 with mock.patch.object(
                     yo.subprocess,
                     "run",
@@ -106,9 +109,9 @@ class TestPickProject(FakeHome):
             picker_calls.append(argv)
             return mock.Mock(returncode=0, stdout=b"a/normal\0")
 
-        with mock.patch.object(yo, "require_tool"):
-            with mock.patch.object(yo, "ssh_run", return_value=proc):
-                with mock.patch.object(yo, "err") as fake_err:
+        with mock.patch.object(yo.proc, "require_tool"):
+            with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
+                with mock.patch.object(yo.ui, "err") as fake_err:
                     with mock.patch.object(
                         yo.subprocess, "run", side_effect=fake_picker_run
                     ):
@@ -131,10 +134,10 @@ class TestPickProject(FakeHome):
             chosen = entries[1]
             return mock.Mock(returncode=0, stdout=(chosen + "\0").encode())
 
-        with mock.patch.object(yo, "require_tool"):
-            with mock.patch.object(yo, "agent_paths", return_value=projects):
+        with mock.patch.object(yo.proc, "require_tool"):
+            with mock.patch.object(yo.guest, "agent_paths", return_value=projects):
                 with mock.patch.object(
-                    yo, "guest_path", side_effect=lambda p: p
+                    yo.paths, "guest_path", side_effect=lambda p: p
                 ) as fake_guest_path:
                     with mock.patch.object(
                         yo.subprocess, "run", side_effect=fake_picker_run

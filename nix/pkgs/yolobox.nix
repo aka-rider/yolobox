@@ -13,6 +13,23 @@
 , xorriso
 }:
 
+let
+  # A host ships only its own driver and the files that driver reads: macOS
+  # runs Lima, Linux runs libvirt behind the host table. cli.driver_for imports
+  # the driver module of the host, so the other one is never loaded.
+  darwinFiles = ''
+    rm "$out/libexec/yolobox/yolobox_cli/libvirt.py"
+    rm "$out/libexec/yolobox/yolobox_cli/libvirt_host.py"
+    install -Dm644 lima/yolobox.yaml "$out/libexec/yolobox/lima/yolobox.yaml"
+  '';
+  linuxFiles = ''
+    rm "$out/libexec/yolobox/yolobox_cli/lima.py"
+    install -Dm644 libvirt/domain.xml "$out/libexec/yolobox/libvirt/domain.xml"
+    install -Dm644 linux/yolobox-host.nft "$out/libexec/yolobox/linux/yolobox-host.nft"
+    install -Dm644 linux/yolobox-host.service "$out/libexec/yolobox/linux/yolobox-host.service"
+    install -Dm644 linux/host-setup.sh "$out/libexec/yolobox/linux/host-setup.sh"
+  '';
+in
 stdenvNoCC.mkDerivation {
   pname = "yolobox";
   inherit version src;
@@ -27,13 +44,9 @@ stdenvNoCC.mkDerivation {
 
     install -Dm755 yo "$out/libexec/yolobox/yo"
     install -Dm755 aws-broker "$out/libexec/yolobox/aws-broker"
-    install -Dm644 lima/yolobox.yaml "$out/libexec/yolobox/lima/yolobox.yaml"
-    install -Dm644 libvirt/domain.xml "$out/libexec/yolobox/libvirt/domain.xml"
-    install -Dm644 linux/yolobox-host.nft "$out/libexec/yolobox/linux/yolobox-host.nft"
-    install -Dm644 linux/yolobox-host.service "$out/libexec/yolobox/linux/yolobox-host.service"
-    install -Dm644 linux/host-setup.sh "$out/libexec/yolobox/linux/host-setup.sh"
-
-    substituteInPlace "$out/libexec/yolobox/yo" \
+    cp -r yolobox_cli "$out/libexec/yolobox/yolobox_cli"
+    ${if stdenvNoCC.hostPlatform.isDarwin then darwinFiles else linuxFiles}
+    substituteInPlace "$out/libexec/yolobox/yolobox_cli/config.py" \
       --replace-fail 'YO_VERSION = "dev"' 'YO_VERSION = "${version}"'
 
     patchShebangs "$out/libexec/yolobox/yo" "$out/libexec/yolobox/aws-broker"

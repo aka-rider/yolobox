@@ -34,6 +34,9 @@
 #                   the known residual in docs/linux-host.md, so it does not
 #                   change the exit status.
 set -Eeuo pipefail
+# Without this a command substitution runs with errexit off, so `peers=$(f)`
+# would carry on past a failing step inside f.
+shopt -s inherit_errexit
 
 readonly URI=qemu:///system
 # dumpxml prints the metadata element with double quotes and the rest of the
@@ -224,7 +227,9 @@ running_peers() {
         fi
         xml=$(virsh_system dumpxml "${other}") || fail "virsh dumpxml ${other} failed"
         if grep -Eq "xmlns:yolobox=['\"]${YOLOBOX_NS}['\"]" <<<"${xml}"; then
-            port=$(ssh_port_of "${xml}")
+            # `|| return 1` as well: the substitution here sits in a list that
+            # errexit ignores, so inherit_errexit alone would not stop it.
+            port=$(ssh_port_of "${xml}") || return 1
             echo "${other} ${port}"
         fi
     done <<<"${names}"

@@ -10,7 +10,13 @@
 #   exit 4  no passphrase on stdin
 #   exit 5  the disk opened but the root filesystem did not mount, or mounted
 #           only on this helper's retry after the initrd had reached emergency mode
+#   exit 6  anything else failed unexpectedly; stderr names the command. Bash
+#           would otherwise exit with that command's own code (sed 4, mkfifo 1),
+#           which collides with the codes above and reads as a wrong key.
 shopt -s nullglob
+# -E carries the ERR trap into functions, where most commands run.
+set -E
+trap 'echo "yolobox-unlock: unexpected failure (exit $?) at line ${LINENO}: ${BASH_COMMAND}" >&2; exit 6' ERR
 
 # The unit that opens the disk; nix/luks/apps.nix sets it from the mapper name
 # in nix/luks/facts.nix, so no default here can drift from it.
@@ -47,8 +53,12 @@ answer_pending() {
       continue
     fi
     case "$answered" in *$'\n'"$f"$'\n'*) continue ;; esac
-    socket=$(sed -n 's/^Socket=//p' "$f")
-    id=$(sed -n 's/^Id=//p' "$f")
+    # systemd removes an ask file the moment it is answered or withdrawn, so it
+    # can vanish between the glob and these reads; the next event rescans.
+    if ! socket=$(sed -n 's/^Socket=//p' "$f") || ! id=$(sed -n 's/^Id=//p' "$f"); then
+      echo "yolobox-unlock: ${f} could not be read, skipped" >&2
+      continue
+    fi
     if [ -z "$socket" ]; then
       echo "yolobox-unlock: ${f} names no socket, skipped" >&2
       continue
@@ -100,6 +110,21 @@ check_units() {
   fi
   return 0
 }
+
+# A cryptsetup unit that failed on an earlier attempt (wrong key, then `yo up`
+# again) is still failed, and the loop below would read that as this attempt's
+# verdict. Reset it and start it again once; --no-block because the start only
+# completes after the ask below is answered. A failed migration is left alone:
+# it is the cause, check_units reports it, and restarting the unit would re-run it.
+retry_failed_unlock() {
+  echo "yolobox-unlock: ${UNTIL_UNIT} failed on an earlier attempt, starting it again"
+  systemctl reset-failed "$UNTIL_UNIT"
+  systemctl restart --no-block "$UNTIL_UNIT"
+}
+
+if ! systemctl is-failed --quiet "$MIGRATE_UNIT" && systemctl is-failed --quiet "$UNTIL_UNIT"; then
+  retry_failed_unlock
+fi
 
 # Two plain background writers into a FIFO, never a pipeline: a pipeline's `$!`
 # is its last member, and a surviving first member would keep the ssh session's

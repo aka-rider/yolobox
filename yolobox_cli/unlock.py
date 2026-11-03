@@ -1,0 +1,330 @@
+"""Unlocking the encrypted root through the initrd's sshd and waiting for the operator's sshd."""
+
+from __future__ import annotations
+
+import enum
+import io
+import shlex
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from typing import List, Optional
+
+from . import proc, release, sshconfig, state, ui
+from .config import LUKS_DEVICE, LUKS_KEY_ITEM, SSH_UNREACHABLE
+from .ui import YoError
+
+
+# yolobox-unlock's exit codes; nix/luks/yolobox-unlock.sh documents the same
+# table in its header and tests/test_consistency.py compares the two.
+HELPER_EXIT_WRONG_KEY = 1
+HELPER_EXIT_MIGRATION_FAILED = 2
+HELPER_EXIT_WATCH_LOST = 3
+HELPER_EXIT_NO_PASSPHRASE = 4
+HELPER_EXIT_ROOT_MOUNT_FAILED = 5
+HELPER_EXIT_INTERNAL = 6
+
+# The script in the initrd that answers the disk's password asks (nix/luks).
+INITRD_UNLOCK_HELPER = "yolobox-unlock"
+# The password-ask id nix/luks/yolobox-luks-migrate.sh posts; seeing it means a
+# migration ran in this boot.
+MIGRATE_ASK_ID = "yolobox:luks-migrate"
+INITRD_WAIT_SECONDS = 600
+OPERATOR_WAIT_SECONDS = 600
+# Polls of a machine outside yo, not orderings between yo's own events: nothing
+# on the Mac can wait on a remote TCP port coming up.
+INITRD_POLL_SECONDS = 2
+OPERATOR_POLL_SECONDS = 3
+
+# What `limactl list` reports before the guest is running: not listed yet,
+# Installing, Starting, and Stopped, which an instance still says in the moments
+# after `limactl start` is spawned and before its hostagent exists.
+LIMA_PRE_BOOT_STATUSES = ("", "Installing", "Starting", "Stopped")
+
+NOT_LISTENING_MARKERS = (
+    "Connection refused",
+    "Connection reset",
+    "kex_exchange_identification",
+    "Connection closed",
+    "closed by remote host",
+    "Broken pipe",
+    "Connection timed out",
+    "Operation timed out",
+)
+
+
+class SshOutcome(enum.Enum):
+    """What one ssh attempt at the initrd's or stage 2's sshd came to."""
+
+    ANSWERED = "answered"  # the command ran and exited 0
+    RAN = "ran"  # the command ran and exited non-zero
+    REFUSED = "refused"  # sshd answered and refused the key
+    NOT_LISTENING = "not-listening"  # no sshd behind the port (yet)
+    ERROR = "error"  # ssh failed in a way yo has no name for
+
+
+def classify_initrd_attempt(returncode: int, stderr: str) -> SshOutcome:
+    if returncode != SSH_UNREACHABLE:
+        return SshOutcome.RAN
+    if "Permission denied" in stderr:
+        return SshOutcome.REFUSED
+    if any(marker in stderr for marker in NOT_LISTENING_MARKERS):
+        return SshOutcome.NOT_LISTENING
+    return SshOutcome.ERROR
+
+
+def sshd_answers(user: str) -> SshOutcome:
+    completed = proc.run(sshconfig.initrd_ssh_argv("true", user=user), stdin=b"")
+    if completed.returncode == 0:
+        return SshOutcome.ANSWERED
+    return classify_initrd_attempt(completed.returncode, completed.stderr)
+
+
+def stage2_up() -> bool:
+    return sshd_answers(release.host_user()) is SshOutcome.ANSWERED
+
+
+class BootStage(enum.Enum):
+    """Which sshd, if any, answers on the box's port."""
+
+    STAGE2 = "stage2"  # the disk is unlocked and the operator can log in
+    INITRD = "initrd"  # locked: waiting in the initrd for the passphrase
+    NONE = "none"  # nothing answers
+
+
+def boot_stage() -> BootStage:
+    # The one place that tells the two sshds apart. Ask for stage 2 first: a
+    # caller must never run a pinned ssh against the initrd, whose per-boot host
+    # key differs from the pin and makes ssh print REMOTE HOST IDENTIFICATION
+    # HAS CHANGED. Both probes go through initrd_ssh_argv(), which pins nothing.
+    if stage2_up():
+        return BootStage.STAGE2
+    if sshd_answers("root") is SshOutcome.ANSWERED:
+        return BootStage.INITRD
+    return BootStage.NONE
+
+
+@dataclass(frozen=True)
+class HelperRun:
+    """One run of the initrd's yolobox-unlock over ssh."""
+
+    returncode: int
+    stderr: str
+    migrated: bool
+    streamed: bool  # the helper's stdout reached the terminal before the session ended
+
+
+def run_initrd_helper(passphrase: bytes) -> HelperRun:
+    stderr_lines: List[str] = []
+
+    def collect(source: io.BufferedReader) -> None:
+        for raw in iter(source.readline, b""):
+            stderr_lines.append(raw.decode("utf-8", "replace").rstrip("\n"))
+
+    migrated = False
+    streamed = False
+    state.driver().verify_initrd_listener(sshconfig.initrd_endpoint().port)
+    helper = proc.spawn(
+        sshconfig.initrd_ssh_argv(INITRD_UNLOCK_HELPER),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    with helper as child:
+        collector = threading.Thread(target=collect, args=(child.stderr,))
+        collector.start()
+        try:
+            child.stdin.write(passphrase + b"\n")
+            child.stdin.close()
+        except BrokenPipeError:
+            pass  # ssh already ended; its exit code and stderr, returned below, say why
+        for raw in iter(child.stdout.readline, b""):
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            streamed = True
+            migrated = migrated or "id=%s" % MIGRATE_ASK_ID in line
+            ui.out(line)
+        collector.join()
+        returncode = child.wait()
+    return HelperRun(returncode, "\n".join(stderr_lines), migrated, streamed)
+
+
+class Verdict(enum.Enum):
+    """What unlock_disk does after one helper run.
+
+    UNLOCKED: the helper finished its job. FAILED: a failure retrying cannot
+    fix. DROPPED: the session ran and then ended (switch-root, or a migration
+    that outlived the connection). REFUSED: sshd refused the key, and stage 2's
+    sshd may be about to accept it. NOT_LISTENING: nothing to talk to yet.
+    """
+
+    UNLOCKED = "unlocked"
+    FAILED = "failed"
+    DROPPED = "dropped"
+    REFUSED = "refused"
+    NOT_LISTENING = "not-listening"
+
+
+def judge_helper_run(attempt: HelperRun) -> Verdict:
+    outcome = classify_initrd_attempt(attempt.returncode, attempt.stderr)
+    if outcome is SshOutcome.RAN:
+        return Verdict.UNLOCKED if attempt.returncode == 0 else Verdict.FAILED
+    if attempt.streamed:
+        return Verdict.DROPPED
+    if outcome is SshOutcome.ERROR:
+        return Verdict.FAILED
+    if outcome is SshOutcome.REFUSED:
+        return Verdict.REFUSED
+    return Verdict.NOT_LISTENING
+
+
+def initrd_root_ssh_command(remote_command: str) -> str:
+    """The command yo itself would run, for a printed remedy to paste."""
+    return shlex.join(sshconfig.initrd_ssh_argv(remote_command))
+
+
+def helper_failure_message(attempt: HelperRun) -> str:
+    code, stderr = attempt.returncode, attempt.stderr
+    if code == SSH_UNREACHABLE:
+        return stderr or "ssh to 127.0.0.1:%d failed with exit %d and no message" % (
+            state.driver().ssh_port(),
+            code,
+        )
+    if code == HELPER_EXIT_MIGRATION_FAILED:
+        return (
+            "encrypting the disk failed in the initrd; the box is still in its initrd "
+            "with the plaintext intact. Inspect it as root: %s\n%s"
+            % (initrd_root_ssh_command("journalctl -u yolobox-luks-migrate"), stderr)
+        )
+    if code == HELPER_EXIT_ROOT_MOUNT_FAILED:
+        return (
+            "the disk unlocked but the initrd could not mount it as /sysroot "
+            "(sysroot.mount failed); the box waits in its initrd emergency mode. "
+            "Inspect it as root: %s\n%s"
+            % (initrd_root_ssh_command("journalctl -b"), stderr)
+        )
+    if code == HELPER_EXIT_WRONG_KEY:
+        return (
+            "the %s key in 1Password does not open %s — a different key encrypted "
+            "this disk, and there is no recovery slot" % (LUKS_KEY_ITEM, LUKS_DEVICE)
+        )
+    if code == HELPER_EXIT_WATCH_LOST:
+        return "the initrd helper lost its watch:\n%s" % stderr
+    if code == HELPER_EXIT_NO_PASSPHRASE:
+        return "no passphrase reached the initrd helper"
+    if code == HELPER_EXIT_INTERNAL:
+        return (
+            "the initrd helper failed unexpectedly; the line below names the command "
+            "that failed:\n%s" % stderr
+        )
+    return "the initrd helper failed with exit %d: %s" % (code, stderr)
+
+
+def deadline_after(
+    deadline: Optional[float], status: str, lima_is_starting: bool, now: float
+) -> Optional[float]:
+    """The unlock budget after seeing lima's status: it starts when lima says Running."""
+    if status == "Running":
+        return deadline or now + INITRD_WAIT_SECONDS
+    if lima_is_starting and status in LIMA_PRE_BOOT_STATUSES:
+        # Lima is still creating, downloading or booting.
+        return None
+    raise YoError(
+        "%s is %s, not Running — %s"
+        % (state.box.name, status or "not listed", state.driver().list_command())
+    )
+
+
+def initrd_timeout_error(key_was_refused: bool) -> YoError:
+    if key_was_refused:
+        return YoError(
+            "the sshd on 127.0.0.1:%d refused %s's key for root and for %s — if %s "
+            "is in its initrd, reading the key from cidata failed; see "
+            "docs/disk-encryption.md#recognising-failures"
+            % (
+                state.driver().ssh_port(),
+                state.driver().name,
+                release.host_user(),
+                state.box.name,
+            )
+        )
+    return YoError(
+        "%s never offered its initrd sshd on 127.0.0.1:%d within %d s of %s "
+        "reporting it Running — %s, %s"
+        % (
+            state.box.name,
+            state.driver().ssh_port(),
+            INITRD_WAIT_SECONDS,
+            state.driver().name,
+            state.driver().list_command(),
+            state.driver().boot_log(),
+        )
+    )
+
+
+def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -> bool:
+    """Answer the initrd's passphrase ask; True when this boot migrated the disk."""
+    migrated_any = False
+    session_ran = False
+    deadline: Optional[float] = None
+    refused_since: Optional[float] = None
+    ui.err(
+        "yo: waiting for %s's initrd to ask for its disk passphrase" % state.box.name
+    )
+    while True:
+        attempt = run_initrd_helper(passphrase)
+        migrated_any = migrated_any or attempt.migrated
+        verdict = judge_helper_run(attempt)
+        if verdict in (Verdict.UNLOCKED, Verdict.DROPPED):
+            for line in attempt.stderr.splitlines():
+                ui.err(line)
+        if verdict is Verdict.UNLOCKED:
+            return migrated_any
+        if verdict is Verdict.FAILED:
+            raise YoError(helper_failure_message(attempt))
+        if verdict is Verdict.DROPPED:
+            # Switch-root, or a migration that outlived the connection. A fresh
+            # budget, since the old one may have expired while the session streamed.
+            session_ran = True
+            deadline = time.monotonic() + INITRD_WAIT_SECONDS
+        if verdict in (Verdict.DROPPED, Verdict.REFUSED) and stage2_up():
+            return migrated_any
+        if verdict is Verdict.REFUSED:
+            # A fresh instance's first plain boot writes the operator's key
+            # moments after its sshd starts, so a refusal is retried.
+            refused_since = refused_since or time.monotonic()
+
+        starter_alive = starter is not None and starter.poll() is None
+        if starter is not None and not starter_alive and not session_ran:
+            if starter.returncode != 0:
+                raise YoError(
+                    "%s exited %d before %s offered its initrd sshd"
+                    % (
+                        state.driver().start_command,
+                        starter.returncode,
+                        state.box.name,
+                    )
+                )
+            # Lima's own ssh worked, so this was a plain boot: stage 2 is up.
+            if stage2_up():
+                return migrated_any
+        deadline = deadline_after(
+            deadline,
+            state.driver().vm_status() or "",
+            starter_alive and not session_ran,
+            time.monotonic(),
+        )
+        if deadline is not None and time.monotonic() > deadline:
+            raise initrd_timeout_error(refused_since is not None)
+        time.sleep(INITRD_POLL_SECONDS)
+
+
+def wait_for_operator() -> None:
+    deadline = time.monotonic() + OPERATOR_WAIT_SECONDS
+    while not stage2_up():
+        if time.monotonic() > deadline:
+            raise YoError(
+                "the disk is unlocked but %s is not reachable as the operator — %s"
+                % (state.box.name, state.yo_cmd("status"))
+            )
+        time.sleep(OPERATOR_POLL_SECONDS)

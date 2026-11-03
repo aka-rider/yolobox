@@ -2,14 +2,15 @@
 {
   # Every port, UDP and IPv6 included, is open to the tailnet; the tailnet ACL
   # is the access control. base.nix opens only 22 on enp0s1, for lima's
-  # hostagent.
+  # hostagent, and openFirewall below stays false so that stays true.
   networking.firewall.trustedInterfaces = [ "tailscale0" ];
 
   services.tailscale = {
     enable = true;
     # nixos-unstable lags tailscale's releases; see nix/pkgs/tailscale.md.
     package = pkgs.callPackage ./pkgs/tailscale.nix { };
-    openFirewall = true;
+    # false: true would open UDP 41641 on enp0s1 as well (CONSTITUTION).
+    openFirewall = false;
     # TS_NO_LOGS_NO_SUPPORT=true: no log uploads to log.tailscale.com, and with
     # them no Tailscale support for this node.
     disableUpstreamLogging = true;

@@ -13,7 +13,7 @@
 # Steps, in order; the first failure stops the run and names its step:
 #   1. yo up
 #   2. tests/box-hardening-check.sh inside the guest
-#   3. yo status: exit 0, egress table in place, network ok
+#   3. yo status: exit 0 (it exits 1 on any warning), egress table in place, network ok
 #   4. yo cp round trip of a temp file
 #   5. yo down, yo up: the LUKS unlock and a boot with the new kernel
 #      parameters. 1Password may ask for Touch ID.
@@ -83,7 +83,11 @@ guest_check() {
 # Not `yo ... status | grep`: a failing grep must not hide yo's own exit code.
 check_status() {
     local out
-    out=$(yo -m "${inst}" status) || return 1
+    out=$(yo -m "${inst}" status) || {
+        printf '%s\n' "${out}"
+        echo "yo status exited non-zero: one of its lines above is a warning" >&2
+        return 1
+    }
     printf '%s\n' "${out}"
     printf '%s\n' "${out}" | grep -qx 'egress: host and LAN blocked' ||
         { echo "status has no 'egress: host and LAN blocked' line" >&2; return 1; }

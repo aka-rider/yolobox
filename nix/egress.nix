@@ -121,12 +121,13 @@ let
 
   # What the box runs in when ruleFile fails to load: no network the guest
   # starts, only DHCP and the replies that keep Lima's inbound ssh alive. It
-  # names nothing from the options, so no local.nix can break it.
+  # names nothing from the options, so no local.nix can break it. Its chain
+  # name tells `yo status` which tier is loaded; so does the last-resort one.
   recoveryFile = builtins.toFile "yolobox-egress-recovery.nft" ''
     table ${table}
     delete table ${table}
     table ${table} {
-      chain output {
+      chain output_recovery {
         type filter hook output priority ${hookPriority}; policy accept;
         oifname "lo" accept
         ct direction reply accept
@@ -137,6 +138,41 @@ let
       }
     }
   '';
+
+  # What the box runs in when even recoveryFile fails to load, which happens
+  # when nft or the kernel lacks one of the statements it shares with ruleFile
+  # (log, limit rate, ct direction, icmpx reject). The statements here are the
+  # oldest ones nft has, and the chain drops by policy, so the file has no
+  # reject to get wrong. `ct state established,related` rather than `ct
+  # direction reply` for the same reason: it also lets a flow the guest opened
+  # earlier keep sending (nix/egress.md). DHCP names no destination: the agent
+  # cannot bind port 68 (nix/hardening.nix), and a set is one more thing to
+  # fail. Without this tier a box whose nft loads nothing runs with no table
+  # at all.
+  lastResortFile = builtins.toFile "yolobox-egress-lastresort.nft" ''
+    table ${table}
+    delete table ${table}
+    table ${table} {
+      chain output_lastresort {
+        type filter hook output priority ${hookPriority}; policy drop;
+        oifname "lo" accept
+        ct state established,related accept
+        udp sport 68 udp dport 67 accept
+      }
+    }
+  '';
+
+  loadTiers = pkgs.writeShellApplication {
+    name = "yolobox-egress-load-tiers";
+    runtimeInputs = [ pkgs.nftables ];
+    text = builtins.readFile ./egress/yolobox-egress-load-tiers.sh;
+  };
+
+  reportFailure = pkgs.writeShellApplication {
+    name = "yolobox-egress-failed";
+    runtimeInputs = [ pkgs.nftables ];
+    text = builtins.readFile ./egress/yolobox-egress-failed.sh;
+  };
 in
 {
   options.yolobox.network.lanAllow = lib.mkOption {
@@ -179,6 +215,7 @@ in
 
     system.build.egressRules = ruleFile;
     system.build.egressRecoveryRules = recoveryFile;
+    system.build.egressLastResortRules = lastResortFile;
 
     # The recovery steps in egress.md run nft by name.
     environment.systemPackages = [ pkgs.nftables ];
@@ -186,8 +223,10 @@ in
     # A separate nft table, not networking.nftables: that option would switch
     # the firewall backend, and nixos-fw stays on iptables-nft. No ExecStop:
     # stopping the unit, or a switch that restarts it, must never open the
-    # box. ExecStartPre loads the recovery table first, so when ExecStart
-    # fails the unit is failed and the recovery table stays.
+    # box. ExecStartPre loads the recovery table first (the last-resort one if
+    # that fails), so when ExecStart fails the unit is failed and the fallback
+    # table stays. When no table loads at all the unit fails the same way, and
+    # OnFailure says so loudly.
     systemd.services.yolobox-egress = {
       description = "Reject guest traffic to the host and private networks";
       wantedBy = [ "sysinit.target" ];
@@ -196,10 +235,24 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        ExecStartPre = [ "${nft} --file ${recoveryFile}" ];
+        ExecStartPre = [ "${loadTiers}/bin/yolobox-egress-load-tiers ${recoveryFile} ${lastResortFile}" ];
         ExecStart = "${nft} --file ${ruleFile}";
       };
     };
+
+    # Not wantedBy anything: only a failure of yolobox-egress starts it. No
+    # default dependencies, so it also runs in early boot, before basic.target.
+    systemd.services.yolobox-egress-failed = {
+      description = "Report that the egress rules failed to load";
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${reportFailure}/bin/yolobox-egress-failed";
+        StandardOutput = "journal+console";
+        StandardError = "journal+console";
+      };
+    };
+    systemd.services.yolobox-egress.onFailure = [ "yolobox-egress-failed.service" ];
 
     # tailscaled refuses to start while the table is absent. Wants= starts the
     # egress unit in the same transaction and After= orders it first.

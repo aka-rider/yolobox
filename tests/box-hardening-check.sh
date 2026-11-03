@@ -55,7 +55,7 @@ trap 'echo "FAIL: unexpected error at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 # Run a command as the agent, the way an AI session sees it.
 #
 # `sudo -iu agent` is a login shell, so the command gets the agent's real
-# environment: PATH with ~/.local/bin (claude, opencode, pi) and
+# environment: PATH with ~/.local/bin (claude, pi) and
 # /run/wrappers/bin, the nix-ld variables a vendor glibc binary needs, DISPLAY,
 # DOCKER_HOST. A bare `sudo -u agent env PATH=...` would have to copy all of
 # that by hand and drift. XDG_RUNTIME_DIR is the one thing the login shell does
@@ -90,7 +90,8 @@ check_sysctls() {
     local pair name want got
     # The sysctls nix/hardening.nix sets, plus kexec_load_disabled (from
     # security.protectKernelImage) and ptrace_scope, which must stay 0 (a
-    # CONSTITUTION rule).
+    # CONSTITUTION rule). The port floor is nix/hardening.nix's mkForce
+    # statement: nixos-lima's 0 would let the agent bind port 22.
     for pair in \
         kernel.kptr_restrict=2 \
         kernel.unprivileged_bpf_disabled=1 \
@@ -113,7 +114,8 @@ check_sysctls() {
         net.ipv6.conf.all.accept_redirects=0 \
         net.ipv6.conf.default.accept_redirects=0 \
         net.ipv6.conf.all.accept_source_route=0 \
-        net.ipv6.conf.default.accept_source_route=0; do
+        net.ipv6.conf.default.accept_source_route=0 \
+        net.ipv4.ip_unprivileged_port_start=1024; do
         name=${pair%%=*}
         want=${pair#*=}
         got=$(sudo -n sysctl -n "${name}") || fail "sysctl ${name} is unreadable"
@@ -423,7 +425,7 @@ await_harness_install() {
 check_vendors() {
     local tool
     await_harness_install
-    for tool in claude opencode pi; do
+    for tool in claude pi; do
         as_agent "${tool}" --version >/dev/null || fail "${tool} --version failed as the agent"
         ok "${tool} --version"
     done

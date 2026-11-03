@@ -1,4 +1,4 @@
-{ config, pkgs, modulesPath, username, agentUser, lib, version, hostOs, ... }:
+{ config, pkgs, modulesPath, username, agentUser, lib, version, hostOs, hostname, ... }:
 let
   agentEnv = import ./lib/agent-env.nix {
     agentHome = config.users.users.${agentUser}.home;
@@ -129,7 +129,7 @@ in
     serviceConfig.OOMScoreAdjust = -500;
   };
 
-  networking.hostName = "yolobox";
+  networking.hostName = hostname;
   # nixos-lima turns NAT on, and nixpkgs' nat module turns IPv4 forwarding on
   # with it. Nothing here routes for others: rootless podman uses pasta and
   # tailscale is only a client. Forwarding would let the host side route
@@ -297,9 +297,9 @@ in
   security.sudo.execWheelOnly = true;
   programs.zsh.enable = true;
 
-  # .NET binaries, such as pi-lens's downloaded marksman, abort without ICU
-  # ("Couldn't find a valid ICU package"), and a language server that
-  # aborts on start crash-loops into a pile of coredumps.
+  # .NET binaries, such as the marksman a pi LSP extension the user installs
+  # downloads, abort without ICU ("Couldn't find a valid ICU package"), and a
+  # language server that aborts on start crash-loops into a pile of coredumps.
   programs.nix-ld.enable = true;
   programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl icu ];
 

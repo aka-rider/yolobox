@@ -47,6 +47,18 @@ fs_block_count() {
   dumpe2fs -h "$1" 2>/dev/null | awk -F: '/^Block count/ {gsub(/ /, "", $2); print $2}'
 }
 
+# A number read from a tool's output, checked before it is used in arithmetic:
+# bash reads an empty or non-numeric string as 0, and 0 here would move the
+# discard offset to the start of the device.
+require_positive_int() {
+  case "$2" in
+    '' | *[!0-9]* | 0*)
+      echo "yolobox: ${1} is '${2}', not a positive integer; nothing was discarded on ${device}" >&2
+      return 1
+      ;;
+  esac
+}
+
 # e2fsck exits 1 when it fixed something and 2 when a reboot is advised; both
 # leave a consistent filesystem. Anything else does not.
 fsck_ok() {
@@ -135,8 +147,12 @@ finalize() {
   (
     set -euo pipefail
     offset_sectors=$(cryptsetup status "$scratch" | awk '/offset:/ {print $2}')
+    require_positive_int offset_sectors "$offset_sectors"
     mapper_bs=$(fs_block_size "/dev/mapper/${scratch}")
-    fs_bytes=$(($(fs_block_count "/dev/mapper/${scratch}") * mapper_bs))
+    require_positive_int "filesystem block size" "$mapper_bs"
+    fs_blocks=$(fs_block_count "/dev/mapper/${scratch}")
+    require_positive_int "filesystem block count" "$fs_blocks"
+    fs_bytes=$((fs_blocks * mapper_bs))
     plaintext_tail=$((offset_sectors * sector_bytes + fs_bytes))
     total=$(blockdev --getsize64 "$device")
     # The never-shrunk tail and reencrypt's temporary copy still hold plaintext.

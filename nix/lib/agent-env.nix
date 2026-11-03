@@ -11,10 +11,13 @@
 { agentHome }:
 {
   env = {
+    # The virtual display (nix/display.nix). The agent's own environment only,
+    # so the operator's shells carry no DISPLAY.
+    DISPLAY = ":0";
     SSH_AUTH_SOCK = "/run/yolobox/op-agent.sock";
     AWS_CONFIG_FILE = "${agentHome}/.config/yolobox/aws-config";
-    # pi emits OSC 52 only with SSH_* set or no DISPLAY; herdr panes have
-    # neither, so opt in (PI_CLIPBOARD_OSC52, pi >= 1.2.0), so no
+    # pi emits OSC 52 only with SSH_* set or no DISPLAY; herdr panes have no
+    # SSH_* and do have a DISPLAY, so opt in (PI_CLIPBOARD_OSC52, pi >= 1.2.0), so no
     # xclip/xsel OSC 52 shim is needed.
     PI_CLIPBOARD_OSC52 = "1";
   };

@@ -1,8 +1,4 @@
 {
   command = "basedpyright-langserver";
   args = [ "--stdio" ];
-  extensionToLanguage = {
-    ".py" = "python";
-    ".pyi" = "python";
-  };
 }

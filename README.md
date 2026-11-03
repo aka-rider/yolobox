@@ -169,13 +169,13 @@ Zed's own language servers don't run on NixOS. Add them explicitly to the projec
 
 Fork it and change whatever you like.
 
-To add tools you use every day, like `helix` or `neovim`, put them in `/etc/yolobox/local.nix` inside the VM and rebuild:
+To add tools you use every day, like `neovim` or `emacs`, put them in `/etc/yolobox/local.nix` inside the VM and rebuild:
 
 ```bash
 sudo YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=darwin nixos-rebuild switch --impure --flake 'github:aka-rider/yolobox/v<version>#yolobox'
 ```
 
-`YOLOBOX_HOST_OS` names the OS that runs the VM: `darwin` for a Mac, `linux` for a Linux PC.
+`YOLOBOX_HOST_OS` names the OS that runs the VM: `darwin` for a Mac, `linux` for a Linux PC. For a machine made with `yo -m NAME`, add `YOLOBOX_HOSTNAME=yolobox-NAME` too (lowercase), or the rebuild renames the box back to `yolobox`; leave it out for the default machine.
 
 Lima reads `lima/yolobox.yaml` only once, when it creates the VM, so editing that file later changes nothing. To give an existing VM more memory or CPUs:
 
@@ -185,9 +185,7 @@ limactl stop yolobox && limactl edit yolobox --memory 16 --cpus 8 --start
 
 ## Browser and screen
 
-The VM has a virtual screen, so agents can drive a real browser and take screenshots. Claude does it with the Playwright plugin, and pi with `agent-browser`. Both use the VM's Chromium.
-
-Screenshots, PDFs and videos go to `~/artifacts/`, not into the project, so they don't end up in git. `yolobox-screen-record start` and `stop` record the screen to the same place.
+The VM has a virtual screen (`DISPLAY=:0`) and the VM's Chromium, so agents can drive a real browser. `yolobox-screen-record start` and `stop` record the screen into `~/artifacts/`, not into the project, so the recordings don't end up in git.
 
 ## Credits
 

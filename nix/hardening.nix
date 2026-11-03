@@ -82,6 +82,11 @@ in
       "net.ipv6.conf.default.accept_source_route" = 0;
     };
 
+    # nixos-lima sets this to 0, so the agent could bind sshd's port 22 whenever
+    # sshd is not holding it. Kept outside the block above because mkForce is
+    # not an integer literal; tests/test_consistency.py reads both spellings.
+    boot.kernel.sysctl."net.ipv4.ip_unprivileged_port_start" = lib.mkForce 1024;
+
     # kexec off and nohibernate; slab_nomerge and page_alloc.shuffle harden
     # the heap; debugfs=off removes a kernel-internals surface.
     security.protectKernelImage = true;

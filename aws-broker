@@ -4,7 +4,7 @@ import http.server
 import json
 import os
 import re
-import select
+import signal
 import socket
 import socketserver
 import stat
@@ -14,33 +14,57 @@ import threading
 import time
 import traceback
 from datetime import datetime, timezone
+from http import HTTPStatus
+from typing import NamedTuple
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from yolobox_cli.common import (  # noqa: E402
+    PROFILE_NAME_PATTERN,
+    PROFILE_NAME_RE,
+    pid_alive,
+    pid_exit_watch,
+    sanitize,
+)
 
-# The one spelling of a valid profile name on the broker side. `yo` carries the
-# same literal as AWS_PROFILE_NAME_RE (a test asserts the two agree). A name
-# must start with an alphanumeric, so it can never read as an option.
-PROFILE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
-PROFILE_NAME_RE = re.compile(PROFILE_NAME_PATTERN)
-
-# At most this many requests are served at once; the next one is told 503
-# immediately instead of queueing a thread behind a stuck mint.
+# At most this many /creds/ requests are served at once; the next one is told
+# 503 immediately instead of queueing a thread behind a stuck mint. /health
+# takes no slot, so it is never busy.
 MAX_CONCURRENT_REQUESTS = 32
-REQUEST_TIMEOUT_SECONDS = 10
+EXIT_OK = 0
+# Without a working watch nothing would ever end this broker, so it ends itself
+# and says so in its exit status.
+EXIT_WATCH_FAILED = 1
+# `aws configure export-credentials` gets this long before it is killed; an SSO
+# login prompt or a hung credential_process must not park a profile's lock.
+MINT_TIMEOUT_SECONDS = 30
+# One wall-clock budget per connection, from accept to close: reading the
+# request, waiting for the profile lock, and a mint (MINT_TIMEOUT_SECONDS at
+# most). A client that trickles bytes cannot stretch it, as it could a
+# per-recv timeout.
+REQUEST_DEADLINE_SECONDS = 60
+# How long a request waits for a profile's lock before it is told 503. Under
+# the deadline minus a mint, so a waiter that gets the lock can still mint.
+PROFILE_LOCK_TIMEOUT_SECONDS = 15
+# Cached credentials with less than this left are minted again: a guest that
+# gets them has time to use them before they lapse.
+REMINT_WINDOW_SECONDS = 600
+# Default for --min-remint-interval: a failing mint (an expired SSO login) is
+# retried at most this often, not on every request.
+DEFAULT_MIN_REMINT_INTERVAL_SECONDS = 5.0
+# A live broker answers a connect at once; a probe that hangs is not one.
+SOCKET_PROBE_TIMEOUT_SECONDS = 1.0
+# The "Version" field of botocore's credential_process JSON.
+CREDENTIAL_PROCESS_VERSION = 1
+# The one Expiration shape served: with a zone, because botocore rejects
+# a timestamp without one.
+EXPIRATION_SERVED_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# The listen backlog, above MAX_CONCURRENT_REQUESTS so a burst waits in the
+# kernel instead of being refused.
 REQUEST_QUEUE_SIZE = 64
-# http.server's own cap on a request line.
-MAX_REQUEST_LINE = 65536
 # A guest-chosen request path is cut to this many characters in broker.log, so
 # a loop of long requests cannot grow the log by 64 KB a line.
 LOGGED_PATH_MAX = 256
-
-
-# Request paths come from the guest, so they can carry terminal escape
-# sequences; `yo` tells the user to read this log. Every line goes through here.
-CONTROL_BYTES_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-
-
-def sanitize(text):
-    return CONTROL_BYTES_RE.sub("?", text)
 
 
 def clip(text):
@@ -64,22 +88,14 @@ def parse_args():
     p.add_argument("--socket", required=True, metavar="PATH")
     p.add_argument("--watch-pid", type=int, required=True)
     p.add_argument("--allow", nargs="+", required=True, metavar="PROFILE")
-    p.add_argument("--min-remint-interval", type=float, default=5.0)
+    p.add_argument(
+        "--min-remint-interval", type=float, default=DEFAULT_MIN_REMINT_INTERVAL_SECONDS
+    )
     args = p.parse_args()
     for name in args.allow:
         if not PROFILE_NAME_RE.fullmatch(name):
             fail(f"invalid profile name {name!r}: must match {PROFILE_NAME_PATTERN}")
     return args
-
-
-def pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def reclaim_socket_path(path):
@@ -93,7 +109,7 @@ def reclaim_socket_path(path):
         fail(f"{path} exists and is not a socket; refusing to remove it")
 
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    probe.settimeout(1.0)
+    probe.settimeout(SOCKET_PROBE_TIMEOUT_SECONDS)
     try:
         probe.connect(path)
     except ConnectionRefusedError:
@@ -118,48 +134,48 @@ def reclaim_socket_path(path):
 def unlink_if_same_identity(path, identity):
     try:
         st = os.lstat(path)
-    except OSError:
+    except OSError as e:
+        log(f"cannot stat {path} at shutdown, leaving it: {e}")
         return
-    if (st.st_dev, st.st_ino) == identity:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    if (st.st_dev, st.st_ino) != identity:
+        log(f"{path} is not the socket this broker bound; leaving it")
+        return
+    try:
+        os.unlink(path)
+    except OSError as e:
+        log(f"cannot remove {path} at shutdown: {e}")
 
 
 def register_pid_watch_event(pid):
     """Watch a pid for exit, without waiting for it yet.
 
-    Returns a function that blocks until the process has exited: a kqueue on
-    macOS, a pidfd on Linux (os.pidfd_open, Python 3.9 and a 5.3 kernel).
+    Returns a function that blocks until the process has exited.
     """
     try:
-        if hasattr(select, "kqueue"):
-            kq = select.kqueue()
-            event = select.kevent(
-                pid,
-                filter=select.KQ_FILTER_PROC,
-                flags=select.KQ_EV_ADD,
-                fflags=select.KQ_NOTE_EXIT,
-            )
-            kq.control([event], 0)
-            return lambda: kq.control([], 1)
-        pidfd = os.pidfd_open(pid)
-        return lambda: select.select([pidfd], [], [])
+        return pid_exit_watch(pid).wait
     except ProcessLookupError:
         fail(f"watched pid {pid} is not running")
     except OSError as e:
         fail(f"registration of a watch on pid {pid} failed: {e}")
 
 
+def exit_cleanly(why, socket_path, identity, status):
+    log(f"{why}; shutting down")
+    unlink_if_same_identity(socket_path, identity)
+    os._exit(status)
+
+
 def wait_for_pid_exit(pid, socket_path, identity, wait_for_exit):
     try:
         wait_for_exit()
-    except OSError:
-        pass
-    log(f"watched pid {pid} exited; shutting down")
-    unlink_if_same_identity(socket_path, identity)
-    os._exit(0)
+    except OSError as failure:
+        exit_cleanly(
+            f"waiting for pid {pid} failed: {failure}",
+            socket_path,
+            identity,
+            EXIT_WATCH_FAILED,
+        )
+    exit_cleanly(f"watched pid {pid} exited", socket_path, identity, EXIT_OK)
 
 
 EXPIRATION_RE = re.compile(
@@ -207,10 +223,16 @@ def export_credentials(profile):
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            # The CLI may prompt (an SSO login, a device code). Stdin is
+            # the launcher's, so it must never be read.
+            stdin=subprocess.DEVNULL,
+            timeout=MINT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        return None, "'aws configure export-credentials' timed out after 30s"
+        return (
+            None,
+            f"'aws configure export-credentials' timed out after {MINT_TIMEOUT_SECONDS}s",
+        )
     except FileNotFoundError:
         return None, "'aws' is not on PATH"
 
@@ -248,7 +270,7 @@ def export_credentials(profile):
                 f"export-credentials field {field} is missing or not a non-empty string",
             )
     try:
-        parse_expiration(data["Expiration"])
+        expiration = parse_expiration(data["Expiration"])
     except ValueError as e:
         return None, f"export-credentials field Expiration is unusable: {e}"
 
@@ -256,8 +278,16 @@ def export_credentials(profile):
         "AccessKeyId": data["AccessKeyId"],
         "SecretAccessKey": data["SecretAccessKey"],
         "SessionToken": data["SessionToken"],
-        "Expiration": data["Expiration"],
+        # Always one shape with a zone: the guest's botocore rejects a
+        # zone-less timestamp, and the parser above accepts those.
+        "Expiration": expiration.astimezone(timezone.utc).strftime(
+            EXPIRATION_SERVED_FORMAT
+        ),
     }, None
+
+
+class ProfileBusy(Exception):
+    """Another request has held the profile's lock past PROFILE_LOCK_TIMEOUT_SECONDS."""
 
 
 class State:
@@ -283,13 +313,18 @@ class State:
 
     # Returns fresh-enough creds, or None when nothing usable is left.
     # Re-mints synchronously (holding the lock) when the cache is within
-    # 10 minutes of expiry, throttled to at most one attempt per
+    # REMINT_WINDOW_SECONDS of expiry, throttled to at most one attempt per
     # min-remint-interval — a mint failure while the cache is still
     # genuinely unexpired keeps serving the stale cache rather than 500ing.
+    # Raises ProfileBusy when the lock stays taken, so one hung mint cannot
+    # park every slot behind it.
     def get(self):
-        with self.lock:
+        if not self.lock.acquire(timeout=PROFILE_LOCK_TIMEOUT_SECONDS):
+            raise ProfileBusy(self.profile)
+        try:
             needs_remint = (
-                self.creds is None or seconds_to_expiry(self.creds["Expiration"]) < 600
+                self.creds is None
+                or seconds_to_expiry(self.creds["Expiration"]) < REMINT_WINDOW_SECONDS
             )
             throttled = (
                 self.last_mint_attempt is not None
@@ -301,11 +336,17 @@ class State:
             if self.creds is None or seconds_to_expiry(self.creds["Expiration"]) <= 0:
                 return None
             return self.creds
+        finally:
+            self.lock.release()
 
 
 class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     request_queue_size = REQUEST_QUEUE_SIZE
+
+    # The base class prints the traceback to stderr as it is, past sanitize().
+    def handle_error(self, request, client_address):
+        log(f"request failed:\n{traceback.format_exc()}")
 
 
 # The 500 body the guest sees. Everything that could carry detail (aws
@@ -317,36 +358,73 @@ def mint_failed_body(profile):
     )
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    timeout = REQUEST_TIMEOUT_SECONDS
+BUSY_BODY = "broker busy; retry\n"
 
+CREDS_PATH_PREFIX = "/creds/"
+
+
+def creds_profile(path):
+    """The profile a /creds/<profile> path names; None for any other path."""
+    if not path.startswith(CREDS_PATH_PREFIX):
+        return None
+    return path[len(CREDS_PATH_PREFIX) :]
+
+
+class Reply(NamedTuple):
+    status: HTTPStatus
+    content_type: str
+    body: str
+
+
+def json_reply(status, payload):
+    return Reply(status, "application/json", json.dumps(payload))
+
+
+def text_reply(status, body):
+    return Reply(status, "text/plain", body)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
     def __init__(self, states, watch_pid, slots, *args, **kwargs):
         self.states = states
         self.watch_pid = watch_pid
         self.slots = slots
         super().__init__(*args, **kwargs)
 
-    # Bounded concurrency: every request holds one slot for its whole life,
-    # and a request that finds none is turned away at once with 503 rather
-    # than queued behind a mint that may take 30 s.
+    # Every connection lives under one wall-clock deadline: when it passes,
+    # the timer shuts the socket down, which fails whatever read or write the
+    # handler is blocked in. A trickling client therefore cannot hold a thread
+    # for longer. A timer that fires after the handler finished finds
+    # `finished` set and does nothing: the socket is the base class's to close.
     def handle(self):
-        if not self.slots.acquire(blocking=False):
-            log("too many concurrent requests; replying 503")
-            # The request is read before the answer: closing a socket the
-            # client is still writing to resets the connection, and the client
-            # would never see the 503.
-            try:
-                self.raw_requestline = self.rfile.readline(MAX_REQUEST_LINE + 1)
-            except OSError as failure:
-                log(f"503 not sent: reading the request failed: {failure}")
-                return
-            if self.parse_request():
-                self._send_text(503, "broker busy; retry\n")
-            return
+        self.out_of_time = threading.Event()
+        self.finished = False
+        self.finish_lock = threading.Lock()
+        deadline = threading.Timer(REQUEST_DEADLINE_SECONDS, self._deadline_passed)
+        deadline.daemon = True
+        deadline.start()
         try:
             super().handle()
+        except OSError:
+            # What the shutdown below breaks is expected and already logged;
+            # any other socket error is not.
+            if not self.out_of_time.is_set():
+                raise
         finally:
-            self.slots.release()
+            with self.finish_lock:
+                self.finished = True
+            deadline.cancel()
+
+    def _deadline_passed(self):
+        with self.finish_lock:
+            if self.finished:
+                return
+            self.out_of_time.set()
+            log("request deadline passed; closing the connection")
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError as failure:
+                log(f"closing the connection failed: {failure}")
 
     # AF_UNIX hands back '' as client_address (there is no peer host/port),
     # so the base class's address_string(), which indexes it as
@@ -360,28 +438,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"{self.address_string()} - {self.log_date_time_string()} - {clip(fmt % args)}"
         )
 
-    def _send_json(self, status, payload):
-        body = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+    def _send(self, reply):
+        body = reply.body.encode()
+        self.send_response(reply.status)
+        self.send_header("Content-Type", reply.content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_text(self, status, body):
-        encoded = body.encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+    def _route(self, profile):
+        """Return the Reply for GET self.path; may raise.
 
-    def _route(self):
-        """Return (status, kind, payload) for GET self.path; may raise."""
+        `profile` is what creds_profile made of the path, None off /creds/.
+        """
         if self.path == "/health":
-            return (
-                200,
-                "json",
+            return json_reply(
+                HTTPStatus.OK,
                 {
                     "pid": os.getpid(),
                     "watch_pid": self.watch_pid,
@@ -389,50 +461,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 },
             )
 
-        if self.path.startswith("/creds/"):
-            profile = self.path[len("/creds/") :]
+        if profile is None:
+            return text_reply(HTTPStatus.NOT_FOUND, "")
 
-            state = self.states.get(profile)
-            if state is None:
-                allowed = ", ".join(sorted(self.states)) or "(none)"
-                return (
-                    403,
-                    "text",
-                    f"profile '{profile}' is not allowlisted; allowed: {allowed}\n",
-                )
+        state = self.states.get(profile)
+        if state is None:
+            allowed = ", ".join(sorted(self.states)) or "(none)"
+            return text_reply(
+                HTTPStatus.FORBIDDEN,
+                f"profile '{profile}' is not allowlisted; allowed: {allowed}\n",
+            )
 
-            creds = state.get()
-            if creds is None:
-                log(
-                    f"{profile}: no credentials: {state.last_mint_error or 'none available'}"
-                )
-                return 500, "text", mint_failed_body(profile)
-
-            return 200, "json", {"Version": 1, **creds}
-
-        return 404, "text", ""
-
-    def do_GET(self):
         try:
-            status, kind, payload = self._route()
+            creds = state.get()
+        except ProfileBusy:
+            log(f"{profile}: another request holds the profile lock; replying 503")
+            return text_reply(HTTPStatus.SERVICE_UNAVAILABLE, BUSY_BODY)
+        if creds is None:
+            log(
+                f"{profile}: no credentials: {state.last_mint_error or 'none available'}"
+            )
+            return text_reply(
+                HTTPStatus.INTERNAL_SERVER_ERROR, mint_failed_body(profile)
+            )
+
+        return json_reply(
+            HTTPStatus.OK, {"Version": CREDENTIAL_PROCESS_VERSION, **creds}
+        )
+
+    # Bounded concurrency: a /creds/ request holds one slot for its whole life,
+    # and one that finds none is turned away at once with 503 rather than
+    # queued behind a mint that may take MINT_TIMEOUT_SECONDS. /health reads
+    # only memory and takes no slot, so yo can always ask who is serving.
+    def do_GET(self):
+        profile = creds_profile(self.path)
+        if profile is None:
+            self._send(self._reply_for(profile))
+        elif self.slots.acquire(blocking=False):
+            try:
+                reply = self._reply_for(profile)
+            finally:
+                self.slots.release()
+            self._send(reply)
+        else:
+            log("too many concurrent requests; replying 503")
+            self._send(text_reply(HTTPStatus.SERVICE_UNAVAILABLE, BUSY_BODY))
+
+    def _reply_for(self, profile):
+        try:
+            return self._route(profile)
         except Exception:
             # A bug or an unexpected shape must become a clean 500, never a
             # dropped connection. The traceback carries the exception's own
             # message, so no code on this path may put a credential in one.
             log(f"{clip(self.path)}: request failed:\n{traceback.format_exc()}")
-            profile = (
-                self.path[len("/creds/") :] if self.path.startswith("/creds/") else ""
-            )
-            status, kind = 500, "text"
-            payload = (
+            return text_reply(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
                 mint_failed_body(profile)
                 if profile
-                else "request failed; the detail is in broker.log\n"
+                else "request failed; the detail is in broker.log\n",
             )
-        if kind == "json":
-            self._send_json(status, payload)
-        else:
-            self._send_text(status, payload)
 
 
 def bind_server(socket_path, states, watch_pid, max_concurrent=MAX_CONCURRENT_REQUESTS):
@@ -472,9 +560,21 @@ def main():
         profile: State(profile, args.min_remint_interval) for profile in args.allow
     }
 
-    server, identity = bind_server(args.socket, states, args.watch_pid)
-
+    # Before the bind: a failure here must not leave a socket file behind.
     wait_for_exit = register_pid_watch_event(args.watch_pid)
+
+    # SIGTERM is how a replaced broker is stopped; the default action would
+    # skip the unlink that the end of serve_forever does. The handler needs
+    # the socket's identity, which exists only once the bind is done, so a
+    # SIGTERM that arrives in between is held back until the handler is in
+    # place instead of killing the broker with the socket file left behind.
+    before_bind_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    server, identity = bind_server(args.socket, states, args.watch_pid)
+    signal.signal(
+        signal.SIGTERM,
+        lambda signum, frame: exit_cleanly("SIGTERM", args.socket, identity, EXIT_OK),
+    )
+    signal.pthread_sigmask(signal.SIG_SETMASK, before_bind_mask)
 
     print("READY")
     sys.stdout.flush()

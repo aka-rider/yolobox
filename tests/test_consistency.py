@@ -5,20 +5,34 @@ brew formula) and compares it to what `yo` declares, so a change
 to one side alone fails here instead of on a user's box.
 """
 
+import ast
 import contextlib
 import io
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 import egress_rules
 from test_yo import yo
 
-REPO = Path(yo.__file__).parent
+REPO = yo.REPO
 YOLOBOX_YAML = REPO / "lima" / "yolobox.yaml"
 GUEST_SCRIPT = REPO / "nix" / "guest" / "yolobox-guest.sh"
+
+
+def package_texts():
+    """The source of every module of the yolobox_cli package, by file name."""
+    return {path.name: path.read_text() for path in sorted(yo.PKG_DIR.glob("*.py"))}
+
+
+def package_text():
+    return "\n".join(package_texts().values())
 
 
 def yaml_scalar(value):
@@ -241,6 +255,14 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
             self.text("nix", "base.nix"),
         )
 
+    def test_the_headroom_yo_warns_about_is_the_one_the_migration_needs(self):
+        script = self.text("nix", "luks", "yolobox-luks-migrate.sh")
+        (percent,) = re.findall(r"^headroom_percent=(\d+)$", script, re.M)
+        (header_mib,) = re.findall(r"^header_room_mib=(\d+)$", script, re.M)
+        self.assertEqual(yo.IN_PLACE_HEADROOM_PERCENT, int(percent))
+        # need = region + header_room, and the region already holds one.
+        self.assertEqual(yo.IN_PLACE_HEADER_ROOM_MIB, 2 * int(header_mib))
+
     def test_the_label_luks_nix_hands_the_migrate_script_is_the_documented_one(self):
         luks = self.text("nix", "luks.nix")
         (args,) = re.findall(r"exec \$\{lib\.getExe apps\.migrate\} (.*?)\";", luks)
@@ -270,7 +292,9 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
     def test_the_unlock_header_table_and_yo_agree_on_the_exit_codes(self):
         script = self.text("nix", "luks", "yolobox-unlock.sh")
         table = {int(n) for n in re.findall(r"^#   exit (\d+)  \S", script, re.M)}
-        used = {int(n) for n in re.findall(r"^\s*exit (\d+)$", script, re.M)}
+        used = {
+            int(n) for n in re.findall(r"(?:^\s*|; )exit (\d+)(?:'|$)", script, re.M)
+        }
         yo_codes = {
             0,
             yo.HELPER_EXIT_WRONG_KEY,
@@ -278,6 +302,7 @@ class TestLuksFilesMatchYoConstants(unittest.TestCase):
             yo.HELPER_EXIT_WATCH_LOST,
             yo.HELPER_EXIT_NO_PASSPHRASE,
             yo.HELPER_EXIT_ROOT_MOUNT_FAILED,
+            yo.HELPER_EXIT_INTERNAL,
         }
         self.assertEqual(table, yo_codes)
         self.assertEqual(used, table)
@@ -516,46 +541,271 @@ class TestGcHelpNamesEverythingItDeletes(unittest.TestCase):
         self.assertTrue(word_in("pip", "uv, pip, pip-tools"))
 
 
-class TestSiblingFilesAreInstalled(unittest.TestCase):
+PLATFORMS = ("darwin", "linux")
+# Files a host ships only when it runs the driver that reads them; everything
+# else is shipped to both.
+PLATFORM_ONLY = {
+    "yolobox_cli/lima.py": "darwin",
+    "lima/": "darwin",
+    "yolobox_cli/libvirt.py": "linux",
+    "yolobox_cli/libvirt_host.py": "linux",
+    "libvirt/": "linux",
+    "linux/": "linux",
+}
+
+
+def platforms_of(path):
+    for prefix, platform in PLATFORM_ONLY.items():
+        if path == prefix or (prefix.endswith("/") and path.startswith(prefix)):
+            return {platform}
+    return set(PLATFORMS)
+
+
+def package_files():
+    return {"yolobox_cli/" + name for name in package_texts()}
+
+
+class TestEachPlatformShipsItsOwnFiles(unittest.TestCase):
+    """macOS runs Lima and Linux runs libvirt, and each ships only the files its
+    driver reads: the other driver's module, config and host files stay out."""
+
     def siblings_read_by_yo(self):
-        text = (REPO / "yo").read_text()
         found = set()
-        for match in re.finditer(r'SCRIPT_DIR((?:\s*/\s*"[^"]+")+)', text):
+        for match in re.finditer(r'SCRIPT_DIR((?:\s*/\s*"[^"]+")+)', package_text()):
             found.add("/".join(re.findall(r'"([^"]+)"', match.group(1))))
         self.assertTrue(found, "yo reads no sibling file; this test is stale")
         return found
 
-    def brew_installed(self):
+    def brew_shipped(self):
         text = (REPO / "homebrew" / "yolobox.rb").read_text()
-        installed = set()
+        shipped = set()
         for line in re.findall(r"^\s*libexec\.install ([^\n]+)", text, re.M):
-            installed.update(
-                os.path.basename(name) for name in re.findall(r'"([^"]+)"', line)
-            )
+            shipped.update(re.findall(r'"([^"]+)"', line))
         for directory, name in re.findall(
             r'\(libexec/"([^"]+)"\)\.install "([^"]+)"', text
         ):
-            installed.add(directory + "/" + os.path.basename(name))
-        return installed
+            shipped.add(directory + "/" + os.path.basename(name))
+        for directory, pattern, excluded in re.findall(
+            r'\(libexec/"([^"]+)"\)\.install Dir\["([^"]+)"\](?: - \[([^\]]*)\])?',
+            text,
+        ):
+            matched = {str(m.relative_to(REPO)) for m in REPO.glob(pattern)}
+            matched -= set(re.findall(r'"([^"]+)"', excluded))
+            shipped.update(directory + "/" + os.path.basename(m) for m in matched)
+        return shipped
 
-    def nix_installed(self):
-        text = (REPO / "nix" / "pkgs" / "yolobox.nix").read_text()
-        return set(
-            re.findall(
-                r'^\s*install -D\w+ (\S+) "\$out/libexec/yolobox/\1"', text, re.M
-            )
+    def nix_text(self):
+        return (REPO / "nix" / "pkgs" / "yolobox.nix").read_text()
+
+    def nix_shipped(self, platform):
+        text = self.nix_text()
+        branch = {"darwin": "darwinFiles", "linux": "linuxFiles"}[platform]
+        branches = {
+            name: body
+            for name, body in re.findall(r"(\w+Files) = \'\'(.*?)\'\';", text, re.S)
+        }
+        self.assertEqual(set(branches), {"darwinFiles", "linuxFiles"})
+        self.assertIn(
+            "if stdenvNoCC.hostPlatform.isDarwin then darwinFiles else linuxFiles", text
+        )
+        script = text.split("stdenvNoCC.mkDerivation", 1)[1]
+        # The branch is spliced in after the copy of the package, so removals in
+        # it apply to the copied files.
+        script = script.replace(
+            "${if stdenvNoCC.hostPlatform.isDarwin then darwinFiles else linuxFiles}",
+            branches[branch],
+        )
+        shipped = set()
+        for line in script.splitlines():
+            line = line.strip()
+            if match := re.fullmatch(
+                r'install -D\w+ (\S+) "\$out/libexec/yolobox/(\S+)"', line
+            ):
+                shipped.add(match.group(2))
+            elif line == 'cp -r yolobox_cli "$out/libexec/yolobox/yolobox_cli"':
+                shipped |= package_files()
+            elif match := re.fullmatch(r'rm "\$out/libexec/yolobox/(\S+)"', line):
+                shipped.discard(match.group(1))
+        return shipped
+
+    def needed(self):
+        return {"yo", "aws-broker"} | self.siblings_read_by_yo() | package_files()
+
+    def test_the_brew_formula_is_for_macos_only(self):
+        self.assertIn(
+            "depends_on :macos", (REPO / "homebrew" / "yolobox.rb").read_text()
         )
 
-    def test_the_brew_formula_installs_every_sibling_file_yo_reads(self):
-        self.assertLessEqual(self.siblings_read_by_yo(), self.brew_installed())
+    def test_every_platform_ships_every_file_its_driver_reads(self):
+        for platform in PLATFORMS:
+            shipped = (
+                self.brew_shipped()
+                if platform == "darwin"
+                else self.nix_shipped(platform)
+            )
+            for path in sorted(self.needed()):
+                if platform in platforms_of(path):
+                    with self.subTest(platform=platform, path=path):
+                        self.assertIn(path, shipped)
 
-    def test_the_nix_package_installs_every_sibling_file_yo_reads(self):
-        self.assertLessEqual(self.siblings_read_by_yo(), self.nix_installed())
+    def test_the_nix_package_ships_the_same_for_darwin_as_brew_does(self):
+        self.assertEqual(self.nix_shipped("darwin"), self.brew_shipped())
+
+    def test_no_platform_ships_a_file_of_the_other_one(self):
+        shipped = {
+            "darwin": self.brew_shipped(),
+            "linux": self.nix_shipped("linux"),
+        }
+        for platform, paths in shipped.items():
+            for path in sorted(paths):
+                with self.subTest(platform=platform, path=path):
+                    self.assertIn(platform, platforms_of(path))
+
+
+def names_tests_patch():
+    """Every name a test patches or rebinds on the package, plus the ones the
+    patch convention names outright."""
+    names = {
+        "YO_VERSION",
+        "HOST_PLATFORM",
+        "AGENT_REPLY_TIMEOUT",
+        "PORT_RANGE_FILE",
+        "LIBVIRT_STOP_TIMEOUT",
+    }
+    for path in sorted(Path(__file__).resolve().parent.glob("test_*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "object"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "patch"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+            ):
+                names.add(node.args[1].value)
+    return names
+
+
+class TestPackageImportsFollowTheConvention(unittest.TestCase):
+    # Modules call each other as `module.attr`, so a test patches the one global
+    # the code reads. A name imported by name is a second copy a patch misses.
+    def test_no_module_spells_the_package_name(self):
+        for name, text in package_texts().items():
+            with self.subTest(module=name):
+                self.assertNotIn("yolobox_cli", text)
+
+    def test_names_imported_from_a_sibling_are_classes_or_unpatched_constants(self):
+        patched = names_tests_patch()
+        imported = []
+        for name, text in package_texts().items():
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+                    imported += [(name, alias.name) for alias in node.names]
+        self.assertTrue(imported, "no module imports a name; this test is stale")
+        for module, imported_name in imported:
+            with self.subTest(module=module, name=imported_name):
+                self.assertRegex(
+                    imported_name,
+                    r"[A-Z][A-Za-z0-9]*|[A-Z][A-Z0-9_]*",
+                    "only classes and constants are imported by name",
+                )
+                self.assertNotIn(imported_name, patched)
+
+
+class TestDriversAreImportedOnlyByCli(unittest.TestCase):
+    """A host ships only its own driver module, so nothing but `driver_for`
+    may name the other one, and the rest of yo reaches a driver through
+    `state.driver()`. `libvirt_host` is the libvirt driver's second file, and
+    only `libvirt` imports it."""
+
+    def drivers_imported_by(self, trees):
+        imported = set()
+        for tree in trees:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.level == 1:
+                    names = (
+                        [node.module] if node.module else [a.name for a in node.names]
+                    )
+                    imported |= {
+                        name
+                        for name in names
+                        if name in ("lima", "libvirt", "libvirt_host")
+                    }
+        return imported
+
+    def test_no_module_but_cli_imports_a_driver_module(self):
+        for name, text in package_texts().items():
+            if name != "cli.py":
+                with self.subTest(module=name):
+                    allowed = {"libvirt_host"} if name == "libvirt.py" else set()
+                    self.assertEqual(
+                        self.drivers_imported_by([ast.parse(text)]), allowed
+                    )
+
+    def test_cli_imports_a_driver_module_only_inside_a_function(self):
+        top_level = ast.parse(package_texts()["cli.py"]).body
+        self.assertEqual(
+            self.drivers_imported_by(
+                n for n in top_level if not isinstance(n, ast.FunctionDef)
+            ),
+            set(),
+        )
+
+    def test_each_driver_module_imports_without_the_other(self):
+        for kept, removed in (
+            ("lima", ("libvirt.py", "libvirt_host.py")),
+            ("libvirt", ("lima.py",)),
+        ):
+            with self.subTest(kept=kept):
+                with tempfile.TemporaryDirectory() as tmp:
+                    shutil.copytree(
+                        yo.PKG_DIR,
+                        Path(tmp) / "yolobox_cli",
+                        ignore=shutil.ignore_patterns(*removed, "__pycache__"),
+                    )
+                    done = subprocess.run(
+                        [
+                            sys.executable,
+                            "-B",
+                            "-I",
+                            "-c",
+                            "import sys; sys.path.insert(0, sys.argv[1]);"
+                            "from yolobox_cli import cli, %s" % kept,
+                            tmp,
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                self.assertEqual(done.returncode, 0, done.stderr)
+
+
+class TestPackagersPatchTheVersionLiteral(unittest.TestCase):
+    def brew(self):
+        return (REPO / "homebrew" / "yolobox.rb").read_text()
+
+    def nix(self):
+        return (REPO / "nix" / "pkgs" / "yolobox.nix").read_text()
+
+    def version_literal_files(self):
+        return {
+            "yolobox_cli/" + name
+            for name, text in package_texts().items()
+            if 'YO_VERSION = "dev"' in text.splitlines()
+        }
+
+    def test_both_packagers_patch_the_file_that_holds_the_version_literal(self):
+        (brew_path,) = re.findall(r'inreplace libexec/"([^"]+)"', self.brew())
+        (nix_path,) = re.findall(
+            r'substituteInPlace "\$out/libexec/yolobox/([^"]+)"', self.nix()
+        )
+        self.assertEqual({brew_path}, self.version_literal_files())
+        self.assertEqual({nix_path}, self.version_literal_files())
 
 
 class TestGuestSubcommandsMatchTheCaseTable(unittest.TestCase):
     def invoked_by_yo(self):
-        text = (REPO / "yo").read_text()
+        text = package_text()
         subs = set(
             re.findall(
                 r'(?:guest_helper|agent_paths)\(\s*(?:[A-Z]+,\s*)?"([a-z-]+)"', text
@@ -586,7 +836,7 @@ class TestGuestProfilePatternMatchesYo(unittest.TestCase):
             r'\[\[ "\$\{profile\}" =~ (\S+) \]\]', GUEST_SCRIPT.read_text()
         )
         self.assertEqual(len(found), 1, "aws-creds must check the profile name once")
-        self.assertEqual(found[0], yo.AWS_PROFILE_NAME_RE.pattern)
+        self.assertEqual(found[0], yo.PROFILE_NAME_RE.pattern)
 
 
 def nix_code(path: Path) -> str:
@@ -698,6 +948,72 @@ class TestTailscaleSocketIsOperatorOnly(unittest.TestCase):
         )
 
 
+class TestTailscaleLeavesTheUplinkAtPort22(unittest.TestCase):
+    """openFirewall = true opens UDP 41641 on every interface, enp0s1 included."""
+
+    def test_the_module_does_not_ask_nixos_to_open_the_tunnel_port(self):
+        self.assertRegex(
+            nix_code(REPO / "nix" / "tailscale.nix"),
+            r"\bopenFirewall = false;",
+        )
+
+
+class TestShellcheckListsAgree(unittest.TestCase):
+    """CLAUDE.md tells a contributor which scripts to shellcheck; CI checks the
+    ones in verify.yml. A script added to one list only is either skipped by CI
+    or never run by the person changing it."""
+
+    COMMAND = re.compile(r"shellcheck -S warning ([^#\n]+)")
+
+    def scripts_in(self, path):
+        found = self.COMMAND.findall(path.read_text())
+        self.assertEqual(len(found), 1, "%s: want one shellcheck command" % path)
+        return found[0].split()
+
+    def test_claude_md_and_ci_list_the_same_scripts(self):
+        claude = self.scripts_in(REPO / "CLAUDE.md")
+        ci = self.scripts_in(REPO / ".github" / "workflows" / "verify.yml")
+        self.assertEqual(sorted(set(claude)), sorted(set(ci)))
+        self.assertEqual(len(claude), len(set(claude)), "a script listed twice")
+
+    def test_every_listed_script_exists(self):
+        for script in self.scripts_in(REPO / "CLAUDE.md"):
+            with self.subTest(script=script):
+                self.assertTrue((REPO / script).is_file())
+
+
+class TestEgressTierChainNames(unittest.TestCase):
+    """The chain name is how every reader tells the three tiers apart: `yo
+    status` reads it, the OnFailure script prints by it, and the rule checker
+    expects it. A name changed in one place leaves the others reporting the
+    wrong tier, or none."""
+
+    CHAIN_HEADER = re.compile(r"\bchain (\w+) \{")
+    # postrouting is the tunnel variant's second chain, not a tier.
+    NOT_A_TIER = {"postrouting"}
+
+    def status_names(self):
+        names = set()
+        for header in yo.EGRESS_TIER_CHAINS:
+            (name,) = self.CHAIN_HEADER.findall(header)
+            names.add(name)
+        return names
+
+    def test_nix_defines_exactly_the_chains_status_knows(self):
+        found = set(self.CHAIN_HEADER.findall(nix_code(REPO / "nix" / "egress.nix")))
+        self.assertEqual(found - self.NOT_A_TIER, self.status_names())
+
+    def test_the_rule_checker_expects_exactly_the_chains_status_knows(self):
+        self.assertEqual(set(egress_rules.HOOKS) - self.NOT_A_TIER, self.status_names())
+
+    def test_the_failure_script_names_every_fallback_chain_status_knows(self):
+        # The full table's chain, plain `output`, is no fallback: it is what the
+        # script's default branch means by "neither fallback chain".
+        script = (REPO / "nix" / "egress" / "yolobox-egress-failed.sh").read_text()
+        cases = set(re.findall(r'\*"chain (\w+) \{"\*\)', script))
+        self.assertEqual(cases, self.status_names() - {"output"})
+
+
 class TestEgressUnitNeverOpensTheBox(unittest.TestCase):
     """The unit that loads nix/egress.nix's rules. The rules themselves are
     checked in their rendered form (tests/test_egress_rules.py); these are the
@@ -721,10 +1037,23 @@ class TestEgressUnitNeverOpensTheBox(unittest.TestCase):
             with self.subTest(hook=hook):
                 self.assertNotIn(hook, self.CODE)
 
-    def test_the_unit_loads_recovery_first_and_the_full_rules_to_replace_it(self):
+    def test_the_unit_loads_a_fallback_first_and_the_full_rules_to_replace_it(self):
         unit = self.service_block("yolobox-egress")
-        self.assertIn('ExecStartPre = [ "${nft} --file ${recoveryFile}" ];', unit)
+        self.assertIn(
+            'ExecStartPre = [ "${loadTiers}/bin/yolobox-egress-load-tiers'
+            ' ${recoveryFile} ${lastResortFile}" ];',
+            unit,
+        )
         self.assertIn('ExecStart = "${nft} --file ${ruleFile}";', unit)
+
+    def test_a_unit_that_fails_says_so_through_the_failure_unit(self):
+        self.assertIn(
+            'systemd.services.yolobox-egress.onFailure = [ "yolobox-egress-failed.service" ];',
+            self.CODE,
+        )
+        self.assertIn(
+            'ExecStart = "${reportFailure}/bin/yolobox-egress-failed";', self.CODE
+        )
 
     def test_tailscaled_is_gated_on_the_table_and_dhcpcd_is_not(self):
         self.assertIn('"+${nft} list table ${table}"', self.service_block("tailscaled"))
@@ -833,17 +1162,21 @@ def hardening_nix_list(name):
 def hardening_nix_sysctls():
     """Every key and value of boot.kernel.sysctl in nix/hardening.nix.
 
-    Each entry must be one `"key" = <integer>;` line. A line of any other shape
-    (a generator, an attribute set, mkForce) fails the count, so it cannot hide
-    from the check script comparison.
+    Each entry of the block must be one `"key" = <integer>;` line. A line of
+    any other shape (a generator, an attribute set, mkForce) fails the count, so
+    it cannot hide from the check script comparison. The one other spelling is
+    a statement outside the block, `boot.kernel.sysctl."key" = lib.mkForce
+    <integer>;`, for a value nixos-lima also sets.
     """
-    (block,) = re.findall(
-        r"boot\.kernel\.sysctl = \{\n(.*?)\n\s*\};", nix_code(HARDENING_NIX), re.S
-    )
+    code = nix_code(HARDENING_NIX)
+    (block,) = re.findall(r"boot\.kernel\.sysctl = \{\n(.*?)\n\s*\};", code, re.S)
     entries = re.findall(r'^\s*"[^"]+"\s*=', block, re.M)
     parsed = re.findall(r'^\s*"([\w.]+)" = (\d+);', block, re.M)
     assert len(parsed) == len(entries), "an unparseable sysctl line in hardening.nix"
-    return dict(parsed)
+    forced_entries = re.findall(r'boot\.kernel\.sysctl\."[^"]+"\s*=', code)
+    forced = re.findall(r'boot\.kernel\.sysctl\."([\w.]+)" = lib\.mkForce (\d+);', code)
+    assert len(forced) == len(forced_entries), "an unparseable forced sysctl line"
+    return dict(parsed + forced)
 
 
 class TestHardeningWrapperAllowlistHasOneSpelling(unittest.TestCase):
@@ -867,6 +1200,9 @@ class TestHardeningSysctlsHaveOneSpelling(unittest.TestCase):
     def test_the_check_script_reads_back_every_sysctl_hardening_nix_sets(self):
         sysctls = hardening_nix_sysctls()
         self.assertEqual(sysctls["kernel.kptr_restrict"], "2")
+        # The forced spelling must reach the comparison too: the port floor is
+        # what stops the agent binding sshd's port.
+        self.assertEqual(sysctls["net.ipv4.ip_unprivileged_port_start"], "1024")
         checked = self.check_script_sysctls()
         for name, value in sysctls.items():
             with self.subTest(sysctl=name):
@@ -906,19 +1242,12 @@ class TestHardeningModuleJournalNamesEveryBlockedModule(unittest.TestCase):
         self.assertEqual(self.journal_blocked_names(), set(blocked))
 
 
-class TestEveryLspRenderGoesThroughTheWrapper(unittest.TestCase):
-    ETC_PATHS = (
-        "yolobox/lsp/zed-settings.json",
-        "yolobox/lsp/claude-basedpyright/.lsp.json",
-        "yolobox/lsp/opencode.json",
-    )
-
-    def test_zed_claude_and_opencode_renders_name_the_wrapper(self):
+class TestZedSettingsGoThroughTheWrapper(unittest.TestCase):
+    def test_zed_settings_render_names_the_wrapper(self):
         code = nix_code(REPO / "nix" / "lsp.nix")
-        for etc_path in self.ETC_PATHS:
-            with self.subTest(etc_path=etc_path):
-                self.assertIn('environment.etc."%s"' % etc_path, code)
-        self.assertGreaterEqual(code.count('"${lspWrapper}"'), len(self.ETC_PATHS))
+        start = code.index('environment.etc."yolobox/lsp/zed-settings.json"')
+        end = code.index("};", code.index("lsp.basedpyright.binary", start))
+        self.assertIn('"${lspWrapper}"', code[start:end])
 
 
 DOMAIN_XML = REPO / "libvirt" / "domain.xml"
@@ -1023,6 +1352,28 @@ class TestHostOsValuesHaveOneSpelling(unittest.TestCase):
         )
 
 
+class TestHostnameHasOneSpelling(unittest.TestCase):
+    """flake.nix validates YOLOBOX_HOSTNAME and yo derives it from -m; the rule
+    and the name must be the same on both sides."""
+
+    def flake_text(self):
+        return (REPO / "flake.nix").read_text()
+
+    def test_yo_names_the_variable_flake_reads(self):
+        self.assertIn('builtins.getEnv "%s"' % yo.NIX_ENV_HOSTNAME, self.flake_text())
+
+    def test_flake_matches_the_label_rule_yo_checks(self):
+        matched = re.search(r'builtins\.match "([^"]+)" n', self.flake_text())
+        self.assertIsNotNone(matched, "flake.nix does not match YOLOBOX_HOSTNAME")
+        self.assertEqual(matched.group(1), yo.HOSTNAME_LABEL_RE.pattern)
+
+    def test_the_default_hostname_of_flake_is_the_default_machine(self):
+        self.assertIn('if n == "" then "%s"' % yo.DEFAULT_INSTANCE, self.flake_text())
+
+    def test_claude_md_names_the_variable(self):
+        self.assertIn(yo.NIX_ENV_HOSTNAME, (REPO / "CLAUDE.md").read_text())
+
+
 class TestCidataDescribesTheOperatorBaseNixDeclares(unittest.TestCase):
     """lima-init creates the operator from lima.env, and base.nix declares the
     same account. A different uid or home would split it into two accounts."""
@@ -1049,3 +1400,203 @@ class TestCidataDescribesTheOperatorBaseNixDeclares(unittest.TestCase):
             self.lima_env()["LIMA_CIDATA_HOME"],
             home.group(1).replace("${username}", self.USER),
         )
+
+
+# ----------------------------------------------------------------------------
+# Facts spelled in more than one file. `yo` is read as TEXT, one helper per
+# fact, so the day `yo` becomes a package only these helpers change.
+
+
+def yo_source_text() -> str:
+    """The text of everything that defines `yo`'s module-level constants."""
+    return "\n".join(p.read_text() for p in sorted(yo.PKG_DIR.glob("*.py")))
+
+
+def yo_string_constant(name: str) -> str:
+    found = re.search(r'^%s = "([^"]*)"$' % re.escape(name), yo_source_text(), re.M)
+    assert found, "yo has no string constant %s" % name
+    return found.group(1)
+
+
+def yo_int_constant(name: str) -> int:
+    found = re.search(r"^%s = (\d+)$" % re.escape(name), yo_source_text(), re.M)
+    assert found, "yo has no integer constant %s" % name
+    return int(found.group(1))
+
+
+def yo_vm_user() -> str:
+    return yo_string_constant("VM_USER")
+
+
+def yo_passt_dir() -> str:
+    return yo_string_constant("PASST_DIR")
+
+
+def yo_agent_user() -> str:
+    return yo_string_constant("AGENT_USER")
+
+
+def yo_agent_home() -> str:
+    return yo_string_constant("AGENT_HOME")
+
+
+def yo_helper_no_subcommand() -> int:
+    return yo_int_constant("HELPER_NO_SUBCOMMAND")
+
+
+def yo_helper_marker() -> str:
+    return yo_string_constant("HELPER_MARKER")
+
+
+HOST_SETUP = REPO / "linux" / "host-setup.sh"
+HOST_UNIT = REPO / "linux" / "yolobox-host.service"
+BASE_NIX = REPO / "nix" / "base.nix"
+
+
+def host_setup_assignment(name: str) -> str:
+    """`NAME="value"` in linux/host-setup.sh, with `$CONF_DIR` expanded."""
+    text = HOST_SETUP.read_text()
+    found = re.search(r'^%s="([^"]*)"$' % re.escape(name), text, re.M)
+    assert found, "host-setup.sh sets no %s" % name
+    conf_dir = re.search(r'^CONF_DIR="([^"]*)"$', text, re.M)
+    assert conf_dir, "host-setup.sh sets no CONF_DIR"
+    return found.group(1).replace("$CONF_DIR", conf_dir.group(1))
+
+
+def host_unit_loaded_file() -> str:
+    found = re.search(r"^ExecStart=\S*nft -f (\S+)$", HOST_UNIT.read_text(), re.M)
+    assert found, "yolobox-host.service has no `nft -f` ExecStart"
+    return found.group(1)
+
+
+def host_table_skuid() -> str:
+    found = re.search(r'meta skuid != "([^"]+)" accept', HOST_NFT.read_text())
+    assert found, "the host table has no skuid exemption"
+    return found.group(1)
+
+
+def agent_account_block() -> str:
+    found = re.search(
+        r"users\.users\.\$\{agentUser\} = \{(.*?)\n  \};", BASE_NIX.read_text(), re.S
+    )
+    assert found, "base.nix declares no agent account"
+    return found.group(1)
+
+
+def nix_agent_uid() -> str:
+    found = re.search(r"\buid = (\d+);", agent_account_block())
+    assert found, "the agent account in base.nix sets no uid"
+    return found.group(1)
+
+
+def flake_agent_user() -> str:
+    return nix_binding(REPO / "flake.nix", "agentUser")
+
+
+def libvirt_nic_name() -> str:
+    """The name systemd gives the PCI address the domain template puts the
+    network interface at: bus and slot, function 0 (no `f` suffix)."""
+    found = re.search(
+        r"<interface .*?<address type='pci' domain='0x([0-9a-f]+)'"
+        r" bus='0x([0-9a-f]+)' slot='0x([0-9a-f]+)' function='0x([0-9a-f]+)'/>"
+        r".*?</interface>",
+        DOMAIN_XML.read_text(),
+        re.S,
+    )
+    assert found, "the domain template puts its interface at no PCI address"
+    domain, bus, slot, function = (int(group, 16) for group in found.groups())
+    assert domain == 0 and function == 0, "the NIC name would need a prefix or suffix"
+    return "enp%ds%d" % (bus, slot)
+
+
+def nix_nic_names() -> set:
+    names = set()
+    for path in (REPO / "nix").rglob("*.nix"):
+        names |= set(re.findall(r"\benp\d+s\d+\b", nix_code(path)))
+    return names
+
+
+class TestHostAccountAndTableAreOneFact(unittest.TestCase):
+    """The account libvirt runs QEMU and passt as is named in four places; the
+    host table judges only that uid, so a rename in one place alone leaves the
+    guest's traffic unjudged."""
+
+    def test_yo_host_setup_and_the_host_table_name_the_same_account(self):
+        self.assertEqual(yo_vm_user(), host_setup_assignment("VM_USER"))
+        self.assertEqual(host_table_skuid(), yo_vm_user())
+
+    def test_the_passt_directory_is_the_one_yo_checks_and_its_rule_spells_the_mask(
+        self,
+    ):
+        """An ACL entry is only as wide as the mask, and yo checks the effective
+        permission of this entry in this directory."""
+        self.assertEqual(yo_passt_dir(), host_setup_assignment("PASST_DIR"))
+        rule = re.search(
+            r"^a\+ \$PASST_DIR - - - - (\S+)$", HOST_SETUP.read_text(), re.M
+        )
+        assert rule, "host-setup.sh has no `a+` rule for the passt directory"
+        self.assertEqual(rule.group(1), "u:$VM_USER:rwx,m::rwx")
+
+    def test_the_unit_loads_the_file_host_setup_installs(self):
+        self.assertEqual(host_unit_loaded_file(), host_setup_assignment("NFT_DEST"))
+
+    def test_host_setup_installs_the_unit_where_the_story_says(self):
+        self.assertEqual(
+            host_setup_assignment("UNIT_DEST"),
+            "/etc/systemd/system/" + HOST_UNIT.name,
+        )
+
+    def test_the_installed_table_is_named_like_the_repo_file(self):
+        self.assertEqual(Path(host_setup_assignment("NFT_DEST")).name, HOST_NFT.name)
+
+
+class TestAgentAccountIsOneFact(unittest.TestCase):
+    def test_yo_and_the_flake_name_the_same_agent(self):
+        self.assertEqual(yo_agent_user(), flake_agent_user())
+
+    def test_the_agent_home_is_the_one_base_nix_gives_the_account(self):
+        home = re.search(r'\bhome = "([^"]+)";', agent_account_block())
+        self.assertIsNotNone(home, "the agent account in base.nix sets no home")
+        self.assertEqual(
+            yo_agent_home(), home.group(1).replace("${agentUser}", flake_agent_user())
+        )
+
+    def test_the_acceptance_check_uses_the_agent_uid_base_nix_declares(self):
+        self.assertEqual(shell_constant(HARDENING_CHECK, "AGENT_UID"), nix_agent_uid())
+
+
+class TestGuestHelperAnswersUnknownSubcommandsAsYoExpects(unittest.TestCase):
+    """`yo` reads exit 64 plus a marker on stderr as "this box predates the
+    subcommand" (version skew), so the guest script must produce both."""
+
+    def run_guest(self, *args):
+        return subprocess.run(
+            [
+                "bash",
+                "-o",
+                "errexit",
+                "-o",
+                "nounset",
+                "-o",
+                "pipefail",
+                str(GUEST_SCRIPT),
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    def test_the_exit_code_and_the_marker_are_the_ones_yo_looks_for(self):
+        result = self.run_guest("no-such-subcommand")
+        self.assertEqual(result.returncode, yo_helper_no_subcommand())
+        self.assertIn(yo_helper_marker(), result.stderr)
+
+
+class TestGuestNicNameIsOneFact(unittest.TestCase):
+    """base.nix names the NIC (firewall rule, anti-spoof rule). On libvirt the
+    name follows from the PCI slot in libvirt/domain.xml, so moving the slot
+    would leave the rules naming an interface that does not exist."""
+
+    def test_the_nix_modules_name_the_interface_the_domain_slot_produces(self):
+        self.assertEqual(nix_nic_names(), {libvirt_nic_name()})

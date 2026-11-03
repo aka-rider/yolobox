@@ -57,7 +57,9 @@ class TestParseAgentMessages(unittest.TestCase):
 
     def test_a_truncated_identity_list_is_refused(self):
         body = identities_answer([(ED25519_BLOB, "yolobox-disk")])[1:-3]
-        with self.assertRaises(yo.YoError):
+        with self.assertRaisesRegex(
+            yo.YoError, "the ssh agent sent a truncated message"
+        ):
             yo.parse_agent_identities(body)
 
     def test_signature_is_the_raw_64_bytes(self):
@@ -72,11 +74,15 @@ class TestParseAgentMessages(unittest.TestCase):
 
     def test_a_63_byte_signature_is_refused(self):
         body = signature_answer(b"ssh-ed25519", RAW_SIGNATURE[:63])[1:]
-        with self.assertRaises(yo.YoError):
+        with self.assertRaisesRegex(
+            yo.YoError, "the ssh agent returned a 63-byte Ed25519"
+        ):
             yo.parse_agent_signature(body)
 
     def test_an_empty_signature_body_is_refused(self):
-        with self.assertRaises(yo.YoError):
+        with self.assertRaisesRegex(
+            yo.YoError, "the ssh agent sent a truncated message"
+        ):
             yo.parse_agent_signature(b"")
 
 
@@ -193,8 +199,8 @@ class TestSshAgentClient(FakeAgent):
 
     def test_luks_passphrase_signs_with_the_titled_key(self):
         with (
-            mock.patch.object(yo, "op_sock", return_value=self.sock_path),
-            mock.patch.object(yo, "err") as fake_err,
+            mock.patch.object(yo.box.driver, "op_sock", return_value=self.sock_path),
+            mock.patch.object(yo.ui, "err") as fake_err,
         ):
             passphrase = yo.luks_passphrase()
         self.assertEqual(passphrase, yo.derive_luks_passphrase(RAW_SIGNATURE))
@@ -204,7 +210,7 @@ class TestSshAgentClient(FakeAgent):
 class TestSshAgentClientFailures(FakeAgent):
     def test_an_empty_reply_is_refused(self):
         self.raw_reply = struct.pack(">I", 0)
-        with self.assertRaises(yo.YoError):
+        with self.assertRaisesRegex(yo.YoError, "1Password's SSH agent at"):
             yo.ssh_agent_identities(self.sock_path)
 
     def test_a_connection_closed_mid_reply_is_refused(self):
@@ -225,7 +231,7 @@ class TestSshAgentClientFailures(FakeAgent):
         self.addCleanup(hang.set)
         self.raw_reply = None
         with (
-            mock.patch.object(yo, "AGENT_REPLY_TIMEOUT", 0.2),
+            mock.patch.object(yo.agent, "AGENT_REPLY_TIMEOUT", 0.2),
             mock.patch.object(FakeAgent, "answer", lambda agent, conn: hang.wait(5)),
         ):
             with self.assertRaises(yo.YoError) as caught:
@@ -282,7 +288,7 @@ class TestClassifyInitrdAttempt(unittest.TestCase):
 
 class TestInitrdSshArgv(FakeHome):
     def write_ssh_config(self, text):
-        os.makedirs(yo.lima_dir())
+        os.makedirs(yo.instance_dir())
         with open(yo.ssh_cfg(), "w") as handle:
             handle.write(text)
 
@@ -317,7 +323,7 @@ class TestInitrdSshArgv(FakeHome):
 
     def test_an_unreadable_config_is_an_error_not_a_fallback(self):
         os.makedirs(yo.ssh_cfg())
-        with self.assertRaises(yo.YoError):
+        with self.assertRaisesRegex(yo.YoError, "cannot read"):
             yo.initrd_ssh_argv("true")
 
 

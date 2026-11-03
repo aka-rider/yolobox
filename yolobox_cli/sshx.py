@@ -1,0 +1,140 @@
+"""The ssh roles and the one place that builds an ssh command line for the guest."""
+
+from __future__ import annotations
+
+import shlex
+import subprocess
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from . import proc, sshconfig, state, ui
+from .config import AGENT_USER, SSH_UNREACHABLE
+from .sshconfig import FIRST_CONTACT_OPTS
+from .ui import YoError
+
+
+@dataclass(frozen=True)
+class SshRole:
+    user: Optional[str]
+    own_control_path: bool
+    pins_host_key: bool = True
+
+
+OPERATOR = SshRole(None, False)
+AGENT = SshRole(AGENT_USER, True)
+# Only for fetching the guest's host keys to pin them (ensure_guest_known_hosts):
+# the pin cannot be checked against itself, and after a VM recreated behind
+# yo's back the old pin would refuse the very connection that replaces it.
+OPERATOR_FIRST_CONTACT = SshRole(None, False, pins_host_key=False)
+
+
+def ssh_options(role: SshRole, mux: bool = False) -> List[str]:
+    """The options every ssh and scp that yo spawns for the guest starts with."""
+    sshconfig.ensure_agent_ssh_config()
+    argv = ["-F", state.ssh_cfg()]
+    if not role.pins_host_key:
+        argv += FIRST_CONTACT_OPTS
+    if role.user is not None:
+        argv += ["-o", "User=%s" % role.user]
+    if not mux:
+        argv += ["-o", "ControlPath=none"]
+    elif role.own_control_path:
+        argv += ["-o", "ControlPath=%s" % state.agent_control_path()]
+    return argv
+
+
+def ssh_argv(role: SshRole, *tail: str, mux: bool = False) -> List[str]:
+    """`ssh` with the role's options, then `tail`: the one place an ssh command starts."""
+    return ["ssh"] + ssh_options(role, mux) + list(tail)
+
+
+def forward_agent_opts() -> List[str]:
+    return ["-o", 'ForwardAgent="%s"' % state.driver().op_sock()]
+
+
+def ssh_run(
+    role: SshRole,
+    argv: Sequence[str],
+    *,
+    stdin: Optional[bytes] = None,
+    env: Optional[Dict[str, str]] = None,
+    mux: bool = False,
+    capture: bool = True,
+    check: bool = False,
+    merge_stderr: bool = False,
+    inherit_stdin: bool = False,
+    binary: bool = False,
+    filtered: bool = False,
+) -> subprocess.CompletedProcess:
+    no_stdin = ["-n"] if stdin is None and not inherit_stdin else []
+    return proc.run(
+        ssh_argv(role, *no_stdin, state.box.vm_host, shlex.join(argv), mux=mux),
+        capture=capture,
+        check=check,
+        stdin=stdin,
+        env=env,
+        merge_stderr=merge_stderr,
+        binary=binary,
+        filtered=filtered,
+    )
+
+
+class Unreachable(YoError):
+    """ssh could not reach the box at all (exit 255), as opposed to a command that failed there."""
+
+
+def unreachable(role: SshRole) -> Unreachable:
+    return Unreachable(
+        state.not_up_hint(
+            "cannot reach %s as %s" % (state.box.name, role.user or "operator")
+        )
+    )
+
+
+def probe(role: SshRole, argv: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
+    """ssh_run for a caller that reads the exit code as a fact about the box.
+
+    ssh itself exits 255 when it cannot connect, so that code says nothing about
+    the command: it raises Unreachable before anyone interprets it.
+    """
+    completed = ssh_run(role, argv, **kwargs)
+    if completed.returncode == SSH_UNREACHABLE:
+        raise unreachable(role)
+    return completed
+
+
+def guest_out(argv: Sequence[str], *, check: bool = True, mux: bool = False) -> str:
+    return ssh_run(OPERATOR, argv, mux=mux, check=check).stdout
+
+
+def account_status() -> Tuple[str, str]:
+    agent_probe = ssh_run(AGENT, ["true"])
+    if agent_probe.returncode == 0:
+        return "agent", ""
+    if ssh_run(OPERATOR, ["true"]).returncode == 0:
+        return "operator_only", ""
+    return "unreachable", agent_probe.stderr.rstrip("\n")
+
+
+def require_agent_account() -> None:
+    status, detail = account_status()
+    if status == "agent":
+        return
+    if status == "operator_only":
+        ui.err("yo: cannot ssh into %s as '%s'." % (state.box.name, AGENT_USER))
+        ui.err(
+            "    Every AI session runs as that account, and this VM has no working one —"
+        )
+        ui.err("    it predates the operator/agent split. Rebuild it:")
+        ui.err(
+            "        %s && %s"
+            % (state.driver().delete_command(), state.yo_cmd("bootstrap"))
+        )
+    else:
+        if detail:
+            ui.err(detail)
+        ui.err(
+            "yo: cannot reach %s as operator either — is the VM up? %s"
+            % (state.box.name, state.yo_cmd("status"))
+        )
+    raise YoError(None, code=1)

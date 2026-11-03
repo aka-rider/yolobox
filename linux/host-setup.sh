@@ -61,7 +61,7 @@ resolver="$(awk '$1 == "nameserver" { print $2; exit }' /etc/resolv.conf)"
 
 step "(a) libvirt repository and packages"
 dnf copr enable -y @virtmaint-sig/virt-preview
-dnf install -y libvirt-daemon-kvm libvirt-client edk2-ovmf passt passt-selinux xorriso nftables
+dnf install -y libvirt-daemon-kvm libvirt-client edk2-ovmf passt passt-selinux xorriso nftables acl
 
 # The system connection needs its daemons running, so this comes before the
 # version gate and the network step. virtnetworkd is started only so the
@@ -116,16 +116,18 @@ fi
 
 # libvirt runs passt under the domain's DAC label, which is yolobox-vm, but it
 # makes the socket directory owned by qemu with mode 0755, so passt's bind fails
-# with "Permission denied". An ACL entry for yolobox-vm leaves the owner alone.
+# with "Permission denied". An ACL entry for yolobox-vm leaves the owner alone,
+# and the mask is spelled out because an entry is only as wide as the mask.
 # /run is a tmpfs, so a tmpfiles rule re-applies it on every boot, before
-# virtqemud starts.
+# virtqemud starts. See linux/host-setup.md.
 step "(j) passt socket directory"
 cat >"$PASST_TMPFILES" <<RULE
 d $PASST_DIR 0755 qemu qemu -
-a+ $PASST_DIR - - - - u:$VM_USER:rwx
+a+ $PASST_DIR - - - - u:$VM_USER:rwx,m::rwx
 RULE
 chmod 0644 "$PASST_TMPFILES"
 systemd-tmpfiles --create "$PASST_TMPFILES"
+setfacl -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
 
 step "(g) host egress table"
 [[ -x /usr/sbin/nft ]] || die "/usr/sbin/nft is missing after installing nftables"

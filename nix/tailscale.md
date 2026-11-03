@@ -4,19 +4,19 @@ The code is `nix/tailscale.nix`, which puts the box on a tailnet so that its ser
 
 ## Firewall
 
-`tailscale0` is a trusted interface (`networking.firewall.trustedInterfaces = [ "tailscale0" ]`), so `nixos-fw` accepts everything that arrives on it. The tailnet ACL, not the box, decides who gets in. The alternative, "tailnet to sshd only", opens TCP 22 on `tailscale0` and nothing else. Its symptom is a service the agent starts on `<tailnet-ip>:5137` that cannot be reached over the tailnet, because `nixos-fw` drops every port but 22 on `tailscale0`. The design is that reaching the box's services over the tailnet with no further setup is worth more than a second filter behind the ACL.
+`tailscale0` is a trusted interface (`networking.firewall.trustedInterfaces = [ "tailscale0" ]`), so `nixos-fw` accepts everything that arrives on it. The tailnet ACL, not the box, decides who gets in. The alternative, "tailnet to sshd only", opens TCP 22 on `tailscale0` and nothing else. Its symptom is a service the agent starts on `<tailnet-ip>:5137` that cannot be reached over the tailnet, because `nixos-fw` drops every port but 22 on `tailscale0`. The design is that reaching the box's services over the tailnet with no further setup is worth more than a second filter behind the ACL. The cost is that the ACL is the only access control: a box on a tailnet should have its ACL reviewed, because every node the ACL admits reaches every port of the box, including whatever the agent binds on a wildcard address.
 
 What trusting the interface opens, all of it to whatever the ACL admits:
 
 - every TCP port the agent binds on a wildcard or tailnet address, not only 22;
-- UDP, which a "sshd only" rule would not admit except the tunnel's own 41641;
+- UDP, which a "sshd only" rule would not admit;
 - IPv6 arriving on `tailscale0`;
 - tailscaled's peerAPI listeners on the tailnet addresses;
 - every rootless podman port published on `0.0.0.0` (see [nix/podman.nix](podman.nix)), because a wildcard bind also answers on `tailscale0`.
 
 Other nodes the ACL admits, such as other yolobox VMs, each running their own agents, reach all of it. Tighten the ACL, not the box, to narrow that. The other direction is the same: the egress table accepts everything that leaves by `tailscale0`, so a host that is a tailnet node is reachable from the box unless the ACL forbids it (see [The tailnet is an entrance](egress.md#the-tailnet-is-an-entrance)).
 
-The enp0s1 side is unchanged: `nixos-fw` opens only TCP 22 there (see [sshd on two interfaces](#sshd-on-two-interfaces)), and the tunnel's UDP 41641 stays open through `services.tailscale.openFirewall = true`.
+The enp0s1 side is unchanged: `nixos-fw` opens only TCP 22 there (see [sshd on two interfaces](#sshd-on-two-interfaces)), and `services.tailscale.openFirewall` is `false`. Setting it to `true` would open the tunnel's UDP 41641 on `enp0s1` too, which breaks the rule that the interface admits port 22 only. Direct tailnet paths are negotiated by outbound traffic that conntrack then lets back in, and a path that cannot be made direct goes through a relay, so closing the port should cost speed at worst, not reachability. That is reasoning, not a measurement: if a box shows `via DERP` for a peer on the same network where it used to be direct, this is the first place to look.
 
 `--netfilter-mode=off` in `extraSetFlags` stays, so that `nixos-fw` is the only thing that writes rules. By default tailscaled installs its own `ts-input` chain: `-A INPUT -j ts-input` before `-A INPUT -j nixos-fw`, with `-A ts-input -i tailscale0 -j ACCEPT` inside it. That accept happens to match the trust given here, but tailscaled re-inserts its jump at the top of `INPUT` whenever it restarts, so a hand-added `iptables -I INPUT 1` is no fix for anything, and the chain would keep a rule outside the declarative firewall. Netfilter mode off also drops tailscaled's anti-spoofing rule for 100.64/10, which the `ts-input` chain used to carry.
 
@@ -46,7 +46,7 @@ Checks in the VM:
 - `sudo iptables -S nixos-fw | grep 'dport 22'` must show exactly one accept, with `-i enp0s1`. The tailnet needs none, because `tailscale0` jumps to `nixos-fw-accept` before the port rules.
 - `ss -a --vsock | grep ':22'` shows `v_str LISTEN *:22` whenever ssh rides vsock. The operator's sessions then appear as `ESTAB 3:22 <-> 2:*` (CID 2 is the host), and `ss -tan` shows no established connection on port 22 during a `yo ssh`. The host's `127.0.0.1:60022` (`ssh.localPort`) is the hostagent's listener on the host side.
 
-Checks from a tailnet device: `ssh <user>@yolobox.<tailnet>.ts.net` must reach sshd and offer keys, and a password prompt is a bug. A service the agent binds on a wildcard address, say `python3 -m http.server 8080`, must answer `curl http://yolobox.<tailnet>.ts.net:8080`. Review the tailnet ACL for the node (see `TODO.md`).
+Checks from a tailnet device: `ssh <user>@yolobox.<tailnet>.ts.net` must reach sshd and offer keys, and a password prompt is a bug. A service the agent binds on a wildcard address, say `python3 -m http.server 8080`, must answer `curl http://yolobox.<tailnet>.ts.net:8080`. Review the tailnet ACL for the node: every node it admits reaches every port of the box (see [Firewall](#firewall)).
 
 ## tailscaled-set
 
@@ -88,7 +88,7 @@ Not tested: whether `yo ssh` drops without the flag. The expectation is that it 
 
 ## Login
 
-Login is interactive and happens once, by the operator, because no auth key exists anywhere in this repo: `yo ssh sudo tailscale up`. It takes no `--hostname`. `extraSetFlags` pins the tailnet name to `networking.hostName`, so every box joins as `yolobox`, and a hand-typed `--hostname` is overwritten by the next `tailscaled-set` run.
+Login is interactive and happens once, by the operator, because no auth key exists anywhere in this repo: `yo ssh sudo tailscale up`. It takes no `--hostname`. `extraSetFlags` pins the tailnet name to `networking.hostName`, so the default machine joins as `yolobox` and `yo -m NAME` machines as `yolobox-<name>` (lowercased; see [Hostname](base.md#hostname)), and a hand-typed `--hostname` is overwritten by the next `tailscaled-set` run. A named machine built before that variable existed was `yolobox` on the tailnet; its next bootstrap renames the node, and `<old>.ts.net` names stop resolving.
 
 `--netfilter-mode=off`, `--accept-dns=false`, `--exit-node-allow-lan-access` and `--hostname` are all non-default, so a bare `tailscale up` on an already logged-in node may refuse with "changing settings via 'tailscale up' requires mentioning all non-default flags". Do not answer that with `tailscale up --reset`, which clears them. Run `yo ssh sudo tailscale up`, then `yo ssh sudo systemctl restart tailscaled-set`, so the unit re-applies the flags.
 

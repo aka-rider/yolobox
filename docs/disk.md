@@ -4,7 +4,7 @@
 
 ## Recognising a full disk
 
-`/tmp` is a directory on `/dev/vda2`, not a tmpfs. So a full disk first shows up as the agent harness dying with `ENOSPC ... mkdir '/tmp/claude-501/...'` before any command runs.
+`/tmp` is a directory on `/dev/vda2`, not a tmpfs. So a full disk first shows up as the agent harness dying with `ENOSPC ... mkdir '/tmp/claude-1000/...'` before any command runs.
 
 Two facts make it survivable. First, ext4 reserves a share of the blocks for root (5% unless tuned), and `df`'s "Avail" column does not count them. The operator's `sudo`, over `yo ssh`, therefore still works while every unprivileged command dies. The agent has no `sudo` at all, so an agent session dying is not evidence either way about how full the disk actually is. Second, `yo ssh` reaches in from the host, which the full disk cannot hurt. That is why the remedy, `yo gc`, lives on the host, and why its machine tier runs first, as the operator.
 

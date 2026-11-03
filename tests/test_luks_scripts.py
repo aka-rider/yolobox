@@ -6,6 +6,8 @@ bash gets the same three options and PATH holds a scratch directory of fake
 tools ahead of the system ones. The fakes append their argv to a log file, so
 the tests read what the scripts did to the disk and to systemd, not how they
 did it.
+
+Tools whose absence skips tests: gawk (the two tests of lima's key program).
 """
 
 import os
@@ -61,7 +63,7 @@ echo "cryptsetup $*" >> "$FAKE_LOG"
 case "$1" in
   isLuks) exit "${FAKE_ISLUKS_RC:-0}" ;;
   luksDump) cat "$FAKE_LUKSDUMP" ;;
-  status) echo "  offset:  32768 sectors" ;;
+  status) echo "${FAKE_STATUS_OFFSET-  offset:  32768 sectors}" ;;
   reencrypt|open) echo "stdin_bytes $(wc -c | tr -d ' ')" >> "$FAKE_LOG" ;;
 esac
 exit 0
@@ -87,7 +89,7 @@ fi
 exit "${FAKE_RESIZE2FS_RC:-0}"
 """,
     "dumpe2fs": """
-echo "Block count:              2000000"
+echo "Block count:              ${FAKE_BLOCK_COUNT:-2000000}"
 echo "Block size:               4096"
 """,
     "blockdev": """
@@ -358,6 +360,37 @@ class TestMigrateNeverOpensTheRealMapping(MigrateScript):
         self.assertTrue(opened[0].endswith(" " + SCRATCH), opened)
 
 
+class TestMigrateRefusesToDiscardOnUnreadableNumbers(MigrateScript):
+    """bash reads "" as 0, which would discard the whole device from byte 0."""
+
+    def setUp(self):
+        super().setUp()
+        self.luks("LUKS header information\n")
+        self.env["FAKE_BLKID_LABEL"] = "other"
+
+    def assertNothingDiscarded(self, result, name):
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertRegex(result.stderr, r"%s is '[^']*', not a positive integer" % name)
+        calls = self.calls()
+        self.assertFalse([c for c in calls if c.startswith("blkdiscard")])
+        self.assertIn("cryptsetup close " + SCRATCH, calls)
+        self.assertFalse([c for c in calls if c.startswith("cryptsetup config")])
+
+    def test_an_offset_cryptsetup_does_not_print_stops_before_the_discard(self):
+        for output in ("", "  offset:  lizard sectors", "  offset:  0 sectors"):
+            with self.subTest(status=output):
+                self.log.write_text("")
+                result = self.run_migrate(FAKE_STATUS_OFFSET=output)
+                self.assertNothingDiscarded(result, "offset_sectors")
+
+    def test_a_filesystem_dumpe2fs_reports_as_empty_stops_before_the_discard(self):
+        for count in ("0", "-5", "x"):
+            with self.subTest(block_count=count):
+                self.log.write_text("")
+                result = self.run_migrate(FAKE_BLOCK_COUNT=count)
+                self.assertNothingDiscarded(result, "filesystem block count")
+
+
 class TestMigrateFinalizeFailures(MigrateScript):
     def setUp(self):
         super().setUp()
@@ -423,6 +456,8 @@ case "$1" in
   is-failed) [ "$state" = failed ] ;;
   is-active) [ "$state" = active ] ;;
   start) echo "$unit" >> "$FAKE_START_LOG"; [ "$state" != failed ] ;;
+  reset-failed) echo "$*" >> "$FAKE_CHANGE_LOG"; rm -f "$FAKE_STATE/$unit" ;;
+  restart) echo "$*" >> "$FAKE_CHANGE_LOG" ;;
 esac
 """,
         )
@@ -439,6 +474,10 @@ for a in "$@"; do
     exec cat <&3
   fi
 done
+if [ -n "${FAKE_JOURNAL_FAILS:-}" ]; then
+  echo "journalctl: cannot read the journal" >&2
+  exit 9
+fi
 cat "$FAKE_JOURNAL_TAIL"
 """,
         )
@@ -481,6 +520,7 @@ printf 'reply %s %s [%s]\\n' "$1" "$2" "$body" >> "$FAKE_REPLY_LOG"
             "YOLOBOX_ASK_DIR": str(self.ask_dir),
             "FAKE_STATE": str(self.state),
             "FAKE_START_LOG": str(self.tmp / "start.log"),
+            "FAKE_CHANGE_LOG": str(self.tmp / "change.log"),
             "FAKE_JOURNAL_FIFO": str(self.tmp / "journal.fifo"),
             "FAKE_INOTIFY_FIFO": str(self.tmp / "inotify.fifo"),
             "FAKE_READY_FIFO": str(self.tmp / "ready.fifo"),
@@ -563,6 +603,11 @@ printf 'reply %s %s [%s]\\n' "$1" "$2" "$body" >> "$FAKE_REPLY_LOG"
 
     def started_units(self):
         log = self.tmp / "start.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def unit_changes(self):
+        """What the helper did to unit state: reset-failed and restart calls."""
+        log = self.tmp / "change.log"
         return log.read_text().splitlines() if log.exists() else []
 
     def replies(self):
@@ -681,9 +726,15 @@ class TestUnlockOutcomes(UnlockScript):
         self.assertIn("encrypting /dev/fake failed", err)
         self.assertNotIn("unlocked", out)
 
-    def test_a_failed_cryptsetup_unit_exits_1_naming_the_passphrase(self):
-        self.set_unit("systemd-cryptsetup@root.service", "failed")
+    def test_a_cryptsetup_unit_that_fails_after_the_answer_exits_1_naming_the_passphrase(
+        self,
+    ):
+        self.write_ask("ask.a")
         self.start()
+        self.wait_until_streams_are_up()
+        self.sync_with_the_loop()
+        self.set_unit("systemd-cryptsetup@root.service", "failed")
+        self.send("journal", "Failed")
         rc, out, err = self.finish()
         self.assertEqual(rc, 1, err)
         self.assertIn("the passphrase does not open /dev/fake", err)
@@ -723,10 +774,22 @@ class TestUnlockOutcomes(UnlockScript):
         self.assertNotIn("unlocked", out)
 
     def test_the_root_mount_is_not_awaited_while_the_disk_is_still_closed(self):
-        self.set_unit("systemd-cryptsetup@root.service", "failed")
         self.start()
+        self.wait_until_streams_are_up()
+        self.set_unit("systemd-cryptsetup@root.service", "failed")
+        self.send("journal", "Failed")
         self.finish()
         self.assertEqual(self.started_units(), [])
+
+    def test_a_failure_inside_a_function_exits_6_naming_the_command(self):
+        self.set_unit("systemd-cryptsetup@root.service", "active")
+        self.set_unit("sysroot.mount", "failed")
+        self.start(FAKE_JOURNAL_FAILS="1")
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 6, err)
+        self.assertIn("unexpected failure (exit 9)", err)
+        self.assertIn("journalctl", err)
+        self.assertNotIn("unlocked", out)
 
     def test_an_empty_passphrase_is_refused_before_anything_starts(self):
         for stdin in ("", "\n"):
@@ -768,6 +831,75 @@ class TestUnlockOutcomes(UnlockScript):
         rc, out, err = self.finish()
         self.assertEqual(rc, 3, err)
         self.assertIn("lost the ask-password watch", err)
+
+
+class TestUnlockAfterAFailedAttempt(UnlockScript):
+    """`yo up` again after a wrong key: the cryptsetup unit is still failed."""
+
+    UNIT = "systemd-cryptsetup@root.service"
+
+    def test_a_unit_failed_at_startup_is_reset_and_started_again_once(self):
+        self.set_unit(self.UNIT, "failed")
+        self.start()
+        self.wait_until_streams_are_up()
+        self.sync_with_the_loop()
+        self.assertIsNone(self.proc.poll(), "judged the old failure as this attempt's")
+        self.assertEqual(
+            self.unit_changes(),
+            ["reset-failed " + self.UNIT, "restart --no-block " + self.UNIT],
+        )
+        self.write_ask("ask.new")
+        self.send("inotify", str(self.ask_dir / "ask.new"))
+        self.wait_for_stdout_line("yolobox-unlock: answered id=%s" % self.ASK_ID)
+        self.set_unit(self.UNIT, "active")
+        self.send("journal", "Finished")
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.unit_changes()), 2)
+
+    def test_a_second_failure_after_the_restart_still_exits_1(self):
+        self.set_unit(self.UNIT, "failed")
+        self.start()
+        self.wait_until_streams_are_up()
+        self.sync_with_the_loop()
+        self.set_unit(self.UNIT, "failed")
+        self.send("journal", "Failed")
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(len(self.unit_changes()), 2)
+
+    def test_a_unit_that_has_not_failed_is_left_alone(self):
+        self.set_unit(self.UNIT, "active")
+        self.start()
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.unit_changes(), [])
+
+    def test_a_failed_migration_is_reported_and_not_restarted(self):
+        self.set_unit("yolobox-luks-migrate.service", "failed")
+        self.set_unit(self.UNIT, "failed")
+        self.start()
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(self.unit_changes(), [])
+
+
+class TestUnlockAskFileRace(UnlockScript):
+    def test_an_ask_entry_that_cannot_be_read_is_skipped_and_the_others_answered(self):
+        # sed exits 4 on a directory, a code the helper documents for another
+        # outcome; a vanished file fails the same way.
+        (self.ask_dir / "ask.a").mkdir()
+        self.write_ask("ask.b", socket="/run/fake/b.sock")
+        self.start()
+        self.wait_until_streams_are_up()
+        self.sync_with_the_loop()
+        self.assertIsNone(self.proc.poll(), "exited on an unreadable ask entry")
+        self.assertEqual(self.replies(), ["reply 1 /run/fake/b.sock [%s]" % PASSPHRASE])
+        self.set_unit("systemd-cryptsetup@root.service", "active")
+        self.send("journal", "Finished")
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("ask.a could not be read, skipped", err)
 
 
 class InitrdKeysScript(unittest.TestCase):

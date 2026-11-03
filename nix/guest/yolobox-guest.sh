@@ -471,13 +471,27 @@ cmd_landing_dir() {
     printf '%s\n' "${d:-$HOME}"
 }
 
+# ensure-repo <dir> [branch]: <dir> becomes a repo of its own that accepts a push
+# to its checked-out branch, HEAD on <branch> (default main) while it has no
+# commit. A push of another branch name would otherwise leave HEAD on an unborn
+# branch and the worktree empty, with no error. The check is on the toplevel,
+# not on --git-dir: that walks up, so a directory inside another repo (or $HOME
+# as a repo) would pass and the push would land in the wrong place. An existing
+# repo is configured too, and its unborn HEAD moved: an earlier yo link left one.
 cmd_ensure_repo() {
     local dir="${1:?ensure-repo requires a directory argument}"
+    local branch="${2:-main}"
+    local real top
     mkdir -p "${dir}"
-    if ! git -C "${dir}" rev-parse --git-dir >/dev/null 2>&1; then
-        git -C "${dir}" init -b main
-        git -C "${dir}" config receive.denyCurrentBranch updateInstead
+    real=$(cd "${dir}" && pwd -P)
+    # Failing outside any repo is the expected answer here, not an error.
+    top=$(git -C "${dir}" rev-parse --show-toplevel 2>/dev/null) || top=
+    if [ "${top}" != "${real}" ]; then
+        git -C "${dir}" init -b "${branch}"
+    elif ! git -C "${dir}" rev-parse -q --verify HEAD >/dev/null; then
+        git -C "${dir}" symbolic-ref HEAD "refs/heads/${branch}"
     fi
+    git -C "${dir}" config receive.denyCurrentBranch updateInstead
 }
 
 cmd_gc_machine() {

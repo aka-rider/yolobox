@@ -7,6 +7,8 @@ fake `curl` ahead of the system tools. Only subcommands that need nothing but
 what macOS and Linux share are exercised, except `gc-user --deep`, which runs
 only where GNU find's `-printf` exists (CI, the guest): the other subcommands
 (`projects`, `gc-machine`) use it or sudo too.
+
+Tools whose absence skips tests: GNU find (the `gc-user` classes).
 """
 
 import os
@@ -159,6 +161,99 @@ class TestLandingDir(GuestScript):
         result = self.run_script("landing-dir", "/yolobox-test-no-such-root/deep")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "%s\n" % self.home)
+
+
+class TestEnsureRepo(GuestScript):
+    def git(self, directory, *args):
+        return subprocess.run(
+            ["git", "-C", str(directory), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=self.env,
+        ).stdout.strip()
+
+    def head(self, directory):
+        return self.git(directory, "symbolic-ref", "--short", "HEAD")
+
+    def commit(self, directory):
+        self.git(
+            directory,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "x",
+        )
+
+    def accepts_pushes_to_the_checked_out_branch(self, directory):
+        probe = subprocess.run(
+            ["git", "-C", str(directory), "config", "receive.denyCurrentBranch"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        return probe.stdout.strip() == "updateInstead"
+
+    def test_a_missing_directory_becomes_a_push_target_on_main(self):
+        target = self.tmp / "new" / "project"
+        result = self.run_script("ensure-repo", str(target))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.head(target), "main")
+        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(target))
+
+    def test_the_branch_the_caller_names_is_the_one_head_is_on(self):
+        target = self.tmp / "project"
+        result = self.run_script("ensure-repo", str(target), "master")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.head(target), "master")
+
+    def test_a_repo_with_commits_keeps_its_branch_and_gains_the_push_setting(self):
+        target = self.tmp / "project"
+        self.git(self.tmp, "init", "-b", "trunk", str(target))
+        self.commit(target)
+        result = self.run_script("ensure-repo", str(target), "main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.head(target), "trunk")
+        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(target))
+
+    def test_an_empty_repo_made_for_another_branch_is_moved_to_the_callers(self):
+        # What an older yo link left behind: HEAD on an unborn main, then a
+        # push of master that is accepted and leaves the worktree empty.
+        target = self.tmp / "project"
+        self.git(self.tmp, "init", "-b", "main", str(target))
+        result = self.run_script("ensure-repo", str(target), "master")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.head(target), "master")
+        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(target))
+
+    def test_a_repo_reached_through_a_symlink_counts_as_existing(self):
+        real = self.tmp / "real"
+        self.git(self.tmp, "init", "-b", "trunk", str(real))
+        self.commit(real)
+        link = self.tmp / "link"
+        link.symlink_to(real)
+        result = self.run_script("ensure-repo", str(link))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.head(real), "trunk")
+        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(real))
+
+    def test_a_directory_inside_another_repo_gets_a_repo_of_its_own(self):
+        outer = self.tmp / "outer"
+        self.git(self.tmp, "init", "-b", "main", str(outer))
+        inner = outer / "sub" / "project"
+        result = self.run_script("ensure-repo", str(inner))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git(inner, "rev-parse", "--show-toplevel"), str(inner))
+        self.assertTrue(self.accepts_pushes_to_the_checked_out_branch(inner))
+
+    def test_no_directory_argument_is_refused(self):
+        result = self.run_script("ensure-repo")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ensure-repo requires a directory argument", result.stderr)
 
 
 FAKE_AWS = """#!/bin/sh

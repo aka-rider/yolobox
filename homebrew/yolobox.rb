@@ -12,12 +12,11 @@ class Yolobox < Formula
 
   def install
     libexec.install "yo", "aws-broker"
+    # macOS runs the Lima driver; the libvirt driver's modules and the Linux host
+    # files stay out.
+    (libexec/"yolobox_cli").install Dir["yolobox_cli/*.py"] - ["yolobox_cli/libvirt.py", "yolobox_cli/libvirt_host.py"]
     (libexec/"lima").install "lima/yolobox.yaml"
-    (libexec/"libvirt").install "libvirt/domain.xml"
-    (libexec/"linux").install "linux/yolobox-host.nft"
-    (libexec/"linux").install "linux/yolobox-host.service"
-    (libexec/"linux").install "linux/host-setup.sh"
-    inreplace libexec/"yo", 'YO_VERSION = "dev"', "YO_VERSION = \"#{version}\""
+    inreplace libexec/"yolobox_cli/config.py", 'YO_VERSION = "dev"', "YO_VERSION = \"#{version}\""
     bin.install_symlink libexec/"yo"
   end
 

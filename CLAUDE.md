@@ -33,7 +33,9 @@ people who change the repo itself. Version 1 was Docker-based.
   private networks, except DNS to the gateway, DHCP and the networks named in
   `yolobox.network.lanAllow`. Traffic out of `tailscale0` is not judged either:
   the tailnet ACL is the gate for what the box reaches there. If the rules fail to load, the box runs in
-  recovery mode: no network, Lima ssh only. Tailscale is optional: a box that
+  recovery mode: no network, Lima ssh only. If even that table fails to load,
+  a last-resort table (loopback, established flows, DHCP) takes its place; the box is
+  without a table only if that fails too, and then it says so loudly. Tailscale is optional: a box that
   never logs in works as before, and `tailscale0` is a trusted interface, so a
   logged-in box is reachable on every port by whatever its tailnet ACL admits.
   A box whose own `/etc/yolobox/local.nix` blocks Lima's gateway by design
@@ -65,7 +67,11 @@ people who change the repo itself. Version 1 was Docker-based.
 
 Mac side:
 
-- `yo`: the CLI, one Python 3.9 file using only the stdlib. `yo.md`.
+- `yo`: the launcher, a few lines that import `yolobox_cli/` and call
+  `cli.entry`. `yolobox_cli/`: the CLI, Python 3.9 and the stdlib only, one
+  module per concern. `yo.md` has the layout. `yolobox_cli/lima.py` is the
+  Mac's driver and ships only to macOS; `yolobox_cli/libvirt.py` and
+  `libvirt_host.py` are the Linux host's and ship only there.
 - `aws-broker`: the credential broker `yo` starts and stops on the Mac.
   `docs/aws.md`.
 - `lima/yolobox.yaml`: instance config, read once at creation.
@@ -73,8 +79,8 @@ Mac side:
 - `homebrew/yolobox.rb`: the brew formula, rendered into the tap on release.
 - `templates/default/`: `devbox.json` for a new project.
 
-Linux host side (the libvirt driver is part of `yo`, see the driver section of
-`yo.md`):
+Linux host side (the libvirt driver is `yolobox_cli/libvirt.py`, see the
+driver section of `yo.md`; brew ships none of this, nix ships it on Linux only):
 
 - `linux/host-setup.sh`: the one script that changes the Linux host
   system-wide, run with sudo. `linux/yolobox-host.nft` and
@@ -96,7 +102,7 @@ Box configuration (Nix):
 - `nix/agentic.nix`: only an imports list for `harnesses.nix`,
   `herd-server.nix` and `display.nix`.
 - `nix/harnesses.nix`: the `claude` launcher and the user service that
-  installs claude, pi, opencode and agent-browser from their vendors.
+  installs claude and pi from their vendors.
   `nix/harnesses.md`.
 - `nix/herd-server.nix`: the VM's own herdr server, run as the agent.
   `nix/herd-server.md`.
@@ -108,11 +114,12 @@ Box configuration (Nix):
   `/etc/yolobox/local.nix`. `nix/hardening.md` journals every item considered,
   kept or rejected.
 - `nix/egress.nix`: the egress nft table that keeps the guest off the host and
-  the LAN, `lanAllow`, and recovery mode. `nix/egress.md`.
+  the LAN, `lanAllow`, and the recovery and last-resort tiers. `nix/egress/`
+  holds the two scripts that load and report the tiers. `nix/egress.md`.
 - `nix/tailscale.nix`: the optional tailnet, with `tailscale0` trusted.
   `nix/tailscale.md`.
 - `nix/podman.nix`: rootless podman with a docker-compatible socket.
-- `nix/lsp.nix`: Python language-server wiring for every editor.
+- `nix/lsp.nix`: Python language-server wiring for Zed.
 - `nix/guest.nix` builds `nix/guest/yolobox-guest.sh` into the
   `yolobox-guest` package, shellchecked, on both accounts' PATH.
 - `nix/lib/`: small shared definitions.
@@ -121,7 +128,6 @@ Box configuration (Nix):
     and `herd-server.nix`.
   - `nix-ld-env.nix`: the two nix-ld variables a glibc binary needs.
   - `home-tmpfiles.nix`: tmpfiles rules that link files into a home.
-  - `claude-hooks-file.nix`: the path of claude's settings file.
   - `basedpyright.nix`: the Python language-server definition.
 - `nix/pkgs/`: packages nixpkgs lacks or lags on.
   - `herdr-bin.nix` (the pinned herdr release asset), `tailscale.nix` (a pin
@@ -140,14 +146,17 @@ Release and repo plumbing:
 Tests, all under `tests/`:
 
 - `test_yo.py`, `test_yo_commands.py`, `test_yo_paths.py`: `yo`'s pure
-  functions, argv builders and path handling.
+  functions, argv builders and path handling. `test_yo.py` also holds
+  `load_yo`, which loads the package as a namespace; patch
+  `yo.<module>.NAME`, never `yo.NAME` (see `yo.md`).
 - `test_aws_broker.py`: the broker's request handler.
 - `test_consistency.py`: keeps the Python, Nix and shell spellings of one
-  fact equal.
+  fact equal, and the package's import and packaging conventions.
 - `test_guest_script.py`: runs the guest script's functions under bash.
 - `test_yo_luks.py`: the passphrase derivation and the ssh agent protocol.
 - `test_egress_rules.py`: runs `tests/egress_rules.py` on the rendered egress
-  rule files in `tests/fixtures/`, and on broken copies. CI diffs the fixtures
+  rule files in `tests/fixtures/`, and on broken copies, and runs the two
+  `nix/egress/` scripts with a fake `nft`. CI diffs the fixtures
   against a fresh render; `render-tunnel-egress.sh` renders the one with
   `tunnelInterfaces`. `nix/egress.md`.
 - `test_luks_scripts.py`: runs the three initrd scripts under bash.
@@ -166,13 +175,16 @@ Tests, all under `tests/`:
   Never run it against a box mid-work. `docs/linux-host.md`.
 - `test_yo_libvirt.py`: the libvirt driver against a fake host.
   `test_yo_instance.py`: `-m/--machine`.
+- A few tests skip when a tool is missing (GNU find, gawk, git, ssh, nix, a
+  Python with `pidfd_open` or `kqueue`). The docstring at the top of each test
+  module names the tools whose absence makes its classes skip.
 
 ## Build, test, release
 
 ```sh
 python3 -m unittest discover -s tests        # CI runs 3.9 and the newest 3.x
 uvx ruff@0.17.2 check . && uvx ruff@0.17.2 format --check .   # see below
-shellcheck -S warning nix/guest/yolobox-guest.sh
+shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh tests/box-libvirt-check.sh   # verify.yml's list
 YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=linux nix flake check --impure
 ```
 
@@ -190,15 +202,18 @@ YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=linux nix flake check --impure
 - Nix needs `YOLOBOX_USERNAME=$(id -un)`, `YOLOBOX_HOST_OS` (`darwin` or
   `linux`, the OS that runs the VM) and `--impure` on every command, because
   the flake has no pure way to learn either host fact. `flake.nix` throws if
-  one is unset. The guest's CPU is the evaluating nix's own system, so check
+  one is unset. A third, `YOLOBOX_HOSTNAME`, is optional: unset means
+  `yolobox`, and a set value must be one lowercase DNS label, else the flake
+  throws. `yo` sets it per machine (`yolobox-<name>` for `-m <name>`). The guest's CPU is the evaluating nix's own system, so check
   the Mac box's aarch64 guest from an x86_64 machine with
   `YOLOBOX_HOST_OS=darwin nix eval --impure --system aarch64-linux ...`.
 - On a local clone, `git add` new files before running nix, which ignores
   untracked files in a git tree.
 - A new `yolobox-guest` subcommand does not exist on a box until the box is
   rebuilt. Calling it earlier exits 64, and `yo` reports a version skew.
-- Keep the literal line `YO_VERSION = "dev"` exactly as written. The Nix
-  build and the brew formula both patch that text.
+- Keep the literal line `YO_VERSION = "dev"` exactly as written, in
+  `yolobox_cli/config.py`. The Nix build and the brew formula both patch that
+  text.
 - A release is a GitHub release published from the tip of `main`. The
   workflow stamps `.version`, moves the tag onto that commit and updates the
   tap. See `.github/workflows/release.md`.

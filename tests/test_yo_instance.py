@@ -5,11 +5,10 @@ import contextlib
 import io
 import json
 import os
-import sys
 import unittest
 from unittest import mock
 
-from test_yo import FakeHome, load_yo, yo
+from test_yo import FakeHome, fake_limactl, load_yo, unload_yo, yo
 
 INSTANCE_B = "second"
 
@@ -19,44 +18,38 @@ def limactl_json(local_port=None, **config):
     return json.dumps({"status": "Stopped", "config": {"ssh": ssh, **config}})
 
 
-def fake_limactl(stdout, returncode=0):
-    return mock.patch.object(
-        yo, "run", return_value=mock.Mock(returncode=returncode, stdout=stdout)
-    )
-
-
 @contextlib.contextmanager
 def as_instance(name):
-    yo.set_instance(name)
+    yo.set_box(yo.box.driver, name)
     try:
         yield
     finally:
-        yo.set_instance(yo.DEFAULT_INSTANCE)
+        yo.set_box(yo.box.driver, yo.DEFAULT_INSTANCE)
 
 
 class TestNamesFollowTheMachine(unittest.TestCase):
     def test_the_default_machine_is_the_box_itself(self):
-        self.assertEqual(yo.INSTANCE, "yolobox")
-        self.assertEqual(yo.VM_HOST, "lima-yolobox")
-        self.assertEqual(yo.HERDR_SSH_ALIAS, "yolobox")
-        self.assertEqual(yo.INCLUDE_LINE, "Include ~/.lima/yolobox/ssh.config")
+        self.assertEqual(yo.box.name, "yolobox")
+        self.assertEqual(yo.box.vm_host, "lima-yolobox")
+        self.assertEqual(yo.box.herdr_alias, "yolobox")
+        self.assertEqual(yo.box.include_line, "Include ~/.lima/yolobox/ssh.config")
         self.assertEqual(yo.SSH_LOCAL_PORT, 60022)
-        self.assertIn("Match host lima-yolobox user agent", yo.EDITOR_SSH_BLOCK)
+        self.assertIn("Match host lima-yolobox user agent", yo.box.editor_ssh_block)
 
     def test_another_instance_gets_its_own_names(self):
         name = "yo_%s" % INSTANCE_B
         try:
             other = load_yo(name)
         finally:
-            sys.modules.pop(name)
-        other.set_instance(INSTANCE_B)
-        self.assertEqual(other.INSTANCE, INSTANCE_B)
-        self.assertEqual(other.VM_HOST, "lima-second")
-        self.assertEqual(other.HERDR_SSH_ALIAS, INSTANCE_B)
-        self.assertEqual(other.INCLUDE_LINE, "Include ~/.lima/second/ssh.config")
-        self.assertTrue(other.lima_dir().endswith(".lima/second"))
-        self.assertIn("Match host lima-second user agent", other.EDITOR_SSH_BLOCK)
-        self.assertIn("~/.lima/second/ssh-agent.sock", other.EDITOR_SSH_BLOCK)
+            unload_yo(name)
+        other.set_box(other.box.driver, INSTANCE_B)
+        self.assertEqual(other.box.name, INSTANCE_B)
+        self.assertEqual(other.box.vm_host, "lima-second")
+        self.assertEqual(other.box.herdr_alias, INSTANCE_B)
+        self.assertEqual(other.box.include_line, "Include ~/.lima/second/ssh.config")
+        self.assertTrue(other.instance_dir().endswith(".lima/second"))
+        self.assertIn("Match host lima-second user agent", other.box.editor_ssh_block)
+        self.assertIn("~/.lima/second/ssh-agent.sock", other.box.editor_ssh_block)
 
     def test_a_name_lima_would_refuse_is_refused_before_anything_runs(self):
         for bad in (
@@ -68,11 +61,22 @@ class TestNamesFollowTheMachine(unittest.TestCase):
             "a--b",
             "_config",
             "lima-second",
+            # Valid for lima, but the box's hostname yolobox-<name> is a DNS label.
+            "has.dot",
+            "has_underscore",
+            "x" * 56,
+            "box\n",
+            "box\n\n",
         ):
             with self.subTest(name=bad):
                 with self.assertRaises(argparse.ArgumentTypeError) as caught:
                     yo.instance_name(bad)
                 self.assertIn("not a usable machine name", str(caught.exception))
+
+    def test_the_longest_name_whose_hostname_is_a_label_is_accepted(self):
+        longest = "x" * 55
+        self.assertEqual(yo.instance_name(longest), longest)
+        self.assertEqual(yo.instance_name("Mixed-Case"), "Mixed-Case")
 
     def test_a_refused_name_exits_2_and_leaves_the_default_machine(self):
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
@@ -80,7 +84,30 @@ class TestNamesFollowTheMachine(unittest.TestCase):
                 yo.main(["-m", "lima-second", "status"])
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("not a usable machine name", stderr.getvalue())
-        self.assertEqual(yo.INSTANCE, yo.DEFAULT_INSTANCE)
+        self.assertEqual(yo.box.name, yo.DEFAULT_INSTANCE)
+
+
+class TestHostnameFollowsTheMachine(unittest.TestCase):
+    """Each machine's box gets its own hostname, so its own tailnet node."""
+
+    def hostname_env(self):
+        (entry,) = [e for e in yo.nix_env("alice") if e.startswith("YOLOBOX_HOSTNAME=")]
+        return entry
+
+    def test_the_default_machine_keeps_the_name_every_box_had(self):
+        self.assertEqual(self.hostname_env(), "YOLOBOX_HOSTNAME=yolobox")
+
+    def test_another_machine_is_yolobox_dash_its_name(self):
+        with as_instance(INSTANCE_B):
+            self.assertEqual(self.hostname_env(), "YOLOBOX_HOSTNAME=yolobox-second")
+
+    def test_the_name_is_lowercased_because_dns_labels_are(self):
+        with as_instance("Second-BOX"):
+            self.assertEqual(self.hostname_env(), "YOLOBOX_HOSTNAME=yolobox-second-box")
+
+    def test_the_libvirt_domain_keeps_its_own_spelling(self):
+        with as_instance("Second"):
+            self.assertEqual(yo.box.vm_name, "yolobox-Second")
 
 
 class TestSeveralInstancesCoexist(FakeHome):
@@ -96,21 +123,21 @@ class TestSeveralInstancesCoexist(FakeHome):
             name = "yo_box%d" % index
             box = load_yo(name)
             if instance is not None:
-                box.set_instance(instance)
+                box.set_box(box.box.driver, instance)
             self.boxes.append(box)
-            self.addCleanup(sys.modules.pop, name)
+            self.addCleanup(unload_yo, name)
         for box in self.boxes:
             self.write_lima_ssh_config(box)
 
     def port_of(self, box):
-        return self.PORTS.get(box.INSTANCE, box.SSH_LOCAL_PORT)
+        return self.PORTS.get(box.box.name, box.SSH_LOCAL_PORT)
 
     def write_lima_ssh_config(self, box):
-        os.makedirs(box.lima_dir())
+        os.makedirs(box.instance_dir())
         with open(box.ssh_cfg(), "w") as handle:
             handle.write(
                 "Host %s\n  Hostname 127.0.0.1\n  Port %d\n"
-                '  IdentityFile "/k/user"\n' % (box.VM_HOST, self.port_of(box))
+                '  IdentityFile "/k/user"\n' % (box.box.vm_host, self.port_of(box))
             )
 
     def read_ssh_config(self, box):
@@ -119,14 +146,14 @@ class TestSeveralInstancesCoexist(FakeHome):
 
     def test_every_derived_name_is_distinct(self):
         for derive in (
-            lambda box: box.INSTANCE,
-            lambda box: box.VM_HOST,
-            lambda box: box.HERDR_SSH_ALIAS,
-            lambda box: box.lima_dir(),
+            lambda box: box.box.name,
+            lambda box: box.box.vm_host,
+            lambda box: box.box.herdr_alias,
+            lambda box: box.instance_dir(),
             lambda box: box.known_hosts_path(),
             lambda box: box.agent_control_path(),
-            lambda box: box.INCLUDE_LINE,
-            lambda box: box.EDITOR_SSH_BLOCK,
+            lambda box: box.box.include_line,
+            lambda box: box.box.editor_ssh_block,
         ):
             values = [derive(box) for box in self.boxes]
             self.assertEqual(len(set(values)), len(self.boxes), values)
@@ -134,14 +161,8 @@ class TestSeveralInstancesCoexist(FakeHome):
     def test_every_instance_reaches_its_own_port(self):
         ports = []
         for box in self.boxes:
-            with mock.patch.object(
-                box,
-                "run",
-                return_value=mock.Mock(
-                    returncode=0, stdout=limactl_json(self.port_of(box))
-                ),
-            ):
-                ports.append(box.ssh_port())
+            with fake_limactl(limactl_json(self.port_of(box)), module=box):
+                ports.append(box.box.driver.ssh_port())
         self.assertEqual(ports, [60022, 60023, 60024])
 
     def test_each_ssh_config_holds_only_its_own_blocks(self):
@@ -149,13 +170,13 @@ class TestSeveralInstancesCoexist(FakeHome):
             box.ensure_agent_ssh_config()
         for box in self.boxes:
             text = self.read_ssh_config(box)
-            self.assertIn(box.EDITOR_SSH_BLOCK, text)
-            self.assertIn("Host %s\n  User agent" % box.HERDR_SSH_ALIAS, text)
+            self.assertIn(box.box.editor_ssh_block, text)
+            self.assertIn("Host %s\n  User agent" % box.box.herdr_alias, text)
             self.assertIn("Port %d" % self.port_of(box), text)
             for other in self.boxes:
                 if other is not box:
-                    self.assertNotIn(other.VM_HOST, text)
-                    self.assertNotIn(".lima/%s/" % other.INSTANCE, text)
+                    self.assertNotIn(other.box.vm_host, text)
+                    self.assertNotIn(".lima/%s/" % other.box.name, text)
 
     def test_rerunning_one_changes_no_file_of_any_instance(self):
         for box in self.boxes:
@@ -179,12 +200,12 @@ class TestSeveralInstancesCoexist(FakeHome):
 class TestSshPort(unittest.TestCase):
     def test_the_default_instance_is_the_constant_and_asks_nobody(self):
         with fake_limactl("") as fake_run:
-            self.assertEqual(yo.ssh_port(), yo.SSH_LOCAL_PORT)
+            self.assertEqual(yo.box.driver.ssh_port(), yo.SSH_LOCAL_PORT)
         fake_run.assert_not_called()
 
     def test_another_instance_reports_the_port_it_was_created_with(self):
         with as_instance(INSTANCE_B), fake_limactl(limactl_json(60023)) as fake_run:
-            self.assertEqual(yo.ssh_port(), 60023)
+            self.assertEqual(yo.box.driver.ssh_port(), 60023)
         self.assertEqual(
             fake_run.call_args.args[0], ["limactl", "list", INSTANCE_B, "--json"]
         )
@@ -203,18 +224,34 @@ class TestSshPort(unittest.TestCase):
             with self.subTest(localPort=label):
                 with as_instance(INSTANCE_B), fake_limactl(stdout):
                     with self.assertRaises(yo.YoError) as caught:
-                        yo.ssh_port()
+                        yo.box.driver.ssh_port()
                 self.assertIn(
                     "limactl create --name second --set '.ssh.localPort=",
                     caught.exception.message,
                 )
 
-    def test_an_instance_limactl_cannot_show_is_an_error(self):
-        for stdout, returncode in (("", 1), ("not json", 0)):
-            with self.subTest(stdout=stdout):
-                with as_instance(INSTANCE_B), fake_limactl(stdout, returncode):
-                    with self.assertRaises(yo.YoError):
-                        yo.ssh_port()
+    def test_an_instance_limactl_does_not_know_is_an_error_naming_the_remedy(self):
+        with as_instance(INSTANCE_B), fake_limactl("", listed=[]):
+            with self.assertRaisesRegex(
+                yo.YoError, "instance second does not exist, so yo cannot learn"
+            ):
+                yo.box.driver.ssh_port()
+
+    def test_a_limactl_that_fails_or_garbles_its_answer_is_not_a_missing_instance(
+        self,
+    ):
+        for stdout, returncode, stderr in (
+            ("", 1, "limactl: permission denied"),
+            ("not json", 0, ""),
+            ("[1, 2]", 0, ""),
+        ):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                with as_instance(INSTANCE_B), fake_limactl(stdout, returncode, stderr):
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.box.driver.ssh_port()
+                self.assertIn("limactl list second --json", caught.exception.message)
+                self.assertIn(stdout or stderr, caught.exception.message)
+                self.assertNotIn("does not exist", caught.exception.message)
 
 
 class TestNothingFallsBackToTheDefaultPortForAnotherInstance(FakeHome):
@@ -226,7 +263,9 @@ class TestNothingFallsBackToTheDefaultPortForAnotherInstance(FakeHome):
 
     def test_the_initrd_probe_refuses_when_the_port_is_unknown(self):
         with as_instance(INSTANCE_B), fake_limactl(limactl_json(0)):
-            with self.assertRaises(yo.YoError):
+            with self.assertRaisesRegex(
+                yo.YoError, "second has ssh\\.localPort 0, which is not a"
+            ):
                 yo.initrd_ssh_argv("true")
 
     def test_every_message_that_names_the_port_names_the_instances(self):
@@ -267,10 +306,12 @@ class TestVmUpOnARunningBoxWithoutSshd(unittest.TestCase):
         )
         with (
             as_instance(INSTANCE_B),
-            mock.patch.object(yo, "lima_config_gaps", return_value=[]),
-            mock.patch.object(yo, "lima_instance_info", return_value=running),
-            mock.patch.object(yo, "stage2_up", return_value=False),
-            mock.patch.object(yo, "initrd_waiting", return_value=False),
+            mock.patch.object(yo.LIMA, "config_gaps", return_value=[]),
+            mock.patch.object(yo.lima, "lima_instance_info", return_value=running),
+            mock.patch.object(yo.unlock, "stage2_up", return_value=False),
+            mock.patch.object(
+                yo.unlock, "sshd_answers", return_value=yo.SshOutcome.NOT_LISTENING
+            ),
         ):
             with self.assertRaises(yo.YoError) as caught:
                 yo.vm_up()
@@ -283,21 +324,21 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
         stubs = {}
         with contextlib.ExitStack() as stack:
             stack.enter_context(as_instance(instance))
-            for name in (
-                "luks_passphrase",
-                "start_and_unlock",
-                "spawn_limactl_start",
-                "ensure_agent_ssh_config",
-                "ensure_guest_known_hosts",
-                "vm_services",
-                "run",
+            for target, name in (
+                (yo.agent, "luks_passphrase"),
+                (yo.LIMA, "start"),
+                (yo.proc, "spawn"),
+                (yo.sshconfig, "ensure_agent_ssh_config"),
+                (yo.guest, "ensure_guest_known_hosts"),
+                (yo.forwards, "vm_services"),
+                (yo.proc, "run"),
             ):
-                stubs[name] = stack.enter_context(mock.patch.object(yo, name))
+                stubs[name] = stack.enter_context(mock.patch.object(target, name))
             stack.enter_context(
-                mock.patch.object(yo, "lima_config_gaps", return_value=[])
+                mock.patch.object(yo.LIMA, "config_gaps", return_value=[])
             )
             stack.enter_context(
-                mock.patch.object(yo, "lima_instance_info", return_value=None)
+                mock.patch.object(yo.lima, "lima_instance_info", return_value=None)
             )
             try:
                 yo.vm_up()
@@ -309,15 +350,15 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
         error, stubs = self.vm_up(INSTANCE_B)
         self.assertIn("limactl create --name second", error.message)
         stubs["luks_passphrase"].assert_not_called()
-        stubs["start_and_unlock"].assert_not_called()
-        stubs["spawn_limactl_start"].assert_not_called()
+        stubs["start"].assert_not_called()
+        stubs["spawn"].assert_not_called()
         stubs["run"].assert_not_called()
 
     def test_the_default_instance_is_still_created_when_missing(self):
         error, stubs = self.vm_up(yo.DEFAULT_INSTANCE)
         self.assertIsNone(error)
         stubs["luks_passphrase"].assert_called_once_with()
-        stubs["start_and_unlock"].assert_called_once()
+        stubs["start"].assert_called_once()
 
 
 class TestVmUpOnALimaConfigGap(unittest.TestCase):
@@ -325,21 +366,23 @@ class TestVmUpOnALimaConfigGap(unittest.TestCase):
         notes = []
         with contextlib.ExitStack() as stack:
             stack.enter_context(as_instance(yo.DEFAULT_INSTANCE))
-            for name in (
-                "luks_passphrase",
-                "ensure_agent_ssh_config",
-                "ensure_guest_known_hosts",
-                "vm_services",
+            for module, name in (
+                (yo.agent, "luks_passphrase"),
+                (yo.sshconfig, "ensure_agent_ssh_config"),
+                (yo.guest, "ensure_guest_known_hosts"),
+                (yo.forwards, "vm_services"),
             ):
-                stack.enter_context(mock.patch.object(yo, name))
+                stack.enter_context(mock.patch.object(module, name))
             stack.enter_context(
-                mock.patch.object(yo, "lima_config_gaps", return_value=[yo.GAP_MOUNTS])
+                mock.patch.object(yo.LIMA, "config_gaps", return_value=[yo.GAP_MOUNTS])
             )
             stack.enter_context(
-                mock.patch.object(yo, "lima_instance_info", return_value=None)
+                mock.patch.object(yo.lima, "lima_instance_info", return_value=None)
             )
-            stack.enter_context(mock.patch.object(yo, "err", side_effect=notes.append))
-            start = stack.enter_context(mock.patch.object(yo, "start_and_unlock"))
+            stack.enter_context(
+                mock.patch.object(yo.ui, "err", side_effect=notes.append)
+            )
+            start = stack.enter_context(mock.patch.object(yo.LIMA, "start"))
             yo.vm_up()
         start.assert_called_once()
         self.assertEqual(len(notes), 1)
@@ -351,8 +394,19 @@ class TestRemediesNameTheMachine(FakeHome):
         self.assertEqual(yo.yo_cmd("up"), "yo up")
         self.assertEqual(yo.yo_cmd("gc", "--deep", "--yes"), "yo gc --deep --yes")
 
+    def test_the_not_up_hint_asks_about_the_machine_it_names(self):
+        self.assertEqual(
+            yo.not_up_hint("cannot reach the VM"),
+            "cannot reach the VM — is it up? yo status",
+        )
+        with as_instance("box2"):
+            self.assertEqual(
+                yo.not_up_hint("cannot read x", parenthesized=True),
+                "cannot read x — is it up? (yo -m box2 status)",
+            )
+
     def test_another_machine_is_named_in_the_remedies(self):
-        with as_instance("box2"), mock.patch.object(yo, "YO_VERSION", "1.0.0"):
+        with as_instance("box2"), mock.patch.object(yo.config, "YO_VERSION", "1.0.0"):
             self.assertEqual(yo.yo_cmd("up"), "yo -m box2 up")
             self.assertIn("yo -m box2 bootstrap", yo.version_drift("1.0.0", "0.9.0"))
             self.assertTrue(yo.rebuild_hint().startswith("yo -m box2 ssh "))

@@ -1,7 +1,7 @@
 table inet yolobox-egress
 delete table inet yolobox-egress
 table inet yolobox-egress {
-  chain output {
+  chain output_recovery {
     type filter hook output priority -20; policy accept;
     oifname "lo" accept
     ct direction reply accept

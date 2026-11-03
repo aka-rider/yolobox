@@ -1,14 +1,15 @@
 """Checks on the rendered egress rule files (nix/egress.md).
 
 The rule files are what the kernel runs, so this reads their text and not the
-Nix that builds them. `check_rules`, `check_tunnel_rules` and `check_recovery`
-raise `RuleError` at the first property a file lacks. The host has no nix, so
+Nix that builds them. `check_rules`, `check_tunnel_rules`, `check_recovery` and
+`check_lastresort` raise `RuleError` at the first property a file lacks. The host has no nix, so
 the unit tests feed them fixtures copied from a render
 (tests/test_egress_rules.py); CI runs this file against a fresh render, and
 diffs the fixtures against it so they cannot drift
 (.github/workflows/verify.yml):
 
-    python3 tests/egress_rules.py <egressRules> <egressRecoveryRules> <tunnel egressRules>
+    python3 tests/egress_rules.py <egressRules> <egressRecoveryRules> \\
+        <egressLastResortRules> <tunnel egressRules>
 """
 
 import re
@@ -17,6 +18,8 @@ import sys
 TABLE = "inet yolobox-egress"
 HOOK = "type filter hook output priority -20; policy accept;"
 POSTROUTING_HOOK = "type filter hook postrouting priority -20; policy accept;"
+# The last-resort chain denies by policy and has no reject rule to get wrong.
+DROP_HOOK = "type filter hook output priority -20; policy drop;"
 GATEWAY = "192.168.5.2"
 
 LO_AND_TAILNET = 'oifname { "lo", "tailscale0" } accept'
@@ -29,6 +32,9 @@ TUNNEL_IFACES = re.compile(
 REWRITTEN = "ct status dnat accept"
 LO = 'oifname "lo" accept'
 REPLY = "ct direction reply accept"
+ESTABLISHED = "ct state established,related accept"
+# The last-resort tier names no destination (nix/egress.md).
+DHCP_ANY = "udp sport 68 udp dport 67 accept"
 DHCP = "udp sport 68 udp dport 67 ip daddr { 255.255.255.255, %s } accept" % GATEWAY
 DNS = [
     "ip daddr %s udp dport 53 accept" % GATEWAY,
@@ -89,20 +95,29 @@ def chains(text):
     return found
 
 
+# The chain name tells `yo status` which tier is loaded (nix/egress.md), so the
+# name is part of what a file must have.
+HOOKS = {
+    "output": HOOK,
+    "postrouting": POSTROUTING_HOOK,
+    "output_recovery": HOOK,
+    "output_lastresort": DROP_HOOK,
+}
+
+
 def chain_rules(found, names):
-    """The rules of the output chain, after checking the file has exactly
-    `names` and that each hooks at priority -20."""
+    """The rules of the first chain in `names`, after checking the file has
+    exactly `names` and that each hooks at priority -20 with its policy."""
     require(
         sorted(found) == sorted(names),
         "the chains are %s, not %s" % (sorted(found), sorted(names)),
     )
-    hooks = {"output": HOOK, "postrouting": POSTROUTING_HOOK}
     for name in names:
         require(
-            found[name][:1] == [hooks[name]],
-            "chain %s is not a filter hook at priority -20, policy accept" % name,
+            found[name][:1] == [HOOKS[name]],
+            "chain %s is not %s" % (name, HOOKS[name]),
         )
-    return found["output"][1:]
+    return found[names[0]][1:]
 
 
 def blocked_set(rule, family, ending):
@@ -190,7 +205,7 @@ def check_blocked(tail, prefix, verdict):
 
 def check_recovery(text):
     """The recovery file: only lo, replies, DHCP and ND, then an unconditional reject."""
-    rules = chain_rules(chains(text), ["output"])
+    rules = chain_rules(chains(text), ["output_recovery"])
     require(
         rules[:-2] == [LO, REPLY, DHCP, ND],
         "recovery accepts something other than lo, replies, DHCP and ND",
@@ -202,18 +217,33 @@ def check_recovery(text):
     require(rules[-1] == REJECT, "recovery does not end with an unconditional reject")
 
 
+def check_lastresort(text):
+    """The last-resort file: drop by policy, and accept only lo, packets of
+    established and related flows, and DHCP. Nothing else, and no `ct
+    direction`, so no statement in it is one the recovery file's failure could
+    also have broken."""
+    rules = chain_rules(chains(text), ["output_lastresort"])
+    require(
+        rules == [LO, ESTABLISHED, DHCP_ANY],
+        "the last-resort tier accepts something other than lo, established"
+        " flows and DHCP: %s" % rules,
+    )
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    if len(sys.argv) != 5:
         sys.exit(
             "usage: egress_rules.py <egressRules> <egressRecoveryRules>"
-            " <tunnel egressRules>"
+            " <egressLastResortRules> <tunnel egressRules>"
         )
-    rules_path, recovery_path, tunnel_path = sys.argv[1:]
+    rules_path, recovery_path, lastresort_path, tunnel_path = sys.argv[1:]
     try:
         with open(rules_path) as f:
             check_rules(f.read())
         with open(recovery_path) as f:
             check_recovery(f.read())
+        with open(lastresort_path) as f:
+            check_lastresort(f.read())
         with open(tunnel_path) as f:
             check_tunnel_rules(f.read())
     except RuleError as e:
