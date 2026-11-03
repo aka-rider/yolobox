@@ -1435,6 +1435,7 @@ class TestEntryExitCodes(unittest.TestCase):
 
 class TestCmdEnterArgv(FakeHome):
     def enter(self, stdin_tty=True, stdout_tty=True):
+        args = yo.build_parser().parse_args(["enter"])
         fake_stdin, fake_stdout = mock.Mock(), mock.Mock()
         fake_stdin.isatty.return_value = stdin_tty
         fake_stdout.isatty.return_value = stdout_tty
@@ -1445,7 +1446,7 @@ class TestCmdEnterArgv(FakeHome):
             mock.patch.object(yo.session, "target_dir", return_value=yo.AGENT_HOME),
             mock.patch.object(yo.proc, "exec_process") as self.exec,
         ):
-            yo.cmd_enter(yo.build_parser().parse_args(["enter"]))
+            yo.cmd_enter(args)
         return list(self.exec.call_args[0][0])
 
     def test_a_pty_is_requested_on_a_terminal(self):
