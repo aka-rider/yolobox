@@ -15,6 +15,9 @@ DEFAULT_INSTANCE = "yolobox"
 # YOLOBOX_HOSTNAME; tests/test_consistency.py keeps the two equal. fullmatch only.
 HOSTNAME_LABEL_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
+# The operator's uid inside the guest on every host: lima-init's cidata
+# account, declared in nix/base.nix and checked by yolobox-guest rebuild.
+OPERATOR_GUEST_UID = 501
 AGENT_USER = "agent"
 AGENT_HOME = "/home/agent"
 HELPER = "yolobox-guest"

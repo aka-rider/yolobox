@@ -174,10 +174,10 @@ Fork it and change whatever you like.
 To add tools you use every day, like `neovim` or `emacs`, put them in `/etc/yolobox/local.nix` inside the VM and rebuild:
 
 ```bash
-sudo YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=darwin YOLOBOX_FLAKE_REF=github:aka-rider/yolobox/v<version> nixos-rebuild switch --impure --flake 'github:aka-rider/yolobox/v<version>#yolobox'
+yolobox-guest rebuild switch
 ```
 
-`YOLOBOX_HOST_OS` names the OS that runs the VM: `darwin` for a Mac, `linux` for a Linux PC. `YOLOBOX_FLAKE_REF` is the ref you build from (the same one as in `--flake`, without `#yolobox`); the box stamps it into `/etc/yolobox/flake-ref`, so leaving it out fails the rebuild instead of silently losing the stamp. For a machine made with `yo -m NAME`, add `YOLOBOX_HOSTNAME=yolobox-NAME` too (lowercase), or the rebuild renames the box back to `yolobox`; leave it out for the default machine.
+It rebuilds from the flake ref the last build stamped into `/etc/yolobox/flake-ref`, with the box's own name from `/etc/yolobox/hostname`. For a box built from a release that is the same release; for a box built from a branch it is that branch's current tip, which may have moved since. Use `boot` instead of `switch` to apply the change at the next boot. To move the box to another release, run `yo bootstrap --version <version>` on the host.
 
 Lima reads `lima/yolobox.yaml` only once, when it creates the VM, so editing that file later changes nothing. To give an existing VM more memory or CPUs:
 

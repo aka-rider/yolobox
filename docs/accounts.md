@@ -4,7 +4,7 @@ The VM has two accounts so that every AI coding session runs with no path to roo
 
 ## Two accounts
 
-Lima creates a guest account named and uid-matched after the Mac account that started the VM. That account is the **operator's**, and only the operator's. `nix/base.nix` declares it as `users.users.${username}` rather than inventing one. `flake.nix` only threads `username` in, and since Nix has no pure way to learn the name, `YOLOBOX_USERNAME=$(id -un)` plus `--impure` carries it in on every `nixos-rebuild`, next to `YOLOBOX_HOST_OS` (`darwin` or `linux`), which `base.nix` reads to tell a Lima box from a libvirt one. The operator is the only account in `wheel`, so it is the only one `security.sudo.wheelNeedsPassword = false` covers. It is the account behind `yo ssh`, `yo disk-grow`, `yo bootstrap`, the machine tier of `yo gc`, and any manual `nixos-rebuild`.
+Lima creates a guest account named and uid-matched after the Mac account that started the VM. That account is the **operator's**, and only the operator's. `nix/base.nix` declares it as `users.users.${username}` rather than inventing one. `flake.nix` only threads `username` in, and since Nix has no pure way to learn the name, `YOLOBOX_USERNAME=$(id -un)` plus `--impure` carries it in on every `nixos-rebuild`. The operator is the only account in `wheel`, so it is the only one `security.sudo.wheelNeedsPassword = false` covers. It is the account behind `yo ssh`, `yo disk-grow`, `yo bootstrap`, the machine tier of `yo gc`, and `yolobox-guest rebuild`, the rebuild run inside the box, which refuses any other account.
 
 Lima >= 2.1.0 names the operator's home `/home/<user>.guest` (it was `/home/<user>.linux` before; lima-vm/lima#4578).
 

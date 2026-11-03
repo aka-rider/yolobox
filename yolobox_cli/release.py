@@ -25,6 +25,16 @@ GIT_REF_RE = re.compile(GIT_REF_PATTERN)
 GITHUB_FLAKE_RE = re.compile(
     r"github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/%s" % GIT_REF_PATTERN
 )
+# GitHub owner and repo names are case-insensitive, so the upstream release
+# check must be too.
+UPSTREAM_RELEASE_RE = re.compile(
+    re.escape(UPSTREAM_FLAKE) + r"/v(\d+)\.(\d+)\.(\d+)", re.IGNORECASE
+)
+
+# The first release whose flake never asks for the host OS. An older release's
+# flake throws unless YOLOBOX_HOST_OS is darwin or linux, and this yo no longer
+# passes it, so it cannot build one (nix/base.md#no-host-os-in-the-guest).
+FIRST_HOST_OS_FREE_RELEASE = (1, 9, 2)
 
 
 def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
@@ -40,14 +50,70 @@ def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
 def flake_ref(version: Optional[str]) -> str:
     """The flake ref `bootstrap --version VERSION` builds the box from."""
     if version is None:
-        if config.YO_VERSION == "dev":
+        own = own_release_ref()
+        if own is None:
             raise YoError(
-                "this is an unreleased build with no pinned flake — pass --version "
-                "with what the VM should build from (e.g. %s, "
+                "this yo (%s) is an unreleased build with no release it can build — "
+                "pass --version with what the VM should build from (e.g. %s, "
                 "or a flake ref such as github:you/yolobox/branch)"
-                % state.yo_cmd("bootstrap", "--version", "my-branch")
+                % (
+                    config.YO_VERSION,
+                    state.yo_cmd("bootstrap", "--version", "my-branch"),
+                )
             )
-        return "%s/v%s" % (UPSTREAM_FLAKE, config.YO_VERSION)
+        return own
+    ref = named_flake_ref(version)
+    old = old_release(ref)
+    if old is not None:
+        raise YoError(
+            "cannot build release %s, %s — build it with that release's own yo "
+            "instead, %s" % (old, OLD_RELEASE_WHY, old_release_yo(old))
+        )
+    return ref
+
+
+def own_release_ref() -> Optional[str]:
+    """This yo's own release ref; None for an unreleased build, which has none
+    it can build: `dev`, or a build of main whose .version still names a
+    release that predates FIRST_HOST_OS_FREE_RELEASE."""
+    if config.YO_VERSION == "dev":
+        return None
+    ref = "%s/v%s" % (UPSTREAM_FLAKE, config.YO_VERSION)
+    return None if old_release(ref) is not None else ref
+
+
+# Why old_release() refs are refused, worded to follow "release X".
+OLD_RELEASE_WHY = (
+    "whose flake needs the host OS, which this yo no longer passes "
+    "(every release before %s does)"
+    % ".".join(str(part) for part in FIRST_HOST_OS_FREE_RELEASE)
+)
+
+
+def old_release(ref: str) -> Optional[str]:
+    """The X.Y.Z of `ref` when it is an upstream release that predates
+    FIRST_HOST_OS_FREE_RELEASE; None for any other ref. A branch or a fork's
+    ref carries no version, so it cannot be checked here (docs/distribution.md)."""
+    release = UPSTREAM_RELEASE_RE.fullmatch(ref)
+    if release is None:
+        return None
+    parts = tuple(int(part) for part in release.groups())
+    if parts >= FIRST_HOST_OS_FREE_RELEASE:
+        return None
+    return ".".join(str(part) for part in parts)
+
+
+def old_release_yo(version: str) -> str:
+    """The command that bootstraps this machine with release `version`'s own yo."""
+    return "nix run %s/v%s -- %s" % (
+        UPSTREAM_FLAKE,
+        version,
+        state.yo_cmd("bootstrap")[len("yo ") :],
+    )
+
+
+def named_flake_ref(version: str) -> str:
+    """The flake ref a --version value names, before any release check."""
     release = RELEASE_VERSION_RE.fullmatch(version)
     if release:
         return "%s/v%s" % (UPSTREAM_FLAKE, release.group(1))
@@ -89,6 +155,24 @@ def remembered_flake_ref() -> Optional[str]:
 
 def rebuild_hint() -> str:
     ref = remembered_flake_ref()
+    old = old_release(ref) if ref is not None else None
+    if old is not None:
+        # A command naming that ref would fail in the old flake, and one naming
+        # this yo's release would silently move the box: offer both instead.
+        if own_release_ref() is not None:
+            move = "run %s to move the box to this yo's release" % state.yo_cmd(
+                "bootstrap"
+            )
+        else:
+            move = "run %s to move the box to a ref this yo can build" % (
+                state.yo_cmd("bootstrap", "--version", "<ref>")
+            )
+        return "%s, or %s to keep it on release %s, %s" % (
+            move,
+            old_release_yo(old),
+            old,
+            OLD_RELEASE_WHY,
+        )
     if ref is not None:
         try:
             ref = flake_ref(ref)
@@ -138,13 +222,12 @@ def host_user() -> str:
 
 
 # The variables every nix command on the box needs: flake.nix throws without the
-# first two and the fourth (the fourth is stamped into /etc/yolobox/flake-ref),
-# and falls back to "yolobox" without the third, which would rename an -m
-# machine back at its next rebuild. `username` is a value or a shell
-# expression, as the caller needs; `ref` is a full github:OWNER/REPO/REF, as
-# flake_ref returns.
+# first and the third (the third is stamped into /etc/yolobox/flake-ref), and
+# falls back to "yolobox" without the second, which would rename an -m machine
+# back at its next rebuild. `username` is a value or a shell expression, as the
+# caller needs; `ref` is a full github:OWNER/REPO/REF, as flake_ref returns.
+# yolobox-guest's `rebuild` sets the same three, from the box's own stamps.
 NIX_ENV_USERNAME = "YOLOBOX_USERNAME"
-NIX_ENV_HOST_OS = "YOLOBOX_HOST_OS"
 NIX_ENV_HOSTNAME = "YOLOBOX_HOSTNAME"
 NIX_ENV_FLAKE_REF = "YOLOBOX_FLAKE_REF"
 
@@ -152,7 +235,6 @@ NIX_ENV_FLAKE_REF = "YOLOBOX_FLAKE_REF"
 def nix_env(username: str, ref: str) -> List[str]:
     return [
         "%s=%s" % (NIX_ENV_USERNAME, username),
-        "%s=%s" % (NIX_ENV_HOST_OS, state.driver().host_os),
         "%s=%s" % (NIX_ENV_HOSTNAME, state.box.hostname),
         "%s=%s" % (NIX_ENV_FLAKE_REF, ref),
     ]

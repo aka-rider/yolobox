@@ -817,8 +817,70 @@ class TestGuestSubcommandsMatchTheCaseTable(unittest.TestCase):
     def test_every_subcommand_yo_invokes_exists_in_the_guest_script(self):
         self.assertEqual(self.invoked_by_yo() - self.case_labels(), set())
 
+    # Subcommands a person runs inside the box, never `yo`: `rebuild` reads the
+    # box's own stamps, and `yo bootstrap` passes the host's facts instead.
+    RUN_INSIDE_THE_BOX = {"rebuild"}
+
     def test_every_guest_script_subcommand_is_invoked_by_yo(self):
-        self.assertEqual(self.case_labels() - self.invoked_by_yo(), set())
+        self.assertEqual(
+            self.case_labels() - self.invoked_by_yo() - self.RUN_INSIDE_THE_BOX, set()
+        )
+
+    def test_a_subcommand_run_inside_the_box_is_in_the_case_table(self):
+        self.assertEqual(self.RUN_INSIDE_THE_BOX - self.case_labels(), set())
+
+
+def guest_script_function(name: str) -> str:
+    text = GUEST_SCRIPT.read_text()
+    start = text.index("\n%s() {\n" % name)
+    return text[start : text.index("\n}\n", start)]
+
+
+def guest_script_constant(name: str) -> str:
+    found = re.search(r"^%s=(.*)$" % re.escape(name), GUEST_SCRIPT.read_text(), re.M)
+    assert found, "the guest script has no constant %s" % name
+    return found.group(1).strip("'\"")
+
+
+class TestGuestRebuildMatchesYoAndTheBox(unittest.TestCase):
+    """`yolobox-guest rebuild` repeats facts yo and base.nix own: the flake ref
+    shape, the nix variables and the operator's uid."""
+
+    def test_the_flake_ref_shape_is_yos(self):
+        self.assertEqual(
+            guest_script_constant("FLAKE_REF_RE"), yo.GITHUB_FLAKE_RE.pattern
+        )
+
+    def test_the_rebuild_sets_exactly_the_variables_yo_sets(self):
+        names = set(
+            re.findall(r'"(YOLOBOX_[A-Z_]+)=', guest_script_function("cmd_rebuild"))
+        )
+        yo_names = {
+            value
+            for name, value in vars(yo.release).items()
+            if name.startswith("NIX_ENV_")
+        }
+        self.assertTrue(yo_names)
+        self.assertEqual(names, yo_names)
+
+    def test_the_operator_uid_is_yos_and_base_nixs(self):
+        uid = int(guest_script_constant("OPERATOR_UID"))
+        self.assertEqual(uid, yo.config.OPERATOR_GUEST_UID)
+        block = re.search(
+            r"users\.users\.\$\{username\} = \{(.*?)\n  \};",
+            (REPO / "nix" / "base.nix").read_text(),
+            re.S,
+        )
+        self.assertIsNotNone(block, "base.nix declares no operator account")
+        self.assertEqual("uid = %d;" % uid, re.search(r"uid = \d+;", block.group(1))[0])
+
+    def test_the_stamps_the_rebuild_reads_are_the_ones_base_nix_writes(self):
+        body = guest_script_function("cmd_rebuild")
+        read = set(re.findall(r'read_stamp "\$\{YOLOBOX_STAMPS\}/([a-z-]+)"', body))
+        base = (REPO / "nix/base.nix").read_text()
+        self.assertEqual(read, {"flake-ref", "hostname"})
+        for name in read:
+            self.assertIn('environment.etc."yolobox/%s".text' % name, base)
 
 
 class TestGuestProfilePatternMatchesYo(unittest.TestCase):
@@ -1326,20 +1388,32 @@ class TestHostTableBlocksWhatTheGuestTableBlocks(unittest.TestCase):
         )
 
 
-class TestHostOsValuesHaveOneSpelling(unittest.TestCase):
-    def test_flake_accepts_exactly_the_host_os_of_the_drivers(self):
-        text = (REPO / "flake.nix").read_text()
-        accepted = re.search(r'if h == "(\w+)" \|\| h == "(\w+)" then h', text)
-        self.assertIsNotNone(accepted, "flake.nix does not check YOLOBOX_HOST_OS")
-        self.assertEqual(
-            set(accepted.groups()),
-            {yo.LimaDriver.host_os, yo.LibvirtDriver.host_os},
-        )
+class TestTheGuestNeverLearnsTheHostOs(unittest.TestCase):
+    """Each setting that differs between hosts gates on the fact it needs, never
+    on which OS runs the VM (nix/base.md, "No host OS in the guest")."""
 
-    def test_yo_names_the_variable_flake_reads(self):
-        self.assertIn(
-            'builtins.getEnv "%s"' % yo.NIX_ENV_HOST_OS,
-            (REPO / "flake.nix").read_text(),
+    SPELLINGS = ("YOLOBOX_HOST_OS", "hostOs", "host-os")
+
+    def box_sources(self):
+        nix = REPO / "nix"
+        return [
+            REPO / "flake.nix",
+            *sorted(nix.rglob("*.nix")),
+            *sorted(nix.rglob("*.sh")),
+        ]
+
+    def test_no_box_source_names_the_host_os(self):
+        sources = self.box_sources()
+        self.assertIn(GUEST_SCRIPT, sources)
+        for path in sources:
+            text = path.read_text()
+            for spelling in self.SPELLINGS:
+                with self.subTest(path=str(path.relative_to(REPO)), spelling=spelling):
+                    self.assertNotIn(spelling, text)
+
+    def test_yo_passes_nix_no_host_os(self):
+        self.assertNotIn(
+            "YOLOBOX_HOST_OS", " ".join(yo.nix_env("alice", "github:x/y/z"))
         )
 
 

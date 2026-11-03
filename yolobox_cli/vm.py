@@ -39,7 +39,7 @@ def vm_up(
     size: Size = NO_SIZE,
 ) -> Optional[bytes]:
     gaps = state.driver().config_gaps()
-    if gaps and state.driver().gaps_are_fatal:
+    if state.driver().fatal_gaps(gaps):
         raise YoError(state.driver().config_gap_message(gaps))
     if gaps:
         ui.err("yo: %s" % state.driver().config_gap_message(gaps))

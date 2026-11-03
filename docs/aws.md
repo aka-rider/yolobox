@@ -67,7 +67,7 @@ The Mac-side half still has to be kept in sync by hand:
 - `AGENT_AWS_BROKER_SOCK` in `yolobox_cli/config.py`, the target of its health probe. `TestAgentEnvMatchesYoSockets` checks it against `agent-env.nix`.
 - `lima/yolobox.yaml`, the one-time seed for a new instance. `TestLimaYamlMatchesPortForwardsConstant` checks it against `LIMA_PORT_FORWARDS`.
 
-On an existing instance, `LimaDriver.config_gaps()` catches the lima side drifting at every `vm_up()`. It prints a stderr note and never refuses, since the healing step adds the forward live regardless (see [Checking a running instance](../lima/yolobox.md#checking-a-running-instance)).
+On an existing instance, `LimaDriver.config_gaps()` catches the lima side drifting at every `vm_up()`. For a missing socket forward it prints a stderr note and does not refuse, since the healing step adds the forward live regardless (see [Checking a running instance](../lima/yolobox.md#checking-a-running-instance)).
 
 ## Broker lifetime
 

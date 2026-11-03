@@ -47,6 +47,7 @@ from .config import (
     LOOPBACK,
     MIN_DISK_GIB,
     MIN_MEMORY_GIB,
+    OPERATOR_GUEST_UID,
     SCRIPT_DIR,
 )
 from .driver import RUNNING, Size
@@ -63,8 +64,6 @@ from .ui import YoError
 LIBVIRT_POOL = "default"
 # The 1Password item whose public key is the operator's login, in cidata.
 OPERATOR_KEY_ITEM = "yolobox-operator"
-# lima-init's cidata account: the operator inside the guest (nix/base.nix).
-OPERATOR_GUEST_UID = 501
 OPERATOR_ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]*")
 # A box's size when `yo up` is given no --memory or --disk (domain_size).
 LIBVIRT_MEMORY_GIB = 16
@@ -427,12 +426,9 @@ def volume_names() -> List[str]:
 class LibvirtDriver:
     """Linux: one libvirt domain per machine, on the system connection."""
 
-    host_os = "linux"
     name = "libvirt"
     instances_dir = ".local/state/yolobox/instances"
     start_command = "virsh start"
-    # A domain that is not what the template made may hold a path to the host.
-    gaps_are_fatal = True
 
     @property
     def initrd_identity(self) -> str:
@@ -587,6 +583,10 @@ class LibvirtDriver:
             "this command again, which adopts the disk"
             % (state.box.name, flags, redefine_command())
         )
+
+    def fatal_gaps(self, gaps: Sequence[str]) -> List[str]:
+        # A domain that is not what the template made may hold a path to the host.
+        return list(gaps)
 
     def host_gaps(self) -> List[str]:
         gap = libvirt_host.passt_dir_gap()

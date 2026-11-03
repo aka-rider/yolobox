@@ -1464,12 +1464,15 @@ class TestStatusAndGaps(LibvirtCase):
                 call()
             self.assertIn("TODO.md", caught.exception.message)
 
-    def test_the_nix_commands_name_the_linux_host(self):
-        self.assertIn(
-            "YOLOBOX_HOST_OS=linux", self.box.nix_env("alice", "github:x/y/z")
-        )
-        self.assertIn(
-            "YOLOBOX_HOSTNAME=yolobox-box", self.box.nix_env("alice", "github:x/y/z")
+    def test_the_nix_commands_name_the_machine_and_never_the_host_os(self):
+        env = self.box.nix_env("alice", "github:x/y/z")
+        self.assertEqual(
+            env,
+            [
+                "YOLOBOX_USERNAME=alice",
+                "YOLOBOX_HOSTNAME=yolobox-box",
+                "YOLOBOX_FLAKE_REF=github:x/y/z",
+            ],
         )
 
 
@@ -1833,11 +1836,6 @@ class TestVmUpWithAGap(LibvirtCase):
             "everything on it is lost: %s" % self.driver.delete_command(),
             caught.exception.message,
         )
-
-    def test_only_the_libvirt_driver_stops_on_a_gap(self):
-        self.assertTrue(self.driver.gaps_are_fatal)
-        self.assertFalse(load_yo("yo_mac_gap").LIMA.gaps_are_fatal)
-        self.addCleanup(unload_yo, "yo_mac_gap")
 
 
 SS_LINE = (
@@ -2525,10 +2523,10 @@ class TestSeed(LibvirtCase):
 
 
 class TestDriverChoice(unittest.TestCase):
-    def test_linux_gets_the_libvirt_driver_and_names_itself_in_nix_commands(self):
+    def test_linux_gets_the_libvirt_driver(self):
         box, name = load_libvirt_yo()
         self.addCleanup(unload_yo, name)
-        self.assertEqual(box.driver_for("linux").host_os, "linux")
+        self.assertIsInstance(box.driver_for("linux"), box.LibvirtDriver)
         self.assertIsInstance(box.box.driver, box.LibvirtDriver)
 
     def test_the_instance_dir_is_under_the_state_dir(self):

@@ -14,7 +14,20 @@
 - `gc-machine` runs as the operator, because ext4's root reserve, which makes any of this recoverable on a genuinely full disk, is the operator's alone.
 - `net-check` runs as the operator too, the one account every box has, however far its agent setup got.
 
-`aws-creds` is covered in [docs/aws.md](../../docs/aws.md#aws-creds).
+`aws-creds` is covered in [docs/aws.md](../../docs/aws.md#aws-creds). `rebuild` is the one subcommand `yo` never calls; a person runs it inside the box, as the operator (below).
+
+## rebuild
+
+`yolobox-guest rebuild switch` (or `boot`) is the one way to rebuild a box from inside it. Before it, a hand rebuild meant typing `sudo YOLOBOX_USERNAME=... YOLOBOX_HOSTNAME=... YOLOBOX_FLAKE_REF=... nixos-rebuild switch --impure --flake '<ref>#yolobox'` correctly. A wrong or missing hostname renamed an `-m` machine back to `yolobox`, and a different ref quietly moved the box to another tree. The helper takes those values from what the last build stamped: `/etc/yolobox/flake-ref` and `/etc/yolobox/hostname`, both written by `nix/base.nix` on every build. The username is the caller's own (`id -un`). Then it `exec`s `sudo env YOLOBOX_USERNAME=... YOLOBOX_HOSTNAME=... YOLOBOX_FLAKE_REF=... nixos-rebuild <action> --impure --flake <ref>#yolobox`, so `nixos-rebuild`'s exit code is the helper's.
+
+It refuses, without running `sudo`:
+
+- anything but exactly one argument, `switch` or `boot`, with the usage line and exit 2. `test`, `dry-activate` and `--rollback` are refused too. Only `switch` and `boot` make the next boot run what was built; `test` activates a system no boot entry names, and the helper's job is the rebuild a person needs after editing `/etc/yolobox/local.nix`, not every `nixos-rebuild` action.
+- a caller whose uid is not 501, the operator's (exit 2, "run as the operator"). Root gets no say here, and the agent has no `sudo` anyway.
+- a stamp that is missing, empty or holds more than one line, naming the file (exit 1). A trailing newline is fine.
+- a flake ref that is not exactly `github:OWNER/REPO/REF` (`FLAKE_REF_RE`, equal to `yo`'s `GITHUB_FLAKE_RE`), naming the file (exit 1). The stamp is a root-owned file the agent cannot write, so this is defence in depth for the `--flake` argument: whatever the file holds, the rebuild never gets a `path:` ref, a second flake attribute after a `#`, or a word starting with `-`.
+
+To move the box to another release or branch, run `yo bootstrap --version <ref>` on the host: the stamp then names the new ref, and the next `rebuild` reuses it. `yo bootstrap` and `yo`'s printed rebuild hint do not go through this helper, because they hold the host's facts already and the helper may be missing from an older box. `TestGuestRebuildMatchesYoAndTheBox` keeps the helper's variable names, ref pattern and operator uid equal to `yo`'s and `nix/base.nix`'s. `YOLOBOX_STAMPS` overrides `/etc/yolobox` for the tests.
 
 ## net-check and the gateway-blocked marker
 
@@ -67,7 +80,7 @@ The Mac side never guesses what a box supports; it reads the exit code. A subcom
 
 The exit code alone is never enough in either direction. A subcommand's own child process (`podman`, `npm`) can legitimately exit 127 or 64 for reasons that have nothing to do with the helper. So both branches require the stderr marker too before reinterpreting the exit. The corollary is load-bearing: no subcommand's own stderr may ever contain the literal string `unknown subcommand`.
 
-It follows that adding a subcommand to the script does not make it callable on its own. The box has to be rebuilt first (`yo bootstrap`, or a plain `nixos-rebuild switch` for someone iterating inside the VM). Calling it against an un-rebuilt box hits the 64 path, correctly, because from the box's point of view the subcommand really is unknown.
+It follows that adding a subcommand to the script does not make it callable on its own. The box has to be rebuilt first (`yo bootstrap`, or `yolobox-guest rebuild switch` for someone iterating inside the VM). Calling it against an un-rebuilt box hits the 64 path, correctly, because from the box's point of view the subcommand really is unknown.
 
 ## gc tiers
 

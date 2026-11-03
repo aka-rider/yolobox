@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from test_yo import (
+    A_RELEASE,
     FIXTURE_EMPTY_TABLE,
     FIXTURES,
     FakeHome,
@@ -42,15 +43,142 @@ class TestFlakeRef(FakeHome):
         self.assertIn("--version", caught.exception.message)
 
     def test_released_build_without_a_version_pins_its_own_tag(self):
-        with mock.patch.object(yo.config, "YO_VERSION", "1.2.3"):
-            self.assertEqual(yo.flake_ref(None), "github:aka-rider/yolobox/v1.2.3")
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
+            self.assertEqual(
+                yo.flake_ref(None), "github:aka-rider/yolobox/v" + A_RELEASE
+            )
 
     def test_a_release_is_pinned_with_or_without_the_v(self):
-        for version in ("1.7.2", "v1.7.2"):
+        for version in ("1.9.2", "v1.9.2"):
             with self.subTest(version=version):
                 self.assertEqual(
-                    yo.flake_ref(version), "github:aka-rider/yolobox/v1.7.2"
+                    yo.flake_ref(version), "github:aka-rider/yolobox/v1.9.2"
                 )
+
+    def test_a_release_that_still_needs_the_host_os_is_refused_naming_its_yo(self):
+        for version, release in (
+            ("1.9.1", "1.9.1"),
+            ("v1.9.1", "1.9.1"),
+            ("0.0.1", "0.0.1"),
+            ("1.8.10", "1.8.10"),
+            ("01.9.1", "1.9.1"),
+            ("github:aka-rider/yolobox/v1.9.1", "1.9.1"),
+            ("github:Aka-Rider/Yolobox/v1.9.1", "1.9.1"),
+            ("github:AKA-RIDER/YOLOBOX/V1.9.1", "1.9.1"),
+        ):
+            with self.subTest(version=version):
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.flake_ref(version)
+                self.assertEqual(
+                    caught.exception.message,
+                    "cannot build release %s, whose flake needs the host OS, which "
+                    "this yo no longer passes (every release before 1.9.2 does) — "
+                    "build it with that release's own yo instead, "
+                    "nix run github:aka-rider/yolobox/v%s -- bootstrap"
+                    % (release, release),
+                )
+
+    def test_an_unreleased_build_still_stamped_with_an_old_release_needs_a_version(
+        self,
+    ):
+        with mock.patch.object(yo.config, "YO_VERSION", "1.9.1"):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.flake_ref(None)
+            self.assertIn("this yo (1.9.1) is an unreleased", caught.exception.message)
+            self.assertIn("--version", caught.exception.message)
+            with mock.patch.object(yo.ui, "err") as fake_err:
+                hint = yo.rebuild_hint()
+        self.assertEqual(
+            hint,
+            "run yo bootstrap --version <ref> with a flake ref the box should "
+            "build from, then retry",
+        )
+        fake_err.assert_called_once()
+
+    def test_the_first_host_os_free_release_is_this_yos_own(self):
+        with mock.patch.object(yo.config, "YO_VERSION", "1.9.2"):
+            self.assertEqual(yo.flake_ref(None), "github:aka-rider/yolobox/v1.9.2")
+
+    def test_a_release_from_the_first_host_os_free_one_on_is_accepted(self):
+        for version in ("1.9.2", "1.9.10", "1.10.0", "2.0.0", "v2.0.0"):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    yo.flake_ref(version),
+                    "github:aka-rider/yolobox/v" + version.lstrip("v"),
+                )
+
+    def test_a_branch_or_a_forks_release_cannot_be_dated_and_is_accepted(self):
+        for ref in ("github:you/yolobox/v1.0.0", "v1.9.1-rc1", "main"):
+            with self.subTest(ref=ref):
+                self.assertTrue(yo.flake_ref(ref).endswith(ref))
+
+    def test_bootstrap_refuses_an_old_release_as_a_usage_error(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                yo.build_parser().parse_args(["bootstrap", "--version", "1.9.1"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("cannot build release 1.9.1", stderr.getvalue())
+
+    OLD_RELEASE_HINT = (
+        "%s, or nix run github:aka-rider/yolobox/v1.9.1 -- bootstrap to keep it on "
+        "release 1.9.1, whose flake needs the host OS, which this yo no longer "
+        "passes (every release before 1.9.2 does)"
+    )
+
+    def test_a_remembered_old_release_offers_both_ways_instead_of_a_failing_rebuild(
+        self,
+    ):
+        self.remember("github:aka-rider/yolobox/v1.9.1\n")
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
+            hint = yo.rebuild_hint()
+        self.assertEqual(
+            hint,
+            self.OLD_RELEASE_HINT
+            % "run yo bootstrap to move the box to this yo's release",
+        )
+
+    def test_the_growpart_refusal_reads_as_one_remedy_for_an_old_release(self):
+        self.remember("github:aka-rider/yolobox/v1.9.1\n")
+        with (
+            mock.patch.object(yo.config, "YO_VERSION", A_RELEASE),
+            mock.patch.object(yo.sshx, "guest_out", return_value="not-found\n"),
+        ):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.require_growable_guest()
+        self.assertTrue(
+            caught.exception.message.endswith(
+                "vda2 untouched — switch it: "
+                + self.OLD_RELEASE_HINT
+                % "run yo bootstrap to move the box to this yo's release"
+            ),
+            caught.exception.message,
+        )
+
+    def test_on_a_dev_build_the_way_off_an_old_release_names_a_ref(self):
+        self.remember("github:aka-rider/yolobox/v1.9.1\n")
+        with mock.patch.object(yo.config, "YO_VERSION", "dev"):
+            hint = yo.rebuild_hint()
+        self.assertEqual(
+            hint,
+            self.OLD_RELEASE_HINT
+            % "run yo bootstrap --version <ref> to move the box to a ref this yo "
+            "can build",
+        )
+
+    def test_the_skew_message_reads_as_one_remedy_for_an_old_release(self):
+        self.remember("github:aka-rider/yolobox/v1.9.1\n")
+        with (
+            mock.patch.object(yo.config, "YO_VERSION", A_RELEASE),
+            mock.patch.object(yo.release, "built_by", return_value=A_RELEASE),
+        ):
+            message = yo.helper_skew("the box has no yolobox-guest")
+        self.assertEqual(
+            message,
+            "the box has no yolobox-guest.\n    rebuild it: "
+            + self.OLD_RELEASE_HINT
+            % "run yo bootstrap to move the box to this yo's release",
+        )
 
     def test_a_branch_or_tag_is_taken_from_the_upstream_repo(self):
         for ref in ("main", "my-branch", "v1.7.2-rc1", "2026-fix"):
@@ -119,10 +247,10 @@ class TestFlakeRef(FakeHome):
         flake_arg = hint.split("--flake ", 1)[1]
         self.assertEqual(shlex.split(flake_arg), ["github:you/yolobox/x#yolobox"])
 
-    def test_the_hint_names_the_host_os_hostname_and_ref_beside_the_username(self):
+    def test_the_hint_names_the_hostname_and_ref_beside_the_username(self):
         self.remember("github:x/y/z")
         self.assertIn(
-            "sudo YOLOBOX_USERNAME=$(id -un) YOLOBOX_HOST_OS=darwin "
+            "sudo YOLOBOX_USERNAME=$(id -un) "
             "YOLOBOX_HOSTNAME=yolobox YOLOBOX_FLAKE_REF=github:x/y/z nixos-rebuild",
             yo.rebuild_hint(),
         )
@@ -137,10 +265,10 @@ class TestFlakeRef(FakeHome):
 
     def test_a_remembered_ref_beats_the_release(self):
         self.remember("github:you/yolobox/x\n")
-        with mock.patch.object(yo.config, "YO_VERSION", "1.2.3"):
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             hint = yo.rebuild_hint()
         self.assertIn("github:you/yolobox/x#yolobox", hint)
-        self.assertNotIn("1.2.3", hint)
+        self.assertNotIn(A_RELEASE, hint)
 
     def test_a_remembered_ref_that_is_no_longer_accepted_is_left_out_and_named(self):
         # An older yo remembered whatever it was given, such as a checkout path.
@@ -152,11 +280,11 @@ class TestFlakeRef(FakeHome):
             with self.subTest(stored=stored):
                 self.remember(stored)
                 with (
-                    mock.patch.object(yo.config, "YO_VERSION", "1.2.3"),
+                    mock.patch.object(yo.config, "YO_VERSION", A_RELEASE),
                     mock.patch.object(yo.ui, "err") as fake_err,
                 ):
                     hint = yo.rebuild_hint()
-                self.assertIn("github:aka-rider/yolobox/v1.2.3#yolobox", hint)
+                self.assertIn("github:aka-rider/yolobox/v%s#yolobox" % A_RELEASE, hint)
                 self.assertNotIn("pwned", hint)
                 self.assertNotIn("/home/agent", hint)
                 fake_err.assert_called_once()
@@ -170,8 +298,8 @@ class TestFlakeRef(FakeHome):
             with self.subTest(text=text):
                 self.remember(text)
                 self.assertIsNone(yo.remembered_flake_ref())
-                with mock.patch.object(yo.config, "YO_VERSION", "1.2.3"):
-                    self.assertIn("v1.2.3#yolobox", yo.rebuild_hint())
+                with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
+                    self.assertIn("v%s#yolobox" % A_RELEASE, yo.rebuild_hint())
 
     def test_a_remembered_ref_that_is_not_utf8_is_read_not_a_crash(self):
         os.makedirs(os.path.dirname(yo.flake_ref_file()), exist_ok=True)
@@ -441,8 +569,8 @@ class TestMainHealsBeforeSomeCommands(unittest.TestCase):
 
 
 class TestSshRemainderPassthrough(unittest.TestCase):
-    # rebuild_hint() prints "yo ssh sudo YOLOBOX_USERNAME=$(id -un)
-    # YOLOBOX_HOST_OS=<os> nixos-rebuild switch --impure --flake '<ref>#yolobox'"
+    # rebuild_hint() prints "yo ssh sudo YOLOBOX_USERNAME=$(id -un) ...
+    # nixos-rebuild switch --impure --flake '<ref>#yolobox'"
     # as the documented remedy for a
     # box that has drifted from the host's yo. If argparse ever ate --impure or
     # --flake off that line, the tool's own printed advice would silently stop
@@ -456,7 +584,7 @@ class TestSshRemainderPassthrough(unittest.TestCase):
                 "ssh",
                 "sudo",
                 "YOLOBOX_USERNAME=x",
-                "YOLOBOX_HOST_OS=darwin",
+                "YOLOBOX_FLAKE_REF=github:x/y/z",
                 "nixos-rebuild",
                 "switch",
                 "--impure",
@@ -469,7 +597,7 @@ class TestSshRemainderPassthrough(unittest.TestCase):
             [
                 "sudo",
                 "YOLOBOX_USERNAME=x",
-                "YOLOBOX_HOST_OS=darwin",
+                "YOLOBOX_FLAKE_REF=github:x/y/z",
                 "nixos-rebuild",
                 "switch",
                 "--impure",
@@ -644,10 +772,10 @@ class TestBootstrapRebootDecision(FakeHome):
     def test_a_default_bootstrap_forgets_the_ref_of_an_earlier_fork_bootstrap(self):
         self.run_bootstrap([("g1", "g1")])
         self.assertTrue(os.path.exists(yo.flake_ref_file()))
-        with mock.patch.object(yo.config, "YO_VERSION", "1.7.2"):
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             self.run_bootstrap_default()
             self.assertFalse(os.path.exists(yo.flake_ref_file()))
-            self.assertIn("v1.7.2#yolobox", yo.rebuild_hint())
+            self.assertIn("v%s#yolobox" % A_RELEASE, yo.rebuild_hint())
 
     def test_stops_exactly_once_then_starts_again_when_the_second_read_agrees(self):
         calls = self.run_bootstrap([("g1", "g0"), ("g1", "g1")])
@@ -845,14 +973,13 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
         self.assertIn("encrypts /dev/vda2 in place", self.stderr)
         self.assertIn("must not be interrupted", self.stderr)
 
-    def test_the_rebuild_names_the_username_host_os_hostname_and_ref(self):
+    def test_the_rebuild_names_the_username_hostname_and_ref(self):
         rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /")
         self.assertEqual(
-            rebuilds[0][:6],
+            rebuilds[0][:5],
             [
                 "sudo",
                 "YOLOBOX_USERNAME=%s" % yo.host_user(),
-                "YOLOBOX_HOST_OS=darwin",
                 "YOLOBOX_HOSTNAME=yolobox",
                 "YOLOBOX_FLAKE_REF=github:x/y/z",
                 "nixos-rebuild",
@@ -1245,7 +1372,7 @@ class TestGuestHelperSkew(unittest.TestCase):
             stderr="bash: line 1: yolobox-guest: command not found\n",
             stdout="",
         )
-        with mock.patch.object(yo.config, "YO_VERSION", "1.2.3"):
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             with mock.patch.object(
                 yo.sshx, "ssh_run", side_effect=self.fake_ssh_run(main_proc)
             ):
@@ -1259,7 +1386,7 @@ class TestGuestHelperSkew(unittest.TestCase):
             stderr="yolobox-guest: unknown subcommand 'projects'\n",
             stdout="",
         )
-        with mock.patch.object(yo.config, "YO_VERSION", "1.2.3"):
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             with mock.patch.object(
                 yo.sshx, "ssh_run", side_effect=self.fake_ssh_run(main_proc)
             ):
@@ -1296,7 +1423,7 @@ class TestGuestHelperSkew(unittest.TestCase):
 
     def test_streamed_absent_helper_names_yo_bootstrap(self):
         main_proc = mock.Mock(returncode=127, stderr=None, stdout=None)
-        with mock.patch.object(yo.config, "YO_VERSION", "1.2.3"):
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             with mock.patch.object(
                 yo.sshx,
                 "ssh_run",
@@ -1308,7 +1435,7 @@ class TestGuestHelperSkew(unittest.TestCase):
 
     def test_streamed_unknown_subcommand_names_the_subcommand(self):
         main_proc = mock.Mock(returncode=64, stderr=None, stdout=None)
-        with mock.patch.object(yo.config, "YO_VERSION", "1.2.3"):
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             with mock.patch.object(
                 yo.sshx,
                 "ssh_run",
@@ -2356,12 +2483,14 @@ class TestCmdStatusExitCode(StatusRunner, unittest.TestCase):
         )
 
     def test_version_drift_fails_the_run(self):
-        with mock.patch.object(yo.config, "YO_VERSION", "1.2.3"):
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             self.assertFailsTheRun(ssh_answer=self.answers(["cat"], stdout="1.0.0\n"))
 
     def test_a_box_built_by_this_yo_does_not_drift(self):
-        with mock.patch.object(yo.config, "YO_VERSION", "1.2.3"):
-            self.assertPassesTheRun(ssh_answer=self.answers(["cat"], stdout="1.2.3\n"))
+        with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
+            self.assertPassesTheRun(
+                ssh_answer=self.answers(["cat"], stdout=A_RELEASE + "\n")
+            )
 
     def test_optional_or_unchecked_things_do_not_fail_the_run(self):
         optional = {

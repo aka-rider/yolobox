@@ -62,10 +62,10 @@ jobs:
   # here instead of on a user's `yo bootstrap`. Evaluation needs no aarch64 builder: the drv
   # path is computed, never realised, and IFD is disallowed to keep it so.
   #
-  # Three boxes are evaluated and every check below runs on each: the Linux
-  # host's x86_64 guest, the Apple-silicon Mac's aarch64 guest, and the Intel
-  # Mac's x86_64 guest. The two Mac boxes have the host OS a Mac has, which
-  # covers the Lima/vz side of every hostOs gate in the modules.
+  # Two boxes are evaluated and every check below runs on each: the x86_64
+  # guest (a Linux host's, or an Intel Mac's) and the aarch64 guest (an
+  # Apple-silicon Mac's). The guest is never told its host OS, so the CPU is
+  # the only axis a box varies on (nix/base.md, "No host OS in the guest").
   # The rule files are builtins.toFile, so they print without a builder on
   # either system.
   eval:
@@ -73,18 +73,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - host_os: linux
-            system: x86_64-linux
-          - host_os: darwin
-            system: aarch64-linux
-          - host_os: darwin
-            system: x86_64-linux
+        system: [x86_64-linux, aarch64-linux]
     env:
-      # flake.nix throws without these three; any non-empty name and any valid
+      # flake.nix throws without these two; any non-empty name and any valid
       # github:OWNER/REPO/REF evaluates the same.
       YOLOBOX_USERNAME: ci
-      YOLOBOX_HOST_OS: ${{ matrix.host_os }}
       YOLOBOX_FLAKE_REF: github:aka-rider/yolobox/ci
       GUEST_SYSTEM: ${{ matrix.system }}
       # The guest system is the evaluating nix's own, so every evaluation goes
@@ -128,16 +121,51 @@ jobs:
           fi
           grep -F 'YOLOBOX_FLAKE_REF is' path.err
 
+      # A yo older than the flake still passes YOLOBOX_HOST_OS. The box must
+      # be the same derivation whatever it says, or unset (nix/base.md).
+      - name: Check the box ignores YOLOBOX_HOST_OS
+        run: |
+          attr=.#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
+          unset_drv="$(env -u YOLOBOX_HOST_OS $NIX_EVAL --raw "$attr")"
+          for value in darwin linux lizard; do
+            test "$(env YOLOBOX_HOST_OS="$value" $NIX_EVAL --raw "$attr")" = "$unset_drv" ||
+              { echo "YOLOBOX_HOST_OS=$value changed the box"; exit 1; }
+          done
+
       # vz cannot emulate, so only an Apple-silicon Mac's guest has a rosetta
-      # share to mount; on any other box it would wait on a mount that never
-      # comes (nix/base.md).
-      - name: Check Rosetta is on only for an Apple-silicon Mac
+      # share to mount, and only that host runs an aarch64 guest; on any other
+      # box it would wait on a mount that never comes (nix/base.md).
+      - name: Check Rosetta is on exactly for the aarch64 guest
         run: |
           expected=false
-          if [ "$YOLOBOX_HOST_OS" = darwin ] && [ "$GUEST_SYSTEM" = aarch64-linux ]; then
+          if [ "$GUEST_SYSTEM" = aarch64-linux ]; then
             expected=true
           fi
           test "$($NIX_EVAL --json .#nixosConfigurations.yolobox.config.virtualisation.rosetta.enable)" = "$expected"
+
+      # The guest agent is enabled on every box and runs only where Lima's
+      # cidata ships its binary. The script check catches a nixos-lima bump
+      # that moves the binary away from the path the condition names.
+      - name: Check lima-guestagent is gated on its binary
+        run: |
+          unit=.#nixosConfigurations.yolobox.config.systemd.services.lima-guestagent
+          binary=/mnt/lima-cidata/lima-guestagent
+          test "$($NIX_EVAL --json "$unit.enable")" = true
+          test "$($NIX_EVAL --raw "$unit.unitConfig.ConditionPathExists")" = "$binary"
+          $NIX_EVAL --raw "$unit.script" | grep -F "$binary daemon"
+
+      # The agent holds a forwarded 1Password agent, which on a Linux host
+      # serves the operator's key, so every box admits the operator only from
+      # the gateway and drops that address off enp0s1 (nix/base.md). The
+      # literals restate base.nix on purpose: this step only proves the two
+      # rules are not conditional, i.e. present on both legs. What they do is
+      # tests/box-hardening-check.sh's check_operator_login_refused.
+      - name: Check the operator rules are on every box
+        run: |
+          box=.#nixosConfigurations.yolobox.config
+          test "$($NIX_EVAL --json "$box.services.openssh.settings.AllowUsers")" = '["ci@192.168.5.2","agent"]'
+          $NIX_EVAL --raw "$box.networking.firewall.extraCommands" |
+            grep -F 'iptables -I nixos-fw 1 ! -i enp0s1 -s 192.168.5.2 -j DROP'
 
       # containersConf.settings is freeform toml, so a misspelled key
       # evaluates fine and silently sends container output back to the

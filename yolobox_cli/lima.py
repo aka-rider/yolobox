@@ -91,7 +91,9 @@ LIMA_SETTING_GAPS = {
         ".ssh.forwardAgent = false",
     ),
     GAP_SSH_OVER_VSOCK: (
-        "lets lima proxy ssh over vsock, which the initrd that unlocks the disk cannot answer",
+        "lets lima proxy ssh over vsock, which the initrd that unlocks the disk cannot answer, "
+        "and which locks the operator out of the booted box: its sshd admits the operator only "
+        "from 192.168.5.2, and a vsock peer has no IP address",
         ".ssh.overVsock = false",
     ),
     GAP_PROPAGATE_PROXY_ENV: (
@@ -111,6 +113,13 @@ LIMA_SETTING_GAPS = {
         RESTATE_PORT_FORWARDS,
     ),
 }
+
+# The gaps vm_up refuses to start with. Every other gap is a note: the healing
+# step adds a missing forward live, and the rest leak but lock nobody out. Over
+# vsock, the initrd that unlocks the disk cannot answer, and the guest's sshd
+# admits the operator only from 192.168.5.2, which a vsock peer, having no IP
+# address, never is (nix/base.md).
+LIMA_FATAL_GAPS = frozenset([GAP_SSH_OVER_VSOCK])
 
 # ssh.localPort in lima/yolobox.yaml: where lima's hostagent listens on the Mac
 # for the default instance. state.driver().ssh_port() answers for any instance.
@@ -283,13 +292,10 @@ def lima_edit_command(expression: str) -> str:
 class LimaDriver:
     """macOS: one Lima instance per machine, run by the vz driver."""
 
-    host_os = "darwin"
     name = "lima"
     instances_dir = ".lima"
     initrd_identity = ".lima/_config/user"
     start_command = "limactl start"
-    # The healing step adds a missing forward live, so a gap is a note, not a stop.
-    gaps_are_fatal = False
 
     def require_tool(self) -> None:
         proc.require_tool("limactl", "brew install lima")
@@ -447,6 +453,9 @@ class LimaDriver:
         if info.load_dot_ssh_pub_keys is not False:
             gaps.append(GAP_LOAD_DOT_SSH_PUB_KEYS)
         return gaps
+
+    def fatal_gaps(self, gaps: Sequence[str]) -> List[str]:
+        return [gap for gap in gaps if gap in LIMA_FATAL_GAPS]
 
     def host_gaps(self) -> List[str]:
         return []

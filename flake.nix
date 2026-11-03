@@ -40,15 +40,9 @@
       # flake creates the agent's account (lima creates only the
       # operator's, from cidata), so there is no host value to thread in.
       agentUser = "agent";
-      # Which OS runs the VM (and so which hypervisor stack the guest was
-      # provisioned by) is a host fact like username: `yo` sets
-      # YOLOBOX_HOST_OS on every nixos-rebuild invocation. It is separate
-      # from the CPU architecture, which guestSystem reads from the nix
-      # that is evaluating.
-      hostOs =
-        let h = builtins.getEnv "YOLOBOX_HOST_OS";
-        in if h == "darwin" || h == "linux" then h
-        else throw "YOLOBOX_HOST_OS is \"${h}\" — set it to darwin (Lima on a Mac) or linux (libvirt on a Linux PC) and build with --impure (yo does this for you)";
+      # The guest is never told which OS runs it: each setting that differs
+      # between hosts gates on the fact it needs (nix/base.md, "No host OS in
+      # the guest"). An older yo still passes the host OS; nothing reads it.
       # The box's hostname, and with it the tailnet node name, is the one
       # input that is optional: unset or empty means "yolobox", so CI, a bare
       # `nix flake check` and every box built before this variable existed
@@ -60,11 +54,12 @@
         in if n == "" then "yolobox"
         else if builtins.match "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?" n != null then n
         else throw "YOLOBOX_HOSTNAME is \"${n}\" — it must be one DNS label: lowercase letters, digits and '-', 1 to 63 characters, not starting or ending with '-' (leave it unset for \"yolobox\")";
-      # The flake ref the box is built from, a host fact like the two above:
-      # `yo` sets YOLOBOX_FLAKE_REF on every nixos-rebuild, and base.nix stamps
-      # it into /etc/yolobox/flake-ref so a later rebuild from inside the box
-      # builds from the same tree. It is required, because a rebuild without it
-      # would delete the stamp and send the box back to guessing v<version>.
+      # The flake ref the box is built from, a host fact like username: `yo`
+      # (or `yolobox-guest rebuild`, from the stamp) sets YOLOBOX_FLAKE_REF on
+      # every nixos-rebuild, and base.nix stamps it into /etc/yolobox/flake-ref
+      # so a later rebuild from inside the box builds from the same tree. It is
+      # required, because a rebuild without it would delete the stamp and
+      # leave the next in-box rebuild nothing to build from.
       # It must be exactly github:OWNER/REPO/REF (release.GITHUB_FLAKE_RE),
       # because it names the tree the box rebuilds from.
       flakeRef =
@@ -95,13 +90,13 @@
           }
         ));
 
-      # builtins.seq forces hostOs, hostname and flakeRef here (guestSystem is
-      # forced by `system`), so evaluating the box fails at once when one is
-      # unset or invalid, instead of only when some module happens to read it.
-      nixosConfigurations.yolobox = builtins.seq hostOs (builtins.seq hostname (builtins.seq flakeRef (nixpkgs.lib.nixosSystem {
+      # builtins.seq forces hostname and flakeRef here (guestSystem is forced
+      # by `system`), so evaluating the box fails at once when one is unset or
+      # invalid, instead of only when some module happens to read it.
+      nixosConfigurations.yolobox = builtins.seq hostname (builtins.seq flakeRef (nixpkgs.lib.nixosSystem {
         system = guestSystem;
         specialArgs = {
-          inherit username agentUser version hostOs hostname flakeRef;
+          inherit username agentUser version hostname flakeRef;
         };
         modules = [
           # nixpkgs' pin can lag herdr, and a saved SSH machine needs the
@@ -132,6 +127,6 @@
           ./nix/egress.nix
           ./nix/hardening.nix
         ];
-      })));
+      }));
     };
 }

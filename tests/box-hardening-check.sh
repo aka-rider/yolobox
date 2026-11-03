@@ -12,9 +12,10 @@
 #   compat half ("nothing the agent needs broke") is the one to iterate on
 #   against a box that is not hardened yet.
 #
-# On a libvirt guest (host-os linux) it also checks that the agent cannot
-# log in as the operator with the forwarded 1Password agent, and that the
-# firewall rule behind that is loaded.
+# It also checks that the agent cannot log in as the operator with the
+# forwarded 1Password agent, and that the firewall rule behind that is
+# loaded; that the box was not told its host OS; that the Lima guest agent runs
+# exactly when Lima's cidata ships it; and that `yolobox-guest rebuild` exists.
 #
 # It stops at the first broken property and names it. There is no python in
 # the box, so socket probes use perl and JSON uses jq.
@@ -36,7 +37,6 @@ WORK=""
 SLEEPER_PID=""
 NET_CREATED=""
 PROBE_OUT=""
-HOST_OS=""
 
 fail() {
     echo "FAIL: $*" >&2
@@ -49,20 +49,6 @@ ok() {
 
 warn() {
     echo "WARN: $*" >&2
-}
-
-# The host OS running this box, from /etc/yolobox/host-os: "darwin" (Lima on a
-# Mac) or "linux" (libvirt on a Linux PC). Never guessed from the CPU: an Intel
-# Mac runs an x86_64 Lima guest. fail exits only the command substitution it
-# runs in, so callers take the result with `HOST_OS=$(host_os) || exit 1`.
-host_os() {
-    local file=/etc/yolobox/host-os host
-    [ -f "${file}" ] || fail "${file} is missing: the box does not say which host runs it"
-    host=$(cat "${file}") || fail "could not read ${file}"
-    case ${host} in
-    darwin | linux) printf '%s\n' "${host}" ;;
-    *) fail "${file} must say darwin or linux, got '${host}'" ;;
-    esac
 }
 
 trap 'echo "FAIL: unexpected error at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
@@ -386,9 +372,9 @@ check_gateway_ssh_closed() {
     ok "the agent cannot reach ${GATEWAY_ADDR}:22 (${PROBE_OUT})"
 }
 
-# A libvirt guest: the operator's key is served by the host's 1Password agent,
-# which the agent account reaches through its forwarded socket. sshd must
-# therefore refuse the operator from every address but the gateway's, and the
+# On a Linux host the operator's key is served by the host's 1Password agent,
+# which the agent account reaches through its forwarded socket. So on every box
+# sshd must refuse the operator from every address but the gateway's, and the
 # firewall must stop the agent claiming that address over loopback.
 # $1 is the operator's account name.
 check_operator_login_refused() {
@@ -415,9 +401,43 @@ check_operator_login_refused() {
     ok "nixos-fw drops packets claiming ${GATEWAY_ADDR} on any interface but enp0s1"
 }
 
-# True on a libvirt guest, the Linux host's way of running the box.
-is_libvirt_guest() {
-    [ "${HOST_OS}" = linux ]
+# The guest gates each host difference on the fact it needs, so nothing tells
+# it which OS runs it (nix/base.md, "No host OS in the guest"). A box built
+# before that carried the stamp; a rebuild removes it.
+check_no_host_os_stamp() {
+    [ ! -e /etc/yolobox/host-os ] ||
+        fail "/etc/yolobox/host-os exists: the box was built by a flake that told it its host OS"
+    ok "the box holds no host OS stamp"
+}
+
+# lima-guestagent runs the binary Lima ships on its cidata disk, so it must run
+# where that binary exists (a Lima box) and be skipped, not failed, where it
+# does not (a libvirt box). /mnt/lima-cidata is root's 0700 mount.
+check_guestagent() {
+    local unit=lima-guestagent.service state result
+    state=$(systemctl show -p ActiveState --value "${unit}") ||
+        fail "could not read the state of ${unit}"
+    if sudo -n test -e /mnt/lima-cidata/lima-guestagent; then
+        [ "${state}" = active ] ||
+            fail "Lima's cidata ships the guest agent, but ${unit} is ${state}"
+        ok "${unit} is active, and Lima's cidata ships its binary"
+        return
+    fi
+    result=$(systemctl show -p ConditionResult --value "${unit}") ||
+        fail "could not read the condition result of ${unit}"
+    [ "${result}" = no ] ||
+        fail "the cidata has no guest agent, but ${unit} has ConditionResult=${result}, not no"
+    [ "${state}" != failed ] || fail "the cidata has no guest agent, and ${unit} failed"
+    ok "${unit} is skipped: the cidata has no guest agent binary"
+}
+
+# The in-box rebuild chokepoint exists and refuses a call without an action.
+check_rebuild_helper() {
+    local status=0 out
+    out=$(yolobox-guest rebuild 2>&1) || status=$?
+    [ "${status}" -eq 2 ] ||
+        fail "yolobox-guest rebuild without an action exited ${status}, not 2: ${out}"
+    ok "yolobox-guest rebuild exists and refuses a call without switch or boot"
 }
 
 # The one qdisc that stays: net.core.default_qdisc is fq_codel.
@@ -521,21 +541,20 @@ compat_checks() {
     check_nix_build
     check_strace
     check_vendors
-    # Rosetta exists only on Apple silicon: a darwin guest on aarch64 is a
-    # Lima/vz box and must have it. An Intel Mac's x86_64 guest and a libvirt
-    # guest have none.
-    if [ "${HOST_OS}" = darwin ] && [ "$(uname -m)" = aarch64 ]; then
+    # Rosetta follows the guest's CPU, as nix/base.nix gates it: an aarch64
+    # guest runs only under Lima/vz on Apple silicon and must have it.
+    if [ "$(uname -m)" = aarch64 ]; then
         check_rosetta
     fi
-    if is_libvirt_guest; then
-        check_operator_login_refused "$(id -un)"
-    fi
+    check_operator_login_refused "$(id -un)"
+    check_no_host_os_stamp
+    check_guestagent
+    check_rebuild_helper
 }
 
 main() {
     [ "$(id -u)" -ne "${AGENT_UID}" ] || fail "run this as the operator, not the agent"
     sudo -n true || fail "passwordless sudo is required (run as the operator)"
-    HOST_OS=$(host_os) || exit 1
     trap cleanup EXIT
     stage_helpers
     case ${ONLY:-both} in

@@ -42,11 +42,9 @@ class Driver(Protocol):
     return a command line or a message build a printed remedy.
     """
 
-    host_os: str  # YOLOBOX_HOST_OS for nix: "darwin" or "linux"
     name: str  # what messages call the driver ("lima: ...")
     instances_dir: str  # instance directories, relative to $HOME
     start_command: str  # the background process unlock_disk watches
-    gaps_are_fatal: bool  # vm_up refuses config_gaps() (True) or only warns
 
     @property
     def initrd_identity(self) -> str: ...  # $HOME-relative key of pre-unlock probes
@@ -64,6 +62,8 @@ class Driver(Protocol):
     # Why an asked size cannot apply to the instance that exists, and the way out.
     def existing_size_refusal(self, size: Size) -> str: ...
     def config_gaps(self) -> List[str]: ...  # how the instance breaks guarantees
+    # Those of `gaps` vm_up refuses to start with; it only warns about the rest.
+    def fatal_gaps(self, gaps: Sequence[str]) -> List[str]: ...
     def config_gap_message(self, gaps: Sequence[str]) -> str: ...  # with the fixes
     def host_gaps(self) -> List[str]: ...  # what the host breaks, each with its fix
     def verify_initrd_listener(self, port: int) -> None: ...  # YoError: not the VM's

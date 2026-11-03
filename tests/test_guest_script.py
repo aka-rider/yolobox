@@ -3,7 +3,8 @@
 Nix builds the script with writeShellApplication, which prepends
 `set -o errexit -o nounset -o pipefail` and puts `runtimeInputs` on PATH. Here
 bash gets the same three options, and PATH holds a scratch directory with a
-fake `curl` ahead of the system tools. Only subcommands that need nothing but
+fake `curl` ahead of the system tools (and, per class, fake `dig`, `stat`,
+`sudo` and `id`). Only subcommands that need nothing but
 what macOS and Linux share are exercised, except `gc-user --deep`, which runs
 only where GNU find's `-printf` exists (CI, the guest): the other subcommands
 (`projects`, `gc-machine`) use it or sudo too.
@@ -729,3 +730,142 @@ class TestNetCheckSkipsTheGatewayProbeOnlyWhenTheBoxBlocksIt(GuestScript):
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")
                 self.assertIn("usage: net-check", result.stderr)
+
+
+FAKE_SUDO = """#!/bin/sh
+printf '%s\\0' "$@" > "$FAKE_SUDO_ARGV"
+exit "$FAKE_SUDO_RC"
+"""
+
+# `id -u` answers FAKE_UID, `id -un` FAKE_USER.
+FAKE_ID = """#!/bin/sh
+case "$*" in
+-u) printf '%s\\n' "$FAKE_UID" ;;
+-un) printf '%s\\n' "$FAKE_USER" ;;
+*) echo "fake id: unexpected $*" >&2; exit 99 ;;
+esac
+"""
+
+REF = "github:aka-rider/yolobox/v1.9.1"
+
+
+class TestRebuild(GuestScript):
+    def setUp(self):
+        super().setUp()
+        bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
+        for name, text in (("sudo", FAKE_SUDO), ("id", FAKE_ID)):
+            tool = bin_dir / name
+            tool.write_text(text)
+            tool.chmod(0o755)
+        self.stamps = self.tmp / "stamps"
+        self.stamps.mkdir()
+        self.sudo_argv = self.tmp / "sudo-argv"
+        self.env.update(
+            YOLOBOX_STAMPS=str(self.stamps),
+            FAKE_SUDO_ARGV=str(self.sudo_argv),
+            FAKE_USER="alice",
+        )
+        self.stamp("flake-ref", REF + "\n")
+        self.stamp("hostname", "yolobox-e2e\n")
+
+    def stamp(self, name, text):
+        (self.stamps / name).write_bytes(text.encode())
+
+    def rebuild(self, *args, uid=501, sudo_rc=0):
+        return self.run_script(
+            "rebuild",
+            *args,
+            extra_env={"FAKE_UID": str(uid), "FAKE_SUDO_RC": str(sudo_rc)},
+        )
+
+    def sudo_argv_list(self):
+        return self.sudo_argv.read_text().split("\0")[:-1]
+
+    def assert_refused(self, result, code, needle):
+        self.assertEqual(result.returncode, code, result.stderr)
+        self.assertIn(needle, result.stderr)
+        self.assertNotIn("unknown subcommand", result.stderr)
+        self.assertFalse(self.sudo_argv.exists(), "sudo ran")
+
+    def test_switch_and_boot_rebuild_from_the_stamps_as_the_operator(self):
+        for action in ("switch", "boot"):
+            with self.subTest(action=action):
+                result = self.rebuild(action)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.sudo_argv_list(),
+                    [
+                        "env",
+                        "YOLOBOX_USERNAME=alice",
+                        "YOLOBOX_HOSTNAME=yolobox-e2e",
+                        "YOLOBOX_FLAKE_REF=" + REF,
+                        "nixos-rebuild",
+                        action,
+                        "--impure",
+                        "--flake",
+                        REF + "#yolobox",
+                    ],
+                )
+
+    def test_anything_but_one_switch_or_boot_is_a_usage_error(self):
+        for args in (
+            (),
+            ("test",),
+            ("dry-activate",),
+            ("--rollback",),
+            ("",),
+            ("switch", "extra"),
+            ("SWITCH",),
+        ):
+            with self.subTest(args=args):
+                self.assert_refused(self.rebuild(*args), 2, "usage: rebuild")
+
+    def test_root_and_the_agent_are_refused(self):
+        for uid in (0, 1000):
+            with self.subTest(uid=uid):
+                self.assert_refused(
+                    self.rebuild("switch", uid=uid), 2, "run as the operator"
+                )
+
+    def test_a_flake_ref_that_is_not_one_github_ref_is_refused_naming_the_file(self):
+        for text in (
+            "",
+            "\n",
+            REF + "\n" + REF + "\n",
+            "path:/x\n",
+            "github:x/y\n",
+            "github:x/y/z#evil\n",
+            "github:x/y/-z\n",
+            REF + " \n",
+            "x" * 4096 + "\n",
+        ):
+            with self.subTest(text=text[:40]):
+                self.stamp("flake-ref", text)
+                self.assert_refused(
+                    self.rebuild("switch"), 1, str(self.stamps / "flake-ref")
+                )
+
+    def test_a_missing_flake_ref_is_refused_naming_the_file(self):
+        (self.stamps / "flake-ref").unlink()
+        self.assert_refused(self.rebuild("switch"), 1, str(self.stamps / "flake-ref"))
+
+    def test_a_missing_or_empty_hostname_is_refused_naming_the_file(self):
+        path = self.stamps / "hostname"
+        for text in ("", "\n", None):
+            with self.subTest(text=text):
+                if text is None:
+                    path.unlink()
+                else:
+                    self.stamp("hostname", text)
+                self.assert_refused(self.rebuild("switch"), 1, str(path))
+
+    def test_a_stamp_without_a_trailing_newline_is_read_whole(self):
+        self.stamp("flake-ref", REF)
+        self.stamp("hostname", "yolobox-e2e")
+        result = self.rebuild("switch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("YOLOBOX_FLAKE_REF=" + REF, self.sudo_argv_list())
+        self.assertIn("YOLOBOX_HOSTNAME=yolobox-e2e", self.sudo_argv_list())
+
+    def test_the_exit_code_of_the_rebuild_is_the_helpers(self):
+        self.assertEqual(self.rebuild("switch", sudo_rc=4).returncode, 4)

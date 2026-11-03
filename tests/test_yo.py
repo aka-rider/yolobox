@@ -31,6 +31,8 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FIXTURE_EGRESS = (FIXTURES / "egress.nft").read_text()
 FIXTURE_EGRESS_TUNNEL = (FIXTURES / "egress-tunnel.nft").read_text()
 FIXTURE_EMPTY_TABLE = "table inet yolobox-egress {\n}\n"
+# A release this yo can build: at or above release.FIRST_HOST_OS_FREE_RELEASE.
+A_RELEASE = "2.3.4"
 
 
 class YoNamespace:
@@ -3487,6 +3489,33 @@ class TestLimaSettingGapMessage(unittest.TestCase):
             ".ssh.forwardAgent = false",
         ):
             self.assertIn(needle, message)
+
+
+class TestVmUpRefusesOnlyTheLimaGapsThatLockTheOperatorOut(FakeHome):
+    def test_ssh_over_vsock_refuses_before_the_vm_is_touched_naming_the_fix(self):
+        for gaps in (
+            [yo.GAP_SSH_OVER_VSOCK],
+            [yo.OP_GUEST_SOCK, yo.GAP_MOUNTS, yo.GAP_SSH_OVER_VSOCK],
+        ):
+            with self.subTest(gaps=gaps):
+                with (
+                    mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
+                    mock.patch.object(yo.LIMA, "vm_status") as status,
+                    mock.patch.object(yo.agent, "luks_passphrase") as passphrase,
+                    mock.patch.object(yo.forwards, "vm_services") as services,
+                ):
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.vm_up()
+                self.assertIn(
+                    "--set '.ssh.overVsock = false'", caught.exception.message
+                )
+                status.assert_not_called()
+                passphrase.assert_not_called()
+                services.assert_not_called()
+
+    def test_every_other_lima_gap_is_only_a_note(self):
+        others = [gap for gap in yo.LIMA_SETTING_GAPS if gap != yo.GAP_SSH_OVER_VSOCK]
+        self.assertEqual(yo.LIMA.fatal_gaps(others + [yo.OP_GUEST_SOCK, ""]), [])
 
 
 class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):

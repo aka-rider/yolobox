@@ -3,7 +3,8 @@
 # find expressions, the gc tiers and the AWS probe are shellchecked at build
 # time instead of living in yo's Python string literals where nothing checks
 # them. Subcommands: projects, landing-dir,
-# gc-machine, gc-user, aws-creds, aws-check, net-check.
+# gc-machine, gc-user, aws-creds, aws-check, net-check, and rebuild, the one a
+# person runs inside the box rather than `yo`.
 #
 # writeShellApplication prepends `set -o errexit -o nounset -o pipefail`. The
 # gc tiers below were written for a shell with none of that — a cleanup step
@@ -42,6 +43,20 @@ GO_BUILD_CACHE_HEADER='This directory holds cached build artifacts from the Go b
 # A box whose local configuration blocks lima's gateway by design creates this
 # file. The YOLOBOX_GATEWAY_BLOCKED override is a test seam.
 GATEWAY_BLOCKED="${YOLOBOX_GATEWAY_BLOCKED:-/etc/yolobox/gateway-blocked}"
+
+# The operator's uid: lima's cidata account, which nix/base.nix declares. Only
+# the operator rebuilds; root and the agent are refused.
+OPERATOR_UID=501
+
+# Where nix/base.nix stamps what built the box (flake-ref, hostname). The
+# YOLOBOX_STAMPS override is a test seam.
+YOLOBOX_STAMPS="${YOLOBOX_STAMPS:-/etc/yolobox}"
+
+# The one flake ref shape a rebuild accepts, equal to yo's GITHUB_FLAKE_RE and
+# the flake's own check: exactly github:OWNER/REPO/REF. The stamp is root's, so
+# this is defence in depth for the --flake argument: no path:, no '#' and no
+# leading '-'. Matched whole, so it carries no anchors.
+FLAKE_REF_RE='github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*'
 
 # Sets EXPR to a find expression matching any of the given directory names.
 build_expr() {
@@ -791,6 +806,56 @@ cmd_net_check() {
     printf 'egress=%s\ngateway=%s\nrootdisk=%s\n' "${egress}" "${gateway}" "${rootdisk}"
 }
 
+# Prints the one line of a stamp file. Fails, naming the file, when it is
+# missing, empty or holds more than one line: a stamp is written by
+# nix/base.nix as one value and a newline, so anything else is not one.
+read_stamp() {
+    local file=$1 line value="" count=0
+    if [ ! -f "${file}" ]; then
+        printf 'yolobox-guest: rebuild: %s is missing\n' "${file}" >&2
+        return 1
+    fi
+    # `|| [ -n ... ]` keeps a last line that has no newline.
+    while IFS= read -r line || [ -n "${line}" ]; do
+        count=$((count + 1))
+        value=${line}
+    done <"${file}"
+    if [ "${count}" -ne 1 ] || [ -z "${value}" ]; then
+        printf 'yolobox-guest: rebuild: %s must hold exactly one non-empty line\n' "${file}" >&2
+        return 1
+    fi
+    printf '%s\n' "${value}"
+}
+
+# The one way to rebuild the box from inside it: the flake ref and hostname
+# come from the stamps of the build that made the box, so a hand rebuild can
+# neither rename an -m machine nor switch trees. A different ref goes through
+# `yo bootstrap --version` on the host. Only switch and boot, because they are
+# the actions that keep the box what yo built.
+cmd_rebuild() {
+    if [ "$#" -ne 1 ] || { [ "$1" != switch ] && [ "$1" != boot ]; }; then
+        printf 'yolobox-guest: rebuild: usage: rebuild switch|boot\n' >&2
+        exit 2
+    fi
+    local action=$1 uid user ref host
+    uid=$(id -u)
+    if [ "${uid}" != "${OPERATOR_UID}" ]; then
+        printf 'yolobox-guest: rebuild: run as the operator (uid %s), not uid %s\n' \
+            "${OPERATOR_UID}" "${uid}" >&2
+        exit 2
+    fi
+    ref=$(read_stamp "${YOLOBOX_STAMPS}/flake-ref") || exit 1
+    if [[ ! "${ref}" =~ ^${FLAKE_REF_RE}$ ]]; then
+        printf 'yolobox-guest: rebuild: %s/flake-ref is not github:OWNER/REPO/REF\n' \
+            "${YOLOBOX_STAMPS}" >&2
+        exit 1
+    fi
+    host=$(read_stamp "${YOLOBOX_STAMPS}/hostname") || exit 1
+    user=$(id -un)
+    exec sudo env "YOLOBOX_USERNAME=${user}" "YOLOBOX_HOSTNAME=${host}" \
+        "YOLOBOX_FLAKE_REF=${ref}" nixos-rebuild "${action}" --impure --flake "${ref}#yolobox"
+}
+
 main() {
     local sub="${1:-}"
     [ "$#" -ge 1 ] && shift
@@ -802,6 +867,7 @@ main() {
     aws-creds) cmd_aws_creds "$@" ;;
     aws-check) cmd_aws_check ;;
     net-check) cmd_net_check "$@" ;;
+    rebuild) cmd_rebuild "$@" ;;
     *)
         printf "yolobox-guest: unknown subcommand '%s'\n" "${sub}" >&2
         exit 64

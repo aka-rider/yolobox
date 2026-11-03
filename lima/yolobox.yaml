@@ -27,7 +27,10 @@ ssh:
   loadDotSSHPubKeys: false
   # Lima picks vsock or TCP for 60022 once per start, when guest port 22 first
   # answers. The initrd sshd that unlocks the disk only speaks TCP, so the
-  # choice must not depend on who answers first.
+  # choice must not depend on who answers first. A vsock peer also has no IP
+  # address, and the guest's sshd admits the operator only from 192.168.5.2
+  # (nix/base.md), so over vsock the operator is locked out. yo up refuses an
+  # instance without this pin.
   overVsock: false
 
 vmOpts:
