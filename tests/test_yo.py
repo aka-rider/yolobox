@@ -91,7 +91,7 @@ class TestMirror(FakeHome):
         self.assertIsNone(yo.mirror(self.home + "x/y"))
 
     def test_symlinked_spelling_is_not_resolved(self):
-        target = os.path.join(self.home, "Developer")
+        target = os.path.join(self.home, "src")
         os.mkdir(target)
         link = os.path.join(self.home, "code")
         os.symlink(target, link)
@@ -145,7 +145,7 @@ class TestSshRunArgv(FakeHome):
 
 
 class TestResolveCpOperands(unittest.TestCase):
-    MIRROR = "/home/agent/Developer/proj"
+    MIRROR = "/home/agent/src/proj"
 
     def test_requires_a_source_and_a_destination(self):
         with self.assertRaises(yo.YoError):
@@ -235,8 +235,8 @@ class TestResolveCpOperands(unittest.TestCase):
 class TestCpMkdirTarget(unittest.TestCase):
     def test_colon_dest_uses_resolved_dest_itself(self):
         self.assertEqual(
-            yo.cp_mkdir_target(":", "/home/agent/Developer/proj", 1),
-            "/home/agent/Developer/proj",
+            yo.cp_mkdir_target(":", "/home/agent/src/proj", 1),
+            "/home/agent/src/proj",
         )
 
     def test_trailing_slash_uses_resolved_dest_itself(self):
@@ -251,8 +251,8 @@ class TestCpMkdirTarget(unittest.TestCase):
 
     def test_single_plain_dest_uses_its_dirname(self):
         self.assertEqual(
-            yo.cp_mkdir_target(":file.txt", "/home/agent/Developer/proj/file.txt", 1),
-            "/home/agent/Developer/proj",
+            yo.cp_mkdir_target(":file.txt", "/home/agent/src/proj/file.txt", 1),
+            "/home/agent/src/proj",
         )
 
 
@@ -665,7 +665,7 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
         self.assertIn("no/such", caught.exception.message)
 
 
-STALE_REMOTE = "ssh://lima-yolobox/home/user.guest/Developer/myproject"
+STALE_REMOTE = "ssh://lima-yolobox/home/user.guest/src/myproject"
 
 
 class TestCpFromGuestNeverLandsControlPaths(CpFromGuestHarness):
@@ -941,7 +941,7 @@ class TestCpRefusesSymlinks(CpHarness):
 
 class TestLinkRemoteAction(unittest.TestCase):
     def setUp(self):
-        self.wanted = "ssh://agent@lima-yolobox/home/agent/Developer/myproject"
+        self.wanted = "ssh://agent@lima-yolobox/home/agent/src/myproject"
 
     def test_no_remote_is_added(self):
         self.assertEqual(yo.link_remote_action(None, self.wanted), "add")
@@ -963,9 +963,9 @@ class TestLinkRemoteAction(unittest.TestCase):
 class TestLink(FakeHome):
     def setUp(self):
         super().setUp()
-        self.project = os.path.join(self.home, "Developer", "myproject")
+        self.project = os.path.join(self.home, "src", "myproject")
         os.makedirs(self.project)
-        self.wanted = "ssh://agent@lima-yolobox%s/Developer/myproject" % yo.AGENT_HOME
+        self.wanted = "ssh://agent@lima-yolobox%s/src/myproject" % yo.AGENT_HOME
         patcher = mock.patch.object(yo, "logical_cwd", lambda: self.project)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1033,9 +1033,9 @@ class TestLogicalToplevel(FakeHome):
         os.symlink(target, os.path.join(self.home, name))
 
     def test_a_symlinked_spelling_of_the_root_is_kept(self):
-        self.make("Developer", "proj", "sub")
-        self.link(os.path.join(self.home, "Developer"), "code")
-        top = os.path.realpath(os.path.join(self.home, "Developer", "proj"))
+        self.make("src", "proj", "sub")
+        self.link(os.path.join(self.home, "src"), "code")
+        top = os.path.realpath(os.path.join(self.home, "src", "proj"))
         cwd = os.path.join(self.home, "code", "proj", "sub")
         self.assertEqual(
             yo.logical_toplevel(top, cwd), os.path.join(self.home, "code", "proj")
@@ -1568,7 +1568,7 @@ class TestHostKeyPinning(FakeHome):
         self.assertEqual(effective["nohostauthenticationforlocalhost"], "yes")
 
     def test_the_push_channel_takes_its_pin_from_the_file_alone(self):
-        project = os.path.join(self.home, "Developer", "myproject")
+        project = os.path.join(self.home, "src", "myproject")
         os.makedirs(project)
         calls = []
 

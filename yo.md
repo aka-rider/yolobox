@@ -12,7 +12,7 @@ When the mirrored path does not exist in the VM, the session lands at the deepes
 
 ### The toplevel of a symlinked repo
 
-`git rev-parse --show-toplevel` reports the repo root with symlinks resolved, but the mirror is spelled logically (say `~/code` is a link to `~/Developer`). `logical_toplevel()` therefore walks up from the cwd as spelled and takes the nearest ancestor whose `realpath` equals git's answer. When no ancestor matches, it falls back to the physical path.
+`git rev-parse --show-toplevel` reports the repo root with symlinks resolved, but the mirror is spelled logically (say `~/code` is a link to `~/src`). `logical_toplevel()` therefore walks up from the cwd as spelled and takes the nearest ancestor whose `realpath` equals git's answer. When no ancestor matches, it falls back to the physical path.
 
 It does not count the `../` that `--show-cdup` prints and apply that count to the logical cwd. That is wrong as soon as a symlink below the root makes the physical and logical depths differ, because the count then climbs to a different directory than the root. Recognise the shape by `yo link` mapping a repo to a parent of the one you stood in, or refusing it as `$HOME` itself.
 
@@ -20,7 +20,7 @@ It does not count the `../` that `--show-cdup` prints and apply that count to th
 
 `yo link` does not refuse outright when a Mac repo already carries a `yolobox` remote. It reads the existing URL first, through `link_remote_action()`. An unrelated remote, one whose host is not `lima-yolobox`, is still refused. A `yolobox` remote whose host is `lima-yolobox` and whose path is merely stale is updated in place with `git remote set-url`, and `yo` prints the old and the new URL to stderr so the change is not silent.
 
-A recreated box leaves exactly that stale shape behind. Every repo linked against a previous instance carries a `yolobox` URL whose path the new box does not have, something like `ssh://lima-yolobox/home/user.guest/Developer/myproject`. The update in place means no manual `git remote remove yolobox` is needed before `yo link` runs.
+A recreated box leaves exactly that stale shape behind. Every repo linked against a previous instance carries a `yolobox` URL whose path the new box does not have, something like `ssh://lima-yolobox/home/user.guest/src/myproject`. The update in place means no manual `git remote remove yolobox` is needed before `yo link` runs.
 
 ## yo cp
 
@@ -72,7 +72,7 @@ The guest side is not checked. The test exists to keep the Mac's private files f
 
 ### Downloads stage, then merge
 
-A download never lets scp write onto the Mac destination itself. scp writes through a symlink it finds there, and the agent controls what a repo it pushed contains. With `notes -> ../../.zshrc` committed, pulling the repo on the Mac and then running `yo cp :proj ~/Developer/` would overwrite `~/.zshrc` through the link.
+A download never lets scp write onto the Mac destination itself. scp writes through a symlink it finds there, and the agent controls what a repo it pushed contains. With `notes -> ../../.zshrc` committed, pulling the repo on the Mac and then running `yo cp :proj ~/src/` would overwrite `~/.zshrc` through the link.
 
 `download_from_guest` instead has scp fill a `.yo-cp-*` staging directory beside the destination, inside it when it is an existing directory, so the final move is a rename on one filesystem. `plan_merge` then plans every entry against what is already on the Mac before anything moves, and `land_staged` renames the entries into place. The refusals you will see:
 
@@ -172,11 +172,11 @@ Each instance's blocks live in that instance's own `ssh.config`, so writing one 
 
 - `1.7.2` or `v1.7.2` is that release tag.
 - `main`, `my-branch` or `v1.7.2-rc1` is a branch or tag on `aka-rider/yolobox`.
-- A flake ref with a `:` in it, such as `github:you/yolobox/branch`, or an absolute guest path, such as `/home/agent/Developer/yolobox`, is passed through verbatim.
+- A flake ref with a `:` in it, such as `github:you/yolobox/branch`, or an absolute guest path, such as `/home/agent/src/yolobox`, is passed through verbatim.
 
 Anything else is refused before anything runs. A partial version such as `1.7` or `v2` is refused because a release is `X.Y.Z`. `latest` is refused because no such ref exists upstream, and this `yo`'s own release already is the latest one after an upgrade. An empty value or one with spaces is refused. So are `~` and `./` spellings: the ref is shell-quoted on its way over ssh, so nothing expands `~`, and `./` would resolve against the operator's working directory in the guest, where `nixos-rebuild` runs, rather than in the checkout. On an unreleased build (`YO_VERSION` is `dev`) `--version` is required, because there is no release to fall back on.
 
-A host checkout cannot be fetched by the guest as a flake ref, so it goes through the repo's git bridge. Run `yo link` once inside the checkout, then `git push yolobox`. A checkout at `~/Developer/yolobox` lands at `/home/agent/Developer/yolobox` in the box, the path `mirror()` gives it under the guest home. Then run `yo bootstrap --version /home/agent/Developer/yolobox`. Nix reads the pushed tree, so commit first: uncommitted changes are invisible to it.
+A host checkout cannot be fetched by the guest as a flake ref, so it goes through the repo's git bridge. Run `yo link` once inside the checkout, then `git push yolobox`. A checkout at `~/src/yolobox` lands at `/home/agent/src/yolobox` in the box, the path `mirror()` gives it under the guest home. Then run `yo bootstrap --version /home/agent/src/yolobox`. Nix reads the pushed tree, so commit first: uncommitted changes are invisible to it.
 
 **The ref is remembered per machine.** A flag does not persist, so `yo bootstrap --version REF` writes the ref it built to `~/.local/state/yolobox/<name>.flake-ref` after `nixos-rebuild` succeeds. `rebuild_hint()` reads that file first, so a remedy printed for a box built from a fork keeps naming the fork's ref. Without the file it falls back to this `yo`'s release. A file that exists but is blank is an error that names the file, and it does not fall back: a silent fallback would switch a fork-built box to the upstream release on the next rebuild. The file holds only an explicit `--version`. A bootstrap without it means this `yo`'s release, so it deletes the file: otherwise the ref of an old fork build would pin the box against every later `brew upgrade`, and the next hint names this `yo`'s release again.
 

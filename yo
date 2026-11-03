@@ -4676,7 +4676,7 @@ def link_remote_action(existing_url: Optional[str], wanted_url: str) -> str:
 
 def logical_toplevel(physical_top: str, cwd: str) -> str:
     # git reports the repo root with symlinks resolved, but the mirror rule
-    # spells paths as the shell does (say ~/code is a link to ~/Developer). The
+    # spells paths as the shell does (say ~/code is a link to ~/src). The
     # root is the nearest ancestor of the logical cwd that resolves to it;
     # cwd's ".." count cannot be used, since a symlink below the root can
     # make the physical and logical depths differ.

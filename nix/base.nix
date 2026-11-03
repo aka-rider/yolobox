@@ -279,7 +279,6 @@ in
 
   systemd.tmpfiles.rules = [
     "d /run/yolobox-op 0700 ${username} users -"
-    "d ${config.users.users.${agentUser}.home}/Developer 0755 ${agentUser} users -"
   ];
 
   environment.localBinInPath = true;

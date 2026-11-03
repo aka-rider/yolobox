@@ -844,7 +844,7 @@ class TestEditorUris(unittest.TestCase):
         )
 
     def test_an_ordinary_path_is_unchanged(self):
-        path = "/home/agent/Developer/myproject"
+        path = "/home/agent/src/myproject"
         self.assertEqual(yo.editor_uri_path(path), path)
 
 
