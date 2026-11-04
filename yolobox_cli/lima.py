@@ -22,7 +22,7 @@ from .config import (
     SCRIPT_DIR,
     USAGE_EXIT,
 )
-from .driver import NO_SIZE, Size, StopRefused
+from .driver import NO_SIZE, Removal, Size, StopRefused
 from .ui import RunTimeout, YoError
 
 
@@ -431,8 +431,12 @@ class LimaDriver:
         if size.disk_gib is not None:
             ways.append(
                 "to grow the disk, keeping what is on it: %s (a smaller disk means "
-                "deleting the box, and everything on it is lost: %s)"
-                % (state.yo_cmd("disk-grow", str(size.disk_gib)), self.delete_command())
+                "deleting the box, and everything on it is lost: %s, which then prints "
+                "how to create it)"
+                % (
+                    state.yo_cmd("disk-grow", str(size.disk_gib)),
+                    state.destroy_then_bootstrap_command(*size.flags()),
+                )
             )
         return (
             "%s already exists, and limactl sized it when it was created — drop %s, "
@@ -622,8 +626,21 @@ class LimaDriver:
             "`limactl hostagent` process for %s." % state.box.name,
         ]
 
-    def delete_command(self) -> str:
-        return "limactl delete %s" % state.box.name
+    def removals(self) -> List[Removal]:
+        if not lima_instance_exists():
+            return []
+        return [
+            Removal(
+                "delete the Lima instance %s and %s, powering it off first if it runs"
+                % (state.box.name, state.box.tilde_dir),
+                self.delete_instance,
+            )
+        ]
+
+    def delete_instance(self) -> None:
+        proc.run(
+            ["limactl", "delete", "--force", state.box.name], capture=False, check=True
+        )
 
     def list_command(self) -> str:
         return "limactl list"

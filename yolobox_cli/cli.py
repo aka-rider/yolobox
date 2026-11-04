@@ -185,6 +185,24 @@ def build_parser() -> argparse.ArgumentParser:
     # Stopping needs no login: a box yo cannot log in to is stopped all the same.
     down.set_defaults(func=vm.cmd_down, logs_in=False)
 
+    destroy = add(
+        "destroy",
+        "Delete the VM and everything on it.",
+        "Delete the VM, its disk and the files yo keeps for it on this host, and\n"
+        "remove its herdr machine. Everything on the box is lost, and a running\n"
+        "box is powered off without asking. Without --yes it only lists what\n"
+        "would be removed. It leaves what the host shares between machines: the\n"
+        "Include line in ~/.ssh/config, the downloaded base image and the AWS\n"
+        "broker.",
+    )
+    destroy.add_argument(
+        "--yes",
+        action="store_true",
+        help="delete instead of only listing what would be deleted",
+    )
+    # Deleting needs no login: a box yo cannot log in to is deleted all the same.
+    destroy.set_defaults(func=vm.cmd_destroy, logs_in=False)
+
     status_parser = add(
         "status",
         "Describe the VM.",

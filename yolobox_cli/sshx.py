@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import proc, sshconfig, state, ui
 from .config import AGENT_USER, SSH_UNREACHABLE
+from .driver import Removal
 from .sshconfig import FIRST_CONTACT_OPTS
 from .ui import YoError
 
@@ -46,6 +47,40 @@ def ssh_options(role: SshRole, mux: bool = False) -> List[str]:
 def ssh_argv(role: SshRole, *tail: str, mux: bool = False) -> List[str]:
     """`ssh` with the role's options, then `tail`: the one place an ssh command starts."""
     return ["ssh"] + ssh_options(role, mux) + list(tail)
+
+
+def master_alive(role: SshRole) -> bool:
+    return (
+        proc.run(ssh_argv(role, "-O", "check", state.box.vm_host, mux=True)).returncode
+        == 0
+    )
+
+
+def stop_master(role: SshRole, failure: str) -> None:
+    """Ask the role's ssh master to quit, and raise `failure` (then ssh's stderr)
+    when one still answers. What counts is that none is left: a master that died
+    on its own since the caller looked makes the exit fail, and that is fine."""
+    exit_run = proc.run(ssh_argv(role, "-O", "exit", state.box.vm_host, mux=True))
+    if master_alive(role):
+        raise YoError("%s: %s" % (failure, exit_run.stderr.strip() or "no output"))
+
+
+def agent_master_removals() -> List[Removal]:
+    """Closing the agent account's ssh master, if one runs. The agent role's mux
+    sessions open it (ControlMaster auto, ControlPersist yes) on both drivers,
+    at a socket inside the instance directory, so it must quit before that
+    directory goes."""
+    if not master_alive(AGENT):
+        return []
+
+    def close() -> None:
+        stop_master(
+            AGENT,
+            "%s's agent ssh master is still running after `ssh -O exit`"
+            % state.box.name,
+        )
+
+    return [Removal("close the agent's ssh master", close)]
 
 
 def forward_agent_opts() -> List[str]:
@@ -139,10 +174,7 @@ def require_agent_account() -> None:
             "    Every AI session runs as that account, and this VM has no working one —"
         )
         ui.err("    it predates the operator/agent split. Rebuild it:")
-        ui.err(
-            "        %s && %s"
-            % (state.driver().delete_command(), state.yo_cmd("bootstrap"))
-        )
+        ui.err("        %s" % state.destroy_then_bootstrap_command())
     else:
         if detail:
             ui.err(detail)

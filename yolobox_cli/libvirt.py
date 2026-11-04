@@ -50,7 +50,7 @@ from .config import (
     OPERATOR_GUEST_UID,
     SCRIPT_DIR,
 )
-from .driver import RUNNING, Size, StopRefused
+from .driver import RUNNING, Removal, Size, StopRefused
 from .libvirt_host import GUEST_SSH_PORT, LIBVIRT_URI, VM_USER, DomainInfo
 from .sshx import OPERATOR
 from .ui import YoError
@@ -400,6 +400,13 @@ def redefine_command() -> str:
     )
 
 
+def virsh_removal(what: str, *args: str) -> Removal:
+    def remove() -> None:
+        libvirt_host.virsh(*args)
+
+    return Removal(what, remove)
+
+
 def yolobox_domains() -> List[DomainInfo]:
     """Every domain on the system connection that carries yolobox's metadata.
 
@@ -541,13 +548,14 @@ class LibvirtDriver:
             )
         return host_port
 
-    def master_alive(self) -> bool:
-        return (
-            proc.run(
-                sshx.ssh_argv(OPERATOR, "-O", "check", state.box.vm_host, mux=True)
-            ).returncode
-            == 0
-        )
+    def close_master(self) -> None:
+        """Quit the operator's master, under the lock that orders it against
+        ensure_master, so none opens in between."""
+        with self.master_lock():
+            sshx.stop_master(
+                OPERATOR,
+                "%s's ssh master is still running after `ssh -O exit`" % state.box.name,
+            )
 
     def ensure_master(self) -> None:
         """Open the operator's multiplexed ssh connection, if it is not open.
@@ -566,20 +574,14 @@ class LibvirtDriver:
         mux ssh joins it rather than replacing it, so the window is that gap
         alone; the other yo's session then fails, and its command reports it."""
         with self.master_lock():
-            if self.master_alive():
+            if sshx.master_alive(OPERATOR):
                 if sshx.ssh_run(OPERATOR, ["true"], mux=True).returncode == 0:
                     return
-                # What counts is that no master is left: one that died on its
-                # own since the check makes the exit fail, and that is fine.
-                exit_run = proc.run(
-                    sshx.ssh_argv(OPERATOR, "-O", "exit", state.box.vm_host, mux=True)
+                sshx.stop_master(
+                    OPERATOR,
+                    "%s's ssh master answers but carries no session, and "
+                    "`ssh -O exit` did not stop it" % state.box.name,
                 )
-                if self.master_alive():
-                    raise YoError(
-                        "%s's ssh master answers but carries no session, and "
-                        "`ssh -O exit` did not stop it: %s"
-                        % (state.box.name, exit_run.stderr.strip() or "no output")
-                    )
             self.require_login_key()
             sshx.ssh_run(OPERATOR, ["true"], mux=True, check=True)
 
@@ -644,8 +646,13 @@ class LibvirtDriver:
         if size.disk_gib is not None:
             return (
                 "%s already exists, and its disk was sized when yo created it — drop "
-                "%s, or delete the box, and everything on it is lost: %s, then run "
-                "this command again" % (state.box.name, flags, self.delete_command())
+                "%s, or delete the box and create it again at that size, and "
+                "everything on it is lost: %s"
+                % (
+                    state.box.name,
+                    flags,
+                    state.destroy_then_bootstrap_command(*size.flags()),
+                )
             )
         return (
             "%s already exists, and its memory was set when yo defined its domain — "
@@ -1022,16 +1029,38 @@ class LibvirtDriver:
             "then start it again with: %s" % state.yo_cmd("up"),
         ]
 
-    def delete_command(self) -> str:
-        virsh_ = "virsh -c %s" % LIBVIRT_URI
-        return " && ".join(
-            [
-                redefine_command(),
-                "%s vol-delete --pool %s %s" % (virsh_, LIBVIRT_POOL, disk_volume()),
-                "%s vol-delete --pool %s %s" % (virsh_, LIBVIRT_POOL, cidata_volume()),
-                "rm -r ~/%s/%s" % (self.instances_dir, state.box.name),
-            ]
-        )
+    def removals(self) -> List[Removal]:
+        steps: List[Removal] = []
+        if sshx.master_alive(OPERATOR):
+            steps.append(Removal("close the operator's ssh master", self.close_master))
+        if self.domain_exists():
+            if self.domain_state() != STATE_OFF:
+                steps.append(
+                    Removal("power off domain %s" % domain_name(), self.force_stop)
+                )
+            steps.append(
+                virsh_removal(
+                    "undefine domain %s with its nvram" % domain_name(),
+                    "undefine",
+                    "--nvram",
+                    domain_name(),
+                )
+            )
+        volumes = volume_names()
+        for volume in (disk_volume(), cidata_volume()):
+            if volume in volumes:
+                steps.append(
+                    virsh_removal(
+                        "delete volume %s" % volume,
+                        "vol-delete",
+                        "--pool",
+                        LIBVIRT_POOL,
+                        volume,
+                    )
+                )
+        if os.path.exists(state.instance_dir()):
+            steps.append(state.tree_removal(state.instance_dir()))
+        return steps
 
     def list_command(self) -> str:
         return "virsh -c %s list --all" % LIBVIRT_URI

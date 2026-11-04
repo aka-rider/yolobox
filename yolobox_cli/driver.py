@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional, Protocol, Sequence, Tuple
+from typing import Callable, List, NamedTuple, Optional, Protocol, Sequence, Tuple
 
 from .ui import YoError
 
@@ -41,6 +41,18 @@ class Size(NamedTuple):
 
 
 NO_SIZE = Size(None, None)
+
+
+class Removal(NamedTuple):
+    """One piece of a machine `yo destroy` removes: what it is, and the way to remove it.
+
+    `what` reads as an action ("delete volume X"), because the same line is
+    printed before a --yes run and as each step of it.
+    """
+
+    what: str
+    remove: Callable[[], None]
+
 
 # The status of a VM that is up, in Lima's word, which every driver reports.
 RUNNING = "Running"
@@ -99,7 +111,10 @@ class Driver(Protocol):
     def stop_command(self) -> str: ...
     def stop_failed(self, detail: str) -> str: ...  # first line of the abort
     def stop_recovery(self) -> List[str]: ...  # how to stop what stop() could not
-    def delete_command(self) -> str: ...
+    # What of this machine the driver holds and `yo destroy` removes, in the order
+    # to remove it. Only what exists is listed, so a machine with nothing left
+    # gives [].
+    def removals(self) -> List[Removal]: ...
     def list_command(self) -> str: ...  # shows the instance's state
     # Where to look when the initrd's sshd never answered, from what the host
     # can actually show of the boot.

@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import functools
 import os
 import pwd
+import shlex
 import sys
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterator, Optional
 
 from . import proc
 from .config import AGENT_USER, DEFAULT_INSTANCE, FILE_MODE_PRIVATE
-from .driver import Driver
+from .driver import Driver, Removal
 from .ui import YoError
 
 # sizeof(sockaddr_un.sun_path): a unix socket path of this many bytes or more cannot be bound.
@@ -157,6 +159,47 @@ def state_dir() -> str:
     return os.path.join(home(), ".local/state/yolobox")
 
 
+def tilde(path: str) -> str:
+    """The path as an operator would type it: ~/... for one under $HOME."""
+    prefix = home() + os.sep
+    return "~/" + path[len(prefix) :] if path.startswith(prefix) else path
+
+
+def file_removal(path: str) -> Removal:
+    return Removal(
+        "delete file %s" % tilde(path), functools.partial(proc.delete_file, path)
+    )
+
+
+def tree_removal(path: str) -> Removal:
+    return Removal(
+        "delete directory %s" % tilde(path), functools.partial(proc.delete_tree, path)
+    )
+
+
+def flake_ref_file() -> str:
+    return os.path.join(state_dir(), "%s.flake-ref" % box.name)
+
+
+def remembered_flake_ref() -> Optional[str]:
+    """The ref the last bootstrap built this machine from, if it ever did."""
+    text = proc.read_text_file(flake_ref_file(), errors="surrogateescape")
+    ref = text.strip() if text is not None else ""
+    return ref or None
+
+
+def destroy_then_bootstrap_command(*bootstrap_args: str) -> str:
+    """The command line that deletes this machine and bootstraps it again, with
+    `bootstrap_args`, from the ref it was built from: destroy deletes the file
+    that remembers the ref, so the bootstrap names it here."""
+    ref = remembered_flake_ref()
+    version = [] if ref is None else ["--version", shlex.quote(ref)]
+    return "%s && %s" % (
+        yo_cmd("destroy", "--yes"),
+        yo_cmd("bootstrap", *bootstrap_args, *version),
+    )
+
+
 class UnlockBusy(Exception):
     """Another yo holds this box's unlock lock."""
 
@@ -168,8 +211,14 @@ def unlock_lock(wait: bool) -> Iterator[None]:
     The one chokepoint between the yo that answers the ask and the yo that
     powers the box off: whoever sends the passphrase holds it while sending, and
     `yo down` holds it from its probe to the power-off, so the answer can never
-    land between the two. With `wait` False a held lock raises UnlockBusy
-    instead of blocking, which `yo down` turns into a refusal.
+    land between the two. `yo destroy` holds it for its whole run. With `wait`
+    False a held lock raises UnlockBusy instead of blocking, which those two
+    turn into a refusal.
+
+    The lock file is never deleted, `yo destroy` included. A yo blocked in
+    `flock` holds the old inode: with the file unlinked under it, the next yo
+    would create and lock a fresh one, and the two would hold "the" lock at
+    once. Like `instances/.port.lock`, it is a few bytes of host state.
     """
     proc.private_dir(state_dir())
     fd = os.open(

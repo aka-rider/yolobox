@@ -5,6 +5,7 @@ option tests), and a Python with `os.pidfd_open` or `select.kqueue` (the
 pid-exit watch).
 """
 
+import argparse
 import contextlib
 import errno
 import http.server
@@ -3101,6 +3102,133 @@ def fake_limactl(
     return mock.patch.object(target.proc, "run", side_effect=run)
 
 
+class TestDeletingPaths(FakeHome):
+    def test_a_path_that_is_already_gone_is_the_wanted_end_state(self):
+        gone = os.path.join(self.home, "gone")
+        yo.proc.delete_file(gone)
+        yo.proc.delete_tree(gone)
+
+    def test_a_path_of_the_wrong_kind_is_a_yo_error_naming_it(self):
+        directory = os.path.join(self.home, "dir")
+        os.mkdir(directory)
+        with self.assertRaisesRegex(yo.YoError, "cannot delete .*dir: "):
+            yo.proc.delete_file(directory)
+        file = os.path.join(self.home, "file")
+        Path(file).touch()
+        with self.assertRaisesRegex(yo.YoError, "cannot delete .*file: "):
+            yo.proc.delete_tree(file)
+
+    def test_a_symlink_is_refused_with_the_reason_not_with_none(self):
+        link = os.path.join(self.home, "link")
+        os.symlink(self.home, link)
+        with self.assertRaises(yo.YoError) as caught:
+            yo.proc.delete_tree(link)
+        self.assertIn("symbolic link", caught.exception.message)
+        self.assertNotIn("None", caught.exception.message)
+        self.assertTrue(os.path.islink(link))
+
+    @unittest.skipIf(os.geteuid() == 0, "root can delete inside a read-only directory")
+    def test_a_failure_inside_a_tree_names_the_file_that_failed(self):
+        tree = os.path.join(self.home, "tree")
+        locked = os.path.join(tree, "locked")
+        os.makedirs(locked)
+        Path(locked, "stuck").touch()
+        os.chmod(locked, 0o500)
+        self.addCleanup(os.chmod, locked, 0o700)
+        with self.assertRaisesRegex(
+            yo.YoError, "cannot delete .*tree: Permission denied at .*tree/locked"
+        ):
+            yo.proc.delete_tree(tree)
+
+
+class TestLimaDestroy(FakeHome):
+    """`yo destroy` on Lima: one `limactl delete --force`, for an instance that exists."""
+
+    def setUp(self):
+        super().setUp()
+        self.listed = [yo.box.name]
+        self.list_code = 0
+        self.agent_master = False
+        self.agent_master_survives_exit = False
+        self.delete_code = 0
+        self.calls = []
+        self.lines = []
+        for patcher in (
+            mock.patch.object(yo.subprocess, "run", side_effect=self.subprocess_run),
+            mock.patch.object(yo.shutil, "which", return_value=None),
+            mock.patch.object(yo.ui, "out", side_effect=self.lines.append),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def subprocess_run(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        code, stdout = 0, b""
+        if argv[:3] == ["limactl", "list", "-q"]:
+            code = self.list_code
+            stdout = "".join(name + "\n" for name in self.listed).encode()
+        elif argv[:2] == ["limactl", "delete"]:
+            code = self.delete_code
+        elif argv[0] == "ssh" and "check" in argv:
+            code = 0 if self.agent_master else 255
+        elif argv[0] == "ssh" and "exit" in argv:
+            self.agent_master = self.agent_master_survives_exit
+        return subprocess.CompletedProcess(argv, code, stdout, b"")
+
+    def destroy(self, yes):
+        yo.cmd_destroy(argparse.Namespace(yes=yes))
+
+    def deletes(self):
+        return [call for call in self.calls if call[:2] == ["limactl", "delete"]]
+
+    def test_yes_force_deletes_the_listed_instance(self):
+        self.destroy(yes=True)
+        self.assertEqual(self.deletes(), [["limactl", "delete", "--force", "yolobox"]])
+
+    def test_a_failing_delete_is_a_yo_error(self):
+        self.delete_code = 1
+        with self.assertRaisesRegex(
+            yo.YoError, "limactl delete --force yolobox failed"
+        ):
+            self.destroy(yes=True)
+
+    def test_the_agents_ssh_master_quits_before_its_socket_directory_is_deleted(self):
+        self.agent_master = True
+        self.destroy(yes=False)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn("close the agent's ssh master", "\n".join(self.lines))
+        self.destroy(yes=True)
+        self.assertFalse(self.agent_master)
+        exit_at = next(i for i, call in enumerate(self.calls) if "exit" in call)
+        self.assertLess(exit_at, self.calls.index(self.deletes()[0]))
+
+    def test_an_agent_master_that_will_not_quit_stops_the_run(self):
+        self.agent_master = True
+        self.agent_master_survives_exit = True
+        with self.assertRaisesRegex(yo.YoError, "agent ssh master is still running"):
+            self.destroy(yes=True)
+        self.assertEqual(self.deletes(), [])
+
+    def test_without_yes_nothing_is_deleted(self):
+        self.destroy(yes=False)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn("delete the Lima instance yolobox", "\n".join(self.lines))
+
+    def test_an_instance_that_is_not_listed_has_nothing_to_destroy(self):
+        self.listed = ["my-yolobox"]
+        for yes in (False, True):
+            with self.subTest(yes=yes):
+                self.lines.clear()
+                self.destroy(yes=yes)
+                self.assertEqual(self.deletes(), [])
+                self.assertEqual(self.lines, ["yolobox has nothing to destroy"])
+
+    def test_a_limactl_that_cannot_list_is_not_a_box_with_nothing_to_destroy(self):
+        self.list_code = 1
+        with self.assertRaisesRegex(yo.YoError, "list.*failed"):
+            self.destroy(yes=True)
+
+
 class TestLimaConfigGaps(FakeHome):
     def mock_lima_list(
         self,
@@ -3649,40 +3777,56 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
         fake_err.assert_not_called()
 
 
-class TestHerdrMachineExists(unittest.TestCase):
-    def test_empty_listing_is_false(self):
-        self.assertFalse(yo.herdr_machine_exists("[]"))
+class TestHerdrMachineId(unittest.TestCase):
+    def test_empty_listing_has_no_machine(self):
+        self.assertIsNone(yo.herdr_machine_id("[]"))
 
-    def test_matching_target_field_is_true(self):
-        self.assertTrue(
-            yo.herdr_machine_exists(
-                '[{"id": "1", "label": "yolobox", "target": "yolobox", '
-                '"session": null, "enabled": true}]'
-            )
+    def test_the_matching_targets_id_is_returned(self):
+        self.assertEqual(
+            yo.herdr_machine_id(
+                '[{"id": "7", "label": "x", "target": "other-box"},'
+                ' {"id": "9", "label": "ops", "target": "yolobox", "enabled": true}]'
+            ),
+            "9",
         )
 
-    def test_unrelated_target_is_false(self):
-        self.assertFalse(yo.herdr_machine_exists('[{"target": "other-box"}]'))
+    def test_unrelated_target_is_no_machine(self):
+        self.assertIsNone(yo.herdr_machine_id('[{"id": "1", "target": "other-box"}]'))
 
     def test_yolobox_value_outside_the_target_field_is_not_a_match(self):
         # Locks in the fix for a hidden failure: the old implementation matched
         # "yolobox" anywhere in an entry, so a machine merely *labelled*
         # yolobox but pointed at a different ssh target read as already added.
-        self.assertFalse(
-            yo.herdr_machine_exists('[{"label": "yolobox", "target": "other-box"}]')
+        self.assertIsNone(
+            yo.herdr_machine_id(
+                '[{"id": "1", "label": "yolobox", "target": "other-box"}]'
+            )
         )
 
     def test_unparseable_json_raises(self):
         with self.assertRaisesRegex(
             yo.YoError, "herdr machine list --json produced unparseable"
         ):
-            yo.herdr_machine_exists("not json")
+            yo.herdr_machine_id("not json")
 
     def test_non_array_json_raises(self):
         with self.assertRaisesRegex(
             yo.YoError, "herdr machine list --json did not print a JSON"
         ):
-            yo.herdr_machine_exists('{"target": "yolobox"}')
+            yo.herdr_machine_id('{"target": "yolobox"}')
+
+    def test_a_matching_entry_without_a_usable_id_raises(self):
+        for entry in (
+            '{"target": "yolobox"}',
+            '{"id": "", "target": "yolobox"}',
+            '{"id": 5, "target": "yolobox"}',
+            '{"id": null, "target": "yolobox"}',
+        ):
+            with self.subTest(entry=entry):
+                with self.assertRaisesRegex(
+                    yo.YoError, "has no id.*herdr machine list --json.*machine remove"
+                ):
+                    yo.herdr_machine_id("[%s]" % entry)
 
 
 class TestYoNamespace(unittest.TestCase):

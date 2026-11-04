@@ -247,6 +247,39 @@ class TestFlakeRef(FakeHome):
         flake_arg = hint.split("--flake ", 1)[1]
         self.assertEqual(shlex.split(flake_arg), ["github:you/yolobox/x#yolobox"])
 
+    def test_the_hint_that_deletes_the_box_names_the_ref_destroy_will_forget(self):
+        self.assertEqual(
+            yo.destroy_then_bootstrap_command(),
+            "yo destroy --yes && yo bootstrap",
+        )
+        self.remember("github:you/yolobox/x\n")
+        self.assertEqual(
+            yo.destroy_then_bootstrap_command("--disk", "250"),
+            "yo destroy --yes && yo bootstrap --disk 250 --version github:you/yolobox/x",
+        )
+
+    def test_a_remembered_ref_is_quoted_in_the_hint_that_deletes_the_box(self):
+        self.remember("github:x/y'; touch pwned #")
+        hint = yo.destroy_then_bootstrap_command()
+        self.assertEqual(
+            shlex.split(hint.split("&&", 1)[1])[-1], "github:x/y'; touch pwned #"
+        )
+
+    def test_a_box_without_an_agent_account_is_told_to_delete_and_bootstrap_it(self):
+        self.remember("main")
+        with (
+            mock.patch.object(
+                yo.sshx, "account_status", return_value=("operator_only", "")
+            ),
+            mock.patch.object(yo.ui, "err") as fake_err,
+        ):
+            with self.assertRaises(yo.YoError):
+                yo.sshx.require_agent_account()
+        self.assertIn(
+            "        yo destroy --yes && yo bootstrap --version main",
+            [call.args[0] for call in fake_err.call_args_list],
+        )
+
     def test_the_hint_names_the_hostname_and_ref_beside_the_username(self):
         self.remember("github:x/y/z")
         self.assertIn(
@@ -383,6 +416,8 @@ class TestMainPreflight(unittest.TestCase):
             "cp",
             "code",
             "zed",
+            "port",
+            "destroy",
             "aws-check",
             "help",
         ]
@@ -1695,7 +1730,7 @@ class TestEnsureHerdrMachine(unittest.TestCase):
         def fake_run(argv, **kwargs):
             if argv[1:3] == ["machine", "list"]:
                 return mock.Mock(
-                    returncode=0, stdout='[{"target": "yolobox"}]', stderr=""
+                    returncode=0, stdout='[{"id": "1", "target": "yolobox"}]', stderr=""
                 )
             return mock.Mock(returncode=0, stdout="", stderr="")
 

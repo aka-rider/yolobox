@@ -10,7 +10,7 @@ import re
 import shlex
 from typing import List, Optional
 
-from . import config, proc, sshx, state, ui
+from . import config, sshx, state, ui
 from .ui import YoError
 
 
@@ -143,19 +143,8 @@ def bootstrap_version(value: str) -> str:
         raise argparse.ArgumentTypeError(failure.message)
 
 
-def flake_ref_file() -> str:
-    return os.path.join(state.state_dir(), "%s.flake-ref" % state.box.name)
-
-
-def remembered_flake_ref() -> Optional[str]:
-    """The ref the last bootstrap built this machine from, if it ever did."""
-    text = proc.read_text_file(flake_ref_file(), errors="surrogateescape")
-    ref = text.strip() if text is not None else ""
-    return ref or None
-
-
 def rebuild_hint() -> str:
-    ref = remembered_flake_ref()
+    ref = state.remembered_flake_ref()
     old = old_release(ref) if ref is not None else None
     if old is not None:
         # A command naming that ref would fail in the old flake, and one naming
@@ -182,7 +171,7 @@ def rebuild_hint() -> str:
                 "yo: %s holds %r, which is no longer an accepted flake ref — not using "
                 "it; run %s to rewrite it"
                 % (
-                    flake_ref_file(),
+                    state.flake_ref_file(),
                     ref,
                     state.yo_cmd("bootstrap", "--version", "<ref>"),
                 )

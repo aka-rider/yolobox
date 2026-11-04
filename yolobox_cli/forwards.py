@@ -16,32 +16,68 @@ from .config import (
     OP_GUEST_SOCK,
     SSH_CONFIG_INCLUDE_LINE,
 )
+from .driver import Removal
 from .sshx import AGENT, OPERATOR
 from .ui import YoError
 
 
-def herdr_machine_exists(listing_json: str) -> bool:
+def herdr_machine_id(listing_json: str) -> Optional[str]:
+    """The id of the herdr machine whose target is this box's alias, or None.
+
+    `herdr machine remove` takes that id, not the target. A matching entry
+    without a usable id is an error, never a guess, for `yo bootstrap` too: it
+    exists, but nothing can remove it.
+    """
     try:
         entries = json.loads(listing_json)
     except ValueError:
         raise YoError("herdr machine list --json produced unparseable output")
     if not isinstance(entries, list):
         raise YoError("herdr machine list --json did not print a JSON array")
-    return any(
-        isinstance(entry, dict) and entry.get("target") == state.box.herdr_alias
-        for entry in entries
-    )
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("target") == state.box.herdr_alias:
+            machine_id = entry.get("id")
+            if not isinstance(machine_id, str) or not machine_id:
+                raise YoError(
+                    "herdr machine list --json: the entry for %s has no id, so yo "
+                    "cannot tell which machine it is. Inspect it with `herdr machine "
+                    "list --json` and delete it by hand with `herdr machine remove "
+                    "<id>`" % state.box.herdr_alias
+                )
+            return machine_id
+    return None
+
+
+def herdr_binary() -> Optional[str]:
+    return shutil.which("herdr")
+
+
+def listed_herdr_machine_id(herdr: str) -> Optional[str]:
+    listing = proc.run([herdr, "machine", "list", "--json"], check=True)
+    return herdr_machine_id(listing.stdout)
+
+
+def herdr_machine_removals(herdr: str) -> List[Removal]:
+    """The herdr machine registered for this box, as a step of `yo destroy`; none
+    when herdr has no such machine."""
+    machine_id = listed_herdr_machine_id(herdr)
+    if machine_id is None:
+        return []
+
+    def remove() -> None:
+        proc.run([herdr, "machine", "remove", machine_id], check=True)
+
+    return [Removal("delete the herdr machine %s" % state.box.herdr_alias, remove)]
 
 
 def ensure_herdr_machine(ssh_config_includes_the_vm: bool) -> None:
-    herdr = shutil.which("herdr")
+    herdr = herdr_binary()
     if herdr is None:
         ui.err(
             "yo: herdr not found on this host's PATH — skipping herdr machine registration"
         )
         return
-    listing = proc.run([herdr, "machine", "list", "--json"], check=True)
-    if herdr_machine_exists(listing.stdout):
+    if listed_herdr_machine_id(herdr) is not None:
         return
     if not ssh_config_includes_the_vm:
         # herdr runs `ssh <alias>`, and the alias exists only in the file that

@@ -335,11 +335,16 @@ class TestVmUpOnARunningBoxWithoutSshd(unittest.TestCase):
 
 
 class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
-    def vm_up(self, instance, size=yo.NO_SIZE, info=None):
+    def vm_up(self, instance, size=yo.NO_SIZE, info=None, remembered_ref=None):
         """Run vm_up on an instance limactl reports as `info`; return error and stubs."""
         stubs = {}
         with contextlib.ExitStack() as stack:
             stack.enter_context(as_instance(instance))
+            stack.enter_context(
+                mock.patch.object(
+                    yo.state, "remembered_flake_ref", return_value=remembered_ref
+                )
+            )
             for target, name in (
                 (yo.agent, "luks_passphrase"),
                 (yo.LIMA, "start"),
@@ -427,7 +432,7 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
             "stop it (yo -m second down), then: limactl edit --yes second --memory 24",
             error.message,
         )
-        self.assertNotIn("limactl delete", error.message)
+        self.assertNotIn("destroy", error.message)
         self.assert_refused_before_anything(stubs)
 
     def test_a_disk_for_an_instance_that_exists_names_disk_grow_and_the_loss(self):
@@ -436,9 +441,22 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
         self.assertIn(
             "keeping what is on it: yo -m second disk-grow 250", error.message
         )
-        self.assertIn("everything on it is lost: limactl delete second", error.message)
+        self.assertIn(
+            "everything on it is lost: yo -m second destroy --yes && "
+            "yo -m second bootstrap --disk 250, which then prints how to create it)",
+            error.message,
+        )
         self.assertNotIn("limactl edit", error.message)
         self.assert_refused_before_anything(stubs)
+
+    def test_the_delete_a_disk_refusal_names_keeps_the_ref_the_box_was_built_from(self):
+        error, _ = self.vm_up(
+            INSTANCE_B, yo.Size(None, 250), info=self.STOPPED, remembered_ref="main"
+        )
+        self.assertIn(
+            "yo -m second bootstrap --disk 250 --version main, which then",
+            error.message,
+        )
 
 
 class TestLimaStartNeverDropsASize(unittest.TestCase):

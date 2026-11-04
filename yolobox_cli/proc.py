@@ -30,7 +30,7 @@ def read_text_file(
     except FileNotFoundError:
         return missing
     except OSError as failure:
-        raise YoError("cannot read %s: %s" % (path, failure.strerror))
+        raise YoError("cannot read %s: %s" % (path, failure))
 
 
 def atomic_write(path: str, content: str, mode: int) -> None:
@@ -43,6 +43,30 @@ def atomic_write(path: str, content: str, mode: int) -> None:
     except BaseException:
         os.unlink(tmp_path)
         raise
+
+
+def delete_path(path: str, delete: Callable[[str], None]) -> None:
+    """Run `delete` on the path. One already gone is the wanted end state; any other
+    failure is a YoError, whose text names the path that failed (a nested one, for a tree)."""
+    try:
+        delete(path)
+    except FileNotFoundError:
+        pass
+    except OSError as failure:
+        # shutil.rmtree's own refusals (a symlink) carry a message and no strerror;
+        # a failure inside a tree carries the nested path that failed.
+        reason = failure.strerror or " ".join(str(arg) for arg in failure.args)
+        where = "" if failure.filename in (None, path) else " at %s" % failure.filename
+        raise YoError("cannot delete %s: %s%s" % (path, reason, where))
+
+
+def delete_file(path: str) -> None:
+    delete_path(path, os.remove)
+
+
+def delete_tree(path: str) -> None:
+    """Delete the directory and all in it, failing like delete_file."""
+    delete_path(path, shutil.rmtree)
 
 
 def require_tool(name: str, hint: str) -> str:

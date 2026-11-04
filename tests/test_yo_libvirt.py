@@ -9,11 +9,13 @@ Tools whose absence skips tests: gawk, or nix to fetch it (the initrd's key
 program).
 """
 
+import argparse
 import base64
 import contextlib
 import fcntl
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
@@ -48,6 +50,7 @@ DAEMON_VERSION_TEXT = (
     "Running against daemon: %s\n"
 )
 PASST_DIR = "/run/libvirt/qemu/passt"
+HERDR = "/opt/herdr/bin/herdr"
 HOST_MEMORY_GIB = 64
 # The virsh subcommands that only look.
 READS = frozenset({"list", "dumpxml", "domstate", "dominfo", "vol-list", "vol-info"})
@@ -109,6 +112,10 @@ class FakeHost:
         self.iso_inputs = []  # (directory, file names) at each xorriso call
         self.master_output = ""
         self.master_running = True  # whether `ssh -O check` finds the master
+        # The same for the agent account's master, which no session opens here.
+        self.agent_master_running = False
+        # A master that answers `ssh -O exit` and keeps running.
+        self.master_survives_exit = False
         # What a session through that master gets: (code, stderr). A master
         # whose connection died still answers -O check, and its sessions fail.
         self.master_session = (0, "")
@@ -128,6 +135,9 @@ class FakeHost:
         self.sshd = lambda argv: (0, "")
         # The initrd's yolobox-unlock session: (stdout lines, exit code, stderr).
         self.helper = None
+        # What `herdr machine list --json` prints, entry by entry.
+        self.herdr_machines = []
+        self.herdr_remove_fails = False
 
     def subcommands(self):
         return [call[3] for call in self.calls if call[0] == "virsh" and len(call) > 3]
@@ -152,8 +162,13 @@ class FakeHost:
             Path(argv[argv.index("-o") + 1]).write_bytes(b"ISO" * 100)
             result = completed()
         elif argv[0] == "ssh" and "check" in argv:
+            running = (
+                self.agent_master_running
+                if "User=agent" in argv
+                else self.master_running
+            )
             result = completed(
-                returncode=0 if self.master_running else 255, stderr=self.master_output
+                returncode=0 if running else 255, stderr=self.master_output
             )
         elif argv[0] == "ssh" and "-O" in argv and "forward" in argv:
             if self.master_running and self.master_session[0] == 0:
@@ -162,8 +177,12 @@ class FakeHost:
             else:
                 result = completed(returncode=255, stderr="mux_client_forward: failed")
         elif argv[0] == "ssh" and "exit" in argv:
-            result = completed(returncode=0 if self.master_running else 255)
-            self.master_running = False
+            if "User=agent" in argv:
+                result = completed(returncode=0 if self.agent_master_running else 255)
+                self.agent_master_running &= self.master_survives_exit
+            else:
+                result = completed(returncode=0 if self.master_running else 255)
+                self.master_running &= self.master_survives_exit
         elif argv[0] == "ssh" and argv[-1] == "true":
             # A session without ControlPath=none rides the master when one runs;
             # any other one logs in to the box's sshd, and a mux one that does
@@ -177,6 +196,16 @@ class FakeHost:
                     self.master_running = True
                     self.master_session = (0, "")
             result = completed(returncode=code, stderr=stderr)
+        elif argv[0] == HERDR and argv[1:3] == ["machine", "list"]:
+            result = completed(json.dumps(self.herdr_machines))
+        elif argv[0] == HERDR and argv[1:3] == ["machine", "remove"]:
+            if self.herdr_remove_fails:
+                result = completed(returncode=1, stderr="no such machine")
+            else:
+                self.herdr_machines = [
+                    m for m in self.herdr_machines if m["id"] != argv[3]
+                ]
+                result = completed()
         elif argv[0] == "ss":
             result = completed(self.listeners)
         elif argv[0] == "getfacl":
@@ -214,6 +243,11 @@ class FakeHost:
             return completed()
         if sub == "destroy":
             self.states[args[0]] = "shut off"
+            return completed()
+        if sub == "undefine":
+            assert args[0] == "--nvram", args
+            del self.domains[args[1]]
+            del self.states[args[1]]
             return completed()
         if sub == "list":
             # Without --all virsh lists the active domains only.
@@ -1985,6 +2019,250 @@ class TestDown(LibvirtCase):
             self.down(self.box.BootStage.INITRD)
 
 
+class TestDestroy(LibvirtCase):
+    """`yo destroy` lists what this machine has, and with --yes removes exactly that."""
+
+    TILDE_INSTANCE_DIR = "~/.local/state/yolobox/instances/box"
+
+    def setUp(self):
+        super().setUp()
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.tagged_domain("other", FIRST_PORT + 1)
+        self.host.agent_master_running = True
+        self.host.volumes = {
+            "yolobox-box.qcow2": b"",
+            "yolobox-box-cidata.iso": b"",
+            "yolobox-other.qcow2": b"",
+        }
+        self.host.herdr_machines = [
+            {"id": "m-7", "label": "ops", "target": "box"},
+            {"id": "m-8", "label": "ops", "target": "other"},
+        ]
+        self.instance_dir = Path(self.box.state.instance_dir())
+        self.instance_dir.mkdir(parents=True)
+        (self.instance_dir / "operator.pub").write_text(PUBLIC_KEY)
+        self.flake_ref = Path(self.box.state.flake_ref_file())
+        self.flake_ref.parent.mkdir(parents=True, exist_ok=True)
+        self.flake_ref.write_text("main\n")
+        self.lock_file = Path(self.box.state.state_dir()) / "box.unlock.lock"
+        self.lines = []
+        for patcher in (
+            mock.patch.object(self.box.ui, "out", side_effect=self.lines.append),
+            mock.patch.object(self.box.shutil, "which", return_value=HERDR),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def destroy(self, yes):
+        self.box.cmd_destroy(argparse.Namespace(yes=yes))
+
+    def forget_the_box(self):
+        """Take away everything this machine had, leaving the other one."""
+        del self.host.domains["yolobox-box"], self.host.states["yolobox-box"]
+        del self.host.volumes["yolobox-box.qcow2"]
+        del self.host.volumes["yolobox-box-cidata.iso"]
+        self.host.herdr_machines.pop(0)
+        self.host.master_running = False
+        self.host.agent_master_running = False
+        shutil.rmtree(self.instance_dir)
+        self.flake_ref.unlink()
+        self.host.calls.clear()
+
+    def assert_the_other_machine_is_untouched(self):
+        self.assertIn("yolobox-other", self.host.domains)
+        self.assertEqual(list(self.host.volumes), ["yolobox-other.qcow2"])
+        self.assertEqual([m["id"] for m in self.host.herdr_machines], ["m-8"])
+
+    def mutations(self):
+        return [s for s in self.host.subcommands() if s not in READS]
+
+    def test_yes_removes_every_piece_of_a_running_box_and_only_that_box(self):
+        def assert_lock_held_while_it_mutates(argv, **kwargs):
+            if argv[0] == "virsh" and argv[3] not in READS:
+                with self.assertRaises(self.box.UnlockBusy):
+                    with self.box.state.unlock_lock(wait=False):
+                        pass
+            return self.host.run(argv, **kwargs)
+
+        with mock.patch.object(
+            self.box.proc, "run", side_effect=assert_lock_held_while_it_mutates
+        ):
+            self.destroy(yes=True)
+        self.assertNotIn("yolobox-box", self.host.domains)
+        self.assertFalse(self.instance_dir.exists())
+        self.assertFalse(self.flake_ref.exists())
+        self.assertFalse(self.host.master_running)
+        self.assertFalse(self.host.agent_master_running)
+        self.assert_the_other_machine_is_untouched()
+        self.assertEqual(
+            self.mutations(), ["destroy", "undefine", "vol-delete", "vol-delete"]
+        )
+        self.assertIn("delete volume yolobox-box.qcow2", self.lines)
+
+    def test_the_agents_master_quits_before_the_domain_is_touched(self):
+        self.destroy(yes=True)
+        first_virsh_change = next(
+            i
+            for i, call in enumerate(self.host.calls)
+            if call[:1] == ["virsh"] and call[3] in ("destroy", "undefine")
+        )
+        agent_exit = next(
+            i
+            for i, call in enumerate(self.host.calls)
+            if "exit" in call and "User=agent" in call
+        )
+        self.assertLess(agent_exit, first_virsh_change)
+
+    def test_a_box_that_is_already_off_is_not_powered_off_again(self):
+        self.host.states["yolobox-box"] = "shut off"
+        self.destroy(yes=True)
+        self.assertEqual(self.host.calls_of("destroy"), [])
+        self.assertNotIn("yolobox-box", self.host.domains)
+
+    def test_a_domain_another_yo_starts_while_destroy_waits_is_powered_off_first(self):
+        # The list is made under the lock: a yo up that wins the lock first may
+        # start the box that was off, and undefining it running leaves qemu on a
+        # deleted volume.
+        self.host.states["yolobox-box"] = "shut off"
+        take_the_lock = self.box.state.unlock_lock
+
+        @contextlib.contextmanager
+        def lock_after_a_yo_up_started_the_box(wait):
+            self.host.states["yolobox-box"] = "running"
+            with take_the_lock(wait) as held:
+                yield held
+
+        with mock.patch.object(
+            self.box.state, "unlock_lock", lock_after_a_yo_up_started_the_box
+        ):
+            self.destroy(yes=True)
+        self.assertEqual(self.mutations()[:2], ["destroy", "undefine"])
+
+    def test_without_yes_nothing_changes_and_each_piece_is_named(self):
+        self.destroy(yes=False)
+        self.assertLessEqual(set(self.host.subcommands()), READS)
+        self.assertIn("yolobox-box", self.host.domains)
+        self.assertEqual(
+            set(self.host.volumes),
+            {"yolobox-box.qcow2", "yolobox-box-cidata.iso", "yolobox-other.qcow2"},
+        )
+        self.assertTrue(self.instance_dir.exists())
+        self.assertTrue(self.flake_ref.exists())
+        self.assertTrue(self.host.master_running)
+        self.assertTrue(self.host.agent_master_running)
+        self.assertEqual([m["id"] for m in self.host.herdr_machines], ["m-7", "m-8"])
+        listing = "\n".join(self.lines)
+        for piece in (
+            "close the operator's ssh master",
+            "close the agent's ssh master",
+            "power off domain yolobox-box",
+            "undefine domain yolobox-box",
+            "delete volume yolobox-box.qcow2",
+            "delete volume yolobox-box-cidata.iso",
+            "delete directory " + self.TILDE_INSTANCE_DIR,
+            "delete the herdr machine box",
+            "delete file ~/.local/state/yolobox/box.flake-ref",
+        ):
+            with self.subTest(piece=piece):
+                self.assertIn(piece, listing)
+        self.assertNotIn("yolobox-other", listing)
+        self.assertNotIn("unlock.lock", listing)
+        self.assertIn("yo -m box destroy --yes", self.lines[-1])
+
+    def test_a_box_with_nothing_left_has_nothing_to_destroy(self):
+        self.forget_the_box()
+        for yes in (False, True):
+            with self.subTest(yes=yes):
+                self.lines.clear()
+                self.destroy(yes=yes)
+                self.assertEqual(self.lines, ["box has nothing to destroy"])
+                self.assertLessEqual(set(self.host.subcommands()), READS)
+        self.assert_the_other_machine_is_untouched()
+
+    def test_the_lock_file_stays_so_a_waiting_yo_and_the_next_one_share_it(self):
+        with self.box.state.unlock_lock(wait=True):
+            pass
+        waiting_yo = os.open(self.lock_file, os.O_RDWR)
+        self.addCleanup(os.close, waiting_yo)
+        self.destroy(yes=True)
+        self.assertTrue(self.lock_file.exists())
+        self.assertEqual(os.fstat(waiting_yo).st_nlink, 1)
+
+    def test_pieces_that_are_gone_are_skipped_and_the_rest_removed(self):
+        del self.host.volumes["yolobox-box-cidata.iso"]
+        self.host.herdr_machines.pop(0)
+        self.flake_ref.unlink()
+        self.destroy(yes=True)
+        self.assertEqual(self.mutations().count("vol-delete"), 1)
+        self.assertNotIn("yolobox-box", self.host.domains)
+        self.assertFalse(self.instance_dir.exists())
+
+    def test_the_operators_master_quits_under_the_lock_that_orders_ensure_master(self):
+        master_lock = os.path.join(self.instance_dir, self.box.MASTER_LOCK_NAME)
+        held_while_quitting = []
+
+        def watch_the_exit(argv, **kwargs):
+            if argv[0] == "ssh" and "exit" in argv and "User=agent" not in argv:
+                held_while_quitting.append(self.lock_held(master_lock))
+            return self.host.run(argv, **kwargs)
+
+        with mock.patch.object(self.box.proc, "run", side_effect=watch_the_exit):
+            self.destroy(yes=True)
+        self.assertEqual(held_while_quitting, [True])
+
+    def test_a_master_that_survives_its_exit_stops_the_run(self):
+        self.host.master_survives_exit = True
+        with self.assertRaisesRegex(self.box.YoError, "still running after"):
+            self.destroy(yes=True)
+        self.assertEqual(self.mutations(), [])
+        self.assertTrue(self.instance_dir.exists())
+
+    def test_a_failing_step_is_raised_and_stops_the_run(self):
+        self.host.fail["undefine"] = "domain is busy"
+        with self.assertRaisesRegex(self.box.YoError, "domain is busy"):
+            self.destroy(yes=True)
+        self.assertIn("yolobox-box", self.host.domains)
+        self.assertEqual(self.host.calls_of("vol-delete"), [])
+        self.assertTrue(self.instance_dir.exists())
+        self.assertTrue(self.flake_ref.exists())
+
+    def test_a_failing_herdr_removal_is_raised(self):
+        self.host.herdr_remove_fails = True
+        with self.assertRaisesRegex(
+            self.box.YoError, "machine remove m-7 failed.*no such machine"
+        ):
+            self.destroy(yes=True)
+        self.assertTrue(self.flake_ref.exists())
+
+    def test_a_box_another_yo_is_unlocking_is_not_destroyed(self):
+        with self.box.state.unlock_lock(wait=True):
+            with self.assertRaisesRegex(
+                self.box.YoError, "another yo is unlocking box"
+            ):
+                self.destroy(yes=True)
+        self.assertLessEqual(set(self.host.subcommands()), READS)
+        self.assertIn("yolobox-box", self.host.domains)
+        self.assertTrue(self.instance_dir.exists())
+
+    def test_the_listing_does_not_wait_for_an_unlocking_yo(self):
+        with self.box.state.unlock_lock(wait=True):
+            self.destroy(yes=False)
+        self.assertIn("yo -m box destroy --yes", self.lines[-1])
+
+    def test_the_hint_that_deletes_and_rebuilds_names_the_remembered_ref(self):
+        self.flake_ref.write_text("github:aka-rider/yolobox/v1.2.3\n")
+        self.assertEqual(
+            self.box.state.destroy_then_bootstrap_command("--disk", "250"),
+            "yo -m box destroy --yes && "
+            "yo -m box bootstrap --disk 250 --version github:aka-rider/yolobox/v1.2.3",
+        )
+        self.flake_ref.unlink()
+        self.assertEqual(
+            self.box.state.destroy_then_bootstrap_command(),
+            "yo -m box destroy --yes && yo -m box bootstrap",
+        )
+
+
 class TestADeadAgent(LibvirtCase):
     """1Password's agent is gone. What needs no login still works, through
     main() and the real boot_stage; what must log in says so before any ssh."""
@@ -2030,6 +2308,27 @@ class TestADeadAgent(LibvirtCase):
             [argv for argv in self.ssh_calls() if argv[-1] != "true"],
             "down ran more than the boot-stage probes",
         )
+
+    def test_destroy_deletes_the_box_it_cannot_log_in_to(self):
+        instance_dir = Path(self.box.state.instance_dir())
+        instance_dir.mkdir(parents=True)
+        with mock.patch.object(self.box.shutil, "which", return_value=None):
+            self.box.main(["-m", "box", "destroy", "--yes"])
+        self.assertNotIn("yolobox-box", self.host.domains)
+        self.assertFalse(instance_dir.exists())
+        self.assertFalse(self.host.master_running)
+        self.assertFalse(
+            [argv for argv in self.ssh_calls() if argv[-1] == "true"],
+            "destroy logged in",
+        )
+
+    def test_destroy_without_yes_only_lists(self):
+        with mock.patch.object(self.box.shutil, "which", return_value=None):
+            self.box.main(["-m", "box", "destroy"])
+        self.assertIn("yolobox-box", self.host.domains)
+        self.assertLessEqual(set(self.host.subcommands()), READS)
+        self.assertIn("undefine domain yolobox-box", "\n".join(self.lines))
+        self.assertIn("yo -m box destroy --yes", self.lines[-1])
 
     def test_down_refuses_an_sshd_it_cannot_identify_and_names_the_agent(self):
         # An unmarked banner and both logins refused: an initrd, maybe encrypting
@@ -2333,8 +2632,27 @@ class TestVmUpWithAGap(LibvirtCase):
         with self.assertRaises(self.box.YoError) as caught:
             self.box.vm_up(size=self.box.Size(24, 250))
         self.assertIn("drop --memory 24 --disk 250", caught.exception.message)
-        self.assertIn(
-            "everything on it is lost: %s" % self.driver.delete_command(),
+        self.assertTrue(
+            caught.exception.message.endswith(
+                "everything on it is lost: "
+                "yo -m box destroy --yes && yo -m box bootstrap --memory 24 --disk 250"
+            ),
+            caught.exception.message,
+        )
+
+    def test_the_delete_a_disk_refusal_names_keeps_the_ref_the_box_was_built_from(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.states["yolobox-box"] = "shut off"
+        ref_file = Path(self.box.state.flake_ref_file())
+        ref_file.parent.mkdir(parents=True)
+        ref_file.write_text("github:aka-rider/yolobox/v1.2.3\n")
+        with self.assertRaises(self.box.YoError) as caught:
+            self.box.vm_up(size=self.box.Size(None, 250))
+        self.assertTrue(
+            caught.exception.message.endswith(
+                "yo -m box destroy --yes && yo -m box bootstrap --disk 250 "
+                "--version github:aka-rider/yolobox/v1.2.3"
+            ),
             caught.exception.message,
         )
 

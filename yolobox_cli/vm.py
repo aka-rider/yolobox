@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import enum
 import os
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from . import agent, forwards, guest, proc, release, sshconfig, sshx, state, ui, unlock
 from .config import FILE_MODE_PRIVATE, GIB, LUKS_DEVICE
-from .driver import NO_SIZE, RUNNING, Size, StopRefused
+from .driver import NO_SIZE, RUNNING, Removal, Size, StopRefused
 from .sshx import AGENT, OPERATOR
 from .ui import Report, YoError
 from .unlock import BootStage
@@ -268,6 +269,22 @@ def unknown_stage_message(login: Optional[str], rerun: str) -> str:
     )
 
 
+def unlock_busy_refusal(consequence: str, rerun: str) -> YoError:
+    """The refusal of a command that needs the unlock lock while a yo holds it."""
+    return YoError(
+        "another yo is unlocking %s (%s, %s or %s is sending its passphrase). %s "
+        "Wait for that command to finish, then run %s again"
+        % (
+            state.box.name,
+            state.yo_cmd("up"),
+            state.yo_cmd("bootstrap"),
+            state.yo_cmd("disk-grow"),
+            consequence,
+            rerun,
+        )
+    )
+
+
 def cmd_down(args: argparse.Namespace) -> None:
     stage = unlock.boot_stage()
     if stage is BootStage.UNKNOWN:
@@ -298,17 +315,48 @@ def cmd_down(args: argparse.Namespace) -> None:
             )
             state.driver().force_stop()
     except state.UnlockBusy:
-        raise YoError(
-            "another yo is unlocking %s (%s, %s or %s is sending its passphrase). "
-            "Not stopping it: its answer may start the in-place encryption. Wait "
-            "for that command to finish, then run %s again"
-            % (
-                state.box.name,
-                state.yo_cmd("up"),
-                state.yo_cmd("bootstrap"),
-                state.yo_cmd("disk-grow"),
-                state.yo_cmd("down"),
-            )
+        raise unlock_busy_refusal(
+            "Not stopping it: its answer may start the in-place encryption.",
+            state.yo_cmd("down"),
+        )
+
+
+def destruction_steps() -> List[Removal]:
+    """Every piece of this machine that exists now, in the order to remove it."""
+    steps = sshx.agent_master_removals() + state.driver().removals()
+    herdr = forwards.herdr_binary()
+    if herdr is not None:
+        steps += forwards.herdr_machine_removals(herdr)
+    if os.path.exists(state.flake_ref_file()):
+        steps.append(state.file_removal(state.flake_ref_file()))
+    return steps
+
+
+def cmd_destroy(args: argparse.Namespace) -> None:
+    # The lock comes before the list: a yo that is unlocking can start a box that
+    # is off, and a list made earlier would leave it running at its undefine. The
+    # listing changes nothing, so it takes no lock.
+    lock = state.unlock_lock(wait=False) if args.yes else contextlib.nullcontext()
+    try:
+        with lock:
+            steps = destruction_steps()
+            if not steps:
+                ui.out("%s has nothing to destroy" % state.box.name)
+            elif args.yes:
+                for step in steps:
+                    ui.out(step.what)
+                    step.remove()
+            else:
+                ui.out("Destroying %s would:" % state.box.name)
+                for step in steps:
+                    ui.out("  - %s" % step.what)
+                ui.out(
+                    "Everything on %s is lost. Run %s to do it."
+                    % (state.box.name, state.yo_cmd("destroy", "--yes"))
+                )
+    except state.UnlockBusy:
+        raise unlock_busy_refusal(
+            "Not destroying it.", state.yo_cmd("destroy", "--yes")
         )
 
 
@@ -361,12 +409,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     # Any test that reaches this line must run under FakeHome.
     if args.version is not None:
         proc.private_dir(state.state_dir())
-        proc.atomic_write(release.flake_ref_file(), ref + "\n", FILE_MODE_PRIVATE)
+        proc.atomic_write(state.flake_ref_file(), ref + "\n", FILE_MODE_PRIVATE)
     else:
-        try:
-            os.remove(release.flake_ref_file())
-        except FileNotFoundError:
-            pass
+        proc.delete_file(state.flake_ref_file())
     report.ok("built from %s" % ref)
 
     profile, booted = booted_generations(report)
