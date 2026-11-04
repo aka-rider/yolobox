@@ -3141,6 +3141,16 @@ class TestDeletingPaths(FakeHome):
             yo.proc.delete_tree(tree)
 
 
+class TestOsErrorWithoutErrno(FakeHome):
+    def test_a_message_spells_an_error_with_no_errno_by_its_own_text(self):
+        # strerror is None for OSError("lizard"); the message must not print it.
+        with mock.patch("builtins.open", side_effect=OSError("lizard")):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.sshconfig.add_ssh_config_include()
+        self.assertIn(": lizard", caught.exception.message)
+        self.assertNotIn("None", caught.exception.message)
+
+
 class TestLimaDestroy(FakeHome):
     """`yo destroy` on Lima: one `limactl delete --force`, for an instance that exists."""
 

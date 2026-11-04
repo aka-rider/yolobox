@@ -127,7 +127,9 @@ def loopback_port_bound(port: int) -> bool:
         except OSError as failure:
             if failure.errno == errno.EADDRINUSE:
                 return True
-            raise YoError("cannot probe %s:%d: %s" % (LOOPBACK, port, failure.strerror))
+            raise YoError(
+                "cannot probe %s:%d: %s" % (LOOPBACK, port, ui.os_error_reason(failure))
+            )
     return False
 
 

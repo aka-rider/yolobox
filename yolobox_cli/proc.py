@@ -8,6 +8,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 from typing import Any, Callable, Dict, Optional, Sequence
@@ -53,9 +54,8 @@ def delete_path(path: str, delete: Callable[[str], None]) -> None:
     except FileNotFoundError:
         pass
     except OSError as failure:
-        # shutil.rmtree's own refusals (a symlink) carry a message and no strerror;
-        # a failure inside a tree carries the nested path that failed.
-        reason = failure.strerror or " ".join(str(arg) for arg in failure.args)
+        # A failure inside a tree carries the nested path that failed.
+        reason = ui.os_error_reason(failure)
         where = "" if failure.filename in (None, path) else " at %s" % failure.filename
         raise YoError("cannot delete %s: %s%s" % (path, reason, where))
 
@@ -66,7 +66,24 @@ def delete_file(path: str) -> None:
 
 def delete_tree(path: str) -> None:
     """Delete the directory and all in it, failing like delete_file."""
-    delete_path(path, shutil.rmtree)
+    delete_path(path, rmtree_naming_the_failed_path)
+
+
+def rmtree_naming_the_failed_path(path: str) -> None:
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path)
+        return
+
+    # Python 3.9-3.11 raise from inside the tree with the bare entry name as the
+    # error's filename; only onerror is told the full path, 3.12+ sets it.
+    def name_the_path(
+        _function: Callable[..., Any], failed_path: str, exc_info: Any
+    ) -> None:
+        failure = exc_info[1]
+        failure.filename = failed_path
+        raise failure
+
+    shutil.rmtree(path, onerror=name_the_path)
 
 
 def require_tool(name: str, hint: str) -> str:

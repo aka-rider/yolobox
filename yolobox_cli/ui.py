@@ -41,6 +41,15 @@ def shown(text: str) -> str:
     return repr(text)[1:-1]
 
 
+def os_error_reason(failure: OSError) -> str:
+    """Why the OS call failed, as one phrase for a message.
+
+    `strerror` is None for an OSError raised without an errno (shutil.rmtree's
+    symlink refusal, say), so the error's own arguments stand in for it.
+    """
+    return failure.strerror or " ".join(str(arg) for arg in failure.args)
+
+
 class StatusLine(NamedTuple):
     """One line of a report, and whether it is a warning that fails the run."""
 

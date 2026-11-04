@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, NamedTuple, Optional, Tuple
 
-from . import proc
+from . import proc, ui
 from .config import KIB, LOOPBACK, MAX_PORT, SCRIPT_DIR
 from .ui import YoError
 
@@ -175,7 +175,9 @@ def read_port_window() -> range:
         with open(PORT_RANGE_FILE, "r") as handle:
             return host_port_window(handle.read())
     except OSError as failure:
-        raise YoError("cannot read %s: %s" % (PORT_RANGE_FILE, failure.strerror))
+        raise YoError(
+            "cannot read %s: %s" % (PORT_RANGE_FILE, ui.os_error_reason(failure))
+        )
 
 
 def host_memory_bytes() -> int:
@@ -184,7 +186,9 @@ def host_memory_bytes() -> int:
         with open(MEMINFO_FILE, "r") as handle:
             text = handle.read()
     except OSError as failure:
-        raise YoError("cannot read %s: %s" % (MEMINFO_FILE, failure.strerror))
+        raise YoError(
+            "cannot read %s: %s" % (MEMINFO_FILE, ui.os_error_reason(failure))
+        )
     found = MEMTOTAL_RE.search(text)
     if found is None:
         raise YoError("%s has no MemTotal line in kB" % MEMINFO_FILE)

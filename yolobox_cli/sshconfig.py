@@ -308,7 +308,7 @@ def add_ssh_config_include() -> None:
         current = ""
         mode = FILE_MODE_PRIVATE
     except OSError as failure:
-        raise YoError("cannot read %s: %s" % (config_path, failure.strerror))
+        raise YoError("cannot read %s: %s" % (config_path, ui.os_error_reason(failure)))
     proc.atomic_write(config_path, SSH_CONFIG_INCLUDE_LINE + "\n" + current, mode)
 
 

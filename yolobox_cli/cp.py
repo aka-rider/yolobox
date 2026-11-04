@@ -109,7 +109,9 @@ def local_cp_operand(operand: str) -> str:
 
 
 def walk_failure(failure: OSError) -> None:
-    raise YoError("cannot read %s: %s" % (failure.filename, failure.strerror))
+    raise YoError(
+        "cannot read %s: %s" % (failure.filename, ui.os_error_reason(failure))
+    )
 
 
 def refuse_symlinks_in(source: str) -> None:
@@ -127,7 +129,7 @@ def refuse_symlinks_in(source: str) -> None:
     try:
         mode = os.lstat(source).st_mode
     except OSError as failure:
-        raise YoError("cannot read %s: %s" % (source, failure.strerror))
+        raise YoError("cannot read %s: %s" % (source, ui.os_error_reason(failure)))
     if stat.S_ISLNK(mode):
         refuse(source)
     if not stat.S_ISDIR(mode):
@@ -185,7 +187,7 @@ def plan_merge(staged: str, target: str, moves: List[Tuple[str, str]]) -> None:
         moves.append((staged, target))
         return
     except OSError as failure:
-        raise YoError("cannot read %s: %s" % (target, failure.strerror))
+        raise YoError("cannot read %s: %s" % (target, ui.os_error_reason(failure)))
     if stat.S_ISLNK(existing):
         raise YoError(
             'refusing to copy over symlink "%s": the copy would overwrite its target "%s", not the link'
@@ -233,7 +235,7 @@ def remove_staging(path: str) -> None:
     except OSError as failure:
         raise YoError(
             'cannot remove the staging directory "%s": %s; delete it by hand'
-            % (path, failure.strerror or failure)
+            % (path, ui.os_error_reason(failure))
         )
 
 
@@ -294,7 +296,7 @@ def drop_control_paths(staging: str) -> None:
             except OSError as failure:
                 raise YoError(
                     'cannot drop "%s" from the download: %s'
-                    % (ui.shown(path), failure.strerror or failure)
+                    % (ui.shown(path), ui.os_error_reason(failure))
                 )
         subdirs[:] = [d for d in subdirs if d not in judged]
     for relative in skipped:
@@ -561,7 +563,7 @@ def land_staged(moves: Sequence[Tuple[str, str]]) -> None:
                 % (
                     ui.shown(staged),
                     ui.shown(target),
-                    failure.strerror or failure,
+                    ui.os_error_reason(failure),
                     landed,
                     len(moves),
                 )
@@ -588,7 +590,8 @@ def download_from_guest(sources: Sequence[str], dest: str) -> None:
         staging = tempfile.mkdtemp(prefix=".yo-cp-", dir=staging_parent)
     except OSError as failure:
         raise YoError(
-            "cannot stage a copy in %s: %s" % (staging_parent, failure.strerror)
+            "cannot stage a copy in %s: %s"
+            % (staging_parent, ui.os_error_reason(failure))
         )
     try:
         fetch_guest_sources(sources, staging)

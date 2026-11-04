@@ -730,4 +730,4 @@ def du_kib(path: str) -> Optional[int]:
     except FileNotFoundError:
         return None
     except OSError as failure:
-        raise YoError("cannot stat %s: %s" % (path, failure.strerror))
+        raise YoError("cannot stat %s: %s" % (path, ui.os_error_reason(failure)))
