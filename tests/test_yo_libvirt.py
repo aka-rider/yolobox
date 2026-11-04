@@ -347,6 +347,13 @@ class FakeHelper:
         return self.code
 
 
+def fake_which(name):
+    """The tools FakeHost.run answers for are installed; nothing else is, so a
+    test never depends on what the machine running it has (getfacl is absent on
+    macOS, `aws` is present on some CI images)."""
+    return "/usr/bin/" + name if name in ("virsh", "getfacl", "ss") else None
+
+
 class LibvirtCase(FakeHome):
     instance = "box"
 
@@ -363,6 +370,7 @@ class LibvirtCase(FakeHome):
                 return_value=mock.Mock(pw_uid=VM_UID, pw_gid=VM_GID),
             ),
             mock.patch.object(self.box.release, "host_user", return_value=OPERATOR),
+            mock.patch.object(self.box.shutil, "which", fake_which),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
