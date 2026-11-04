@@ -203,9 +203,14 @@ YOLOBOX_USERNAME=$(id -un) YOLOBOX_FLAKE_REF=github:aka-rider/yolobox/ci nix fla
   older (0.16) and formats differently. In the guest, run the pinned one with
   `nix shell nixpkgs#uv -c uvx ruff@0.17.2 format --check .` from a copy of the
   tree; the host `tar` needs `COPYFILE_DISABLE=1`, otherwise macOS writes `._*`
-  AppleDouble entries that GNU tar extracts and ruff reports as E902. To bump it, change `ruff.toml`, `verify.yml` and these commands together.
-- Python 3.9 is the floor because the Mac's Xcode Python is 3.9. The Mac
-  usually has no nix, so check Nix changes inside the guest.
+  AppleDouble entries that GNU tar extracts and ruff reports as E902. On a
+  host with neither nix nor uv, install the pinned ruff into a throwaway venv:
+  `python3 -m venv /tmp/ruff && /tmp/ruff/bin/pip install ruff==0.17.2`, then
+  run `/tmp/ruff/bin/ruff`. To bump it, change `ruff.toml`, `verify.yml` and these commands together.
+- Python 3.9 is the floor because the Mac's Xcode Python is 3.9. Neither host
+  has nix: the Mac usually lacks it, and the Linux host has none on purpose.
+  So test yolobox inside a yolobox: run the nix commands, and the shellcheck
+  list, in the guest.
 - `nix/base.nix` imports `/etc/yolobox/local.nix` when it exists, so a flake
   check inside a box also evaluates that file. CI's `eval` job in
   `.github/workflows/verify.yml` proves a box without it evaluates.
