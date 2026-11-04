@@ -30,21 +30,15 @@ jobs:
       - name: Shellcheck the guest helper
         run: shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh
 
-  # 3.9 is the floor yo promises; the newest 3.x catches the other direction.
-  # The 3.9 leg is pinned to ubuntu-24.04 because setup-python has no 3.9 build
-  # for ubuntu-latest's 26.04 image.
-  # The official python:3.9 container is no substitute: it runs as root and
-  # lacks jq and gawk, so tests fail or skip.
+  # yo is stdlib Python, so the only axis is the Python version: 3.9 is the
+  # floor yo promises, the newest 3.x catches the other direction. One runner,
+  # ubuntu-24.04, because setup-python has no 3.9 build for 26.04.
   unit:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - python: "3.9"
-            os: ubuntu-24.04
-          - python: "3.x"
-            os: ubuntu-latest
+        python: ["3.9", "3.x"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

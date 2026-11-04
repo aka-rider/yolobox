@@ -59,7 +59,7 @@ The reasoning is in lima/yolobox.md#an-empty-page-means-limas-forwarder-died. Th
 
 ## `yo` and the repo
 
-- The Python 3.9 unit leg in `.github/workflows/verify.yml` is pinned to `ubuntu-24.04`, because setup-python has no 3.9 build for ubuntu-latest's 26.04 image. The pin will age out when GitHub retires the 24.04 image. Then run the leg in a `python:3.9` container as a non-root user with `jq` and `gawk` installed (as root with those missing, 26 tests fail and 2 skip), or drop the floor along with the host's Xcode Python 3.9.
+- The `unit` job in `.github/workflows/verify.yml` is pinned to `ubuntu-24.04`, because setup-python has no 3.9 build for ubuntu-latest's 26.04 image. The pin will age out when GitHub retires the 24.04 image. Then run the leg in a `python:3.9` container as a non-root user with `jq` and `gawk` installed (as root with those missing, 26 tests fail and 2 skip), or drop the floor along with the host's Xcode Python 3.9.
 - GitHub `environment: release` protection for HOMEBREW_TAP_TOKEN not configured.
 - Some guest-controlled text still reaches the terminal with only `common.sanitize` applied, which replaces control bytes with `?` and keeps newlines. File names already go through `ui.shown`, which escapes them onto one printable line.
   - Free-text multi-line guest stderr (tailscale, nft and probe detail) still reaches `ui.err` with its newlines. So a guest can print lines that look like `yo:` lines.
