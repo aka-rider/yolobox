@@ -6,11 +6,11 @@ import argparse
 import contextlib
 import enum
 import os
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from . import agent, forwards, guest, proc, release, sshconfig, sshx, state, ui, unlock
 from .config import FILE_MODE_PRIVATE, GIB, LUKS_DEVICE
-from .driver import NO_SIZE, RUNNING, Removal, Size, StopRefused
+from .driver import NO_SIZE, RUNNING, BoxSize, Removal, Size, StopRefused
 from .sshx import AGENT, OPERATOR
 from .ui import Report, YoError
 from .unlock import BootStage
@@ -37,6 +37,68 @@ DISK_FSTYPE_LUKS = "crypto_LUKS"
 RERUN = "run the command again"
 
 
+class Resize(NamedTuple):
+    """A stopped box's size now, and the size `yo up` was asked to give it."""
+
+    current: BoxSize
+    wanted: BoxSize
+
+    @property
+    def sets_hardware(self) -> bool:
+        return (self.wanted.memory_gib, self.wanted.cpus) != (
+            self.current.memory_gib,
+            self.current.cpus,
+        )
+
+
+def plan_resize(status: str, asked: Size) -> Optional[Resize]:
+    """What the size asked of a box that exists changes, or None for no change.
+
+    A flag that equals the current value, or was not given, changes nothing.
+    Everything that cannot be applied is refused here, before the passphrase
+    and before anything is changed: a smaller disk, and any change to a box
+    that is not stopped (it is never silently ignored).
+    """
+    if not asked.asked:
+        return None
+    driver = state.driver()
+    current = driver.current_size()
+    wanted = asked.fill(current)
+    if wanted == current:
+        return None
+    if wanted.disk_gib < current.disk_gib:
+        raise YoError(
+            "%s's disk is %d GiB, and --disk %d is smaller: neither lima nor libvirt "
+            "can shrink a disk — ask for at least %d, or drop --disk"
+            % (state.box.name, current.disk_gib, wanted.disk_gib, current.disk_gib)
+        )
+    if status != driver.off_status:
+        changed = current.changes_to(wanted)
+        # A running box can have its disk grown alone, without stopping it first.
+        grow_alone = (
+            ", or, to only grow the disk of a running box, %s"
+            % state.yo_cmd("disk-grow", str(wanted.disk_gib))
+            if status == RUNNING and changed.memory_gib is None and changed.cpus is None
+            else ""
+        )
+        raise YoError(
+            "%s is %s with %s; %s would change that, and a box is resized only "
+            "while it is stopped — %s, then run this command again%s"
+            % (
+                state.box.name,
+                status,
+                current.describe(),
+                " ".join(changed.flags()),
+                state.yo_cmd("down"),
+                grow_alone,
+            )
+        )
+    refusal = driver.resize_refusal(current, wanted)
+    if refusal is not None:
+        raise YoError(refusal)
+    return Resize(current, wanted)
+
+
 def vm_up(
     run_services: bool = True,
     passphrase: Optional[bytes] = None,
@@ -48,21 +110,31 @@ def vm_up(
     if gaps:
         ui.err("yo: %s" % state.driver().config_gap_message(gaps))
     status = state.driver().vm_status()
+    resize = None
     if status is None:
         refusal = state.driver().creation_refusal(size)
         if refusal is not None:
             raise YoError(refusal)
-    elif size.asked:
+        # The default CPU count is decided here, so a host that cannot give one
+        # is refused before the passphrase and both drivers create the same box.
+        size = size.for_creation()
+    else:
         # The one place for both drivers, and before the passphrase is asked for.
-        raise YoError(state.driver().existing_size_refusal(size))
+        resize = plan_resize(status, size)
     # The one check for every start and unlock: up, both of bootstrap's and
     # disk-grow's. A cached passphrase needs no 1Password, but the logins that
     # follow do, and a 1Password that quit or locked since would otherwise
     # surface as a refused key (docs/linux-host.md#the-operators-key).
     state.driver().require_login_key()
     if status != RUNNING:
+        # Derived before anything changes, so a missing 1Password key leaves the
+        # box as it was.
         passphrase = passphrase or agent.luks_passphrase()
-        state.driver().start(passphrase, size)
+        if resize is not None and resize.sets_hardware:
+            state.driver().resize(resize.wanted.memory_gib, resize.wanted.cpus)
+        # `size` creates a box that is missing; a box that exists is already sized,
+        # and a bigger disk is grown after the start (grow_to_asked_disk).
+        state.driver().start(passphrase, size if status is None else NO_SIZE)
     else:
         stage = unlock.boot_stage()
         if stage is BootStage.UNKNOWN:
@@ -147,12 +219,15 @@ def in_place_encryption_warning() -> str:
 
 
 def asked_size(args: argparse.Namespace) -> Size:
-    """The size the --memory and --disk of `yo up` or `yo bootstrap` ask for."""
-    return Size(args.memory, args.disk)
+    """The size the --memory, --disk and --cpus of `yo up` or `yo bootstrap` ask for."""
+    return Size(args.memory, args.disk, args.cpus)
 
 
 def cmd_up(args: argparse.Namespace) -> None:
-    vm_up(size=asked_size(args))
+    size = asked_size(args)
+    passphrase = vm_up(size=size)
+    if size.disk_gib is not None:
+        grow_to_asked_disk(size.disk_gib, passphrase)
 
 
 def initrd_down_refusal(reading: unlock.InitrdReading) -> str:
@@ -452,6 +527,12 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
             )
         report.ok("rebooted into the built generation")
 
+    if args.disk is not None:
+        # Only the built generation can grow its disk: the stock image grows
+        # the partition at its first boot only, and the mapping and filesystem
+        # of an encrypted root only with the passphrase, which yo holds.
+        grow_to_asked_disk(args.disk, passphrase)
+
     include_present = sshconfig.ensure_ssh_config_include(refuse=False)
     guest.ensure_guest_known_hosts()
     forwards.ensure_herdr_machine(include_present)
@@ -513,42 +594,91 @@ def vda2_size_for_report() -> str:
     return sizes[0] if sizes else "unreadable: lsblk printed nothing"
 
 
-def cmd_disk_grow(args: argparse.Namespace) -> None:
-    wanted = args.size
-
-    current_gib = state.driver().disk_ceiling_gib()
-    if wanted < current_gib:
-        raise YoError(
-            "%s's ceiling is already %dGiB and %s can only grow it — ask for at least %d"
-            % (state.box.name, current_gib, state.driver().name, current_gib)
-        )
-    # The ceiling edit is the one step that cannot be repeated, so asking for
-    # the ceiling the instance already has finishes a grow that failed after it.
-    finishing = wanted == current_gib
-
-    if finishing:
-        ui.out(
-            "%s: %s already has a %dGiB ceiling; finishing a previous grow"
-            % (state.driver().name, state.box.name, current_gib)
-        )
-        # Derived first: the box may be stopped or waiting in its initrd.
-        passphrase = agent.luks_passphrase()
-        vm_up(passphrase=passphrase)
-        require_growable_guest()
-    else:
-        require_growable_guest()
-        # Derived before the VM stops, so a missing 1Password key leaves the box running.
-        passphrase = agent.luks_passphrase()
-
+def root_usage_before_grow() -> guest.RootUsage:
+    """The root's usage before the grow, read while the ceiling can still be left alone."""
     try:
-        # Before the ceiling is edited, the one step that cannot be repeated.
-        before = guest.guest_root_usage()
+        return guest.guest_root_usage()
     except YoError as error:
         raise YoError(state.not_up_hint(error.message))
 
-    if not finishing:
-        state.driver().grow_disk(current_gib, wanted)
+
+def grow_running_disk(
+    current_gib: int, wanted_gib: int, passphrase: Optional[bytes] = None
+) -> None:
+    """Raise the running box's disk from `current_gib` to `wanted_gib`, and grow into it.
+
+    The one path of growing a disk that is not yet at its size, for
+    `yo disk-grow` and for the disk of `yo up` and `yo bootstrap`
+    (grow_to_asked_disk). The caller has checked that the guest can grow
+    (require_growable_guest), while the ceiling was still untouched.
+    """
+    # Derived before the VM stops, so a missing 1Password key leaves the box running.
+    passphrase = passphrase or agent.luks_passphrase()
+    # Before the ceiling is edited, the one step that cannot be repeated.
+    before = root_usage_before_grow()
+    state.driver().stop()
+    try:
+        state.driver().grow_disk(current_gib, wanted_gib)
+    except YoError as error:
+        raise YoError(
+            "%s\n%s is stopped and its disk is still %dGiB — try again with: %s"
+            % (
+                error.message,
+                state.box.name,
+                current_gib,
+                state.yo_cmd("up", "--disk", str(wanted_gib)),
+            ),
+            error.code,
+        )
+    # From here the disk limit is wanted_gib, and asking for it again changes
+    # nothing, so any failure names the command that finishes the growing.
+    try:
         vm_up(passphrase=passphrase)
+        grow_mapping_and_filesystem(passphrase, wanted_gib, before, finishing=False)
+    except YoError as error:
+        raise YoError(
+            "%s\n%s's disk limit is already %dGiB; finish growing it with: %s"
+            % (
+                error.message,
+                state.box.name,
+                wanted_gib,
+                state.yo_cmd("disk-grow", str(wanted_gib)),
+            ),
+            error.code,
+        )
+
+
+def grow_to_asked_disk(wanted_gib: int, passphrase: Optional[bytes]) -> None:
+    """After `yo up --disk` or `yo bootstrap --disk` has the box up: grow its disk to `wanted_gib`.
+
+    A box vm_up just created already has it, and a box that has it needs
+    nothing. vm_up refused a smaller disk and a running box before this.
+    """
+    current_gib = state.driver().current_size().disk_gib
+    if wanted_gib <= current_gib:
+        return
+    try:
+        require_growable_guest()
+    except YoError as error:
+        # The rest of what was asked is done, so a rerun of this command is
+        # refused as a change to a running box: name what grows the disk.
+        raise YoError(
+            "%s\n%s's disk is still %dGiB; once the guest can grow, grow it with: %s"
+            % (
+                error.message,
+                state.box.name,
+                current_gib,
+                state.yo_cmd("disk-grow", str(wanted_gib)),
+            ),
+            error.code,
+        )
+    grow_running_disk(current_gib, wanted_gib, passphrase)
+
+
+def grow_mapping_and_filesystem(
+    passphrase: bytes, ceiling_gib: int, before: guest.RootUsage, finishing: bool
+) -> None:
+    """Grow the LUKS mapping and the filesystem into the raised ceiling, and verify."""
     # systemd-growfs cannot resize a keyring-keyed LUKS2 mapping, so the
     # mapping and then the filesystem are grown here, with the passphrase.
     sshx.ssh_run(
@@ -566,7 +696,7 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
     except YoError as error:
         raise YoError(
             "the ceiling is now %dGiB but the grow is unverified: %s — check with: %s"
-            % (wanted, error.message, state.yo_cmd("ssh", "df", "-k", "/"))
+            % (ceiling_gib, error.message, state.yo_cmd("ssh", "df", "-k", "/"))
         )
     ui.out("before: %s" % before.human_line)
     ui.out("after:  %s" % after.human_line)
@@ -577,15 +707,45 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
         # An earlier run may have grown the root already and failed afterwards.
         # But a growpart that failed at the previous boot leaves the partition
         # short, and then there is nothing left only for df.
-        require_partition_grown(wanted)
+        require_partition_grown(ceiling_gib)
         ui.out(
-            "the root already fills the %dGiB ceiling; nothing left to grow" % wanted
+            "the root already fills the %dGiB ceiling; nothing left to grow"
+            % ceiling_gib
         )
         return
     raise YoError(
         "the ceiling is now %dGiB but the guest root did not grow — diagnose with: %s"
-        % (wanted, state.yo_cmd("ssh", "systemctl", "status", "growpart"))
+        % (ceiling_gib, state.yo_cmd("ssh", "systemctl", "status", "growpart"))
     )
+
+
+def cmd_disk_grow(args: argparse.Namespace) -> None:
+    wanted = args.size
+
+    current_gib = state.driver().current_size().disk_gib
+    if wanted < current_gib:
+        raise YoError(
+            "%s's ceiling is already %dGiB and %s can only grow it — ask for at least %d"
+            % (state.box.name, current_gib, state.driver().name, current_gib)
+        )
+    # The ceiling edit is the one step that cannot be repeated, so asking for
+    # the ceiling the instance already has finishes a grow that failed after it.
+    if wanted == current_gib:
+        ui.out(
+            "%s: %s already has a %dGiB ceiling; finishing a previous grow"
+            % (state.driver().name, state.box.name, current_gib)
+        )
+        # Derived first: the box may be stopped or waiting in its initrd.
+        passphrase = agent.luks_passphrase()
+        vm_up(passphrase=passphrase)
+        require_growable_guest()
+        grow_mapping_and_filesystem(
+            passphrase, wanted, root_usage_before_grow(), finishing=True
+        )
+        return
+
+    require_growable_guest()
+    grow_running_disk(current_gib, wanted)
 
 
 def require_partition_grown(ceiling_gib: int) -> None:

@@ -29,6 +29,7 @@ from typing import (
 from . import (
     agent,
     aws,
+    driver,
     libvirt_host,
     proc,
     release,
@@ -50,7 +51,7 @@ from .config import (
     OPERATOR_GUEST_UID,
     SCRIPT_DIR,
 )
-from .driver import RUNNING, Removal, Size, StopRefused
+from .driver import RUNNING, BoxSize, Removal, Size, StopRefused
 from .libvirt_host import GUEST_SSH_PORT, LIBVIRT_URI, VM_USER, DomainInfo
 from .sshx import OPERATOR
 from .ui import YoError
@@ -65,7 +66,9 @@ LIBVIRT_POOL = "default"
 # The 1Password item whose public key is the operator's login, in cidata.
 OPERATOR_KEY_ITEM = "yolobox-operator"
 OPERATOR_ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]*")
-# A box's size when `yo up` is given no --memory or --disk (domain_size).
+# A box's memory and disk when `yo up` is given no --memory or --disk
+# (domain_size); lima/yolobox.yaml has the same. Its CPUs are default_cpus()
+# in driver.py, which vm_up fills into the size.
 LIBVIRT_MEMORY_GIB = 16
 LIBVIRT_DISK_GIB = 100
 # What an explicit --memory leaves the host itself: its kernel, page cache and
@@ -105,6 +108,7 @@ CIDATA_FILES = ("user-data", "meta-data", "lima.env", "etc_environment")
 MASTER_PID_RE = re.compile(r"Master running \(pid=(\d+)\)")
 SIZE_LINE_RE = re.compile(r"^(Capacity|Allocation):\s+(\d+) bytes\s*$", re.M)
 MAX_MEMORY_LINE_RE = re.compile(r"^Max memory:\s+(\d+) KiB\s*$", re.M)
+CPUS_LINE_RE = re.compile(r"^CPU\(s\):\s+(\d+)\s*$", re.M)
 
 
 def domain_name() -> str:
@@ -145,22 +149,30 @@ def lowest_free_port(
     )
 
 
-def domain_size(size: Size) -> Tuple[int, int]:
-    """The (memory, disk) GiB of a box yo creates: what was asked, else the defaults."""
-    return (
-        LIBVIRT_MEMORY_GIB if size.memory_gib is None else size.memory_gib,
-        LIBVIRT_DISK_GIB if size.disk_gib is None else size.disk_gib,
-    )
+def domain_size(size: Size) -> BoxSize:
+    """The size of a box yo creates: what was asked, else the defaults.
+
+    `size` is the one vm_up decided (Size.for_creation), which also holds the
+    default CPU count, so there is no second default here.
+    """
+    if size.cpus is None:
+        raise YoError("a box is created with the CPU count vm_up decides; got none")
+    return size.fill(BoxSize(LIBVIRT_MEMORY_GIB, LIBVIRT_DISK_GIB, size.cpus))
 
 
 def domain_xml(
-    instance: str, ssh_port: int, uid: int, gid: int, memory_gib: int
+    instance: str, ssh_port: int, uid: int, gid: int, memory_gib: int, cpus: int
 ) -> str:
     template = string.Template(
         (SCRIPT_DIR / "libvirt" / "domain.xml").read_text(encoding="utf-8")
     )
     return template.substitute(
-        name=instance, ssh_port=ssh_port, uid=uid, gid=gid, memory_gib=memory_gib
+        name=instance,
+        ssh_port=ssh_port,
+        uid=uid,
+        gid=gid,
+        memory_gib=memory_gib,
+        cpus=cpus,
     )
 
 
@@ -451,6 +463,7 @@ class LibvirtDriver:
     name = "libvirt"
     instances_dir = ".local/state/yolobox/instances"
     start_command = "virsh start"
+    off_status = STATE_OFF
 
     @property
     def initrd_identity(self) -> str:
@@ -610,15 +623,17 @@ class LibvirtDriver:
         """virsh's own word for the state: "running", "in shutdown", "shut off"..."""
         return libvirt_host.virsh("domstate", domain_name()).stdout.strip()
 
+    def memory_fit_refusal(self, memory_gib: int) -> Optional[str]:
+        """Why a domain of `memory_gib` does not fit beside the active ones."""
+        return memory_refusal(
+            memory_gib, libvirt_host.host_memory_bytes(), active_domains_memory()
+        )
+
     def creation_refusal(self, size: Size) -> Optional[str]:
         # Explicit values only: the default must not refuse a 16 GiB host, whose
         # MemTotal is a little under 16 GiB.
         if size.memory_gib is not None:
-            refusal = memory_refusal(
-                size.memory_gib,
-                libvirt_host.host_memory_bytes(),
-                active_domains_memory(),
-            )
+            refusal = self.memory_fit_refusal(size.memory_gib)
             if refusal is not None:
                 return refusal
         # start() adopts a finished volume as it is, so a --disk it would not get
@@ -628,40 +643,53 @@ class LibvirtDriver:
         capacity = self.volume_sizes()["Capacity"]
         if not self.disk_volume_finished(capacity) or capacity == size.disk_gib * GIB:
             return None
+        if size.disk_gib * GIB > capacity:
+            way = (
+                "drop --disk to use that disk, then grow it, keeping what is on it: %s"
+                % (state.yo_cmd("disk-grow", str(size.disk_gib)))
+            )
+        else:
+            way = (
+                "drop --disk to keep that disk (a disk cannot shrink), or delete it, "
+                "and everything on it, to build a smaller one: virsh -c %s vol-delete "
+                "--pool %s %s" % (LIBVIRT_URI, LIBVIRT_POOL, disk_volume())
+            )
         return (
             "volume %s already holds a finished %g GiB disk, which yo would use as "
-            "it is, not at the --disk %d asked for — drop --disk to keep that disk, "
-            "or delete it, and everything on it, to build a new one: "
-            "virsh -c %s vol-delete --pool %s %s"
-            % (
-                disk_volume(),
-                capacity / GIB,
-                size.disk_gib,
-                LIBVIRT_URI,
-                LIBVIRT_POOL,
-                disk_volume(),
-            )
+            "it is, not at the --disk %d asked for — %s"
+            % (disk_volume(), capacity / GIB, size.disk_gib, way)
         )
 
-    def existing_size_refusal(self, size: Size) -> str:
-        flags = " ".join(size.flags())
-        if size.disk_gib is not None:
-            return (
-                "%s already exists, and its disk was sized when yo created it — drop "
-                "%s, or delete the box and create it again at that size, and "
-                "everything on it is lost: %s"
-                % (
-                    state.box.name,
-                    flags,
-                    state.destroy_then_bootstrap_command(*size.flags()),
-                )
+    def current_size(self) -> BoxSize:
+        info = libvirt_host.virsh("dominfo", domain_name()).stdout
+        memory = MAX_MEMORY_LINE_RE.search(info)
+        cpus = CPUS_LINE_RE.search(info)
+        if memory is None or cpus is None:
+            raise YoError(
+                "virsh dominfo %s printed no Max memory in KiB and CPU(s): %s"
+                % (domain_name(), info.strip())
             )
-        return (
-            "%s already exists, and its memory was set when yo defined its domain — "
-            "drop %s, or define the domain again, keeping the disk: %s, then run "
-            "this command again, which adopts the disk"
-            % (state.box.name, flags, redefine_command())
+        return BoxSize(
+            driver.exact_gib(int(memory.group(1)) * KIB, "memory"),
+            driver.exact_gib(self.volume_sizes()["Capacity"], "disk"),
+            int(cpus.group(1)),
         )
+
+    def resize_refusal(self, current: BoxSize, wanted: BoxSize) -> Optional[str]:
+        # A box that keeps its memory is not judged by the host's room again.
+        if wanted.memory_gib == current.memory_gib:
+            return None
+        return self.memory_fit_refusal(wanted.memory_gib)
+
+    def resize(self, memory_gib: int, cpus: int) -> None:
+        # --config edits the stopped domain's definition, which the next start
+        # reads. The maximum goes first and the current value follows it: the
+        # template sets both alike, and a current above the maximum is refused.
+        name = domain_name()
+        libvirt_host.virsh("setmaxmem", name, "%dG" % memory_gib, "--config")
+        libvirt_host.virsh("setmem", name, "%dG" % memory_gib, "--config")
+        libvirt_host.virsh("setvcpus", name, str(cpus), "--config", "--maximum")
+        libvirt_host.virsh("setvcpus", name, str(cpus), "--config")
 
     def fatal_gaps(self, gaps: Sequence[str]) -> List[str]:
         # A domain that is not what the template made may hold a path to the host.
@@ -859,7 +887,7 @@ class LibvirtDriver:
         if sshconfig.lima_part_of(current) != wanted:
             proc.atomic_write(state.ssh_cfg(), wanted, FILE_MODE_PRIVATE)
 
-    def create_domain(self, memory_gib: int) -> int:
+    def create_domain(self, memory_gib: int, cpus: int) -> int:
         """Define the domain on the lowest free host port; return that port."""
         uid, gid = libvirt_host.vm_account()
         with self.port_lock():
@@ -867,7 +895,7 @@ class LibvirtDriver:
             path = os.path.join(state.instance_dir(), "domain.xml")
             proc.atomic_write(
                 path,
-                domain_xml(state.box.name, port, uid, gid, memory_gib),
+                domain_xml(state.box.name, port, uid, gid, memory_gib, cpus),
                 FILE_MODE_READABLE,
             )
             libvirt_host.virsh("define", path)
@@ -875,9 +903,6 @@ class LibvirtDriver:
 
     def start(self, passphrase: bytes, size: Size) -> None:
         existing = self.domain_exists()
-        if existing and size.asked:
-            # The domain appeared after vm_up looked; it has a size already.
-            raise YoError(self.existing_size_refusal(size))
         public_key = public_key_line(self.operator_key())
         files = cidata_files(release.host_user(), public_key, state.box.name)
         os.makedirs(os.path.dirname(state.instance_dir()), exist_ok=True)
@@ -890,13 +915,17 @@ class LibvirtDriver:
             public_key + "\n",
             FILE_MODE_PRIVATE,
         )
-        memory_gib, disk_gib = domain_size(size)
-        if not existing:
-            self.ensure_disk_volume(disk_gib)
+        created = None if existing else domain_size(size)
+        if created is not None:
+            self.ensure_disk_volume(created.disk_gib)
         self.sync_cidata(files)
         # The port is chosen last: the volume upload above is slow, and the port
         # lock is held from choosing until the domain claims the port.
-        port = self.ssh_port() if existing else self.create_domain(memory_gib)
+        port = (
+            self.ssh_port()
+            if created is None
+            else self.create_domain(created.memory_gib, created.cpus)
+        )
         self.write_ssh_config(port)
         # Only a start needs passt to bind its socket, so only a start is
         # refused for the directory's ACL; down, ssh and status work without it.
@@ -1122,14 +1151,22 @@ class LibvirtDriver:
         allocation = self.volume_sizes()["Allocation"]
         return "pool %s volume %s" % (LIBVIRT_POOL, disk_volume()), allocation // KIB
 
-    def disk_ceiling_gib(self) -> int:
-        raise self.disk_grow_unsupported()
-
-    def disk_grow_unsupported(self) -> YoError:
-        return YoError("growing a libvirt box's disk is not implemented yet (TODO.md)")
-
     def grow_disk(self, current_gib: int, wanted_gib: int) -> None:
-        raise self.disk_grow_unsupported()
+        # qemu holds the image of a running domain open, so only a stopped one
+        # is resized.
+        domain_state = self.domain_state()
+        if domain_state != STATE_OFF:
+            raise YoError(
+                "%s is %s, and a disk is grown only while the domain is shut off"
+                % (state.box.name, domain_state)
+            )
+        ui.out(
+            "libvirt: raising %s from %dGiB to %dGiB"
+            % (state.box.name, current_gib, wanted_gib)
+        )
+        libvirt_host.virsh(
+            "vol-resize", "--pool", LIBVIRT_POOL, disk_volume(), "%dG" % wanted_gib
+        )
 
 
 LIBVIRT = LibvirtDriver()

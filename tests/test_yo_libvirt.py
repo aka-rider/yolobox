@@ -52,8 +52,11 @@ DAEMON_VERSION_TEXT = (
 PASST_DIR = "/run/libvirt/qemu/passt"
 HERDR = "/opt/herdr/bin/herdr"
 HOST_MEMORY_GIB = 64
+DOMAIN_CPUS = 8
 # The virsh subcommands that only look.
 READS = frozenset({"list", "dumpxml", "domstate", "dominfo", "vol-list", "vol-info"})
+# The virsh subcommands that edit a domain's definition.
+WRITES = frozenset({"setmaxmem", "setmem", "setvcpus"})
 # What ssh prints when nothing listens behind the box's port: a domain that is off.
 SSH_REFUSED = (255, "ssh: connect to host 127.0.0.1 port 61000: Connection refused")
 
@@ -127,6 +130,9 @@ class FakeHost:
         self.off_at_eof = False  # the domain goes off as that stream ends
         self.watchers = []
         self.max_memory_kib = {}  # domain -> the Max memory `virsh dominfo` prints
+        self.cpus = {}  # domain -> the CPU(s) `virsh dominfo` prints, default 8
+        self.max_cpus = {}  # domain -> its maximum vCPUs, default 8
+        self.memory_kib = {}  # domain -> its current memory (`setmem`), default max
         self.dominfo = {}  # domain -> what `virsh dominfo` prints instead
         # Runs as `virsh dominfo NAME` starts, given NAME: another tool acting.
         self.before_dominfo = lambda name: None
@@ -233,6 +239,34 @@ class FakeHost:
         self.watchers.append(watcher)
         return watcher
 
+    def set_definition(self, sub, args):
+        """setmaxmem, setmem and setvcpus on the definition of a domain, as libvirt
+        refuses them: only with --config on a shut-off domain, and a current
+        value never above its maximum."""
+        name, value = args[0], args[1]
+        assert "--config" in args, "a live change to a domain that is shut off"
+        if self.states[name] != "shut off":
+            return completed(returncode=1, stderr="error: domain is running")
+        if sub == "setvcpus":
+            if "--maximum" in args:
+                self.max_cpus[name] = int(value)
+                self.cpus[name] = min(self.cpus.get(name, DOMAIN_CPUS), int(value))
+            elif int(value) > self.max_cpus.get(name, DOMAIN_CPUS):
+                return completed(returncode=1, stderr="error: too many vCPUs")
+            else:
+                self.cpus[name] = int(value)
+            return completed()
+        kib = int(re.fullmatch(r"(\d+)G", value).group(1)) << 20
+        if sub == "setmaxmem":
+            current = self.memory_kib.get(name, self.max_memory_kib[name])
+            self.max_memory_kib[name] = kib
+            self.memory_kib[name] = min(current, kib)
+        elif kib > self.max_memory_kib[name]:
+            return completed(returncode=1, stderr="error: memory above the maximum")
+        else:
+            self.memory_kib[name] = kib
+        return completed()
+
     def virsh(self, sub, args):
         if sub in self.interrupted:
             raise self.interrupted[sub]
@@ -268,9 +302,17 @@ class FakeHost:
                 return completed(self.dominfo[args[0]])
             return completed(
                 "Id:             7\nName:           %s\nState:          %s\n"
-                "Max memory:     %d KiB\nUsed memory:    1048576 KiB\n\n"
-                % (args[0], self.states[args[0]], self.max_memory_kib[args[0]])
+                "Max memory:     %d KiB\nUsed memory:    1048576 KiB\n"
+                "CPU(s):         %d\n\n"
+                % (
+                    args[0],
+                    self.states[args[0]],
+                    self.max_memory_kib[args[0]],
+                    self.cpus.get(args[0], DOMAIN_CPUS),
+                )
             )
+        if sub in ("setmaxmem", "setmem", "setvcpus"):
+            return self.set_definition(sub, args)
         if sub == "dumpxml":
             return completed(self.domains[args[0]])
         if sub == "domstate":
@@ -313,7 +355,12 @@ class FakeHost:
 
     def tagged_domain(self, name, port, address="127.0.0.1"):
         xml = self.box.domain_xml(
-            name, port, VM_UID, VM_GID, self.box.LIBVIRT_MEMORY_GIB
+            name,
+            port,
+            VM_UID,
+            VM_GID,
+            self.box.LIBVIRT_MEMORY_GIB,
+            DOMAIN_CPUS,
         )
         self.domains["yolobox-" + name] = xml.replace(
             "address='127.0.0.1'", "address='%s'" % address
@@ -577,7 +624,12 @@ LIBVIRT_STORED_DOMAIN = """\
 class TestDomainTemplate(LibvirtCase):
     def render(self, name="box", port=FIRST_PORT):
         return self.box.domain_xml(
-            name, port, VM_UID, VM_GID, self.box.LIBVIRT_MEMORY_GIB
+            name,
+            port,
+            VM_UID,
+            VM_GID,
+            self.box.LIBVIRT_MEMORY_GIB,
+            DOMAIN_CPUS,
         )
 
     def devices(self, xml):
@@ -886,7 +938,12 @@ class TestPortAllocation(LibvirtCase):
         self.host.tagged_domain("first", FIRST_PORT)
         self.host.tagged_domain("second", FIRST_PORT + 1)
         untagged = self.box.domain_xml(
-            "x", FIRST_PORT + 2, VM_UID, VM_GID, self.box.LIBVIRT_MEMORY_GIB
+            "x",
+            FIRST_PORT + 2,
+            VM_UID,
+            VM_GID,
+            self.box.LIBVIRT_MEMORY_GIB,
+            DOMAIN_CPUS,
         )
         self.host.domains["plain"] = re.sub(
             r"<metadata>.*</metadata>", "", untagged, flags=re.S
@@ -1584,12 +1641,21 @@ class TestStatusAndGaps(LibvirtCase):
         with self.assertRaisesRegex(self.box.YoError, "cannot read"):
             self.refusal(memory_gib=24)
 
-    def test_a_disk_size_the_kept_volume_does_not_have_is_refused(self):
+    def test_a_bigger_disk_than_the_kept_volume_is_refused_pointing_at_disk_grow(self):
         self.finished_volume(100)
         refusal = self.refusal(disk_gib=250)
         self.assertIn("100 GiB", refusal)
         self.assertIn("--disk 250", refusal)
         self.assertIn("drop --disk", refusal)
+        self.assertIn("keeping what is on it: yo -m box disk-grow 250", refusal)
+        self.assertNotIn("vol-delete", refusal)
+
+    def test_a_smaller_disk_than_the_kept_volume_is_refused_since_a_disk_cannot_shrink(
+        self,
+    ):
+        self.finished_volume(250)
+        refusal = self.refusal(disk_gib=100)
+        self.assertIn("a disk cannot shrink", refusal)
         self.assertIn(
             "virsh -c qemu:///system vol-delete --pool default yolobox-box.qcow2",
             refusal,
@@ -1612,14 +1678,52 @@ class TestStatusAndGaps(LibvirtCase):
         self.assertIn("yolobox-box.qcow2", label)
         self.assertEqual(kib, 2 * 1024 * 1024)
 
-    def test_growing_the_disk_is_refused_naming_the_todo(self):
-        for call in (
-            self.driver.disk_ceiling_gib,
-            lambda: self.driver.grow_disk(100, 200),
+    def test_the_size_is_what_dominfo_and_the_volume_report(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.states["yolobox-box"] = "shut off"
+        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+        self.host.capacity["yolobox-box.qcow2"] = 120 << 30
+        self.host.cpus["yolobox-box"] = 6
+        self.assertEqual(self.driver.current_size(), self.box.BoxSize(16, 120, 6))
+
+    def test_memory_that_is_not_whole_gib_is_an_error(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.max_memory_kib["yolobox-box"] = 12 * (1 << 20) + 1
+        with self.assertRaisesRegex(self.box.YoError, "not a whole number of GiB"):
+            self.driver.current_size()
+
+    def test_a_disk_that_is_not_whole_gib_is_an_error_not_a_rounded_one(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+        self.host.capacity["yolobox-box.qcow2"] = (100 << 30) + 512
+        with self.assertRaisesRegex(self.box.YoError, "disk is .* not a whole number"):
+            self.driver.current_size()
+
+    def test_a_dominfo_without_cpus_is_an_error(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.dominfo["yolobox-box"] = "Max memory:     16777216 KiB\n"
+        with self.assertRaisesRegex(self.box.YoError, "printed no Max memory"):
+            self.driver.current_size()
+
+    def test_a_shut_off_domain_gets_its_volume_resized_and_a_running_one_does_not(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+        with (
+            mock.patch.object(self.box.ui, "out"),
+            self.assertRaisesRegex(
+                self.box.YoError, "only while the domain is shut off"
+            ),
         ):
-            with self.assertRaises(self.box.YoError) as caught:
-                call()
-            self.assertIn("TODO.md", caught.exception.message)
+            self.driver.grow_disk(100, 200)
+        self.assertEqual(self.host.calls_of("vol-resize"), [])
+        self.host.states["yolobox-box"] = "shut off"
+        with mock.patch.object(self.box.ui, "out"):
+            self.driver.grow_disk(100, 200)
+        self.assertEqual(
+            self.host.calls_of("vol-resize")[0][3:],
+            ["vol-resize", "--pool", "default", "yolobox-box.qcow2", "200G"],
+        )
+        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 200 << 30)
 
     def test_the_nix_commands_name_the_machine_and_never_the_host_os(self):
         env = self.box.nix_env("alice", "github:x/y/z")
@@ -2260,9 +2364,9 @@ class TestDestroy(LibvirtCase):
     def test_the_hint_that_deletes_and_rebuilds_names_the_remembered_ref(self):
         self.flake_ref.write_text("github:aka-rider/yolobox/v1.2.3\n")
         self.assertEqual(
-            self.box.state.destroy_then_bootstrap_command("--disk", "250"),
+            self.box.state.destroy_then_bootstrap_command(),
             "yo -m box destroy --yes && "
-            "yo -m box bootstrap --disk 250 --version github:aka-rider/yolobox/v1.2.3",
+            "yo -m box bootstrap --version github:aka-rider/yolobox/v1.2.3",
         )
         self.flake_ref.unlink()
         self.assertEqual(
@@ -2617,52 +2721,190 @@ class TestVmUpWithAGap(LibvirtCase):
             self.box.vm_up()
         self.assertIn("seclabel.dac", caught.exception.message)
 
-    def test_a_size_for_a_domain_that_exists_is_refused_before_the_passphrase(self):
-        self.host.tagged_domain("box", FIRST_PORT)
-        self.host.states["yolobox-box"] = "shut off"
-        with mock.patch.object(self.box.agent, "luks_passphrase") as passphrase:
-            with self.assertRaises(self.box.YoError) as caught:
-                self.box.vm_up(size=self.box.Size(24, None))
-        self.assertIn("box already exists", caught.exception.message)
-        self.assertIn("drop --memory 24", caught.exception.message)
-        self.assertIn(
-            "keeping the disk: yo -m box down && virsh -c qemu:///system undefine "
-            "--nvram yolobox-box, then",
-            caught.exception.message,
-        )
-        self.assertNotIn("vol-delete", caught.exception.message)
-        passphrase.assert_not_called()
-        self.assertNotIn("start", self.host.subcommands())
 
-    def test_a_disk_for_a_domain_that_exists_names_the_delete_and_the_loss(self):
+class TestVmUpResizes(LibvirtCase):
+    """`yo up --memory/--disk/--cpus` on a box whose domain exists."""
+
+    def setUp(self):
+        super().setUp()
         self.host.tagged_domain("box", FIRST_PORT)
         self.host.states["yolobox-box"] = "shut off"
-        with self.assertRaises(self.box.YoError) as caught:
-            self.box.vm_up(size=self.box.Size(24, 250))
-        self.assertIn("drop --memory 24 --disk 250", caught.exception.message)
+        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+        self.host.capacity["yolobox-box.qcow2"] = 100 << 30
+        self.order = []
+
+    def vm_up(self, size):
+        """Run vm_up; return the error it raised (or None) and its stubs."""
+        stubs = {}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(self.box.ui, "out"))
+            for target, name in (
+                (self.box.agent, "luks_passphrase"),
+                (self.driver, "start"),
+                (self.box.sshconfig, "ensure_agent_ssh_config"),
+                (self.box.guest, "ensure_guest_known_hosts"),
+                (self.box.forwards, "vm_services"),
+            ):
+                stubs[name] = stack.enter_context(mock.patch.object(target, name))
+            for name in ("luks_passphrase", "start"):
+                stubs[name].side_effect = lambda *a, _n=name, **k: (
+                    self.order.append((_n, len(self.host.calls))) or mock.DEFAULT
+                )
+            try:
+                self.box.vm_up(size=size)
+            except self.box.YoError as failure:
+                return failure, stubs
+        return None, stubs
+
+    def writes(self):
+        return [sub for sub in self.host.subcommands() if sub not in READS]
+
+    def assert_nothing_asked_or_changed(self, stubs):
+        stubs["luks_passphrase"].assert_not_called()
+        stubs["start"].assert_not_called()
+        self.assertEqual(self.writes(), [])
+
+    def test_memory_and_cpus_are_set_in_the_definition_after_the_passphrase(self):
+        error, stubs = self.vm_up(self.box.Size(24, None, 2))
+        self.assertIsNone(error)
+        self.assertEqual(
+            [call[3:] for call in self.host.calls if call[3:4] and call[3] in WRITES],
+            [
+                ["setmaxmem", "yolobox-box", "24G", "--config"],
+                ["setmem", "yolobox-box", "24G", "--config"],
+                ["setvcpus", "yolobox-box", "2", "--config", "--maximum"],
+                ["setvcpus", "yolobox-box", "2", "--config"],
+            ],
+        )
+        self.assertEqual(self.driver.current_size(), self.box.BoxSize(24, 100, 2))
+        self.assertEqual(self.host.memory_kib["yolobox-box"], 24 << 20)
+        stubs["start"].assert_called_once_with(
+            stubs["luks_passphrase"].return_value, self.box.NO_SIZE
+        )
+        passphrase_at = dict(self.order)["luks_passphrase"]
         self.assertTrue(
-            caught.exception.message.endswith(
-                "everything on it is lost: "
-                "yo -m box destroy --yes && yo -m box bootstrap --memory 24 --disk 250"
+            all(
+                call[3] not in WRITES
+                for call in self.host.calls[:passphrase_at]
+                if call[3:4]
             ),
-            caught.exception.message,
+            "the box was changed before the passphrase was derived",
         )
 
-    def test_the_delete_a_disk_refusal_names_keeps_the_ref_the_box_was_built_from(self):
-        self.host.tagged_domain("box", FIRST_PORT)
-        self.host.states["yolobox-box"] = "shut off"
-        ref_file = Path(self.box.state.flake_ref_file())
-        ref_file.parent.mkdir(parents=True)
-        ref_file.write_text("github:aka-rider/yolobox/v1.2.3\n")
-        with self.assertRaises(self.box.YoError) as caught:
-            self.box.vm_up(size=self.box.Size(None, 250))
-        self.assertTrue(
-            caught.exception.message.endswith(
-                "yo -m box destroy --yes && yo -m box bootstrap --disk 250 "
-                "--version github:aka-rider/yolobox/v1.2.3"
-            ),
-            caught.exception.message,
+    def test_less_memory_and_fewer_cpus_are_set_too(self):
+        error, _ = self.vm_up(self.box.Size(8, None, 2))
+        self.assertIsNone(error)
+        self.assertEqual(self.driver.current_size(), self.box.BoxSize(8, 100, 2))
+        self.assertEqual(self.host.memory_kib["yolobox-box"], 8 << 20)
+
+    def test_a_bigger_disk_is_left_to_the_grow_after_the_start(self):
+        # The volume is resized by grow_to_asked_disk, once the booted guest is
+        # known to be able to grow (TestUpGrowsTheDiskOfAStoppedBox).
+        error, stubs = self.vm_up(self.box.Size(None, 250, None))
+        self.assertIsNone(error)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 100 << 30)
+        stubs["start"].assert_called_once_with(
+            stubs["luks_passphrase"].return_value, self.box.NO_SIZE
         )
+
+    def test_the_size_the_box_already_has_changes_nothing(self):
+        error, stubs = self.vm_up(self.box.Size(16, 100, DOMAIN_CPUS))
+        self.assertIsNone(error)
+        self.assertEqual(self.writes(), [])
+        stubs["start"].assert_called_once_with(
+            stubs["luks_passphrase"].return_value, self.box.NO_SIZE
+        )
+
+    def test_a_start_without_a_size_never_reads_the_size(self):
+        error, _ = self.vm_up(self.box.NO_SIZE)
+        self.assertIsNone(error)
+        self.assertEqual(self.host.calls_of("dominfo"), [])
+        self.assertEqual(self.writes(), [])
+
+    def test_a_change_to_a_box_that_is_not_shut_off_is_refused_before_anything(self):
+        for domain_state in ("running", "paused", "in shutdown"):
+            with self.subTest(domain_state=domain_state):
+                self.host.states["yolobox-box"] = domain_state
+                error, stubs = self.vm_up(self.box.Size(24, None, None))
+                shown = "Running" if domain_state == "running" else domain_state
+                self.assertIn(
+                    "box is %s with 16 GiB of memory, %d CPUs and a 100 GiB disk"
+                    % (shown, DOMAIN_CPUS),
+                    error.message,
+                )
+                self.assertIn("--memory 24 would change that", error.message)
+                self.assertIn("yo -m box down, then run this command", error.message)
+                self.assert_nothing_asked_or_changed(stubs)
+
+    def test_a_smaller_disk_is_refused_before_anything_and_not_by_deleting_the_box(
+        self,
+    ):
+        error, stubs = self.vm_up(self.box.Size(24, 50, None))
+        self.assertIn("box's disk is 100 GiB", error.message)
+        self.assertIn("neither lima nor libvirt can shrink a disk", error.message)
+        self.assertNotIn("destroy", error.message)
+        self.assert_nothing_asked_or_changed(stubs)
+
+    def test_more_memory_than_the_host_has_room_for_is_refused_before_anything(self):
+        self.host.foreign_domain("win", 6 << 20)
+        error, stubs = self.vm_up(self.box.Size(HOST_MEMORY_GIB - 4 - 6 + 1, None, 2))
+        self.assertIn("does not fit on this host", error.message)
+        self.assert_nothing_asked_or_changed(stubs)
+
+    def test_cpus_alone_are_not_judged_by_the_hosts_memory(self):
+        self.host_memory(8 << 20)
+        error, _ = self.vm_up(self.box.Size(None, None, 2))
+        self.assertIsNone(error)
+        self.assertEqual(self.driver.current_size().cpus, 2)
+
+    def test_a_virsh_that_refuses_a_setting_stops_before_the_start(self):
+        self.host.fail["setvcpus"] = "error: too many vCPUs"
+        error, stubs = self.vm_up(self.box.Size(None, None, 2))
+        self.assertIn("too many vCPUs", error.message)
+        stubs["start"].assert_not_called()
+
+
+class TestVmUpCreatesAtTheAskedSize(LibvirtCase):
+    def up(self, host_cpus=16, *flags):
+        with (
+            mock.patch.object(self.driver, "require_tool"),
+            mock.patch.object(self.box.os, "cpu_count", return_value=host_cpus),
+            mock.patch.object(self.box.agent, "luks_passphrase") as passphrase,
+            mock.patch.object(self.driver, "start") as start,
+        ):
+            try:
+                self.box.main(["-m", "box", "up", *flags])
+            except self.box.YoError as failure:
+                return failure, passphrase, start
+        return None, passphrase, start
+
+    def test_all_three_flags_reach_the_creation(self):
+        with (
+            mock.patch.object(self.box.sshconfig, "ensure_agent_ssh_config"),
+            mock.patch.object(self.box.guest, "ensure_guest_known_hosts"),
+            mock.patch.object(self.box.forwards, "vm_services"),
+            # The box start() would have created, at the size it was asked.
+            mock.patch.object(
+                self.driver, "current_size", return_value=self.box.BoxSize(24, 250, 3)
+            ),
+        ):
+            error, passphrase, start = self.up(
+                16, "--memory", "24", "--disk", "250", "--cpus", "3"
+            )
+        self.assertIsNone(error)
+        self.assertEqual(self.host.calls_of("vol-resize"), [])
+        start.assert_called_once_with(
+            passphrase.return_value, self.box.Size(24, 250, 3)
+        )
+
+    def test_a_host_that_cannot_give_a_default_creates_nothing(self):
+        for host in (1, None):
+            with self.subTest(host=host):
+                error, passphrase, start = self.up(host)
+                self.assertIn("CPU", error.message)
+                passphrase.assert_not_called()
+                start.assert_not_called()
 
 
 SS_LINE = (
@@ -2740,7 +2982,9 @@ class TestInitrdListener(LibvirtCase):
 
 
 class TestStart(LibvirtCase):
-    def start(self, memory_gib=None, disk_gib=None):
+    def start(self, memory_gib=None, disk_gib=None, cpus=None, size=None):
+        """driver.start() of the flags as vm_up decides a creation size from them,
+        or of `size` as it is."""
         seed = Path(self.home) / "seed.qcow2"
         seed.write_bytes(b"Q" * 4096)
         with (
@@ -2755,7 +2999,9 @@ class TestStart(LibvirtCase):
                 self.box.libvirt, "loopback_port_bound", return_value=False
             ),
         ):
-            self.driver.start(b"pass", self.box.Size(memory_gib, disk_gib))
+            if size is None:
+                size = self.box.Size(memory_gib, disk_gib, cpus).for_creation()
+            self.driver.start(b"pass", size)
         return unlock
 
     def test_a_new_instance_gets_its_volumes_then_its_domain_then_starts(self):
@@ -2809,15 +3055,36 @@ class TestStart(LibvirtCase):
             self.host.capacity["yolobox-box.qcow2"], self.box.LIBVIRT_DISK_GIB << 30
         )
 
-    def test_a_size_for_a_domain_that_appeared_since_vm_up_looked_is_refused(self):
+    def vcpus(self):
+        return ET.fromstring(self.host.domains["yolobox-box"]).findtext("vcpu")
+
+    def test_an_existing_domain_starts_on_a_host_whose_default_is_unavailable(self):
         self.host.tagged_domain("box", FIRST_PORT)
         self.host.states["yolobox-box"] = "shut off"
-        with self.assertRaises(self.box.YoError) as caught:
-            self.start(memory_gib=24)
-        self.assertIn("box already exists", caught.exception.message)
-        self.assertEqual(
-            [sub for sub in self.host.subcommands() if sub not in READS], []
-        )
+        for host in (1, None):
+            with self.subTest(host=host):
+                with mock.patch.object(self.box.os, "cpu_count", return_value=host):
+                    unlock = self.start(size=self.box.NO_SIZE)
+                unlock.assert_called_once_with(b"pass")
+                self.assertEqual(self.host.calls_of("define"), [])
+                self.assertNotIn("yolobox-box.qcow2", self.host.volumes)
+
+    def test_creating_without_the_cpus_vm_up_decides_is_an_error(self):
+        with self.assertRaisesRegex(self.box.YoError, "CPU count vm_up decides"):
+            self.start(size=self.box.NO_SIZE)
+
+    def test_a_box_is_created_with_the_cpus_asked_for(self):
+        self.start(cpus=3)
+        self.assertEqual(self.vcpus(), "3")
+
+    def test_a_box_created_without_cpus_gets_one_less_than_the_host_up_to_four(self):
+        for host, expected in ((2, "1"), (5, "4"), (64, "4")):
+            with self.subTest(host=host):
+                self.host.domains.clear()
+                self.host.states.clear()
+                with mock.patch.object(self.box.os, "cpu_count", return_value=host):
+                    self.start()
+                self.assertEqual(self.vcpus(), expected)
 
     def test_a_passt_directory_the_vm_user_cannot_write_in_refuses_the_start(self):
         self.host.acl = getfacl_listing(mask="r-x")

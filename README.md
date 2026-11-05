@@ -76,7 +76,7 @@ A Linux PC (Fedora, x86_64, with KVM) runs the box under libvirt instead of Lima
    Or run it from the checkout as `./yo`. Step 2 installed `xorriso`; Python 3.9 or newer, `git`, `ssh`, `curl` and `fzf` must already be on your `PATH`.
 4. Bring the VM up as in [Init the VM](#init-the-vm): `yo bootstrap` creates and starts it, then builds it.
 
-   The box gets 16 GiB of memory and a 100 GiB disk. To size it, pass the sizes in GiB to the `yo bootstrap` that creates it: `yo bootstrap --memory 24 --disk 250`. The size is set only when the box is created, so choose the disk before the first boot. See [Sizing a box](docs/linux-host.md#sizing-a-box).
+   The box gets 16 GiB of memory, a 100 GiB disk and up to 4 CPUs (one less than your machine has, at most 4). To size it, pass the sizes to the `yo bootstrap` that creates it: `yo bootstrap --memory 24 --disk 250 --cpus 3` (memory and disk in GiB; `--cpus` takes 1 to one less than your machine's CPU count). To resize a box that exists, stop it (`yo down`) and run `yo up` with the same flags: memory and CPUs change, a disk only grows. See [Sizing a box](docs/linux-host.md#sizing-a-box).
 
 5. To open a VM port on the host, run `yo port <guest-port>`. It prints the `127.0.0.1` port it chose.
 
@@ -183,11 +183,14 @@ yolobox-guest rebuild switch
 
 It rebuilds from the flake ref the last build stamped into `/etc/yolobox/flake-ref`, with the box's own name from `/etc/yolobox/hostname`. For a box built from a release that is the same release; for a box built from a branch it is that branch's current tip, which may have moved since. Use `boot` instead of `switch` to apply the change at the next boot. To move the box to another release, run `yo bootstrap --version <version>` on the host.
 
-Lima reads `lima/yolobox.yaml` only once, when it creates the VM, so editing that file later changes nothing. To give an existing VM more memory or CPUs:
+Lima reads `lima/yolobox.yaml` only once, when it creates the VM, so editing that file later changes nothing. To give an existing VM more memory, CPUs or disk, stop it and start it with the new size:
 
 ```bash
-limactl stop yolobox && limactl edit yolobox --memory 16 --cpus 8 --start
+yo down
+yo up --memory 24 --cpus 4 --disk 250
 ```
+
+A flag equal to the box's current size changes nothing, and `yo up` refuses a size change while the box is not stopped.
 
 ## Browser and screen
 

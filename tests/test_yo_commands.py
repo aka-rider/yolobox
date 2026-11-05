@@ -254,8 +254,8 @@ class TestFlakeRef(FakeHome):
         )
         self.remember("github:you/yolobox/x\n")
         self.assertEqual(
-            yo.destroy_then_bootstrap_command("--disk", "250"),
-            "yo destroy --yes && yo bootstrap --disk 250 --version github:you/yolobox/x",
+            yo.destroy_then_bootstrap_command(),
+            "yo destroy --yes && yo bootstrap --version github:you/yolobox/x",
         )
 
     def test_a_remembered_ref_is_quoted_in_the_hint_that_deletes_the_box(self):
@@ -839,11 +839,49 @@ class TestBootstrapRebootDecision(FakeHome):
                 yo.vm, "guest_generations", side_effect=[("g1", "g0"), ("g1", "g1")]
             ),
             mock.patch.object(yo.proc, "run"),
+            mock.patch.object(yo.vm, "grow_to_asked_disk") as grow,
         ):
             yo.cmd_bootstrap(args)
         first, second = yo.vm_up.call_args_list
         self.assertEqual(first.kwargs["size"], yo.Size(memory_gib=24, disk_gib=250))
         self.assertEqual(second.kwargs.get("size", yo.NO_SIZE), yo.NO_SIZE)
+        grow.assert_called_once_with(250, yo.vm_up.return_value)
+
+    def test_the_disk_is_grown_only_after_the_build_and_the_reboot(self):
+        events = []
+        yo.sshx.ssh_run.side_effect = lambda *a, **k: (
+            events.append("build") or mock.Mock(returncode=0, stdout="", stderr="")
+        )
+        yo.vm_up.side_effect = lambda **k: events.append("vm_up") or b"p" * 64
+        args = yo.build_parser().parse_args(
+            ["bootstrap", "--version", "main", "--disk", "250"]
+        )
+        with (
+            mock.patch.object(
+                yo.vm, "guest_generations", side_effect=[("g1", "g0"), ("g1", "g1")]
+            ),
+            mock.patch.object(yo.proc, "run"),
+            mock.patch.object(yo.LIMA, "stop"),
+            mock.patch.object(
+                yo.vm,
+                "grow_to_asked_disk",
+                side_effect=lambda *a: events.append("grow"),
+            ),
+        ):
+            yo.cmd_bootstrap(args)
+        self.assertEqual(events, ["vm_up", "build", "vm_up", "grow"])
+
+    def test_a_bootstrap_without_a_disk_never_grows_one(self):
+        args = yo.build_parser().parse_args(["bootstrap", "--version", "main"])
+        with (
+            mock.patch.object(
+                yo.vm, "guest_generations", side_effect=[("g1", "g0"), ("g1", "g1")]
+            ),
+            mock.patch.object(yo.proc, "run"),
+            mock.patch.object(yo.vm, "grow_to_asked_disk") as grow,
+        ):
+            yo.cmd_bootstrap(args)
+        grow.assert_not_called()
 
     def test_the_passphrase_is_derived_before_the_vm_stops(self):
         # A missing 1Password key must leave the running box alone.
@@ -3554,7 +3592,12 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         def fake_run(argv, **kwargs):
             limactl.append(list(argv))
             if argv[:2] == ["limactl", "list"]:
-                return mock.Mock(returncode=0, stdout=str(100 * 1024**3), stderr="")
+                # Memory and Disk in bytes, then CPUs.
+                return mock.Mock(
+                    returncode=0,
+                    stdout="%d %d 4" % (16 * 1024**3, 100 * 1024**3),
+                    stderr="",
+                )
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         def fake_ssh_run(role, argv, **kwargs):
@@ -3692,6 +3735,143 @@ class TestDiskGrowResizesTheMapping(FakeHome):
             self.disk_grow(fstype="ext4\n")
         self.assertIn("yo bootstrap", caught.exception.message)
         self.assertEqual(self.order, [])
+
+
+class TestUpGrowsTheDiskOfAStoppedBox(FakeHome):
+    """`yo up --disk N` boots the box, checks the guest, then grows as `yo disk-grow N`."""
+
+    def up(
+        self,
+        growpart="loaded\n",
+        grow_disk_error=None,
+        restart_error=None,
+        resize2fs_code=0,
+    ):
+        self.events = events = []
+        usage = iter(
+            (
+                df_output("/dev/mapper/root 100 50 50 50% /"),
+                df_output("/dev/mapper/root 200 50 150 25% /"),
+            )
+        )
+
+        def fake_ssh_run(role, argv, **kwargs):
+            stdout = ""
+            if argv[:2] == ["systemctl", "show"]:
+                stdout = growpart
+            elif argv[:2] == ["lsblk", "-dno"] and argv[2] == "FSTYPE":
+                stdout = "crypto_LUKS\n"
+            elif argv == yo.guest.ROOT_USAGE_PROBE:
+                stdout = next(usage)
+            elif argv[:2] == ["lsblk", "-no"]:
+                stdout = "199.8G\n"
+            elif argv[0] == "sudo":
+                events.append((argv[1], kwargs.get("stdin")))
+                if argv[1] == "resize2fs" and resize2fs_code:
+                    raise yo.YoError("resize2fs failed (exit %d)" % resize2fs_code)
+            return mock.Mock(returncode=0, stdout=stdout, stderr="")
+
+        starts = iter([None, restart_error])
+
+        def start(*args, **kwargs):
+            events.append("start")
+            error = next(starts)
+            if error is not None:
+                raise error
+
+        def record(name, error=None):
+            def run(*args, **kwargs):
+                events.append(name)
+                if error is not None:
+                    raise error
+                return mock.DEFAULT
+
+            return run
+
+        with (
+            mock.patch.object(yo.LIMA, "vm_status", return_value="Stopped"),
+            mock.patch.object(yo.LIMA, "config_gaps", return_value=[]),
+            mock.patch.object(
+                yo.LIMA, "current_size", return_value=yo.BoxSize(16, 100, 4)
+            ),
+            mock.patch.object(yo.LIMA, "require_login_key"),
+            mock.patch.object(yo.LIMA, "stop", side_effect=record("stop")),
+            mock.patch.object(
+                yo.LIMA, "grow_disk", side_effect=record("grow_disk", grow_disk_error)
+            ),
+            mock.patch.object(yo.LIMA, "start", side_effect=start),
+            mock.patch.object(yo.agent, "luks_passphrase", return_value=b"p" * 64),
+            mock.patch.object(yo.sshconfig, "ensure_agent_ssh_config"),
+            mock.patch.object(yo.guest, "ensure_guest_known_hosts"),
+            mock.patch.object(yo.forwards, "vm_services"),
+            mock.patch.object(yo.sshx, "ssh_run", side_effect=fake_ssh_run),
+            mock.patch.object(yo.ui, "out"),
+            mock.patch.object(yo.release, "rebuild_hint", return_value="rebuild it"),
+        ):
+            yo.cmd_up(yo.build_parser().parse_args(["up", "--disk", "200"]))
+
+    def test_the_box_boots_then_stops_to_have_its_ceiling_raised_then_grows(self):
+        self.up()
+        self.assertEqual(
+            self.events,
+            [
+                "start",
+                "stop",
+                "grow_disk",
+                "start",
+                ("cryptsetup", b"p" * 64),
+                ("resize2fs", None),
+            ],
+        )
+
+    def test_a_guest_that_cannot_grow_leaves_the_ceiling_alone(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.up(growpart="not-found\n")
+        self.assertIn("no growpart unit", caught.exception.message)
+        self.assertEqual(self.events, ["start"])
+
+    def test_a_guest_that_cannot_grow_names_disk_grow_as_the_next_step(self):
+        # The rest of what was asked is applied and the box is running, so a rerun
+        # of yo up is refused as a change to a running box.
+        with self.assertRaises(yo.YoError) as caught:
+            self.up(growpart="not-found\n")
+        message = caught.exception.message
+        self.assertIn("yolobox's disk is still 100GiB", message)
+        self.assertTrue(message.endswith("grow it with: yo disk-grow 200"), message)
+
+    def test_a_restart_that_fails_after_the_ceiling_moved_names_disk_grow(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.up(restart_error=yo.YoError("limactl start exited 1", code=7))
+        message = caught.exception.message
+        self.assertIn("limactl start exited 1", message)
+        self.assertTrue(
+            message.endswith(
+                "yolobox's disk limit is already 200GiB; finish growing it with: "
+                "yo disk-grow 200"
+            ),
+            message,
+        )
+        self.assertEqual(caught.exception.code, 7)
+        self.assertEqual(self.events, ["start", "stop", "grow_disk", "start"])
+
+    def test_a_filesystem_grow_that_fails_after_the_ceiling_moved_names_disk_grow(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.up(resize2fs_code=1)
+        message = caught.exception.message
+        self.assertIn("resize2fs failed", message)
+        self.assertIn("disk limit is already 200GiB", message)
+        self.assertTrue(message.endswith("yo disk-grow 200"), message)
+
+    def test_a_ceiling_the_host_refuses_names_the_rerun_with_the_disk_flag(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.up(grow_disk_error=yo.YoError("limactl edit refused"))
+        message = caught.exception.message
+        self.assertIn("limactl edit refused", message)
+        self.assertIn("is stopped and its disk is still 100GiB", message)
+        self.assertTrue(message.endswith("yo up --disk 200"), message)
+        self.assertNotIn("disk-grow", message)
+        self.assertNotIn("None", message)
+        self.assertEqual(self.events, ["start", "stop", "grow_disk"])
 
 
 if __name__ == "__main__":

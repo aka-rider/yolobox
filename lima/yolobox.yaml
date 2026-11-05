@@ -16,8 +16,9 @@ propagateProxyEnv: false
 
 mounts: []
 
+# No cpus: yo passes --cpus when it creates the instance (default_cpus() in
+# yolobox_cli/driver.py), since a count that fits every Mac cannot be written here.
 memory: 16GiB
-cpus: 8
 disk: 100GiB
 
 ssh:

@@ -9,7 +9,15 @@ import shutil
 import unittest
 from unittest import mock
 
-from test_yo import A_RELEASE, FakeHome, fake_limactl, load_yo, unload_yo, yo
+from test_yo import (
+    A_RELEASE,
+    FakeHome,
+    fake_limactl,
+    host_cpus,
+    load_yo,
+    unload_yo,
+    yo,
+)
 
 INSTANCE_B = "second"
 
@@ -334,12 +342,41 @@ class TestVmUpOnARunningBoxWithoutSshd(unittest.TestCase):
         self.assertIn("127.0.0.1:60023", caught.exception.message)
 
 
-class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
-    def vm_up(self, instance, size=yo.NO_SIZE, info=None, remembered_ref=None):
-        """Run vm_up on an instance limactl reports as `info`; return error and stubs."""
+def lima_info(status, port=60023):
+    return yo.LimaInfo(
+        host_agent_pid=None,
+        port_forwards=[],
+        mounts=[],
+        forward_agent=False,
+        status=status,
+        over_vsock=False,
+        propagate_proxy_env=False,
+        load_dot_ssh_pub_keys=False,
+        ssh_local_port=port,
+    )
+
+
+# What the box has now in the resize tests: 16 GiB of memory, a 100 GiB disk, 4 CPUs.
+CURRENT = yo.BoxSize(16, 100, 4)
+
+
+# The calls whose order the resize tests check.
+ORDERED = ("luks_passphrase", "resize", "grow_disk", "start")
+
+
+class VmUpOnLima(unittest.TestCase):
+    """vm_up on an instance limactl reports as `info`, with every side effect stubbed."""
+
+    def vm_up(self, instance, size=yo.NO_SIZE, info=None, remembered_ref=None, cpus=16):
+        """Return the error vm_up raised (or None) and the stubs, which also
+        record the order of the calls that change the box in `self.order`."""
         stubs = {}
+        self.order = []
         with contextlib.ExitStack() as stack:
             stack.enter_context(as_instance(instance))
+            stack.enter_context(
+                mock.patch.object(yo.os, "cpu_count", return_value=cpus)
+            )
             stack.enter_context(
                 mock.patch.object(
                     yo.state, "remembered_flake_ref", return_value=remembered_ref
@@ -348,6 +385,9 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
             for target, name in (
                 (yo.agent, "luks_passphrase"),
                 (yo.LIMA, "start"),
+                (yo.LIMA, "resize"),
+                (yo.LIMA, "grow_disk"),
+                (yo.LIMA, "current_size"),
                 (yo.proc, "spawn"),
                 (yo.sshconfig, "ensure_agent_ssh_config"),
                 (yo.guest, "ensure_guest_known_hosts"),
@@ -355,6 +395,11 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
                 (yo.proc, "run"),
             ):
                 stubs[name] = stack.enter_context(mock.patch.object(target, name))
+                if name in ORDERED:
+                    stubs[name].side_effect = lambda *a, _n=name, **k: (
+                        self.order.append(_n) or mock.DEFAULT
+                    )
+            stubs["current_size"].return_value = CURRENT
             stack.enter_context(
                 mock.patch.object(yo.LIMA, "config_gaps", return_value=[])
             )
@@ -367,6 +412,19 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
                 return failure, stubs
         return None, stubs
 
+    def assert_refused_before_anything(self, stubs):
+        stubs["luks_passphrase"].assert_not_called()
+        for name in (
+            "start",
+            "resize",
+            "grow_disk",
+            "spawn",
+            "run",
+        ):
+            stubs[name].assert_not_called()
+
+
+class TestVmUpNeverCreatesAnotherInstance(VmUpOnLima):
     def test_a_missing_instance_fails_before_touch_id_and_before_limactl_start(self):
         error, stubs = self.vm_up(INSTANCE_B)
         self.assertIn("limactl create --name second", error.message)
@@ -378,106 +436,293 @@ class TestVmUpNeverCreatesAnotherInstance(unittest.TestCase):
         stubs["luks_passphrase"].assert_called_once_with()
         stubs["start"].assert_called_once()
 
-    def assert_refused_before_anything(self, stubs):
-        stubs["luks_passphrase"].assert_not_called()
-        stubs["start"].assert_not_called()
-        stubs["spawn"].assert_not_called()
-        stubs["run"].assert_not_called()
-
-    def test_a_sized_default_instance_is_left_to_limactl_create(self):
-        error, stubs = self.vm_up(yo.DEFAULT_INSTANCE, yo.Size(24, 250))
-        self.assertIn(
-            "limactl create --name yolobox --memory 24 --disk 250 %s\n"
-            % (yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
-            error.message,
-        )
-        self.assertNotIn("--set", error.message)
-        self.assertTrue(
-            error.message.endswith(
-                "then run this command again without --memory 24 --disk 250"
-            )
-        )
-        self.assert_refused_before_anything(stubs)
+    def test_a_missing_named_instance_asked_for_no_size_gets_the_default_cpus_in_the_hint(
+        self,
+    ):
+        # Lima's own default CPU count is not yo's, and the user passed no flag
+        # to drop, so the command has --cpus and the message does not say "without".
+        for host, expected in ((16, "4"), (3, "2")):
+            with self.subTest(host=host):
+                error, _ = self.vm_up(INSTANCE_B, cpus=host)
+                self.assertIn(
+                    "--set '.ssh.localPort=<free port>' --cpus %s " % expected,
+                    error.message,
+                )
+                self.assertNotIn("without", error.message)
 
     def test_a_sized_named_instance_also_needs_its_own_port(self):
-        error, stubs = self.vm_up(INSTANCE_B, yo.Size(None, 250))
+        error, stubs = self.vm_up(INSTANCE_B, yo.Size(None, 250, 3))
         self.assertIn(
             "limactl create --name second --set '.ssh.localPort=<free port>' "
-            "--disk 250 %s" % (yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
+            "--disk 250 --cpus 3 %s" % (yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
             error.message,
         )
         self.assertNotIn("--memory", error.message)
         self.assertTrue(
-            error.message.endswith("then run this command again without --disk 250")
+            error.message.endswith(
+                "then run this command again without --disk 250 --cpus 3"
+            )
         )
         self.assert_refused_before_anything(stubs)
 
-    STOPPED = yo.LimaInfo(
-        host_agent_pid=None,
-        port_forwards=[],
-        mounts=[],
-        forward_agent=False,
-        status="Stopped",
-        over_vsock=False,
-        propagate_proxy_env=False,
-        load_dot_ssh_pub_keys=False,
-        ssh_local_port=60023,
-    )
 
-    def test_memory_for_an_instance_that_exists_names_limactl_edit(self):
-        error, stubs = self.vm_up(INSTANCE_B, yo.Size(24, None), info=self.STOPPED)
-        self.assertIn("second already exists", error.message)
-        self.assertIn("drop --memory 24", error.message)
-        self.assertIn(
-            "stop it (yo -m second down), then: limactl edit --yes second --memory 24",
-            error.message,
-        )
-        self.assertNotIn("destroy", error.message)
-        self.assert_refused_before_anything(stubs)
-
-    def test_a_disk_for_an_instance_that_exists_names_disk_grow_and_the_loss(self):
-        error, stubs = self.vm_up(INSTANCE_B, yo.Size(None, 250), info=self.STOPPED)
-        self.assertIn("drop --disk 250", error.message)
-        self.assertIn(
-            "keeping what is on it: yo -m second disk-grow 250", error.message
-        )
-        self.assertIn(
-            "everything on it is lost: yo -m second destroy --yes && "
-            "yo -m second bootstrap --disk 250, which then prints how to create it)",
-            error.message,
-        )
-        self.assertNotIn("limactl edit", error.message)
-        self.assert_refused_before_anything(stubs)
-
-    def test_the_delete_a_disk_refusal_names_keeps_the_ref_the_box_was_built_from(self):
-        error, _ = self.vm_up(
-            INSTANCE_B, yo.Size(None, 250), info=self.STOPPED, remembered_ref="main"
-        )
-        self.assertIn(
-            "yo -m second bootstrap --disk 250 --version main, which then",
-            error.message,
+class TestVmUpCreatesAtTheAskedSize(VmUpOnLima):
+    def test_a_missing_box_is_created_at_all_three_sizes_asked(self):
+        error, stubs = self.vm_up(yo.DEFAULT_INSTANCE, yo.Size(24, 250, 3))
+        self.assertIsNone(error)
+        stubs["start"].assert_called_once_with(
+            stubs["luks_passphrase"].return_value, yo.Size(24, 250, 3)
         )
 
+    def test_a_box_created_without_cpus_gets_one_less_than_the_host_up_to_four(self):
+        for host, expected in ((2, 1), (3, 2), (5, 4), (64, 4)):
+            with self.subTest(host=host):
+                error, stubs = self.vm_up(yo.DEFAULT_INSTANCE, cpus=host)
+                self.assertIsNone(error)
+                stubs["start"].assert_called_once_with(
+                    stubs["luks_passphrase"].return_value,
+                    yo.Size(None, None, expected),
+                )
 
-class TestLimaStartNeverDropsASize(unittest.TestCase):
-    """start() is reached with a size only when vm_up's own refusal was skipped."""
+    def test_a_host_with_one_cpu_or_an_unknown_count_creates_nothing(self):
+        for host in (1, None):
+            with self.subTest(host=host):
+                error, stubs = self.vm_up(yo.DEFAULT_INSTANCE, cpus=host)
+                self.assertIsInstance(error, yo.YoError)
+                self.assertIn("CPU", error.message)
+                self.assert_refused_before_anything(stubs)
 
-    def start(self, exists):
+    def test_the_actual_start_passes_every_flag_to_limactl(self):
         with (
             as_instance(INSTANCE_B),
-            mock.patch.object(yo.lima, "lima_instance_exists", return_value=exists),
+            mock.patch.object(yo.lima, "lima_instance_exists", return_value=False),
             mock.patch.object(yo.proc, "spawn") as spawn,
+            mock.patch.object(yo.unlock, "unlock_disk"),
+            mock.patch.object(yo.unlock, "wait_for_operator"),
+        ):
+            spawn.return_value.wait.return_value = 0
+            yo.LIMA.start(b"pass", yo.Size(24, 250, 3))
+        spawn.assert_called_once_with(
+            [
+                "limactl",
+                "start",
+                "--name",
+                "second",
+                "--yes",
+                "--memory",
+                "24",
+                "--disk",
+                "250",
+                "--cpus",
+                "3",
+                str(yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
+            ]
+        )
+
+
+class TestVmUpResizesAStoppedBox(VmUpOnLima):
+    STOPPED = lima_info("Stopped")
+
+    def resize(self, size, status="Stopped"):
+        return self.vm_up(INSTANCE_B, size, info=lima_info(status))
+
+    def test_memory_and_cpus_are_set_before_the_start_and_the_start_asks_for_no_size(
+        self,
+    ):
+        error, stubs = self.resize(yo.Size(24, None, 2))
+        self.assertIsNone(error)
+        stubs["resize"].assert_called_once_with(24, 2)
+        self.assertEqual(self.order, ["luks_passphrase", "resize", "start"])
+        stubs["start"].assert_called_once_with(
+            stubs["luks_passphrase"].return_value, yo.NO_SIZE
+        )
+        stubs["grow_disk"].assert_not_called()
+
+    def test_only_what_differs_is_a_change(self):
+        # The same memory and disk as now, a new CPU count.
+        error, stubs = self.resize(yo.Size(16, 100, 2))
+        self.assertIsNone(error)
+        stubs["resize"].assert_called_once_with(16, 2)
+        stubs["grow_disk"].assert_not_called()
+
+    def test_a_bigger_disk_is_left_to_the_grow_after_the_start(self):
+        # The ceiling is raised by grow_to_asked_disk, once the booted guest
+        # is known to be able to grow (TestUpGrowsTheDiskOfAStoppedBox).
+        error, stubs = self.resize(yo.Size(None, 250, None))
+        self.assertIsNone(error)
+        stubs["resize"].assert_not_called()
+        stubs["grow_disk"].assert_not_called()
+        self.assertEqual(self.order, ["luks_passphrase", "start"])
+        stubs["start"].assert_called_once_with(
+            stubs["luks_passphrase"].return_value, yo.NO_SIZE
+        )
+
+    def test_a_size_equal_to_the_current_one_changes_nothing_and_asks_nothing_extra(
+        self,
+    ):
+        error, stubs = self.resize(yo.Size(16, 100, 4))
+        self.assertIsNone(error)
+        for name in ("resize", "grow_disk"):
+            stubs[name].assert_not_called()
+        stubs["start"].assert_called_once_with(
+            stubs["luks_passphrase"].return_value, yo.NO_SIZE
+        )
+
+    def test_a_box_started_without_a_size_keeps_its_cpus_and_is_not_even_measured(self):
+        error, stubs = self.resize(yo.NO_SIZE)
+        self.assertIsNone(error)
+        stubs["current_size"].assert_not_called()
+        stubs["resize"].assert_not_called()
+
+    def test_a_change_to_a_box_that_is_not_stopped_is_refused_before_anything(self):
+        for status in ("Running", "Starting", "Broken"):
+            with self.subTest(status=status):
+                error, stubs = self.resize(yo.Size(24, None, None), status)
+                self.assertIn(
+                    "second is %s with 16 GiB of memory" % status, error.message
+                )
+                self.assertIn("4 CPUs and a 100 GiB disk", error.message)
+                self.assertIn("--memory 24 would change that", error.message)
+                self.assertIn(
+                    "yo -m second down, then run this command again", error.message
+                )
+                self.assert_refused_before_anything(stubs)
+
+    def test_a_running_box_asked_only_for_a_bigger_disk_is_pointed_at_disk_grow(self):
+        error, _ = self.resize(yo.Size(None, 250, None), "Running")
+        self.assertIn("yo -m second down, then run this command again", error.message)
+        self.assertIn(
+            "to only grow the disk of a running box, yo -m second disk-grow 250",
+            error.message,
+        )
+
+    def test_disk_grow_is_not_offered_when_memory_or_cpus_change_too_or_it_is_not_running(
+        self,
+    ):
+        for size, status in (
+            (yo.Size(24, 250, None), "Running"),
+            (yo.Size(None, 250, 2), "Running"),
+            (yo.Size(None, 250, None), "Starting"),
+        ):
+            with self.subTest(size=size, status=status):
+                error, _ = self.resize(size, status)
+                self.assertNotIn("disk-grow", error.message)
+
+    def test_a_running_box_asked_for_its_own_size_goes_on_to_the_boot_stage(self):
+        with mock.patch.object(
+            yo.unlock, "boot_stage", return_value=yo.BootStage.UNKNOWN
+        ) as stage:
+            error, stubs = self.vm_up(
+                INSTANCE_B, yo.Size(16, 100, 4), info=lima_info("Running")
+            )
+        stage.assert_called_once_with()
+        self.assertNotIn("would change that", error.message)
+        stubs["resize"].assert_not_called()
+
+    def test_a_smaller_disk_is_refused_before_anything_and_destroy_is_no_way_out(self):
+        for status in ("Stopped", "Running"):
+            with self.subTest(status=status):
+                error, stubs = self.resize(yo.Size(24, 50, None), status)
+                self.assertIn("second's disk is 100 GiB", error.message)
+                self.assertIn(
+                    "neither lima nor libvirt can shrink a disk", error.message
+                )
+                self.assertNotIn("destroy", error.message)
+                self.assert_refused_before_anything(stubs)
+
+    def test_the_passphrase_is_derived_before_the_box_is_changed(self):
+        error, _ = self.resize(yo.Size(24, 250, None))
+        self.assertIsNone(error)
+        self.assertEqual(self.order[0], "luks_passphrase")
+
+
+class TestLimaGrowDisk(unittest.TestCase):
+    def test_a_refused_edit_says_what_happened_and_leaves_the_next_step_to_the_caller(
+        self,
+    ):
+        with (
+            as_instance(INSTANCE_B),
+            mock.patch.object(yo.ui, "out"),
+            mock.patch.object(
+                yo.proc, "run", return_value=mock.Mock(returncode=3)
+            ) as run,
             self.assertRaises(yo.YoError) as caught,
         ):
-            yo.LIMA.start(b"pass", yo.Size(24, None))
-        spawn.assert_not_called()
-        return caught.exception.message
+            yo.LIMA.grow_disk(100, 200)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["limactl", "edit", "--yes", "second", "--disk", "200"],
+        )
+        self.assertEqual(
+            caught.exception.message, "limactl edit refused the disk resize (exit 3)"
+        )
 
-    def test_an_instance_that_exists_is_refused_as_vm_up_would(self):
-        self.assertIn("limactl edit --yes second --memory 24", self.start(True))
 
-    def test_a_missing_instance_is_left_to_limactl_create(self):
-        self.assertIn("limactl create --name second", self.start(False))
+class TestLimaSizeCommands(unittest.TestCase):
+    GIB = 1024**3
+
+    def current_size(self, stdout, returncode=0):
+        with (
+            as_instance(INSTANCE_B),
+            mock.patch.object(
+                yo.proc,
+                "run",
+                return_value=mock.Mock(returncode=returncode, stdout=stdout, stderr=""),
+            ) as run,
+        ):
+            try:
+                return yo.LIMA.current_size(), run
+            except yo.YoError as failure:
+                return failure, run
+
+    def test_the_size_is_read_in_whole_gib_from_limactls_bytes(self):
+        size, run = self.current_size("%d %d 4\n" % (16 * self.GIB, 100 * self.GIB))
+        self.assertEqual(size, yo.BoxSize(16, 100, 4))
+        self.assertEqual(
+            run.call_args.args[0][:4], ["limactl", "list", "second", "--format"]
+        )
+
+    def test_memory_that_is_not_whole_gib_is_an_error_not_a_rounded_comparison(self):
+        error, _ = self.current_size("%d %d 4" % (int(12.5 * self.GIB), 100 * self.GIB))
+        self.assertIsInstance(error, yo.YoError)
+        self.assertIn("not a whole number of GiB", error.message)
+
+    def test_a_disk_that_is_not_whole_gib_is_an_error_not_a_rounded_one(self):
+        error, _ = self.current_size("%d %d 4" % (16 * self.GIB, 100 * self.GIB + 512))
+        self.assertIsInstance(error, yo.YoError)
+        self.assertIn("disk is", error.message)
+        self.assertIn("not a whole number of GiB", error.message)
+
+    def test_an_answer_that_is_not_three_numbers_is_an_error(self):
+        for stdout, returncode in (("", 0), ("1 2", 0), ("1 2 x", 0), ("1 2 3", 1)):
+            with self.subTest(stdout=stdout, returncode=returncode):
+                error, _ = self.current_size(stdout, returncode)
+                self.assertIn("reports no memory, disk and CPUs", error.message)
+
+    def edit(self, returncode):
+        with (
+            as_instance(INSTANCE_B),
+            mock.patch.object(
+                yo.proc, "run", return_value=mock.Mock(returncode=returncode)
+            ) as run,
+        ):
+            try:
+                yo.LIMA.resize(24, 2)
+            except yo.YoError as failure:
+                return failure, run
+        return None, run
+
+    def test_resize_edits_the_stopped_instance(self):
+        error, run = self.edit(0)
+        self.assertIsNone(error)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["limactl", "edit", "--yes", "second", "--memory", "24", "--cpus", "2"],
+        )
+
+    def test_a_refused_edit_is_an_error_saying_the_box_is_unchanged(self):
+        error, _ = self.edit(1)
+        self.assertIn("left stopped at its old size", error.message)
 
 
 class TestVmUpOnALimaConfigGap(unittest.TestCase):
@@ -485,6 +730,7 @@ class TestVmUpOnALimaConfigGap(unittest.TestCase):
         notes = []
         with contextlib.ExitStack() as stack:
             stack.enter_context(as_instance(yo.DEFAULT_INSTANCE))
+            stack.enter_context(host_cpus())
             for module, name in (
                 (yo.agent, "luks_passphrase"),
                 (yo.sshconfig, "ensure_agent_ssh_config"),

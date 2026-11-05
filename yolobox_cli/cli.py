@@ -9,7 +9,20 @@ import re
 import signal
 from typing import Callable, Sequence
 
-from . import config, cp, forwards, proc, release, session, sshx, state, status, ui, vm
+from . import (
+    config,
+    cp,
+    driver,
+    forwards,
+    proc,
+    release,
+    session,
+    sshx,
+    state,
+    status,
+    ui,
+    vm,
+)
 from .config import (
     DEFAULT_INSTANCE,
     MAX_PORT,
@@ -95,24 +108,54 @@ def box_gib(label: str, floor: int, why: str) -> Callable[[str], int]:
     return parse
 
 
+def box_cpus(value: str) -> int:
+    """argparse `type=` of --cpus: a whole number from 1 to one less than the
+    host's CPU count, so the host keeps a CPU."""
+    try:
+        host = driver.host_cpu_count()
+    except YoError as unknown:
+        raise argparse.ArgumentTypeError(
+            "--cpus cannot be checked, %s" % unknown.message
+        )
+    if host < 2:
+        raise argparse.ArgumentTypeError(
+            "--cpus cannot be used: this host has only 1 CPU, and a box needs at "
+            "least 1 and must leave the host 1"
+        )
+    if not proc.is_ascii_number(value) or not 1 <= int(value) < host:
+        raise argparse.ArgumentTypeError(
+            "--cpus must be a whole number of CPUs from 1 to %d (this host has %d "
+            "CPUs and keeps at least 1), got '%s'" % (host - 1, host, value)
+        )
+    return int(value)
+
+
 def add_size_arguments(parser: argparse.ArgumentParser) -> None:
-    """--memory and --disk, for the commands that can create a box."""
+    """--memory, --disk and --cpus, for the commands that create or resize a box."""
     parser.add_argument(
         "--memory",
         metavar="GiB",
         type=box_gib("--memory", MIN_MEMORY_GIB, MIN_MEMORY_WHY),
         default=None,
-        help="the memory of a box yo creates (at least %d). Refused for a box "
-        "that exists; on macOS yo prints the limactl create command to run "
-        "instead" % MIN_MEMORY_GIB,
+        help="the box's memory (at least %d). Creates the box at this size, or "
+        "resizes a stopped one; a box that is not stopped is refused" % MIN_MEMORY_GIB,
     )
     parser.add_argument(
         "--disk",
         metavar="GiB",
         type=box_gib("--disk", MIN_DISK_GIB, MIN_DISK_WHY),
         default=None,
-        help="the disk of a box yo creates (at least %d), refused like --memory"
-        % MIN_DISK_GIB,
+        help="the box's disk (at least %d), applied like --memory. A disk only "
+        "grows. The box is started, then stopped and started a second time to "
+        "grow its disk, and its encrypted root and filesystem are grown into it "
+        "(the same steps as disk-grow)" % MIN_DISK_GIB,
+    )
+    parser.add_argument(
+        "--cpus",
+        metavar="N",
+        type=box_cpus,
+        default=None,
+        help="the box's CPU count, from 1 to one less than the host's, applied like --memory",
     )
 
 
@@ -175,7 +218,13 @@ def build_parser() -> argparse.ArgumentParser:
         "Start the VM.",
         "Start the VM and unlock its encrypted disk. When the box has to be started\n"
         "or unlocked, asks 1Password (Touch ID) for the yolobox-disk key; a box that\n"
-        "is already up needs no prompt. Safe to run again.",
+        "is already up needs no prompt. Safe to run again.\n"
+        "--memory, --disk and --cpus create a missing box at that size, or resize a\n"
+        "stopped one: memory and CPUs before it starts, a bigger disk after (the\n"
+        "box is stopped and started a second time to grow it; a disk only grows).\n"
+        "A box that is not stopped is refused, before anything is asked or changed:\n"
+        "yo down first, or yo disk-grow to grow only the disk of a running box.\n"
+        "A flag equal to the box's current size changes nothing.",
     )
     add_size_arguments(up)
     # vm_up checks the login key itself, before any start or unlock.
@@ -219,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
         "Create and build the VM from the pinned flake ref.",
         "Create the VM and build/(if needed) reboot it into the NixOS\n"
         "configuration from the pinned yolobox flake ref. Safe to run again: every step checks before it acts.\n"
+        "--memory, --disk and --cpus size the box as they do for yo up.\n"
         "--version picks which flake ref to build from (e.g. a branch), and is\n"
         'required on an unreleased ("dev") build.\n'
         "The reboot into the first encrypted generation encrypts the disk in\n"
@@ -281,7 +331,8 @@ def build_parser() -> argparse.ArgumentParser:
         "Refuses unless the VM already runs a generation with boot.growPartition.\n"
         "Needs the disk passphrase (1Password, Touch ID) to grow the LUKS mapping.\n"
         "If a grow failed after the ceiling was raised, repeat the same size: the\n"
-        "ceiling edit is skipped and only the mapping and filesystem are grown.",
+        "ceiling edit is skipped and only the mapping and filesystem are grown.\n"
+        "yo up --disk GiB does the same for a stopped box.",
     )
     disk_grow.add_argument(
         "size", type=functools.partial(whole_gib, "disk-grow size"), metavar="GiB"

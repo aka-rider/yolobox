@@ -36,6 +36,16 @@ FIXTURE_EMPTY_TABLE = "table inet yolobox-egress {\n}\n"
 # A release this yo can build: at or above release.FIRST_HOST_OS_FREE_RELEASE.
 A_RELEASE = "2.3.4"
 
+# The host's CPU count in tests that create a box or read --cpus, so the default
+# CPU count (min(4, host - 1)) and the --cpus range do not depend on the machine
+# that runs them. FakeHome pins it; a test that needs another count patches
+# os.cpu_count itself.
+HOST_CPUS = 16
+
+
+def host_cpus(count=HOST_CPUS):
+    return mock.patch.object(os, "cpu_count", return_value=count)
+
 
 class YoNamespace:
     """The yolobox_cli package as one namespace, read live.
@@ -138,6 +148,9 @@ class FakeHome(unittest.TestCase):
         patcher = with_home(self.home)
         patcher.start()
         self.addCleanup(patcher.stop)
+        cpus = host_cpus()
+        cpus.start()
+        self.addCleanup(cpus.stop)
 
 
 class TestShown(unittest.TestCase):
@@ -2499,7 +2512,7 @@ class TestBoxSizeFlags(unittest.TestCase):
 
     def test_no_flag_asks_for_nothing(self):
         args = self.parse("up")
-        self.assertEqual((args.memory, args.disk), (None, None))
+        self.assertEqual((args.memory, args.disk, args.cpus), (None, None, None))
 
     def test_what_is_not_a_whole_number_of_gib_above_zero_is_refused(self):
         values = ("lizard", "24.5", "1e3", "", "NaN", "inf", "0", "-1")
@@ -2529,9 +2542,55 @@ class TestBoxSizeFlags(unittest.TestCase):
         )
 
     def test_only_the_commands_that_create_a_box_take_a_size(self):
-        self.assertIn(
-            "unrecognized arguments", self.parse_error("down", "--memory", "24")
-        )
+        for flag in ("--memory", "--cpus"):
+            with self.subTest(flag=flag):
+                self.assertIn(
+                    "unrecognized arguments", self.parse_error("down", flag, "2")
+                )
+
+
+class TestCpusFlag(unittest.TestCase):
+    """--cpus is 1 to one less than the host's CPU count, so the host keeps one."""
+
+    def parse(self, value, host):
+        with mock.patch.object(os, "cpu_count", return_value=host):
+            return yo.build_parser().parse_args(["up", "--cpus=" + value])
+
+    def error(self, value, host):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                self.parse(value, host)
+        self.assertEqual(caught.exception.code, 2)
+        return stderr.getvalue()
+
+    def test_one_and_all_but_one_of_the_hosts_cpus_are_accepted(self):
+        self.assertEqual(self.parse("1", 8).cpus, 1)
+        self.assertEqual(self.parse("7", 8).cpus, 7)
+        self.assertEqual(self.parse("1", 2).cpus, 1)
+
+    def test_every_other_value_is_refused_naming_the_range_and_the_hosts_count(self):
+        # ٢ is 2 in Arabic-Indic digits.
+        for value in ("0", "-1", "8", "9", "lizard", "", "2.5", "+2", " 2 ", "٢"):
+            with self.subTest(value=value):
+                self.assertIn(
+                    "--cpus must be a whole number of CPUs from 1 to 7 (this host "
+                    "has 8 CPUs and keeps at least 1), got '%s'" % value,
+                    self.error(value, 8),
+                )
+
+    def test_a_host_with_one_cpu_has_no_range_and_says_so(self):
+        for value in ("1", "0", "2"):
+            with self.subTest(value=value):
+                self.assertIn("this host has only 1 CPU", self.error(value, 1))
+
+    def test_an_unknown_host_count_refuses_instead_of_leaving_the_range_open(self):
+        self.assertIn("cannot read the host's CPU count", self.error("2", None))
+
+    def test_bootstrap_takes_it_too(self):
+        with mock.patch.object(os, "cpu_count", return_value=4):
+            args = yo.build_parser().parse_args(["bootstrap", "--cpus", "3"])
+        self.assertEqual(args.cpus, 3)
 
 
 AWS_CONFIG_TEXT = """[default]
@@ -4421,12 +4480,14 @@ class TestNumbersFromOtherSystemsAreAsciiDigitsOnly(FakeHome):
                     with self.assertRaisesRegex(yo.YoError, "expected 4 lines"):
                         yo.guest.guest_root_usage()
 
-    def test_a_limactl_disk_size_that_is_not_ascii_digits_is_an_error(self):
+    def test_a_limactl_size_that_is_not_ascii_digits_is_an_error(self):
         with mock.patch.object(
-            yo.proc, "run", return_value=mock.Mock(returncode=0, stdout="\u00b2\n")
+            yo.proc,
+            "run",
+            return_value=mock.Mock(returncode=0, stdout="1 \u00b2 1\n"),
         ):
-            with self.assertRaisesRegex(yo.YoError, "reports no disk size"):
-                yo.LIMA.disk_ceiling_gib()
+            with self.assertRaisesRegex(yo.YoError, "reports no memory, disk and CPUs"):
+                yo.LIMA.current_size()
 
 
 class TestDuKib(FakeHome):

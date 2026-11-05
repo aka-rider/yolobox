@@ -10,11 +10,10 @@ import shutil
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-from . import aws, proc, state, ui, unlock
+from . import aws, driver, proc, state, ui, unlock
 from .config import (
     AWS_BROKER_GUEST_SOCK,
     DEFAULT_INSTANCE,
-    GIB,
     KIB,
     MAX_PORT,
     MIB,
@@ -22,7 +21,7 @@ from .config import (
     SCRIPT_DIR,
     USAGE_EXIT,
 )
-from .driver import NO_SIZE, Removal, Size, StopRefused
+from .driver import NO_SIZE, BoxSize, Removal, Size, StopRefused
 from .ui import RunTimeout, YoError
 
 
@@ -296,6 +295,7 @@ class LimaDriver:
     instances_dir = ".lima"
     initrd_identity = ".lima/_config/user"
     start_command = "limactl start"
+    off_status = "Stopped"
 
     def require_tool(self) -> None:
         proc.require_tool("limactl", "brew install lima")
@@ -402,47 +402,70 @@ class LimaDriver:
         return info.status if info is not None else None
 
     def creation_refusal(self, size: Size) -> Optional[str]:
-        # Only the default instance is created here, from lima/yolobox.yaml, and
-        # at its size. Any other needs a port yo can know, which only its creator
-        # can choose, and a size is limactl's to set.
-        if size.asked:
-            return self.sized_creation_refusal(size)
+        # Only the default instance is created here, from lima/yolobox.yaml, which
+        # fixes its port. Any other needs a port yo can know, which only its
+        # creator can choose.
         if state.box.name == DEFAULT_INSTANCE:
             return None
-        return "instance %s does not exist — create it with:\n    %s" % (
+        rerun = (
+            "\nthen run this command again without %s" % " ".join(size.flags())
+            if size.asked
+            else ""
+        )
+        # The command carries the CPU count the box would get, since lima's own
+        # default is not yo's.
+        return "instance %s does not exist — create it with:\n    %s%s" % (
             state.box.name,
-            self.create_command(NO_SIZE),
+            self.create_command(size.for_creation()),
+            rerun,
         )
 
-    def sized_creation_refusal(self, size: Size) -> str:
-        return (
-            "yo does not size a lima instance — create %s with:\n    %s\n"
-            "then run this command again without %s"
-            % (state.box.name, self.create_command(size), " ".join(size.flags()))
+    def current_size(self) -> BoxSize:
+        # Go template fields of limactl's own instance record (limactl list
+        # --list-fields): Memory and Disk in bytes, CPUs a count.
+        probe = proc.run(
+            [
+                "limactl",
+                "list",
+                state.box.name,
+                "--format",
+                "{{.Memory}} {{.Disk}} {{.CPUs}}",
+            ]
+        )
+        fields = probe.stdout.split() if probe.returncode == 0 else []
+        if len(fields) != 3 or not all(proc.is_ascii_number(f) for f in fields):
+            raise YoError(
+                "limactl reports no memory, disk and CPUs for %s — does the instance "
+                "exist? (%s)" % (state.box.name, state.yo_cmd("status"))
+            )
+        memory, disk, cpus = (int(field) for field in fields)
+        return BoxSize(
+            driver.exact_gib(memory, "memory"), driver.exact_gib(disk, "disk"), cpus
         )
 
-    def existing_size_refusal(self, size: Size) -> str:
-        ways = []
-        if size.memory_gib is not None:
-            ways.append(
-                "for the memory, stop it (%s), then: limactl edit --yes %s --memory %d"
-                % (state.yo_cmd("down"), state.box.name, size.memory_gib)
-            )
-        if size.disk_gib is not None:
-            ways.append(
-                "to grow the disk, keeping what is on it: %s (a smaller disk means "
-                "deleting the box, and everything on it is lost: %s, which then prints "
-                "how to create it)"
-                % (
-                    state.yo_cmd("disk-grow", str(size.disk_gib)),
-                    state.destroy_then_bootstrap_command(*size.flags()),
-                )
-            )
-        return (
-            "%s already exists, and limactl sized it when it was created — drop %s, "
-            "or:\n    %s\nthen run this command again without them"
-            % (state.box.name, " ".join(size.flags()), "\n    ".join(ways))
+    def resize_refusal(self, current: BoxSize, wanted: BoxSize) -> Optional[str]:
+        # lima does not look at the host's memory when it creates one either
+        return None
+
+    def resize(self, memory_gib: int, cpus: int) -> None:
+        edit = proc.run(
+            [
+                "limactl",
+                "edit",
+                "--yes",
+                state.box.name,
+                "--memory",
+                str(memory_gib),
+                "--cpus",
+                str(cpus),
+            ],
+            capture=False,
         )
+        if edit.returncode != 0:
+            raise YoError(
+                "limactl edit refused the resize (exit %d), so %s is left stopped "
+                "at its old size" % (edit.returncode, state.box.name)
+            )
 
     def config_gaps(self) -> List[str]:
         info = lima_instance_info()
@@ -520,15 +543,6 @@ class LimaDriver:
         pass  # lima's hostagent, which owns the port, runs as the host user
 
     def start(self, passphrase: bytes, size: Size) -> None:
-        # lima/yolobox.yaml or limactl sizes the instance, never yo: vm_up has
-        # refused any size before the passphrase, and this keeps one from
-        # being dropped should a caller skip that.
-        if size.asked:
-            raise YoError(
-                self.existing_size_refusal(size)
-                if lima_instance_exists()
-                else self.sized_creation_refusal(size)
-            )
         if lima_instance_exists():
             start_argv = ["limactl", "start", "--yes", state.box.name]
         else:
@@ -538,6 +552,7 @@ class LimaDriver:
                 "--name",
                 state.box.name,
                 "--yes",
+                *size.flags(),
                 str(SCRIPT_DIR / "lima" / "yolobox.yaml"),
             ]
         # limactl start blocks until lima's own ssh works, which needs the disk
@@ -683,16 +698,6 @@ class LimaDriver:
             return None
         return self.shown_instance_file("disk"), kib
 
-    def disk_ceiling_gib(self) -> int:
-        probe = proc.run(["limactl", "list", state.box.name, "--format", "{{.Disk}}"])
-        current_bytes = probe.stdout.strip() if probe.returncode == 0 else ""
-        if not proc.is_ascii_number(current_bytes):
-            raise YoError(
-                "limactl reports no disk size for %s — does the instance exist? (%s)"
-                % (state.box.name, state.yo_cmd("status"))
-            )
-        return int(current_bytes) // GIB
-
     def grow_disk(self, current_gib: int, wanted_gib: int) -> None:
         free_kib = (
             shutil.disk_usage(os.path.join(state.home(), self.instances_dir)).free
@@ -708,15 +713,13 @@ class LimaDriver:
             % (state.box.name, current_gib, wanted_gib)
         )
 
-        self.stop()
         resize = proc.run(
             ["limactl", "edit", "--yes", state.box.name, "--disk", str(wanted_gib)],
             capture=False,
         )
         if resize.returncode != 0:
             raise YoError(
-                "limactl refused the resize and %s is left stopped — start it again with: %s"
-                % (state.box.name, state.yo_cmd("up"))
+                "limactl edit refused the disk resize (exit %d)" % resize.returncode
             )
 
 

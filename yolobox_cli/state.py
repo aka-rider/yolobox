@@ -188,15 +188,15 @@ def remembered_flake_ref() -> Optional[str]:
     return ref or None
 
 
-def destroy_then_bootstrap_command(*bootstrap_args: str) -> str:
-    """The command line that deletes this machine and bootstraps it again, with
-    `bootstrap_args`, from the ref it was built from: destroy deletes the file
-    that remembers the ref, so the bootstrap names it here."""
+def destroy_then_bootstrap_command() -> str:
+    """The command line that deletes this machine and bootstraps it again from
+    the ref it was built from: destroy deletes the file that remembers the ref,
+    so the bootstrap names it here."""
     ref = remembered_flake_ref()
     version = [] if ref is None else ["--version", shlex.quote(ref)]
     return "%s && %s" % (
         yo_cmd("destroy", "--yes"),
-        yo_cmd("bootstrap", *bootstrap_args, *version),
+        yo_cmd("bootstrap", *version),
     )
 
 
