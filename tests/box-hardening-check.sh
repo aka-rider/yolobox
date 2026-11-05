@@ -420,6 +420,16 @@ check_etc_environment() {
     ok "/etc/environment is absent or readable"
 }
 
+# The initrd mounts cidata, and mount creates /run/mount, which outlives
+# switch-root. A 0700 one denies every user manager its mount watch
+# (docs/disk-encryption.md, "The initrd network").
+check_run_mount() {
+    local mode
+    mode=$(stat -c %a /run/mount) || fail "cannot stat /run/mount"
+    [ "${mode}" = 755 ] || fail "/run/mount is ${mode}, not 755"
+    ok "/run/mount is 755"
+}
+
 # lima-guestagent runs the binary Lima ships on its cidata disk, so it must run
 # where that binary exists (a Lima box) and be skipped, not failed, where it
 # does not (a libvirt box). /mnt/lima-cidata is root's 0700 mount.
@@ -577,6 +587,7 @@ compat_checks() {
     check_operator_login_refused "$(id -un)"
     check_no_host_os_stamp
     check_etc_environment
+    check_run_mount
     check_guestagent
     check_rebuild_helper
     check_github_host_keys

@@ -922,15 +922,19 @@ class InitrdKeysScript(unittest.TestCase):
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
         # The mountpoint is the last argument; the "ISO" is one user-data file.
+        # Like libmount, the fake creates its run directory under the umask.
         write_fake(
             bin_dir,
             "mount",
+            'mkdir -p "$FAKE_RUN_MOUNT"\n'
             'for last; do :; done\ncp "$FAKE_USER_DATA" "$last/user-data"\n',
         )
         write_fake(bin_dir, "umount", 'rm -f "$1/user-data"\n')
         self.user_data = self.tmp / "user-data"
         self.out = self.tmp / "keys"
+        self.run_mount = self.tmp / "run-mount"
         self.env = {
+            "FAKE_RUN_MOUNT": str(self.run_mount),
             "PATH": os.pathsep.join(
                 [str(bin_dir), os.environ.get("PATH", "/usr/bin:/bin")]
             ),
@@ -944,6 +948,8 @@ class InitrdKeysScript(unittest.TestCase):
             text=True,
             env=self.env,
             timeout=20,
+            # The initrd's own umask: what mount must see.
+            preexec_fn=lambda: os.umask(0o022),
         )
 
     def test_without_exactly_one_argument_it_prints_usage(self):
@@ -971,6 +977,16 @@ class InitrdKeysScript(unittest.TestCase):
             "ssh-ed25519 AAAA1 lima\nssh-ed25519 AAAA2 other\n",
         )
         self.assertEqual(oct(self.out.stat().st_mode & 0o777), "0o600")
+
+    @unittest.skipUnless(shutil.which("gawk"), "lima's key program needs gawk")
+    def test_the_mount_leaves_its_run_directory_readable_to_users(self):
+        # /run/mount outlives switch-root; 0700 denies user managers their watch.
+        self.user_data.write_text(
+            "users:\n  - name: user\n    ssh-authorized-keys:\n      - ssh-ed25519 AAAA1\n"
+        )
+        result = self.run_keys(str(self.out))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(oct(self.run_mount.stat().st_mode & 0o777), "0o755")
 
     @unittest.skipUnless(shutil.which("gawk"), "lima's key program needs gawk")
     def test_user_data_without_a_key_fails_instead_of_authorizing_nobody(self):

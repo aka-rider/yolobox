@@ -7,11 +7,15 @@ if [ "$#" -ne 1 ]; then
 fi
 out=$1
 
-umask 077
+# mktemp -d makes its directory 0700 whatever the umask. The umask is set only
+# after the mount, because mount creates /run/mount under it, and /run outlives
+# switch-root: a 0700 /run/mount denies every user manager its mount watch.
 mnt=$(mktemp -d /tmp/yolobox-cidata.XXXXXX)
 trap 'umount "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true' EXIT
 
 mount -t iso9660 -o ro /dev/disk/by-label/cidata "$mnt"
+
+umask 077
 
 # The same program nixos-lima's lima-init uses to read the key out of cidata's
 # user-data (3-argument match is gawk-only).
