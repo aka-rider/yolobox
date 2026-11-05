@@ -47,6 +47,23 @@ def host_cpus(count=HOST_CPUS):
     return mock.patch.object(os, "cpu_count", return_value=count)
 
 
+REAL_CREATE_CONNECTION = socket.create_connection
+
+
+def no_tcp_to_the_host(address, *args, **kwargs):
+    raise ConnectionRefusedError(
+        errno.ECONNREFUSED, "no test may reach a real TCP port: %s:%s" % address[:2]
+    )
+
+
+# yo's only TCP client is unlock.ssh_banner, and Lima's default port is the one
+# a real box on the machine running the tests listens on. A test that does not
+# fake the banner would meet that box's stage-2 sshd and take a different branch
+# than on a machine with none. Refused is what the tests were written against;
+# a test that serves its own port restores REAL_CREATE_CONNECTION.
+mock.patch.object(socket, "create_connection", no_tcp_to_the_host).start()
+
+
 class YoNamespace:
     """The yolobox_cli package as one namespace, read live.
 
@@ -4257,6 +4274,7 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
             ),
             mock.patch.object(yo.unlock, "sshd_answers", answers),
             mock.patch.object(yo.release, "host_user", return_value="op"),
+            mock.patch.object(socket, "create_connection", REAL_CREATE_CONNECTION),
         ):
             return yo.boot_stage(), asked
 
