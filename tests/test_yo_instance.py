@@ -508,7 +508,7 @@ class TestVmUpCreatesAtTheAskedSize(VmUpOnLima):
                 "start",
                 "--name",
                 "second",
-                "--yes",
+                "--tty=false",
                 "--memory",
                 "24",
                 "--disk",
@@ -651,7 +651,7 @@ class TestLimaGrowDisk(unittest.TestCase):
             yo.LIMA.grow_disk(100, 200)
         self.assertEqual(
             run.call_args.args[0],
-            ["limactl", "edit", "--yes", "second", "--disk", "200"],
+            ["limactl", "edit", "--tty=false", "second", "--disk", "200"],
         )
         self.assertEqual(
             caught.exception.message, "limactl edit refused the disk resize (exit 3)"
@@ -717,7 +717,16 @@ class TestLimaSizeCommands(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(
             run.call_args.args[0],
-            ["limactl", "edit", "--yes", "second", "--memory", "24", "--cpus", "2"],
+            [
+                "limactl",
+                "edit",
+                "--tty=false",
+                "second",
+                "--memory",
+                "24",
+                "--cpus",
+                "2",
+            ],
         )
 
     def test_a_refused_edit_is_an_error_saying_the_box_is_unchanged(self):

@@ -452,7 +452,7 @@ class LimaDriver:
             [
                 "limactl",
                 "edit",
-                "--yes",
+                "--tty=false",
                 state.box.name,
                 "--memory",
                 str(memory_gib),
@@ -544,14 +544,14 @@ class LimaDriver:
 
     def start(self, passphrase: bytes, size: Size) -> None:
         if lima_instance_exists():
-            start_argv = ["limactl", "start", "--yes", state.box.name]
+            start_argv = ["limactl", "start", "--tty=false", state.box.name]
         else:
             start_argv = [
                 "limactl",
                 "start",
                 "--name",
                 state.box.name,
-                "--yes",
+                "--tty=false",
                 *size.flags(),
                 str(SCRIPT_DIR / "lima" / "yolobox.yaml"),
             ]
@@ -714,7 +714,14 @@ class LimaDriver:
         )
 
         resize = proc.run(
-            ["limactl", "edit", "--yes", state.box.name, "--disk", str(wanted_gib)],
+            [
+                "limactl",
+                "edit",
+                "--tty=false",
+                state.box.name,
+                "--disk",
+                str(wanted_gib),
+            ],
             capture=False,
         )
         if resize.returncode != 0:
