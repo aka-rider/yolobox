@@ -410,6 +410,16 @@ check_no_host_os_stamp() {
     ok "the box holds no host OS stamp"
 }
 
+# nixos-lima links /etc/environment into root's 0700 cidata mount, which every
+# user manager then fails to read (nix/base.md, "/etc/environment").
+check_etc_environment() {
+    if [ -L /etc/environment ] || [ -e /etc/environment ]; then
+        cat /etc/environment >/dev/null ||
+            fail "/etc/environment exists but the operator cannot read it"
+    fi
+    ok "/etc/environment is absent or readable"
+}
+
 # lima-guestagent runs the binary Lima ships on its cidata disk, so it must run
 # where that binary exists (a Lima box) and be skipped, not failed, where it
 # does not (a libvirt box). /mnt/lima-cidata is root's 0700 mount.
@@ -566,6 +576,7 @@ compat_checks() {
     fi
     check_operator_login_refused "$(id -un)"
     check_no_host_os_stamp
+    check_etc_environment
     check_guestagent
     check_rebuild_helper
     check_github_host_keys

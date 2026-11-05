@@ -120,3 +120,9 @@ The box is built from `github:OWNER/REPO/REF#yolobox` with `YOLOBOX_USERNAME`, `
 
 `nix/base.nix` therefore sets `nix.nixPath` to `nixpkgs=flake:nixpkgs` plus a `nixos-config` that only throws: `this box is built from a flake ref: run \`yolobox-guest rebuild switch\` (or \`boot\`) instead of nixos-rebuild`. `yolobox-guest rebuild` reads the box's own stamps and sets all three variables ([nix/guest/yolobox-guest.md](guest/yolobox-guest.md)). `nixos-rebuild switch --rollback` does not evaluate a config, so it still works. A `nixos-rebuild --flake` names its config itself and never reads `<nixos-config>`.
 
+## /etc/environment
+
+nixos-lima's `lima-init.nix` sets `environment.etc.environment.source = "/mnt/lima-cidata/etc_environment"`, and mounts the cidata disk with `mode=0700,dmode=0700,uid=0`. So `/etc/environment` resolved to a file only root can read. Every user manager's environment generator reported `Failed to chase '…/systemd-262/lib/environment.d/99-environment.conf': Permission denied` (that file is systemd's link to `/etc/environment`), followed by `Failed to acquire watch file descriptor: Permission denied`, at login and again at each switch.
+
+The file carries nothing on either host. Lima fills it from the instance's `env:` and, with `propagateProxyEnv`, the host's proxy variables; `lima/yolobox.yaml` sets neither, so it is empty. `yo` writes it empty into a libvirt box's cidata (`CIDATA_FILES` in `yolobox_cli/libvirt.py`). So `nix/base.nix` sets `environment.etc.environment.enable = false`, and the box has no `/etc/environment`, as a plain NixOS box has none. The agent's environment comes from `nix/lib/agent-env.nix`, never from this file. `tests/box-hardening-check.sh` (`check_etc_environment`) fails when `/etc/environment` exists and the operator cannot read it.
+

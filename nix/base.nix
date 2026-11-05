@@ -124,6 +124,10 @@ in
   # The unit runs the binary Lima ships on its cidata disk; a libvirt box's
   # cidata has none, so there it is skipped (nix/base.md, "No host OS ...").
   systemd.services.lima-guestagent.unitConfig.ConditionPathExists = "/mnt/lima-cidata/lima-guestagent";
+  # nixos-lima links /etc/environment to the cidata disk, which it mounts root
+  # 0700, so every user manager failed to read it. It is always empty here
+  # (nix/base.md, "/etc/environment").
+  environment.etc.environment.enable = false;
 
   # Upstream's user@.service ships OOMScoreAdjust=100, making the per-user
   # manager a preferred kernel-OOM victim over every system service; killing
