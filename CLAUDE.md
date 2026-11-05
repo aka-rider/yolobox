@@ -172,7 +172,7 @@ Tests, all under `tests/`:
 - `box-hardening-check.sh` and `box-hardening-e2e.sh`: the acceptance test for
   `nix/hardening.nix`. The first runs inside a box as the operator and checks
   that the hardening holds and nothing the agent needs broke. Its environment
-  takes `EXTRA_WRAPPERS` (space-separated wrapper names a box adds) and
+  takes `EXTRA_WRAPPERS` (space-separated wrapper names a box adds, each optionally `=caps`) and
   `ONLY=hardening|compat`. The second, `box-hardening-e2e.sh <instance> [EXTRA_WRAPPERS...]`,
   runs on the host against a throwaway lima instance and drives the first
   across a reboot. Run them by hand, `unittest` does not. `nix/hardening.md`.

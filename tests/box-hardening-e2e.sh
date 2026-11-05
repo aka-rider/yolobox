@@ -6,7 +6,7 @@
 #   tests/box-hardening-e2e.sh <instance> [EXTRA_WRAPPERS...]
 #
 # <instance>        lima instance name, as for `yo -m <instance>`.
-# EXTRA_WRAPPERS    names of the setuid wrappers the instance's own
+# EXTRA_WRAPPERS    names (or name=caps) of the setuid wrappers the instance's own
 #                   /etc/yolobox/local.nix adds via
 #                   yolobox.hardening.extraWrappers (e.g. a VPN client's split-tunnel helper).
 #

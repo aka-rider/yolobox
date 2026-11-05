@@ -4,10 +4,13 @@
 # sudo). The host driver tests/box-hardening-e2e.sh pipes it over `yo ssh`;
 # a person inside the box can run it directly.
 #
-#   EXTRA_WRAPPERS="<wrapper>" tests/box-hardening-check.sh
+#   EXTRA_WRAPPERS="<wrapper>[=<caps>] ..." tests/box-hardening-check.sh
 #
-# EXTRA_WRAPPERS: space-separated setuid/capability wrapper names a box adds
+# EXTRA_WRAPPERS: space-separated setuid/capability wrappers a box adds
 #   through yolobox.hardening.extraWrappers in its /etc/yolobox/local.nix.
+#   Each is a name, or name=caps with the sorted capability names getcap
+#   shows, comma-separated (dumpcap=cap_net_raw,cap_setpcap). A bare name
+#   means the wrapper carries none.
 # ONLY=hardening | ONLY=compat: run just one half. Unset runs both. The
 #   compat half ("nothing the agent needs broke") is the one to iterate on
 #   against a box that is not hardened yet.
@@ -295,9 +298,9 @@ check_net_sched() {
 }
 
 check_wrappers() {
-    local want have name out caps expected_caps
+    local want have name out caps expected_caps extra
     have=$(ls /run/wrappers/bin | sort -u)
-    want=$(printf '%s\n' ${WRAPPER_ALLOWLIST} ${EXTRA_WRAPPERS:-} | sort -u)
+    want=$(printf '%s\n' ${WRAPPER_ALLOWLIST} ${EXTRA_WRAPPERS:-} | sed 's/=.*//' | sort -u)
     [ "${have}" = "${want}" ] || fail "/run/wrappers/bin differs from the allowlist (< unexpected, > missing)
 $(diff <(printf '%s\n' "${have}") <(printf '%s\n' "${want}") || true)"
     ok "wrapper set is exactly: $(echo ${want})"
@@ -318,12 +321,19 @@ $(diff <(printf '%s\n' "${have}") <(printf '%s\n' "${want}") || true)"
         # (getcap: "newuidmap cap_setuid,cap_setpcap=ep").
         newuidmap) expected_caps=cap_setpcap,cap_setuid ;;
         newgidmap) expected_caps=cap_setgid,cap_setpcap ;;
-        *) expected_caps="" ;;
+        *)
+            expected_caps=""
+            for extra in ${EXTRA_WRAPPERS:-}; do
+                case ${extra} in
+                "${name}="*) expected_caps=${extra#*=} ;;
+                esac
+            done
+            ;;
         esac
         [ "${caps}" = "${expected_caps}" ] ||
             fail "wrapper ${name} has capabilities '${caps}', want '${expected_caps}'"
     done
-    ok "only newuidmap (cap_setuid, cap_setpcap) and newgidmap (cap_setgid, cap_setpcap) carry capabilities"
+    ok "only newuidmap (cap_setuid, cap_setpcap), newgidmap (cap_setgid, cap_setpcap) and the EXTRA_WRAPPERS that name theirs carry capabilities"
 }
 
 check_no_su() {
