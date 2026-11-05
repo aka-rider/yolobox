@@ -63,6 +63,7 @@ The reasoning is in lima/yolobox.md#an-empty-page-means-limas-forwarder-died. Th
   - Free-text multi-line guest stderr (tailscale, nft and probe detail) still reaches `ui.err` with its newlines. So a guest can print lines that look like `yo:` lines.
   - `session.pick_project` shows `?` in fzf for control bytes in a project name. Showing `ui.shown(name)` would also mean mapping the picked line back to the real name.
 - `state.require_control_path_fits` checks only the agent's `ssh-agent.sock`, because it is the longest socket name in the instance directory today. A longer socket name added later must be checked too (`docs/ssh.md#a-controlpath-that-is-too-long`).
+- `limactl edit --yes` is deprecated in Lima 2.2.1. On 2026-11-05, `yo up --cpus 8` printed "--yes flag is deprecated". `LimaDriver.resize` (`yolobox_cli/lima.py:455`) and `LimaDriver.grow_disk` (`yolobox_cli/lima.py:717`) both pass `--yes`. It still works, but a later Lima that removes the flag would break resizing and disk grow. The fix: switch to the replacement the help names. The help does not say "deprecated"; it says `-y, --yes  Alias of --tty=false`, so the replacement is `--tty=false`.
 
 
 # Security backlog
