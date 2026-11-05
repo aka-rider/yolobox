@@ -272,5 +272,9 @@ in
       wants = [ "yolobox-egress.service" ];
       after = [ "yolobox-egress.service" ];
     };
+    # The table rejects ff00::/8, so DHCPv6 to ff02::1:2 never leaves, and
+    # dhcpcd logged "sendmsg: Operation not permitted" for every try. The
+    # address comes from router advertisements (SLAAC) either way.
+    networking.dhcpcd.extraConfig = "nodhcp6";
   };
 }
