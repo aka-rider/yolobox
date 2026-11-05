@@ -113,3 +113,10 @@ The keys are GitHub's published ones, with these fingerprints (GitHub's document
 ## Hostname
 
 `networking.hostName` is the `hostname` that `flake.nix` threads in, from the optional `YOLOBOX_HOSTNAME` (default `yolobox`, one lowercase DNS label, see [docs/distribution.md](../docs/distribution.md#nix-flake-check-throws-with-no-explanation)). `yo` passes `yolobox` for the default machine and `yolobox-<name>` for `-m <name>`, so two boxes on one tailnet do not fight over the node name `yolobox`. The same name goes to `tailscale set --hostname` (see [nix/tailscale.md](tailscale.md)). A manual `nixos-rebuild` of a named machine without `YOLOBOX_HOSTNAME` renames the box back to `yolobox`; `rebuild_hint()` prints the variable for that reason. The box stamps its hostname into `/etc/yolobox/hostname`, and `yolobox-guest rebuild switch`, the rebuild to run inside the box, reads it from there (see [nix/guest/yolobox-guest.md](guest/yolobox-guest.md#rebuild)).
+
+## A bare nixos-rebuild
+
+The box is built from `github:OWNER/REPO/REF#yolobox` with `YOLOBOX_USERNAME`, `YOLOBOX_FLAKE_REF` and `YOLOBOX_HOSTNAME` set and `--impure` (see [Hostname](#hostname)). A bare `sudo nixos-rebuild switch` knows none of that. With nixpkgs' default `NIX_PATH` (`nixpkgs=flake:nixpkgs` and root's channels, of which the box has none) it evaluates `<nixpkgs/nixos>`, finds no `<nixos-config>`, and fails with `error: file 'nixos-config' was not found in the Nix search path (add it using $NIX_PATH or -I)`, which names no way forward.
+
+`nix/base.nix` therefore sets `nix.nixPath` to `nixpkgs=flake:nixpkgs` plus a `nixos-config` that only throws: `this box is built from a flake ref: run \`yolobox-guest rebuild switch\` (or \`boot\`) instead of nixos-rebuild`. `yolobox-guest rebuild` reads the box's own stamps and sets all three variables ([nix/guest/yolobox-guest.md](guest/yolobox-guest.md)). `nixos-rebuild switch --rollback` does not evaluate a config, so it still works. A `nixos-rebuild --flake` names its config itself and never reads `<nixos-config>`.
+

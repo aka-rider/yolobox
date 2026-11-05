@@ -388,6 +388,17 @@ in
   environment.etc."yolobox/flake-ref".text = flakeRef + "\n";
   environment.etc."yolobox/hostname".text = hostname + "\n";
 
+  # The box is built from a flake ref with three variables set, which a bare
+  # `nixos-rebuild switch` knows none of. Without a nixos-config it fails with
+  # "file 'nixos-config' was not found", so this one says what to run instead.
+  # See nix/base.md#a-bare-nixos-rebuild.
+  nix.nixPath = [
+    "nixpkgs=flake:nixpkgs"
+    "nixos-config=${pkgs.writeText "nixos-config.nix" ''
+      throw "this box is built from a flake ref: run `yolobox-guest rebuild switch` (or `boot`) instead of nixos-rebuild"
+    ''}"
+  ];
+
   nix.settings.experimental-features = [ "nix-command" "flakes" "fetch-closure" "ca-derivations" ];
   nix.settings.auto-optimise-store = true;
 }
