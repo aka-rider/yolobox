@@ -29,6 +29,10 @@ in
   # sshd in the initrd is the only way to deliver the passphrase: the vz serial
   # console is output only.
   boot.initrd.network.enable = true;
+  # The initrd resolves no names. Its resolved, on by default with initrd
+  # networking, sends LLMNR multicast that passt cannot carry and logs once per
+  # packet on a Linux host. See docs/disk-encryption.md#the-initrd-network.
+  boot.initrd.services.resolved.enable = false;
   boot.initrd.network.ssh = {
     enable = true;
     # The host key is generated per boot (preStart below), so no private key
