@@ -1136,7 +1136,7 @@ class TestTailscaleSocketIsOperatorOnly(unittest.TestCase):
 
 
 class TestTailscaleLeavesTheUplinkAtPort22(unittest.TestCase):
-    """openFirewall = true opens UDP 41641 on every interface, enp0s1 included."""
+    """openFirewall = true opens the tunnel's UDP port on every interface, enp0s1 included."""
 
     def test_the_module_does_not_ask_nixos_to_open_the_tunnel_port(self):
         self.assertRegex(

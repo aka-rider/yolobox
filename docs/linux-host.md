@@ -141,3 +141,4 @@ The way back after an OOM kill is less memory or more free memory on the host. T
 - `yo` refuses to run, saying the kernel's ephemeral range ends at 65535: lower the range's end with `sysctl net.ipv4.ip_local_port_range`.
 - Every `virsh` call asks for a password: the polkit rule is missing or names a different account.
 - The guest cannot resolve names: the host's first nameserver is not a loopback address, so passt does not serve DNS at the gateway.
+- passt logs `Couldn't open flow specific socket` and `Address already in use` for UDP flows from `192.168.5.15:41641`: the box runs a build from before its tunnel port became automatic, and the host or another box holds 41641. Rebuild the box (`yo bootstrap`, or `yolobox-guest rebuild switch` inside it). See [nix/tailscale.md](../nix/tailscale.md#the-tunnel-port).

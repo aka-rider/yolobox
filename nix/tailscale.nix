@@ -9,7 +9,11 @@
     enable = true;
     # nixos-unstable lags tailscale's releases; see nix/pkgs/tailscale.md.
     package = pkgs.callPackage ./pkgs/tailscale.nix { };
-    # false: true would open UDP 41641 on enp0s1 as well (CONSTITUTION).
+    # 0: tailscaled picks a free UDP port at each start. A fixed port collides
+    # on a Linux host, where passt binds it for the guest and the host's own
+    # tailscaled may hold it. See nix/tailscale.md.
+    port = 0;
+    # false: true would open its UDP port on enp0s1 as well (CONSTITUTION).
     openFirewall = false;
     # TS_NO_LOGS_NO_SUPPORT=true: no log uploads to log.tailscale.com, and with
     # them no Tailscale support for this node.

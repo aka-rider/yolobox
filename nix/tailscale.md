@@ -16,7 +16,7 @@ What trusting the interface opens, all of it to whatever the ACL admits:
 
 Other nodes the ACL admits, such as other yolobox VMs, each running their own agents, reach all of it. Tighten the ACL, not the box, to narrow that. The other direction is the same: the egress table accepts everything that leaves by `tailscale0`, so a host that is a tailnet node is reachable from the box unless the ACL forbids it (see [The tailnet is an entrance](egress.md#the-tailnet-is-an-entrance)).
 
-The enp0s1 side is unchanged: `nixos-fw` opens only TCP 22 there (see [sshd on two interfaces](#sshd-on-two-interfaces)), and `services.tailscale.openFirewall` is `false`. Setting it to `true` would open the tunnel's UDP 41641 on `enp0s1` too, which breaks the rule that the interface admits port 22 only. Direct tailnet paths are negotiated by outbound traffic that conntrack then lets back in, and a path that cannot be made direct goes through a relay, so closing the port should cost speed at worst, not reachability. That is reasoning, not a measurement: if a box shows `via DERP` for a peer on the same network where it used to be direct, this is the first place to look.
+The enp0s1 side is unchanged: `nixos-fw` opens only TCP 22 there (see [sshd on two interfaces](#sshd-on-two-interfaces)), and `services.tailscale.openFirewall` is `false`. Setting it to `true` would open the tunnel's UDP port on `enp0s1` too, which breaks the rule that the interface admits port 22 only. Direct tailnet paths are negotiated by outbound traffic that conntrack then lets back in, and a path that cannot be made direct goes through a relay, so closing the port should cost speed at worst, not reachability. That is reasoning, not a measurement: if a box shows `via DERP` for a peer on the same network where it used to be direct, this is the first place to look.
 
 `--netfilter-mode=off` in `extraSetFlags` stays, so that `nixos-fw` is the only thing that writes rules. By default tailscaled installs its own `ts-input` chain: `-A INPUT -j ts-input` before `-A INPUT -j nixos-fw`, with `-A ts-input -i tailscale0 -j ACCEPT` inside it. That accept happens to match the trust given here, but tailscaled re-inserts its jump at the top of `INPUT` whenever it restarts, so a hand-added `iptables -I INPUT 1` is no fix for anything, and the chain would keep a rule outside the declarative firewall. Netfilter mode off also drops tailscaled's anti-spoofing rule for 100.64/10, which the `ts-input` chain used to carry.
 
@@ -68,13 +68,31 @@ The line is noise in `journalctl -u tailscaled` and not a disk problem; a journa
 
 - The UDP 41641 collision in [lima/yolobox.md](../lima/yolobox.md#guest-udp-is-never-mirrored): that is lima's mirror on the host's loopback, which no packet of tailscaled's takes.
 
-What decides whether a direct path exists is outside this repo. The box reaches the internet through lima's NAT on the host, so a peer can use only addresses the host's network lets through. One cause was found and it is on the host: a VPN that disconnects leaves lima's UDP flows bound to the VPN's vanished address, tailscaled's UDP then goes nowhere, and netcheck logs `UDP is blocked, trying HTTPS` every 25 seconds. That is described in [docs/host-network.md](../docs/host-network.md#a-vpn-that-disconnects-leaves-udp-flows-stuck). Clearing it needs a host agent restart, so no setting in the guest could.
+What decides whether a direct path exists is outside this repo. The box reaches the internet through lima's NAT on the host, so a peer can use only addresses the host's network lets through. One cause was found and it is on the host: a VPN that disconnects leaves lima's UDP flows bound to the VPN's vanished address, tailscaled's UDP then goes nowhere, and netcheck logs `UDP is blocked, trying HTTPS` every 25 seconds. That is described in [docs/host-network.md](../docs/host-network.md#a-vpn-that-disconnects-leaves-udp-flows-stuck). Clearing it needs a host agent restart, so no setting in the guest could. On a Linux host a second cause was the tunnel's fixed port, which passt could not bind on the host; see [The tunnel port](#the-tunnel-port).
 
 tailscaled has no switch for this line, and its verbosity flags only add lines. So `nix/tailscale.nix` sets `LogFilterPatterns` on the unit to drop exactly `via=derp`, a mitigation and not a fix. systemd's journald applies it to the unit's stream, so it also holds for tailscaled's stderr. The `via=direct` line, `now using` (the path change) and `endpoints changed` all stay, because they report events. `TestTailscaledLogFilter` checks the pattern against real lines. Drop the setting if tailscale ever ratelimits or demotes the line. To see the relayed state without it, use `tailscale status` (`relay "..."` and no `direct`) or `tailscale ping <node>`, which answers `via DERP(...)` or `via <ip:port>`.
 
 ## The port mapper
 
 `nix/tailscale.nix` sets `TS_DISABLE_PORTMAPPER=1` on tailscaled. Its port mapper sends NAT-PMP and PCP to 192.168.5.2:5351 and SSDP to 239.255.255.250, and both go only to the host and the LAN, which the [egress table](egress.md) rejects. Without the setting tailscaled would keep probing a path that cannot answer. A peer on the same LAN then connects through public endpoints and then DERP, which is slower (tailscale.com/kb/1257).
+
+## The tunnel port
+
+`services.tailscale.port` is `0`, so tailscaled picks a free UDP port each time it starts. NixOS defaults to 41641, and that default broke direct paths on Linux hosts.
+
+A Linux host runs the box under libvirt, with passt for its network (see [docs/linux-host.md](../docs/linux-host.md#why-qemusystem-and-passt)). The host often runs Tailscale too, and its tailscaled binds UDP `0.0.0.0:41641` and `[::]:41641`. The box's tailscaled sends from UDP 41641 as well. passt keeps the guest's source port when it opens the host-side socket for a UDP flow, so that bind fails with `EADDRINUSE` and passt drops the datagram. The failure writes these lines to the host journal, once per datagram; one box produced about 98,000 of them:
+
+```
+passt[PID]: Flow 0 (UDP flow): Couldn't open flow specific socket
+passt[PID]: : Address already in use
+passt[PID]: Dropping datagram with no flow TAP 192.168.5.15:41641 -> 51.15.24.89:3478
+```
+
+The box then has no direct UDP path, so STUN and disco cannot find one, and every tailnet peer is reached through DERP. Two boxes on one Linux host would collide the same way without any host Tailscale, because each box's passt would bind the same host port.
+
+To recognise it, run `ss -ulpn | grep 41641` on the host. A socket on 41641 while the host's tailscaled is active means a box's datagrams from 41641 have nowhere to go. `journalctl _COMM=passt` on the host shows the three lines above. In the box, `tailscale status` shows peers only as relays (`relay "..."` and no `direct`).
+
+Port 0 removes the fixed port that passt would bind, so nothing collides. A different fixed port would only move the collision: two boxes on one host would still send from the same port. The setting applies to every box, and no host check gates it, because the guest is never told which host runs it (see [No host OS in the guest](base.md#no-host-os-in-the-guest)). On a Mac the port is NATed by Lima and never mirrored (see [lima/yolobox.md](../lima/yolobox.md#guest-udp-is-never-mirrored)), so the change makes no visible difference there. A box built before this change keeps 41641 until it is rebuilt; see [docs/linux-host.md](../docs/linux-host.md#recognising-failures).
 
 ## Exit nodes
 
