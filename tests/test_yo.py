@@ -4350,8 +4350,11 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
 
 class TestLimaStopHangOffersTheKillOnlyPastTheInitrd(unittest.TestCase):
     def test_the_kill_is_conditional_on_ssh_answering(self):
-        with mock.patch.object(
-            yo.proc, "run", side_effect=yo.RunTimeout("limactl stop timed out")
+        with (
+            mock.patch.object(yo.LIMA, "vm_status", return_value="Running"),
+            mock.patch.object(
+                yo.proc, "run", side_effect=yo.RunTimeout("limactl stop timed out")
+            ),
         ):
             with self.assertRaises(yo.YoError) as caught:
                 yo.LIMA.stop()

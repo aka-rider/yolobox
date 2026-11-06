@@ -611,6 +611,9 @@ class LimaDriver:
             raise
 
     def stop(self) -> None:
+        # An instance that is not there is left to limactl to refuse.
+        if self.vm_status() == self.off_status:
+            return
         # `yo down` reaches this without proof the box is past its initrd, so
         # the hostagent's kill, which ends the VM, is offered only once `yo ssh
         # true` succeeds: the initrd refuses that login (with a host-key or a

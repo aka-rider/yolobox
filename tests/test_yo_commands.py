@@ -714,6 +714,12 @@ class TestBootstrapRebootDecision(FakeHome):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+        running_patcher = mock.patch.object(
+            yo.LIMA, "vm_status", return_value="Running"
+        )
+        running_patcher.start()
+        self.addCleanup(running_patcher.stop)
+
         fstype_patcher = mock.patch.object(
             yo.vm, "luks_device_fstype", return_value="crypto_LUKS"
         )
@@ -3410,6 +3416,29 @@ NOT_IDLE_PROBES = {
 
 
 class TestLimaStop(FakeHome):
+    def setUp(self):
+        super().setUp()
+        running = mock.patch.object(yo.LIMA, "vm_status", return_value="Running")
+        running.start()
+        self.addCleanup(running.stop)
+
+    def test_stopping_a_stopped_instance_asks_limactl_nothing(self):
+        with (
+            mock.patch.object(yo.LIMA, "vm_status", return_value="Stopped"),
+            mock.patch.object(yo.proc, "run") as fake_run,
+        ):
+            yo.LIMA.stop()
+        fake_run.assert_not_called()
+
+    def test_stopping_an_instance_limactl_does_not_know_surfaces_its_refusal(self):
+        failed = subprocess.CompletedProcess(["limactl", "stop"], 1, None, None)
+        with (
+            mock.patch.object(yo.LIMA, "vm_status", return_value=None),
+            mock.patch.object(yo.subprocess, "run", return_value=failed),
+        ):
+            with self.assertRaisesRegex(yo.YoError, "limactl stop yolobox failed"):
+                yo.LIMA.stop()
+
     def test_a_hung_stop_carries_the_recovery(self):
         expired = subprocess.TimeoutExpired(["limactl", "stop"], yo.LIMA_STOP_TIMEOUT)
         with mock.patch.object(yo.subprocess, "run", side_effect=expired):
