@@ -247,8 +247,9 @@ def export_credentials(profile):
                 "--format",
                 "process",
             ],
+            # Bytes, decoded below: text=True would raise on a byte that is not
+            # UTF-8 and skip the throttle's timestamp in _remint_locked.
             capture_output=True,
-            text=True,
             # The CLI may prompt (an SSO login, a device code). Stdin is
             # the launcher's, so it must never be read.
             stdin=subprocess.DEVNULL,
@@ -262,15 +263,17 @@ def export_credentials(profile):
     except FileNotFoundError:
         return None, "'aws' is not on PATH"
 
+    stdout = proc.stdout.decode("utf-8", "replace")
+    stderr = proc.stderr.decode("utf-8", "replace")
     if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        detail = stderr.strip() or stdout.strip() or f"exit {proc.returncode}"
         return (
             None,
             f"'aws configure export-credentials --profile {profile}' failed: {detail}",
         )
 
     try:
-        data = json.loads(proc.stdout)
+        data = json.loads(stdout)
     except json.JSONDecodeError as e:
         return None, f"unparseable export-credentials output: {e}"
 

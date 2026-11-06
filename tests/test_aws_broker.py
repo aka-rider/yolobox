@@ -69,7 +69,13 @@ def process_json(**overrides):
 
 
 def aws_result(stdout="", stderr="", returncode=0):
-    return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+    """What `aws` printed, as the bytes subprocess.run hands back; text is UTF-8."""
+    return subprocess.CompletedProcess(
+        [],
+        returncode,
+        stdout=stdout.encode() if isinstance(stdout, str) else stdout,
+        stderr=stderr.encode() if isinstance(stderr, str) else stderr,
+    )
 
 
 class TestProfileNamePattern(unittest.TestCase):
@@ -292,6 +298,38 @@ class TestExportCredentials(unittest.TestCase):
         _, err = self.run_export(aws_result(process_json(Expiration="soon")))
         for secret in ["s3cr3t-value", "token-value", "AKIAEXAMPLE"]:
             self.assertNotIn(secret, err)
+
+
+class TestMintOutputThatIsNotUtf8(unittest.TestCase):
+    def test_a_failure_with_non_utf8_output_is_an_error_not_an_exception(self):
+        with mock.patch.object(
+            broker.subprocess,
+            "run",
+            return_value=aws_result(returncode=255, stderr=b"bad \xff\xfe byte"),
+        ):
+            creds, err = broker.export_credentials("dev")
+        self.assertIsNone(creds)
+        self.assertIn("bad \ufffd\ufffd byte", err)
+
+    def test_a_success_with_non_utf8_output_is_an_error_not_an_exception(self):
+        with mock.patch.object(
+            broker.subprocess, "run", return_value=aws_result(b"\xff\xfe")
+        ):
+            creds, err = broker.export_credentials("dev")
+        self.assertIsNone(creds)
+        self.assertIn("unparseable", err)
+
+    def test_the_remint_throttle_still_counts_a_mint_that_printed_non_utf8(self):
+        state = broker.State("dev", 3600.0)
+        with mock.patch.object(broker, "log"):
+            with mock.patch.object(
+                broker.subprocess,
+                "run",
+                return_value=aws_result(returncode=255, stderr=b"\xff"),
+            ) as run:
+                self.assertIsNone(state.get())
+                self.assertIsNone(state.get())
+        self.assertEqual(run.call_count, 1)
 
 
 class SocketDirCase(unittest.TestCase):
