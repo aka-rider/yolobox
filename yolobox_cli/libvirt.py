@@ -984,6 +984,15 @@ class LibvirtDriver:
         if self.domain_state() != STATE_OFF:
             libvirt_host.virsh("destroy", domain_name())
 
+    def undefine_domain(self) -> None:
+        """Remove the definition, after powering the domain off if it is active now.
+
+        The state is read here, not when the steps were listed: a `yo up` can
+        start the domain in between, and undefining a running one leaves qemu
+        on the volume the next step deletes."""
+        self.force_stop()
+        libvirt_host.virsh("undefine", "--nvram", domain_name())
+
     def force_stop_command(self) -> str:
         return "virsh -c %s destroy %s" % (LIBVIRT_URI, domain_name())
 
@@ -1070,11 +1079,9 @@ class LibvirtDriver:
                     Removal("power off domain %s" % domain_name(), self.force_stop)
                 )
             steps.append(
-                virsh_removal(
+                Removal(
                     "undefine domain %s with its nvram" % domain_name(),
-                    "undefine",
-                    "--nvram",
-                    domain_name(),
+                    self.undefine_domain,
                 )
             )
         volumes = volume_names()

@@ -2253,6 +2253,21 @@ class TestDestroy(LibvirtCase):
             self.destroy(yes=True)
         self.assertEqual(self.mutations()[:2], ["destroy", "undefine"])
 
+    def test_a_domain_started_after_the_steps_were_listed_is_powered_off_before_its_undefine(
+        self,
+    ):
+        # The lock does not keep a `yo up` from `virsh start`: the state read when
+        # the list was made is stale by the time the undefine runs.
+        self.host.states["yolobox-box"] = "shut off"
+        steps = self.box.destruction_steps()
+        self.assertNotIn("power off domain yolobox-box", [step.what for step in steps])
+        self.host.states["yolobox-box"] = "running"
+        self.host.calls.clear()
+        undefine = next(step for step in steps if step.what.startswith("undefine"))
+        undefine.remove()
+        self.assertEqual(self.mutations(), ["destroy", "undefine"])
+        self.assertNotIn("yolobox-box", self.host.domains)
+
     def test_without_yes_nothing_changes_and_each_piece_is_named(self):
         self.destroy(yes=False)
         self.assertLessEqual(set(self.host.subcommands()), READS)
