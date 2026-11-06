@@ -1421,6 +1421,20 @@ class TestStreamedOutputIsFiltered(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "o?]52;c;eA==?\n")
         self.assertEqual(stderr.getvalue(), "e?[2J\n")
 
+    def test_options_a_streamed_run_would_drop_are_refused_not_ignored(self):
+        for option in (
+            {"stdin": b"x"},
+            {"env": {"A": "b"}},
+            {"timeout": 5},
+            {"merge_stderr": True},
+            {"binary": True},
+        ):
+            with self.subTest(option=option):
+                with mock.patch.object(yo.proc, "run_filtered") as streamed:
+                    with self.assertRaisesRegex(ValueError, next(iter(option))):
+                        yo.run(["true"], filtered=True, **option)
+                streamed.assert_not_called()
+
 
 class TestEditorUris(unittest.TestCase):
     def launched(self, command, tool):

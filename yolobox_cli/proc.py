@@ -105,6 +105,24 @@ def run(
     filtered: bool = False,
     timeout: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
+    if filtered:
+        unsupported = [
+            name
+            for name, given in (
+                ("stdin", stdin is not None),
+                ("env", env is not None),
+                ("timeout", timeout is not None),
+                ("merge_stderr", merge_stderr),
+                ("binary", binary),
+            )
+            if given
+        ]
+        if unsupported:
+            # A programming error, not an operator's: run_filtered streams the
+            # child's output as it comes and would drop these without a word.
+            raise ValueError(
+                "run(filtered=True) cannot honour %s" % ", ".join(unsupported)
+            )
     try:
         if filtered:
             completed = run_filtered(argv)

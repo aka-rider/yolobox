@@ -322,7 +322,7 @@ Verified against real argparse: every invocation whose first token is not option
 
 Filtering at one chokepoint, instead of at each call site that happens to print guest text, is what keeps a new message from forgetting. It is a display filter only. What `yo` runs and writes to files is never altered by it, and a command that must hand bytes through untouched (`yo ssh`, `yo enter`) does not print them via `out()` at all.
 
-Output streamed live goes through it too. `yo gc` and `yo aws-check` show the guest tiers as they run, and the tiers print project paths and whatever a project's `make -n clean` or `make clean` recipe prints. So `run_filtered()` pumps their stdout and stderr line by line into `out()` and `err()` instead of handing ssh the terminal.
+Output streamed live goes through it too. `yo gc` and `yo aws-check` show the guest tiers as they run, and the tiers print project paths and whatever a project's `make -n clean` or `make clean` recipe prints. So `run_filtered()` pumps their stdout and stderr line by line into `out()` and `err()` instead of handing ssh the terminal. `run(filtered=True)` has no stdin, env, timeout, stderr merge or binary mode, and raises `ValueError` when asked for one instead of dropping it.
 
 `pick_project()` runs each guest-listed project name through `common.sanitize` before handing the list to `fzf --read0`, so the picker's safety does not depend on the installed fzf stripping control bytes. A name that contained one comes back from the picker with `?` in its place and so names no real directory.
 
