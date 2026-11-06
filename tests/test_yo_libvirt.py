@@ -3031,11 +3031,13 @@ class TestInitrdListener(LibvirtCase):
         popen.assert_called_once()
         self.assertIn("ssh not found", caught.exception.message)
 
-    def test_lima_checks_nothing(self):
+    def test_lima_asks_no_process_and_refuses_only_a_port_lima_mirrors(self):
         mac = load_yo("yo_mac_listener")
         self.addCleanup(unload_yo, "yo_mac_listener")
         with mock.patch.object(mac.proc, "run") as run:
             mac.box.driver.verify_initrd_listener(60022)
+            with self.assertRaisesRegex(mac.YoError, "ssh.localPort 22222"):
+                mac.box.driver.verify_initrd_listener(22222)
         run.assert_not_called()
 
 

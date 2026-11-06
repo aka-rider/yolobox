@@ -326,6 +326,35 @@ def lima_edit_command(expression: str) -> str:
     )
 
 
+def refuse_mirrored_ssh_port(port: int) -> None:
+    """Refuse an ssh port another box's listener can claim.
+
+    Lima mirrors every guest TCP port up to MIRRORED_TCP_PORTS[1] onto the
+    host's 127.0.0.1, and the disk unlock sends the passphrase to the ssh port
+    without checking the host key. The one check for the port read from
+    limactl (ssh_port) and the port read from ssh.config (the listener check
+    before every passphrase).
+    """
+    if port >= MIN_SSH_LOCAL_PORT:
+        return
+    raise YoError(
+        "%s has ssh.localPort %d, which another box's listener can claim: lima "
+        "mirrors every guest TCP port up to %d onto the host's 127.0.0.1, and "
+        "the disk unlock sends the passphrase to this port without checking "
+        "the host key. Stop the instance and move it to a port in %d-%d:\n    %s"
+        % (
+            state.box.name,
+            port,
+            MIRRORED_TCP_PORTS[1],
+            MIN_SSH_LOCAL_PORT,
+            MAX_PORT,
+            lima_edit_command(
+                ".ssh.localPort=<a free port in %d-%d>" % (MIN_SSH_LOCAL_PORT, MAX_PORT)
+            ),
+        )
+    )
+
+
 class LimaDriver:
     """macOS: one Lima instance per machine, run by the vz driver."""
 
@@ -427,24 +456,7 @@ class LimaDriver:
                 "Create the instance with:\n    %s"
                 % (state.box.name, port, self.create_command(NO_SIZE))
             )
-        if port < MIN_SSH_LOCAL_PORT:
-            raise YoError(
-                "%s has ssh.localPort %d, which another box's listener can claim: lima "
-                "mirrors every guest TCP port up to %d onto the host's 127.0.0.1, and "
-                "the disk unlock sends the passphrase to this port without checking "
-                "the host key. Stop the instance and move it to a port in %d-%d:\n    %s"
-                % (
-                    state.box.name,
-                    port,
-                    MIRRORED_TCP_PORTS[1],
-                    MIN_SSH_LOCAL_PORT,
-                    MAX_PORT,
-                    lima_edit_command(
-                        ".ssh.localPort=<a free port in %d-%d>"
-                        % (MIN_SSH_LOCAL_PORT, MAX_PORT)
-                    ),
-                )
-            )
+        refuse_mirrored_ssh_port(port)
         return port
 
     def keepalive_pid(self) -> Optional[int]:
@@ -620,7 +632,10 @@ class LimaDriver:
         return "\n".join(lines)
 
     def verify_initrd_listener(self, port: int) -> None:
-        pass  # lima's hostagent, which owns the port, runs as the host user
+        # The unlock reads its port from lima's ssh.config, not from ssh_port(),
+        # so the check ssh_port() makes is made again here. Above the mirrored
+        # range only lima's hostagent, which runs as the host user, holds the port.
+        refuse_mirrored_ssh_port(port)
 
     def start(self, passphrase: bytes, size: Size) -> None:
         if lima_instance_exists():

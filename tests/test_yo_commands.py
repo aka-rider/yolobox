@@ -17,6 +17,7 @@ from test_yo import (
     FakeHome,
     Reached,
     df_output,
+    fake_limactl,
     initrd_probe,
     yo,
 )
@@ -3748,6 +3749,42 @@ class TestLimaStop(FakeHome):
         ):
             yo.run_initrd_helper(b"secret")
         self.assertEqual(held, [True])
+
+
+class TestThePassphraseGoesOnlyToAPortNoMirroredListenerCanClaim(FakeHome):
+    """The unlock reads its port from lima's ssh.config, not from ssh_port()."""
+
+    def send_to_port(self, port):
+        """run_initrd_helper with ssh.config and limactl both naming `port`;
+        returns the spawn mock and the helper it would have started."""
+        os.makedirs(yo.instance_dir(), exist_ok=True)
+        with open(yo.ssh_cfg(), "w") as handle:
+            handle.write(
+                "Host %s\n  Hostname 127.0.0.1\n  Port %d\n"
+                '  IdentityFile "/k/user"\n' % (yo.box.vm_host, port)
+            )
+        helper = FakeHelper(*UNLOCKED)
+        with (
+            fake_limactl(json.dumps({"config": {"ssh": {"localPort": port}}})),
+            mock.patch.object(yo.proc, "spawn", return_value=helper) as spawn,
+        ):
+            try:
+                yo.run_initrd_helper(b"secret")
+            finally:
+                self.spawn = spawn
+        return helper
+
+    def test_a_port_inside_the_mirrored_range_gets_nothing(self):
+        for port in (1, 22222, 49151):
+            with self.subTest(port=port):
+                with self.assertRaisesRegex(yo.YoError, "ssh.localPort %d" % port):
+                    self.send_to_port(port)
+                self.spawn.assert_not_called()
+
+    def test_a_port_above_the_mirrored_range_gets_the_passphrase(self):
+        helper = self.send_to_port(60022)
+        self.spawn.assert_called_once()
+        self.assertEqual(helper.stdin.sent, b"secret\n")
 
 
 class TestDiskGrowResizesTheMapping(FakeHome):
