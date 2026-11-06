@@ -37,11 +37,23 @@ let
   # including the cap_setpcap that nixpkgs adds to every capability wrapper.
   # It is compared sorted, so a value may list its names in any order. See
   # nix/hardening.md.
-  setuidRoot = { setuid = true; capabilities = ""; };
-  capRoot = capabilities: { setuid = false; inherit capabilities; };
+  #
+  # `group` and `permissions` are compared too. A capability wrapper ignores
+  # its `setuid` option and takes its mode from `permissions` alone, so a
+  # permissions string with an s would make it setuid. `open` is what nixpkgs
+  # gives a wrapper by default (the default of `permissions` in
+  # security/wrappers/default.nix). `wheelOnly` is what
+  # security.sudo.execWheelOnly makes of sudo's wrappers (security/sudo.nix),
+  # stated here and not read from that option, so that switching the option
+  # off fails the rebuild.
+  groupOnly = "u+rx,g+x";
+  open = { group = "root"; permissions = "u+rx,g+x,o+x"; };
+  wheelOnly = { group = "wheel"; permissions = groupOnly; };
+  setuidRoot = open // { setuid = true; capabilities = ""; };
+  capRoot = capabilities: open // { setuid = false; inherit capabilities; };
   keptWrappers = {
-    sudo = setuidRoot;
-    sudoedit = setuidRoot;
+    sudo = setuidRoot // wheelOnly;
+    sudoedit = setuidRoot // wheelOnly;
     unix_chkpwd = setuidRoot;
     newuidmap = capRoot "cap_setpcap,cap_setuid";
     newgidmap = capRoot "cap_setgid,cap_setpcap";
@@ -71,17 +83,25 @@ let
     else sortedCaps (lib.splitString "," (builtins.head m) ++ [ "cap_setpcap" ]);
 
   have = w: {
-    inherit (w) program setuid setgid owner;
+    inherit (w) program setuid setgid owner group permissions;
     capabilities = getcapSpelling w.capabilities;
   };
   want = name: e: {
     program = name;
-    inherit (e) setuid capabilities;
+    inherit (e) setuid capabilities group permissions;
     setgid = false;
     owner = "root";
   };
+  # An extraWrappers entry may be narrower than `open`: with mode u+rx,g+x
+  # only root and one group can exec it (nixpkgs' wireshark gives dumpcap that),
+  # which is never wider than `open`, so its group is taken as given.
+  expected = name: w:
+    let e = expectedWrappers.${name}; in
+    if !(keptWrappers ? ${name}) && w.permissions == groupOnly
+    then e // { inherit (w) group permissions; }
+    else e;
   wrongPrivilege = lib.filterAttrs
-    (name: w: have w != want name expectedWrappers.${name})
+    (name: w: have w != want name (expected name w))
     (lib.getAttrs (lib.intersectLists enabledNames allowedNames) enabledWrappers);
 
   # Refused from any source, an extraWrappers entry included. CAP_SYS_PTRACE
@@ -104,8 +124,10 @@ in
       the capabilities it must carry: comma separated, in any order, as
       `getcap` lists them (include the cap_setpcap that nixpkgs adds).
       The empty string means a setuid-root wrapper with no capabilities.
+      The wrapper must be owned by root with nixpkgs' default permissions
+      and group root, or with the permissions `u+rx,g+x` and any group.
       Evaluation fails when an enabled wrapper differs in program name,
-      setuid, setgid, owner or capabilities.
+      setuid, setgid, owner, group, permissions or capabilities.
     '';
   };
 
@@ -141,7 +163,7 @@ in
         message = lib.concatStringsSep "\n" (
           [ "A wrapper carries other privilege than the allowlist states (nix/hardening.nix)." ]
           ++ lib.mapAttrsToList
-            (name: w: "${name}: have ${builtins.toJSON (have w)}, want ${builtins.toJSON (want name expectedWrappers.${name})}")
+            (name: w: "${name}: have ${builtins.toJSON (have w)}, want ${builtins.toJSON (want name (expected name w))}")
             wrongPrivilege
           ++ [ "Fix the wrapper, or state its privilege in yolobox.hardening.extraWrappers; see nix/hardening.md." ]
         );
