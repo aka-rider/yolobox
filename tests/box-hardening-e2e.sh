@@ -37,10 +37,11 @@ check_script="${here}/box-hardening-check.sh"
 command -v yo >/dev/null || { echo "FAIL: yo is not on PATH" >&2; exit 1; }
 
 # The names travel inside one single-quoted word of the remote command line,
-# so they must not be able to close the quote.
+# so they must not be able to close the quote. `=` and `,` are in because the
+# documented form is name=caps (dumpcap=cap_net_raw,cap_setpcap).
 for name in "$@"; do
     case ${name} in
-    *[!A-Za-z0-9._-]* | '')
+    *[!A-Za-z0-9._,=-]* | '')
         echo "FAIL: '${name}' is not a plausible wrapper name" >&2
         exit 64
         ;;

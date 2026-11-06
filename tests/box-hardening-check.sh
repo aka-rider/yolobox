@@ -16,8 +16,9 @@
 #   against a box that is not hardened yet.
 #
 # It also checks that the agent cannot log in as the operator with the
-# forwarded 1Password agent, and that the firewall rule behind that is
-# loaded; that the box was not told its host OS; that the Lima guest agent runs
+# forwarded 1Password agent (it prints SKIP, and tests nothing, when the agent
+# lists no key), and that the firewall rule behind that is loaded; that the
+# agent's herdr-server runs with oom_score_adj >= 0; that the box was not told its host OS; that the Lima guest agent runs
 # exactly when Lima's cidata ships it; and that `yolobox-guest rebuild` exists.
 #
 # It stops at the first broken property and names it. There is no python in
@@ -386,24 +387,31 @@ check_gateway_ssh_closed() {
 # which the agent account reaches through its forwarded socket. So on every box
 # sshd must refuse the operator from every address but the gateway's, and the
 # firewall must stop the agent claiming that address over loopback.
+# The ssh probes count Permission denied as sshd's AllowUsers refusing, but ssh
+# fails the same way when the forwarded agent offers no operator key. So they
+# run only when the agent lists a key, and otherwise print a SKIP.
 # $1 is the operator's account name.
 check_operator_login_refused() {
-    local operator=$1 addr out
+    local operator=$1 addr out keys
     out=$(as_agent printenv SSH_AUTH_SOCK) ||
         fail "the agent has no SSH_AUTH_SOCK, so a login probe would prove nothing"
     [ -n "${out}" ] || fail "the agent's SSH_AUTH_SOCK is empty"
-    for addr in 127.0.0.1 "${GUEST_ADDR}"; do
-        if out=$(as_agent ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
-            "${operator}@${addr}" true 2>&1); then
-            fail "the agent logged in as ${operator} at ${addr} with its forwarded agent"
-        fi
-        case ${out} in
-        *"Permission denied"*) ;;
-        *) fail "ssh as ${operator} at ${addr} failed, but not with Permission denied: ${out}" ;;
-        esac
-        ok "the agent cannot log in as ${operator} at ${addr}"
-    done
+    if keys=$(as_agent ssh-add -L 2>&1); then
+        for addr in 127.0.0.1 "${GUEST_ADDR}"; do
+            if out=$(as_agent ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+                "${operator}@${addr}" true 2>&1); then
+                fail "the agent logged in as ${operator} at ${addr} with its forwarded agent"
+            fi
+            case ${out} in
+            *"Permission denied"*) ;;
+            *) fail "ssh as ${operator} at ${addr} failed, but not with Permission denied: ${out}" ;;
+            esac
+            ok "the agent cannot log in as ${operator} at ${addr}"
+        done
+    else
+        echo "SKIP: sshd's refusal of ${operator} was NOT tested: the agent's forwarded ssh agent lists no key (ssh-add -L: ${keys}), so a Permission denied would not prove AllowUsers refused. Connect with an ssh agent forwarded and run this again" >&2
+    fi
     # -C matches the rule by meaning; `iptables -S` prints its options in
     # another order than the one the unit adds them in.
     sudo -n iptables -C nixos-fw ! -i enp0s1 -s "${GATEWAY_ADDR}" -j DROP ||
@@ -568,6 +576,23 @@ check_vendors() {
     done
 }
 
+# user@.service has OOMScoreAdjust=-500 (nix/base.md, "Memory pressure"), which
+# every process under the agent's user manager inherits unless its unit sets
+# its own. The herdr server and the panes it forks are the heavy, restartable
+# part of a session, so a -500 there would make them the last thing the kernel
+# kills, behind the manager that holds them. nix/herd-server.nix sets 0.
+check_herdr_server_oom_score() {
+    local unit=herdr-server.service pid score
+    pid=$(sudo systemctl --user -M "agent@" show -p MainPID --value "${unit}") ||
+        fail "could not read the main pid of the agent's ${unit}"
+    [ "${pid}" -gt 0 ] || fail "the agent's ${unit} is not running"
+    score=$(sudo cat "/proc/${pid}/oom_score_adj") ||
+        fail "could not read oom_score_adj of ${unit} (pid ${pid})"
+    [ "${score}" -ge 0 ] ||
+        fail "${unit} runs with oom_score_adj ${score}, inherited from user@.service; it must be 0 or more"
+    ok "${unit} runs with oom_score_adj ${score}"
+}
+
 check_rosetta() {
     local hello
     [ "$(head -n 1 /proc/sys/fs/binfmt_misc/rosetta)" = enabled ] ||
@@ -589,6 +614,7 @@ compat_checks() {
     check_nix_build
     check_strace
     check_vendors
+    check_herdr_server_oom_score
     # Rosetta follows the guest's CPU, as nix/base.nix gates it: an aarch64
     # guest runs only under Lima/vz on Apple silicon and must have it.
     if [ "$(uname -m)" = aarch64 ]; then

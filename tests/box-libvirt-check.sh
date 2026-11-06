@@ -14,7 +14,8 @@
 #       or tpm, the ssh forward bound to 127.0.0.1, the yolobox metadata
 #   (d) with the guest's own egress table deleted, so that only the host layer
 #       (linux/yolobox-host.nft) is left, the guest cannot reach the host, the
-#       LAN or a peer box, and still reaches the internet and DNS
+#       LAN or a peer box, on IPv4 and through the IPv6 gateway, and still
+#       reaches the internet and DNS
 #   (e) the ssh forward is bound on 127.0.0.1 only
 #
 # Step (d) CHANGES THE GUEST: it deletes the table inet yolobox-egress and
@@ -29,6 +30,9 @@
 #   SKIP peer       no other yolobox domain is running, so the box-to-box
 #                   probe did not run (start a second instance to run it)
 #   SKIP tailnet    the host or the box is not on a tailnet
+#   SKIP v6-gateway the guest has no IPv6 default route, or the host cannot
+#                   bind an IPv6 listener, so the probe through the IPv6
+#                   gateway (mapped to the host's ::1) did not run
 #   RESIDUAL tailnet-host-ssh
 #                   the box reached the host's sshd over the tailnet. This is
 #                   the known residual in docs/linux-host.md, so it does not
@@ -73,6 +77,7 @@ SSH_HOST="lima-${NAME}"
 TABLE_DELETED=""
 CANARY_PID=""
 CANARY_PORT=""
+CANARY6_PORT=""
 CATEGORIES=""
 SSH_PORT=""
 
@@ -134,21 +139,54 @@ expect_blocked() {
     ok "the guest cannot reach ${label} (${host}:${port})"
 }
 
-# A listener the host owns, on every address, so a probe that fails to reach it
-# was refused by the layers and not by a closed port. Port 22 on the host may
-# well have no sshd.
+# Listeners the host owns, on every address of each family, so a probe that
+# fails to reach one was refused by the layers and not by a closed port. Port 22
+# on the host may well have no sshd. It prints the IPv4 port, then the IPv6 port,
+# or 0 for the IPv6 one when the host cannot bind it (IPv6 disabled).
 start_canary() {
     # A simple command, not a brace group: COPROC_PID is then python's own pid.
-    coproc python3 -c 'import socket
-s = socket.socket()
-s.bind(("0.0.0.0", 0))
-s.listen(8)
-print(s.getsockname()[1], flush=True)
+    coproc python3 -c 'import select, socket
+
+def listener(family, address):
+    s = socket.socket(family)
+    if family == socket.AF_INET6:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    s.bind((address, 0))
+    s.listen(8)
+    print(s.getsockname()[1], flush=True)
+    return s
+
+listeners = [listener(socket.AF_INET, "0.0.0.0")]
+try:
+    listeners.append(listener(socket.AF_INET6, "::"))
+except OSError:
+    print(0, flush=True)
 while True:
-    s.accept()[0].close()'
+    for ready in select.select(listeners, [], [])[0]:
+        ready.accept()[0].close()'
     CANARY_PID=${COPROC_PID}
     read -r -u "${COPROC[0]}" CANARY_PORT ||
         fail "the canary listener printed no port"
+    read -r -u "${COPROC[0]}" CANARY6_PORT ||
+        fail "the canary listener printed no IPv6 port"
+}
+
+# Prints the guest's IPv6 default gateway, scoped when it is link-local (a
+# connect to fe80:: needs the interface), or nothing when the guest has no
+# IPv6 default route. passt answers for its gateway address of each family and
+# maps it to the host's loopback, so this is the IPv6 twin of ${GATEWAY_ADDR}.
+guest_v6_gateway() {
+    local routes via
+    routes=$(guest "ip -6 route show default") || fail "could not list the guest's IPv6 routes"
+    via=$(awk '{
+        gw = ""; dev = ""
+        for (i = 1; i < NF; i++) {
+            if ($i == "via") gw = $(i + 1)
+            if ($i == "dev") dev = $(i + 1)
+        }
+        if (gw != "") { print (gw ~ /^fe80:/ ? gw "%" dev : gw); exit }
+    }' <<<"${routes}")
+    echo "${via}"
 }
 
 # ---------------------------------------------------------------- (a), (b)
@@ -278,6 +316,17 @@ check_tailnet() {
     fi
 }
 
+# The host table also rejects ::1, which passt maps the IPv6 gateway to.
+check_v6_gateway() {
+    local v6_gateway
+    v6_gateway=$(guest_v6_gateway)
+    if [ -z "${v6_gateway}" ] || [ "${CANARY6_PORT}" -eq 0 ]; then
+        echo "SKIP v6-gateway"
+        return
+    fi
+    expect_blocked "the IPv6 gateway, a listener of the host" "${v6_gateway}" "${CANARY6_PORT}"
+}
+
 check_host_layer_alone() {
     local route host_ip default_gw answer
     route=$(ip -4 route get 1.1.1.1) || fail "the host has no route to 1.1.1.1"
@@ -292,6 +341,7 @@ check_host_layer_alone() {
     start_canary
     expect_blocked "the gateway, the host's loopback, ssh" "${GATEWAY_ADDR}" 22
     expect_blocked "the gateway, a listener of the host" "${GATEWAY_ADDR}" "${CANARY_PORT}"
+    check_v6_gateway
     expect_blocked "the host's primary address, ssh" "${host_ip}" 22
     expect_blocked "the host's primary address, a listener of the host" "${host_ip}" "${CANARY_PORT}"
     if [ -n "${default_gw}" ]; then
