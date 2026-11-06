@@ -714,9 +714,8 @@ class TestPackageImportsFollowTheConvention(unittest.TestCase):
         self.assertTrue(imported, "no module imports a name; this test is stale")
         for module, imported_name in imported:
             with self.subTest(module=module, name=imported_name):
-                self.assertRegex(
-                    imported_name,
-                    r"[A-Z][A-Za-z0-9]*|[A-Z][A-Z0-9_]*",
+                self.assertIsNotNone(
+                    re.fullmatch(r"[A-Z][A-Za-z0-9]*|[A-Z][A-Z0-9_]*", imported_name),
                     "only classes and constants are imported by name",
                 )
                 self.assertNotIn(imported_name, patched)
@@ -1112,19 +1111,30 @@ class TestHomeLinksBelongToTheirUser(unittest.TestCase):
 
 
 class TestRuffVersionIsPinnedOnce(unittest.TestCase):
-    def test_verify_workflow_installs_the_version_ruff_toml_requires(self):
-        required = re.search(
+    def required(self):
+        found = re.search(
             r'^required-version = "==([\d.]+)"$',
             (REPO / "ruff.toml").read_text(),
             re.M,
         )
+        self.assertIsNotNone(found)
+        return found.group(1)
+
+    def test_claude_md_spells_the_version_ruff_toml_requires(self):
+        spelled = re.findall(
+            r"\bruff(?:@|==)([\d.]+)", (REPO / "CLAUDE.md").read_text()
+        )
+        self.assertTrue(spelled, "CLAUDE.md names no ruff version; this test is stale")
+        self.assertEqual(set(spelled), {self.required()})
+
+    def test_verify_workflow_installs_the_version_ruff_toml_requires(self):
+        required = self.required()
         installed = re.findall(
             r'^\s+version: "([\d.]+)"$',
             (REPO / ".github" / "workflows" / "verify.yml").read_text(),
             re.M,
         )
-        self.assertIsNotNone(required)
-        self.assertEqual(installed, [required.group(1)] * 2)
+        self.assertEqual(installed, [required] * 2)
 
 
 class TestTailscaleSocketIsOperatorOnly(unittest.TestCase):
@@ -1178,6 +1188,19 @@ class TestShellcheckListsAgree(unittest.TestCase):
         ci = self.scripts_in(REPO / ".github" / "workflows" / "verify.yml")
         self.assertEqual(sorted(set(claude)), sorted(set(ci)))
         self.assertEqual(len(claude), len(set(claude)), "a script listed twice")
+
+    def test_the_lists_hold_every_shell_script_the_repo_tracks(self):
+        if not shutil.which("git") or not (REPO / ".git").exists():
+            self.skipTest("needs git and a checkout (CLAUDE.md copies the tree out)")
+        tracked = subprocess.run(
+            ["git", "-C", str(REPO), "ls-files", "*.sh"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        self.assertEqual(
+            sorted(set(self.scripts_in(REPO / "CLAUDE.md"))), sorted(tracked)
+        )
 
     def test_every_listed_script_exists(self):
         for script in self.scripts_in(REPO / "CLAUDE.md"):
