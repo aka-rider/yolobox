@@ -255,6 +255,10 @@ There is no spelling for a checkout in the guest, on purpose. A checkout in the 
 
 `sshx.guest_out(argv)` is the plain-ssh read of a command's output (the generations above, the root device's type, `growpart`'s unit state, the partition sizes). It goes through `sshx.probe`, so ssh's exit 255 is `Unreachable` with the "is it up?" hint and never an empty string: an empty answer means the command ran on the box and printed nothing. `yo status` turns that `Unreachable` into a warning line, `disk: cannot reach ...`. The two `df` reads of `disk-grow` keep ssh's own words (`guest_root_usage` quotes the exit code and stderr) and `disk-grow` adds the hint to the first.
 
+### Whether the agent account exists
+
+`sshx.account_status()` never infers a missing agent account from a failed `ssh agent true`: the agent's own `~/.bashrc` can exit non-zero and fail that probe on a box that has the account. When the agent probe fails and the operator's works, it asks the box, `getent passwd agent` as the operator, and only exit 2 (key not found) is `operator_only`, the box that predates the operator/agent split and gets the `yo destroy --yes && yo bootstrap` advice. Exit 0 is `agent_failing`: `require_agent_account()` prints the probe's exit code and stderr, points at the account's shell startup files and does not name `yo destroy`, which would lose unpushed work for a fixable rc file; `yo status` prints it as an `agent:` warning. Any other `getent` exit is a `YoError` naming it.
+
 ## The network line and the gateway-blocked marker
 
 `yo status` prints one `network:` line, built by `network_status_line()` from the two results of `yolobox-guest net-check`: whether egress works and whether lima's gateway answers a DNS query. The pair tells a VPN on the host that owns its default route from one that blackholes the gateway (see [docs/host-network.md](docs/host-network.md#vpn-shapes)).

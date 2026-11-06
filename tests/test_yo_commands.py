@@ -342,6 +342,55 @@ class TestFlakeRef(FakeHome):
         self.assertEqual(yo.remembered_flake_ref(), "github:x/y/\udcff")
 
 
+class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
+    def status(self, agent_rc, operator_rc, getent_rc, agent_stderr=""):
+        def ssh_run(role, argv, **kwargs):
+            if role is yo.AGENT:
+                done = (agent_rc, agent_stderr)
+            elif argv[0] == "getent":
+                self.assertEqual(argv, ["getent", "passwd", "agent"])
+                done = (getent_rc, "")
+            else:
+                done = (operator_rc, "")
+            return subprocess.CompletedProcess(argv, done[0], stdout="", stderr=done[1])
+
+        with mock.patch.object(yo.sshx, "ssh_run", ssh_run):
+            return yo.sshx.account_status()
+
+    def test_an_agent_whose_login_fails_is_not_a_missing_account(self):
+        status, detail = self.status(1, 0, 0, agent_stderr="rc: boom\n")
+        self.assertEqual(status, "agent_failing")
+        self.assertIn("exited 1: rc: boom", detail)
+
+    def test_a_missing_account_is_what_getent_says(self):
+        self.assertEqual(self.status(255, 0, 2), ("operator_only", ""))
+
+    def test_a_getent_that_fails_otherwise_is_an_error(self):
+        with self.assertRaisesRegex(yo.YoError, "getent passwd agent failed.*exit 3"):
+            self.status(1, 0, 3)
+
+    def test_a_lost_operator_is_unreachable(self):
+        self.assertEqual(
+            self.status(255, 255, 0, "no route\n"), ("unreachable", "no route")
+        )
+
+    def test_a_failing_agent_login_never_advises_destroying_the_box(self):
+        with (
+            mock.patch.object(
+                yo.sshx,
+                "account_status",
+                return_value=("agent_failing", "exited 1: boom"),
+            ),
+            mock.patch.object(yo.ui, "err") as fake_err,
+        ):
+            with self.assertRaises(yo.YoError):
+                yo.sshx.require_agent_account()
+        said = "\n".join(call.args[0] for call in fake_err.call_args_list)
+        self.assertIn("exited 1: boom", said)
+        self.assertNotIn("destroy", said)
+        self.assertNotIn("predates", said)
+
+
 class TestMainPreflight(unittest.TestCase):
     def test_version_flag_skips_the_limactl_preflight(self):
         with mock.patch.object(yo.proc, "require_tool", side_effect=Reached):
@@ -1849,6 +1898,8 @@ class TestVmServicesSkipsOnAnOldBox(unittest.TestCase):
             if argv == ["true"]:
                 ok = agent_ok if role is yo.AGENT else operator_ok
                 return mock.Mock(returncode=0 if ok else 1, stdout="", stderr="")
+            if argv[:2] == ["getent", "passwd"]:
+                return mock.Mock(returncode=2, stdout="", stderr="")
             if argv[:2] == ["systemctl", "cat"]:
                 return mock.Mock(returncode=0 if units_ok else 1, stdout="", stderr="")
             raise AssertionError("unexpected ssh_run call: %r" % (argv,))

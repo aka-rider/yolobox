@@ -576,6 +576,9 @@ def cmd_status(args: argparse.Namespace) -> None:
         if stage is BootStage.INITRD:
             ui.out(initrd_disk_line(unlock.initrd_state()))
 
+    if status == "agent_failing":
+        report.warn("agent: login fails — %s" % detail)
+
     for line in disk_lines(vm_reachable):
         report.emit(line)
 

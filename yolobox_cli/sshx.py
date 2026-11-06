@@ -21,6 +21,9 @@ class SshRole:
     pins_host_key: bool = True
 
 
+# getent's exit code for a key the database does not hold.
+GETENT_KEY_NOT_FOUND = 2
+
 OPERATOR = SshRole(None, False)
 AGENT = SshRole(AGENT_USER, True)
 # Only for fetching the guest's host keys to pin them (ensure_guest_known_hosts):
@@ -156,19 +159,48 @@ def guest_out(argv: Sequence[str]) -> str:
 
 
 def account_status() -> Tuple[str, str]:
+    """Which accounts work, as (status, detail).
+
+    `operator_only` means the box has no agent account, a fact `getent` states.
+    An agent whose login merely fails (its own rc file exits, say) is `agent_failing`,
+    with the failed probe's exit code and stderr as detail.
+    """
     agent_probe = ssh_run(AGENT, ["true"])
     if agent_probe.returncode == 0:
         return "agent", ""
-    if ssh_run(OPERATOR, ["true"]).returncode == 0:
+    if ssh_run(OPERATOR, ["true"]).returncode != 0:
+        return "unreachable", agent_probe.stderr.rstrip("\n")
+    lookup = ssh_run(OPERATOR, ["getent", "passwd", AGENT_USER])
+    if lookup.returncode == SSH_UNREACHABLE:
+        return "unreachable", lookup.stderr.rstrip("\n")
+    if lookup.returncode == GETENT_KEY_NOT_FOUND:
         return "operator_only", ""
-    return "unreachable", agent_probe.stderr.rstrip("\n")
+    if lookup.returncode != 0:
+        raise YoError(
+            "getent passwd %s failed on the box (exit %d)%s"
+            % (AGENT_USER, lookup.returncode, ": " + lookup.stderr.strip())
+        )
+    stderr = agent_probe.stderr.strip()
+    return "agent_failing", "ssh %s@%s true exited %d%s" % (
+        AGENT_USER,
+        state.box.vm_host,
+        agent_probe.returncode,
+        ": " + stderr if stderr else " with no stderr",
+    )
 
 
 def require_agent_account() -> None:
     status, detail = account_status()
     if status == "agent":
         return
-    if status == "operator_only":
+    if status == "agent_failing":
+        ui.err("yo: cannot ssh into %s as '%s'." % (state.box.name, AGENT_USER))
+        ui.err("    The account exists, but its login fails: %s" % detail)
+        ui.err(
+            "    Its shell startup files (~/.bashrc, ~/.profile) are the usual cause; "
+            "inspect them as the operator: %s" % state.yo_cmd("ssh")
+        )
+    elif status == "operator_only":
         ui.err("yo: cannot ssh into %s as '%s'." % (state.box.name, AGENT_USER))
         ui.err(
             "    Every AI session runs as that account, and this VM has no working one —"
