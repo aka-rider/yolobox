@@ -447,6 +447,9 @@ class TestInitrdProbeCommand(unittest.TestCase):
         with open(systemctl, "w") as handle:
             handle.write("#!/bin/sh\necho $MIGRATE_UNIT_STATE\n")
         os.chmod(systemctl, 0o755)
+        # The initrd's PATH holds no more than cat and the fake systemctl,
+        # and /bin is not where every host keeps cat (NixOS has none there).
+        os.symlink(shutil.which("cat"), os.path.join(bin_dir, "cat"))
         self.bin_dir = bin_dir
 
     def ask(self, name, text):
@@ -460,7 +463,7 @@ class TestInitrdProbeCommand(unittest.TestCase):
             capture_output=True,
             text=True,
             env={
-                "PATH": self.bin_dir + ":/bin:/usr/bin",
+                "PATH": self.bin_dir,
                 "MIGRATE_UNIT_STATE": migrate,
             },
         )
