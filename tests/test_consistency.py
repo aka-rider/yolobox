@@ -900,6 +900,19 @@ class TestGuestRebuildMatchesYoAndTheBox(unittest.TestCase):
         self.assertEqual(tuple(found.group(1).split()), yo.release.NIX_REBUILD_FLAGS)
         self.assertIn("--refresh", yo.release.NIX_REBUILD_FLAGS)
 
+    def test_the_rebuild_lock_and_its_busy_exit_are_yos(self):
+        # Both sides take one lock, or an interrupted bootstrap's nixos-rebuild
+        # runs beside a hand rebuild. The path has a test override in the script.
+        lock = re.fullmatch(
+            r"\$\{YOLOBOX_REBUILD_LOCK:-(.*)\}", guest_script_constant("REBUILD_LOCK")
+        )
+        self.assertIsNotNone(lock, "REBUILD_LOCK lost its override spelling")
+        self.assertEqual(lock.group(1), yo.release.REBUILD_LOCK)
+        self.assertEqual(
+            int(guest_script_constant("REBUILD_BUSY_EXIT")),
+            yo.release.REBUILD_BUSY_EXIT,
+        )
+
     def test_the_stamps_the_rebuild_reads_are_the_ones_base_nix_writes(self):
         body = guest_script_function("cmd_rebuild")
         read = set(re.findall(r'read_stamp "\$\{YOLOBOX_STAMPS\}/([a-z-]+)"', body))

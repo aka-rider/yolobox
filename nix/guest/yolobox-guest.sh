@@ -48,6 +48,15 @@ GATEWAY_BLOCKED="${YOLOBOX_GATEWAY_BLOCKED:-/etc/yolobox/gateway-blocked}"
 # the operator rebuilds; root and the agent are refused.
 OPERATOR_UID=501
 
+# The lock a rebuild holds while nixos-rebuild runs, and the exit code flock -n
+# gives when another rebuild holds it, both equal to yo's (REBUILD_LOCK,
+# REBUILD_BUSY_EXIT). It lives in /run, which only root writes, so flock runs
+# under sudo. yo bootstrap takes the same lock: an interrupted one leaves its
+# nixos-rebuild running in the box, and a second must not start beside it. The
+# YOLOBOX_REBUILD_LOCK override is a test seam.
+REBUILD_LOCK="${YOLOBOX_REBUILD_LOCK:-/run/yolobox-rebuild.lock}"
+REBUILD_BUSY_EXIT=75
+
 # Where nix/base.nix stamps what built the box (flake-ref, hostname). The
 # YOLOBOX_STAMPS override is a test seam.
 YOLOBOX_STAMPS="${YOLOBOX_STAMPS:-/etc/yolobox}"
@@ -854,8 +863,15 @@ cmd_rebuild() {
     fi
     host=$(read_stamp "${YOLOBOX_STAMPS}/hostname") || exit 1
     user=$(id -un)
-    exec sudo env "YOLOBOX_USERNAME=${user}" "YOLOBOX_HOSTNAME=${host}" \
-        "YOLOBOX_FLAKE_REF=${ref}" nixos-rebuild "${action}" --impure --refresh --flake "${ref}#yolobox"
+    local status=0
+    sudo env "YOLOBOX_USERNAME=${user}" "YOLOBOX_HOSTNAME=${host}" \
+        "YOLOBOX_FLAKE_REF=${ref}" flock -n -E "${REBUILD_BUSY_EXIT}" "${REBUILD_LOCK}" \
+        nixos-rebuild "${action}" --impure --refresh --flake "${ref}#yolobox" || status=$?
+    if [ "${status}" -eq "${REBUILD_BUSY_EXIT}" ]; then
+        printf 'yolobox-guest: rebuild: another rebuild is running (it holds %s); wait for it to finish\n' \
+            "${REBUILD_LOCK}" >&2
+    fi
+    exit "${status}"
 }
 
 main() {

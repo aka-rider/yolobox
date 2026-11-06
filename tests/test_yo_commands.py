@@ -1096,7 +1096,7 @@ class TestBootstrapRebootDecision(FakeHome):
 
 
 class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
-    def run_bootstrap(self, fstype, df_line):
+    def run_bootstrap(self, fstype, df_line, rebuild_exit=0):
         rebuilds = self.rebuilds = []
         self.resolved = []
 
@@ -1109,6 +1109,7 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
                 return mock.Mock(returncode=0, stdout=df_output(df_line), stderr="")
             if "nixos-rebuild" in argv:
                 rebuilds.append(argv)
+                return mock.Mock(returncode=rebuild_exit, stdout="", stderr="")
             if argv[:3] == ["nix", "flake", "metadata"]:
                 self.resolved.append(argv)
                 return self.metadata
@@ -1187,6 +1188,11 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
                 "YOLOBOX_USERNAME=%s" % yo.host_user(),
                 "YOLOBOX_HOSTNAME=yolobox",
                 "YOLOBOX_FLAKE_REF=github:x/y/z",
+                "flock",
+                "-n",
+                "-E",
+                "75",
+                "/run/yolobox-rebuild.lock",
                 "nixos-rebuild",
                 "boot",
                 "--impure",
@@ -1195,6 +1201,21 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
                 "github:x/y/%s#yolobox" % self.REV,
             ],
         )
+
+    def test_a_rebuild_another_run_left_going_is_refused_at_once(self):
+        with self.assertRaisesRegex(
+            yo.YoError, "another nixos-rebuild is already running in yolobox"
+        ):
+            self.run_bootstrap(
+                "crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /", rebuild_exit=75
+            )
+        self.assertFalse(os.path.exists(yo.flake_ref_file()))
+
+    def test_a_rebuild_that_fails_otherwise_names_its_exit_code(self):
+        with self.assertRaisesRegex(yo.YoError, r"nixos-rebuild.*failed \(exit 1\)"):
+            self.run_bootstrap(
+                "crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /", rebuild_exit=1
+            )
 
     def test_an_encrypted_disk_gets_no_warning(self):
         rebuilds = self.run_bootstrap(

@@ -7,6 +7,7 @@ import contextlib
 import enum
 import os
 import re
+import shlex
 from typing import List, NamedTuple, Optional, Tuple
 
 from . import agent, forwards, guest, proc, release, sshconfig, sshx, state, ui, unlock
@@ -476,14 +477,20 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     # very commit is built, whatever the branch does meanwhile.
     rev = release.locked_rev(ref)
     report.ok("building %s at %s" % (ref, rev))
-    sshx.ssh_run(
+    rebuild_argv = release.nixos_rebuild_argv("boot", release.host_user(), ref, rev)
+    rebuild = sshx.ssh_run(
         OPERATOR,
-        release.nixos_rebuild_argv("boot", release.host_user(), ref, rev),
+        rebuild_argv,
         mux=True,
         capture=False,
-        check=True,
         inherit_stdin=True,
     )
+    if rebuild.returncode == release.REBUILD_BUSY_EXIT:
+        raise YoError(release.rebuild_busy_message())
+    if rebuild.returncode != 0:
+        raise YoError(
+            "%s failed (exit %d)" % (shlex.join(rebuild_argv), rebuild.returncode)
+        )
     # Only an explicit --version is remembered: a default bootstrap means this
     # yo's release, so it forgets a fork ref instead of pinning it.
     # Any test that reaches this line must run under FakeHome.

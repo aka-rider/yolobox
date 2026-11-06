@@ -233,8 +233,29 @@ def rebuild_hint() -> str:
 NIX_REBUILD_FLAGS = ("--impure", "--refresh")
 
 
+# The lock the box's nixos-rebuild holds while it runs, and the exit code flock -n
+# gives when another holds it. yolobox-guest's `rebuild` spells both the same
+# (tests/test_consistency.py). An interrupted yo bootstrap leaves its
+# nixos-rebuild running in the box, and a second must not start beside it.
+REBUILD_LOCK = "/run/yolobox-rebuild.lock"
+REBUILD_BUSY_EXIT = 75
+
+
+def rebuild_busy_message() -> str:
+    return (
+        "another nixos-rebuild is already running in %s (it holds %s), perhaps one "
+        "an interrupted bootstrap left behind. Wait for it to finish, see it with %s, "
+        "then run this again"
+        % (
+            state.box.name,
+            REBUILD_LOCK,
+            state.yo_cmd("ssh", "pgrep", "-a", "nixos-rebuild"),
+        )
+    )
+
+
 def nixos_rebuild_argv(action: str, username: str, ref: str, rev: str) -> List[str]:
-    """The box's `sudo ... nixos-rebuild ACTION` of `ref` at commit `rev`.
+    """The box's `sudo ... flock ... nixos-rebuild ACTION` of `ref` at commit `rev`.
 
     It builds the commit itself (github:OWNER/REPO/<rev>), so what yo printed
     is what is built, even if the branch moves meanwhile. YOLOBOX_FLAKE_REF
@@ -243,6 +264,11 @@ def nixos_rebuild_argv(action: str, username: str, ref: str, rev: str) -> List[s
     return [
         "sudo",
         *nix_env(username, ref),
+        "flock",
+        "-n",
+        "-E",
+        str(REBUILD_BUSY_EXIT),
+        REBUILD_LOCK,
         "nixos-rebuild",
         action,
         *NIX_REBUILD_FLAGS,

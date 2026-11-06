@@ -9,9 +9,11 @@ what macOS and Linux share are exercised, except `gc-user --deep`, which runs
 only where GNU find's `-printf` exists (CI, the guest): the other subcommands
 (`projects`, `gc-machine`) use it or sudo too.
 
-Tools whose absence skips tests: GNU find (the `gc-user` classes).
+Tools whose absence skips tests: GNU find (the `gc-user` classes), flock (the
+rebuild lock).
 """
 
+import fcntl
 import os
 import shutil
 import subprocess
@@ -749,7 +751,7 @@ esac
 REF = "github:aka-rider/yolobox/v1.9.1"
 
 
-class TestRebuild(GuestScript):
+class RebuildCase(GuestScript):
     def setUp(self):
         super().setUp()
         bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
@@ -787,6 +789,8 @@ class TestRebuild(GuestScript):
         self.assertNotIn("unknown subcommand", result.stderr)
         self.assertFalse(self.sudo_argv.exists(), "sudo ran")
 
+
+class TestRebuild(RebuildCase):
     def test_switch_and_boot_rebuild_from_the_stamps_as_the_operator(self):
         for action in ("switch", "boot"):
             with self.subTest(action=action):
@@ -799,6 +803,11 @@ class TestRebuild(GuestScript):
                         "YOLOBOX_USERNAME=alice",
                         "YOLOBOX_HOSTNAME=yolobox-e2e",
                         "YOLOBOX_FLAKE_REF=" + REF,
+                        "flock",
+                        "-n",
+                        "-E",
+                        "75",
+                        "/run/yolobox-rebuild.lock",
                         "nixos-rebuild",
                         action,
                         "--impure",
@@ -870,3 +879,48 @@ class TestRebuild(GuestScript):
 
     def test_the_exit_code_of_the_rebuild_is_the_helpers(self):
         self.assertEqual(self.rebuild("switch", sudo_rc=4).returncode, 4)
+
+
+# A sudo that runs its command, and a nixos-rebuild that only records it ran.
+RUNNING_SUDO = """#!/bin/sh
+exec "$@"
+"""
+RECORDING_REBUILD = """#!/bin/sh
+printf '%s\\n' "$*" > "$FAKE_REBUILD_RAN"
+"""
+
+
+@unittest.skipUnless(shutil.which("flock"), "needs flock")
+class TestRebuildLock(RebuildCase):
+    """With the real flock, a rebuild runs only while no other holds the lock."""
+
+    def setUp(self):
+        super().setUp()
+        bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
+        for name, text in (
+            ("sudo", RUNNING_SUDO),
+            ("nixos-rebuild", RECORDING_REBUILD),
+        ):
+            tool = bin_dir / name
+            tool.write_text(text)
+            tool.chmod(0o755)
+        self.lock = self.tmp / "rebuild.lock"
+        self.ran = self.tmp / "rebuild-ran"
+        self.env.update(
+            YOLOBOX_REBUILD_LOCK=str(self.lock), FAKE_REBUILD_RAN=str(self.ran)
+        )
+
+    def test_a_free_lock_lets_the_rebuild_run_with_its_variables(self):
+        result = self.rebuild("boot")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.ran.read_text(), "boot --impure --refresh --flake %s#yolobox\n" % REF
+        )
+
+    def test_a_held_lock_refuses_the_rebuild_at_once_and_says_why(self):
+        with open(self.lock, "w") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            result = self.rebuild("boot")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertIn("another rebuild is running", result.stderr)
+        self.assertFalse(self.ran.exists(), "nixos-rebuild ran under a held lock")
