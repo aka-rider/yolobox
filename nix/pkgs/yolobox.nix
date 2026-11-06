@@ -4,11 +4,8 @@
 , src
 , version
 , fzf
-, git
 , openssh
-, curl
 , python3
-, coreutils
 , lima
 , xorriso
 }:
@@ -52,8 +49,11 @@ stdenvNoCC.mkDerivation {
 
     patchShebangs "$out/libexec/yolobox/yo" "$out/libexec/yolobox/aws-broker"
 
+    # What yo and aws-broker run on the host: ssh and scp, fzf, python3 (their
+    # shebang), limactl on a Mac and xorriso on Linux. The rest of what yo
+    # names (git, curl, coreutils) runs in the guest over ssh.
     makeWrapper "$out/libexec/yolobox/yo" "$out/bin/yo" \
-      --prefix PATH : ${lib.makeBinPath ([ fzf git openssh curl python3 coreutils ]
+      --prefix PATH : ${lib.makeBinPath ([ fzf openssh python3 ]
         ++ lib.optional stdenvNoCC.hostPlatform.isDarwin lima
         ++ lib.optional stdenvNoCC.hostPlatform.isLinux xorriso)}
 
