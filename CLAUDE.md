@@ -115,8 +115,9 @@ Box configuration (Nix):
   `nix/harnesses.md`.
 - `nix/herd-server.nix`: the VM's own herdr server, run as the agent.
   `nix/herd-server.md`.
-- `nix/display.nix`: the virtual X display, browsers and screen recording.
-  `nix/display.md`.
+- `nix/display.nix`: the virtual X display, browsers and screen recording;
+  `nix/display/yolobox-screen-record.sh` is the recorder, built the way
+  `nix/guest.nix` builds the guest script. `nix/display.md`.
 - `nix/hardening.nix`: blocked kernel modules, the setuid and capability wrapper
   allowlist with its eval-time assertion of each wrapper's privilege, sysctls and
   kernel parameters. `yolobox.hardening.extraWrappers` (wrapper name to its
@@ -170,6 +171,8 @@ Tests, all under `tests/`:
   against a fresh render; `render-tunnel-egress.sh` renders the one with
   `tunnelInterfaces`. `nix/egress.md`.
 - `test_luks_scripts.py`: runs the three initrd scripts under bash.
+- `test_screen_record.py`: runs `yolobox-screen-record` under bash with a fake
+  `ffmpeg`.
 - `box-hardening-check.sh` and `box-hardening-e2e.sh`: the acceptance test for
   `nix/hardening.nix`. The first runs inside a box as the operator and checks
   that the hardening holds and nothing the agent needs broke. Its environment
@@ -195,7 +198,7 @@ Tests, all under `tests/`:
 ```sh
 python3 -m unittest discover -s tests        # CI runs 3.9 and the newest 3.x
 uvx ruff@0.17.2 check . && uvx ruff@0.17.2 format --check .   # see below
-shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh   # verify.yml's list
+shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/display/yolobox-screen-record.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh   # verify.yml's list
 YOLOBOX_USERNAME=$(id -un) YOLOBOX_FLAKE_REF=github:aka-rider/yolobox/ci nix flake check --impure
 ```
 

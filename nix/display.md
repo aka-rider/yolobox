@@ -39,7 +39,7 @@ To recognise a regression, look for the exact pi error string coming back. It me
 - `openbox` waits for the X socket in `ExecStartPre`. A `Restart=` loop trips systemd's start limit and stays failed.
 - Use `${pkgs.xvfb}/bin/Xvfb`. `lib.getExe` on it names a binary that does not exist.
 - No tmpfiles rule for `/tmp/.X11-unix`. systemd ships one.
-- The screen-record pidfile lives in `~/.local/state/yolobox`, because `/run/user/$UID` dies at logout while the backgrounded `ffmpeg` survives. `SIGINT` finalizes the mp4 and `SIGKILL` corrupts it.
+- The screen-record pidfile lives in `~/.local/state/yolobox`, because `/run/user/$UID` dies at logout while the backgrounded `ffmpeg` survives. `SIGINT` finalizes the mp4 and `SIGKILL` corrupts it. The file survives a reboot too, and the kernel reuses its pid, so `start` and `stop` trust it only when `/proc/<pid>/comm` is `ffmpeg` and otherwise remove it. Without that check, `stop` sent `SIGINT` to whatever agent process had the pid, and `start` refused with "already recording". Recognise it by `stop` saying "stale pid file" after a reboot.
 - Headed screenshots without `fonts.packages` render as tofu.
 - Default ffmpeg has no x11grab, so `nix/display.nix` uses `ffmpeg-full`.
 - Two sessions share one browser. Chromium's singleton lock forwards the second launch, which is slow. That is not isolation and not a failure.
