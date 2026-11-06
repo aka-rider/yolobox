@@ -2744,6 +2744,14 @@ class TestCmdStatusExitCode(StatusRunner, unittest.TestCase):
                 aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
                 broker=yo.BROKER_UNREACHABLE,
             ),
+            "aws broker without a control socket": dict(
+                aws_which="/usr/bin/aws",
+                aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
+                broker=yo.BrokerHealth(
+                    yo.BrokerState.NO_CONTROL,
+                    {"pid": 5, "watch_pid": 777, "allow": ["work"]},
+                ),
+            ),
             "aws broker stale": dict(
                 aws_which="/usr/bin/aws",
                 aws_allowlist_side_effect=lambda: [("work", "us-east-1")],

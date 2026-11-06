@@ -68,7 +68,13 @@ def checked_pid(value: object) -> Optional[int]:
 
 
 def aws_broker_sock() -> str:
+    """The socket Lima forwards into the guest."""
     return os.path.join(state.state_dir(), "aws-broker.sock")
+
+
+def aws_broker_ctl_sock() -> str:
+    """The broker's host-only socket, for yo's /health. Never forwarded."""
+    return os.path.join(state.state_dir(), "aws-broker.ctl.sock")
 
 
 AWS_REGION_RE = re.compile(r"[a-z]{2,4}(-[a-z]+)+-\d+", re.ASCII)
@@ -170,20 +176,24 @@ class UnixSocketHTTPConnection(http.client.HTTPConnection):
 class BrokerState(enum.Enum):
     UNREACHABLE = "unreachable"
     HEALTHY = "healthy"
+    # Answers only on the socket forwarded to the guest: a broker started by an
+    # older yo, which has no control socket. It is stopped by the pid it reports.
+    NO_CONTROL = "no control socket"
 
 
 class BrokerHealth(NamedTuple):
     state: BrokerState
-    info: Dict[str, Any]  # the broker's /health JSON; empty unless HEALTHY
+    info: Dict[str, Any]  # the broker's /health JSON; empty when UNREACHABLE
 
 
 BROKER_UNREACHABLE = BrokerHealth(BrokerState.UNREACHABLE, {})
 HTTP_OK = 200
 
 
-def aws_broker_health(timeout: float = HEALTH_TIMEOUT_SECONDS) -> BrokerHealth:
+def health_on(sock_path: str, timeout: float) -> Optional[Dict[str, Any]]:
+    """The /health JSON the broker answers on `sock_path`, None for anything else."""
     try:
-        conn = UnixSocketHTTPConnection(aws_broker_sock(), timeout)
+        conn = UnixSocketHTTPConnection(sock_path, timeout)
         try:
             conn.request("GET", "/health")
             response = conn.getresponse()
@@ -191,13 +201,26 @@ def aws_broker_health(timeout: float = HEALTH_TIMEOUT_SECONDS) -> BrokerHealth:
         finally:
             conn.close()
         if response.status != HTTP_OK:
-            return BROKER_UNREACHABLE
+            return None
         info = json.loads(data.decode())
-        if not isinstance(info, dict):
-            return BROKER_UNREACHABLE
-        return BrokerHealth(BrokerState.HEALTHY, info)
+        return info if isinstance(info, dict) else None
     except (OSError, http.client.HTTPException, ValueError):
-        return BROKER_UNREACHABLE
+        return None
+
+
+def aws_broker_health(timeout: float = HEALTH_TIMEOUT_SECONDS) -> BrokerHealth:
+    """Ask the broker on its control socket, which the guest cannot crowd out.
+
+    A broker from an older yo has none, but still answers on the forwarded
+    socket; that is NO_CONTROL, not healthy, so it gets replaced.
+    """
+    info = health_on(aws_broker_ctl_sock(), timeout)
+    if info is not None:
+        return BrokerHealth(BrokerState.HEALTHY, info)
+    info = health_on(aws_broker_sock(), timeout)
+    if info is not None:
+        return BrokerHealth(BrokerState.NO_CONTROL, info)
+    return BROKER_UNREACHABLE
 
 
 def pid_exits_within(pid: int, timeout: float) -> bool:
@@ -245,6 +268,8 @@ def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
                 str(SCRIPT_DIR / "aws-broker"),
                 "--socket",
                 aws_broker_sock(),
+                "--control-socket",
+                aws_broker_ctl_sock(),
                 "--watch-pid",
                 str(watch_pid),
                 "--allow",
@@ -339,7 +364,7 @@ def disable_aws_broker() -> None:
 def broker_needs_restart(
     health: BrokerHealth, watch_pid: int, allowed_names: Sequence[str]
 ) -> bool:
-    if health.state is BrokerState.UNREACHABLE:
+    if health.state is not BrokerState.HEALTHY:
         return True
     if checked_pid(health.info.get("watch_pid")) != watch_pid:
         return True

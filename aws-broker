@@ -33,6 +33,19 @@ from yolobox_cli.common import (  # noqa: E402
 # 503 immediately instead of queueing a thread behind a stuck mint. /health
 # takes no slot, so it is never busy.
 MAX_CONCURRENT_REQUESTS = 32
+# At most this many connections are open on the guest socket at once; the next
+# one is closed at accept, before a thread or a deadline timer is spent on it.
+# The guest is the untrusted side and can open them as fast as it likes. Twice
+# the /creds/ slots, so a full house of mints still leaves room for probes and
+# for the 503 replies.
+MAX_CONNECTIONS = 64
+# The control socket serves yo's /health and nothing else, and only the host
+# reaches it; the bound just keeps a runaway host process from piling up threads.
+MAX_CONTROL_CONNECTIONS = 8
+# The request line and the headers together, a GET's whole request. The stdlib
+# allows 64 KiB for the line and 100 headers of 64 KiB, which is 6.4 MB a
+# connection; a real request is a couple of hundred bytes.
+MAX_REQUEST_HEAD_BYTES = 8192
 EXIT_OK = 0
 # Without a working watch nothing would ever end this broker, so it ends itself
 # and says so in its exit status.
@@ -88,6 +101,7 @@ def fail(msg):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--socket", required=True, metavar="PATH")
+    p.add_argument("--control-socket", required=True, metavar="PATH")
     p.add_argument("--watch-pid", type=int, required=True)
     p.add_argument("--allow", nargs="+", required=True, metavar="PROFILE")
     p.add_argument(
@@ -157,6 +171,11 @@ def reclaim_socket_path(path):
         fail(f"cannot remove stale socket {path}: {e}")
 
 
+class BoundSocket(NamedTuple):
+    path: str
+    identity: tuple  # (st_dev, st_ino) of the socket file at bind
+
+
 def unlink_if_same_identity(path, identity):
     try:
         st = os.lstat(path)
@@ -185,23 +204,25 @@ def register_pid_watch_event(pid):
         fail(f"registration of a watch on pid {pid} failed: {e}")
 
 
-def exit_cleanly(why, socket_path, identity, status):
+def unlink_bound(sockets):
+    for bound in sockets:
+        unlink_if_same_identity(bound.path, bound.identity)
+
+
+def exit_cleanly(why, sockets, status):
     log(f"{why}; shutting down")
-    unlink_if_same_identity(socket_path, identity)
+    unlink_bound(sockets)
     os._exit(status)
 
 
-def wait_for_pid_exit(pid, socket_path, identity, wait_for_exit):
+def wait_for_pid_exit(pid, sockets, wait_for_exit):
     try:
         wait_for_exit()
     except OSError as failure:
         exit_cleanly(
-            f"waiting for pid {pid} failed: {failure}",
-            socket_path,
-            identity,
-            EXIT_WATCH_FAILED,
+            f"waiting for pid {pid} failed: {failure}", sockets, EXIT_WATCH_FAILED
         )
-    exit_cleanly(f"watched pid {pid} exited", socket_path, identity, EXIT_OK)
+    exit_cleanly(f"watched pid {pid} exited", sockets, EXIT_OK)
 
 
 EXPIRATION_RE = re.compile(
@@ -373,6 +394,38 @@ class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     request_queue_size = REQUEST_QUEUE_SIZE
 
+    def __init__(self, socket_path, handler_factory, max_connections):
+        self.connections = threading.BoundedSemaphore(max_connections)
+        # Only the accept loop reads or writes this.
+        self.saturated = False
+        super().__init__(socket_path, handler_factory)
+
+    # The bound is taken here, in the accept loop, before the base class starts
+    # a thread: whatever a client sends, it costs this broker one of
+    # max_connections threads at most. A connection over the bound is closed at
+    # once. The one log line is for the first of a run of refusals, so a flood
+    # cannot also grow broker.log.
+    def process_request(self, request, client_address):
+        if not self.connections.acquire(blocking=False):
+            if not self.saturated:
+                self.saturated = True
+                log("too many open connections; closing new ones until some finish")
+            self.shutdown_request(request)
+            return
+        self.saturated = False
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # No thread took the connection over, so its slot is still ours.
+            self.connections.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connections.release()
+
     # The base class prints the traceback to stderr as it is, past sanitize().
     def handle_error(self, request, client_address):
         log(f"request failed:\n{traceback.format_exc()}")
@@ -413,12 +466,48 @@ def text_reply(status, body):
     return Reply(status, "text/plain", body)
 
 
+class RequestHeadTooLarge(Exception):
+    """The request line and headers ran past MAX_REQUEST_HEAD_BYTES."""
+
+
+class CappedReader:
+    """The request's rfile, which refuses to hand out more than `limit` bytes.
+
+    The stdlib's own caps are per line (64 KiB) and per header count (100), far
+    above any request this broker serves.
+    """
+
+    def __init__(self, inner, limit):
+        self.inner = inner
+        self.remaining = limit
+
+    def readline(self, size=-1):
+        # One byte past what is left, so that overshooting is seen as such.
+        if size < 0 or size > self.remaining + 1:
+            size = self.remaining + 1
+        line = self.inner.readline(size)
+        self.remaining -= len(line)
+        if self.remaining < 0:
+            raise RequestHeadTooLarge()
+        return line
+
+    def close(self):
+        self.inner.close()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    # The control socket's handler turns this off: it answers /health only.
+    serves_creds = True
+
     def __init__(self, states, watch_pid, slots, *args, **kwargs):
         self.states = states
         self.watch_pid = watch_pid
         self.slots = slots
         super().__init__(*args, **kwargs)
+
+    def setup(self):
+        super().setup()
+        self.rfile = CappedReader(self.rfile, MAX_REQUEST_HEAD_BYTES)
 
     # Every connection lives under one wall-clock deadline: when it passes,
     # the timer shuts the socket down, which fails whatever read or write the
@@ -434,6 +523,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         deadline.start()
         try:
             super().handle()
+        except RequestHeadTooLarge:
+            log(f"request head over {MAX_REQUEST_HEAD_BYTES} bytes; closing")
         except OSError:
             # What the shutdown below breaks is expected and already logged;
             # any other socket error is not.
@@ -523,7 +614,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # queued behind a mint that may take MINT_TIMEOUT_SECONDS. /health reads
     # only memory and takes no slot, so yo can always ask who is serving.
     def do_GET(self):
-        profile = creds_profile(self.path)
+        profile = creds_profile(self.path) if self.serves_creds else None
         if profile is None:
             self._send(self._reply_for(profile))
         elif self.slots.acquire(blocking=False):
@@ -552,7 +643,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
 
 
-def bind_server(socket_path, states, watch_pid, max_concurrent=MAX_CONCURRENT_REQUESTS):
+class ControlHandler(Handler):
+    """yo's /health on the host-only socket; the guest never reaches it."""
+
+    serves_creds = False
+
+
+def bind_server(
+    socket_path,
+    states,
+    watch_pid,
+    max_concurrent=MAX_CONCURRENT_REQUESTS,
+    max_connections=MAX_CONNECTIONS,
+    handler_class=Handler,
+):
     """Bind the 0600 unix socket and return (server, (st_dev, st_ino))."""
     slots = threading.BoundedSemaphore(max_concurrent)
     # Only the socket file's own mode governs who can connect: no bearer
@@ -566,7 +670,8 @@ def bind_server(socket_path, states, watch_pid, max_concurrent=MAX_CONCURRENT_RE
     try:
         server = UnixHTTPServer(
             socket_path,
-            lambda *a, **kw: Handler(states, watch_pid, slots, *a, **kw),
+            lambda *a, **kw: handler_class(states, watch_pid, slots, *a, **kw),
+            max_connections,
         )
     except OSError as e:
         fail(f"cannot bind unix socket {socket_path}: {e}")
@@ -577,6 +682,38 @@ def bind_server(socket_path, states, watch_pid, max_concurrent=MAX_CONCURRENT_RE
     return server, (st.st_dev, st.st_ino)
 
 
+class Bound(NamedTuple):
+    guest: UnixHTTPServer
+    control: UnixHTTPServer
+    sockets: list  # of BoundSocket
+
+
+def bind_servers(socket_path, control_path, states, watch_pid):
+    """Bind the guest socket and the host-only control socket, or neither."""
+    guest, guest_identity = bind_server(socket_path, states, watch_pid)
+    try:
+        control, control_identity = bind_server(
+            control_path,
+            states,
+            watch_pid,
+            max_connections=MAX_CONTROL_CONNECTIONS,
+            handler_class=ControlHandler,
+        )
+    except SystemExit:
+        # bind_server has said why; the guest socket must not outlive it.
+        guest.server_close()
+        unlink_if_same_identity(socket_path, guest_identity)
+        raise
+    return Bound(
+        guest,
+        control,
+        [
+            BoundSocket(socket_path, guest_identity),
+            BoundSocket(control_path, control_identity),
+        ],
+    )
+
+
 def main():
     args = parse_args()
 
@@ -585,6 +722,7 @@ def main():
 
     with held_socket_lock(args.socket):
         reclaim_socket_path(args.socket)
+        reclaim_socket_path(args.control_socket)
 
         states = {
             profile: State(profile, args.min_remint_interval) for profile in args.allow
@@ -599,12 +737,10 @@ def main():
         # SIGTERM that arrives in between is held back until the handler is in
         # place instead of killing the broker with the socket file left behind.
         before_bind_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-        server, identity = bind_server(args.socket, states, args.watch_pid)
+        bound = bind_servers(args.socket, args.control_socket, states, args.watch_pid)
         signal.signal(
             signal.SIGTERM,
-            lambda signum, frame: exit_cleanly(
-                "SIGTERM", args.socket, identity, EXIT_OK
-            ),
+            lambda signum, frame: exit_cleanly("SIGTERM", bound.sockets, EXIT_OK),
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, before_bind_mask)
 
@@ -617,14 +753,15 @@ def main():
 
     threading.Thread(
         target=wait_for_pid_exit,
-        args=(args.watch_pid, args.socket, identity, wait_for_exit),
+        args=(args.watch_pid, bound.sockets, wait_for_exit),
         daemon=True,
     ).start()
+    threading.Thread(target=bound.control.serve_forever, daemon=True).start()
 
     try:
-        server.serve_forever()
+        bound.guest.serve_forever()
     finally:
-        unlink_if_same_identity(args.socket, identity)
+        unlink_bound(bound.sockets)
 
 
 if __name__ == "__main__":

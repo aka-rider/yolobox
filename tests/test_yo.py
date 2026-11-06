@@ -2887,13 +2887,16 @@ class BrokerStub:
 
 
 class TestAwsBrokerHealth(FakeHome):
-    def health_of(self, status, body):
+    def health_on(self, sock, status, body):
         os.makedirs(yo.state_dir(), exist_ok=True)
-        stub = BrokerStub(yo.aws_broker_sock(), status, body)
+        stub = BrokerStub(sock, status, body)
         try:
             return yo.aws_broker_health()
         finally:
             stub.close()
+
+    def health_of(self, status, body):
+        return self.health_on(yo.aws.aws_broker_ctl_sock(), status, body)
 
     def test_a_healthy_broker_carries_what_it_reported(self):
         info = {"pid": 5, "watch_pid": 7, "allow": ["work"]}
@@ -2914,6 +2917,28 @@ class TestAwsBrokerHealth(FakeHome):
 
     def test_no_socket_is_unreachable(self):
         self.assertIs(yo.aws_broker_health(), yo.BROKER_UNREACHABLE)
+
+    def test_a_broker_answering_only_on_the_forwarded_socket_has_no_control_socket(
+        self,
+    ):
+        # What an older yo's broker looks like: it has no control socket.
+        info = {"pid": 5, "watch_pid": 7, "allow": ["work"]}
+        health = self.health_on(yo.aws_broker_sock(), 200, json.dumps(info).encode())
+        self.assertEqual(health, yo.BrokerHealth(yo.BrokerState.NO_CONTROL, info))
+
+    def test_the_control_socket_is_asked_first(self):
+        # A control socket that answers decides, whatever the forwarded one says.
+        os.makedirs(yo.state_dir(), exist_ok=True)
+        control = BrokerStub(
+            yo.aws.aws_broker_ctl_sock(), 200, json.dumps({"pid": 1}).encode()
+        )
+        guest = BrokerStub(yo.aws_broker_sock(), 503, b"broker busy; retry\n")
+        try:
+            health = yo.aws_broker_health()
+        finally:
+            guest.close()
+            control.close()
+        self.assertEqual(health, healthy({"pid": 1}))
 
 
 class TestOpProbeAlive(unittest.TestCase):
@@ -2972,6 +2997,12 @@ class TestBrokerNeedsRestart(unittest.TestCase):
             with self.subTest(value=value):
                 health = healthy({"pid": 5, "watch_pid": value, "allow": ["work"]})
                 self.assertTrue(yo.broker_needs_restart(health, 123, ["work"]))
+
+    def test_a_broker_without_a_control_socket_needs_restart(self):
+        health = yo.BrokerHealth(
+            yo.BrokerState.NO_CONTROL, {"pid": 1, "watch_pid": 123, "allow": ["work"]}
+        )
+        self.assertTrue(yo.broker_needs_restart(health, 123, ["work"]))
 
     def test_an_unreachable_broker_needs_restart(self):
         self.assertTrue(yo.broker_needs_restart(yo.BROKER_UNREACHABLE, 123, ["work"]))
@@ -3078,6 +3109,31 @@ class TestEnsureAwsBrokerSerializesYos(FakeHome):
         self.assertFalse(self.lock_is_held())
 
 
+class TestEnsureAwsBrokerUpgradesAnOlderBroker(FakeHome):
+    def test_a_broker_without_a_control_socket_is_killed_by_its_pid_and_replaced(self):
+        older = yo.BrokerHealth(
+            yo.BrokerState.NO_CONTROL, {"pid": 111, "watch_pid": 555, "allow": ["work"]}
+        )
+        killed = []
+        with (
+            mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
+            mock.patch.object(
+                yo.aws, "aws_allowlist", return_value=[("work", "us-east-1")]
+            ),
+            mock.patch.object(yo.box.driver, "keepalive_pid", return_value=555),
+            mock.patch.object(yo.aws, "aws_broker_health", return_value=older),
+            mock.patch.object(yo.aws, "wait_for_pid_exit"),
+            mock.patch.object(yo.aws, "start_aws_broker") as fake_start,
+            mock.patch.object(yo.aws, "push_aws_guest_files"),
+            mock.patch.object(
+                yo.os, "kill", side_effect=lambda pid, sig: killed.append(pid)
+            ),
+        ):
+            yo.ensure_aws_broker()
+        self.assertEqual(killed, [111])
+        fake_start.assert_called_once_with(555, ["work"])
+
+
 @unittest.skipUnless(
     hasattr(os, "pidfd_open") or hasattr(select, "kqueue"),
     "needs os.pidfd_open or select.kqueue to watch a pid",
@@ -3138,6 +3194,25 @@ class TestStartAwsBrokerFiles(FakeHome):
             ),
         ):
             yo.start_aws_broker(555, ["work"])
+
+    def test_the_broker_is_told_both_its_sockets(self):
+        proc = mock.Mock()
+        proc.stdout.fileno.return_value = 0
+        with (
+            mock.patch.object(yo.subprocess, "Popen", return_value=proc) as popen,
+            mock.patch.object(
+                yo.aws,
+                "read_handshake",
+                return_value=yo.aws.Handshake(["READY"], False),
+            ),
+        ):
+            yo.start_aws_broker(555, ["work"])
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[argv.index("--socket") + 1], yo.aws_broker_sock())
+        self.assertEqual(
+            argv[argv.index("--control-socket") + 1], yo.aws.aws_broker_ctl_sock()
+        )
+        self.assertNotEqual(yo.aws_broker_sock(), yo.aws.aws_broker_ctl_sock())
 
     def test_the_broker_does_not_inherit_yos_stdin(self):
         proc = mock.Mock()

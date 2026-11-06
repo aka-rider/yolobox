@@ -523,7 +523,16 @@ def aws_lines(vm_reachable: bool) -> List[StatusLine]:
     if health.state is aws.BrokerState.UNREACHABLE:
         lines.append(
             StatusLine(
-                "aws: broker not reachable on this host's %s" % aws.aws_broker_sock(),
+                "aws: broker not reachable on this host's %s"
+                % aws.aws_broker_ctl_sock(),
+                True,
+            )
+        )
+    elif health.state is aws.BrokerState.NO_CONTROL:
+        lines.append(
+            StatusLine(
+                "aws: broker has no control socket (started by an older yo); "
+                "%s replaces it" % state.yo_cmd("up"),
                 True,
             )
         )

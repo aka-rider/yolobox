@@ -132,7 +132,8 @@ class TestSanitize(unittest.TestCase):
 
 class TestParseArgs(unittest.TestCase):
     def parse(self, *allow):
-        argv = ["aws-broker", "--socket", "/x", "--watch-pid", "1", "--allow", *allow]
+        argv = ["aws-broker", "--socket", "/x", "--control-socket", "/y"]
+        argv += ["--watch-pid", "1", "--allow", *allow]
         out = io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
             try:
@@ -337,6 +338,7 @@ class SocketDirCase(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="awsb")
         self.addCleanup(self.rmtree)
         self.sock = os.path.join(self.dir, "s.sock")
+        self.ctl = os.path.join(self.dir, "c.sock")
 
     def rmtree(self):
         for name in os.listdir(self.dir):
@@ -519,7 +521,8 @@ class TestWatchedPidExit(unittest.TestCase):
             mock.patch.object(broker.os, "_exit", side_effect=Exited) as exit_,
         ):
             with self.assertRaises(Exited):
-                broker.wait_for_pid_exit(7, "/no/such/socket", (0, 0), wait_for_exit)
+                gone = broker.BoundSocket("/no/such/socket", (0, 0))
+                broker.wait_for_pid_exit(7, [gone], wait_for_exit)
         exit_.assert_called_once_with(status)
         return "\n".join(str(call.args[0]) for call in log.call_args_list)
 
@@ -537,7 +540,8 @@ class TestWatchedPidExit(unittest.TestCase):
 
 class TestMain(SocketDirCase):
     def test_a_watch_that_cannot_be_set_up_leaves_no_socket_behind(self):
-        argv = ["aws-broker", "--socket", self.sock, "--watch-pid", str(os.getpid())]
+        argv = ["aws-broker", "--socket", self.sock, "--control-socket", self.ctl]
+        argv += ["--watch-pid", str(os.getpid())]
         out = io.StringIO()
         with mock.patch.object(sys, "argv", [*argv, "--allow", "dev"]):
             with mock.patch.object(broker, "pid_exit_watch", side_effect=OSError("no")):
@@ -556,6 +560,8 @@ class TestSigterm(SocketDirCase):
                 BROKER_PATH,
                 "--socket",
                 self.sock,
+                "--control-socket",
+                self.ctl,
                 "--watch-pid",
                 str(os.getpid()),
                 "--allow",
@@ -570,9 +576,11 @@ class TestSigterm(SocketDirCase):
         self.addCleanup(broker_proc.kill)
         self.assertEqual(broker_proc.stdout.readline(), "READY\n")
         self.assertTrue(os.path.exists(self.sock))
+        self.assertTrue(os.path.exists(self.ctl))
         broker_proc.terminate()
         self.assertEqual(broker_proc.wait(30), 0, broker_proc.stderr.read())
         self.assertFalse(os.path.lexists(self.sock))
+        self.assertFalse(os.path.lexists(self.ctl))
 
 
 # The head of every script below: load the broker file as a module to wrap one
@@ -587,15 +595,16 @@ loader.exec_module(broker)
 WINDOW_SCRIPT = (
     LOAD_BROKER
     + """
-real_bind = broker.bind_server
+real_bind = broker.bind_servers
 
 def bind_then_sigterm(*args, **kwargs):
     bound = real_bind(*args, **kwargs)
     os.kill(os.getpid(), signal.SIGTERM)  # lands between the bind and main()'s next line
     return bound
 
-broker.bind_server = bind_then_sigterm
-sys.argv = ["aws-broker", "--socket", sys.argv[2], "--watch-pid", sys.argv[3], "--allow", "dev"]
+broker.bind_servers = bind_then_sigterm
+sys.argv = ["aws-broker", "--socket", sys.argv[2], "--control-socket", sys.argv[2] + ".ctl",
+            "--watch-pid", sys.argv[3], "--allow", "dev"]
 broker.main()
 """
 )
@@ -626,15 +635,16 @@ class TestSigtermDuringBind(SocketDirCase):
 PAUSE_SCRIPT = (
     LOAD_BROKER
     + """
-real_bind = broker.bind_server
+real_bind = broker.bind_servers
 
 def bind_after_go(*args, **kwargs):
     print("IN_WINDOW", flush=True)
     sys.stdin.readline()
     return real_bind(*args, **kwargs)
 
-broker.bind_server = bind_after_go
-sys.argv = ["aws-broker", "--socket", sys.argv[2], "--watch-pid", sys.argv[3], "--allow", "dev"]
+broker.bind_servers = bind_after_go
+sys.argv = ["aws-broker", "--socket", sys.argv[2], "--control-socket", sys.argv[2] + ".ctl",
+            "--watch-pid", sys.argv[3], "--allow", "dev"]
 broker.main()
 """
 )
@@ -656,7 +666,8 @@ def announce_reclaim(path):
 
 broker.held_socket_lock = announce_lock
 broker.reclaim_socket_path = announce_reclaim
-sys.argv = ["aws-broker", "--socket", sys.argv[2], "--watch-pid", sys.argv[3], "--allow", "dev"]
+sys.argv = ["aws-broker", "--socket", sys.argv[2], "--control-socket", sys.argv[2] + ".ctl",
+            "--watch-pid", sys.argv[3], "--allow", "dev"]
 broker.main()
 """
 )
@@ -737,6 +748,7 @@ class TestSocketLock(SocketDirCase):
         # serve forever instead of failing.
         done = subprocess.run(
             [sys.executable, BROKER_PATH, "--socket", self.sock]
+            + ["--control-socket", self.ctl]
             + ["--watch-pid", str(os.getpid()), "--allow", "dev"],
             capture_output=True,
             text=True,
@@ -782,6 +794,7 @@ class TestBindServer(SocketDirCase):
 class ServedBroker(SocketDirCase):
     allow = ("dev", "prod")
     max_concurrent = broker.MAX_CONCURRENT_REQUESTS
+    max_connections = broker.MAX_CONNECTIONS
     min_remint_interval = 0.0
 
     def setUp(self):
@@ -791,7 +804,11 @@ class ServedBroker(SocketDirCase):
         self.addCleanup(log_patch.stop)
         self.states = {p: broker.State(p, self.min_remint_interval) for p in self.allow}
         self.server, _ = broker.bind_server(
-            self.sock, self.states, 4242, max_concurrent=self.max_concurrent
+            self.sock,
+            self.states,
+            4242,
+            max_concurrent=self.max_concurrent,
+            max_connections=self.max_connections,
         )
         thread = threading.Thread(
             target=self.server.serve_forever,
@@ -806,11 +823,11 @@ class ServedBroker(SocketDirCase):
         thread.join()
         self.server.server_close()
 
-    def exchange(self, request, half_close=False):
+    def exchange(self, request, half_close=False, sock=None):
         """Send raw bytes, return everything the broker answers until it closes."""
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
             c.settimeout(5)
-            c.connect(self.sock)
+            c.connect(sock or self.sock)
             try:
                 c.sendall(request)
                 if half_close:
@@ -825,8 +842,8 @@ class ServedBroker(SocketDirCase):
                 pass  # the broker closed with part of the request unread
         return raw
 
-    def get(self, path):
-        raw = self.exchange(f"GET {path} HTTP/1.0\r\n\r\n".encode())
+    def get(self, path, sock=None):
+        raw = self.exchange(f"GET {path} HTTP/1.0\r\n\r\n".encode(), sock=sock)
         head, _, body = raw.partition(b"\r\n\r\n")
         return int(head.split()[1]), body.decode()
 
@@ -957,7 +974,7 @@ class TestServedRequests(ServedBroker):
         self.assertNotIn("\x1b", stderr.getvalue())
 
     def test_a_long_request_path_is_clipped_in_the_log(self):
-        path = "/" + "x" * 20000
+        path = "/" + "x" * (broker.MAX_REQUEST_HEAD_BYTES // 2)
         self.assertEqual(self.get(path)[0], 404)
         self.assertNotIn(path, self.logged())
         self.assertIn("more)", self.logged())
@@ -1079,10 +1096,6 @@ class TestConcurrentClients(ServedBroker):
         self.assertEqual(run.call_count, 1)
 
 
-# http.server's own cap on a request line.
-HTTP_SERVER_REQUEST_LINE_CAP = 65536
-
-
 class TestMalformedRequests(ServedBroker):
     def assert_still_serving(self):
         self.assertEqual(self.get("/health")[0], 200)
@@ -1101,15 +1114,44 @@ class TestMalformedRequests(ServedBroker):
                 self.assertRegex(answer, rb"^HTTP/1\.[01] (200|403) ")
                 self.assert_still_serving()
 
-    def test_a_request_line_over_64_kb_is_414(self):
-        answer = self.exchange(b"GET /" + b"a" * 70000 + b" HTTP/1.0\r\n\r\n")
-        self.assertRegex(answer, rb"^HTTP/1\.[01] 414 ")
-        self.assert_still_serving()
 
-    def test_a_request_line_of_exactly_64_kb_is_not_414(self):
-        padding = b"a" * (HTTP_SERVER_REQUEST_LINE_CAP - len(b"GET / HTTP/1.0\r\n") - 1)
+class TestRequestHeadCap(ServedBroker):
+    cap = broker.MAX_REQUEST_HEAD_BYTES
+
+    def assert_still_serving(self):
+        self.assertEqual(self.get("/health")[0], 200)
+
+    def test_a_request_head_of_exactly_the_cap_is_served(self):
+        frame = b"GET / HTTP/1.0\r\n\r\n"
+        padding = b"a" * (self.cap - len(frame))
         answer = self.exchange(b"GET /" + padding + b" HTTP/1.0\r\n\r\n")
         self.assertRegex(answer, rb"^HTTP/1\.[01] 404 ")
+
+    def test_a_request_line_over_the_cap_is_closed_unanswered(self):
+        for length in [self.cap, 70000]:
+            with self.subTest(length=length):
+                answer = self.exchange(b"GET /" + b"a" * length + b" HTTP/1.0\r\n\r\n")
+                self.assertEqual(answer, b"")
+                self.assert_still_serving()
+
+    def test_one_header_over_the_cap_is_closed_unanswered(self):
+        answer = self.exchange(
+            b"GET /health HTTP/1.0\r\nX: " + b"a" * self.cap + b"\r\n\r\n"
+        )
+        self.assertEqual(answer, b"")
+        self.assert_still_serving()
+
+    def test_many_small_headers_over_the_cap_together_are_closed_unanswered(self):
+        headers = b"".join(b"X-%03d: %s\r\n" % (n, b"a" * 100) for n in range(90))
+        self.assertGreater(len(headers), self.cap)
+        answer = self.exchange(b"GET /health HTTP/1.0\r\n" + headers + b"\r\n")
+        self.assertEqual(answer, b"")
+        self.assert_still_serving()
+
+    def test_the_refusal_is_logged_without_a_traceback(self):
+        self.exchange(b"GET /" + b"a" * self.cap + b" HTTP/1.0\r\n\r\n")
+        self.assertIn("request head over", self.logged())
+        self.assertNotIn("Traceback", self.logged())
 
 
 class TestSingleSlot(ServedBroker):
@@ -1159,6 +1201,190 @@ class TestNoSlotFree(ServedBroker):
 
     def test_health_is_never_busy(self):
         self.assertEqual(self.get("/health")[0], 200)
+
+
+class HeldConnection:
+    """A client that connects and then says nothing, so its handler stays blocked in a read."""
+
+    def __init__(self, path):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(5)
+        self.sock.connect(path)
+
+    def close(self):
+        self.sock.close()
+
+
+class TestConnectionBound(ServedBroker):
+    max_connections = 1
+
+    def setUp(self):
+        super().setUp()
+        # Set once a connection's thread has finished, slot released.
+        self.finished = threading.Event()
+        real = broker.UnixHTTPServer.process_request_thread
+
+        def finishing(server, request, client_address):
+            real(server, request, client_address)
+            self.finished.set()
+
+        patch = mock.patch.object(
+            broker.UnixHTTPServer, "process_request_thread", finishing
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def hold(self):
+        held = HeldConnection(self.sock)
+        self.addCleanup(held.close)
+        return held
+
+    def test_a_connection_over_the_bound_is_closed_at_once_and_unanswered(self):
+        self.hold()  # accepted first: the kernel queues connections in order
+        self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
+        self.assertFalse(self.finished.is_set())
+
+    def test_the_slot_comes_back_when_the_connection_ends(self):
+        held = self.hold()
+        self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
+        held.close()
+        self.assertTrue(self.finished.wait(10))
+        self.assertEqual(self.get("/health")[0], 200)
+
+    def test_the_slot_comes_back_when_the_handler_crashes(self):
+        boom = RuntimeError("boom")
+        with mock.patch.object(broker.Handler, "handle_one_request", side_effect=boom):
+            self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
+            self.assertTrue(self.finished.wait(10))
+        self.assertEqual(self.get("/health")[0], 200)
+
+    def test_the_slot_comes_back_when_no_thread_can_be_started(self):
+        with mock.patch.object(
+            broker.threading.Thread, "start", side_effect=RuntimeError("no threads")
+        ):
+            self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
+        self.assertEqual(self.get("/health")[0], 200)
+
+
+class TestConnectionBoundLogging(ServedBroker):
+    max_connections = 0
+
+    def test_a_run_of_refused_connections_is_logged_once(self):
+        for _ in range(3):
+            self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
+        self.assertEqual(self.logged().count("too many open connections"), 1)
+
+
+class TestControlSocket(ServedBroker):
+    # The guest socket takes no connection at all: the flood the control socket
+    # must not be subject to.
+    max_connections = 0
+
+    def setUp(self):
+        super().setUp()
+        self.control, _ = broker.bind_server(
+            self.ctl,
+            self.states,
+            4242,
+            max_connections=broker.MAX_CONTROL_CONNECTIONS,
+            handler_class=broker.ControlHandler,
+        )
+        thread = threading.Thread(
+            target=self.control.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        thread.start()
+        self.addCleanup(self.stop_control, thread)
+
+    def stop_control(self, thread):
+        self.control.shutdown()
+        thread.join()
+        self.control.server_close()
+
+    def test_health_is_answered_while_the_guest_socket_refuses_every_connection(self):
+        self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
+        status, body = self.get("/health", sock=self.ctl)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["pid"], os.getpid())
+
+    def test_credentials_are_never_served_on_it(self):
+        run = self.aws(aws_result(process_json()))
+        self.assertEqual(self.get("/creds/dev", sock=self.ctl)[0], 404)
+        run.assert_not_called()
+
+    def test_the_socket_is_mode_0600(self):
+        self.assertEqual(stat.S_IMODE(os.lstat(self.ctl).st_mode), 0o600)
+
+
+class TestBindServers(SocketDirCase):
+    def test_both_sockets_are_bound_and_both_identities_recorded(self):
+        bound = broker.bind_servers(self.sock, self.ctl, {}, 1)
+        self.addCleanup(bound.guest.server_close)
+        self.addCleanup(bound.control.server_close)
+        self.assertEqual([b.path for b in bound.sockets], [self.sock, self.ctl])
+        for path, identity in bound.sockets:
+            st = os.lstat(path)
+            self.assertEqual(identity, (st.st_dev, st.st_ino))
+            self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
+
+    def test_a_control_socket_that_cannot_be_bound_leaves_no_guest_socket(self):
+        missing = os.path.join(self.dir, "no-such-dir", "c.sock")
+        out = self.fails(broker.bind_servers, self.sock, missing, {}, 1)
+        self.assertIn("cannot bind", out)
+        self.assertFalse(os.path.lexists(self.sock))
+
+    def test_unlinking_the_bound_sockets_removes_both(self):
+        bound = broker.bind_servers(self.sock, self.ctl, {}, 1)
+        bound.guest.server_close()
+        bound.control.server_close()
+        broker.unlink_bound(bound.sockets)
+        self.assertFalse(os.path.lexists(self.sock))
+        self.assertFalse(os.path.lexists(self.ctl))
+
+
+class TestControlSocketReclaim(SocketDirCase):
+    def broker_args(self):
+        return [
+            *["--socket", self.sock, "--control-socket", self.ctl],
+            *["--watch-pid", str(os.getpid()), "--allow", "dev"],
+        ]
+
+    def test_a_live_control_socket_stops_a_second_broker_and_leaves_no_guest_socket(
+        self,
+    ):
+        live, _ = broker.bind_server(self.ctl, {}, 1)
+        self.addCleanup(live.server_close)
+        done = subprocess.run(
+            [sys.executable, BROKER_PATH, *self.broker_args()],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(
+            done.stdout,
+            "ERROR=another aws-broker is already serving %s\n" % self.ctl,
+        )
+        self.assertFalse(os.path.lexists(self.sock))
+
+    @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+    def test_a_stale_control_socket_is_replaced(self):
+        stale, _ = broker.bind_server(self.ctl, {}, 1)
+        stale.server_close()  # closed but the file remains
+        child = subprocess.Popen(
+            [sys.executable, BROKER_PATH, *self.broker_args()],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(child.stderr.close)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertEqual(child.stdout.readline(), "READY\n")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.connect(self.ctl)
 
 
 class TestHandlerCrash(ServedBroker):
