@@ -534,7 +534,7 @@ class LibvirtDriver:
         """
         directory = os.path.join(state.home(), self.instances_dir)
         os.makedirs(directory, exist_ok=True)
-        with state.held_flock(os.path.join(directory, PORT_LOCK_NAME)):
+        with state.held_flock(os.path.join(directory, PORT_LOCK_NAME), wait=True):
             yield
 
     @contextlib.contextmanager
@@ -542,7 +542,9 @@ class LibvirtDriver:
         """Hold this machine's lock over checking, dropping and opening its
         operator master, so one yo never drops a master another just opened."""
         proc.private_dir(state.instance_dir())
-        with state.held_flock(os.path.join(state.instance_dir(), MASTER_LOCK_NAME)):
+        with state.held_flock(
+            os.path.join(state.instance_dir(), MASTER_LOCK_NAME), wait=True
+        ):
             yield
 
     def forward_port(self, guest_port: int) -> int:

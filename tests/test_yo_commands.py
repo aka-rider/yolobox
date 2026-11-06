@@ -3659,7 +3659,7 @@ class TestLimaStop(FakeHome):
         self.assertNotIn("kill -9", caught.exception.message)
 
     def assert_unlock_lock_held(self):
-        with self.assertRaises(yo.UnlockBusy):
+        with self.assertRaises(yo.LockBusy):
             with yo.unlock_lock(wait=False):
                 pass
 
@@ -3765,7 +3765,7 @@ class TestLimaStop(FakeHome):
             try:
                 with yo.unlock_lock(wait=False):
                     held.append(False)
-            except yo.UnlockBusy:
+            except yo.LockBusy:
                 held.append(True)
             return FakeHelper(*UNLOCKED)
 

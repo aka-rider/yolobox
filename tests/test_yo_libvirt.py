@@ -2232,7 +2232,7 @@ class TestDestroy(LibvirtCase):
     def test_yes_removes_every_piece_of_a_running_box_and_only_that_box(self):
         def assert_lock_held_while_it_mutates(argv, **kwargs):
             if argv[0] == "virsh" and argv[3] not in READS:
-                with self.assertRaises(self.box.UnlockBusy):
+                with self.assertRaises(self.box.LockBusy):
                     with self.box.state.unlock_lock(wait=False):
                         pass
             return self.host.run(argv, **kwargs)

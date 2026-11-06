@@ -395,7 +395,7 @@ def cmd_down(args: argparse.Namespace) -> None:
                 "powering it off" % state.box.name
             )
             state.driver().force_stop()
-    except state.UnlockBusy:
+    except state.LockBusy:
         raise unlock_busy_refusal(
             "Not stopping it: its answer may start the in-place encryption.",
             state.yo_cmd("down"),
@@ -435,7 +435,7 @@ def cmd_destroy(args: argparse.Namespace) -> None:
                     "Everything on %s is lost. Run %s to do it."
                     % (state.box.name, state.yo_cmd("destroy", "--yes"))
                 )
-    except state.UnlockBusy:
+    except state.LockBusy:
         raise unlock_busy_refusal(
             "Not destroying it.", state.yo_cmd("destroy", "--yes")
         )
