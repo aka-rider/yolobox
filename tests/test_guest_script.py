@@ -887,6 +887,8 @@ exec "$@"
 """
 RECORDING_REBUILD = """#!/bin/sh
 printf '%s\\n' "$*" > "$FAKE_REBUILD_RAN"
+printf '%s %s %s\\n' "$YOLOBOX_USERNAME" "$YOLOBOX_HOSTNAME" "$YOLOBOX_FLAKE_REF" \\
+    >> "$FAKE_REBUILD_RAN"
 """
 
 
@@ -914,7 +916,9 @@ class TestRebuildLock(RebuildCase):
         result = self.rebuild("boot")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            self.ran.read_text(), "boot --impure --refresh --flake %s#yolobox\n" % REF
+            self.ran.read_text(),
+            "boot --impure --refresh --flake %s#yolobox\n" % REF
+            + "alice yolobox-e2e %s\n" % REF,
         )
 
     def test_a_held_lock_refuses_the_rebuild_at_once_and_says_why(self):
