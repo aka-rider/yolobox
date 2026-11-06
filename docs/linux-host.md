@@ -26,7 +26,7 @@ The domain reproduces Lima's network so that `nix/egress.nix`, its test fixtures
 
 ## The host table
 
-`linux/yolobox-host.nft` hooks output and judges uid `yolobox-vm` only: loopback is open to DNS and nothing else, and the private, CGNAT, link-local and multicast ranges are rejected, exactly the sets of `nix/egress.nix` (v6 adds `::1`). The reasons for the unit's shape are in [linux/host-setup.md](../linux/host-setup.md#the-host-table):
+`linux/yolobox-host.nft` hooks output and judges uid `yolobox-vm` only (the output chain accepts by policy and sends that uid, and only that uid, to the chain `vm` with `goto`; a packet with no full socket, such as the host's own IPv6 neighbour discovery or kernel NFS traffic, has no uid and is never judged): loopback is open to DNS and nothing else, and the private, CGNAT, link-local and multicast ranges are rejected, exactly the sets of `nix/egress.nix` (v6 adds `::1`). The reasons for the unit's shape are in [linux/host-setup.md](../linux/host-setup.md#the-host-table):
 
 - no `ExecStop`, so stopping the unit never opens the host;
 - `RequiredBy=virtqemud.service` and `Before=`, so no domain can start while the table is missing;

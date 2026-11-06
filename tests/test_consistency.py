@@ -1535,6 +1535,42 @@ class TestHostTableBlocksWhatTheGuestTableBlocks(unittest.TestCase):
         self.assertIsNotNone(found, "the host table has no %s reject" % family)
         return address_set(found.group(1))
 
+    def chain_rules(self, name):
+        body = re.search(
+            r"^  chain %s \{\n(.*?)^  \}$" % name, HOST_NFT.read_text(), re.M | re.S
+        )
+        self.assertIsNotNone(body, "the host table has no chain %s" % name)
+        return [line.strip() for line in body.group(1).splitlines()]
+
+    def test_the_output_chain_accepts_by_policy_and_sends_only_the_vm_uid_on(self):
+        """`meta skuid` breaks for a packet with no full socket (neighbour
+        discovery, MLD, IGMP, kernel NFS), and then neither `==` nor `!=`
+        matches. A `!=` exemption would let those host packets fall through to
+        the rejects, so the only rule is a positive match, and the policy
+        accepts what it does not match."""
+        rules = self.chain_rules("output")
+        self.assertEqual(
+            rules,
+            [
+                "type filter hook output priority 0; policy accept;",
+                'meta skuid "%s" goto vm' % yo_vm_user(),
+            ],
+        )
+
+    def test_the_vm_chain_lets_replies_and_dns_by_and_rejects_the_rest(self):
+        rules = self.chain_rules("vm")
+        self.assertEqual(rules[0], "ct state established,related accept")
+        self.assertEqual(
+            rules[1:3],
+            [
+                'oifname "lo" ip daddr 127.0.0.0/8 meta l4proto { tcp, udp }'
+                " th dport 53 accept",
+                'oifname "lo" reject',
+            ],
+        )
+        self.assertEqual(len(rules), 5)
+        self.assertTrue(all(rule.endswith("reject") for rule in rules[3:]))
+
     def test_blocked_v4_ranges_are_equal(self):
         self.assertEqual(
             self.host_set("ip"), address_set(nix_binding(EGRESS_NIX, "blockedV4"))
@@ -1744,8 +1780,8 @@ def host_unit_loaded_file() -> str:
 
 
 def host_table_skuid() -> str:
-    found = re.search(r'meta skuid != "([^"]+)" accept', HOST_NFT.read_text())
-    assert found, "the host table has no skuid exemption"
+    found = re.search(r'meta skuid "([^"]+)" goto vm$', HOST_NFT.read_text(), re.M)
+    assert found, "the host table sends no uid to the vm chain"
     return found.group(1)
 
 
