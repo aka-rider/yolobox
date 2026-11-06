@@ -158,6 +158,12 @@ def guest_out(argv: Sequence[str]) -> str:
     return completed.stdout
 
 
+def stderr_suffix(stderr: str) -> str:
+    """What follows a failed command in a message: its stderr, or that it had none."""
+    stderr = stderr.strip()
+    return ": " + stderr if stderr else " with no stderr"
+
+
 def account_status() -> Tuple[str, str]:
     """Which accounts work, as (status, detail).
 
@@ -178,14 +184,13 @@ def account_status() -> Tuple[str, str]:
     if lookup.returncode != 0:
         raise YoError(
             "getent passwd %s failed on the box (exit %d)%s"
-            % (AGENT_USER, lookup.returncode, ": " + lookup.stderr.strip())
+            % (AGENT_USER, lookup.returncode, stderr_suffix(lookup.stderr))
         )
-    stderr = agent_probe.stderr.strip()
     return "agent_failing", "ssh %s@%s true exited %d%s" % (
         AGENT_USER,
         state.box.vm_host,
         agent_probe.returncode,
-        ": " + stderr if stderr else " with no stderr",
+        stderr_suffix(agent_probe.stderr),
     )
 
 

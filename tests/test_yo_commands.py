@@ -354,13 +354,15 @@ class TestFlakeRef(FakeHome):
 
 
 class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
-    def status(self, agent_rc, operator_rc, getent_rc, agent_stderr=""):
+    def status(
+        self, agent_rc, operator_rc, getent_rc, agent_stderr="", getent_stderr=""
+    ):
         def ssh_run(role, argv, **kwargs):
             if role is yo.AGENT:
                 done = (agent_rc, agent_stderr)
             elif argv[0] == "getent":
                 self.assertEqual(argv, ["getent", "passwd", "agent"])
-                done = (getent_rc, "")
+                done = (getent_rc, getent_stderr)
             else:
                 done = (operator_rc, "")
             return subprocess.CompletedProcess(argv, done[0], stdout="", stderr=done[1])
@@ -379,6 +381,17 @@ class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
     def test_a_getent_that_fails_otherwise_is_an_error(self):
         with self.assertRaisesRegex(yo.YoError, "getent passwd agent failed.*exit 3"):
             self.status(1, 0, 3)
+
+    def test_a_getent_failure_ends_with_its_stderr_or_says_it_had_none(self):
+        failed = "getent passwd agent failed on the box (exit 3)"
+        for stderr, message in (
+            ("getent: boom\n", failed + ": getent: boom"),
+            ("", failed + " with no stderr"),
+        ):
+            with self.subTest(stderr=stderr):
+                with self.assertRaises(yo.YoError) as caught:
+                    self.status(1, 0, 3, getent_stderr=stderr)
+                self.assertEqual(caught.exception.message, message)
 
     def test_a_lost_operator_is_unreachable(self):
         self.assertEqual(
