@@ -33,9 +33,10 @@ let
   ];
 
   # Setuid and capability wrappers the box keeps, each with the privilege it
-  # must carry. `capabilities` is the sorted list `getcap` prints, including
-  # the cap_setpcap that nixpkgs adds to every capability wrapper; it is the
-  # spelling tests/box-hardening-check.sh uses. See nix/hardening.md.
+  # must carry. `capabilities` is the comma separated list `getcap` prints,
+  # including the cap_setpcap that nixpkgs adds to every capability wrapper.
+  # It is compared sorted, so a value may list its names in any order. See
+  # nix/hardening.md.
   setuidRoot = { setuid = true; capabilities = ""; };
   capRoot = capabilities: { setuid = false; inherit capabilities; };
   keptWrappers = {
@@ -45,8 +46,11 @@ let
     newuidmap = capRoot "cap_setpcap,cap_setuid";
     newgidmap = capRoot "cap_setgid,cap_setpcap";
   };
+  # The one spelling of a capability list that both sides are compared in:
+  # unique, byte-sorted, comma separated. "" has no names and stays "".
+  sortedCaps = names: lib.concatStringsSep "," (lib.sort lib.lessThan (lib.unique names));
   expectedWrappers = keptWrappers // lib.mapAttrs
-    (_: caps: if caps == "" then setuidRoot else capRoot caps)
+    (_: caps: if caps == "" then setuidRoot else capRoot (sortedCaps (lib.splitString "," caps)))
     cfg.extraWrappers;
 
   enabledWrappers = lib.filterAttrs (_: w: w.enable) config.security.wrappers;
@@ -64,8 +68,7 @@ let
     let m = builtins.match "(cap_[a-z_]+(,cap_[a-z_]+)*)[+=][eip]+" caps; in
     if caps == "" then ""
     else if m == null then "<unparsable: ${caps}>"
-    else lib.concatStringsSep ","
-      (lib.sort lib.lessThan (lib.unique (lib.splitString "," (builtins.head m) ++ [ "cap_setpcap" ])));
+    else sortedCaps (lib.splitString "," (builtins.head m) ++ [ "cap_setpcap" ]);
 
   have = w: {
     inherit (w) program setuid setgid owner;
@@ -98,8 +101,8 @@ in
       Setuid or capability wrappers a box adds on top of the allowlist.
       Escape hatch for /etc/yolobox/local.nix, e.g. a VPN client's
       split-tunnel helper. The name is the wrapper's name; the value is
-      the capabilities it must carry, spelled as `getcap` prints them:
-      sorted, comma separated, including the cap_setpcap that nixpkgs adds.
+      the capabilities it must carry: comma separated, in any order, as
+      `getcap` lists them (include the cap_setpcap that nixpkgs adds).
       The empty string means a setuid-root wrapper with no capabilities.
       Evaluation fails when an enabled wrapper differs in program name,
       setuid, setgid, owner or capabilities.

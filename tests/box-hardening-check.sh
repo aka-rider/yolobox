@@ -8,9 +8,9 @@
 #
 # EXTRA_WRAPPERS: space-separated setuid/capability wrappers a box adds
 #   through yolobox.hardening.extraWrappers in its /etc/yolobox/local.nix.
-#   Each is a name, or name=caps with the sorted capability names getcap
-#   shows, comma-separated (dumpcap=cap_net_raw,cap_setpcap). A bare name
-#   means the wrapper carries none.
+#   Each is a name, or name=caps with the capability names getcap shows,
+#   comma-separated, in any order (dumpcap=cap_net_raw,cap_setpcap). A bare
+#   name means the wrapper carries none.
 # ONLY=hardening | ONLY=compat: run just one half. Unset runs both. The
 #   compat half ("nothing the agent needs broke") is the one to iterate on
 #   against a box that is not hardened yet.
@@ -298,6 +298,13 @@ check_net_sched() {
     ok "no cls_, act_ or sch_ module is loaded but sch_fq_codel, and cls_u32 is routed to bin/false"
 }
 
+# Capability names, one per line or comma separated on stdin, as one sorted
+# comma-separated list without duplicates: the spelling nix/hardening.nix
+# compares in.
+sorted_caps() {
+    tr ',' '\n' | sort -u | paste -sd, -
+}
+
 check_wrappers() {
     local want have name out caps expected_caps extra
     have=$(ls /run/wrappers/bin | sort -u)
@@ -311,12 +318,12 @@ $(diff <(printf '%s\n' "${have}") <(printf '%s\n' "${want}") || true)"
     done
     ok "sudo, sudoedit and unix_chkpwd are setuid"
 
-    # Sorted capability names the wrapper carries; "" when it has none.
+    # The capability names the wrapper carries; "" when it has none.
     # getcap prints "path cap_x=ep" or "path = cap_x+ep" by libcap version.
     for name in ${have}; do
         out=$(getcap "/run/wrappers/bin/${name}") || fail "getcap ${name} failed"
         # grep exits 1 on the empty output of a wrapper without capabilities.
-        caps=$(printf '%s\n' "${out}" | grep -o 'cap_[a-z_]*' | sort | paste -sd, -) || caps=""
+        caps=$(printf '%s\n' "${out}" | grep -o 'cap_[a-z_]*' | sorted_caps) || caps=""
         case ${name} in
         # nixpkgs grants cap_setpcap beside the one the name suggests
         # (getcap: "newuidmap cap_setuid,cap_setpcap=ep").
@@ -326,7 +333,7 @@ $(diff <(printf '%s\n' "${have}") <(printf '%s\n' "${want}") || true)"
             expected_caps=""
             for extra in ${EXTRA_WRAPPERS:-}; do
                 case ${extra} in
-                "${name}="*) expected_caps=${extra#*=} ;;
+                "${name}="*) expected_caps=$(printf '%s' "${extra#*=}" | sorted_caps) ;;
                 esac
             done
             ;;
