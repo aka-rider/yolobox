@@ -1148,8 +1148,17 @@ class LibvirtDriver:
         return "check why with %s, then run this command again" % reason
 
     def show_status(self) -> Optional[str]:
-        libvirt_host.virsh("dominfo", domain_name(), check=False, capture=False)
-        return None
+        shown = libvirt_host.virsh("dominfo", domain_name(), check=False, capture=False)
+        if shown.returncode == 0:
+            return None
+        return (
+            "libvirt: virsh -c %s dominfo %s failed (exit %d), its own message is above"
+            % (
+                LIBVIRT_URI,
+                domain_name(),
+                shown.returncode,
+            )
+        )
 
     def volume_sizes(self) -> Dict[str, int]:
         """Capacity and Allocation of the disk volume, in bytes."""

@@ -1547,6 +1547,19 @@ class TestStatusAndGaps(LibvirtCase):
         self.host.states["yolobox-box"] = "shut off"
         self.assertEqual(self.driver.vm_status(), "shut off")
 
+    def test_a_dominfo_that_worked_is_left_to_the_terminal(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.assertIsNone(self.driver.show_status())
+
+    def test_a_dominfo_that_failed_is_a_line_with_its_exit_code(self):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.fail["dominfo"] = "error: internal error: lizard"
+        self.assertEqual(
+            self.driver.show_status(),
+            "libvirt: virsh -c qemu:///system dominfo yolobox-box failed (exit 1), "
+            "its own message is above",
+        )
+
     def test_another_instances_domain_is_not_this_one(self):
         self.host.tagged_domain("other", FIRST_PORT)
         self.assertIsNone(self.driver.vm_status())
