@@ -3544,12 +3544,27 @@ class TestLimaConfigGaps(FakeHome):
 
     def test_an_operator_uid_other_than_the_boxs_is_reported_unless_it_is_501(self):
         # Lima took the Mac account's uid when it created the instance.
-        for value in (502, 0, None, MISSING, "501", True):
+        for value in (502, 0):
             with self.subTest(value=value):
                 with self.mock_lima_list(self.restated_forwards(), user_uid=value):
                     self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_OPERATOR_UID])
         with self.mock_lima_list(self.restated_forwards(), user_uid=501):
             self.assertEqual(yo.LIMA.config_gaps(), [])
+
+    def test_a_uid_limactl_does_not_report_as_an_integer_is_unreadable_not_wrong(self):
+        for value in (None, MISSING, "501", 501.5, True, [501]):
+            with self.subTest(value=value):
+                with self.mock_lima_list(self.restated_forwards(), user_uid=value):
+                    self.assertEqual(
+                        yo.LIMA.config_gaps(), [yo.GAP_OPERATOR_UID_UNREADABLE]
+                    )
+
+    def test_an_unreadable_uid_says_how_to_check_and_never_offers_to_destroy(self):
+        message = yo.LIMA.config_gap_message([yo.GAP_OPERATOR_UID_UNREADABLE])
+        self.assertIn("limactl list --json yolobox", message)
+        self.assertIn("yo ssh id -u", message)
+        for destructive in ("destroy", "limactl delete", "bootstrap", "--set"):
+            self.assertNotIn(destructive, message)
 
     def test_the_uid_gap_says_to_recreate_the_instance_not_to_edit_it(self):
         message = yo.LIMA.config_gap_message([yo.GAP_OPERATOR_UID])
@@ -3874,7 +3889,7 @@ class TestVmUpRefusesOnlyTheLimaGapsThatLockTheOperatorOut(FakeHome):
 
     def test_every_other_lima_gap_is_only_a_note(self):
         others = [gap for gap in yo.LIMA_SETTING_GAPS if gap != yo.GAP_SSH_OVER_VSOCK]
-        others += list(yo.LIMA_RECREATE_GAPS)
+        others += list(yo.LIMA_MANUAL_GAPS)
         self.assertEqual(yo.LIMA.fatal_gaps(others + [yo.OP_GUEST_SOCK, ""]), [])
 
 

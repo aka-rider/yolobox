@@ -36,6 +36,7 @@ GAP_LOAD_DOT_SSH_PUB_KEYS = "ssh.loadDotSSHPubKeys"
 GAP_UDP_FORWARDS = "portForwards.udp"
 GAP_TCP_FORWARDS = "portForwards.tcp"
 GAP_OPERATOR_UID = "user.uid"
+GAP_OPERATOR_UID_UNREADABLE = "user.uid.unreadable"
 
 # The guest TCP ports lima mirrors onto the host's 127.0.0.1: unprivileged and
 # below the macOS ephemeral range (49152). A Linux host mirrors nothing: it has no
@@ -121,16 +122,29 @@ LIMA_SETTING_GAPS = {
     ),
 }
 
-# Gaps that no `limactl edit` mends: lima reads the setting once, when it creates
-# the instance, so only a new instance has it right. A note and not a fatal gap:
-# the operator must still be able to start the box to copy their work out.
-LIMA_RECREATE_GAPS = {
+# Gaps whose remedy is not a `limactl edit`. All are notes and not fatal: the
+# operator must still be able to start the box to copy their work out.
+# A uid lima reports and a uid it does not report differ in the remedy: lima
+# reads user.uid once, at creation, so a wrong one is mended only by recreating
+# the instance, while an unreadable one may belong to a healthy box.
+LIMA_MANUAL_GAPS = {
     GAP_OPERATOR_UID: (
         "has an operator whose uid is not %d (lima took the Mac account's uid), so "
         "its files do not match the account nix/base.nix declares. Lima reads "
         "user.uid only when it creates an instance, and `limactl edit` cannot "
         "change file ownership. Push out what you need, then recreate the "
-        "instance from lima/yolobox.yaml, which pins the uid" % OPERATOR_GUEST_UID
+        "instance from lima/yolobox.yaml, which pins the uid" % OPERATOR_GUEST_UID,
+        lambda: state.destroy_then_bootstrap_command(),
+    ),
+    GAP_OPERATOR_UID_UNREADABLE: (
+        "reports no user.uid in `limactl list --json`, so yo cannot tell whether "
+        "the operator's uid is %d, as nix/base.nix declares. Nothing says the box "
+        "is wrong. Check by hand, and recreate the instance only if it is not %d"
+        % (OPERATOR_GUEST_UID, OPERATOR_GUEST_UID),
+        lambda: (
+            "limactl list --json %s (config.user.uid), or %s"
+            % (state.box.name, state.yo_cmd("ssh", "id", "-u"))
+        ),
     ),
 }
 
@@ -552,7 +566,9 @@ class LimaDriver:
             gaps.append(GAP_PROPAGATE_PROXY_ENV)
         if info.load_dot_ssh_pub_keys is not False:
             gaps.append(GAP_LOAD_DOT_SSH_PUB_KEYS)
-        if info.user_uid != OPERATOR_GUEST_UID:
+        if isinstance(info.user_uid, bool) or not isinstance(info.user_uid, int):
+            gaps.append(GAP_OPERATOR_UID_UNREADABLE)
+        elif info.user_uid != OPERATOR_GUEST_UID:
             gaps.append(GAP_OPERATOR_UID)
         return gaps
 
@@ -566,7 +582,7 @@ class LimaDriver:
         missing = [
             gap
             for gap in gaps
-            if gap not in LIMA_SETTING_GAPS and gap not in LIMA_RECREATE_GAPS
+            if gap not in LIMA_SETTING_GAPS and gap not in LIMA_MANUAL_GAPS
         ]
         lines = []
         restated = bool(missing)
@@ -580,15 +596,9 @@ class LimaDriver:
                 )
             )
         for gap in gaps:
-            if gap in LIMA_RECREATE_GAPS:
-                lines.append(
-                    "%s %s:\n    %s"
-                    % (
-                        state.box.name,
-                        LIMA_RECREATE_GAPS[gap],
-                        state.destroy_then_bootstrap_command(),
-                    )
-                )
+            if gap in LIMA_MANUAL_GAPS:
+                problem, remedy = LIMA_MANUAL_GAPS[gap]
+                lines.append("%s %s:\n    %s" % (state.box.name, problem, remedy()))
                 continue
             if gap not in LIMA_SETTING_GAPS:
                 continue
