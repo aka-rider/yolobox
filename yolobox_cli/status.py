@@ -178,8 +178,23 @@ def egress_tier(table: subprocess.CompletedProcess) -> EgressTier:
 def egress_fallback_line(
     active_state: str, table: subprocess.CompletedProcess
 ) -> StatusLine:
-    tier = egress_tier(table)
     unit = "%s %s" % (EGRESS_UNIT, active_state)
+    # The unit has no ExecStop, so a stopped unit leaves the full table loaded.
+    # Its chain is a plain "output" like an old recovery table's: only the
+    # structure tells them apart, so judge that first.
+    if table.returncode == 0 and egress_table_holds(table.stdout):
+        return StatusLine(
+            "egress: WARNING full rules loaded, unit %s — the host and LAN are "
+            "blocked, but the unit that loads the rules is not active; "
+            "restart it with: %s; logs: %s"
+            % (
+                unit,
+                state.yo_cmd("ssh", "sudo", "systemctl", "restart", EGRESS_UNIT),
+                state.yo_cmd("ssh", "journalctl", "-u", EGRESS_UNIT),
+            ),
+            True,
+        )
+    tier = egress_tier(table)
     if tier is EgressTier.RECOVERY:
         what = (
             "recovery table — the egress rules failed to load (%s), "

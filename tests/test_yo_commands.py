@@ -2490,8 +2490,9 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         self.assertIn("systemctl: not found", unknown)
         self.assertIn("yo down", unknown)
 
-    def egress_lines(self, egress_probe):
+    def egress_lines(self, egress_probe, table=None):
         outs = self.run_status(
+            table=table,
             units_present=True,
             gaps=[],
             aws_which=None,
@@ -2507,10 +2508,27 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         )
 
     def test_a_box_whose_egress_unit_failed_warns_of_recovery_mode(self):
-        lines = self.egress_lines("LoadState=loaded\nActiveState=failed\n")
+        recovery = mock.Mock(
+            returncode=0,
+            stdout=(FIXTURES / "egress-recovery.nft").read_text(),
+            stderr="",
+        )
+        lines = self.egress_lines(
+            "LoadState=loaded\nActiveState=failed\n", table=recovery
+        )
         self.assertEqual(len(lines), 1)
         self.assertIn("WARNING recovery table", lines[0])
         self.assertIn("(yolobox-egress failed)", lines[0])
+
+    def test_a_stopped_egress_unit_over_the_full_table_is_not_called_recovery_mode(
+        self,
+    ):
+        lines = self.egress_lines("LoadState=loaded\nActiveState=inactive\n")
+        self.assertEqual(len(lines), 1)
+        self.assertIn(
+            "WARNING full rules loaded, unit yolobox-egress inactive", lines[0]
+        )
+        self.assertNotIn("recovery", lines[0])
 
     def test_a_box_that_predates_the_egress_unit_is_named_not_blamed(self):
         self.assertEqual(

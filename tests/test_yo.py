@@ -4135,6 +4135,36 @@ class TestEgressStatusLine(unittest.TestCase):
                 self.assertIn("yo ssh sudo nixos-rebuild switch --rollback", line.text)
                 self.assertIn("yo ssh journalctl -u yolobox-egress", line.text)
 
+    def test_a_stopped_unit_over_the_full_table_is_not_a_recovery_table(self):
+        # The unit has no ExecStop: stopping it leaves the full table loaded.
+        for state in ("inactive", "failed"):
+            for listing in (FIXTURE_EGRESS, FIXTURE_EGRESS_TUNNEL):
+                with self.subTest(state=state):
+                    line = yo.egress_status_line(
+                        self.answer("loaded", state), self.table(listing)
+                    )
+                    self.assertTrue(line.warning)
+                    self.assertTrue(
+                        line.text.startswith(
+                            "egress: WARNING full rules loaded, unit yolobox-egress %s"
+                            % state
+                        ),
+                        line.text,
+                    )
+                    self.assertNotIn("recovery", line.text)
+
+    def test_a_recovery_table_named_output_is_still_a_recovery_table(self):
+        # Boxes built before the tiers called their recovery table plain "output".
+        old_recovery = (
+            (FIXTURES / "egress-recovery.nft")
+            .read_text()
+            .replace("output_recovery", "output")
+        )
+        line = yo.egress_status_line(
+            self.answer("loaded", "failed"), self.table(old_recovery)
+        )
+        self.assertTrue(line.text.startswith("egress: WARNING recovery table"))
+
     def test_a_unit_the_box_does_not_know_means_the_box_predates_the_table(self):
         # systemctl prints ActiveState=inactive for an unknown unit.
         self.assertEqual(
