@@ -45,9 +45,9 @@ def read_handshake(child: subprocess.Popen, deadline: float) -> Handshake:
     closed = False
     while b"\n" not in buffer:
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        ready, _, _ = select.select([fd], [], [], remaining)
+        # Past the deadline, one last poll: what the broker already wrote, or its
+        # closed stdout, is read whatever the clock says, but nothing is waited for.
+        ready, _, _ = select.select([fd], [], [], max(0.0, remaining))
         if not ready:
             break
         chunk = os.read(fd, HANDSHAKE_READ_BYTES)
@@ -55,6 +55,8 @@ def read_handshake(child: subprocess.Popen, deadline: float) -> Handshake:
             closed = True
             break
         buffer += chunk
+        if remaining <= 0:
+            break
     return Handshake(buffer.decode("utf-8", "replace").splitlines(), closed)
 
 

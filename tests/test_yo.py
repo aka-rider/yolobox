@@ -3323,13 +3323,16 @@ class TestStartAwsBrokerHandshakeFailures(FakeHome):
         spawned = []
         spawn = yo.proc.spawn
 
-        def remember(argv, **kwargs):
+        def spawned_once_its_output_closed(argv, **kwargs):
+            # select does not consume EOF: yo then finds the pipe closed, so a zero
+            # handshake time decides nothing but how long yo waits for the exit.
             spawned.append(spawn(argv, **kwargs))
+            select.select([spawned[-1].stdout], [], [])
             return spawned[-1]
 
         with (
-            mock.patch.object(yo.aws, "BROKER_HANDSHAKE_SECONDS", 0.5),
-            mock.patch.object(yo.proc, "spawn", remember),
+            mock.patch.object(yo.aws, "BROKER_HANDSHAKE_SECONDS", 0),
+            mock.patch.object(yo.proc, "spawn", spawned_once_its_output_closed),
         ):
             with self.assertRaisesRegex(
                 yo.YoError, "closed its output without exiting"
@@ -3338,7 +3341,8 @@ class TestStartAwsBrokerHandshakeFailures(FakeHome):
         self.assertIsNotNone(spawned[0].poll())
 
     def test_a_broker_that_stays_silent_is_reported_as_no_handshake(self):
-        with mock.patch.object(yo.aws, "BROKER_HANDSHAKE_SECONDS", 0.2):
+        # The broker never writes or closes its output, so no deadline makes it speak.
+        with mock.patch.object(yo.aws, "BROKER_HANDSHAKE_SECONDS", 0):
             with self.assertRaisesRegex(yo.YoError, "no handshake within"):
                 self.start_with_broker_script("exec sleep 60\n")
 
