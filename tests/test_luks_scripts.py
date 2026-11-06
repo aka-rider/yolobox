@@ -82,17 +82,17 @@ exit "${FAKE_E2FSCK_RC:-1}"
 echo "resize2fs $*" >> "$FAKE_LOG"
 if [ "$1" = -P ]; then
   echo "resize2fs 1.47 (fake)" >&2
-  echo "Estimated minimum size of the filesystem: 1000000"
+  echo "Estimated minimum size of the filesystem: ${FAKE_FS_MIN-1000000}"
   exit 0
 fi
 exit "${FAKE_RESIZE2FS_RC:-0}"
 """,
     "dumpe2fs": """
 echo "Block count:              ${FAKE_BLOCK_COUNT:-2000000}"
-echo "Block size:               4096"
+[ "${FAKE_BLOCK_SIZE-4096}" = omit ] || echo "Block size:               ${FAKE_BLOCK_SIZE-4096}"
 """,
     "blockdev": """
-echo "${FAKE_DEVICE_BYTES}"
+[ "${FAKE_DEVICE_BYTES}" = omit ] || echo "${FAKE_DEVICE_BYTES}"
 """,
     "blkdiscard": """
 echo "blkdiscard $*" >> "$FAKE_LOG"
@@ -388,6 +388,46 @@ class TestMigrateRefusesToDiscardOnUnreadableNumbers(MigrateScript):
                 self.log.write_text("")
                 result = self.run_migrate(FAKE_BLOCK_COUNT=count)
                 self.assertNothingDiscarded(result, "filesystem block count")
+
+
+class TestMigrateRefusesToEncryptOnUnreadableNumbers(MigrateScript):
+    """bash reads "" as 0, which would collapse the region reencrypt is limited to."""
+
+    def assertNothingShrunkOrEncrypted(self, result, name):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertRegex(result.stderr, r"%s is '[^']*', not a positive integer" % name)
+        self.assertIn("was not shrunk or encrypted", result.stderr)
+        self.assertNotIn("discarded", result.stderr)
+        calls = self.calls()
+        self.assertFalse([c for c in calls if c.startswith("resize2fs " + DEVICE)])
+        self.assertFalse(
+            [
+                c
+                for c in calls
+                if c.startswith(("cryptsetup reencrypt", "cryptsetup open"))
+            ]
+        )
+
+    def test_a_block_size_dumpe2fs_does_not_report_stops_before_resize2fs(self):
+        for size in ("omit", "0", "x"):
+            with self.subTest(block_size=size):
+                self.log.write_text("")
+                result = self.run_migrate(FAKE_BLOCK_SIZE=size)
+                self.assertNothingShrunkOrEncrypted(result, "filesystem block size")
+
+    def test_a_minimum_size_resize2fs_does_not_report_stops_before_resize2fs(self):
+        for size in ("", "lizard", "0"):
+            with self.subTest(minimum=size):
+                self.log.write_text("")
+                result = self.run_migrate(FAKE_FS_MIN=size)
+                self.assertNothingShrunkOrEncrypted(result, "filesystem minimum size")
+
+    def test_a_device_size_blockdev_does_not_report_stops_before_resize2fs(self):
+        for size in ("omit", "-1", "x"):
+            with self.subTest(device_bytes=size):
+                self.log.write_text("")
+                result = self.run_migrate(FAKE_DEVICE_BYTES=size)
+                self.assertNothingShrunkOrEncrypted(result, "device size")
 
 
 class TestMigrateFinalizeFailures(MigrateScript):

@@ -46,12 +46,13 @@ fs_block_count() {
 }
 
 # A number read from a tool's output, checked before it is used in arithmetic:
-# bash reads an empty or non-numeric string as 0, and 0 here would move the
-# discard offset to the start of the device.
+# bash reads an empty or non-numeric string as 0. In finalize that would move
+# the discard offset to the start of the device; in encrypt it would collapse
+# the region the encryption is limited to. $3 says what was left untouched.
 require_positive_int() {
   case "$2" in
     '' | *[!0-9]* | 0*)
-      echo "yolobox: ${1} is '${2}', not a positive integer; nothing was discarded on ${device}" >&2
+      echo "yolobox: ${1} is '${2}', not a positive integer; ${3}" >&2
       return 1
       ;;
   esac
@@ -98,7 +99,9 @@ encrypt() {
   echo "yolobox-luks-migrate: encrypt ${device}"
   fsck_ok "$device"
   min=$(resize2fs -P "$device" | awk '{print $NF}')
+  require_positive_int "filesystem minimum size" "$min" "${device} was not shrunk or encrypted"
   bs=$(fs_block_size "$device")
+  require_positive_int "filesystem block size" "$bs" "${device} was not shrunk or encrypted"
   target=$((min + min * headroom_percent / 100 + 1))
   # The shrunken filesystem plus the LUKS header room, rounded up to the
   # alignment. The encryption sector size stays at 512 bytes: the partition
@@ -106,6 +109,7 @@ encrypt() {
   # segment covers the whole device.
   region=$(((target * bs + header_room + align - 1) / align * align))
   total=$(blockdev --getsize64 "$device")
+  require_positive_int "device size" "$total" "${device} was not shrunk or encrypted"
   need=$((region + header_room))
   if [ "$need" -gt "$total" ]; then
     {
@@ -145,11 +149,11 @@ finalize() {
   (
     set -euo pipefail
     offset_sectors=$(cryptsetup status "$scratch" | awk '/offset:/ {print $2}')
-    require_positive_int offset_sectors "$offset_sectors"
+    require_positive_int offset_sectors "$offset_sectors" "nothing was discarded on ${device}"
     mapper_bs=$(fs_block_size "/dev/mapper/${scratch}")
-    require_positive_int "filesystem block size" "$mapper_bs"
+    require_positive_int "filesystem block size" "$mapper_bs" "nothing was discarded on ${device}"
     fs_blocks=$(fs_block_count "/dev/mapper/${scratch}")
-    require_positive_int "filesystem block count" "$fs_blocks"
+    require_positive_int "filesystem block count" "$fs_blocks" "nothing was discarded on ${device}"
     fs_bytes=$((fs_blocks * mapper_bs))
     plaintext_tail=$((offset_sectors * sector_bytes + fs_bytes))
     total=$(blockdev --getsize64 "$device")
