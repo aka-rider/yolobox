@@ -621,8 +621,24 @@ class TestEachPlatformShipsItsOwnFiles(unittest.TestCase):
                 shipped.discard(match.group(1))
         return shipped
 
+    def siblings_read_by_host_setup(self):
+        """host-setup.sh installs these from beside itself, as `$HERE/NAME`."""
+        found = {
+            "linux/" + name
+            for name in re.findall(
+                r"\$HERE/([\w.-]+)", (REPO / "linux" / "host-setup.sh").read_text()
+            )
+        }
+        self.assertTrue(found, "host-setup.sh reads no sibling; this test is stale")
+        return found
+
     def needed(self):
-        return {"yo", "aws-broker"} | self.siblings_read_by_yo() | package_files()
+        return (
+            {"yo", "aws-broker"}
+            | self.siblings_read_by_yo()
+            | self.siblings_read_by_host_setup()
+            | package_files()
+        )
 
     def test_the_brew_formula_is_for_macos_only(self):
         self.assertIn(
@@ -1806,6 +1822,37 @@ class TestHostAccountAndTableAreOneFact(unittest.TestCase):
 
     def test_the_installed_table_is_named_like_the_repo_file(self):
         self.assertEqual(Path(host_setup_assignment("NFT_DEST")).name, HOST_NFT.name)
+
+
+class TestHostSetupCanBeRerun(unittest.TestCase):
+    """A second run of linux/host-setup.sh changes nothing (linux/host-setup.md),
+    and a damaged checkout is refused before the host is touched."""
+
+    def test_every_file_it_reads_beside_itself_is_checked_before_the_first_step(self):
+        text = HOST_SETUP.read_text()
+        first_step = text.index('step "')
+        read = set(re.findall(r"\$HERE/([\w.-]+)", text))
+        self.assertTrue(read)
+        for name in sorted(read):
+            with self.subTest(file=name):
+                check = '[[ -f $HERE/%s ]] || die "missing $HERE/%s"' % (name, name)
+                self.assertIn(check, text[:first_step])
+
+    def test_it_reads_virsh_in_the_c_locale(self):
+        text = HOST_SETUP.read_text()
+        self.assertLess(text.index("export LC_ALL=C\n"), text.index("VIRSH=("))
+
+    def test_the_unit_reloads_by_loading_the_file_it_starts_with(self):
+        """A reload does not propagate to virtqemud, a restart does."""
+        unit = HOST_UNIT.read_text()
+        start = re.search(r"^ExecStart=(.+)$", unit, re.M)
+        reload_ = re.search(r"^ExecReload=(.+)$", unit, re.M)
+        assert start, "yolobox-host.service has no ExecStart"
+        self.assertIsNotNone(reload_, "yolobox-host.service has no ExecReload")
+        self.assertEqual(reload_.group(1), start.group(1))
+
+    def test_it_never_restarts_the_table_unit(self):
+        self.assertNotIn("restart yolobox-host", HOST_SETUP.read_text())
 
 
 class TestAgentAccountIsOneFact(unittest.TestCase):

@@ -4,6 +4,9 @@
 # The reasons for each step, and how to recognise a failure, are in
 # linux/host-setup.md.
 set -Eeuo pipefail
+# The script greps virsh's output for English words (Autostart, Active, State),
+# which a translated virsh would not print.
+export LC_ALL=C
 
 MIN_LIBVIRT="12.2.0"
 VM_USER="yolobox-vm"
@@ -30,6 +33,12 @@ die() {
   exit 1
 }
 
+# True when $2 is not yet a copy of $1 with mode $3, so a rerun installs
+# nothing and restarts nothing.
+needs_install() {
+  ! cmp -s "$1" "$2" || [[ $(stat -c %a "$2") != "${3#0}" ]]
+}
+
 # True when dotted version $1 is at least $2. Numeric per field, so 12.10.0
 # is newer than 12.2.0.
 version_at_least() {
@@ -52,6 +61,7 @@ id -u "$SUDO_USER" >/dev/null || die "no such account: $SUDO_USER"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f $HERE/yolobox-host.nft ]] || die "missing $HERE/yolobox-host.nft"
 [[ -f $HERE/yolobox-host.service ]] || die "missing $HERE/yolobox-host.service"
+[[ -f $HERE/yolobox-libvirt-hook.sh ]] || die "missing $HERE/yolobox-libvirt-hook.sh"
 
 # Checked before anything is installed or enabled, so a host that fails it is
 # left as it was.
@@ -134,23 +144,42 @@ setfacl -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
 # domain, which cuts yolobox-vm's entry down to r-x. A qemu hook re-applies the
 # same fixed setfacl before a yolobox domain starts and after any domain starts
 # or is released. virtqemud reads its hook directory only when it starts, so it
-# is restarted if it runs; running domains are not touched. See
-# linux/host-setup.md, "The passt ACL hook".
+# is restarted if it runs, and only when the hook changed; running domains are
+# not touched. See linux/host-setup.md, "The passt ACL hook".
 step "(l) libvirt hook that keeps the passt ACL"
-install -D -m0755 "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK"
+hook_changed=false
+if needs_install "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK" 0755; then
+  install -D -m0755 "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK"
+  hook_changed=true
+fi
 restorecon -F "$PASST_HOOK"
-systemctl try-restart virtqemud.service
+if $hook_changed; then
+  systemctl try-restart virtqemud.service
+fi
 
 step "(g) host egress table"
 [[ -x /usr/sbin/nft ]] || die "/usr/sbin/nft is missing after installing nftables"
 /usr/sbin/nft -c -f "$HERE/yolobox-host.nft"
-install -D -m0644 "$HERE/yolobox-host.nft" "$NFT_DEST"
-install -D -m0644 "$HERE/yolobox-host.service" "$UNIT_DEST"
-systemctl daemon-reload
-systemctl enable --now yolobox-host.service
+table_changed=false
+if needs_install "$HERE/yolobox-host.nft" "$NFT_DEST" 0644; then
+  install -D -m0644 "$HERE/yolobox-host.nft" "$NFT_DEST"
+  table_changed=true
+fi
+if needs_install "$HERE/yolobox-host.service" "$UNIT_DEST" 0644; then
+  install -D -m0644 "$HERE/yolobox-host.service" "$UNIT_DEST"
+  systemctl daemon-reload
+fi
 # enable --now does nothing for a unit that is already active, so a changed
-# file needs the restart.
-systemctl restart yolobox-host.service
+# table needs the reload. Not a restart: the unit is RequiredBy=virtqemud, and
+# a restart would restart virtqemud with it, which a reload does not.
+if systemctl is-active --quiet yolobox-host.service; then
+  systemctl enable yolobox-host.service
+  if $table_changed; then
+    systemctl reload yolobox-host.service
+  fi
+else
+  systemctl enable --now yolobox-host.service
+fi
 
 step "(i) storage pool $POOL_NAME"
 pools="$("${VIRSH[@]}" pool-list --all --name)"

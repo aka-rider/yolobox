@@ -8,6 +8,7 @@ Before=virtqemud.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/yolobox/yolobox-host.nft
+ExecReload=/usr/sbin/nft -f /etc/yolobox/yolobox-host.nft
 
 [Install]
 WantedBy=multi-user.target
