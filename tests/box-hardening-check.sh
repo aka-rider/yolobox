@@ -397,14 +397,19 @@ check_gateway_ssh_closed() {
 # firewall must stop the agent claiming that address over loopback.
 # The ssh probes count Permission denied as sshd's AllowUsers refusing, but ssh
 # fails the same way when the forwarded agent offers no operator key. So they
-# run only when the agent lists a key, and otherwise print a SKIP.
+# run only when the agent lists a key, and print a SKIP when it lists none. An
+# agent that cannot be reached at all is a FAIL.
 # $1 is the operator's account name.
 check_operator_login_refused() {
-    local operator=$1 addr out keys
+    local operator=$1 addr out keys keys_status=0
     out=$(as_agent printenv SSH_AUTH_SOCK) ||
         fail "the agent has no SSH_AUTH_SOCK, so a login probe would prove nothing"
     [ -n "${out}" ] || fail "the agent's SSH_AUTH_SOCK is empty"
-    if keys=$(as_agent ssh-add -L 2>&1); then
+    # ssh-add -L exits 1 when the agent lists no identity and 2 when it cannot
+    # reach the agent; only the first is a SKIP.
+    keys=$(as_agent ssh-add -L 2>&1) || keys_status=$?
+    case ${keys_status} in
+    0)
         for addr in 127.0.0.1 "${GUEST_ADDR}"; do
             if out=$(as_agent ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
@@ -417,9 +422,12 @@ check_operator_login_refused() {
             esac
             ok "the agent cannot log in as ${operator} at ${addr}"
         done
-    else
+        ;;
+    1)
         echo "SKIP: sshd's refusal of ${operator} was NOT tested: the agent's forwarded ssh agent lists no key (ssh-add -L: ${keys}), so a Permission denied would not prove AllowUsers refused. Connect with an ssh agent forwarded and run this again" >&2
-    fi
+        ;;
+    *) fail "ssh-add -L exited ${keys_status}: the agent's ssh agent socket is unreachable (${keys})" ;;
+    esac
     # -C matches the rule by meaning; `iptables -S` prints its options in
     # another order than the one the unit adds them in.
     sudo -n iptables -C nixos-fw ! -i enp0s1 -s "${GATEWAY_ADDR}" -j DROP ||
