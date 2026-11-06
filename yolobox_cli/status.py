@@ -624,6 +624,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     try:
         gaps = state.driver().config_gaps()
+        notes = state.driver().config_notes()
     except YoError as unreadable:
         report.warn("%s: %s" % (state.driver().name, unreadable.message))
     else:
@@ -634,6 +635,8 @@ def cmd_status(args: argparse.Namespace) -> None:
             )
         else:
             ui.out("%s: reverse forwards ok" % state.driver().name)
+        for note in notes:
+            report.emit(StatusLine("%s: %s" % (state.driver().name, note)))
     for gap in state.driver().host_gaps():
         report.emit(host_gap_line(gap))
 

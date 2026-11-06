@@ -2271,6 +2271,7 @@ class StatusRunner:
         *,
         units_present=True,
         gaps=(),
+        notes=(),
         host_gaps=(),
         aws_which=None,
         aws_allowlist_side_effect=lambda: [],
@@ -2335,18 +2336,20 @@ class StatusRunner:
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         # limactl_list is what every `limactl list` prints: the driver's own
-        # config_gaps then runs on it instead of answering `gaps`.
-        config_gaps = (
-            contextlib.nullcontext()
-            if limactl_list is not None
-            else mock.patch.object(yo.LIMA, "config_gaps", return_value=list(gaps))
-        )
+        # config_gaps and config_notes then run on it instead of answering
+        # `gaps` and `notes`.
+        def driver_answer(method, answer):
+            if limactl_list is not None:
+                return contextlib.nullcontext()
+            return mock.patch.object(yo.LIMA, method, return_value=list(answer))
+
         with (
             mock.patch.object(yo.proc, "run", side_effect=fake_proc_run),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=fake_ssh_run),
             mock.patch.object(yo.lima, "du_kib", return_value=None),
             mock.patch.object(yo.guest, "vm_units_present", return_value=units_present),
-            config_gaps,
+            driver_answer("config_gaps", gaps),
+            driver_answer("config_notes", notes),
             mock.patch.object(yo.LIMA, "host_gaps", return_value=list(host_gaps)),
             mock.patch.object(yo.shutil, "which", return_value=aws_which),
             mock.patch.object(
@@ -2416,6 +2419,12 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         self.assertTrue(any(line.startswith("disk:") for line in outs))
         self.assertTrue(any(line.startswith("aws:") for line in outs))
         self.assertEqual((self.raised.message, self.raised.code), (None, 1))
+
+    def test_a_note_is_shown_without_failing_the_report(self):
+        outs = self.run_status(notes=["yolobox cannot tell something"])
+        self.assertIn("lima: yolobox cannot tell something", outs)
+        self.assertIn("lima: reverse forwards ok", outs)
+        self.assertIsNone(self.raised)
 
     def test_lima_config_gap_is_reported(self):
         outs = self.run_status(

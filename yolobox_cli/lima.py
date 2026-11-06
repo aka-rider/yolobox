@@ -36,7 +36,6 @@ GAP_LOAD_DOT_SSH_PUB_KEYS = "ssh.loadDotSSHPubKeys"
 GAP_UDP_FORWARDS = "portForwards.udp"
 GAP_TCP_FORWARDS = "portForwards.tcp"
 GAP_OPERATOR_UID = "user.uid"
-GAP_OPERATOR_UID_UNREADABLE = "user.uid.unreadable"
 
 # The guest TCP ports lima mirrors onto the host's 127.0.0.1: unprivileged and
 # below the macOS ephemeral range (49152). A Linux host mirrors nothing: it has no
@@ -124,9 +123,8 @@ LIMA_SETTING_GAPS = {
 
 # Gaps whose remedy is not a `limactl edit`. All are notes and not fatal: the
 # operator must still be able to start the box to copy their work out.
-# A uid lima reports and a uid it does not report differ in the remedy: lima
-# reads user.uid once, at creation, so a wrong one is mended only by recreating
-# the instance, while an unreadable one may belong to a healthy box.
+# A uid lima does not report is no gap: it may belong to a healthy box, so
+# config_notes() says so and `yo status` still exits 0.
 LIMA_MANUAL_GAPS = {
     GAP_OPERATOR_UID: (
         "has an operator whose uid is not %d (lima took the Mac account's uid), so "
@@ -135,16 +133,6 @@ LIMA_MANUAL_GAPS = {
         "change file ownership. Push out what you need, then recreate the "
         "instance from lima/yolobox.yaml, which pins the uid" % OPERATOR_GUEST_UID,
         lambda: state.destroy_then_bootstrap_command(),
-    ),
-    GAP_OPERATOR_UID_UNREADABLE: (
-        "reports no user.uid in `limactl list --json`, so yo cannot tell whether "
-        "the operator's uid is %d, as nix/base.nix declares. Nothing says the box "
-        "is wrong. Check by hand, and recreate the instance only if it is not %d"
-        % (OPERATOR_GUEST_UID, OPERATOR_GUEST_UID),
-        lambda: (
-            "limactl list --json %s (config.user.uid), or %s"
-            % (state.box.name, state.yo_cmd("ssh", "id", "-u"))
-        ),
     ),
 }
 
@@ -241,6 +229,10 @@ def lima_instance_info() -> Optional[LimaInfo]:
         user_uid=user.get("uid"),
         ssh_local_port=ssh.get("localPort"),
     )
+
+
+def operator_uid_readable(info: LimaInfo) -> bool:
+    return isinstance(info.user_uid, int) and not isinstance(info.user_uid, bool)
 
 
 def ignores_all_guest_udp(forward: object) -> bool:
@@ -582,11 +574,27 @@ class LimaDriver:
             gaps.append(GAP_PROPAGATE_PROXY_ENV)
         if info.load_dot_ssh_pub_keys is not False:
             gaps.append(GAP_LOAD_DOT_SSH_PUB_KEYS)
-        if isinstance(info.user_uid, bool) or not isinstance(info.user_uid, int):
-            gaps.append(GAP_OPERATOR_UID_UNREADABLE)
-        elif info.user_uid != OPERATOR_GUEST_UID:
+        if operator_uid_readable(info) and info.user_uid != OPERATOR_GUEST_UID:
             gaps.append(GAP_OPERATOR_UID)
         return gaps
+
+    def config_notes(self) -> List[str]:
+        info = lima_instance_info()
+        if info is None or operator_uid_readable(info):
+            return []
+        return [
+            "%s reports no user.uid in `limactl list --json`, so yo cannot tell "
+            "whether the operator's uid is %d, as nix/base.md declares. Nothing says "
+            "the box is wrong. Check by hand, and recreate the instance only if it "
+            "is not %d: limactl list --json %s (config.user.uid), or %s"
+            % (
+                state.box.name,
+                OPERATOR_GUEST_UID,
+                OPERATOR_GUEST_UID,
+                state.box.name,
+                state.yo_cmd("ssh", "id", "-u"),
+            )
+        ]
 
     def fatal_gaps(self, gaps: Sequence[str]) -> List[str]:
         return [gap for gap in gaps if gap in LIMA_FATAL_GAPS]

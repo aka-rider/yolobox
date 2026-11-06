@@ -194,6 +194,9 @@ class Driver(Protocol):
     # Set the stopped instance's memory and CPUs, taking effect at its next start.
     def resize(self, memory_gib: int, cpus: int) -> None: ...
     def config_gaps(self) -> List[str]: ...  # how the instance breaks guarantees
+    # What yo cannot verify about the instance, each a full sentence: no gap, so
+    # `yo status` shows it without failing and `yo up` does not repeat it.
+    def config_notes(self) -> List[str]: ...
     # Those of `gaps` vm_up refuses to start with; it only warns about the rest.
     def fatal_gaps(self, gaps: Sequence[str]) -> List[str]: ...
     def config_gap_message(self, gaps: Sequence[str]) -> str: ...  # with the fixes

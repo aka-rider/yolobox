@@ -715,6 +715,9 @@ class LibvirtDriver:
             gid,
         )
 
+    def config_notes(self) -> List[str]:
+        return []
+
     def config_gap_message(self, gaps: Sequence[str]) -> str:
         return (
             "domain %s breaks the box's guarantees (%s) — remove its definition, "

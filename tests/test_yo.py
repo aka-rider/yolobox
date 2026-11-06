@@ -3808,16 +3808,25 @@ class TestLimaConfigGaps(FakeHome):
         with self.mock_lima_list(self.restated_forwards(), user_uid=501):
             self.assertEqual(yo.LIMA.config_gaps(), [])
 
-    def test_a_uid_limactl_does_not_report_as_an_integer_is_unreadable_not_wrong(self):
+    def test_a_uid_limactl_does_not_report_as_an_integer_is_a_note_not_a_gap(self):
         for value in (None, MISSING, "501", 501.5, True, [501]):
             with self.subTest(value=value):
                 with self.mock_lima_list(self.restated_forwards(), user_uid=value):
-                    self.assertEqual(
-                        yo.LIMA.config_gaps(), [yo.GAP_OPERATOR_UID_UNREADABLE]
-                    )
+                    self.assertEqual(yo.LIMA.config_gaps(), [])
+                    (note,) = yo.LIMA.config_notes()
+                self.assertIn("cannot tell whether the operator's uid is 501", note)
+
+    def test_a_readable_uid_or_a_missing_instance_has_no_note(self):
+        for value in (501, 502, 0):
+            with self.subTest(value=value):
+                with self.mock_lima_list(self.restated_forwards(), user_uid=value):
+                    self.assertEqual(yo.LIMA.config_notes(), [])
+        with fake_limactl("", 1, "whatever limactl says", listed=["other"]):
+            self.assertEqual(yo.LIMA.config_notes(), [])
 
     def test_an_unreadable_uid_says_how_to_check_and_never_offers_to_destroy(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_OPERATOR_UID_UNREADABLE])
+        with self.mock_lima_list(self.restated_forwards(), user_uid=MISSING):
+            (message,) = yo.LIMA.config_notes()
         self.assertIn("limactl list --json yolobox", message)
         self.assertIn("yo ssh id -u", message)
         for destructive in ("destroy", "limactl delete", "bootstrap", "--set"):
@@ -4556,6 +4565,7 @@ class TestStatusWithVmDown(unittest.TestCase):
             mock.patch.object(yo.sshx, "account_status", lambda: ("unreachable", "")),
             mock.patch.object(yo.sshx, "ssh_run", ssh_run),
             mock.patch.object(yo.LIMA, "config_gaps", lambda: []),
+            mock.patch.object(yo.LIMA, "config_notes", lambda: []),
             mock.patch.object(
                 yo.unlock, "sshd_answers", lambda user: yo.SshOutcome.NOT_LISTENING
             ),
