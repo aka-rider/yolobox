@@ -144,39 +144,40 @@ setfacl -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
 # domain, which cuts yolobox-vm's entry down to r-x. A qemu hook re-applies the
 # same fixed setfacl before a yolobox domain starts and after any domain starts
 # or is released. virtqemud reads its hook directory only when it starts, so it
-# is restarted if it runs, and only when the hook changed; running domains are
-# not touched. See linux/host-setup.md, "The passt ACL hook".
+# is restarted if it runs and has been running since before the hook file was
+# written; running domains are not touched. That is read from the two
+# timestamps, not from "this run installed the hook", so a run that died
+# between the install and the restart is finished by the next one. See
+# linux/host-setup.md, "The passt ACL hook".
 step "(l) libvirt hook that keeps the passt ACL"
-hook_changed=false
 if needs_install "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK" 0755; then
   install -D -m0755 "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK"
-  hook_changed=true
 fi
 restorecon -F "$PASST_HOOK"
-if $hook_changed; then
+qemud_started="$(systemctl show --timestamp=unix --property=ActiveEnterTimestamp --value virtqemud.service)"
+if [[ $qemud_started == @* ]] && ((${qemud_started#@} <= $(stat -c %Y "$PASST_HOOK"))); then
   systemctl try-restart virtqemud.service
 fi
 
 step "(g) host egress table"
 [[ -x /usr/sbin/nft ]] || die "/usr/sbin/nft is missing after installing nftables"
 /usr/sbin/nft -c -f "$HERE/yolobox-host.nft"
-table_changed=false
 if needs_install "$HERE/yolobox-host.nft" "$NFT_DEST" 0644; then
   install -D -m0644 "$HERE/yolobox-host.nft" "$NFT_DEST"
-  table_changed=true
 fi
 if needs_install "$HERE/yolobox-host.service" "$UNIT_DEST" 0644; then
   install -D -m0644 "$HERE/yolobox-host.service" "$UNIT_DEST"
-  systemctl daemon-reload
 fi
-# enable --now does nothing for a unit that is already active, so a changed
-# table needs the reload. Not a restart: the unit is RequiredBy=virtqemud, and
-# a restart would restart virtqemud with it, which a reload does not.
+systemctl daemon-reload
+# enable --now does nothing for a unit that is already active, so an active
+# unit is reloaded on every run, whether or not the file changed: the loaded
+# table may differ from the file (deleted or edited by hand, or a run that died
+# after the install and before the reload). A reload is one atomic nft -f and
+# idempotent. Not a restart: the unit is RequiredBy=virtqemud, and a restart
+# would restart virtqemud with it, which a reload does not.
 if systemctl is-active --quiet yolobox-host.service; then
   systemctl enable yolobox-host.service
-  if $table_changed; then
-    systemctl reload yolobox-host.service
-  fi
+  systemctl reload yolobox-host.service
 else
   systemctl enable --now yolobox-host.service
 fi

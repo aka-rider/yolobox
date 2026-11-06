@@ -1938,8 +1938,11 @@ class TestHostAccountAndTableAreOneFact(unittest.TestCase):
 
 
 class TestHostSetupCanBeRerun(unittest.TestCase):
-    """A second run of linux/host-setup.sh changes nothing (linux/host-setup.md),
-    and a damaged checkout is refused before the host is touched."""
+    """A second run of linux/host-setup.sh changes nothing on a healthy host and
+    finishes what a run that died left half done (linux/host-setup.md), and a
+    damaged checkout is refused before the host is touched. The steps that
+    restart and reload run here under bash with a fake systemctl; they skip
+    without GNU stat and install."""
 
     def test_every_file_it_reads_beside_itself_is_checked_before_the_first_step(self):
         text = HOST_SETUP.read_text()
@@ -1966,6 +1969,132 @@ class TestHostSetupCanBeRerun(unittest.TestCase):
 
     def test_it_never_restarts_the_table_unit(self):
         self.assertNotIn("restart yolobox-host", HOST_SETUP.read_text())
+
+    def run_steps(
+        self,
+        first,
+        last,
+        *,
+        hook_mtime=None,
+        started="",
+        active=False,
+        table_installed=False,
+    ):
+        """Run the steps of host-setup.sh from `first` up to `last` against a
+        scratch root with a fake systemctl, and return the systemctl calls
+        other than `show`. `started` is what `systemctl show` prints for
+        virtqemud's start; `hook_mtime` pre-installs the hook with that
+        mtime; `table_installed` pre-installs the table and its unit,
+        identical to the repo's; `active` is whether the table unit is
+        active."""
+        if subprocess.run(["stat", "--version"], capture_output=True).returncode:
+            self.skipTest("needs GNU stat and install")
+        text = HOST_SETUP.read_text()
+        (needs_install,) = re.findall(
+            r"^needs_install\(\) \{\n.*?^\}\n", text, re.M | re.S
+        )
+        steps = text[text.index('step "%s' % first) : text.index('step "%s' % last)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            here = root / "repo"
+            here.mkdir()
+            for name in (
+                "yolobox-libvirt-hook.sh",
+                "yolobox-host.nft",
+                "yolobox-host.service",
+            ):
+                shutil.copy(HOST_SETUP.parent / name, here / name)
+            fakes = {
+                "nft": "exit 0",
+                "restorecon": "exit 0",
+                "systemctl": (
+                    "case $1 in\n"
+                    '  show) printf "%s\\n" "$FAKE_STARTED" ;;\n'
+                    '  is-active) exit "$FAKE_IS_ACTIVE" ;;\n'
+                    '  *) echo "$*" >>"$CALLS" ;;\n'
+                    "esac"
+                ),
+            }
+            for name, body in fakes.items():
+                fake = bin_dir / name
+                fake.write_text("#!/bin/sh\n%s\n" % body)
+                fake.chmod(0o755)
+            hook = root / "hook"
+            if hook_mtime is not None:
+                shutil.copy(here / "yolobox-libvirt-hook.sh", hook)
+                hook.chmod(0o755)
+                os.utime(hook, (hook_mtime, hook_mtime))
+            nft_dest = root / "nft-file"
+            unit_dest = root / "unit-file"
+            if table_installed:
+                shutil.copy(here / "yolobox-host.nft", nft_dest)
+                shutil.copy(here / "yolobox-host.service", unit_dest)
+                nft_dest.chmod(0o644)
+                unit_dest.chmod(0o644)
+            script = root / "steps.sh"
+            script.write_text(
+                "set -Eeuo pipefail\n"
+                'HERE="%s" PASST_HOOK="%s" NFT_DEST="%s" UNIT_DEST="%s"\n'
+                "step() { :; }\n"
+                'die() { echo "$1" >&2; exit 1; }\n'
+                "%s%s"
+                % (
+                    here,
+                    hook,
+                    nft_dest,
+                    unit_dest,
+                    needs_install,
+                    steps.replace("/usr/sbin/nft", str(bin_dir / "nft")),
+                )
+            )
+            calls = root / "calls"
+            calls.touch()
+            subprocess.run(
+                ["bash", str(script)],
+                check=True,
+                env={
+                    "PATH": "%s:%s" % (bin_dir, os.environ["PATH"]),
+                    "CALLS": str(calls),
+                    "FAKE_STARTED": started,
+                    "FAKE_IS_ACTIVE": "0" if active else "3",
+                },
+            )
+            return calls.read_text().splitlines()
+
+    def test_virtqemud_restarts_when_it_started_before_the_hook_was_written(self):
+        self.assertEqual(
+            self.run_steps("(l)", "(g)", started="@1000"),
+            ["try-restart virtqemud.service"],
+        )
+
+    def test_a_run_that_died_before_the_restart_is_finished_by_the_next(self):
+        """The hook is installed and identical, so the restart cannot hang on
+        this run having installed it."""
+        self.assertEqual(
+            self.run_steps("(l)", "(g)", hook_mtime=2000, started="@1000"),
+            ["try-restart virtqemud.service"],
+        )
+
+    def test_virtqemud_is_left_alone_when_it_started_after_the_hook(self):
+        self.assertEqual(
+            self.run_steps("(l)", "(g)", hook_mtime=2000, started="@3000"), []
+        )
+
+    def test_a_virtqemud_that_never_ran_is_left_alone(self):
+        self.assertEqual(self.run_steps("(l)", "(g)", started=""), [])
+
+    def test_an_active_table_unit_is_reloaded_even_when_no_file_changed(self):
+        """The loaded table may have been deleted by hand under an active unit."""
+        calls = self.run_steps("(g)", "(i)", active=True, table_installed=True)
+        self.assertIn("reload yolobox-host.service", calls)
+        self.assertNotIn("restart yolobox-host.service", calls)
+
+    def test_an_inactive_table_unit_is_enabled_and_started(self):
+        calls = self.run_steps("(g)", "(i)", active=False, table_installed=True)
+        self.assertIn("enable --now yolobox-host.service", calls)
+        self.assertNotIn("reload yolobox-host.service", calls)
 
 
 class TestAgentAccountIsOneFact(unittest.TestCase):
