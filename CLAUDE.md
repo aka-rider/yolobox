@@ -82,7 +82,6 @@ Mac side:
 - `lima/yolobox.yaml`: instance config, read once at creation.
   `lima/yolobox.md`.
 - `homebrew/yolobox.rb`: the brew formula, rendered into the tap on release.
-- `templates/default/`: `devbox.json` for a new project.
 
 Linux host side (the libvirt driver is `yolobox_cli/libvirt.py`, see the
 driver section of `yo.md`; brew ships none of this, nix ships it on Linux only):

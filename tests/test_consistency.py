@@ -1305,20 +1305,16 @@ class TestThereIsNoDirenvInTheBox(unittest.TestCase):
 
     def box_files(self):
         files = sorted((REPO / "nix").rglob("*.nix"))
-        files += sorted(p for p in (REPO / "templates").rglob("*") if p.is_file())
         files.append(REPO / "flake.nix")
         self.assertTrue(files)
         return files
 
-    def test_no_nix_module_or_template_loads_or_mentions_direnv_machinery(self):
+    def test_no_nix_module_loads_or_mentions_direnv_machinery(self):
         for path in self.box_files():
             text = nix_code(path) if path.suffix == ".nix" else path.read_text()
             for pattern in self.FORBIDDEN:
                 with self.subTest(file=str(path.relative_to(REPO)), pattern=pattern):
                     self.assertNotIn(pattern, text)
-
-    def test_the_default_template_ships_no_envrc(self):
-        self.assertFalse((REPO / "templates" / "default" / ".envrc").exists())
 
 
 class TestSudoIsReachableByWheelOnly(unittest.TestCase):

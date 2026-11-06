@@ -6,7 +6,7 @@
 
 An `.envrc` is code, and the agent writes it. The operator pulls the repo to the host, and the first `cd` into it would run that file with the operator's `sudo` available.
 
-A direnv whitelist for one account does not help when the file travels by git to another account's machine, so the rule is to have no loader, not to fence it. There is no direnv anywhere: not in the box, not in `templates/`, not in the agent's environment.
+A direnv whitelist for one account does not help when the file travels by git to another account's machine, so the rule is to have no loader, not to fence it. There is no direnv anywhere: not in the box, not in the agent's environment.
 
 A project's environment is entered explicitly, with `devbox shell` or `devbox run`. `yo cp` also refuses to land an `.envrc` on the host (see [yo.md](../yo.md#downloads-never-land-control-paths)), so a download cannot plant one either.
 
