@@ -200,10 +200,10 @@ Identify whether you are running on the host (macOS or Linux) or in the guest (L
 
 - ALWAYS spell the profile-name pattern identically in `yo`, `aws-broker` and `yolobox-guest`, and match it with `fullmatch`. A name goes into a `credential_process` argument and a URL path, and `$` matches before a trailing newline. [story](docs/aws.md#allowlist)
 - NEVER allow-list a profile without a valid `region`. A region-less profile makes the CLI target the global STS endpoint, which a DNS filter on the host may sinkhole, and the region lands in the rendered config file. [story](docs/aws.md#allowlist)
-- ALWAYS answer every request failure with the same generic 500, and write the detail only to `broker.log`. The guest is the untrusted side and the response is the one channel it reads. [story](docs/aws.md#minting)
+- ALWAYS answer every failure of a request the broker reads with the same generic 500, and write the detail only to `broker.log`. A connection over the bound, or a request head over the cap, is closed with no answer at all. The guest is the untrusted side and the response is the one channel it reads. [story](docs/aws.md#minting)
 - NEVER hand long-lived IAM keys to the guest. A response without a `SessionToken` is refused at request time. [story](docs/aws.md#minting)
 - ALWAYS compare socket identity with `lstat`, never `stat`. A path replaced by a symlink to the old socket would otherwise report the target's identity and be deleted as ours. [story](docs/aws.md#broker-lifetime)
-- ALWAYS bound the broker: at most 32 concurrent requests, answering the next with 503, and a 60 s wall-clock deadline per connection, and a 15 s wait for a profile's lock before a `503`. A mint can take 30 s, and a silent or trickling client must free its slot. [story](docs/aws.md#bounds-on-one-request)
+- ALWAYS bound the broker: at most 64 open connections on the guest socket, closing the next at accept, an 8 KiB request head, at most 32 concurrent `/creds/` requests, answering the next with `503`, a 60 s wall-clock deadline per connection, and a 15 s wait for a profile's lock before a `503`; and answer yo's `/health` on a host-only control socket. A mint can take 30 s, a silent or trickling client must free its slot, and a guest flood must not make yo think the broker is gone. [story](docs/aws.md#bounds-on-one-request)
 - ALWAYS write the guest AWS config atomically, with `mktemp` and `mv`. A `credential_process` call must never read a half-written file. [story](docs/aws.md#guest-config)
 
 ## Project repos in the VM

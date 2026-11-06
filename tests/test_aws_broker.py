@@ -376,7 +376,7 @@ class TestReclaimSocketPath(SocketDirCase):
 
     def test_refuses_a_symlink_to_a_live_socket(self):
         real = os.path.join(self.dir, "real.sock")
-        server, _ = broker.bind_server(real, {}, 1)
+        server, _ = broker.bind_guest_server(real, {}, 1)
         self.addCleanup(server.server_close)
         os.symlink(real, self.sock)
         out = self.fails(broker.reclaim_socket_path, self.sock)
@@ -384,14 +384,14 @@ class TestReclaimSocketPath(SocketDirCase):
         self.assertTrue(os.path.islink(self.sock))
 
     def test_removes_a_stale_socket(self):
-        server, _ = broker.bind_server(self.sock, {}, 1)
+        server, _ = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()  # closed but the file remains: stale
         self.assertTrue(os.path.exists(self.sock))
         broker.reclaim_socket_path(self.sock)
         self.assertFalse(os.path.exists(self.sock))
 
     def test_refuses_a_live_socket(self):
-        server, _ = broker.bind_server(self.sock, {}, 1)
+        server, _ = broker.bind_guest_server(self.sock, {}, 1)
         self.addCleanup(server.server_close)
         self.fails(broker.reclaim_socket_path, self.sock)
         self.assertTrue(os.path.exists(self.sock))
@@ -399,13 +399,13 @@ class TestReclaimSocketPath(SocketDirCase):
 
 class TestUnlinkIfSameIdentity(SocketDirCase):
     def test_removes_the_file_with_that_identity(self):
-        server, identity = broker.bind_server(self.sock, {}, 1)
+        server, identity = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()
         broker.unlink_if_same_identity(self.sock, identity)
         self.assertFalse(os.path.lexists(self.sock))
 
     def test_leaves_a_newer_file_alone(self):
-        server, identity = broker.bind_server(self.sock, {}, 1)
+        server, identity = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()
         # Made while the old socket still exists, then renamed over it: Linux
         # hands a freed inode number straight to the next file, which would
@@ -420,7 +420,7 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
         self.assertIn("not the socket this broker bound", log.call_args.args[0])
 
     def test_a_path_that_cannot_be_inspected_is_logged_not_ignored(self):
-        server, identity = broker.bind_server(self.sock, {}, 1)
+        server, identity = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()
         with mock.patch.object(broker.os, "lstat", side_effect=PermissionError("no")):
             with mock.patch.object(broker, "log") as log:
@@ -430,7 +430,7 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
         self.assertTrue(os.path.lexists(self.sock))
 
     def test_a_failing_unlink_is_logged_not_ignored(self):
-        server, identity = broker.bind_server(self.sock, {}, 1)
+        server, identity = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()
         with mock.patch.object(broker.os, "unlink", side_effect=PermissionError("no")):
             with mock.patch.object(broker, "log") as log:
@@ -440,7 +440,7 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
 
     def test_does_not_follow_a_symlink_to_the_identity(self):
         real = os.path.join(self.dir, "real.sock")
-        server, identity = broker.bind_server(real, {}, 1)
+        server, identity = broker.bind_guest_server(real, {}, 1)
         server.server_close()
         os.symlink(real, self.sock)
         with mock.patch.object(broker, "log") as log:
@@ -775,7 +775,7 @@ class TestBindServer(SocketDirCase):
     def test_socket_is_mode_0600_and_umask_is_restored(self):
         before = os.umask(0o022)
         try:
-            server, identity = broker.bind_server(self.sock, {}, 1)
+            server, identity = broker.bind_guest_server(self.sock, {}, 1)
             self.addCleanup(server.server_close)
             self.assertEqual(os.umask(0o022), 0o022)
         finally:
@@ -803,25 +803,30 @@ class ServedBroker(SocketDirCase):
         self.log = log_patch.start()
         self.addCleanup(log_patch.stop)
         self.states = {p: broker.State(p, self.min_remint_interval) for p in self.allow}
-        self.server, _ = broker.bind_server(
-            self.sock,
-            self.states,
-            4242,
-            max_concurrent=self.max_concurrent,
-            max_connections=self.max_connections,
+        self.serve(
+            broker.bind_guest_server(
+                self.sock,
+                self.states,
+                4242,
+                max_concurrent=self.max_concurrent,
+                max_connections=self.max_connections,
+            )[0]
         )
+
+    def serve(self, server):
+        """Serve on a thread until the test ends."""
         thread = threading.Thread(
-            target=self.server.serve_forever,
+            target=server.serve_forever,
             kwargs={"poll_interval": 0.01},
             daemon=True,
         )
         thread.start()
-        self.addCleanup(self.stop, thread)
+        self.addCleanup(self.stop, server, thread)
 
-    def stop(self, thread):
-        self.server.shutdown()
+    def stop(self, server, thread):
+        server.shutdown()
         thread.join()
-        self.server.server_close()
+        server.server_close()
 
     def exchange(self, request, half_close=False, sock=None):
         """Send raw bytes, return everything the broker answers until it closes."""
@@ -949,7 +954,9 @@ class TestServedRequests(ServedBroker):
         self.assertIn("RuntimeError", self.logged())
 
     def test_unexpected_exception_off_creds_path_is_still_a_500(self):
-        with mock.patch.object(broker.Handler, "_route", side_effect=ValueError("x")):
+        with mock.patch.object(
+            broker.HealthHandler, "_route", side_effect=ValueError("x")
+        ):
             status, body = self.get("/health")
         self.assertEqual(status, 500)
         self.assertIn("broker.log", body)
@@ -966,7 +973,7 @@ class TestServedRequests(ServedBroker):
         self.log.side_effect = REAL_LOG
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
             with mock.patch.object(
-                broker.Handler, "_route", side_effect=ValueError("x")
+                broker.GuestHandler, "_creds_route", side_effect=ValueError("x")
             ):
                 status, _ = self.get("/creds/a\x1b[31m")
         self.assertEqual(status, 500)
@@ -1117,6 +1124,9 @@ class TestMalformedRequests(ServedBroker):
 
 class TestRequestHeadCap(ServedBroker):
     cap = broker.MAX_REQUEST_HEAD_BYTES
+    # http.server answers 414 to a request line longer than this; the cap must
+    # close such a line unanswered too, not leave it to the stdlib.
+    stdlib_line_limit = 64 * 1024
 
     def assert_still_serving(self):
         self.assertEqual(self.get("/health")[0], 200)
@@ -1128,7 +1138,7 @@ class TestRequestHeadCap(ServedBroker):
         self.assertRegex(answer, rb"^HTTP/1\.[01] 404 ")
 
     def test_a_request_line_over_the_cap_is_closed_unanswered(self):
-        for length in [self.cap, 70000]:
+        for length in [self.cap, self.stdlib_line_limit + 1]:
             with self.subTest(length=length):
                 answer = self.exchange(b"GET /" + b"a" * length + b" HTTP/1.0\r\n\r\n")
                 self.assertEqual(answer, b"")
@@ -1164,7 +1174,9 @@ class TestSingleSlot(ServedBroker):
 
     def test_slot_is_released_after_a_failed_request(self):
         self.aws(aws_result(process_json()))
-        with mock.patch.object(broker.Handler, "_route", side_effect=ValueError("x")):
+        with mock.patch.object(
+            broker.GuestHandler, "_creds_route", side_effect=ValueError("x")
+        ):
             self.assertEqual(self.get("/creds/dev")[0], 500)
         self.assertEqual(self.get("/creds/dev")[0], 200)
 
@@ -1253,7 +1265,9 @@ class TestConnectionBound(ServedBroker):
 
     def test_the_slot_comes_back_when_the_handler_crashes(self):
         boom = RuntimeError("boom")
-        with mock.patch.object(broker.Handler, "handle_one_request", side_effect=boom):
+        with mock.patch.object(
+            broker.HealthHandler, "handle_one_request", side_effect=boom
+        ):
             self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
             self.assertTrue(self.finished.wait(10))
         self.assertEqual(self.get("/health")[0], 200)
@@ -1282,25 +1296,7 @@ class TestControlSocket(ServedBroker):
 
     def setUp(self):
         super().setUp()
-        self.control, _ = broker.bind_server(
-            self.ctl,
-            self.states,
-            4242,
-            max_connections=broker.MAX_CONTROL_CONNECTIONS,
-            handler_class=broker.ControlHandler,
-        )
-        thread = threading.Thread(
-            target=self.control.serve_forever,
-            kwargs={"poll_interval": 0.01},
-            daemon=True,
-        )
-        thread.start()
-        self.addCleanup(self.stop_control, thread)
-
-    def stop_control(self, thread):
-        self.control.shutdown()
-        thread.join()
-        self.control.server_close()
+        self.serve(broker.bind_control_server(self.ctl, self.states, 4242)[0])
 
     def test_health_is_answered_while_the_guest_socket_refuses_every_connection(self):
         self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
@@ -1312,9 +1308,6 @@ class TestControlSocket(ServedBroker):
         run = self.aws(aws_result(process_json()))
         self.assertEqual(self.get("/creds/dev", sock=self.ctl)[0], 404)
         run.assert_not_called()
-
-    def test_the_socket_is_mode_0600(self):
-        self.assertEqual(stat.S_IMODE(os.lstat(self.ctl).st_mode), 0o600)
 
 
 class TestBindServers(SocketDirCase):
@@ -1353,7 +1346,7 @@ class TestControlSocketReclaim(SocketDirCase):
     def test_a_live_control_socket_stops_a_second_broker_and_leaves_no_guest_socket(
         self,
     ):
-        live, _ = broker.bind_server(self.ctl, {}, 1)
+        live, _ = broker.bind_guest_server(self.ctl, {}, 1)
         self.addCleanup(live.server_close)
         done = subprocess.run(
             [sys.executable, BROKER_PATH, *self.broker_args()],
@@ -1370,7 +1363,7 @@ class TestControlSocketReclaim(SocketDirCase):
 
     @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
     def test_a_stale_control_socket_is_replaced(self):
-        stale, _ = broker.bind_server(self.ctl, {}, 1)
+        stale, _ = broker.bind_guest_server(self.ctl, {}, 1)
         stale.server_close()  # closed but the file remains
         child = subprocess.Popen(
             [sys.executable, BROKER_PATH, *self.broker_args()],
@@ -1393,7 +1386,7 @@ class TestHandlerCrash(ServedBroker):
         boom = RuntimeError("guest said \x1b[31m")
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
             with mock.patch.object(
-                broker.Handler, "handle_one_request", side_effect=boom
+                broker.HealthHandler, "handle_one_request", side_effect=boom
             ):
                 self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
         self.assertIn("RuntimeError: guest said ?[31m", stderr.getvalue())

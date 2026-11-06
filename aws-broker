@@ -442,6 +442,8 @@ def mint_failed_body(profile):
 
 BUSY_BODY = "broker busy; retry\n"
 
+REQUEST_FAILED_BODY = "request failed; the detail is in broker.log\n"
+
 CREDS_PATH_PREFIX = "/creds/"
 
 
@@ -495,14 +497,15 @@ class CappedReader:
         self.inner.close()
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    # The control socket's handler turns this off: it answers /health only.
-    serves_creds = True
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    """yo's /health, and what every connection on either socket goes through.
 
-    def __init__(self, states, watch_pid, slots, *args, **kwargs):
+    The control socket serves this alone; GuestHandler adds /creds/.
+    """
+
+    def __init__(self, states, watch_pid, *args, **kwargs):
         self.states = states
         self.watch_pid = watch_pid
-        self.slots = slots
         super().__init__(*args, **kwargs)
 
     def setup(self):
@@ -566,11 +569,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _route(self, profile):
-        """Return the Reply for GET self.path; may raise.
+    def _guarded(self, route, failure_body):
+        """Return route()'s Reply, or a 500 with failure_body if it raises."""
+        try:
+            return route()
+        except Exception:
+            # A bug or an unexpected shape must become a clean 500, never a
+            # dropped connection. The traceback carries the exception's own
+            # message, so no code on this path may put a credential in one.
+            log(f"{clip(self.path)}: request failed:\n{traceback.format_exc()}")
+            return text_reply(HTTPStatus.INTERNAL_SERVER_ERROR, failure_body)
 
-        `profile` is what creds_profile made of the path, None off /creds/.
-        """
+    def _route(self):
+        """Return the Reply for GET self.path; may raise."""
         if self.path == "/health":
             return json_reply(
                 HTTPStatus.OK,
@@ -580,10 +591,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "allow": sorted(self.states),
                 },
             )
+        return text_reply(HTTPStatus.NOT_FOUND, "")
 
-        if profile is None:
-            return text_reply(HTTPStatus.NOT_FOUND, "")
+    def do_GET(self):
+        self._send(self._guarded(self._route, REQUEST_FAILED_BODY))
 
+
+class GuestHandler(HealthHandler):
+    """The guest's socket: /health, and the credentials under /creds/."""
+
+    def __init__(self, states, watch_pid, slots, *args, **kwargs):
+        self.slots = slots
+        super().__init__(states, watch_pid, *args, **kwargs)
+
+    def _creds_route(self, profile):
+        """Return the Reply for GET /creds/<profile>; may raise."""
         state = self.states.get(profile)
         if state is None:
             allowed = ", ".join(sorted(self.states)) or "(none)"
@@ -614,12 +636,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # queued behind a mint that may take MINT_TIMEOUT_SECONDS. /health reads
     # only memory and takes no slot, so yo can always ask who is serving.
     def do_GET(self):
-        profile = creds_profile(self.path) if self.serves_creds else None
+        profile = creds_profile(self.path)
         if profile is None:
-            self._send(self._reply_for(profile))
+            super().do_GET()
         elif self.slots.acquire(blocking=False):
             try:
-                reply = self._reply_for(profile)
+                reply = self._guarded(
+                    lambda: self._creds_route(profile),
+                    mint_failed_body(profile) if profile else REQUEST_FAILED_BODY,
+                )
             finally:
                 self.slots.release()
             self._send(reply)
@@ -627,38 +652,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             log("too many concurrent requests; replying 503")
             self._send(text_reply(HTTPStatus.SERVICE_UNAVAILABLE, BUSY_BODY))
 
-    def _reply_for(self, profile):
-        try:
-            return self._route(profile)
-        except Exception:
-            # A bug or an unexpected shape must become a clean 500, never a
-            # dropped connection. The traceback carries the exception's own
-            # message, so no code on this path may put a credential in one.
-            log(f"{clip(self.path)}: request failed:\n{traceback.format_exc()}")
-            return text_reply(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                mint_failed_body(profile)
-                if profile
-                else "request failed; the detail is in broker.log\n",
-            )
 
-
-class ControlHandler(Handler):
-    """yo's /health on the host-only socket; the guest never reaches it."""
-
-    serves_creds = False
-
-
-def bind_server(
-    socket_path,
-    states,
-    watch_pid,
-    max_concurrent=MAX_CONCURRENT_REQUESTS,
-    max_connections=MAX_CONNECTIONS,
-    handler_class=Handler,
-):
+def bind_server(socket_path, handler_factory, max_connections):
     """Bind the 0600 unix socket and return (server, (st_dev, st_ino))."""
-    slots = threading.BoundedSemaphore(max_concurrent)
     # Only the socket file's own mode governs who can connect: no bearer
     # token guards these requests, and this file only ever runs on the Mac,
     # which has no separate agent account — 0600 restricts the socket to
@@ -668,11 +664,7 @@ def bind_server(
     # not the 0o077 that a regular file's 0666 default would call for.
     old_umask = os.umask(0o177)
     try:
-        server = UnixHTTPServer(
-            socket_path,
-            lambda *a, **kw: handler_class(states, watch_pid, slots, *a, **kw),
-            max_connections,
-        )
+        server = UnixHTTPServer(socket_path, handler_factory, max_connections)
     except OSError as e:
         fail(f"cannot bind unix socket {socket_path}: {e}")
     finally:
@@ -680,6 +672,29 @@ def bind_server(
 
     st = os.lstat(socket_path)
     return server, (st.st_dev, st.st_ino)
+
+
+def bind_guest_server(
+    socket_path,
+    states,
+    watch_pid,
+    max_concurrent=MAX_CONCURRENT_REQUESTS,
+    max_connections=MAX_CONNECTIONS,
+):
+    slots = threading.BoundedSemaphore(max_concurrent)
+    return bind_server(
+        socket_path,
+        lambda *a, **kw: GuestHandler(states, watch_pid, slots, *a, **kw),
+        max_connections,
+    )
+
+
+def bind_control_server(socket_path, states, watch_pid):
+    return bind_server(
+        socket_path,
+        lambda *a, **kw: HealthHandler(states, watch_pid, *a, **kw),
+        MAX_CONTROL_CONNECTIONS,
+    )
 
 
 class Bound(NamedTuple):
@@ -690,17 +705,11 @@ class Bound(NamedTuple):
 
 def bind_servers(socket_path, control_path, states, watch_pid):
     """Bind the guest socket and the host-only control socket, or neither."""
-    guest, guest_identity = bind_server(socket_path, states, watch_pid)
+    guest, guest_identity = bind_guest_server(socket_path, states, watch_pid)
     try:
-        control, control_identity = bind_server(
-            control_path,
-            states,
-            watch_pid,
-            max_connections=MAX_CONTROL_CONNECTIONS,
-            handler_class=ControlHandler,
-        )
+        control, control_identity = bind_control_server(control_path, states, watch_pid)
     except SystemExit:
-        # bind_server has said why; the guest socket must not outlive it.
+        # bind_control_server has said why; the guest socket must not outlive it.
         guest.server_close()
         unlink_if_same_identity(socket_path, guest_identity)
         raise
