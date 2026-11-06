@@ -1414,6 +1414,39 @@ def hardening_nix_sysctls():
     return dict(parsed + forced)
 
 
+class TestNixPatternsAreEre(unittest.TestCase):
+    """builtins.match and strMatching take POSIX ERE over the whole string,
+    which has no \\s, \\S, \\d or \\w: inside a bracket expression `[\\s\\S]` is
+    the three characters backslash, s and S. nix/hardening.nix once spelled
+    its forbidden-capability test that way and the assertion never fired."""
+
+    PATTERN = re.compile(r'(?:builtins\.match|strMatching)\s+"((?:[^"\\]|\\.)*)"')
+    PERL_CLASS = re.compile(r"\\[sSdDwW]")
+
+    def nix_files(self):
+        if not shutil.which("git") or not (REPO / ".git").exists():
+            self.skipTest("needs git and a checkout (CLAUDE.md copies the tree out)")
+        names = subprocess.run(
+            ["git", "-C", str(REPO), "ls-files", "*.nix"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        self.assertIn("nix/hardening.nix", names)
+        return [REPO / name for name in names]
+
+    def test_no_pattern_uses_a_perl_character_class(self):
+        for path in self.nix_files():
+            for pattern in self.PATTERN.findall(path.read_text()):
+                with self.subTest(file=path.name, pattern=pattern):
+                    self.assertIsNone(self.PERL_CLASS.search(pattern))
+
+    def test_the_check_sees_the_pattern_hardening_nix_once_had(self):
+        old = r'builtins.match "[\\s\\S]*(cap_sys_admin)[\\s\\S]*" caps'
+        (pattern,) = self.PATTERN.findall(old)
+        self.assertIsNotNone(self.PERL_CLASS.search(pattern))
+
+
 class TestHardeningWrapperAllowlistHasOneSpelling(unittest.TestCase):
     def test_the_check_script_allows_the_wrappers_hardening_nix_keeps(self):
         (spelled,) = re.findall(

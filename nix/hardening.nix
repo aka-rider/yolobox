@@ -86,7 +86,7 @@ let
   # nix/base.md#same-uid-ptrace); CAP_SYS_ADMIN and the CAP_DAC_* pair reach
   # what other uids own.
   forbiddenCaps = lib.filterAttrs
-    (_: w: builtins.match "[\\s\\S]*(cap_sys_ptrace|cap_sys_admin|cap_dac_)[\\s\\S]*" (lib.toLower w.capabilities) != null)
+    (_: w: lib.any (c: lib.hasInfix c (lib.toLower w.capabilities)) [ "cap_sys_ptrace" "cap_sys_admin" "cap_dac_" ])
     enabledWrappers;
 in
 {

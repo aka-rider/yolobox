@@ -332,3 +332,33 @@ jobs:
           for entry in 192.168.1.20/32 fd00:1::/64; do
             test "$(check "$entry")" = accepted || { echo "not accepted: $entry"; exit 1; }
           done
+
+      # The wrapper assertions fire only when the system is evaluated, so each
+      # case evaluates the toplevel of a configuration extended with one module.
+      # The refusal must name the offender, or it failed for some other reason,
+      # and the control proves the same wrapper evaluates without the forbidden
+      # capability. `! cmd` never fails a `bash -e` step, hence the explicit
+      # exits.
+      - name: Check the wrapper allowlist refuses what it must
+        run: |
+          toplevel() {
+            $NIX_EVAL --raw --expr "
+              let
+                box = (builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
+                  modules = [ ({ pkgs, ... }: { $1 }) ];
+                };
+              in box.config.system.build.toplevel.drvPath
+            "
+          }
+          refused() {
+            if toplevel "$1" 2> wrappers.err; then
+              echo "evaluated: $1"; exit 1
+            fi
+            grep -F -- "$2" wrappers.err
+          }
+          wrapper() {
+            echo "security.wrappers.x = { source = \"\${pkgs.coreutils}/bin/true\"; owner = \"root\"; group = \"root\"; capabilities = \"$1+ep\"; };"
+          }
+          toplevel "$(wrapper cap_net_raw) yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap\";" > /dev/null
+          refused "$(wrapper cap_net_raw,cap_sys_admin) yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap,cap_sys_admin\";" 'x: cap_net_raw,cap_sys_admin+ep'
+          refused 'yolobox.hardening.extraWrappers.sudo = "";' 'names kept wrappers (sudo)'
