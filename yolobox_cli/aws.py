@@ -282,7 +282,8 @@ def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
             bufsize=0,
         )
 
-    handshake = read_handshake(child, time.monotonic() + BROKER_HANDSHAKE_SECONDS)
+    deadline = time.monotonic() + BROKER_HANDSHAKE_SECONDS
+    handshake = read_handshake(child, deadline)
     child.stdout.close()
     line = handshake.lines[0] if handshake.lines else ""
     if line.startswith("ERROR="):
@@ -290,13 +291,26 @@ def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
         raise YoError("aws-broker failed: %s" % line.removeprefix("ERROR="))
     if line == "READY":
         return
-    if handshake.closed and not line:
-        raise YoError(
-            "aws-broker exited with code %d before its handshake — see %s"
-            % (child.wait(), log_path)
-        )
+    closed_silently = handshake.closed and not line
+    if closed_silently:
+        # EOF means every writer closed the pipe, not that the broker exited:
+        # wait only as long as the handshake has left.
+        try:
+            code = child.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            raise YoError(
+                "aws-broker %s before its handshake — see %s"
+                % (describe_exit(code), log_path)
+            )
     child.terminate()
     child.wait()
+    if closed_silently:
+        raise YoError(
+            "aws-broker closed its output without exiting, so it sent no handshake "
+            "— see %s" % log_path
+        )
     if not line:
         raise YoError(
             "aws-broker produced no handshake within %ds — see %s"
@@ -305,6 +319,16 @@ def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
     raise YoError(
         "aws-broker produced an unexpected handshake %r — see %s" % (line, log_path)
     )
+
+
+def describe_exit(code: int) -> str:
+    """How a Popen return code reads in a message: negative is a signal's number."""
+    if code >= 0:
+        return "exited with code %d" % code
+    try:
+        return "was killed by %s" % signal.Signals(-code).name
+    except ValueError:
+        return "was killed by signal %d" % -code
 
 
 GUEST_AWS_CONFIG_DIR = os.path.dirname(GUEST_AWS_CONFIG_PATH)

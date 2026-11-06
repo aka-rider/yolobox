@@ -3287,6 +3287,32 @@ class TestStartAwsBrokerHandshakeFailures(FakeHome):
         self.assertIn("broker.log", message)
         self.assertNotIn("no handshake", message)
 
+    def test_a_broker_killed_by_a_signal_is_named_by_the_signal(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.start_with_broker_script("kill -KILL $$\n")
+        self.assertIn(
+            "killed by SIGKILL before its handshake", caught.exception.message
+        )
+        self.assertNotIn("-9", caught.exception.message)
+
+    def test_a_broker_that_closes_its_output_but_runs_on_is_not_waited_for(self):
+        spawned = []
+        spawn = yo.proc.spawn
+
+        def remember(argv, **kwargs):
+            spawned.append(spawn(argv, **kwargs))
+            return spawned[-1]
+
+        with (
+            mock.patch.object(yo.aws, "BROKER_HANDSHAKE_SECONDS", 0.5),
+            mock.patch.object(yo.proc, "spawn", remember),
+        ):
+            with self.assertRaisesRegex(
+                yo.YoError, "closed its output without exiting"
+            ):
+                self.start_with_broker_script("exec 1>&-\nexec sleep 60\n")
+        self.assertIsNotNone(spawned[0].poll())
+
     def test_a_broker_that_stays_silent_is_reported_as_no_handshake(self):
         with mock.patch.object(yo.aws, "BROKER_HANDSHAKE_SECONDS", 0.2):
             with self.assertRaisesRegex(yo.YoError, "no handshake within"):
