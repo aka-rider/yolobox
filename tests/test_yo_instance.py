@@ -666,7 +666,12 @@ class TestVmUpResizesAStoppedBox(VmUpOnLima):
         self.assertEqual(self.order[0], "luks_passphrase")
 
 
-class TestLimaGrowDisk(unittest.TestCase):
+class TestLimaGrowDisk(FakeHome):
+    def setUp(self):
+        super().setUp()
+        # grow_disk reports the free space where lima keeps its instances.
+        os.makedirs(os.path.join(self.home, yo.LIMA.instances_dir))
+
     def test_a_refused_edit_says_what_happened_and_leaves_the_next_step_to_the_caller(
         self,
     ):
