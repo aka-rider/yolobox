@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Records the virtual display to an mp4 under ~/artifacts. Built by
 # nix/display.nix with writeShellApplication, which prepends
-# `set -o errexit -o nounset -o pipefail` and puts ffmpeg-full on PATH.
+# `set -o errexit -o nounset -o pipefail` and puts the `runtimeInputs` listed
+# there on PATH.
 # See nix/display.md.
 
 # State lives under ~/.local/state, not /run/user: /run/user is torn
