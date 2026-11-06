@@ -71,8 +71,17 @@ def aws_allowlist() -> List[Tuple[str, str]]:
     config_path = os.path.join(state.home(), ".aws", "config")
     parser = configparser.ConfigParser(interpolation=None)
     try:
-        if not parser.read(config_path):
+        # parser.read() skips a file it cannot open, which would read an
+        # unreadable config as "no SSO profiles" and tear the broker down.
+        try:
+            with open(config_path) as handle:
+                parser.read_file(handle)
+        except FileNotFoundError:
             return []
+        except OSError as failure:
+            raise YoError(
+                "cannot read %s: %s" % (config_path, ui.os_error_reason(failure))
+            )
         # profile name -> its section. [default] and [profile default] both name
         # "default"; botocore's build_profile_map lets the later section win,
         # and the broker's `aws configure export-credentials` follows botocore.

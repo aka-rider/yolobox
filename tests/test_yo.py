@@ -2741,6 +2741,16 @@ class TestAwsAllowlist(FakeHome):
             yo.aws_allowlist()
         self.assertIn(config_path, caught.exception.message)
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode 000 file")
+    def test_a_config_that_cannot_be_opened_raises_yoerror_naming_the_path(self):
+        config_path = os.path.join(self.home, ".aws", "config")
+        self.write_aws_config(AWS_CONFIG_TEXT)
+        os.chmod(config_path, 0)
+        with self.assertRaises(yo.YoError) as caught:
+            yo.aws_allowlist()
+        self.assertIn(config_path, caught.exception.message)
+        self.assertIn("Permission denied", caught.exception.message)
+
     def test_profile_name_with_shell_metacharacters_is_excluded_and_warned(self):
         self.write_aws_config(
             "[profile work; rm -rf /]\n"

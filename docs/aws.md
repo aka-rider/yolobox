@@ -19,6 +19,8 @@ Fixing the profile at process start avoids all four, because nothing is switched
 
 `aws_allowlist()` in `yolobox_cli/aws.py` reads the Mac's `~/.aws/config` with `configparser`. It allow-lists every `[profile X]` and `[default]` section that has `sso_session` or `sso_start_url`. `[sso-session ...]` sections describe a session, not an account, so they are excluded.
 
+A missing `~/.aws/config` means no profiles. One that exists but cannot be opened (mode `000`, say) is a `YoError` naming the path, never an empty allowlist: `ConfigParser.read()` skips a file it cannot open, and an empty allowlist makes `ensure_aws_broker()` kill the running broker and delete the guest's aws-config.
+
 ### The profile name pattern
 
 A profile name must `fullmatch` `PROFILE_NAME_RE` (`^[A-Za-z0-9][A-Za-z0-9._-]*$`). A name with a space, a shell metacharacter, or a leading `-`, `.` or `_` is excluded with a stderr line naming it. `yo` would otherwise pass it down to `credential_process P` unescaped, and a leading dash would read as an option. The pattern has two spellings that are the same text on purpose:
