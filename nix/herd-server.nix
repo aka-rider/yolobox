@@ -15,6 +15,8 @@ in
     serviceConfig = {
       Restart = "on-failure";
       RestartSec = 5;
+      # Panes inherit this; base.nix gives user@.service -500, and a runaway build in a pane must not outrank system services.
+      OOMScoreAdjust = 0;
       ExecStart = "${lib.getExe herdrPkg} server";
     };
   };
