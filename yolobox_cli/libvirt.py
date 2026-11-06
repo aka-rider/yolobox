@@ -318,11 +318,11 @@ def active_domain_names() -> List[str]:
     return names_listed(libvirt_host.virsh("list", "--name").stdout)
 
 
-def require_undefined(
+def raise_unless_undefined(
     subcommand: str, name: str, failed: subprocess.CompletedProcess
 ) -> None:
-    """Return when `failed`, a virsh `subcommand` on domain `name`, failed because the
-    domain was undefined since it was listed; raise its failure when the domain is still there."""
+    """Raise `failed`, the failure of `virsh SUBCOMMAND NAME`, unless that domain is no
+    longer defined, which means it was undefined after it was listed."""
     if name in domain_names():
         raise YoError(
             proc.failed_message(
@@ -343,7 +343,7 @@ def active_domains_memory() -> Dict[str, int]:
     for name in active_domain_names():
         info = libvirt_host.virsh("dominfo", name, check=False)
         if info.returncode != 0:
-            require_undefined("dominfo", name, info)
+            raise_unless_undefined("dominfo", name, info)
             continue
         found = MAX_MEMORY_LINE_RE.search(info.stdout)
         if found is None:
@@ -442,7 +442,7 @@ def yolobox_domains() -> List[DomainInfo]:
     for name in domain_names():
         dump = libvirt_host.virsh("dumpxml", name, check=False)
         if dump.returncode != 0:
-            require_undefined("dumpxml", name, dump)
+            raise_unless_undefined("dumpxml", name, dump)
             continue
         roots.append(libvirt_host.domain_root(dump.stdout))
     return [

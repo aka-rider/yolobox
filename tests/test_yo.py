@@ -2324,7 +2324,7 @@ LIMA_BLOCK_WITH_TWO_KEYS = (
 
 class TestParseLimaSshBlock(unittest.TestCase):
     def test_keeps_every_identity_file_in_order_and_the_first_other_value(self):
-        block = yo.parse_lima_ssh_block(LIMA_BLOCK_WITH_TWO_KEYS, "lima-yolobox")
+        block = yo.parse_ssh_host_block(LIMA_BLOCK_WITH_TWO_KEYS, "lima-yolobox")
         self.assertEqual(block.hostname, "127.0.0.1")
         self.assertEqual(block.port, "60022")
         self.assertEqual(
@@ -2333,7 +2333,7 @@ class TestParseLimaSshBlock(unittest.TestCase):
         )
 
     def test_the_herdr_alias_offers_every_identity_in_order(self):
-        block = yo.parse_lima_ssh_block(LIMA_BLOCK_WITH_TWO_KEYS, "lima-yolobox")
+        block = yo.parse_ssh_host_block(LIMA_BLOCK_WITH_TWO_KEYS, "lima-yolobox")
         lines = yo.herdr_alias_block(block).splitlines()
         self.assertEqual(
             [line for line in lines if "IdentityFile" in line],
@@ -3091,6 +3091,10 @@ class TestEnsureAwsBrokerStaleBroker(FakeHome):
 
 
 class TestEnsureAwsBrokerSerializesYos(FakeHome):
+    def setUp(self):
+        super().setUp()
+        self.held_during = {}
+
     def lock_is_held(self):
         os.makedirs(yo.state_dir(), exist_ok=True)
         fd = os.open(
@@ -3104,17 +3108,17 @@ class TestEnsureAwsBrokerSerializesYos(FakeHome):
             os.close(fd)  # drops the lock when this probe got it
         return False
 
+    def seen(self, step, result=None):
+        """A stand-in for `step` that records whether yo's broker lock is held when it runs."""
+
+        def record(*args, **kwargs):
+            self.held_during[step] = self.lock_is_held()
+            return result
+
+        return record
+
     def test_checking_killing_and_starting_happen_under_one_lock(self):
-        held_during = {}
         stale = healthy({"pid": 111, "watch_pid": 999, "allow": ["work"]})
-
-        def seen(step, result=None):
-            def record(*args, **kwargs):
-                held_during[step] = self.lock_is_held()
-                return result
-
-            return record
-
         with (
             mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
             mock.patch.object(
@@ -3122,36 +3126,33 @@ class TestEnsureAwsBrokerSerializesYos(FakeHome):
             ),
             mock.patch.object(yo.box.driver, "keepalive_pid", return_value=555),
             mock.patch.object(
-                yo.aws, "aws_broker_health", side_effect=seen("check", stale)
+                yo.aws, "aws_broker_health", side_effect=self.seen("check", stale)
             ),
-            mock.patch.object(yo.aws, "kill_stale_broker", side_effect=seen("kill")),
-            mock.patch.object(yo.aws, "start_aws_broker", side_effect=seen("start")),
+            mock.patch.object(
+                yo.aws, "kill_stale_broker", side_effect=self.seen("kill")
+            ),
+            mock.patch.object(
+                yo.aws, "start_aws_broker", side_effect=self.seen("start")
+            ),
             mock.patch.object(yo.aws, "push_aws_guest_files"),
         ):
             yo.ensure_aws_broker()
-        self.assertEqual(held_during, {"check": True, "kill": True, "start": True})
+        self.assertEqual(self.held_during, {"check": True, "kill": True, "start": True})
         self.assertFalse(self.lock_is_held())
 
     def test_disabling_checks_and_kills_under_the_same_lock(self):
-        held_during = {}
-
-        def seen(step, result=None):
-            def record(*args, **kwargs):
-                held_during[step] = self.lock_is_held()
-                return result
-
-            return record
-
         stale = healthy({"pid": 111, "watch_pid": 999, "allow": []})
         with (
             mock.patch.object(
-                yo.aws, "aws_broker_health", side_effect=seen("check", stale)
+                yo.aws, "aws_broker_health", side_effect=self.seen("check", stale)
             ),
-            mock.patch.object(yo.aws, "kill_stale_broker", side_effect=seen("kill")),
+            mock.patch.object(
+                yo.aws, "kill_stale_broker", side_effect=self.seen("kill")
+            ),
             mock.patch.object(yo.sshx, "ssh_run"),
         ):
             yo.disable_aws_broker()
-        self.assertEqual(held_during, {"check": True, "kill": True})
+        self.assertEqual(self.held_during, {"check": True, "kill": True})
         self.assertFalse(self.lock_is_held())
 
 

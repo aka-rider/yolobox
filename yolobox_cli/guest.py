@@ -32,8 +32,8 @@ def ensure_guest_known_hosts() -> None:
     current = proc.read_text_file(state.ssh_cfg(), errors="surrogateescape")
     if current is None:
         return
-    lima_values = sshconfig.parse_lima_ssh_block(current, state.box.vm_host)
-    if lima_values is None:
+    host_block = sshconfig.parse_ssh_host_block(current, state.box.vm_host)
+    if host_block is None:
         return
 
     completed = sshx.ssh_run(
@@ -50,7 +50,7 @@ def ensure_guest_known_hosts() -> None:
             )
         )
 
-    lines = sshconfig.known_hosts_lines(lima_values, completed.stdout)
+    lines = sshconfig.known_hosts_lines(host_block, completed.stdout)
     if not lines:
         raise YoError(
             "the guest reported no parseable ssh host keys at %s" % HOST_KEY_GLOB

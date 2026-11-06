@@ -40,7 +40,7 @@ class SshHostBlock(NamedTuple):
     identity_agent: Optional[str]
 
 
-def parse_lima_ssh_block(text: str, host: str) -> Optional[SshHostBlock]:
+def parse_ssh_host_block(text: str, host: str) -> Optional[SshHostBlock]:
     lines = text.splitlines()
     start = None
     for i, line in enumerate(lines):
@@ -73,10 +73,10 @@ def parse_lima_ssh_block(text: str, host: str) -> Optional[SshHostBlock]:
     )
 
 
-def herdr_alias_block(lima_values: SshHostBlock) -> str:
+def herdr_alias_block(host_block: SshHostBlock) -> str:
     identity_agent = (
-        ['  IdentityAgent "%s"' % lima_values.identity_agent]
-        if lima_values.identity_agent is not None
+        ['  IdentityAgent "%s"' % host_block.identity_agent]
+        if host_block.identity_agent is not None
         else []
     )
     return "\n".join(
@@ -88,10 +88,10 @@ def herdr_alias_block(lima_values: SshHostBlock) -> str:
             # master's, so herdr would silently ride an operator session.
             "  ControlPath none",
             "  ForwardAgent no",
-            "  Hostname %s" % lima_values.hostname,
-            "  Port %s" % lima_values.port,
+            "  Hostname %s" % host_block.hostname,
+            "  Port %s" % host_block.port,
         ]
-        + ['  IdentityFile "%s"' % identity for identity in lima_values.identity_files]
+        + ['  IdentityFile "%s"' % identity for identity in host_block.identity_files]
         + [
             '  UserKnownHostsFile "%s"' % state.known_hosts_path(),
             "  IdentitiesOnly yes",
@@ -159,15 +159,15 @@ def ensure_agent_ssh_config() -> None:
         host_key_pin_block(),
         connection_bounds_block(),
     ]
-    lima_values = parse_lima_ssh_block(rest, state.box.vm_host)
-    if lima_values is None:
+    host_block = parse_ssh_host_block(rest, state.box.vm_host)
+    if host_block is None:
         ui.err(
             "yo: %s has no parseable 'Host %s' block (Hostname/Port/IdentityFile) — "
             "skipping the %r ssh alias herdr needs; run %s to let lima regenerate it"
             % (path, state.box.vm_host, state.box.herdr_alias, state.yo_cmd("up"))
         )
     else:
-        owned.append(herdr_alias_block(lima_values))
+        owned.append(herdr_alias_block(host_block))
 
     new_content = "\n".join(owned) + "\n\n" + rest
     if new_content == current:
@@ -175,8 +175,8 @@ def ensure_agent_ssh_config() -> None:
     proc.atomic_write(path, new_content, FILE_MODE_PRIVATE)
 
 
-def known_hosts_lines(lima_values: SshHostBlock, pubkeys: str) -> List[str]:
-    host_port = "[%s]:%s" % (lima_values.hostname, lima_values.port)
+def known_hosts_lines(host_block: SshHostBlock, pubkeys: str) -> List[str]:
+    host_port = "[%s]:%s" % (host_block.hostname, host_block.port)
     lines = []
     for raw in pubkeys.splitlines():
         parts = raw.split(None, 2)
@@ -211,18 +211,22 @@ def initrd_endpoint() -> InitrdEndpoint:
     # No file: a first start, lima has not written it yet, and the defaults below
     # are what it will write.
     text = proc.read_text_file(state.ssh_cfg(), errors="surrogateescape")
-    values = parse_lima_ssh_block(text, state.box.vm_host) if text is not None else None
-    if not values:
+    host_block = (
+        parse_ssh_host_block(text, state.box.vm_host) if text is not None else None
+    )
+    if not host_block:
         return InitrdEndpoint(
             "127.0.0.1",
             state.driver().ssh_port(),
             (os.path.join(state.home(), state.driver().initrd_identity),),
         )
-    if not proc.is_ascii_number(values.port):
+    if not proc.is_ascii_number(host_block.port):
         raise YoError(
-            "%s names the port %r, not a number" % (state.ssh_cfg(), values.port)
+            "%s names the port %r, not a number" % (state.ssh_cfg(), host_block.port)
         )
-    return InitrdEndpoint(values.hostname, int(values.port), values.identity_files)
+    return InitrdEndpoint(
+        host_block.hostname, int(host_block.port), host_block.identity_files
+    )
 
 
 def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:

@@ -1277,7 +1277,7 @@ class TestSshConfig(LibvirtCase):
         )
 
     def test_the_block_is_the_shape_yos_parser_reads(self):
-        values = self.box.parse_lima_ssh_block(self.config(), "lima-box")
+        values = self.box.parse_ssh_host_block(self.config(), "lima-box")
         self.assertEqual(values.hostname, "127.0.0.1")
         self.assertEqual(values.port, "61234")
         self.assertEqual(values.identity_files, ("/h/state/box/operator.pub",))
@@ -1296,13 +1296,13 @@ class TestSshConfig(LibvirtCase):
             self.assertIn("  " + line + "\n", text)
 
     def test_the_herdr_alias_carries_the_agent_socket(self):
-        values = self.box.parse_lima_ssh_block(self.config(), "lima-box")
+        values = self.box.parse_ssh_host_block(self.config(), "lima-box")
         alias = self.box.herdr_alias_block(values)
         self.assertIn('IdentityAgent "/h/.1password/agent.sock"', alias)
 
     def test_a_block_without_an_agent_gives_an_alias_without_one(self):
         text = 'Host lima-box\n  Hostname 127.0.0.1\n  Port 1\n  IdentityFile "/k"\n'
-        values = self.box.parse_lima_ssh_block(text, "lima-box")
+        values = self.box.parse_ssh_host_block(text, "lima-box")
         self.assertNotIn("IdentityAgent", self.box.herdr_alias_block(values))
 
     def test_the_file_is_rewritten_only_when_the_block_changed(self):
