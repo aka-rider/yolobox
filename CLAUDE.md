@@ -118,8 +118,9 @@ Box configuration (Nix):
 - `nix/display.nix`: the virtual X display, browsers and screen recording.
   `nix/display.md`.
 - `nix/hardening.nix`: blocked kernel modules, the setuid and capability wrapper
-  allowlist with its eval-time assertion, sysctls and kernel parameters.
-  `yolobox.hardening.extraWrappers` is the per-box escape hatch for
+  allowlist with its eval-time assertion of each wrapper's privilege, sysctls and
+  kernel parameters. `yolobox.hardening.extraWrappers` (wrapper name to its
+  `getcap` capabilities, `""` for a setuid one) is the per-box escape hatch for
   `/etc/yolobox/local.nix`. `nix/hardening.md` journals every item considered,
   kept or rejected.
 - `nix/egress.nix`: the egress nft table that keeps the guest off the host and

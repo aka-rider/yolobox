@@ -32,21 +32,77 @@ let
     "sch_skbprio" "sch_taprio" "sch_tbf" "sch_teql"
   ];
 
-  # Setuid and capability wrappers the box keeps. See nix/hardening.md.
-  keptWrappers = [ "sudo" "sudoedit" "unix_chkpwd" "newuidmap" "newgidmap" ];
-  enabledWrappers = lib.attrNames (lib.filterAttrs (_: w: w.enable) config.security.wrappers);
-  allowedWrappers = keptWrappers ++ cfg.extraWrappers;
-  unexpected = lib.subtractLists allowedWrappers enabledWrappers;
-  missing = lib.subtractLists enabledWrappers allowedWrappers;
+  # Setuid and capability wrappers the box keeps, each with the privilege it
+  # must carry. `capabilities` is the sorted list `getcap` prints, including
+  # the cap_setpcap that nixpkgs adds to every capability wrapper; it is the
+  # spelling tests/box-hardening-check.sh uses. See nix/hardening.md.
+  setuidRoot = { setuid = true; capabilities = ""; };
+  capRoot = capabilities: { setuid = false; inherit capabilities; };
+  keptWrappers = {
+    sudo = setuidRoot;
+    sudoedit = setuidRoot;
+    unix_chkpwd = setuidRoot;
+    newuidmap = capRoot "cap_setpcap,cap_setuid";
+    newgidmap = capRoot "cap_setgid,cap_setpcap";
+  };
+  expectedWrappers = keptWrappers // lib.mapAttrs
+    (_: caps: if caps == "" then setuidRoot else capRoot caps)
+    cfg.extraWrappers;
+
+  enabledWrappers = lib.filterAttrs (_: w: w.enable) config.security.wrappers;
+  enabledNames = lib.attrNames enabledWrappers;
+  allowedNames = lib.attrNames expectedWrappers;
+  unexpected = lib.subtractLists allowedNames enabledNames;
+  missing = lib.subtractLists enabledNames allowedNames;
+  shadowed = lib.attrNames (lib.intersectAttrs keptWrappers cfg.extraWrappers);
+
+  # NixOS writes a wrapper's capabilities as one clause, "cap_a,cap_b+ep", and
+  # its setcap adds cap_setpcap. This renders that as the sorted names getcap
+  # prints. Any other clause form (several clauses, "all", numbers, "-") comes
+  # out as "<unparsable ...>", which never equals an expected value.
+  getcapSpelling = caps:
+    let m = builtins.match "(cap_[a-z_]+(,cap_[a-z_]+)*)[+=][eip]+" caps; in
+    if caps == "" then ""
+    else if m == null then "<unparsable: ${caps}>"
+    else lib.concatStringsSep ","
+      (lib.sort lib.lessThan (lib.unique (lib.splitString "," (builtins.head m) ++ [ "cap_setpcap" ])));
+
+  have = w: {
+    inherit (w) program setuid setgid owner;
+    capabilities = getcapSpelling w.capabilities;
+  };
+  want = name: e: {
+    program = name;
+    inherit (e) setuid capabilities;
+    setgid = false;
+    owner = "root";
+  };
+  wrongPrivilege = lib.filterAttrs
+    (name: w: have w != want name expectedWrappers.${name})
+    (lib.getAttrs (lib.intersectLists enabledNames allowedNames) enabledWrappers);
+
+  # Refused from any source, an extraWrappers entry included. CAP_SYS_PTRACE
+  # attaches to root's processes and hands the agent root (CONSTITUTION,
+  # nix/base.md#same-uid-ptrace); CAP_SYS_ADMIN and the CAP_DAC_* pair reach
+  # what other uids own.
+  forbiddenCaps = lib.filterAttrs
+    (_: w: builtins.match "[\\s\\S]*(cap_sys_ptrace|cap_sys_admin|cap_dac_)[\\s\\S]*" (lib.toLower w.capabilities) != null)
+    enabledWrappers;
 in
 {
   options.yolobox.hardening.extraWrappers = lib.mkOption {
-    type = lib.types.listOf lib.types.str;
-    default = [ ];
+    type = lib.types.attrsOf (lib.types.strMatching "(cap_[a-z_]+(,cap_[a-z_]+)*)?");
+    default = { };
+    example = { dumpcap = "cap_net_admin,cap_net_raw,cap_setpcap"; helper = ""; };
     description = ''
       Setuid or capability wrappers a box adds on top of the allowlist.
       Escape hatch for /etc/yolobox/local.nix, e.g. a VPN client's
-      split-tunnel helper.
+      split-tunnel helper. The name is the wrapper's name; the value is
+      the capabilities it must carry, spelled as `getcap` prints them:
+      sorted, comma separated, including the cap_setpcap that nixpkgs adds.
+      The empty string means a setuid-root wrapper with no capabilities.
+      Evaluation fails when an enabled wrapper differs in program name,
+      setuid, setgid, owner or capabilities.
     '';
   };
 
@@ -63,15 +119,38 @@ in
       [ "su" "sg" "newgrp" "chsh" "passwd" "mount" "umount" ]
       (_: { enable = false; });
 
-    assertions = [{
-      assertion = unexpected == [ ] && missing == [ ];
-      message = lib.concatStringsSep "\n" (
-        [ "security.wrappers differs from the allowlist (nix/hardening.nix)." ]
-        ++ lib.optional (unexpected != [ ]) "Unexpected wrappers: ${lib.concatStringsSep ", " unexpected}"
-        ++ lib.optional (missing != [ ]) "Missing wrappers: ${lib.concatStringsSep ", " missing}"
-        ++ [ "Add a wanted one to yolobox.hardening.extraWrappers; see nix/hardening.md." ]
-      );
-    }];
+    assertions = [
+      {
+        assertion = shadowed == [ ];
+        message = "yolobox.hardening.extraWrappers names kept wrappers (${lib.concatStringsSep ", " shadowed}); the allowlist already fixes their privilege (nix/hardening.nix).";
+      }
+      {
+        assertion = unexpected == [ ] && missing == [ ];
+        message = lib.concatStringsSep "\n" (
+          [ "security.wrappers differs from the allowlist (nix/hardening.nix)." ]
+          ++ lib.optional (unexpected != [ ]) "Unexpected wrappers: ${lib.concatStringsSep ", " unexpected}"
+          ++ lib.optional (missing != [ ]) "Missing wrappers: ${lib.concatStringsSep ", " missing}"
+          ++ [ "Add a wanted one to yolobox.hardening.extraWrappers; see nix/hardening.md." ]
+        );
+      }
+      {
+        assertion = wrongPrivilege == { };
+        message = lib.concatStringsSep "\n" (
+          [ "A wrapper carries other privilege than the allowlist states (nix/hardening.nix)." ]
+          ++ lib.mapAttrsToList
+            (name: w: "${name}: have ${builtins.toJSON (have w)}, want ${builtins.toJSON (want name expectedWrappers.${name})}")
+            wrongPrivilege
+          ++ [ "Fix the wrapper, or state its privilege in yolobox.hardening.extraWrappers; see nix/hardening.md." ]
+        );
+      }
+      {
+        assertion = forbiddenCaps == { };
+        message = lib.concatStringsSep "\n" (
+          [ "A wrapper carries cap_sys_ptrace, cap_sys_admin or a cap_dac_* capability, which the box never allows (nix/hardening.nix):" ]
+          ++ lib.mapAttrsToList (name: w: "${name}: ${w.capabilities}") forbiddenCaps
+        );
+      }
+    ];
 
     # See nix/hardening.md for each line.
     boot.kernel.sysctl = {

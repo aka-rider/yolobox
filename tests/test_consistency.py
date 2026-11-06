@@ -1373,9 +1373,22 @@ class TestHardeningWrapperAllowlistHasOneSpelling(unittest.TestCase):
             HARDENING_CHECK.read_text(),
             re.M,
         )
-        kept = hardening_nix_list("keptWrappers")
+        (table,) = re.findall(
+            r"\bkeptWrappers = \{(.*?)\};", nix_code(HARDENING_NIX), re.S
+        )
+        kept = re.findall(r"^\s*(\w+) =", table, re.M)
         self.assertIn("sudo", kept)
         self.assertEqual(sorted(spelled.split()), sorted(kept))
+
+    def test_the_check_script_expects_the_capabilities_hardening_nix_states(self):
+        text = HARDENING_CHECK.read_text()
+        for name in ("newuidmap", "newgidmap"):
+            (nix_caps,) = re.findall(
+                r'^\s*%s = capRoot "([^"]*)";' % name,
+                nix_code(HARDENING_NIX),
+                re.M,
+            )
+            self.assertIn("%s) expected_caps=%s ;;" % (name, nix_caps), text)
 
 
 class TestHardeningSysctlsHaveOneSpelling(unittest.TestCase):
