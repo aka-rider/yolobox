@@ -253,10 +253,12 @@ class TestGuestHelperCheck(unittest.TestCase):
             caught.exception.message, "projects failed (exit 3): find: odd"
         )
 
-    def test_a_failure_that_said_nothing_is_a_yo_error_without_detail(self):
+    def test_a_failure_that_said_nothing_is_a_yo_error_that_says_so(self):
         with self.assertRaises(yo.YoError) as caught:
             yo.guest.guest_helper_check(self.failed(b"", ""), "projects")
-        self.assertEqual(caught.exception.message, "projects failed (exit 3)")
+        self.assertEqual(
+            caught.exception.message, "projects failed (exit 3) with no output"
+        )
 
     def test_stderr_comes_before_stdout(self):
         with self.assertRaisesRegex(yo.YoError, "exit 3.: boom"):

@@ -325,8 +325,11 @@ def require_undefined(
     domain was undefined since it was listed; raise its failure when the domain is still there."""
     if name in domain_names():
         raise YoError(
-            "virsh %s %s failed (exit %d): %s"
-            % (subcommand, name, failed.returncode, proc.failure_detail(failed))
+            proc.failed_message(
+                "virsh %s %s" % (subcommand, name),
+                failed.returncode,
+                proc.failure_detail(failed),
+            )
         )
 
 
@@ -1060,7 +1063,7 @@ class LibvirtDriver:
                 "%s shows its state; do not force it off while its disk may be "
                 "encrypting" % (state.yo_cmd("down"), state.yo_cmd("status")),
             )
-        return YoError("virsh event failed (exit %d): %s" % (code, stderr.strip()))
+        return YoError(proc.failed_message("virsh event", code, stderr.strip()))
 
     def stop_command(self) -> str:
         return state.yo_cmd("down")
@@ -1151,13 +1154,10 @@ class LibvirtDriver:
         shown = libvirt_host.virsh("dominfo", domain_name(), check=False, capture=False)
         if shown.returncode == 0:
             return None
-        return (
-            "libvirt: virsh -c %s dominfo %s failed (exit %d), its own message is above"
-            % (
-                LIBVIRT_URI,
-                domain_name(),
-                shown.returncode,
-            )
+        return "libvirt: %s, its own message is above" % proc.failed_message(
+            "virsh -c %s dominfo %s" % (LIBVIRT_URI, domain_name()),
+            shown.returncode,
+            None,
         )
 
     def volume_sizes(self) -> Dict[str, int]:

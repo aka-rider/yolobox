@@ -373,7 +373,9 @@ class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
     def test_an_agent_whose_login_fails_is_not_a_missing_account(self):
         status, detail = self.status(1, 0, 0, agent_stderr="rc: boom\n")
         self.assertEqual(status, "agent_failing")
-        self.assertIn("exited 1: rc: boom", detail)
+        self.assertEqual(
+            detail, "ssh agent@lima-yolobox true failed (exit 1): rc: boom"
+        )
 
     def test_a_missing_account_is_what_getent_says(self):
         self.assertEqual(self.status(255, 0, 2), ("operator_only", ""))
@@ -382,11 +384,11 @@ class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
         with self.assertRaisesRegex(yo.YoError, "getent passwd agent failed.*exit 3"):
             self.status(1, 0, 3)
 
-    def test_a_getent_failure_ends_with_its_stderr_or_says_it_had_none(self):
+    def test_a_getent_failure_ends_with_what_it_said_or_says_it_said_nothing(self):
         failed = "getent passwd agent failed on the box (exit 3)"
         for stderr, message in (
             ("getent: boom\n", failed + ": getent: boom"),
-            ("", failed + " with no stderr"),
+            ("", failed + " with no output"),
         ):
             with self.subTest(stderr=stderr):
                 with self.assertRaises(yo.YoError) as caught:
@@ -1572,7 +1574,9 @@ class TestGuestOutNamesALostBox(unittest.TestCase):
             "lsblk: /dev/vda2: not a block device",
         )
         with self.answering(7):
-            with self.assertRaisesRegex(yo.YoError, r"failed on the box \(exit 7\)$"):
+            with self.assertRaisesRegex(
+                yo.YoError, r"failed on the box \(exit 7\) with no output$"
+            ):
                 yo.vm.luks_device_fstype()
 
     def test_a_lost_box_is_unreachable_at_every_read_of_the_guest_disk(self):

@@ -65,10 +65,10 @@ def guest_helper_check(
     completed: subprocess.CompletedProcess, what: str
 ) -> subprocess.CompletedProcess:
     if completed.returncode != 0:
-        detail = proc.failure_detail(completed)
         raise YoError(
-            "%s failed (exit %d)%s"
-            % (what, completed.returncode, ": " + detail if detail else "")
+            proc.failed_message(
+                what, completed.returncode, proc.failure_detail(completed)
+            )
         )
     return completed
 

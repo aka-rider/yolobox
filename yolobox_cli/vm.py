@@ -489,7 +489,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         raise YoError(release.rebuild_busy_message())
     if rebuild.returncode != 0:
         raise YoError(
-            "%s failed (exit %d)" % (shlex.join(rebuild_argv), rebuild.returncode)
+            proc.failed_message(shlex.join(rebuild_argv), rebuild.returncode, None)
         )
     # Only an explicit --version is remembered: a default bootstrap means this
     # yo's release, so it forgets a fork ref instead of pinning it.

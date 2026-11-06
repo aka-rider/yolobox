@@ -146,22 +146,17 @@ def guest_out(argv: Sequence[str]) -> str:
     the command's stderr when it failed there: its output is a fact only if it succeeded."""
     completed = probe(OPERATOR, argv)
     if completed.returncode != 0:
-        stderr = completed.stderr.strip()
-        raise YoError(
-            "%s failed on the box (exit %d)%s"
-            % (
-                shlex.join(argv),
-                completed.returncode,
-                ": " + stderr if stderr else "",
-            )
-        )
+        raise box_failure(shlex.join(argv), completed)
     return completed.stdout
 
 
-def stderr_suffix(stderr: str) -> str:
-    """What follows a failed command in a message: its stderr, or that it had none."""
-    stderr = stderr.strip()
-    return ": " + stderr if stderr else " with no stderr"
+def box_failure(what: str, completed: subprocess.CompletedProcess) -> YoError:
+    """A command that ran on the box and failed there, with what it said."""
+    return YoError(
+        proc.failed_message(
+            what, completed.returncode, proc.failure_detail(completed), "on the box"
+        )
+    )
 
 
 def account_status() -> Tuple[str, str]:
@@ -182,15 +177,11 @@ def account_status() -> Tuple[str, str]:
     if lookup.returncode == GETENT_KEY_NOT_FOUND:
         return "operator_only", ""
     if lookup.returncode != 0:
-        raise YoError(
-            "getent passwd %s failed on the box (exit %d)%s"
-            % (AGENT_USER, lookup.returncode, stderr_suffix(lookup.stderr))
-        )
-    return "agent_failing", "ssh %s@%s true exited %d%s" % (
-        AGENT_USER,
-        state.box.vm_host,
+        raise box_failure("getent passwd %s" % AGENT_USER, lookup)
+    return "agent_failing", proc.failed_message(
+        "ssh %s@%s true" % (AGENT_USER, state.box.vm_host),
         agent_probe.returncode,
-        stderr_suffix(agent_probe.stderr),
+        proc.failure_detail(agent_probe),
     )
 
 

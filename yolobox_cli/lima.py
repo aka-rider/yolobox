@@ -180,8 +180,9 @@ def lima_instance_exists() -> bool:
     completed = proc.run(argv, check=False)
     if completed.returncode != 0:
         raise YoError(
-            "%s failed (exit %d): %s"
-            % (shlex.join(argv), completed.returncode, proc.failure_detail(completed))
+            proc.failed_message(
+                shlex.join(argv), completed.returncode, proc.failure_detail(completed)
+            )
         )
     return state.box.name in completed.stdout.splitlines()
 
@@ -199,8 +200,9 @@ def lima_instance_info() -> Optional[LimaInfo]:
     completed = proc.run(argv, check=False)
     if completed.returncode != 0:
         raise YoError(
-            "%s failed (exit %d): %s"
-            % (shlex.join(argv), completed.returncode, proc.failure_detail(completed))
+            proc.failed_message(
+                shlex.join(argv), completed.returncode, proc.failure_detail(completed)
+            )
         )
     try:
         data = json.loads(completed.stdout.strip())
@@ -501,8 +503,9 @@ class LimaDriver:
         probe = proc.run(argv)
         if probe.returncode != 0:
             raise YoError(
-                "%s failed (exit %d): %s"
-                % (shlex.join(argv), probe.returncode, proc.failure_detail(probe))
+                proc.failed_message(
+                    shlex.join(argv), probe.returncode, proc.failure_detail(probe)
+                )
             )
         fields = probe.stdout.split()
         if len(fields) != 3 or not all(proc.is_ascii_number(f) for f in fields):
@@ -800,9 +803,8 @@ class LimaDriver:
         listed = proc.run(argv, capture=False)
         if listed.returncode == 0:
             return None
-        return "lima: %s failed (exit %d), its own message is above" % (
-            shlex.join(argv),
-            listed.returncode,
+        return "lima: %s, its own message is above" % proc.failed_message(
+            shlex.join(argv), listed.returncode, None
         )
 
     def disk_image(self) -> Optional[Tuple[str, int]]:

@@ -154,12 +154,32 @@ def run(
                 "\r", ""
             )
     if check and completed.returncode != 0:
-        detail = failure_detail(completed) if capture else ""
         raise YoError(
-            "%s failed (exit %d)%s"
-            % (shlex.join(argv), completed.returncode, ": " + detail if detail else "")
+            failed_message(
+                shlex.join(argv),
+                completed.returncode,
+                failure_detail(completed) if capture else None,
+            )
         )
     return completed
+
+
+def failed_message(what: str, code: int, said: Optional[str], where: str = "") -> str:
+    """The one spelling of a failed command: `WHAT failed[ WHERE] (exit N)`, then what
+    it said. `said` is None when its output went to the terminal, so nothing follows;
+    an empty one is said to be empty rather than ending the message on a bare colon."""
+    if said is None:
+        suffix = ""
+    elif said:
+        suffix = ": " + said
+    else:
+        suffix = " with no output"
+    return "%s failed%s (exit %d)%s" % (
+        what,
+        " " + where if where else "",
+        code,
+        suffix,
+    )
 
 
 def failure_detail(completed: subprocess.CompletedProcess) -> str:
