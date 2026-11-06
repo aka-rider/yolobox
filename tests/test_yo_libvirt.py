@@ -33,6 +33,9 @@ from unittest import mock
 from test_yo import ACCEPT_TIMEOUT_SECONDS, FakeHome, load_yo, unload_yo
 
 REPO = Path(__file__).resolve().parent.parent
+# LibvirtCase.setUp patches `which` on the stdlib module itself, which yo shares,
+# so a test that looks for a real tool needs the function as it was at import.
+REAL_WHICH = shutil.which
 INITRD_KEYS_SCRIPT = REPO / "nix" / "luks" / "yolobox-initrd-authorized-keys.sh"
 
 VM_UID, VM_GID = 990, 989
@@ -1171,9 +1174,9 @@ class TestOperatorKey(LibvirtCase):
 
 
 def gawk_argv():
-    if shutil.which("gawk"):
+    if REAL_WHICH("gawk"):
         return ["gawk"]
-    if shutil.which("nix"):
+    if REAL_WHICH("nix"):
         return ["nix", "shell", "nixpkgs#gawk", "-c", "gawk"]
     raise unittest.SkipTest("the initrd's key program needs gawk, or nix to fetch it")
 
