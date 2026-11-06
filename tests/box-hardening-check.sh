@@ -300,9 +300,10 @@ check_net_sched() {
 
 # Capability names, one per line or comma separated on stdin, as one sorted
 # comma-separated list without duplicates: the spelling nix/hardening.nix
-# compares in.
+# compares in. Nix sorts bytewise, so the sort must not use the box's locale:
+# under en_US.UTF-8 cap_syslog sorts before cap_sys_time.
 sorted_caps() {
-    tr ',' '\n' | sort -u | paste -sd, -
+    tr ',' '\n' | LC_ALL=C sort -u | paste -sd, -
 }
 
 check_wrappers() {
