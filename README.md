@@ -12,7 +12,7 @@ It limits what an agent can do. It doesn't lock the agent in.
 
 - The agent runs as its own user with no `sudo`. The filesystem is airgaped. Files move only through git, scp, or rsync.
 - The VM can use your 1Password SSH agent. You must approve the access (TouchID or similarly).
-- The VM reaches the internet, but not your computer or your local network. To let it reach one address, such as a package cache on your LAN, name it in `/etc/yolobox/local.nix`, for example `yolobox.network.lanAllow = [ "192.168.1.20/32" ];`.
+- The VM reaches the internet, but not your computer or your local network. To let it reach one address, such as a package cache on your LAN, name it in `/etc/yolobox/local.nix`, for example `yolobox.network.lanAllow = [ "192.168.1.20/32" ];`. On a Linux host this has no effect: the host table rejects the same ranges for the VM, see [docs/linux-host.md](docs/linux-host.md#the-host-table).
 - On a Mac, open VM ports from 1024 to 49151 are mapped on the host, except a few login-callback ports such as 8085 (you can open `http://localhost:<port>` directly in your browser). On Linux nothing is mapped on its own: `yo port <guest-port>` opens one.
 
 

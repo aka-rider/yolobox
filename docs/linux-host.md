@@ -32,6 +32,8 @@ The domain reproduces Lima's network so that `nix/egress.nix`, its test fixtures
 - `RequiredBy=virtqemud.service` and `Before=`, so no domain can start while the table is missing;
 - a static `yolobox-vm` account, because the table names it and nft resolves the name when it loads the file.
 
+`yolobox.network.lanAllow` (see [nix/egress.md](../nix/egress.md#lanallow)) does nothing on a Linux host. The guest table accepts the entry, but the connection leaves through passt, and this table rejects the private ranges for `yolobox-vm` with no allowance of its own, so the connection to the allowed LAN address fails. Mac boxes are not affected.
+
 Recognise a missing table with `nft list table inet yolobox-host` (needs root) or `systemctl is-active yolobox-host.service`. `yo` can only see the unit, not the table (see `TODO.md`). A working layer shows up from inside a box as a `curl` to the host's LAN address that fails at once while DNS still answers. `tests/box-libvirt-check.sh` proves it by deleting the guest table first, so the host layer is the only thing in the way.
 
 ## Host ports

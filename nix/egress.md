@@ -46,6 +46,8 @@ A box whose `local.nix` adds a separate table that rejects everything not leavin
 }
 ```
 
+On a Linux host `lanAllow` does nothing. The guest table accepts the entry, but the packet then leaves through passt, and the host table (`linux/yolobox-host.nft`) rejects the private ranges for passt's uid, with no equivalent of this option. The connection fails with a reject on the host, and the guest's own table shows nothing wrong. A Linux-host box that needs a LAN service has to be served another way (the tailnet, say) until the host table learns the same allowance. See [the host table](../docs/linux-host.md#the-host-table).
+
 Name single addresses where you can. An entry that covers the host's own LAN address, such as the whole `192.168.1.0/24` when the host sits on it, lets the guest reach the host at that address, and the table then protects nothing.
 
 IPv4 entries become one `ip daddr { … } accept` and IPv6 entries one `ip6 daddr { … } accept`, placed before the rejects. An entry that is not a CIDR fails the evaluation with `yolobox.network.lanAllow: not a CIDR: <entries>`, because the string goes into the rule file and a typo must not reach `nft` on a user's box, where it would drop the box into recovery mode. IPv4 octets must be 0 to 255 without leading zeros and the prefix 0 to 32. IPv6 entries need well-formed groups (at most eight, `::` once) and a prefix of 0 to 128. CI evaluates `300.1.1.1/8`, `10.0.0.0/33`, `lizard` and `fd00::/129` and expects each to fail.

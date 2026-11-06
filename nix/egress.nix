@@ -183,6 +183,8 @@ in
       Private networks the guest may reach, e.g. a LAN package cache. Empty:
       no LAN, no host. Name single addresses where you can: a network that
       holds the host's own LAN address lets the guest reach the host.
+      On a Linux host it does nothing: the host table rejects the same
+      ranges for the guest (docs/linux-host.md).
     '';
   };
 
