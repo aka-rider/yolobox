@@ -2887,6 +2887,8 @@ class TestVmUpCreatesAtTheAskedSize(LibvirtCase):
             mock.patch.object(self.box.sshconfig, "ensure_agent_ssh_config"),
             mock.patch.object(self.box.guest, "ensure_guest_known_hosts"),
             mock.patch.object(self.box.forwards, "vm_services"),
+            # A box just created runs the stock image, whose root is not encrypted.
+            mock.patch.object(self.box.vm, "luks_device_fstype", return_value="ext4"),
             # The box start() would have created, at the size it was asked.
             mock.patch.object(
                 self.driver, "current_size", return_value=self.box.BoxSize(24, 250, 3)

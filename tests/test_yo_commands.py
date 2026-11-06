@@ -3966,5 +3966,83 @@ class TestUpGrowsTheDiskOfAStoppedBox(FakeHome):
         self.assertEqual(self.events, ["start", "stop", "grow_disk"])
 
 
+class TestUpAskedForTheCeilingTheBoxHas(FakeHome):
+    """`yo up --disk N` on a box at N finishes a grow that stopped after the ceiling moved."""
+
+    DISK = 100 * 1024**3
+    PARTITION = DISK - 249 * 1024**2
+    HEADER = 32 * 1024**2
+
+    def up(self, fstype="crypto_LUKS\n", mapping=None, filesystem=None, partition=None):
+        partition = self.PARTITION if partition is None else partition
+        mapping = partition - self.HEADER if mapping is None else mapping
+        filesystem = mapping if filesystem is None else filesystem
+        self.sudo = sudo = []
+        usage = df_output("/dev/mapper/root 100 50 50 50% /")
+
+        def fake_ssh_run(role, argv, **kwargs):
+            stdout = ""
+            if argv[:2] == ["lsblk", "-dno"]:
+                stdout = fstype
+            elif argv[:3] == ["lsblk", "-bdno", "SIZE"]:
+                stdout = "%d\n" % (
+                    mapping if argv[3] == "/dev/mapper/root" else partition
+                )
+            elif argv[:3] == ["sudo", "dumpe2fs", "-h"]:
+                stdout = (
+                    "Block count:              %d\nBlock size:               4096\n"
+                    % (filesystem // 4096)
+                )
+            elif argv[:2] == ["systemctl", "show"]:
+                stdout = "loaded\n"
+            elif argv == yo.guest.ROOT_USAGE_PROBE:
+                stdout = usage
+            elif argv[:2] == ["lsblk", "-no"]:
+                stdout = "99.8G\n"
+            elif argv[:2] in (["sudo", "cryptsetup"], ["sudo", "resize2fs"]):
+                sudo.append((argv[1], kwargs.get("stdin")))
+            return mock.Mock(returncode=0, stdout=stdout, stderr="")
+
+        with (
+            mock.patch.object(yo.vm, "vm_up", return_value=None),
+            mock.patch.object(
+                yo.LIMA, "current_size", return_value=yo.BoxSize(16, 100, 4)
+            ),
+            mock.patch.object(yo.sshx, "ssh_run", side_effect=fake_ssh_run),
+            mock.patch.object(
+                yo.agent, "luks_passphrase", return_value=b"p" * 64
+            ) as passphrase,
+            mock.patch.object(yo.ui, "out"),
+        ):
+            yo.cmd_up(yo.build_parser().parse_args(["up", "--disk", "100"]))
+        self.passphrase = passphrase
+
+    def test_a_mapping_short_of_its_partition_is_grown(self):
+        self.up(mapping=self.PARTITION // 2)
+        self.assertEqual(self.sudo, [("cryptsetup", b"p" * 64), ("resize2fs", None)])
+
+    def test_a_filesystem_short_of_its_mapping_is_grown(self):
+        self.up(filesystem=self.PARTITION // 2)
+        self.assertEqual(self.sudo, [("cryptsetup", b"p" * 64), ("resize2fs", None)])
+
+    def test_a_grown_root_is_left_alone_and_asks_for_no_passphrase(self):
+        self.up()
+        self.assertEqual(self.sudo, [])
+        self.passphrase.assert_not_called()
+
+    def test_a_box_not_yet_encrypted_has_nothing_to_finish(self):
+        self.up(fstype="ext4\n")
+        self.assertEqual(self.sudo, [])
+
+    def test_a_partition_that_never_grew_is_an_error_not_a_silent_exit(self):
+        with self.assertRaisesRegex(yo.YoError, "growpart did not grow it"):
+            self.up(partition=50 * 1024**3)
+        self.assertEqual(self.sudo, [])
+
+    def test_a_root_whose_type_cannot_be_read_is_an_error(self):
+        with self.assertRaisesRegex(yo.YoError, "cannot tell whether"):
+            self.up(fstype="\n")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,10 +6,11 @@ import argparse
 import contextlib
 import enum
 import os
+import re
 from typing import List, NamedTuple, Optional, Tuple
 
 from . import agent, forwards, guest, proc, release, sshconfig, sshx, state, ui, unlock
-from .config import FILE_MODE_PRIVATE, GIB, LUKS_DEVICE
+from .config import FILE_MODE_PRIVATE, GIB, LUKS_DEVICE, MIB
 from .driver import NO_SIZE, RUNNING, BoxSize, Removal, Size, StopRefused
 from .sshx import AGENT, OPERATOR
 from .ui import Report, YoError
@@ -29,6 +30,10 @@ IN_PLACE_HEADER_ROOM_MIB = 64
 # What of the disk /dev/vda2 does not get: the 249 MiB ESP (nix/base.md), the
 # GPT tables and alignment, rounded up.
 PARTITION_SLACK_BYTES = GIB
+# What a grown LUKS mapping may lack of the partition (its header: the
+# migration reserves header_room_mib of 32, see IN_PLACE_HEADER_ROOM_MIB) and a
+# grown filesystem of its mapping (under one block), rounded up.
+MAPPING_SLACK_BYTES = 64 * MIB
 
 DISK_FSTYPE_PLAIN = "ext4"
 DISK_FSTYPE_LUKS = "crypto_LUKS"
@@ -651,11 +656,17 @@ def grow_running_disk(
 def grow_to_asked_disk(wanted_gib: int, passphrase: Optional[bytes]) -> None:
     """After `yo up --disk` or `yo bootstrap --disk` has the box up: grow its disk to `wanted_gib`.
 
-    A box vm_up just created already has it, and a box that has it needs
-    nothing. vm_up refused a smaller disk and a running box before this.
+    A box vm_up just created already has it. A box whose ceiling is already
+    `wanted_gib` may have had a grow interrupted after the ceiling moved, so
+    its mapping and filesystem are checked and finished as `yo disk-grow` does.
+    vm_up refused a smaller disk and a running box before this.
     """
     current_gib = state.driver().current_size().disk_gib
-    if wanted_gib <= current_gib:
+    if wanted_gib < current_gib:
+        return
+    if wanted_gib == current_gib:
+        if root_has_room_to_grow(wanted_gib):
+            finish_previous_grow(wanted_gib, passphrase or agent.luks_passphrase())
         return
     try:
         require_growable_guest()
@@ -719,6 +730,14 @@ def grow_mapping_and_filesystem(
     )
 
 
+def finish_previous_grow(ceiling_gib: int, passphrase: bytes) -> None:
+    """On the running box, grow the mapping and filesystem into a ceiling already raised."""
+    require_growable_guest()
+    grow_mapping_and_filesystem(
+        passphrase, ceiling_gib, root_usage_before_grow(), finishing=True
+    )
+
+
 def cmd_disk_grow(args: argparse.Namespace) -> None:
     wanted = args.size
 
@@ -738,33 +757,78 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
         # Derived first: the box may be stopped or waiting in its initrd.
         passphrase = agent.luks_passphrase()
         vm_up(passphrase=passphrase)
-        require_growable_guest()
-        grow_mapping_and_filesystem(
-            passphrase, wanted, root_usage_before_grow(), finishing=True
-        )
+        finish_previous_grow(wanted, passphrase)
         return
 
     require_growable_guest()
     grow_running_disk(current_gib, wanted)
 
 
-def require_partition_grown(ceiling_gib: int) -> None:
-    """Raise unless /dev/vda2 fills the disk the ceiling describes, ESP aside."""
-    sizes = sshx.guest_out(["lsblk", "-bdno", "SIZE", LUKS_DEVICE]).splitlines()
+def guest_device_bytes(device: str) -> int:
+    """The size of a block device in the box, in bytes."""
+    sizes = sshx.guest_out(["lsblk", "-bdno", "SIZE", device]).splitlines()
     size = sizes[0].strip() if sizes else ""
     if not proc.is_ascii_number(size):
         raise YoError(
             state.not_up_hint(
-                "cannot read the size of %s (lsblk answered %r)" % (LUKS_DEVICE, size)
+                "cannot read the size of %s (lsblk answered %r)" % (device, size)
             )
         )
-    if int(size) < ceiling_gib * GIB - PARTITION_SLACK_BYTES:
+    return int(size)
+
+
+def guest_filesystem_bytes(device: str) -> int:
+    """The size of the ext4 filesystem on `device`, from its superblock."""
+    listing = sshx.guest_out(["sudo", "dumpe2fs", "-h", device])
+    fields = {
+        name: re.search(r"^%s:\s+(\d+)$" % name, listing, re.MULTILINE)
+        for name in ("Block count", "Block size")
+    }
+    missing = [name for name, found in fields.items() if found is None]
+    if missing:
+        raise YoError(
+            "cannot read the filesystem size of %s: dumpe2fs printed no %s"
+            % (device, " or ".join(missing))
+        )
+    return int(fields["Block count"].group(1)) * int(fields["Block size"].group(1))
+
+
+def root_has_room_to_grow(ceiling_gib: int) -> bool:
+    """Whether the running box's mapping or filesystem is short of the device under it.
+
+    The question behind `yo up --disk N` when the ceiling already is N: an
+    earlier grow may have raised it and stopped before `cryptsetup resize` or
+    `resize2fs`. A root that is not encrypted has no mapping, so a box not yet
+    bootstrapped has nothing to finish. Reads only, so it asks for no passphrase.
+    """
+    fstype = luks_device_fstype()
+    disk_state = classify_disk(fstype)
+    if disk_state is DiskState.PLAIN_EXT4:
+        return False
+    if disk_state is not DiskState.ENCRYPTED:
+        raise YoError(
+            "cannot tell whether %s's root fills its disk: lsblk reports %r for %s"
+            % (state.box.name, fstype, LUKS_DEVICE)
+        )
+    require_partition_grown(ceiling_gib)
+    mapping = "/dev/mapper/%s" % LUKS_MAPPER
+    mapping_bytes = guest_device_bytes(mapping)
+    return (
+        guest_device_bytes(LUKS_DEVICE) - mapping_bytes > MAPPING_SLACK_BYTES
+        or mapping_bytes - guest_filesystem_bytes(mapping) > MAPPING_SLACK_BYTES
+    )
+
+
+def require_partition_grown(ceiling_gib: int) -> None:
+    """Raise unless /dev/vda2 fills the disk the ceiling describes, ESP aside."""
+    size = guest_device_bytes(LUKS_DEVICE)
+    if size < ceiling_gib * GIB - PARTITION_SLACK_BYTES:
         raise YoError(
             "%s is %d bytes, short of the %dGiB ceiling: growpart did not grow it at "
             "the last boot — diagnose with: %s"
             % (
                 LUKS_DEVICE,
-                int(size),
+                size,
                 ceiling_gib,
                 state.yo_cmd("ssh", "systemctl", "status", "growpart"),
             )
