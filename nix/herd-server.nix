@@ -12,6 +12,8 @@ in
     wantedBy = [ "default.target" ];
     path = [ "/run/current-system/sw" ];
     environment = agentEnv.env;
+    # A switch must not stop the server: that kills the panes, and lets the host's remote-client-bridge start a server outside this unit.
+    restartIfChanged = false;
     serviceConfig = {
       Restart = "on-failure";
       RestartSec = 5;

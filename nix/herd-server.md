@@ -87,6 +87,35 @@ generation, not the version string beside it. The remedy is the pin's own
 escape hatch: bump `yolobox.harness.herdr.version` and `.hashes` to the
 generation the host's herdr now speaks.
 
+## A switch leaves the server running
+
+`nixos-rebuild switch` used to restart `herdr-server` whenever its unit
+changed. The stop killed every process in the panes, so a rebuild ended the
+agents' sessions. The gap before the restart let the host's herdr win the
+race. It was attached over a long-lived ssh session running `herdr
+remote-client-bridge`, and found no server, so it started its own `herdr
+server` in that ssh session's cgroup, outside the unit, and restored the panes
+from `session.json`. The unit's next start then failed every 5 s with `error:
+herdr server is already running`, and kept failing. `Restart=on-failure` with
+`RestartSec=5` never reaches the start limit, so nothing stopped the loop.
+
+The unit sets `restartIfChanged = false`, so a switch leaves the running
+server alone. The cost is that a new herdr takes effect only at the next
+reboot, or when the agent runs `systemctl --user restart herdr-server` by hand.
+
+To recognise the failure, `journalctl --user -u herdr-server` repeats `herdr
+server is already running`, and `ps -ef` shows a `herdr server` whose parent
+is `herdr remote-client-bridge`. That server belongs to the host's bridge,
+not to the unit.
+
+To recover, stop the stray server and restart the unit at once, as the
+agent: `kill <pid>`, then `systemctl --user restart herdr-server`. Its
+restored panes go with it, so the agent's sessions in them are lost. Waiting
+for the unit's own retry does not work while the host's herdr is attached:
+its client reconnects within a second, and each new bridge starts a server
+again. If the bridge wins the restart too, repeat both steps, or detach the
+host's herdr first.
+
 ## HERDR_AGENT
 
 `herdr agent list` comes back empty for a session that is plainly running
