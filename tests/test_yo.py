@@ -1071,6 +1071,30 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
 
         self.assertIn("no/such", caught.exception.message)
 
+    def test_a_destination_with_a_newline_cannot_forge_a_message_line(self):
+        for operands in (
+            [":~/x", "new\nyo: forged/"],
+            [":~/x", ":~/y", "new\nyo: forged"],
+            [":~/x", "new\nyo: forged/parent"],
+        ):
+            with self.subTest(operands=operands):
+                with self.assertRaises(yo.YoError) as caught:
+                    self.copy(operands, {"x": "1", "y": "2"})
+                self.assertIn("new\\nyo: forged", caught.exception.message)
+                self.assertNotIn("\n", caught.exception.message)
+
+    def test_a_staging_directory_that_stays_cannot_forge_a_message_line(self):
+        os.makedirs("d\nyo: forged")
+        with (
+            mock.patch.object(
+                yo.cp, "remove_tree", side_effect=PermissionError(13, "Denied")
+            ),
+            self.assertRaises(yo.YoError) as caught,
+        ):
+            self.copy([":~/x", "d\nyo: forged"], {"x": "1"})
+        self.assertIn("d\\nyo: forged/.yo-cp-", caught.exception.message)
+        self.assertNotIn("\n", caught.exception.message)
+
 
 class TestCpFromGuestNeverLandsControlPaths(CpFromGuestHarness):
     """A pulled .git/config (fsmonitor, pager, core.hooksPath) or .envrc runs

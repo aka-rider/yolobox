@@ -239,7 +239,7 @@ def remove_staging(path: str) -> None:
     except OSError as failure:
         raise YoError(
             'cannot remove the staging directory "%s": %s; delete it by hand'
-            % (path, ui.os_error_reason(failure))
+            % (ui.shown(path), ui.os_error_reason(failure))
         )
 
 
@@ -582,11 +582,11 @@ def download_from_guest(sources: Sequence[str], dest: str) -> None:
     # on the next pull. Same filesystem, so landing each entry is a rename.
     dest_is_dir = os.path.isdir(dest)
     if dest.endswith("/") and not dest_is_dir:
-        raise YoError('destination "%s" is not a directory' % dest)
+        raise YoError('destination "%s" is not a directory' % ui.shown(dest))
     if not dest_is_dir and len(sources) > 1:
         raise YoError(
             '"%s" is not an existing directory, which %d sources need'
-            % (dest, len(sources))
+            % (ui.shown(dest), len(sources))
         )
     new_name = dest.rstrip("/") or "/"
     staging_parent = dest if dest_is_dir else os.path.dirname(new_name)
@@ -595,7 +595,7 @@ def download_from_guest(sources: Sequence[str], dest: str) -> None:
     except OSError as failure:
         raise YoError(
             "cannot stage a copy in %s: %s"
-            % (staging_parent, ui.os_error_reason(failure))
+            % (ui.shown(staging_parent), ui.os_error_reason(failure))
         )
     try:
         fetch_guest_sources(sources, staging)
