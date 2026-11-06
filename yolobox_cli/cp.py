@@ -110,7 +110,7 @@ def local_cp_operand(operand: str) -> str:
 
 def walk_failure(failure: OSError) -> None:
     raise YoError(
-        "cannot read %s: %s" % (failure.filename, ui.os_error_reason(failure))
+        "cannot read %s: %s" % (ui.shown(failure.filename), ui.os_error_reason(failure))
     )
 
 
@@ -121,7 +121,7 @@ def refuse_symlinks_in(source: str) -> None:
     def refuse(link: str) -> None:
         raise YoError(
             'refusing to upload symlink "%s": scp would copy its target "%s", not the link'
-            % (link, os.readlink(link))
+            % (ui.shown(link), ui.shown(os.readlink(link)))
         )
 
     # lstat of "link/" follows the link, so a trailing slash would hide it.
@@ -129,7 +129,9 @@ def refuse_symlinks_in(source: str) -> None:
     try:
         mode = os.lstat(source).st_mode
     except OSError as failure:
-        raise YoError("cannot read %s: %s" % (source, ui.os_error_reason(failure)))
+        raise YoError(
+            "cannot read %s: %s" % (ui.shown(source), ui.os_error_reason(failure))
+        )
     if stat.S_ISLNK(mode):
         refuse(source)
     if not stat.S_ISDIR(mode):
@@ -187,7 +189,9 @@ def plan_merge(staged: str, target: str, moves: List[Tuple[str, str]]) -> None:
         moves.append((staged, target))
         return
     except OSError as failure:
-        raise YoError("cannot read %s: %s" % (target, ui.os_error_reason(failure)))
+        raise YoError(
+            "cannot read %s: %s" % (ui.shown(target), ui.os_error_reason(failure))
+        )
     if stat.S_ISLNK(existing):
         raise YoError(
             'refusing to copy over symlink "%s": the copy would overwrite its target "%s", not the link'

@@ -1735,6 +1735,40 @@ class TestCpRefusesSymlinks(CpHarness):
     def test_a_missing_source_is_refused_naming_it(self):
         self.refused(["nope", ":~/x"], os.path.join(self.cwd, "nope"))
 
+    def test_a_name_with_a_newline_cannot_forge_a_message_line(self):
+        forged = "x\nyo: forged line"
+        os.symlink("t\nyo: forged target", forged)
+        with self.assertRaises(yo.YoError) as caught:
+            self.run_cp([forged, ":~/x"])
+        message = caught.exception.message
+        self.assertNotIn("\n", message)
+        self.assertIn("x\\nyo: forged line", message)
+        self.assertIn("t\\nyo: forged target", message)
+
+    def test_a_missing_source_with_a_newline_cannot_forge_a_message_line(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.run_cp(["gone\nyo: forged", ":~/x"])
+        self.assertNotIn("\n", caught.exception.message)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode 000 directory")
+    def test_an_unreadable_directory_with_a_newline_cannot_forge_a_message_line(self):
+        os.makedirs("repo/d\nyo: forged")
+        os.chmod("repo/d\nyo: forged", 0)
+        self.addCleanup(os.chmod, "repo/d\nyo: forged", 0o700)
+        with self.assertRaises(yo.YoError) as caught:
+            self.run_cp(["repo", ":~/x"])
+        self.assertIn("Permission denied", caught.exception.message)
+        self.assertNotIn("\n", caught.exception.message)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode 000 directory")
+    def test_a_download_target_that_cannot_be_read_cannot_forge_a_message_line(self):
+        os.makedirs("dest")
+        os.chmod("dest", 0)
+        self.addCleanup(os.chmod, "dest", 0o700)
+        with self.assertRaises(yo.YoError) as caught:
+            yo.plan_merge("staged", "dest/e\nyo: forged", [])
+        self.assertNotIn("\n", caught.exception.message)
+
     def test_a_directory_without_symlinks_is_uploaded(self):
         os.makedirs("repo/sub")
         Path("repo/sub/f").write_text("x")
