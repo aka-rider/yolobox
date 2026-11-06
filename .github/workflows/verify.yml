@@ -115,6 +115,21 @@ jobs:
           fi
           grep -F 'YOLOBOX_FLAKE_REF is' path.err
 
+      # The operator account must not collide with the agent's or with root.
+      # The refusal must name the variable, or it failed for some other reason.
+      # The toplevel is evaluated because an assertion fires only when the
+      # system is. `! cmd` never fails a `bash -e` step, hence the explicit
+      # exits.
+      - name: Check the flake refuses the agent's and root's name as the operator
+        run: |
+          attr=.#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
+          for name in agent root; do
+            if env YOLOBOX_USERNAME="$name" $NIX_EVAL --raw "$attr" 2> "$name.err"; then
+              echo "evaluated with YOLOBOX_USERNAME=$name"; exit 1
+            fi
+            grep -F 'YOLOBOX_USERNAME' "$name.err"
+          done
+
       # A yo older than the flake still passes YOLOBOX_HOST_OS. The box must
       # be the same derivation whatever it says, or unset (nix/base.md).
       - name: Check the box ignores YOLOBOX_HOST_OS
@@ -219,6 +234,7 @@ jobs:
       # (nix/hardening.md).
       - name: Check the hardening settings are present
         run: |
+          set -o pipefail
           box=.#nixosConfigurations.yolobox.config
           test "$($NIX_EVAL --json "$box.boot.kernel.sysctl.\"kernel.io_uring_disabled\"")" = 2
           $NIX_EVAL --json "$box.boot.extraModprobeConfig" | grep -F 'install bluetooth '
@@ -227,8 +243,11 @@ jobs:
           for module in cls_u32 act_gact sch_netem; do
             $NIX_EVAL --json "$box.boot.extraModprobeConfig" | grep -F "install $module "
           done
-          # `! cmd` never fails a `bash -e` step, hence the explicit exit.
-          if $NIX_EVAL --json "$box.boot.extraModprobeConfig" | grep -F 'install sch_fq_codel '; then
+          # `! cmd` never fails a `bash -e` step, hence the explicit exit. The
+          # config is read first: in an `if` condition a failing nix eval would
+          # read as "not blocked", with or without pipefail.
+          modprobe="$($NIX_EVAL --json "$box.boot.extraModprobeConfig")"
+          if grep -F 'install sch_fq_codel ' <<<"$modprobe"; then
             echo "sch_fq_codel, the default qdisc, is blocked"; exit 1
           fi
 
