@@ -280,7 +280,9 @@ class TestFlakeRef(FakeHome):
         self.remember("main")
         with (
             mock.patch.object(
-                yo.sshx, "account_status", return_value=("operator_only", "")
+                yo.sshx,
+                "account_status",
+                return_value=(yo.AccountStatus.OPERATOR_ONLY, ""),
             ),
             mock.patch.object(yo.ui, "err") as fake_err,
         ):
@@ -372,13 +374,13 @@ class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
 
     def test_an_agent_whose_login_fails_is_not_a_missing_account(self):
         status, detail = self.status(1, 0, 0, agent_stderr="rc: boom\n")
-        self.assertEqual(status, "agent_failing")
+        self.assertIs(status, yo.AccountStatus.AGENT_FAILING)
         self.assertEqual(
             detail, "ssh agent@lima-yolobox true failed (exit 1): rc: boom"
         )
 
     def test_a_missing_account_is_what_getent_says(self):
-        self.assertEqual(self.status(255, 0, 2), ("operator_only", ""))
+        self.assertEqual(self.status(255, 0, 2), (yo.AccountStatus.OPERATOR_ONLY, ""))
 
     def test_a_getent_that_fails_otherwise_is_an_error(self):
         with self.assertRaisesRegex(yo.YoError, "getent passwd agent failed.*exit 3"):
@@ -397,7 +399,8 @@ class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
 
     def test_a_lost_operator_is_unreachable(self):
         self.assertEqual(
-            self.status(255, 255, 0, "no route\n"), ("unreachable", "no route")
+            self.status(255, 255, 0, "no route\n"),
+            (yo.AccountStatus.UNREACHABLE, "no route"),
         )
 
     def test_a_failing_agent_login_never_advises_destroying_the_box(self):
@@ -405,7 +408,7 @@ class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
             mock.patch.object(
                 yo.sshx,
                 "account_status",
-                return_value=("agent_failing", "exited 1: boom"),
+                return_value=(yo.AccountStatus.AGENT_FAILING, "exited 1: boom"),
             ),
             mock.patch.object(yo.ui, "err") as fake_err,
         ):
@@ -1985,7 +1988,9 @@ class TestVmServicesSkipsOnAnOldBox(unittest.TestCase):
             mock.patch.object(yo.aws, "ensure_aws_broker") as fake_aws,
             mock.patch.object(yo.forwards, "ensure_forwards") as fake_forward,
             mock.patch.object(
-                yo.sshx, "account_status", return_value=("unreachable", "")
+                yo.sshx,
+                "account_status",
+                return_value=(yo.AccountStatus.UNREACHABLE, ""),
             ),
         ):
             with self.assertRaisesRegex(yo.Unreachable, "is it up\\? yo status"):
@@ -2013,7 +2018,7 @@ class TestVmServicesSkipsOnAnOldBox(unittest.TestCase):
 class TestVmServicesRunsHealersIndependently(unittest.TestCase):
     def setUp(self):
         status_patcher = mock.patch.object(
-            yo.sshx, "account_status", return_value=("agent", "")
+            yo.sshx, "account_status", return_value=(yo.AccountStatus.AGENT, "")
         )
         status_patcher.start()
         self.addCleanup(status_patcher.stop)

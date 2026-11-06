@@ -4564,7 +4564,9 @@ class TestStatusWithVmDown(unittest.TestCase):
             mock.patch.object(
                 yo.proc, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0)
             ),
-            mock.patch.object(yo.sshx, "account_status", lambda: ("unreachable", "")),
+            mock.patch.object(
+                yo.sshx, "account_status", lambda: (yo.AccountStatus.UNREACHABLE, "")
+            ),
             mock.patch.object(yo.sshx, "ssh_run", ssh_run),
             mock.patch.object(yo.LIMA, "config_gaps", lambda: []),
             mock.patch.object(yo.LIMA, "config_notes", lambda: []),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -159,26 +160,34 @@ def box_failure(what: str, completed: subprocess.CompletedProcess) -> YoError:
     )
 
 
-def account_status() -> Tuple[str, str]:
+class AccountStatus(enum.Enum):
+    AGENT = "agent"
+    # The box has no agent account, a fact `getent` states.
+    OPERATOR_ONLY = "operator_only"
+    # The agent exists but its login fails (its own rc file exits, say).
+    AGENT_FAILING = "agent_failing"
+    UNREACHABLE = "unreachable"
+
+
+def account_status() -> Tuple[AccountStatus, str]:
     """Which accounts work, as (status, detail).
 
-    `operator_only` means the box has no agent account, a fact `getent` states.
-    An agent whose login merely fails (its own rc file exits, say) is `agent_failing`,
-    with the failed probe's exit code and stderr as detail.
+    The detail of AGENT_FAILING is the failed probe's exit code and stderr, and that
+    of UNREACHABLE what ssh said; the others have none.
     """
     agent_probe = ssh_run(AGENT, ["true"])
     if agent_probe.returncode == 0:
-        return "agent", ""
+        return AccountStatus.AGENT, ""
     if ssh_run(OPERATOR, ["true"]).returncode != 0:
-        return "unreachable", agent_probe.stderr.rstrip("\n")
+        return AccountStatus.UNREACHABLE, agent_probe.stderr.rstrip("\n")
     lookup = ssh_run(OPERATOR, ["getent", "passwd", AGENT_USER])
     if lookup.returncode == SSH_UNREACHABLE:
-        return "unreachable", lookup.stderr.rstrip("\n")
+        return AccountStatus.UNREACHABLE, lookup.stderr.rstrip("\n")
     if lookup.returncode == GETENT_KEY_NOT_FOUND:
-        return "operator_only", ""
+        return AccountStatus.OPERATOR_ONLY, ""
     if lookup.returncode != 0:
         raise box_failure("getent passwd %s" % AGENT_USER, lookup)
-    return "agent_failing", proc.failed_message(
+    return AccountStatus.AGENT_FAILING, proc.failed_message(
         "ssh %s@%s true" % (AGENT_USER, state.box.vm_host),
         agent_probe.returncode,
         proc.failure_detail(agent_probe),
@@ -187,16 +196,16 @@ def account_status() -> Tuple[str, str]:
 
 def require_agent_account() -> None:
     status, detail = account_status()
-    if status == "agent":
+    if status is AccountStatus.AGENT:
         return
-    if status == "agent_failing":
+    if status is AccountStatus.AGENT_FAILING:
         ui.err("yo: cannot ssh into %s as '%s'." % (state.box.name, AGENT_USER))
         ui.err("    The account exists, but its login fails: %s" % detail)
         ui.err(
             "    Its shell startup files (~/.bashrc, ~/.profile) are the usual cause; "
             "inspect them as the operator: %s" % state.yo_cmd("ssh")
         )
-    elif status == "operator_only":
+    elif status is AccountStatus.OPERATOR_ONLY:
         ui.err("yo: cannot ssh into %s as '%s'." % (state.box.name, AGENT_USER))
         ui.err(
             "    Every AI session runs as that account, and this VM has no working one —"

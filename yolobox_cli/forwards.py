@@ -17,7 +17,7 @@ from .config import (
     SSH_CONFIG_INCLUDE_LINE,
 )
 from .driver import Removal
-from .sshx import AGENT, OPERATOR
+from .sshx import AGENT, OPERATOR, AccountStatus
 from .ui import YoError
 
 
@@ -214,7 +214,7 @@ def units_missing_note() -> str:
 
 def vm_services() -> None:
     status, _ = sshx.account_status()
-    if status == "unreachable":
+    if status is AccountStatus.UNREACHABLE:
         raise sshx.unreachable(OPERATOR)
     if not guest.vm_units_present():
         ui.err("yo: %s" % units_missing_note())

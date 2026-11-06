@@ -12,7 +12,7 @@ from typing import Callable, List, NamedTuple, Optional
 
 from . import aws, config, forwards, guest, proc, release, sshx, state, ui, unlock, vm
 from .config import LUKS_DEVICE, MIB, PROXY_SOCKET_UNITS
-from .sshx import OPERATOR
+from .sshx import OPERATOR, AccountStatus
 from .ui import Report, StatusLine, YoError
 from .unlock import BootStage
 from .vm import DiskState
@@ -587,10 +587,10 @@ def cmd_status(args: argparse.Namespace) -> None:
     stage = unlock.boot_stage()
     if stage in (BootStage.INITRD, BootStage.UNKNOWN):
         # No pinned probe against a box that is, or may be, in its initrd.
-        status, detail = "unreachable", ""
+        status, detail = AccountStatus.UNREACHABLE, ""
     else:
         status, detail = sshx.account_status()
-    vm_reachable = status != "unreachable"
+    vm_reachable = status is not AccountStatus.UNREACHABLE
     if not vm_reachable:
         if detail:
             ui.err(detail)
@@ -609,7 +609,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         if stage is BootStage.INITRD:
             ui.out(initrd_disk_line(unlock.initrd_state()))
 
-    if status == "agent_failing":
+    if status is AccountStatus.AGENT_FAILING:
         report.warn("agent: login fails — %s" % detail)
 
     for line in disk_lines(vm_reachable):
