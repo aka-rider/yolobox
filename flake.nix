@@ -35,6 +35,12 @@
         let u = builtins.getEnv "YOLOBOX_USERNAME";
         in if u == "" then
           throw "YOLOBOX_USERNAME is not set — build with --impure and YOLOBOX_USERNAME=$(id -un) (yo does this for you)"
+        # Checked here, not as module assertions: either name makes two
+        # users.users definitions conflict, which throws before any assertion.
+        else if u == agentUser then
+          throw "YOLOBOX_USERNAME is \"${u}\", the agent's own account name — the operator and the agent must be different accounts"
+        else if u == "root" then
+          throw "YOLOBOX_USERNAME is root — the operator mirrors the Mac user, never root"
         else u;
       # Unlike username, this is a plain constant: nothing outside this
       # flake creates the agent's account (lima creates only the
@@ -90,10 +96,10 @@
           }
         ));
 
-      # builtins.seq forces hostname and flakeRef here (guestSystem is forced
-      # by `system`), so evaluating the box fails at once when one is unset or
-      # invalid, instead of only when some module happens to read it.
-      nixosConfigurations.yolobox = builtins.seq hostname (builtins.seq flakeRef (nixpkgs.lib.nixosSystem {
+      # builtins.seq forces username, hostname and flakeRef here (guestSystem
+      # is forced by `system`), so evaluating the box fails at once when one is
+      # unset or invalid, instead of only when some module happens to read it.
+      nixosConfigurations.yolobox = builtins.seq username (builtins.seq hostname (builtins.seq flakeRef (nixpkgs.lib.nixosSystem {
         system = guestSystem;
         specialArgs = {
           inherit username agentUser version hostname flakeRef;
@@ -127,6 +133,6 @@
           ./nix/egress.nix
           ./nix/hardening.nix
         ];
-      }));
+      })));
     };
 }

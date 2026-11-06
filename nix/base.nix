@@ -216,16 +216,9 @@ in
   };
 
   # username reaches shell scripts, sshd config and tmpfiles rules below, and
-  # must not be able to collide with or impersonate the agent.
+  # must not be able to impersonate the agent; flake.nix already refuses the
+  # agent's and root's names.
   assertions = [
-    {
-      assertion = username != agentUser;
-      message = "YOLOBOX_USERNAME is \"${username}\", the agent's own account name; the operator and the agent must be different accounts.";
-    }
-    {
-      assertion = username != "root";
-      message = "YOLOBOX_USERNAME is root; the operator mirrors the Mac user, never root.";
-    }
     {
       assertion = builtins.match "[a-z_][a-z0-9_-]*" username != null;
       message = "YOLOBOX_USERNAME \"${username}\" is not a plain lowercase unix name ([a-z_][a-z0-9_-]*).";
