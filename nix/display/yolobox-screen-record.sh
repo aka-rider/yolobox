@@ -10,6 +10,11 @@
 # orphaning an unfinalized mp4 with no way to stop it cleanly.
 state_dir="$HOME/.local/state/yolobox"
 pid_file="$state_dir/screen-record.pid"
+progress_fifo="$state_dir/screen-record.progress"
+# Seconds start waits for ffmpeg's first progress report, and stop waits for
+# ffmpeg to finalize the mp4 after SIGINT.
+start_timeout=10
+stop_timeout=20
 
 usage() {
   echo "usage: yolobox-screen-record {start|stop}" >&2
@@ -36,8 +41,22 @@ live_recorder_pid() {
   rm -f "$pid_file"
 }
 
+# Reads fd 4 up to the end of ffmpeg's first progress block, which ffmpeg
+# writes once it is recording. Returns 0 when the block arrives, 1 when ffmpeg
+# closed the pipe first, which it does when it exits, and 2 on timeout.
+await_first_progress() {
+  local line status
+  while :; do
+    status=0
+    read -r -t "$start_timeout" line <&4 || status=$?
+    if ((status > 128)); then return 2; fi
+    if ((status != 0)); then return 1; fi
+    if [ "$line" = progress=continue ]; then return 0; fi
+  done
+}
+
 cmd_start() {
-  local old_pid dir out log pid
+  local old_pid dir out log pid ready code
   old_pid="$(live_recorder_pid)"
   if [ -n "$old_pid" ]; then
     echo "yolobox-screen-record: already recording (pid $old_pid)" >&2
@@ -50,24 +69,45 @@ cmd_start() {
   out="$dir/screen-$(date +%Y%m%d-%H%M%S).mp4"
   log="${out%.mp4}.log"
 
-  ffmpeg -nostdin -loglevel error -f x11grab -video_size 1920x1080 \
-    -framerate 15 -i "${DISPLAY:-:0}" -c:v libx264 -preset ultrafast \
-    -pix_fmt yuv420p "$out" >/dev/null 2>"$log" &
+  rm -f "$progress_fifo"
+  mkfifo "$progress_fifo"
+  ffmpeg -nostdin -loglevel error -progress pipe:3 -f x11grab \
+    -video_size 1920x1080 -framerate 15 -i "${DISPLAY:-:0}" -c:v libx264 \
+    -preset ultrafast -pix_fmt yuv420p "$out" \
+    >/dev/null 2>"$log" 3>"$progress_fifo" &
   pid=$!
+  exec 4<"$progress_fifo"
+  rm "$progress_fifo"
 
-  sleep 0.2
-  if ! kill -0 "$pid" 2>/dev/null; then
-    echo "yolobox-screen-record: ffmpeg exited immediately, log follows:" >&2
-    cat "$log" >&2
-    exit 1
-  fi
+  ready=0
+  await_first_progress || ready=$?
+  case $ready in
+    1)
+      code=0
+      wait "$pid" || code=$?
+      echo "yolobox-screen-record: ffmpeg exited with status $code before it started recording, log follows:" >&2
+      cat "$log" >&2
+      exit 1
+      ;;
+    2)
+      # It may have exited since the read gave up; then there is nothing to kill.
+      kill -KILL "$pid" 2>/dev/null || true
+      echo "yolobox-screen-record: ffmpeg did not start recording within ${start_timeout}s, killed it; log follows:" >&2
+      cat "$log" >&2
+      exit 1
+      ;;
+  esac
+  # Something must read the pipe until ffmpeg exits: ffmpeg survives writing
+  # to a pipe no one reads, but logs it as an error when it finishes.
+  cat <&4 >/dev/null 2>&1 &
+  exec 4<&-
 
   printf '%s\n%s\n' "$pid" "$out" >"$pid_file"
   echo "$out"
 }
 
 cmd_stop() {
-  local pid out
+  local pid out status
   if [ ! -f "$pid_file" ]; then
     echo "yolobox-screen-record: not recording (no pid file)" >&2
     exit 1
@@ -82,14 +122,20 @@ cmd_stop() {
 
   # SIGINT lets ffmpeg finalize the mp4 container; SIGKILL corrupts it.
   kill -INT "$pid"
-  for _ in $(seq 1 100); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.2
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    echo "yolobox-screen-record: ffmpeg did not exit within 20s" >&2
-    exit 1
-  fi
+  # --exited: ffmpeg may have exited, and been reaped, before waitpid looks.
+  status=0
+  waitpid --exited --timeout "$stop_timeout" "$pid" || status=$?
+  case $status in
+    0) ;;
+    3)
+      echo "yolobox-screen-record: ffmpeg did not exit within ${stop_timeout}s" >&2
+      exit 1
+      ;;
+    *)
+      echo "yolobox-screen-record: waitpid failed with status $status while waiting for ffmpeg (pid $pid)" >&2
+      exit 1
+      ;;
+  esac
 
   rm -f "$pid_file"
   echo "$out"
