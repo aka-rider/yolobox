@@ -168,6 +168,21 @@ class TestVersionDrift(unittest.TestCase):
     def test_dev_host_reports_no_drift(self):
         self.assertIsNone(yo.version_drift("dev", "1.1.0"))
 
+    def test_a_box_built_by_a_newer_release_is_never_advised_a_downgrade(self):
+        message = yo.version_drift("1.2.3", "1.3.0")
+        self.assertIn("upgrade yo", message)
+        self.assertNotIn("rebuild it", message)
+
+    def test_versions_compare_as_numbers_not_as_text(self):
+        # "1.9.0" > "1.10.0" as text.
+        self.assertIn("rebuild it", yo.version_drift("1.10.0", "1.9.0"))
+        self.assertIn("upgrade yo", yo.version_drift("1.9.0", "1.10.0"))
+
+    def test_a_version_that_cannot_be_ordered_is_advised_the_rebuild(self):
+        for guest in ("dev", "1.3", "1.3.0-rc1", "١.٣.٠"):
+            with self.subTest(guest=guest):
+                self.assertIn("rebuild it", yo.version_drift("1.2.3", guest))
+
 
 if __name__ == "__main__":
     unittest.main()

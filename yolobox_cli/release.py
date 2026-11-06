@@ -8,7 +8,7 @@ import os
 import pwd
 import re
 import shlex
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import config, sshx, state, ui
 from .ui import YoError
@@ -18,6 +18,7 @@ UPSTREAM_FLAKE = "github:aka-rider/yolobox"
 # Every pattern here is matched with fullmatch, so none carries ^ or $. The
 # ones with \d are re.ASCII: str patterns otherwise take any Unicode digit.
 RELEASE_VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)", re.ASCII)
+VERSION_TRIPLE_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)", re.ASCII)
 PARTIAL_VERSION_RE = re.compile(r"v?\d+(\.\d+)?", re.ASCII)
 GIT_REF_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 GIT_REF_RE = re.compile(GIT_REF_PATTERN)
@@ -39,9 +40,36 @@ UPSTREAM_RELEASE_RE = re.compile(
 FIRST_HOST_OS_FREE_RELEASE = (1, 9, 2)
 
 
+def release_triple(version: str) -> Optional[Tuple[int, int, int]]:
+    """The (X, Y, Z) of a plain X.Y.Z version; None for `dev` or anything else."""
+    found = VERSION_TRIPLE_RE.fullmatch(version)
+    if found is None:
+        return None
+    major, minor, patch = (int(part) for part in found.groups())
+    return major, minor, patch
+
+
 def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
+    """What to do about a box built by another release than this yo, or None.
+
+    A box built by a newer release is not rebuilt by this yo: `yo bootstrap`
+    would build the older release over it. Versions that are not X.Y.Z cannot be
+    ordered, so a box that differs from this yo is advised the rebuild.
+    """
     if guest is None or host == "dev" or host == guest:
         return None
+    host_triple = release_triple(host)
+    guest_triple = release_triple(guest)
+    if (
+        host_triple is not None
+        and guest_triple is not None
+        and guest_triple > host_triple
+    ):
+        return (
+            "yo: the box was built by %s, newer than this host's yo %s — upgrade yo "
+            "(%s would build %s over it)"
+            % (guest, host, state.yo_cmd("bootstrap"), host)
+        )
     return "yo: this host's yo is %s but the box was built by %s — rebuild it: %s" % (
         host,
         guest,
