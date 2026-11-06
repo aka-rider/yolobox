@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import contextlib
 import errno
-import fcntl
 import hashlib
 import os
 import re
@@ -458,17 +457,6 @@ def volume_names() -> List[str]:
     return [row.split()[0] for row in rows[separators[0] + 1 :] if row.strip()]
 
 
-@contextlib.contextmanager
-def held_lock(path: str) -> Iterator[None]:
-    """Hold an exclusive flock on `path`, created private if it is missing."""
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, FILE_MODE_PRIVATE)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)  # closing the descriptor drops the lock
-
-
 class LibvirtDriver:
     """Linux: one libvirt domain per machine, on the system connection."""
 
@@ -546,7 +534,7 @@ class LibvirtDriver:
         """
         directory = os.path.join(state.home(), self.instances_dir)
         os.makedirs(directory, exist_ok=True)
-        with held_lock(os.path.join(directory, PORT_LOCK_NAME)):
+        with state.held_flock(os.path.join(directory, PORT_LOCK_NAME)):
             yield
 
     @contextlib.contextmanager
@@ -554,7 +542,7 @@ class LibvirtDriver:
         """Hold this machine's lock over checking, dropping and opening its
         operator master, so one yo never drops a master another just opened."""
         proc.private_dir(state.instance_dir())
-        with held_lock(os.path.join(state.instance_dir(), MASTER_LOCK_NAME)):
+        with state.held_flock(os.path.join(state.instance_dir(), MASTER_LOCK_NAME)):
             yield
 
     def forward_port(self, guest_port: int) -> int:

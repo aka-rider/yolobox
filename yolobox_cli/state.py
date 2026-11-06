@@ -10,7 +10,7 @@ import pwd
 import shlex
 import sys
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import ContextManager, Iterator, Optional, Type
 
 from . import proc
 from .config import AGENT_USER, DEFAULT_INSTANCE, FILE_MODE_PRIVATE
@@ -200,12 +200,47 @@ def destroy_then_bootstrap_command() -> str:
     )
 
 
-class UnlockBusy(Exception):
+class LockBusy(Exception):
+    """Another process holds the lock, and the caller asked not to wait."""
+
+
+class UnlockBusy(LockBusy):
     """Another yo holds this box's unlock lock."""
 
 
 @contextlib.contextmanager
-def unlock_lock(wait: bool) -> Iterator[None]:
+def held_flock(
+    path: str, wait: bool = True, busy: Type[LockBusy] = LockBusy
+) -> Iterator[None]:
+    """Hold an exclusive flock on `path`, created private if it is missing.
+
+    With `wait` False a held lock raises `busy` instead of blocking.
+
+    The lock file is never deleted. A process blocked in `flock` holds the old
+    inode: with the file unlinked under it, the next one would create and lock
+    a fresh file, and the two would hold "the" lock at once. Like
+    `instances/.port.lock`, it is a few bytes of host state.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, FILE_MODE_PRIVATE)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise busy()
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor drops the lock
+
+
+def host_state_lock(
+    name: str, wait: bool, busy: Type[LockBusy] = LockBusy
+) -> ContextManager[None]:
+    """`held_flock` on the file `name` in the state directory, which it creates."""
+    proc.private_dir(state_dir())
+    return held_flock(os.path.join(state_dir(), name), wait, busy)
+
+
+def unlock_lock(wait: bool) -> ContextManager[None]:
     """Hold this box's exclusive host-side lock on its initrd's passphrase ask.
 
     The one chokepoint between the yo that answers the ask and the yo that
@@ -213,24 +248,6 @@ def unlock_lock(wait: bool) -> Iterator[None]:
     `yo down` holds it from its probe to the power-off, so the answer can never
     land between the two. `yo destroy` holds it for its whole run. With `wait`
     False a held lock raises UnlockBusy instead of blocking, which those two
-    turn into a refusal.
-
-    The lock file is never deleted, `yo destroy` included. A yo blocked in
-    `flock` holds the old inode: with the file unlinked under it, the next yo
-    would create and lock a fresh one, and the two would hold "the" lock at
-    once. Like `instances/.port.lock`, it is a few bytes of host state.
+    turn into a refusal. The lock file is never deleted, `yo destroy` included.
     """
-    proc.private_dir(state_dir())
-    fd = os.open(
-        os.path.join(state_dir(), "%s.unlock.lock" % box.name),
-        os.O_RDWR | os.O_CREAT,
-        FILE_MODE_PRIVATE,
-    )
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
-        except BlockingIOError:
-            raise UnlockBusy()
-        yield
-    finally:
-        os.close(fd)  # closing the descriptor drops the lock
+    return host_state_lock("%s.unlock.lock" % box.name, wait, UnlockBusy)

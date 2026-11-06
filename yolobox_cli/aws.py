@@ -322,9 +322,15 @@ class BrokerDisableError(YoError):
     """The broker could not be turned off. Recreating the ssh master does not cure it."""
 
 
+# yo's own lock, not the broker's: the broker flocks <socket>.lock while it
+# starts, and a yo holding that one would make every broker it starts fail.
+YO_BROKER_LOCK_NAME = "aws-broker.yo.lock"
+
+
 def disable_aws_broker() -> None:
     try:
-        kill_broker_in(aws_broker_health())
+        with state.host_state_lock(YO_BROKER_LOCK_NAME, wait=True):
+            kill_broker_in(aws_broker_health())
         sshx.ssh_run(AGENT, ["rm", "-f", GUEST_AWS_CONFIG_PATH], check=True)
     except YoError as failure:
         raise BrokerDisableError(failure.message, failure.code)
@@ -362,10 +368,13 @@ def ensure_aws_broker() -> bool:
         raise YoError(state.driver().keepalive_pid_error())
 
     allowed_names = sorted(name for name, _ in allowed)
-    health = aws_broker_health()
-    if broker_needs_restart(health, pid, allowed_names):
-        kill_broker_in(health)
-        start_aws_broker(pid, allowed_names)
+    # Check, kill and start are one step: two yos racing through them would each
+    # see no broker, and the second to start would fail on the first one's.
+    with state.host_state_lock(YO_BROKER_LOCK_NAME, wait=True):
+        health = aws_broker_health()
+        if broker_needs_restart(health, pid, allowed_names):
+            kill_broker_in(health)
+            start_aws_broker(pid, allowed_names)
 
     push_aws_guest_files(allowed)
     return True

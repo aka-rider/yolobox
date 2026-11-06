@@ -8,6 +8,7 @@ pid-exit watch).
 import argparse
 import contextlib
 import errno
+import fcntl
 import http.server
 import importlib.util
 import io
@@ -3010,6 +3011,71 @@ class TestEnsureAwsBrokerStaleBroker(FakeHome):
         self.assertTrue(result)
         self.assertEqual(killed, [111])
         fake_start.assert_called_once_with(555, ["work"])
+
+
+class TestEnsureAwsBrokerSerializesYos(FakeHome):
+    def lock_is_held(self):
+        os.makedirs(yo.state_dir(), exist_ok=True)
+        fd = os.open(
+            os.path.join(yo.state_dir(), "aws-broker.yo.lock"), os.O_RDWR | os.O_CREAT
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)  # drops the lock when this probe got it
+        return False
+
+    def test_checking_killing_and_starting_happen_under_one_lock(self):
+        held_during = {}
+        stale = healthy({"pid": 111, "watch_pid": 999, "allow": ["work"]})
+
+        def seen(step, result=None):
+            def record(*args, **kwargs):
+                held_during[step] = self.lock_is_held()
+                return result
+
+            return record
+
+        with (
+            mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
+            mock.patch.object(
+                yo.aws, "aws_allowlist", return_value=[("work", "us-east-1")]
+            ),
+            mock.patch.object(yo.box.driver, "keepalive_pid", return_value=555),
+            mock.patch.object(
+                yo.aws, "aws_broker_health", side_effect=seen("check", stale)
+            ),
+            mock.patch.object(yo.aws, "kill_stale_broker", side_effect=seen("kill")),
+            mock.patch.object(yo.aws, "start_aws_broker", side_effect=seen("start")),
+            mock.patch.object(yo.aws, "push_aws_guest_files"),
+        ):
+            yo.ensure_aws_broker()
+        self.assertEqual(held_during, {"check": True, "kill": True, "start": True})
+        self.assertFalse(self.lock_is_held())
+
+    def test_disabling_checks_and_kills_under_the_same_lock(self):
+        held_during = {}
+
+        def seen(step, result=None):
+            def record(*args, **kwargs):
+                held_during[step] = self.lock_is_held()
+                return result
+
+            return record
+
+        stale = healthy({"pid": 111, "watch_pid": 999, "allow": []})
+        with (
+            mock.patch.object(
+                yo.aws, "aws_broker_health", side_effect=seen("check", stale)
+            ),
+            mock.patch.object(yo.aws, "kill_stale_broker", side_effect=seen("kill")),
+            mock.patch.object(yo.sshx, "ssh_run"),
+        ):
+            yo.disable_aws_broker()
+        self.assertEqual(held_during, {"check": True, "kill": True})
+        self.assertFalse(self.lock_is_held())
 
 
 @unittest.skipUnless(
