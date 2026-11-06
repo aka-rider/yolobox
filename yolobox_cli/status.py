@@ -538,7 +538,9 @@ def initrd_disk_line(reading: unlock.InitrdReading) -> str:
 
 def cmd_status(args: argparse.Namespace) -> None:
     report = Report()
-    state.driver().show_status()
+    listing_failure = state.driver().show_status()
+    if listing_failure is not None:
+        report.warn(listing_failure)
     # Said first and once: with no login key every probe below fails, and the
     # lines that need no login (the VM's state, the config gaps) still follow.
     login = vm.login_problem()

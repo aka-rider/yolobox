@@ -696,16 +696,16 @@ class TestLimaShowStatus(unittest.TestCase):
                 yo.proc, "run", return_value=mock.Mock(returncode=returncode)
             ) as run,
         ):
-            yo.LIMA.show_status()
-        return run
+            return yo.LIMA.show_status(), run
 
     def test_a_listing_that_worked_is_left_to_the_terminal(self):
-        run = self.show_status(0)
+        line, run = self.show_status(0)
+        self.assertIsNone(line)
         self.assertEqual(run.call_args.args[0], ["limactl", "list", "second"])
 
-    def test_a_listing_that_failed_is_an_error_with_its_exit_code(self):
-        with self.assertRaisesRegex(yo.YoError, "limactl list second failed .exit 1."):
-            self.show_status(1)
+    def test_a_listing_that_failed_is_a_line_with_its_exit_code(self):
+        line, _ = self.show_status(3)
+        self.assertIn("limactl list second failed (exit 3)", line)
 
 
 class TestLimaSizeCommands(unittest.TestCase):

@@ -215,7 +215,9 @@ class Driver(Protocol):
     # Why a VM that yo waits for is in `status`, not Running (None: it no longer
     # exists), and the way back.
     def vm_lost_hint(self, status: Optional[str]) -> str: ...
-    def show_status(self) -> None: ...  # the driver's view, head of `yo status`
+    # The driver's view, head of `yo status`. A warning line when it could not
+    # show it, which the report keeps and the rest of the report follows.
+    def show_status(self) -> Optional[str]: ...
     def disk_image(self) -> Optional[Tuple[str, int]]: ...  # label and host KiB
     # Raise the disk's ceiling. The VM must be off, and it stays off.
     def grow_disk(self, current_gib: int, wanted_gib: int) -> None: ...

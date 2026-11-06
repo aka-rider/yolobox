@@ -1132,8 +1132,9 @@ class LibvirtDriver:
             return "%s; %s, then run this command again" % (why, hint)
         return "check why with %s, then run this command again" % reason
 
-    def show_status(self) -> None:
+    def show_status(self) -> Optional[str]:
         libvirt_host.virsh("dominfo", domain_name(), check=False, capture=False)
+        return None
 
     def volume_sizes(self) -> Dict[str, int]:
         """Capacity and Allocation of the disk volume, in bytes."""

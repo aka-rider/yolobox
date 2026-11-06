@@ -758,12 +758,15 @@ class LimaDriver:
             )
         )
 
-    def show_status(self) -> None:
+    def show_status(self) -> Optional[str]:
         argv = ["limactl", "list", state.box.name]
         listed = proc.run(argv, capture=False)
-        if listed.returncode != 0:
-            # Its own message is already on the terminal.
-            raise YoError("%s failed (exit %d)" % (shlex.join(argv), listed.returncode))
+        if listed.returncode == 0:
+            return None
+        return "lima: %s failed (exit %d), its own message is above" % (
+            shlex.join(argv),
+            listed.returncode,
+        )
 
     def disk_image(self) -> Optional[Tuple[str, int]]:
         kib = du_kib(os.path.join(state.instance_dir(), "disk"))

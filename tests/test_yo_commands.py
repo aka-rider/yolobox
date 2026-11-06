@@ -2184,6 +2184,7 @@ class StatusRunner:
         ssh_answer=lambda role, argv: None,
         broker=None,
         keepalive_pid=777,
+        listing_failure=None,
     ):
         outs = []
         # net_check is either the net-check subprocess result or the YoError
@@ -2249,6 +2250,7 @@ class StatusRunner:
                 ),
             ),
             mock.patch.object(yo.LIMA, "keepalive_pid", return_value=keepalive_pid),
+            mock.patch.object(yo.LIMA, "show_status", return_value=listing_failure),
             mock.patch.object(yo.ui, "out", side_effect=fake_out),
             mock.patch.object(yo.ui, "err"),
             mock.patch.object(yo.guest, "guest_helper", helper),
@@ -2284,6 +2286,14 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         )
         self.assertTrue(any(line.startswith("1password:") for line in outs))
         self.assertTrue(any(line.startswith("proxy:") for line in outs))
+
+    def test_a_failed_instance_listing_is_a_warning_and_the_report_goes_on(self):
+        outs = self.run_status(
+            listing_failure="lima: limactl list yolobox failed (exit 1)"
+        )
+        self.assertIn("lima: limactl list yolobox failed (exit 1)", outs)
+        self.assertIn("lima: reverse forwards ok", outs)
+        self.assertEqual((self.raised.message, self.raised.code), (None, 1))
 
     def test_lima_config_gap_is_reported(self):
         outs = self.run_status(
