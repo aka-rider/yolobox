@@ -16,7 +16,7 @@ let
     name = "yolobox-screen-record";
     # ffmpeg-full, not the default ffmpeg: nixpkgs' default build is
     # --disable-xlib/--disable-libxcb*, so x11grab doesn't exist in it.
-    runtimeInputs = [ pkgs.ffmpeg-full pkgs.coreutils ];
+    runtimeInputs = [ pkgs.ffmpeg-full pkgs.coreutils pkgs.gnused ];
     text = builtins.readFile ./display/yolobox-screen-record.sh;
   };
 
