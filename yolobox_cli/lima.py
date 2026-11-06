@@ -451,16 +451,20 @@ class LimaDriver:
     def current_size(self) -> BoxSize:
         # Go template fields of limactl's own instance record (limactl list
         # --list-fields): Memory and Disk in bytes, CPUs a count.
-        probe = proc.run(
-            [
-                "limactl",
-                "list",
-                state.box.name,
-                "--format",
-                "{{.Memory}} {{.Disk}} {{.CPUs}}",
-            ]
-        )
-        fields = probe.stdout.split() if probe.returncode == 0 else []
+        argv = [
+            "limactl",
+            "list",
+            state.box.name,
+            "--format",
+            "{{.Memory}} {{.Disk}} {{.CPUs}}",
+        ]
+        probe = proc.run(argv)
+        if probe.returncode != 0:
+            raise YoError(
+                "%s failed (exit %d): %s"
+                % (shlex.join(argv), probe.returncode, proc.failure_detail(probe))
+            )
+        fields = probe.stdout.split()
         if len(fields) != 3 or not all(proc.is_ascii_number(f) for f in fields):
             raise YoError(
                 "limactl reports no memory, disk and CPUs for %s — does the instance "
@@ -721,7 +725,11 @@ class LimaDriver:
         )
 
     def show_status(self) -> None:
-        proc.run(["limactl", "list", state.box.name], capture=False)
+        argv = ["limactl", "list", state.box.name]
+        listed = proc.run(argv, capture=False)
+        if listed.returncode != 0:
+            # Its own message is already on the terminal.
+            raise YoError("%s failed (exit %d)" % (shlex.join(argv), listed.returncode))
 
     def disk_image(self) -> Optional[Tuple[str, int]]:
         kib = du_kib(os.path.join(state.instance_dir(), "disk"))

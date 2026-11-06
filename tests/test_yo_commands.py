@@ -2366,6 +2366,8 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         outs, errs, pinned_ssh = [], [], []
 
         def initrd_run(argv, **kwargs):
+            if argv[0] == "limactl":
+                return mock.Mock(returncode=0, stdout="", stderr="")
             if "User=root" in argv:
                 return mock.Mock(
                     returncode=0,

@@ -686,16 +686,38 @@ class TestLimaGrowDisk(unittest.TestCase):
         )
 
 
+class TestLimaShowStatus(unittest.TestCase):
+    def show_status(self, returncode):
+        with (
+            as_instance(INSTANCE_B),
+            mock.patch.object(
+                yo.proc, "run", return_value=mock.Mock(returncode=returncode)
+            ) as run,
+        ):
+            yo.LIMA.show_status()
+        return run
+
+    def test_a_listing_that_worked_is_left_to_the_terminal(self):
+        run = self.show_status(0)
+        self.assertEqual(run.call_args.args[0], ["limactl", "list", "second"])
+
+    def test_a_listing_that_failed_is_an_error_with_its_exit_code(self):
+        with self.assertRaisesRegex(yo.YoError, "limactl list second failed .exit 1."):
+            self.show_status(1)
+
+
 class TestLimaSizeCommands(unittest.TestCase):
     GIB = 1024**3
 
-    def current_size(self, stdout, returncode=0):
+    def current_size(self, stdout, returncode=0, stderr=""):
         with (
             as_instance(INSTANCE_B),
             mock.patch.object(
                 yo.proc,
                 "run",
-                return_value=mock.Mock(returncode=returncode, stdout=stdout, stderr=""),
+                return_value=mock.Mock(
+                    returncode=returncode, stdout=stdout, stderr=stderr
+                ),
             ) as run,
         ):
             try:
@@ -722,10 +744,16 @@ class TestLimaSizeCommands(unittest.TestCase):
         self.assertIn("not a whole number of GiB", error.message)
 
     def test_an_answer_that_is_not_three_numbers_is_an_error(self):
-        for stdout, returncode in (("", 0), ("1 2", 0), ("1 2 x", 0), ("1 2 3", 1)):
-            with self.subTest(stdout=stdout, returncode=returncode):
-                error, _ = self.current_size(stdout, returncode)
+        for stdout in ("", "1 2", "1 2 x"):
+            with self.subTest(stdout=stdout):
+                error, _ = self.current_size(stdout)
                 self.assertIn("reports no memory, disk and CPUs", error.message)
+
+    def test_a_limactl_that_fails_says_why_instead_of_naming_a_missing_instance(self):
+        error, _ = self.current_size("", returncode=1, stderr="no such instance: x")
+        self.assertIn("limactl list second --format", error.message)
+        self.assertIn("failed (exit 1): no such instance: x", error.message)
+        self.assertNotIn("reports no memory", error.message)
 
     def edit(self, returncode):
         with (
