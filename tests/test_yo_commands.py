@@ -2259,6 +2259,12 @@ class StatusRunner:
             if isinstance(net_check, Exception)
             else mock.Mock(return_value=net_check)
         )
+        # keepalive_pid is the pid the driver reads, or the YoError it raises.
+        keepalive = (
+            mock.Mock(side_effect=keepalive_pid)
+            if isinstance(keepalive_pid, Exception)
+            else mock.Mock(return_value=keepalive_pid)
+        )
         if table is None:
             table = mock.Mock(
                 returncode=0, stdout=(FIXTURES / "egress.nft").read_text(), stderr=""
@@ -2310,7 +2316,7 @@ class StatusRunner:
                     {"pid": 5, "watch_pid": keepalive_pid, "allow": ["work"]},
                 ),
             ),
-            mock.patch.object(yo.LIMA, "keepalive_pid", return_value=keepalive_pid),
+            mock.patch.object(yo.LIMA, "running_keepalive_pid", keepalive),
             mock.patch.object(yo.LIMA, "show_status", return_value=listing_failure),
             mock.patch.object(yo.ui, "out", side_effect=fake_out),
             mock.patch.object(yo.ui, "err"),
@@ -2386,6 +2392,24 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
             ),
         )
         self.assertTrue(any("aws: config unreadable:" in line for line in outs))
+
+    def test_an_unreadable_keepalive_pid_is_a_line_and_the_report_goes_on(self):
+        outs = self.run_status(
+            units_present=True,
+            gaps=[],
+            aws_which="/usr/local/bin/aws",
+            aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
+            keepalive_pid=yo.YoError("cannot open the ssh master"),
+        )
+        self.assertTrue(
+            any(
+                line.startswith("aws: cannot read the pid the broker watches")
+                and "cannot open the ssh master" in line
+                for line in outs
+            )
+        )
+        self.assertIsNotNone(self.raised)
+        self.assertEqual(self.raised.code, 1)
 
     def status_with_fstype(self, fstype):
         return self.run_status(

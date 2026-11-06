@@ -451,6 +451,10 @@ class LimaDriver:
         info = lima_instance_info()
         return info.host_agent_pid if info else None
 
+    def running_keepalive_pid(self) -> Optional[int]:
+        # limactl list only reads: the host agent is lima's, not yo's to start.
+        return self.keepalive_pid()
+
     def keepalive_pid_error(self) -> str:
         return state.not_up_hint(
             "cannot read %s's host agent pid (%s %s --json)"

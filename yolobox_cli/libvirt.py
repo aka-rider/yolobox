@@ -614,6 +614,9 @@ class LibvirtDriver:
 
     def keepalive_pid(self) -> Optional[int]:
         self.ensure_master()
+        return self.running_keepalive_pid()
+
+    def running_keepalive_pid(self) -> Optional[int]:
         check = proc.run(
             sshx.ssh_argv(OPERATOR, "-O", "check", state.box.vm_host, mux=True)
         )

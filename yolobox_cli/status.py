@@ -509,7 +509,16 @@ def aws_lines(vm_reachable: bool) -> List[StatusLine]:
             not forward_up,
         )
     ]
-    pid = state.driver().keepalive_pid()
+    try:
+        pid = state.driver().running_keepalive_pid()
+    except YoError as failure:
+        lines.append(
+            StatusLine(
+                "aws: cannot read the pid the broker watches: %s" % failure.message,
+                True,
+            )
+        )
+        return lines
     health = aws.aws_broker_health()
     if health.state is aws.BrokerState.UNREACHABLE:
         lines.append(

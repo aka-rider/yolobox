@@ -1781,6 +1781,17 @@ class TestKeepalive(LibvirtCase):
     def test_a_pid_that_would_hit_init_is_not_a_pid(self):
         self.assertIsNone(self.pid("Master running (pid=1)\n"))
 
+    def test_reading_the_pid_for_status_opens_no_master(self):
+        self.host.master_running = False
+        self.assertIsNone(self.driver.running_keepalive_pid())
+        self.assertFalse(self.host.master_running)
+        self.assertEqual([call for call in self.host.calls if call[-1] == "true"], [])
+
+    def test_reading_the_pid_for_status_reads_a_running_master(self):
+        self.host.master_running = True
+        self.host.master_output = "Master running (pid=4242)\r\n"
+        self.assertEqual(self.driver.running_keepalive_pid(), 4242)
+
 
 class FakeEventStream:
     """`virsh event DOM lifecycle --loop --timeout N`, as the Popen the driver reads.

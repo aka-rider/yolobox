@@ -177,6 +177,10 @@ class Driver(Protocol):
     def ssh_port(self) -> int: ...  # loopback port reaching sshd, initrd included
     def forward_port(self, guest_port: int) -> int: ...  # the host port forwarded
     def keepalive_pid(self) -> Optional[int]: ...  # pid the AWS broker lives with
+    # The same pid, read without starting anything: a box with no master or
+    # agent yet answers None. `yo status` reports and never repairs (YoError when
+    # it cannot be read).
+    def running_keepalive_pid(self) -> Optional[int]: ...
     def keepalive_pid_error(self) -> str: ...  # why keepalive_pid() was empty
     def vm_status(self) -> Optional[str]: ...  # None: no such instance
     # Why start() will not create the instance, at that size.
