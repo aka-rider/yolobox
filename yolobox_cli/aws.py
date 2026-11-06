@@ -34,9 +34,15 @@ STALE_BROKER_EXIT_SECONDS = 10.0
 HEALTH_TIMEOUT_SECONDS = 2.0
 
 
-def read_handshake(child: subprocess.Popen, deadline: float) -> List[str]:
+class Handshake(NamedTuple):
+    lines: List[str]
+    closed: bool  # the broker closed its stdout: it has exited, or is about to
+
+
+def read_handshake(child: subprocess.Popen, deadline: float) -> Handshake:
     fd = child.stdout.fileno()
     buffer = b""
+    closed = False
     while b"\n" not in buffer:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -46,9 +52,10 @@ def read_handshake(child: subprocess.Popen, deadline: float) -> List[str]:
             break
         chunk = os.read(fd, HANDSHAKE_READ_BYTES)
         if not chunk:
+            closed = True
             break
         buffer += chunk
-    return buffer.decode("utf-8", "replace").splitlines()
+    return Handshake(buffer.decode("utf-8", "replace").splitlines(), closed)
 
 
 def checked_pid(value: object) -> Optional[int]:
@@ -250,14 +257,19 @@ def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
             bufsize=0,
         )
 
-    lines = read_handshake(child, time.monotonic() + BROKER_HANDSHAKE_SECONDS)
+    handshake = read_handshake(child, time.monotonic() + BROKER_HANDSHAKE_SECONDS)
     child.stdout.close()
-    line = lines[0] if lines else ""
+    line = handshake.lines[0] if handshake.lines else ""
     if line.startswith("ERROR="):
         child.wait()
         raise YoError("aws-broker failed: %s" % line.removeprefix("ERROR="))
     if line == "READY":
         return
+    if handshake.closed and not line:
+        raise YoError(
+            "aws-broker exited with code %d before its handshake — see %s"
+            % (child.wait(), log_path)
+        )
     child.terminate()
     child.wait()
     if not line:

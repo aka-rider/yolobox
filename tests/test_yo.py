@@ -3031,7 +3031,11 @@ class TestStartAwsBrokerFiles(FakeHome):
         proc.stdout.fileno.return_value = 0
         with (
             mock.patch.object(yo.subprocess, "Popen", return_value=proc),
-            mock.patch.object(yo.aws, "read_handshake", return_value=["READY"]),
+            mock.patch.object(
+                yo.aws,
+                "read_handshake",
+                return_value=yo.aws.Handshake(["READY"], False),
+            ),
         ):
             yo.start_aws_broker(555, ["work"])
 
@@ -3040,7 +3044,11 @@ class TestStartAwsBrokerFiles(FakeHome):
         proc.stdout.fileno.return_value = 0
         with (
             mock.patch.object(yo.subprocess, "Popen", return_value=proc) as popen,
-            mock.patch.object(yo.aws, "read_handshake", return_value=["READY"]),
+            mock.patch.object(
+                yo.aws,
+                "read_handshake",
+                return_value=yo.aws.Handshake(["READY"], False),
+            ),
         ):
             yo.start_aws_broker(555, ["work"])
         self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
@@ -3074,6 +3082,44 @@ class TestStartAwsBrokerFiles(FakeHome):
             handle.write("old secrets")
         self.start()
         self.assertEqual(os.path.getsize(log), 0)
+
+
+class TestStartAwsBrokerHandshakeFailures(FakeHome):
+    """start_aws_broker against real children: a script standing in for aws-broker."""
+
+    def start_with_broker_script(self, body):
+        script_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, script_dir)
+        script = os.path.join(script_dir, "aws-broker")
+        with open(script, "w") as handle:
+            handle.write("#!/bin/sh\n" + body)
+        os.chmod(script, 0o755)
+        spawn = yo.proc.spawn
+        with mock.patch.object(
+            yo.proc,
+            "spawn",
+            lambda argv, **kwargs: spawn([script, *argv[1:]], **kwargs),
+        ):
+            yo.start_aws_broker(555, ["work"])
+
+    def test_a_broker_that_exits_before_its_handshake_is_reported_with_its_exit_code(
+        self,
+    ):
+        with self.assertRaises(yo.YoError) as caught:
+            self.start_with_broker_script("echo boom >&2\nexit 3\n")
+        message = caught.exception.message
+        self.assertIn("exited with code 3", message)
+        self.assertIn("broker.log", message)
+        self.assertNotIn("no handshake", message)
+
+    def test_a_broker_that_stays_silent_is_reported_as_no_handshake(self):
+        with mock.patch.object(yo.aws, "BROKER_HANDSHAKE_SECONDS", 0.2):
+            with self.assertRaisesRegex(yo.YoError, "no handshake within"):
+                self.start_with_broker_script("exec sleep 60\n")
+
+    def test_a_broker_that_reports_an_error_is_reported_with_it(self):
+        with self.assertRaisesRegex(yo.YoError, "aws-broker failed: no good"):
+            self.start_with_broker_script("echo ERROR=no good\nexit 1\n")
 
 
 class TestEnsureAwsBrokerDisabling(FakeHome):
