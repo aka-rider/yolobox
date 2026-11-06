@@ -356,15 +356,17 @@ jobs:
             fi
             grep -F -- "$2" wrappers.err
           }
+          # $1 the capabilities, $2 the group (root when omitted). The group is
+          # an argument because Nix refuses a second x.group in the same set.
           wrapper() {
-            echo "security.wrappers.x = { source = \"\${pkgs.coreutils}/bin/true\"; owner = \"root\"; group = \"root\"; capabilities = \"$1+ep\"; };"
+            echo "security.wrappers.x = { source = \"\${pkgs.coreutils}/bin/true\"; owner = \"root\"; group = \"${2:-root}\"; capabilities = \"$1+ep\"; };"
           }
           toplevel "$(wrapper cap_net_raw) yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap\";" > /dev/null
           refused "$(wrapper cap_net_raw,cap_sys_admin) yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap,cap_sys_admin\";" 'x: cap_net_raw,cap_sys_admin+ep'
           refused 'yolobox.hardening.extraWrappers.sudo = "";' 'names kept wrappers (sudo)'
           # group and permissions are privilege too: a mode with an s makes a
           # capability wrapper setuid, and sudo is wheel-only.
-          toplevel "$(wrapper cap_net_raw) security.wrappers.x.group = lib.mkForce \"wireshark\"; security.wrappers.x.permissions = \"u+rx,g+x\"; yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap\";" > /dev/null
+          toplevel "$(wrapper cap_net_raw wireshark) security.wrappers.x.permissions = \"u+rx,g+x\"; yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap\";" > /dev/null
           refused "$(wrapper cap_net_raw) security.wrappers.x.permissions = \"u+rxs,g+x,o+x\"; yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap\";" 'x: have'
           refused 'security.wrappers.sudo.group = lib.mkForce "root";' 'sudo: have'
           refused 'security.wrappers.sudo.permissions = lib.mkForce "u+rx,g+x,o+x";' 'sudo: have'
