@@ -352,6 +352,7 @@ class TestVmUpOnARunningBoxWithoutSshd(unittest.TestCase):
             over_vsock=False,
             propagate_proxy_env=False,
             load_dot_ssh_pub_keys=False,
+            user_uid=yo.OPERATOR_GUEST_UID,
             ssh_local_port=60023,
         )
         with (
@@ -379,6 +380,7 @@ def lima_info(status, port=60023):
         over_vsock=False,
         propagate_proxy_env=False,
         load_dot_ssh_pub_keys=False,
+        user_uid=yo.OPERATOR_GUEST_UID,
         ssh_local_port=port,
     )
 

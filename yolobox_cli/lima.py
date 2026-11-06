@@ -18,6 +18,7 @@ from .config import (
     MAX_PORT,
     MIB,
     OP_GUEST_SOCK,
+    OPERATOR_GUEST_UID,
     SCRIPT_DIR,
     USAGE_EXIT,
 )
@@ -34,6 +35,7 @@ GAP_PROPAGATE_PROXY_ENV = "propagateProxyEnv"
 GAP_LOAD_DOT_SSH_PUB_KEYS = "ssh.loadDotSSHPubKeys"
 GAP_UDP_FORWARDS = "portForwards.udp"
 GAP_TCP_FORWARDS = "portForwards.tcp"
+GAP_OPERATOR_UID = "user.uid"
 
 # The guest TCP ports lima mirrors onto the host's 127.0.0.1: unprivileged and
 # below the macOS ephemeral range (49152). A Linux host mirrors nothing: it has no
@@ -119,6 +121,19 @@ LIMA_SETTING_GAPS = {
     ),
 }
 
+# Gaps that no `limactl edit` mends: lima reads the setting once, when it creates
+# the instance, so only a new instance has it right. A note and not a fatal gap:
+# the operator must still be able to start the box to copy their work out.
+LIMA_RECREATE_GAPS = {
+    GAP_OPERATOR_UID: (
+        "has an operator whose uid is not %d (lima took the Mac account's uid), so "
+        "its files do not match the account nix/base.nix declares. Lima reads "
+        "user.uid only when it creates an instance, and `limactl edit` cannot "
+        "change file ownership. Push out what you need, then recreate the "
+        "instance from lima/yolobox.yaml, which pins the uid" % OPERATOR_GUEST_UID
+    ),
+}
+
 # The gaps vm_up refuses to start with. Every other gap is a note: the healing
 # step adds a missing forward live, and the rest leak but lock nobody out. Over
 # vsock, the initrd that unlocks the disk cannot answer, and the guest's sshd
@@ -149,6 +164,7 @@ class LimaInfo:
     over_vsock: Optional[bool]
     propagate_proxy_env: Optional[bool]
     load_dot_ssh_pub_keys: Optional[bool]
+    user_uid: object  # the operator's uid as lima created it
     ssh_local_port: object  # as limactl reports it: 0 means lima picks per start
 
 
@@ -196,6 +212,7 @@ def lima_instance_info() -> Optional[LimaInfo]:
     pid = data.get("hostAgentPID")
     config = data.get("config", {})
     ssh = config.get("ssh", {})
+    user = config.get("user", {})
     forwards = config.get("portForwards", [])
     mounts = config.get("mounts", [])
     return LimaInfo(
@@ -207,6 +224,7 @@ def lima_instance_info() -> Optional[LimaInfo]:
         over_vsock=ssh.get("overVsock"),
         propagate_proxy_env=config.get("propagateProxyEnv"),
         load_dot_ssh_pub_keys=ssh.get("loadDotSSHPubKeys"),
+        user_uid=user.get("uid"),
         ssh_local_port=ssh.get("localPort"),
     )
 
@@ -534,6 +552,8 @@ class LimaDriver:
             gaps.append(GAP_PROPAGATE_PROXY_ENV)
         if info.load_dot_ssh_pub_keys is not False:
             gaps.append(GAP_LOAD_DOT_SSH_PUB_KEYS)
+        if info.user_uid != OPERATOR_GUEST_UID:
+            gaps.append(GAP_OPERATOR_UID)
         return gaps
 
     def fatal_gaps(self, gaps: Sequence[str]) -> List[str]:
@@ -543,7 +563,11 @@ class LimaDriver:
         return []
 
     def config_gap_message(self, gaps: Sequence[str]) -> str:
-        missing = [gap for gap in gaps if gap not in LIMA_SETTING_GAPS]
+        missing = [
+            gap
+            for gap in gaps
+            if gap not in LIMA_SETTING_GAPS and gap not in LIMA_RECREATE_GAPS
+        ]
         lines = []
         restated = bool(missing)
         if missing:
@@ -556,6 +580,16 @@ class LimaDriver:
                 )
             )
         for gap in gaps:
+            if gap in LIMA_RECREATE_GAPS:
+                lines.append(
+                    "%s %s:\n    %s"
+                    % (
+                        state.box.name,
+                        LIMA_RECREATE_GAPS[gap],
+                        state.destroy_then_bootstrap_command(),
+                    )
+                )
+                continue
             if gap not in LIMA_SETTING_GAPS:
                 continue
             problem, expression = LIMA_SETTING_GAPS[gap]

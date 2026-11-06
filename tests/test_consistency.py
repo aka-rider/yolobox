@@ -1727,6 +1727,14 @@ class TestCidataDescribesTheOperatorBaseNixDeclares(unittest.TestCase):
         uid = re.search(r"uid = (\d+);", self.operator_block())
         self.assertEqual(self.lima_env()["LIMA_CIDATA_UID"], uid.group(1))
 
+    def test_the_lima_yaml_pins_the_same_uid(self):
+        # Without the pin lima creates the operator with the Mac account's uid.
+        pinned = yaml_block(YOLOBOX_YAML.read_text(), "user")
+        uid = [line.split(":", 1)[1].strip() for line in pinned if "uid:" in line]
+        nix_uid = re.search(r"uid = (\d+);", self.operator_block()).group(1)
+        self.assertEqual(uid, [nix_uid])
+        self.assertEqual(int(nix_uid), yo.config.OPERATOR_GUEST_UID)
+
     def test_home_is_equal(self):
         home = re.search(r'home = "([^"]+)";', self.operator_block())
         self.assertEqual(

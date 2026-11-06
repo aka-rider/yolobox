@@ -153,7 +153,7 @@ in
   # there is no separate "yolobox account", this declares the same account
   # cidata already created so nix and interactive SSH sessions share one
   # $HOME. NixOS refuses isNormalUser below uid 1000 (lima's cidata UID
-  # here is 501, matching the host's macOS UID), so this uses isSystemUser
+  # here is 501, pinned by user.uid in lima/yolobox.yaml), so this uses isSystemUser
   # instead. It keeps wheel and runs no agent; rootless podman's
   # autoSubUidGidRange lives on the agent account below instead.
   users.users.${username} = {

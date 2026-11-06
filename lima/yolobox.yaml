@@ -21,6 +21,13 @@ mounts: []
 memory: 16GiB
 disk: 100GiB
 
+# The operator's uid in the guest. nix/base.nix declares the account with uid 501;
+# lima would otherwise create it with the Mac account's uid, and a Mac whose
+# uid is not 501 would get a box whose files disagree with its declared operator.
+# Lima reads this once, at creation (lima/yolobox.md).
+user:
+  uid: 501
+
 ssh:
   localPort: 60022
   # Lima would copy every ~/.ssh/*.pub into the guest's authorized keys. Only
