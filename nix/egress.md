@@ -7,7 +7,7 @@ The code is `nix/egress.nix`. It is always on. The box reaches the internet thro
 Lima's gateway, 192.168.5.2, is gvproxy's NAT to the host's own loopback, on every port (`natTable()` in lima's `pkg/networks/usernet/gvproxy.go`). A guest that connects to 192.168.5.2:5432 reaches whatever listens on the host's `127.0.0.1:5432`, a database or a dev server the user never meant to share. A guest connection to the host's LAN address, or to any host on the LAN, also leaves through gvproxy. So the table rejects, with `reject with icmpx type admin-prohibited` (a blocked program fails at once instead of timing out):
 
 - IPv4: `10.0.0.0/8`, `100.64.0.0/10`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16` (which holds the Lima subnet), `224.0.0.0/4` and `255.255.255.255`;
-- IPv6: `fc00::/7`, `fe80::/10` and `ff00::/8`.
+- IPv6: `fc00::/7`, `fe80::/10`, `ff00::/8` and `64:ff9b:1::/48`.
 
 These are accepted before the rejects are judged:
 
@@ -21,6 +21,8 @@ These are accepted before the rejects are judged:
 The table has an output chain only, and a postrouting chain when `tunnelInterfaces` is set (see [`tunnelInterfaces`](#tunnelinterfaces)). The box does not route for others, so there is no forward chain.
 
 The priority is -20. A packet must pass every base chain on the output hook, and a reject in either of two tables is final, so this table composes with another module that adds its own table (a kill switch, say) without either one knowing about the other. With equal priorities the kernel orders chains by load order, which is not fixed, so the egress table sits at -20, strictly before a module's table at -10. It still runs after mangle (-150) and dstnat (-100), so the destination it judges is the final one. The interface is not, see [The output hook's interface](#the-output-hooks-interface).
+
+`64:ff9b:1::/48` is the NAT64 local-use prefix (RFC 8215). A network-specific NAT64 may map private IPv4 addresses into it, so an address in it can be a host on the LAN. The well-known prefix `64:ff9b::/96` is deliberately not blocked: RFC 6052 forbids translating private IPv4 addresses with it, and a host that has only IPv6 needs it to reach the IPv4 internet.
 
 DHCPv6 is not among the accepts: its servers are `ff02::1:2`, inside the rejected `ff00::/8`. dhcpcd used to try it anyway and logged `dhcp6_sendmessage: enp0s1: sendmsg: Operation not permitted` (and `failed to confirm prior DHCPv6 address`) at error level on every boot, so `nix/egress.nix` sets `nodhcp6`. The box's IPv6 address comes from router advertisements (SLAAC), which neighbour discovery carries: a Mac box gets only its link-local address, and a Linux host's passt advertises a prefix, so `ip -6 addr show enp0s1` shows a `scope global ... mngtmpaddr` address there.
 

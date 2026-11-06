@@ -55,7 +55,7 @@ BLOCKED_V4 = {
     "224.0.0.0/4",
     "255.255.255.255",
 }
-BLOCKED_V6 = {"fc00::/7", "fe80::/10", "ff00::/8"}
+BLOCKED_V6 = {"fc00::/7", "fe80::/10", "ff00::/8", "64:ff9b:1::/48"}
 
 
 class RuleError(AssertionError):

@@ -71,7 +71,7 @@ On a Mac an instance that differs from `lima/yolobox.yaml` mostly prints a note,
 
 ## IPv6
 
-A Mac box has no global IPv6: Lima's NAT gives it only a link-local address. passt copies the host's IPv6 configuration into the guest, so a box on a Linux host with global IPv6 has a global address and a v6 default route. The host table and the guest table reject the same v6 ranges (`fc00::/7`, `fe80::/10`, `ff00::/8`, and `::1` on the host) and the host's own global v6 address is delivered over loopback, which the host table rejects. But a LAN machine with a global address cannot be told from the internet, the same hairpin that [nix/egress.md](../nix/egress.md#residuals) records for a public IPv4 address.
+A Mac box has no global IPv6: Lima's NAT gives it only a link-local address. passt copies the host's IPv6 configuration into the guest, so a box on a Linux host with global IPv6 has a global address and a v6 default route. The host table and the guest table reject the same v6 ranges (`fc00::/7`, `fe80::/10`, `ff00::/8`, the NAT64 local-use prefix `64:ff9b:1::/48`, and `::1` on the host) and the host's own global v6 address is delivered over loopback, which the host table rejects. But a LAN machine with a global address cannot be told from the internet, the same hairpin that [nix/egress.md](../nix/egress.md#residuals) records for a public IPv4 address.
 
 ## The tailnet residual
 

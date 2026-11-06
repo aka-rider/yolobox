@@ -55,7 +55,8 @@ class TestFullRules(unittest.TestCase):
             ("169.254.0.0/16, ", ""),
             (", 255.255.255.255 } counter", " } counter"),
             ("fc00::/7, ", ""),
-            (", ff00::/8 } counter", " } counter"),
+            (", 64:ff9b:1::/48 } counter", " } counter"),
+            ("ff00::/8, ", ""),
         ):
             with self.subTest(removed=old):
                 with self.assertRaisesRegex(egress_rules.RuleError, "blocked ranges"):

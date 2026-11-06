@@ -14,7 +14,7 @@ table inet yolobox-egress {
     icmpv6 type { mld-listener-report, mld2-listener-report } ip6 daddr ff02::/16 accept
     ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
     ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter reject with icmpx type admin-prohibited
-    ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
-    ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } counter reject with icmpx type admin-prohibited
+    ip6 daddr { fc00::/7, fe80::/10, ff00::/8, 64:ff9b:1::/48 } limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
+    ip6 daddr { fc00::/7, fe80::/10, ff00::/8, 64:ff9b:1::/48 } counter reject with icmpx type admin-prohibited
   }
 }

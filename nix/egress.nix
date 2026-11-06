@@ -23,7 +23,7 @@ let
   # the Lima subnet inside it, CGNAT (tailscale0 is accepted before this is
   # judged), link-local, multicast and the limited broadcast.
   blockedV4 = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255";
-  blockedV6 = "fc00::/7, fe80::/10, ff00::/8";
+  blockedV6 = "fc00::/7, fe80::/10, ff00::/8, 64:ff9b:1::/48";
 
   # Runs after the hooks that change a packet (mangle -150, dstnat -100), so
   # the destination judged here is the final one. The oif is not: every chain
