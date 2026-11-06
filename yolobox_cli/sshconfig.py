@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import stat
 import sys
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from . import proc, state, ui
 from .config import AGENT_USER, FILE_MODE_PRIVATE, SSH_CONFIG_INCLUDE_LINE
@@ -26,13 +26,21 @@ STAGE2_ALIVE_COUNT_MAX = 8
 AGENT_SSH_CONFIG_MARKER = (
     "# yolobox: re-applied by yo; lima rewrites this file on every start"
 )
-LIMA_SSH_ALIAS_FIELDS = ("Hostname", "Port", "IdentityFile")
-# Read when the instance's Host block has it (the libvirt driver's names the
-# 1Password socket, because its IdentityFile is only a public key).
-SSH_ALIAS_OPTIONAL_FIELDS = ("IdentityAgent",)
 
 
-def parse_lima_ssh_block(text: str, host: str) -> Optional[Dict[str, str]]:
+class SshHostBlock(NamedTuple):
+    """What yo reads of an instance's Host block in ssh.config."""
+
+    hostname: str
+    port: str
+    # Every IdentityFile, in file order: ssh offers each in turn.
+    identity_files: Tuple[str, ...]
+    # Set when the instance's block names one (the libvirt driver's names the
+    # 1Password socket, because its IdentityFile is only a public key).
+    identity_agent: Optional[str]
+
+
+def parse_lima_ssh_block(text: str, host: str) -> Optional[SshHostBlock]:
     lines = text.splitlines()
     start = None
     for i, line in enumerate(lines):
@@ -41,22 +49,34 @@ def parse_lima_ssh_block(text: str, host: str) -> Optional[Dict[str, str]]:
             break
     if start is None:
         return None
-    values: Dict[str, str] = {}
+    # ssh keeps the first value of Hostname, Port and IdentityAgent and tries
+    # every IdentityFile, so this does the same.
+    first: Dict[str, str] = {}
+    identity_files: List[str] = []
     for line in lines[start:]:
         if line and not line[0].isspace():
             break
         key, _, value = line.strip().partition(" ")
-        if key in LIMA_SSH_ALIAS_FIELDS + SSH_ALIAS_OPTIONAL_FIELDS:
-            values[key] = value.strip().strip('"')
-    if not all(values.get(field) for field in LIMA_SSH_ALIAS_FIELDS):
+        value = value.strip().strip('"')
+        if key == "IdentityFile":
+            if value:
+                identity_files.append(value)
+        elif key in ("Hostname", "Port", "IdentityAgent"):
+            first.setdefault(key, value)
+    if not (first.get("Hostname") and first.get("Port") and identity_files):
         return None
-    return values
+    return SshHostBlock(
+        first["Hostname"],
+        first["Port"],
+        tuple(identity_files),
+        first.get("IdentityAgent") or None,
+    )
 
 
-def herdr_alias_block(lima_values: Dict[str, str]) -> str:
+def herdr_alias_block(lima_values: SshHostBlock) -> str:
     identity_agent = (
-        ['  IdentityAgent "%s"' % lima_values["IdentityAgent"]]
-        if "IdentityAgent" in lima_values
+        ['  IdentityAgent "%s"' % lima_values.identity_agent]
+        if lima_values.identity_agent is not None
         else []
     )
     return "\n".join(
@@ -68,9 +88,11 @@ def herdr_alias_block(lima_values: Dict[str, str]) -> str:
             # master's, so herdr would silently ride an operator session.
             "  ControlPath none",
             "  ForwardAgent no",
-            "  Hostname %s" % lima_values["Hostname"],
-            "  Port %s" % lima_values["Port"],
-            '  IdentityFile "%s"' % lima_values["IdentityFile"],
+            "  Hostname %s" % lima_values.hostname,
+            "  Port %s" % lima_values.port,
+        ]
+        + ['  IdentityFile "%s"' % identity for identity in lima_values.identity_files]
+        + [
             '  UserKnownHostsFile "%s"' % state.known_hosts_path(),
             "  IdentitiesOnly yes",
         ]
@@ -153,8 +175,8 @@ def ensure_agent_ssh_config() -> None:
     proc.atomic_write(path, new_content, FILE_MODE_PRIVATE)
 
 
-def known_hosts_lines(lima_values: Dict[str, str], pubkeys: str) -> List[str]:
-    host_port = "[%s]:%s" % (lima_values["Hostname"], lima_values["Port"])
+def known_hosts_lines(lima_values: SshHostBlock, pubkeys: str) -> List[str]:
+    host_port = "[%s]:%s" % (lima_values.hostname, lima_values.port)
     lines = []
     for raw in pubkeys.splitlines():
         parts = raw.split(None, 2)
@@ -182,7 +204,7 @@ class InitrdEndpoint(NamedTuple):
 
     hostname: str
     port: int
-    identity: str
+    identities: Tuple[str, ...]
 
 
 def initrd_endpoint() -> InitrdEndpoint:
@@ -194,15 +216,13 @@ def initrd_endpoint() -> InitrdEndpoint:
         return InitrdEndpoint(
             "127.0.0.1",
             state.driver().ssh_port(),
-            os.path.join(state.home(), state.driver().initrd_identity),
+            (os.path.join(state.home(), state.driver().initrd_identity),),
         )
-    if not proc.is_ascii_number(values["Port"]):
+    if not proc.is_ascii_number(values.port):
         raise YoError(
-            "%s names the port %r, not a number" % (state.ssh_cfg(), values["Port"])
+            "%s names the port %r, not a number" % (state.ssh_cfg(), values.port)
         )
-    return InitrdEndpoint(
-        values["Hostname"], int(values["Port"]), values["IdentityFile"]
-    )
+    return InitrdEndpoint(values.hostname, int(values.port), values.identity_files)
 
 
 def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:
@@ -214,14 +234,15 @@ def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:
     # passphrase is sent. And no pinned role may be used here: accept-new would
     # write the initrd's key into known_hosts, and every stage-2 connection after
     # it would be refused.
-    hostname, port, identity = initrd_endpoint()
+    hostname, port, identities = initrd_endpoint()
     return (
         [
             "ssh",
             "-F",
             "/dev/null",
-            "-i",
-            identity,
+        ]
+        + [arg for identity in identities for arg in ("-i", identity)]
+        + [
             "-o",
             "IdentitiesOnly=yes",
             "-o",

@@ -2250,14 +2250,45 @@ class TestEnsureAgentSshConfig(FakeHome):
         self.err.assert_called_once()
 
 
+LIMA_BLOCK_WITH_TWO_KEYS = (
+    "Host lima-yolobox\n"
+    '  IdentityFile "/Users/user/.lima/_config/user"\n'
+    '  IdentityFile "/Users/user/.ssh/id_ed25519"\n'
+    "  Hostname 127.0.0.1\n"
+    "  Port 60022\n"
+    "  Hostname 10.0.0.9\n"
+    "  Port 1\n"
+)
+
+
+class TestParseLimaSshBlock(unittest.TestCase):
+    def test_keeps_every_identity_file_in_order_and_the_first_other_value(self):
+        block = yo.parse_lima_ssh_block(LIMA_BLOCK_WITH_TWO_KEYS, "lima-yolobox")
+        self.assertEqual(block.hostname, "127.0.0.1")
+        self.assertEqual(block.port, "60022")
+        self.assertEqual(
+            block.identity_files,
+            ("/Users/user/.lima/_config/user", "/Users/user/.ssh/id_ed25519"),
+        )
+
+    def test_the_herdr_alias_offers_every_identity_in_order(self):
+        block = yo.parse_lima_ssh_block(LIMA_BLOCK_WITH_TWO_KEYS, "lima-yolobox")
+        lines = yo.herdr_alias_block(block).splitlines()
+        self.assertEqual(
+            [line for line in lines if "IdentityFile" in line],
+            [
+                '  IdentityFile "/Users/user/.lima/_config/user"',
+                '  IdentityFile "/Users/user/.ssh/id_ed25519"',
+            ],
+        )
+
+
 class TestHerdrAliasBlock(FakeHome):
     def block(self):
         return yo.herdr_alias_block(
-            {
-                "Hostname": "127.0.0.1",
-                "Port": "60022",
-                "IdentityFile": "/Users/user/.lima/_config/user",
-            }
+            yo.SshHostBlock(
+                "127.0.0.1", "60022", ("/Users/user/.lima/_config/user",), None
+            )
         )
 
     def test_pins_the_yo_owned_known_hosts_file(self):
@@ -2270,7 +2301,7 @@ class TestHerdrAliasBlock(FakeHome):
 
 
 class TestKnownHostsLines(unittest.TestCase):
-    LIMA_VALUES = {"Hostname": "127.0.0.1", "Port": "60022", "IdentityFile": "x"}
+    LIMA_VALUES = yo.SshHostBlock("127.0.0.1", "60022", ("x",), None)
 
     def test_formats_host_port_type_and_key(self):
         pubkeys = "ssh-ed25519 AAAAC3abc== root@yolobox\n"
@@ -4270,7 +4301,7 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
             mock.patch.object(
                 yo.sshconfig,
                 "initrd_endpoint",
-                return_value=yo.sshconfig.InitrdEndpoint("127.0.0.1", port, "/k"),
+                return_value=yo.sshconfig.InitrdEndpoint("127.0.0.1", port, ("/k",)),
             ),
             mock.patch.object(yo.unlock, "sshd_answers", answers),
             mock.patch.object(yo.release, "host_user", return_value="op"),

@@ -1251,10 +1251,10 @@ class TestSshConfig(LibvirtCase):
 
     def test_the_block_is_the_shape_yos_parser_reads(self):
         values = self.box.parse_lima_ssh_block(self.config(), "lima-box")
-        self.assertEqual(values["Hostname"], "127.0.0.1")
-        self.assertEqual(values["Port"], "61234")
-        self.assertEqual(values["IdentityFile"], "/h/state/box/operator.pub")
-        self.assertEqual(values["IdentityAgent"], "/h/.1password/agent.sock")
+        self.assertEqual(values.hostname, "127.0.0.1")
+        self.assertEqual(values.port, "61234")
+        self.assertEqual(values.identity_files, ("/h/state/box/operator.pub",))
+        self.assertEqual(values.identity_agent, "/h/.1password/agent.sock")
 
     def test_it_uses_the_agent_alone_and_never_forwards_it(self):
         text = self.config()

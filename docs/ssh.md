@@ -26,6 +26,8 @@ Lima rewrites `ssh.config` on every `limactl start`. Its mtime tracks the last s
 
 If the file loses its blank line between the owned block and lima's `Host` block, the rewrite keeps everything after the marker line instead of dropping lima's block. A duplicated owned block is harmless because the first value wins. A lost `Host` block is not.
 
+`yo` reads the instance's `Host` block the way ssh does: the first `Hostname`, `Port` and `IdentityAgent` win, and every `IdentityFile` counts, in file order, because ssh tries each in turn. The herdr alias and the initrd probe's `ssh` command line (one `-i` each) both carry all of them. Keeping only the last `IdentityFile` would offer a key that ssh itself would have tried second.
+
 ### ForwardAgent no
 
 The owned block carries `ForwardAgent no`, and so does the `Host yolobox` alias herdr uses. The operator's own `~/.ssh/config` may well say `Host lima-yolobox` / `ForwardAgent yes` after the `Include` line, which is a reasonable thing to write for the operator's `yo ssh`. Because the owned block sits first and ssh keeps the first value per keyword, it neutralises that line for the agent role. A `yo code` or `yo zed` agent session never forwards the Mac's agent, whatever a later `Host` block says. Only a command-line `-o`, which outranks every file, can turn it on, and `yo ssh` is the one place that does (next sections).

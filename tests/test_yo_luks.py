@@ -540,6 +540,18 @@ class TestInitrdSshArgv(FakeHome):
         self.assertIn("Port=61234", argv)
         self.assertEqual(argv[argv.index("-i") + 1], "/k/user")
 
+    def test_offers_every_key_of_limas_block_in_order(self):
+        self.write_ssh_config(
+            'Host lima-yolobox\n  Hostname 127.0.0.2\n  Port 61234\n  IdentityFile "/k/user"\n'
+            '  IdentityFile "/k/second"\n  Port 1\n'
+        )
+        argv = yo.initrd_ssh_argv("true")
+        self.assertEqual(
+            [argv[i + 1] for i, arg in enumerate(argv) if arg == "-i"],
+            ["/k/user", "/k/second"],
+        )
+        self.assertIn("Port=61234", argv)
+
     def test_falls_back_to_limas_defaults_without_the_file(self):
         argv = yo.initrd_ssh_argv("true")
         self.assertEqual(argv[-2:], ["127.0.0.1", "true"])
