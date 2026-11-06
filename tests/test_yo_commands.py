@@ -2282,6 +2282,7 @@ class StatusRunner:
         broker=None,
         keepalive_pid=777,
         listing_failure=None,
+        limactl_list=None,
     ):
         outs = []
         # net_check is either the net-check subprocess result or the YoError
@@ -2328,16 +2329,24 @@ class StatusRunner:
                 stdout = "active\n"
             return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
+        def fake_proc_run(argv, **kwargs):
+            if limactl_list is not None and argv[:2] == ["limactl", "list"]:
+                return limactl_list
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        # limactl_list is what every `limactl list` prints: the driver's own
+        # config_gaps then runs on it instead of answering `gaps`.
+        config_gaps = (
+            contextlib.nullcontext()
+            if limactl_list is not None
+            else mock.patch.object(yo.LIMA, "config_gaps", return_value=list(gaps))
+        )
         with (
-            mock.patch.object(
-                yo.proc,
-                "run",
-                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
-            ),
+            mock.patch.object(yo.proc, "run", side_effect=fake_proc_run),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=fake_ssh_run),
             mock.patch.object(yo.lima, "du_kib", return_value=None),
             mock.patch.object(yo.guest, "vm_units_present", return_value=units_present),
-            mock.patch.object(yo.LIMA, "config_gaps", return_value=list(gaps)),
+            config_gaps,
             mock.patch.object(yo.LIMA, "host_gaps", return_value=list(host_gaps)),
             mock.patch.object(yo.shutil, "which", return_value=aws_which),
             mock.patch.object(
@@ -2396,6 +2405,16 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         )
         self.assertIn("lima: limactl list yolobox failed (exit 1)", outs)
         self.assertIn("lima: reverse forwards ok", outs)
+        self.assertEqual((self.raised.message, self.raised.code), (None, 1))
+
+    def test_a_limactl_that_cannot_list_is_a_warning_and_the_report_goes_on(self):
+        outs = self.run_status(
+            limactl_list=mock.Mock(returncode=1, stdout="", stderr="limactl: boom")
+        )
+        self.assertIn("lima: limactl list -q failed (exit 1): limactl: boom", outs)
+        self.assertNotIn("lima: reverse forwards ok", outs)
+        self.assertTrue(any(line.startswith("disk:") for line in outs))
+        self.assertTrue(any(line.startswith("aws:") for line in outs))
         self.assertEqual((self.raised.message, self.raised.code), (None, 1))
 
     def test_lima_config_gap_is_reported(self):

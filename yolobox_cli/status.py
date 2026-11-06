@@ -622,13 +622,18 @@ def cmd_status(args: argparse.Namespace) -> None:
             vm_reachable = False
             report.warn("vm: lost while probing — %s" % lost.message)
 
-    gaps = state.driver().config_gaps()
-    if gaps:
-        report.warn(
-            "%s: %s" % (state.driver().name, state.driver().config_gap_message(gaps))
-        )
+    try:
+        gaps = state.driver().config_gaps()
+    except YoError as unreadable:
+        report.warn("%s: %s" % (state.driver().name, unreadable.message))
     else:
-        ui.out("%s: reverse forwards ok" % state.driver().name)
+        if gaps:
+            report.warn(
+                "%s: %s"
+                % (state.driver().name, state.driver().config_gap_message(gaps))
+            )
+        else:
+            ui.out("%s: reverse forwards ok" % state.driver().name)
     for gap in state.driver().host_gaps():
         report.emit(host_gap_line(gap))
 
