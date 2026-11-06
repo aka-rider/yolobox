@@ -72,12 +72,16 @@ let
   missing = lib.subtractLists enabledNames allowedNames;
   shadowed = lib.attrNames (lib.intersectAttrs keptWrappers cfg.extraWrappers);
 
+  # A comma separated list of capability names, the one spelling both the
+  # extraWrappers option type and getcapSpelling match.
+  capList = "(cap_[a-z_]+(,cap_[a-z_]+)*)";
+
   # NixOS writes a wrapper's capabilities as one clause, "cap_a,cap_b+ep", and
   # its setcap adds cap_setpcap. This renders that as the sorted names getcap
   # prints. Any other clause form (several clauses, "all", numbers, "-") comes
   # out as "<unparsable ...>", which never equals an expected value.
   getcapSpelling = caps:
-    let m = builtins.match "(cap_[a-z_]+(,cap_[a-z_]+)*)[+=][eip]+" caps; in
+    let m = builtins.match "${capList}[+=][eip]+" caps; in
     if caps == "" then ""
     else if m == null then "<unparsable: ${caps}>"
     else sortedCaps (lib.splitString "," (builtins.head m) ++ [ "cap_setpcap" ]);
@@ -114,7 +118,7 @@ let
 in
 {
   options.yolobox.hardening.extraWrappers = lib.mkOption {
-    type = lib.types.attrsOf (lib.types.strMatching "(cap_[a-z_]+(,cap_[a-z_]+)*)?");
+    type = lib.types.attrsOf (lib.types.strMatching "${capList}?");
     default = { };
     example = { dumpcap = "cap_net_admin,cap_net_raw,cap_setpcap"; helper = ""; };
     description = ''

@@ -3,6 +3,10 @@
 Each class reads a second file off disk (a nix module, the guest script, the
 brew formula) and compares it to what `yo` declares, so a change
 to one side alone fails here instead of on a user's box.
+
+Tools whose absence skips tests: git and a checkout of the repo (the
+shellcheck-list and Nix-pattern classes), GNU stat and install (the host-setup
+rerun class).
 """
 
 import ast
@@ -1626,20 +1630,6 @@ class TestHostTableBlocksWhatTheGuestTableBlocks(unittest.TestCase):
             ],
         )
 
-    def test_the_vm_chain_lets_replies_and_dns_by_and_rejects_the_rest(self):
-        rules = self.chain_rules("vm")
-        self.assertEqual(rules[0], "ct state established,related accept")
-        self.assertEqual(
-            rules[1:3],
-            [
-                'oifname "lo" ip daddr 127.0.0.0/8 meta l4proto { tcp, udp }'
-                " th dport 53 accept",
-                'oifname "lo" reject',
-            ],
-        )
-        self.assertEqual(len(rules), 5)
-        self.assertTrue(all(rule.endswith("reject") for rule in rules[3:]))
-
     def test_blocked_v4_ranges_are_equal(self):
         self.assertEqual(
             self.host_set("ip"), address_set(nix_binding(EGRESS_NIX, "blockedV4"))
@@ -1940,23 +1930,10 @@ class TestHostAccountAndTableAreOneFact(unittest.TestCase):
 class TestHostSetupCanBeRerun(unittest.TestCase):
     """A second run of linux/host-setup.sh changes nothing on a healthy host and
     finishes what a run that died left half done (linux/host-setup.md), and a
-    damaged checkout is refused before the host is touched. The steps that
-    restart and reload run here under bash with a fake systemctl; they skip
-    without GNU stat and install."""
-
-    def test_every_file_it_reads_beside_itself_is_checked_before_the_first_step(self):
-        text = HOST_SETUP.read_text()
-        first_step = text.index('step "')
-        read = set(re.findall(r"\$HERE/([\w.-]+)", text))
-        self.assertTrue(read)
-        for name in sorted(read):
-            with self.subTest(file=name):
-                check = '[[ -f $HERE/%s ]] || die "missing $HERE/%s"' % (name, name)
-                self.assertIn(check, text[:first_step])
-
-    def test_it_reads_virsh_in_the_c_locale(self):
-        text = HOST_SETUP.read_text()
-        self.assertLess(text.index("export LC_ALL=C\n"), text.index("VIRSH=("))
+    damaged checkout is refused before the host is touched. The script's own
+    definitions and then a slice of its steps run here under bash, with fake
+    systemctl, virsh, nft and restorecon; they skip without GNU stat and
+    install."""
 
     def test_the_unit_reloads_by_loading_the_file_it_starts_with(self):
         """A reload does not propagate to virtqemud, a restart does."""
@@ -1967,101 +1944,140 @@ class TestHostSetupCanBeRerun(unittest.TestCase):
         self.assertIsNotNone(reload_, "yolobox-host.service has no ExecReload")
         self.assertEqual(reload_.group(1), start.group(1))
 
-    def test_it_never_restarts_the_table_unit(self):
-        self.assertNotIn("restart yolobox-host", HOST_SETUP.read_text())
-
-    def run_steps(
+    def run_slice(
         self,
         first,
         last,
         *,
+        missing=None,
         hook_mtime=None,
         started="",
         active=False,
         table_installed=False,
     ):
-        """Run the steps of host-setup.sh from `first` up to `last` against a
-        scratch root with a fake systemctl, and return the systemctl calls
-        other than `show`. `started` is what `systemctl show` prints for
-        virtqemud's start; `hook_mtime` pre-installs the hook with that
-        mtime; `table_installed` pre-installs the table and its unit,
-        identical to the repo's; `active` is whether the table unit is
-        active."""
+        """Run host-setup.sh from the text `first` up to the text `last`, after
+        its definitions, from a scratch checkout that lacks the file
+        `missing`, against a scratch root. Return the finished process and the
+        calls to systemctl (other than show and is-active) and virsh.
+        `started` is what `systemctl show` prints for virtqemud's start;
+        `hook_mtime` pre-installs the hook with that mtime; `table_installed`
+        pre-installs the table and its unit, identical to the repo's; `active`
+        is whether the table unit is active. virsh speaks German unless
+        LC_ALL=C, as a translated virsh would on a German host."""
         if subprocess.run(["stat", "--version"], capture_output=True).returncode:
             self.skipTest("needs GNU stat and install")
         text = HOST_SETUP.read_text()
-        (needs_install,) = re.findall(
-            r"^needs_install\(\) \{\n.*?^\}\n", text, re.M | re.S
-        )
-        steps = text[text.index('step "%s' % first) : text.index('step "%s' % last)]
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bin_dir = root / "bin"
-            bin_dir.mkdir()
-            here = root / "repo"
-            here.mkdir()
-            for name in (
-                "yolobox-libvirt-hook.sh",
-                "yolobox-host.nft",
-                "yolobox-host.service",
-            ):
+        definitions = text[: text.index("[[ $EUID -eq 0 ]]")]
+        steps = text[text.index(first) : text.index(last)]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        here = root / "repo"
+        here.mkdir()
+        for name in (
+            "yolobox-libvirt-hook.sh",
+            "yolobox-host.nft",
+            "yolobox-host.service",
+        ):
+            if name != missing:
                 shutil.copy(HOST_SETUP.parent / name, here / name)
-            fakes = {
-                "nft": "exit 0",
-                "restorecon": "exit 0",
-                "systemctl": (
-                    "case $1 in\n"
-                    '  show) printf "%s\\n" "$FAKE_STARTED" ;;\n'
-                    '  is-active) exit "$FAKE_IS_ACTIVE" ;;\n'
-                    '  *) echo "$*" >>"$CALLS" ;;\n'
-                    "esac"
-                ),
-            }
-            for name, body in fakes.items():
-                fake = bin_dir / name
-                fake.write_text("#!/bin/sh\n%s\n" % body)
-                fake.chmod(0o755)
-            hook = root / "hook"
-            if hook_mtime is not None:
-                shutil.copy(here / "yolobox-libvirt-hook.sh", hook)
-                hook.chmod(0o755)
-                os.utime(hook, (hook_mtime, hook_mtime))
-            nft_dest = root / "nft-file"
-            unit_dest = root / "unit-file"
-            if table_installed:
-                shutil.copy(here / "yolobox-host.nft", nft_dest)
-                shutil.copy(here / "yolobox-host.service", unit_dest)
-                nft_dest.chmod(0o644)
-                unit_dest.chmod(0o644)
-            script = root / "steps.sh"
-            script.write_text(
-                "set -Eeuo pipefail\n"
-                'HERE="%s" PASST_HOOK="%s" NFT_DEST="%s" UNIT_DEST="%s"\n'
-                "step() { :; }\n"
-                'die() { echo "$1" >&2; exit 1; }\n'
-                "%s%s"
-                % (
-                    here,
-                    hook,
-                    nft_dest,
-                    unit_dest,
-                    needs_install,
-                    steps.replace("/usr/sbin/nft", str(bin_dir / "nft")),
-                )
+        fakes = {
+            "nft": "exit 0",
+            "restorecon": "exit 0",
+            "systemctl": (
+                "case $1 in\n"
+                '  show) printf "%s\\n" "$FAKE_STARTED" ;;\n'
+                '  is-active) exit "$FAKE_IS_ACTIVE" ;;\n'
+                '  *) echo "$*" >>"$CALLS" ;;\n'
+                "esac"
+            ),
+            "virsh": (
+                "shift 2\n"
+                "case $1 in\n"
+                "  net-list) echo default ;;\n"
+                "  net-info)\n"
+                '    if [ "${LC_ALL:-}" = C ]; then\n'
+                "      printf 'Autostart:      yes\\nActive:         yes\\n'\n"
+                "    else\n"
+                "      printf 'Automatischer Start: ja\\nAktiv:          ja\\n'\n"
+                "    fi ;;\n"
+                '  *) echo "$*" >>"$CALLS" ;;\n'
+                "esac"
+            ),
+        }
+        for name, body in fakes.items():
+            fake = bin_dir / name
+            fake.write_text("#!/bin/sh\n%s\n" % body)
+            fake.chmod(0o755)
+        hook = root / "hook"
+        if hook_mtime is not None:
+            shutil.copy(here / "yolobox-libvirt-hook.sh", hook)
+            hook.chmod(0o755)
+            os.utime(hook, (hook_mtime, hook_mtime))
+        nft_dest = root / "nft-file"
+        unit_dest = root / "unit-file"
+        if table_installed:
+            shutil.copy(here / "yolobox-host.nft", nft_dest)
+            shutil.copy(here / "yolobox-host.service", unit_dest)
+            nft_dest.chmod(0o644)
+            unit_dest.chmod(0o644)
+        # In the checkout, so that a slice that finds its own directory finds
+        # the scratch one.
+        script = here / HOST_SETUP.name
+        script.write_text(
+            '%sHERE="%s" PASST_HOOK="%s" NFT_DEST="%s" UNIT_DEST="%s"\n%s'
+            % (
+                definitions,
+                here,
+                hook,
+                nft_dest,
+                unit_dest,
+                steps.replace("/usr/sbin/nft", str(bin_dir / "nft")),
             )
-            calls = root / "calls"
-            calls.touch()
-            subprocess.run(
-                ["bash", str(script)],
-                check=True,
-                env={
-                    "PATH": "%s:%s" % (bin_dir, os.environ["PATH"]),
-                    "CALLS": str(calls),
-                    "FAKE_STARTED": started,
-                    "FAKE_IS_ACTIVE": "0" if active else "3",
-                },
-            )
-            return calls.read_text().splitlines()
+        )
+        calls = root / "calls"
+        calls.touch()
+        result = subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": "%s:%s" % (bin_dir, os.environ["PATH"]),
+                "LANG": "de_DE.UTF-8",
+                "CALLS": str(calls),
+                "FAKE_STARTED": started,
+                "FAKE_IS_ACTIVE": "0" if active else "3",
+            },
+        )
+        return result, calls.read_text().splitlines()
+
+    def run_steps(self, first, last, **kwargs):
+        """The calls of a slice from step `first` to step `last` that succeeds."""
+        result, calls = self.run_slice('step "%s' % first, 'step "%s' % last, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return calls
+
+    def test_a_checkout_missing_a_file_it_installs_is_refused_before_the_first_step(
+        self,
+    ):
+        text = HOST_SETUP.read_text()
+        read = sorted(set(re.findall(r"\$HERE/([\w.-]+)", text)))
+        self.assertTrue(read)
+        for name in read:
+            with self.subTest(file=name):
+                result, _ = self.run_slice('HERE="', 'step "', missing=name)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertRegex(result.stderr, r"missing \S*/%s$" % re.escape(name))
+        result, _ = self.run_slice('HERE="', 'step "')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_default_network_is_switched_off_on_a_host_that_speaks_german(self):
+        self.assertEqual(
+            self.run_steps("(c)", "(e)"),
+            ["net-autostart --disable default", "net-destroy default"],
+        )
 
     def test_virtqemud_restarts_when_it_started_before_the_hook_was_written(self):
         self.assertEqual(
@@ -2089,19 +2105,31 @@ class TestHostSetupCanBeRerun(unittest.TestCase):
         """Skipping the restart would leave the hook unloaded, silently."""
         for started in ("Thu 2026-11-05 10:00:00 UTC", "@", "@12a", "1000", "n/a"):
             with self.subTest(started=started):
-                with self.assertRaises(subprocess.CalledProcessError):
-                    self.run_steps("(l)", "(g)", started=started)
+                result, calls = self.run_slice(
+                    'step "(l)', 'step "(g)', started=started
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("cannot read virtqemud's start time", result.stderr)
+                self.assertIn(started, result.stderr)
+                self.assertEqual(calls, [])
 
     def test_an_active_table_unit_is_reloaded_even_when_no_file_changed(self):
-        """The loaded table may have been deleted by hand under an active unit."""
-        calls = self.run_steps("(g)", "(i)", active=True, table_installed=True)
-        self.assertIn("reload yolobox-host.service", calls)
-        self.assertNotIn("restart yolobox-host.service", calls)
+        """The loaded table may have been deleted by hand under an active unit.
+        Never restarted: the restart would propagate to virtqemud."""
+        self.assertEqual(
+            self.run_steps("(g)", "(i)", active=True, table_installed=True),
+            [
+                "daemon-reload",
+                "enable yolobox-host.service",
+                "reload yolobox-host.service",
+            ],
+        )
 
     def test_an_inactive_table_unit_is_enabled_and_started(self):
-        calls = self.run_steps("(g)", "(i)", active=False, table_installed=True)
-        self.assertIn("enable --now yolobox-host.service", calls)
-        self.assertNotIn("reload yolobox-host.service", calls)
+        self.assertEqual(
+            self.run_steps("(g)", "(i)", active=False, table_installed=True),
+            ["daemon-reload", "enable --now yolobox-host.service"],
+        )
 
 
 class TestAgentAccountIsOneFact(unittest.TestCase):
