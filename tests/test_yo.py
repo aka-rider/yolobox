@@ -2903,7 +2903,10 @@ class TestAwsBrokerHealth(FakeHome):
     def test_a_healthy_broker_carries_what_it_reported(self):
         info = {"pid": 5, "watch_pid": 7, "allow": ["work"]}
         health = self.health_of(200, json.dumps(info).encode())
-        self.assertEqual(health, healthy(info))
+        self.assertEqual(
+            health,
+            yo.BrokerHealth(yo.BrokerState.HEALTHY, info, yo.aws.aws_broker_ctl_sock()),
+        )
 
     def test_anything_else_the_socket_says_is_unreachable(self):
         for status, body in (
@@ -2926,7 +2929,21 @@ class TestAwsBrokerHealth(FakeHome):
         # What an older yo's broker looks like: it has no control socket.
         info = {"pid": 5, "watch_pid": 7, "allow": ["work"]}
         health = self.health_on(yo.aws_broker_sock(), 200, json.dumps(info).encode())
-        self.assertEqual(health, yo.BrokerHealth(yo.BrokerState.NO_CONTROL, info))
+        self.assertEqual(
+            health,
+            yo.BrokerHealth(yo.BrokerState.NO_CONTROL, info, yo.aws_broker_sock()),
+        )
+
+    def test_a_broker_without_a_usable_pid_is_named_by_the_socket_that_answered(self):
+        for sock in (yo.aws.aws_broker_ctl_sock(), yo.aws_broker_sock()):
+            with self.subTest(sock=sock):
+                health = self.health_on(sock, 200, json.dumps({"pid": None}).encode())
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.kill_broker_in(health)
+                self.assertIn(
+                    "the aws-broker on %s answered /health" % sock,
+                    caught.exception.message,
+                )
 
     def test_the_control_socket_is_asked_first(self):
         # A control socket that answers decides, whatever the forwarded one says.
@@ -2940,7 +2957,8 @@ class TestAwsBrokerHealth(FakeHome):
         finally:
             guest.close()
             control.close()
-        self.assertEqual(health, healthy({"pid": 1}))
+        self.assertEqual(health.sock, yo.aws.aws_broker_ctl_sock())
+        self.assertEqual(health.info, {"pid": 1})
 
 
 class TestOpProbeAlive(unittest.TestCase):
@@ -2980,7 +2998,7 @@ BAD_PIDS = [0, 1, -1, True, False, "123", 12.0, None]
 
 
 def healthy(info):
-    return yo.BrokerHealth(yo.BrokerState.HEALTHY, info)
+    return yo.BrokerHealth(yo.BrokerState.HEALTHY, info, "/state/aws-broker.ctl.sock")
 
 
 class TestCheckedPid(unittest.TestCase):
@@ -3002,7 +3020,9 @@ class TestBrokerNeedsRestart(unittest.TestCase):
 
     def test_a_broker_without_a_control_socket_needs_restart(self):
         health = yo.BrokerHealth(
-            yo.BrokerState.NO_CONTROL, {"pid": 1, "watch_pid": 123, "allow": ["work"]}
+            yo.BrokerState.NO_CONTROL,
+            {"pid": 1, "watch_pid": 123, "allow": ["work"]},
+            "/state/aws-broker.sock",
         )
         self.assertTrue(yo.broker_needs_restart(health, 123, ["work"]))
 
@@ -3114,7 +3134,9 @@ class TestEnsureAwsBrokerSerializesYos(FakeHome):
 class TestEnsureAwsBrokerUpgradesAnOlderBroker(FakeHome):
     def test_a_broker_without_a_control_socket_is_killed_by_its_pid_and_replaced(self):
         older = yo.BrokerHealth(
-            yo.BrokerState.NO_CONTROL, {"pid": 111, "watch_pid": 555, "allow": ["work"]}
+            yo.BrokerState.NO_CONTROL,
+            {"pid": 111, "watch_pid": 555, "allow": ["work"]},
+            "/state/aws-broker.sock",
         )
         killed = []
         with (

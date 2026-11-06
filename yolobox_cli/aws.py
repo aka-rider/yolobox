@@ -184,9 +184,10 @@ class BrokerState(enum.Enum):
 class BrokerHealth(NamedTuple):
     state: BrokerState
     info: Dict[str, Any]  # the broker's /health JSON; empty when UNREACHABLE
+    sock: Optional[str]  # the socket that answered; None when UNREACHABLE
 
 
-BROKER_UNREACHABLE = BrokerHealth(BrokerState.UNREACHABLE, {})
+BROKER_UNREACHABLE = BrokerHealth(BrokerState.UNREACHABLE, {}, None)
 HTTP_OK = 200
 
 
@@ -214,12 +215,14 @@ def aws_broker_health(timeout: float = HEALTH_TIMEOUT_SECONDS) -> BrokerHealth:
     A broker from an older yo has none, but still answers on the forwarded
     socket; that is NO_CONTROL, not healthy, so it gets replaced.
     """
-    info = health_on(aws_broker_ctl_sock(), timeout)
+    control = aws_broker_ctl_sock()
+    info = health_on(control, timeout)
     if info is not None:
-        return BrokerHealth(BrokerState.HEALTHY, info)
-    info = health_on(aws_broker_sock(), timeout)
+        return BrokerHealth(BrokerState.HEALTHY, info, control)
+    forwarded = aws_broker_sock()
+    info = health_on(forwarded, timeout)
     if info is not None:
-        return BrokerHealth(BrokerState.NO_CONTROL, info)
+        return BrokerHealth(BrokerState.NO_CONTROL, info, forwarded)
     return BROKER_UNREACHABLE
 
 
@@ -361,8 +364,7 @@ def kill_broker_in(health: BrokerHealth) -> None:
     if stale_pid is None:
         raise YoError(
             "the aws-broker on %s answered /health without a usable pid (%r), so yo "
-            "cannot stop it — kill it by hand"
-            % (aws_broker_sock(), health.info.get("pid"))
+            "cannot stop it — kill it by hand" % (health.sock, health.info.get("pid"))
         )
     kill_stale_broker(stale_pid)
 

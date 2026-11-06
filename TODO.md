@@ -80,7 +80,6 @@ The reasoning is in lima/yolobox.md#an-empty-page-means-limas-forwarder-died. Th
 - `state.require_control_path_fits` checks only the agent's `ssh-agent.sock`, because it is the longest socket name in the instance directory today. A longer socket name added later must be checked too (`docs/ssh.md#a-controlpath-that-is-too-long`).
 - The rebuild command `yo` prints for pasting by hand (`rebuild_hint` in `yolobox_cli/release.py`) does not take `/run/yolobox-rebuild.lock`, so a pasted rebuild can run beside a `yo bootstrap`. Candidate fix: print `yolobox-guest rebuild`, which takes the lock, wherever the box has it. A box built before that subcommand exits 64 for it, so the old command stays the hint for such a box.
 - A broker started by a `yo` older than the control socket (`aws-broker.ctl.sock`) is replaced by pid when the new `yo` first meets it. If that old broker is being flooded from the guest at that moment, its `/health` reads as unreachable, the replacement fails once with `another aws-broker is already serving`, and the operator has to rerun the command or kill the old broker (`docs/aws.md`). Candidate fix: read `/health` on the forwarded socket again with a longer timeout before `aws_broker_health` reports `BROKER_UNREACHABLE`.
-- `kill_broker_in` in `yolobox_cli/aws.py` raises "answered /health without a usable pid" and names `aws_broker_sock()` even when the control socket answered. The message should name `aws_broker_ctl_sock()` when `health.state` is `HEALTHY` and `aws_broker_sock()` when it is `NO_CONTROL`.
 
 
 # Security backlog

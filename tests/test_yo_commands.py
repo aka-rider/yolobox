@@ -2384,6 +2384,7 @@ class StatusRunner:
                 or yo.BrokerHealth(
                     yo.BrokerState.HEALTHY,
                     {"pid": 5, "watch_pid": keepalive_pid, "allow": ["work"]},
+                    "/state/aws-broker.ctl.sock",
                 ),
             ),
             mock.patch.object(yo.LIMA, "running_keepalive_pid", keepalive),
@@ -2801,13 +2802,16 @@ class TestCmdStatusExitCode(StatusRunner, unittest.TestCase):
                 broker=yo.BrokerHealth(
                     yo.BrokerState.NO_CONTROL,
                     {"pid": 5, "watch_pid": 777, "allow": ["work"]},
+                    "/state/aws-broker.sock",
                 ),
             ),
             "aws broker stale": dict(
                 aws_which="/usr/bin/aws",
                 aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
                 broker=yo.BrokerHealth(
-                    yo.BrokerState.HEALTHY, {"pid": 5, "watch_pid": 1234, "allow": []}
+                    yo.BrokerState.HEALTHY,
+                    {"pid": 5, "watch_pid": 1234, "allow": []},
+                    "/state/aws-broker.ctl.sock",
                 ),
             ),
         }
