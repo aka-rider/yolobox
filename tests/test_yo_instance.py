@@ -253,6 +253,33 @@ class TestSshPort(unittest.TestCase):
                     caught.exception.message,
                 )
 
+    def test_a_port_another_boxs_listener_can_claim_is_refused_with_the_remedy(self):
+        # Lima mirrors guest TCP ports 1024-49151 onto the host's loopback, and
+        # the initrd unlock writes the passphrase to this port unauthenticated.
+        for port in (1, 1023, 1024, 22222, 49151):
+            with self.subTest(localPort=port):
+                with as_instance(INSTANCE_B), fake_limactl(limactl_json(port)):
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.box.driver.ssh_port()
+                self.assertIn("ssh.localPort %d" % port, caught.exception.message)
+                self.assertIn(
+                    "limactl stop second && limactl edit second --set "
+                    "'.ssh.localPort=<a free port in 49152-65535>'",
+                    caught.exception.message,
+                )
+
+    def test_the_lowest_and_highest_safe_ports_are_accepted(self):
+        for port in (49152, 65535):
+            with as_instance(INSTANCE_B), fake_limactl(limactl_json(port)):
+                self.assertEqual(yo.box.driver.ssh_port(), port)
+
+    def test_the_port_a_create_command_names_is_one_ssh_port_accepts(self):
+        with as_instance(INSTANCE_B):
+            command = yo.box.driver.create_command(yo.NO_SIZE)
+        self.assertIn(
+            "<a free port in %d-%d>" % (yo.MIN_SSH_LOCAL_PORT, 65535), command
+        )
+
     def test_an_instance_limactl_does_not_know_is_an_error_naming_the_remedy(self):
         with as_instance(INSTANCE_B), fake_limactl("", listed=[]):
             with self.assertRaisesRegex(
@@ -445,7 +472,8 @@ class TestVmUpNeverCreatesAnotherInstance(VmUpOnLima):
             with self.subTest(host=host):
                 error, _ = self.vm_up(INSTANCE_B, cpus=host)
                 self.assertIn(
-                    "--set '.ssh.localPort=<free port>' --cpus %s " % expected,
+                    "--set '.ssh.localPort=<a free port in 49152-65535>' --cpus %s "
+                    % expected,
                     error.message,
                 )
                 self.assertNotIn("without", error.message)
@@ -453,7 +481,7 @@ class TestVmUpNeverCreatesAnotherInstance(VmUpOnLima):
     def test_a_sized_named_instance_also_needs_its_own_port(self):
         error, stubs = self.vm_up(INSTANCE_B, yo.Size(None, 250, 3))
         self.assertIn(
-            "limactl create --name second --set '.ssh.localPort=<free port>' "
+            "limactl create --name second --set '.ssh.localPort=<a free port in 49152-65535>' "
             "--disk 250 --cpus 3 %s" % (yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
             error.message,
         )

@@ -14,6 +14,8 @@ Restating `portForwards` means stopping the VM and restating the whole array, be
 
 Any other instance (`yo -m <name>`, see [yo.md](../yo.md#several-machines)) must be created with its own fixed port, different from every other instance's, since each hostagent binds its port on the host: `limactl create --name <name> --set '.ssh.localPort=<port>' lima/yolobox.yaml`. `yo` reads it back from `limactl list <name> --json` (`state.driver().ssh_port()`) and refuses 0, a missing value and a malformed one. It never falls back to 60022, which belongs to the default instance. The yaml keeps 60022, so the default instance is unchanged.
 
+The port must be in 49152-65535, above every port lima mirrors (see [Which guest ports reach the host](#which-guest-ports-reach-the-host)), and `ssh_port()` refuses any lower one. The initrd unlock connects to this port without checking the host key and writes the disk passphrase to whatever answers. Inside the mirrored range, another running box's agent that listens on the same guest port is mirrored onto the host's `127.0.0.1:<port>` and could answer in the hostagent's place, and would receive the passphrase. `create_command()` names a port in the safe range. An instance made with a lower port is moved with `limactl stop NAME && limactl edit NAME --set '.ssh.localPort=<a port in 49152-65535>'`, which is the command the refusal prints.
+
 ## Checking a running instance
 
 Before it starts the VM, `vm_up()` runs `limactl list yolobox --json` and reads the running instance's own `config.portForwards`. It never searches the text of `lima/yolobox.yaml`. For each of `OP_GUEST_SOCK` and `AWS_BROKER_GUEST_SOCK`, it looks for an entry whose `guestSocket`, `hostSocket` and `reverse: true` all match.

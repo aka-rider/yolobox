@@ -41,6 +41,12 @@ GAP_TCP_FORWARDS = "portForwards.tcp"
 # host_port_window(), the ports above the kernel's ephemeral range.
 MIRRORED_TCP_PORTS = [1024, 49151]
 
+# The lowest port a non-default instance may use for ssh.localPort: above every
+# mirrored guest port. The initrd unlock sends the passphrase to that port
+# without checking the host key, so a port inside the mirror could be answered
+# by a listener of another running box.
+MIN_SSH_LOCAL_PORT = MIRRORED_TCP_PORTS[1] + 1
+
 # Fixed OAuth callback ports inside MIRRORED_TCP_PORTS that are never mirrored:
 # Codex CLI 1455-1457, Databricks 8020, gcloud 8085, Firebase 9005, kubelogin 18000.
 # (kubelogin's 8000 stays mirrored on purpose: it is also the Django and
@@ -344,7 +350,11 @@ class LimaDriver:
         port = (
             []
             if state.box.name == DEFAULT_INSTANCE
-            else ["--set", ".ssh.localPort=<free port>"]
+            else [
+                "--set",
+                ".ssh.localPort=<a free port in %d-%d>"
+                % (MIN_SSH_LOCAL_PORT, MAX_PORT),
+            ]
         )
         return shlex.join(
             [
@@ -384,6 +394,24 @@ class LimaDriver:
                 "new port on every start, and yo must know it before the first one. "
                 "Create the instance with:\n    %s"
                 % (state.box.name, port, self.create_command(NO_SIZE))
+            )
+        if port < MIN_SSH_LOCAL_PORT:
+            raise YoError(
+                "%s has ssh.localPort %d, which another box's listener can claim: lima "
+                "mirrors every guest TCP port up to %d onto the host's 127.0.0.1, and "
+                "the disk unlock sends the passphrase to this port without checking "
+                "the host key. Stop the instance and move it to a port in %d-%d:\n    %s"
+                % (
+                    state.box.name,
+                    port,
+                    MIRRORED_TCP_PORTS[1],
+                    MIN_SSH_LOCAL_PORT,
+                    MAX_PORT,
+                    lima_edit_command(
+                        ".ssh.localPort=<a free port in %d-%d>"
+                        % (MIN_SSH_LOCAL_PORT, MAX_PORT)
+                    ),
+                )
             )
         return port
 
