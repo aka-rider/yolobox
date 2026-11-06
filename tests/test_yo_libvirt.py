@@ -139,6 +139,8 @@ class FakeHost:
         self.dominfo = {}  # domain -> what `virsh dominfo` prints instead
         # Runs as `virsh dominfo NAME` starts, given NAME: another tool acting.
         self.before_dominfo = lambda name: None
+        # The same as `virsh dumpxml NAME` starts.
+        self.before_dumpxml = lambda name: None
         self.virsh_envs = []  # the environment of each `virsh` run
         # The guest's sshds, for the `ssh ... true` probes: argv -> (code, stderr).
         self.sshd = lambda argv: (0, "")
@@ -317,6 +319,12 @@ class FakeHost:
         if sub in ("setmaxmem", "setmem", "setvcpus"):
             return self.set_definition(sub, args)
         if sub == "dumpxml":
+            self.before_dumpxml(args[0])
+            if args[0] not in self.domains:
+                return completed(
+                    returncode=1,
+                    stderr="error: failed to get domain '%s'\n" % args[0],
+                )
             return completed(self.domains[args[0]])
         if sub == "domstate":
             return completed(self.states[args[0]] + "\n")
@@ -955,6 +963,25 @@ class TestPortAllocation(LibvirtCase):
             self.box.libvirt, "loopback_port_bound", return_value=False
         ):
             self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 2)
+
+    def test_a_domain_undefined_while_yo_reads_the_others_is_skipped(self):
+        self.host.tagged_domain("first", FIRST_PORT)
+        self.host.tagged_domain("second", FIRST_PORT + 1)
+        self.host.before_dumpxml = lambda name: self.host.domains.pop(
+            "yolobox-first", None
+        )
+        with mock.patch.object(
+            self.box.libvirt, "loopback_port_bound", return_value=False
+        ):
+            self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT)
+
+    def test_a_dumpxml_that_fails_for_a_domain_still_there_is_an_error(self):
+        self.host.tagged_domain("first", FIRST_PORT)
+        self.host.fail["dumpxml"] = "error: internal error: lizard"
+        with self.assertRaisesRegex(
+            self.box.YoError, r"virsh dumpxml yolobox-first failed \(exit 1\): .*lizard"
+        ):
+            self.driver.allocate_host_port()
 
     FOREIGN = (
         "<domain><name>foreign</name><devices><interface>"

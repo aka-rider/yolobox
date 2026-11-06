@@ -319,6 +319,18 @@ def active_domain_names() -> List[str]:
     return names_listed(libvirt_host.virsh("list", "--name").stdout)
 
 
+def require_undefined(
+    subcommand: str, name: str, failed: subprocess.CompletedProcess
+) -> None:
+    """Return when `failed`, a virsh `subcommand` on domain `name`, failed because the
+    domain was undefined since it was listed; raise its failure when the domain is still there."""
+    if name in domain_names():
+        raise YoError(
+            "virsh %s %s failed (exit %d): %s"
+            % (subcommand, name, failed.returncode, proc.failure_detail(failed))
+        )
+
+
 def active_domains_memory() -> Dict[str, int]:
     """The max memory, in bytes, of every active domain, from `virsh dominfo`.
 
@@ -329,12 +341,8 @@ def active_domains_memory() -> Dict[str, int]:
     for name in active_domain_names():
         info = libvirt_host.virsh("dominfo", name, check=False)
         if info.returncode != 0:
-            if name not in domain_names():
-                continue
-            raise YoError(
-                "virsh dominfo %s failed (exit %d): %s"
-                % (name, info.returncode, proc.failure_detail(info))
-            )
+            require_undefined("dominfo", name, info)
+            continue
         found = MAX_MEMORY_LINE_RE.search(info.stdout)
         if found is None:
             raise YoError(
@@ -425,12 +433,16 @@ def yolobox_domains() -> List[DomainInfo]:
     """Every domain on the system connection that carries yolobox's metadata.
 
     A foreign domain is only checked for the tag: its XML is never read strictly,
-    so one odd domain of another tool cannot stop yo.
+    so one odd domain of another tool cannot stop yo. A domain undefined between
+    the listing and its dumpxml is not counted; any other failure is an error.
     """
-    roots = [
-        libvirt_host.domain_root(libvirt_host.virsh("dumpxml", name).stdout)
-        for name in domain_names()
-    ]
+    roots = []
+    for name in domain_names():
+        dump = libvirt_host.virsh("dumpxml", name, check=False)
+        if dump.returncode != 0:
+            require_undefined("dumpxml", name, dump)
+            continue
+        roots.append(libvirt_host.domain_root(dump.stdout))
     return [
         libvirt_host.domain_info(root)
         for root in roots
