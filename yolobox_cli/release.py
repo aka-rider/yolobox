@@ -15,9 +15,10 @@ from .ui import YoError
 
 
 UPSTREAM_FLAKE = "github:aka-rider/yolobox"
-# Every pattern here is matched with fullmatch, so none carries ^ or $.
-RELEASE_VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)")
-PARTIAL_VERSION_RE = re.compile(r"v?\d+(\.\d+)?")
+# Every pattern here is matched with fullmatch, so none carries ^ or $. The
+# ones with \d are re.ASCII: str patterns otherwise take any Unicode digit.
+RELEASE_VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)", re.ASCII)
+PARTIAL_VERSION_RE = re.compile(r"v?\d+(\.\d+)?", re.ASCII)
 GIT_REF_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 GIT_REF_RE = re.compile(GIT_REF_PATTERN)
 # Exactly owner/repo/ref on github, nothing else: a path:, file: or git+file:
@@ -29,7 +30,7 @@ GITHUB_FLAKE_RE = re.compile(
 # GitHub owner and repo names are case-insensitive, so the upstream release
 # check must be too.
 UPSTREAM_RELEASE_RE = re.compile(
-    re.escape(UPSTREAM_FLAKE) + r"/v(\d+)\.(\d+)\.(\d+)", re.IGNORECASE
+    re.escape(UPSTREAM_FLAKE) + r"/v(\d+)\.(\d+)\.(\d+)", re.IGNORECASE | re.ASCII
 )
 
 # The first release whose flake never asks for the host OS. An older release's

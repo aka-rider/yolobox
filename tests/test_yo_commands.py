@@ -209,6 +209,16 @@ class TestFlakeRef(FakeHome):
                 with self.assertRaisesRegex(yo.YoError, reason):
                     yo.flake_ref(version)
 
+    def test_digits_of_other_scripts_are_not_a_release(self):
+        for version in ("١.٢.٣", "v١.٢.٣", "١", "1.٢"):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(yo.YoError, "--version must be"):
+                    yo.flake_ref(version)
+
+    def test_a_remembered_ref_in_other_digits_is_not_an_old_release(self):
+        self.assertIsNone(yo.old_release("github:aka-rider/yolobox/v١.٠.٠"))
+        self.assertEqual(yo.old_release("github:aka-rider/yolobox/v1.0.0"), "1.0.0")
+
     def test_a_ref_the_agent_could_control_is_refused(self):
         # The box runs `sudo nixos-rebuild --flake <ref>#yolobox`, and the agent
         # owns every path in the guest and can push to any checkout there.
