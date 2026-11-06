@@ -154,9 +154,14 @@ if needs_install "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK" 0755; then
   install -D -m0755 "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK"
 fi
 restorecon -F "$PASST_HOOK"
+# An empty start time means virtqemud has not been active since boot.
 qemud_started="$(systemctl show --timestamp=unix --property=ActiveEnterTimestamp --value virtqemud.service)"
-if [[ $qemud_started == @* ]] && ((${qemud_started#@} <= $(stat -c %Y "$PASST_HOOK"))); then
-  systemctl try-restart virtqemud.service
+if [[ $qemud_started =~ ^@([0-9]+)$ ]]; then
+  if ((BASH_REMATCH[1] <= $(stat -c %Y "$PASST_HOOK"))); then
+    systemctl try-restart virtqemud.service
+  fi
+elif [[ -n $qemud_started ]]; then
+  die "cannot read virtqemud's start time: 'systemctl show --timestamp=unix' printed '$qemud_started', not @<seconds> (systemd 247 or newer prints that). Restart virtqemud by hand (systemctl try-restart virtqemud.service) so it loads $PASST_HOOK"
 fi
 
 step "(g) host egress table"

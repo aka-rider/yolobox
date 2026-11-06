@@ -2085,6 +2085,13 @@ class TestHostSetupCanBeRerun(unittest.TestCase):
     def test_a_virtqemud_that_never_ran_is_left_alone(self):
         self.assertEqual(self.run_steps("(l)", "(g)", started=""), [])
 
+    def test_a_start_time_it_cannot_read_stops_the_run(self):
+        """Skipping the restart would leave the hook unloaded, silently."""
+        for started in ("Thu 2026-11-05 10:00:00 UTC", "@", "@12a", "1000", "n/a"):
+            with self.subTest(started=started):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.run_steps("(l)", "(g)", started=started)
+
     def test_an_active_table_unit_is_reloaded_even_when_no_file_changed(self):
         """The loaded table may have been deleted by hand under an active unit."""
         calls = self.run_steps("(g)", "(i)", active=True, table_installed=True)
