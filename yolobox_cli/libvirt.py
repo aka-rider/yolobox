@@ -456,6 +456,22 @@ def volume_names() -> List[str]:
     return [row.split()[0] for row in rows[separators[0] + 1 :] if row.strip()]
 
 
+def host_firmware() -> libvirt_host.HostFirmware:
+    """The emulator and the firmware loaders libvirt runs the template's
+    machine with, the one canonical answer a defined domain may carry."""
+    return libvirt_host.parse_domcapabilities(
+        libvirt_host.virsh(
+            "domcapabilities",
+            "--virttype",
+            "kvm",
+            "--arch",
+            "x86_64",
+            "--machine",
+            "q35",
+        ).stdout
+    )
+
+
 class LibvirtDriver:
     """Linux: one libvirt domain per machine, on the system connection."""
 
@@ -720,6 +736,7 @@ class LibvirtDriver:
             state.box.name,
             uid,
             gid,
+            host_firmware(),
         )
 
     def config_notes(self) -> List[str]:
