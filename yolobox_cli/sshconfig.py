@@ -127,6 +127,7 @@ def host_key_pin_block() -> str:
             '  UserKnownHostsFile "%s"' % state.known_hosts_path(),
             "  StrictHostKeyChecking accept-new",
             "  NoHostAuthenticationForLocalhost no",
+            "  ForwardAgent no",
         ]
     )
 

@@ -2359,9 +2359,10 @@ class TestEnsureAgentSshConfig(FakeHome):
         self.assertIn("  ForwardAgent no\n", alias)
 
     @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_agent_role_never_forwards_even_if_a_later_host_block_says_yes(self):
+    def test_no_user_forwards_even_if_a_later_host_block_says_yes(self):
         # A user's own "Host lima-yolobox / ForwardAgent yes" sits after the
-        # Include; ssh keeps the first value, so the owned block must win.
+        # Include; ssh keeps the first value, so the owned blocks must win, for
+        # the operator too: only `yo ssh` forwards, by its own command line.
         self.write_config(LIMA_BLOCK + "\nHost lima-yolobox\n  ForwardAgent yes\n")
         yo.ensure_agent_ssh_config()
 
@@ -2376,7 +2377,7 @@ class TestEnsureAgentSshConfig(FakeHome):
             return [line for line in proc.stdout.splitlines() if "forwardagent" in line]
 
         self.assertEqual(forwardagent("agent"), ["forwardagent no"])
-        self.assertEqual(forwardagent("user"), ["forwardagent yes"])
+        self.assertEqual(forwardagent("user"), ["forwardagent no"])
 
     @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
     def test_every_connection_gives_up_on_a_guest_that_stops_answering(self):
@@ -3816,15 +3817,16 @@ class TestLimaConfigGaps(FakeHome):
         self,
         forwards,
         host_agent_pid=123,
-        mounts=None,
+        mounts=MISSING,
         forward_agent=None,
         over_vsock=False,
         propagate_proxy_env=False,
         load_dot_ssh_pub_keys=False,
         user_uid=501,
+        vm_type="vz",
     ):
-        config = {"portForwards": forwards}
-        if mounts is not None:
+        config = {"portForwards": forwards, "vmType": vm_type}
+        if mounts is not MISSING:
             config["mounts"] = mounts
         config["ssh"] = {}
         if forward_agent is not None:
@@ -3868,6 +3870,77 @@ class TestLimaConfigGaps(FakeHome):
                 with fake_limactl(stdout):
                     with self.assertRaisesRegex(
                         yo.YoError, "did not print one JSON object"
+                    ):
+                        yo.LIMA.config_gaps()
+
+    def test_a_listing_without_a_config_object_is_an_error_not_a_box_without_gaps(
+        self,
+    ):
+        # A null or scalar config would read as every setting unset, which is
+        # every gap at once, or as none: both wrong for a listing yo cannot read.
+        for config, said in (
+            (None, "printed config as None, not a JSON object"),
+            ("lizard", "printed config as 'lizard', not a JSON object"),
+            ([], "printed config as [], not a JSON object"),
+            (MISSING, "printed no config for yolobox"),
+        ):
+            with self.subTest(config=config):
+                data = {"hostAgentPID": 5, "status": "Stopped"}
+                if config is not MISSING:
+                    data["config"] = config
+                with fake_limactl(json.dumps(data)):
+                    for read in (
+                        yo.LIMA.config_gaps,
+                        yo.LIMA.vm_status,
+                        yo.LIMA.keepalive_pid,
+                    ):
+                        with self.assertRaises(yo.YoError) as caught:
+                            read()
+                        self.assertIn(
+                            "limactl list yolobox --json", caught.exception.message
+                        )
+                        self.assertIn(said, caught.exception.message)
+
+    def test_an_ssh_or_user_that_is_not_an_object_is_an_error(self):
+        for config in (
+            {"ssh": None},
+            {"ssh": 1},
+            {"ssh": {}, "user": None},
+            {"ssh": {}, "user": "lizard"},
+        ):
+            with self.subTest(config=config):
+                with fake_limactl(json.dumps({"config": config})):
+                    with self.assertRaisesRegex(yo.YoError, "not a JSON object"):
+                        yo.LIMA.config_gaps()
+
+    def test_a_broken_instance_is_an_error_quoting_what_lima_said(self):
+        # Lima refuses to start or stop it; a listing that hid that would
+        # report gaps on a box nothing can edit.
+        data = {
+            "status": "Broken",
+            "errors": ["ha.pid is stale", {"not": "a string"}, ""],
+        }
+        with fake_limactl(json.dumps(data)):
+            for read in (yo.LIMA.config_gaps, yo.LIMA.keepalive_pid):
+                with self.assertRaises(yo.YoError) as caught:
+                    read()
+                message = caught.exception.message
+                self.assertIn("reports yolobox as Broken: ha.pid is stale", message)
+                self.assertIn("limactl list yolobox", message)
+                self.assertNotIn("delete", message.replace("Do not delete", ""))
+            # The status itself stays readable: the callers that decide by it
+            # (the wait for sshd, a resize) say where to look themselves.
+            self.assertEqual(yo.LIMA.vm_status(), "Broken")
+
+    def test_a_broken_instance_without_a_reason_is_still_an_error(self):
+        for errors in (MISSING, None, [], [{}], "lizard"):
+            with self.subTest(errors=errors):
+                data = {"status": "Broken", "config": {}}
+                if errors is not MISSING:
+                    data["errors"] = errors
+                with fake_limactl(json.dumps(data)):
+                    with self.assertRaisesRegex(
+                        yo.YoError, "as Broken and prints no reason"
                     ):
                         yo.LIMA.config_gaps()
 
@@ -3940,10 +4013,35 @@ class TestLimaConfigGaps(FakeHome):
                 with self.mock_lima_list(self.replacing_udp_rule(rule)):
                     self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_UDP_FORWARDS])
 
-    def test_an_ipv6_unspecified_udp_ignore_rule_covers_every_listener(self):
+    def test_a_udp_rule_spelled_unlike_the_restate_is_a_gap_even_when_it_covers_all(
+        self,
+    ):
+        # "::" ignores every listener as 0.0.0.0 does, but the check compares
+        # the instance with what the restate writes, and the restate is the
+        # remedy either way.
         rule = self.udp_ignore_rule(guestIP="::")
         with self.mock_lima_list(self.replacing_udp_rule(rule)):
-            self.assertEqual(yo.LIMA.config_gaps(), [])
+            self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_UDP_FORWARDS])
+
+    def test_a_udp_forward_before_the_catch_all_is_a_gap(self):
+        # Lima takes the first matching rule, so the catch-all after it
+        # ignores nothing on that port: 41641 is mirrored onto the Mac.
+        forward = {
+            "proto": "udp",
+            "guestIP": "127.0.0.1",
+            "guestIPMustBeZero": False,
+            "guestPortRange": [41641, 41641],
+            "hostIP": "0.0.0.0",
+            "hostPortRange": [41641, 41641],
+        }
+        forwards = [forward, *self.restated_forwards()]
+        self.assertEqual(self.gaps_for(forwards), [yo.GAP_UDP_FORWARDS])
+
+    def test_a_forward_of_any_protocol_before_the_catch_alls_is_both_gaps(self):
+        forwards = [{"guestPort": 4321}, *self.restated_forwards()]
+        self.assertEqual(
+            self.gaps_for(forwards), [yo.GAP_UDP_FORWARDS, yo.GAP_TCP_FORWARDS]
+        )
 
     def test_a_blanket_udp_rule_that_forwards_instead_of_ignoring_is_a_gap(self):
         forwarding = self.udp_ignore_rule(ignore=False)
@@ -3965,9 +4063,18 @@ class TestLimaConfigGaps(FakeHome):
         with self.mock_lima_list(self.restated_forwards(), mounts=mounts):
             self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_MOUNTS])
 
-    def test_an_empty_mount_list_is_no_gap(self):
-        with self.mock_lima_list(self.restated_forwards(), mounts=[]):
-            self.assertEqual(yo.LIMA.config_gaps(), [])
+    def test_an_empty_or_omitted_mount_list_is_no_gap(self):
+        # Lima leaves an empty list out of its JSON.
+        for mounts in ([], None):
+            with self.subTest(mounts=mounts):
+                with self.mock_lima_list(self.restated_forwards(), mounts=mounts):
+                    self.assertEqual(yo.LIMA.config_gaps(), [])
+
+    def test_mounts_that_are_not_a_list_are_a_gap_not_a_clean_bill(self):
+        for mounts in ("lizard", {"location": "/Users/x"}, 0, True, ""):
+            with self.subTest(mounts=mounts):
+                with self.mock_lima_list(self.restated_forwards(), mounts=mounts):
+                    self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_MOUNTS])
 
     def test_forward_agent_is_reported(self):
         with self.mock_lima_list(self.restated_forwards(), forward_agent=True):
@@ -4039,6 +4146,18 @@ class TestLimaConfigGaps(FakeHome):
         self.assertIn("yo ssh id -u", message)
         for destructive in ("destroy", "limactl delete", "bootstrap", "--set"):
             self.assertNotIn(destructive, message)
+
+    def test_a_vm_type_other_than_vz_is_a_note_naming_the_recreate_not_a_gap(self):
+        # The box works without the rosetta share; the remedy deletes it.
+        for value in ("qemu", None, 1):
+            with self.subTest(vm_type=value):
+                with self.mock_lima_list(self.restated_forwards(), vm_type=value):
+                    self.assertEqual(yo.LIMA.config_gaps(), [])
+                    (note,) = yo.LIMA.config_notes()
+                self.assertIn("vmType %r, not vz" % value, note)
+                self.assertIn("yo destroy --yes && yo bootstrap", note)
+        with self.mock_lima_list(self.restated_forwards(), vm_type="vz"):
+            self.assertEqual(yo.LIMA.config_notes(), [])
 
     def test_the_uid_gap_says_to_recreate_the_instance_not_to_edit_it(self):
         message = yo.LIMA.config_gap_message([yo.GAP_OPERATOR_UID])
@@ -4236,6 +4355,53 @@ class TestLimaConfigGaps(FakeHome):
             self.assertIsNone(yo.box.driver.keepalive_pid())
 
 
+class TestNoOperatorRoleForwardsTheMacsAgent(FakeHome):
+    """A lima instance created with ssh.forwardAgent true writes `ForwardAgent
+    yes` into its own Host block. The agent block covers the agent role and the
+    herdr alias; the pin block covers every other connection through the file,
+    the operator roles included, since ssh keeps the first value. Only `yo ssh`
+    forwards, by its own command line."""
+
+    def write_lima_config_forwarding(self):
+        os.makedirs(yo.instance_dir(), exist_ok=True)
+        with open(yo.ssh_cfg(), "w") as handle:
+            handle.write(
+                LIMA_ALIAS_BLOCK.replace(
+                    "  User user\n", "  ForwardAgent yes\n  User user\n"
+                )
+            )
+        with mock.patch.object(yo.ui, "err"):
+            yo.ensure_agent_ssh_config()
+
+    def effective_forward_agent(self, argv):
+        completed = subprocess.run(
+            list(argv) + ["-G", yo.box.vm_host],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        (line,) = [
+            line
+            for line in completed.stdout.splitlines()
+            if line.startswith("forwardagent ")
+        ]
+        return line.split(" ", 1)[1]
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_every_role_reads_no_over_limas_yes(self):
+        self.write_lima_config_forwarding()
+        for role in (yo.OPERATOR, yo.AGENT):
+            with self.subTest(role=role):
+                argv = ["ssh"] + yo.ssh_options(role)
+                self.assertEqual(self.effective_forward_agent(argv), "no")
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_yo_ssh_still_forwards_the_1password_socket_from_its_command_line(self):
+        self.write_lima_config_forwarding()
+        argv = ["ssh"] + yo.ssh_options(yo.OPERATOR) + yo.forward_agent_opts()
+        self.assertEqual(self.effective_forward_agent(argv), yo.LIMA.op_sock())
+
+
 class TestNormalizePortForward(unittest.TestCase):
     def test_a_bare_guest_port_gets_lima_defaults(self):
         self.assertEqual(
@@ -4339,32 +4505,45 @@ class TestLimaSettingGapMessage(unittest.TestCase):
             self.assertIn(needle, message)
 
 
-class TestVmUpRefusesOnlyTheLimaGapsThatLockTheOperatorOut(FakeHome):
+class TestVmUpRefusesOnlyTheLimaGapsThatBreakThePromises(FakeHome):
+    def refused_vm_up(self, gaps):
+        with (
+            mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
+            mock.patch.object(yo.LIMA, "vm_status") as status,
+            mock.patch.object(yo.agent, "luks_passphrase") as passphrase,
+            mock.patch.object(yo.forwards, "vm_services") as services,
+        ):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.vm_up()
+        status.assert_not_called()
+        passphrase.assert_not_called()
+        services.assert_not_called()
+        return caught.exception.message
+
     def test_ssh_over_vsock_refuses_before_the_vm_is_touched_naming_the_fix(self):
         for gaps in (
             [yo.GAP_SSH_OVER_VSOCK],
-            [yo.OP_GUEST_SOCK, yo.GAP_MOUNTS, yo.GAP_SSH_OVER_VSOCK],
+            [yo.OP_GUEST_SOCK, yo.GAP_FORWARD_AGENT, yo.GAP_SSH_OVER_VSOCK],
         ):
             with self.subTest(gaps=gaps):
-                with (
-                    mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
-                    mock.patch.object(yo.LIMA, "vm_status") as status,
-                    mock.patch.object(yo.agent, "luks_passphrase") as passphrase,
-                    mock.patch.object(yo.forwards, "vm_services") as services,
-                ):
-                    with self.assertRaises(yo.YoError) as caught:
-                        yo.vm_up()
-                self.assertIn(
-                    "--set '.ssh.overVsock = false'", caught.exception.message
-                )
-                status.assert_not_called()
-                passphrase.assert_not_called()
-                services.assert_not_called()
+                message = self.refused_vm_up(gaps)
+                self.assertIn("--set '.ssh.overVsock = false'", message)
+
+    def test_a_host_mount_refuses_before_the_vm_is_touched_naming_the_fix(self):
+        # The one promise the box makes is no host mounts: a box with one must
+        # not start, and the remedy edits the instance without deleting anything.
+        message = self.refused_vm_up([yo.OP_GUEST_SOCK, yo.GAP_MOUNTS])
+        self.assertIn("--set '.mounts = []'", message)
+        self.assertNotIn("destroy", message)
 
     def test_every_other_lima_gap_is_only_a_note(self):
-        others = [gap for gap in yo.LIMA_SETTING_GAPS if gap != yo.GAP_SSH_OVER_VSOCK]
+        others = [gap for gap in yo.LIMA_SETTING_GAPS if gap not in yo.LIMA_FATAL_GAPS]
         others += list(yo.LIMA_MANUAL_GAPS)
         self.assertEqual(yo.LIMA.fatal_gaps(others + [yo.OP_GUEST_SOCK, ""]), [])
+        self.assertEqual(
+            yo.LIMA.fatal_gaps(others + [yo.GAP_MOUNTS, yo.GAP_SSH_OVER_VSOCK]),
+            [yo.GAP_MOUNTS, yo.GAP_SSH_OVER_VSOCK],
+        )
 
 
 class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
@@ -4380,6 +4559,7 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
             load_dot_ssh_pub_keys=False,
             user_uid=yo.OPERATOR_GUEST_UID,
             ssh_local_port=yo.SSH_LOCAL_PORT,
+            vm_type="vz",
         )
         with (
             mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
@@ -4911,6 +5091,33 @@ class TestLimaStopHangOffersTheKillOnlyPastTheInitrd(unittest.TestCase):
         self.assertIn("If it fails in any way", message)
         self.assertIn("do not kill the hostagent", message)
         self.assertNotIn(yo.LIMA.force_stop_command(), message)
+
+
+class TestLimaStopThatExitsNonZeroOnARunningBox(unittest.TestCase):
+    """lima's stop has its own deadline and exits 1 past it, with the box still
+    running: the same hang, so the same way out."""
+
+    def failed_stop(self, stop, statuses):
+        failed = subprocess.CompletedProcess(["limactl", "stop"], 1, None, None)
+        with (
+            mock.patch.object(yo.LIMA, "vm_status", side_effect=statuses),
+            mock.patch.object(yo.subprocess, "run", return_value=failed),
+        ):
+            with self.assertRaises(yo.StopRefused) as caught:
+                stop()
+        return caught.exception
+
+    def test_a_polite_stop_carries_the_hang_recovery_and_its_exit(self):
+        refused = self.failed_stop(yo.LIMA.stop, ["Running", "Running"])
+        self.assertEqual(refused.reason, "limactl stop yolobox failed (exit 1)")
+        self.assertIn("If yo ssh true succeeds", refused.message)
+        self.assertIn("do not kill the hostagent", refused.message)
+
+    def test_a_forced_stop_carries_the_hostagent_kill_alone(self):
+        refused = self.failed_stop(yo.LIMA.force_stop, ["Running"])
+        self.assertEqual(refused.reason, "limactl stop --force yolobox failed (exit 1)")
+        self.assertIn("kill -9 any 'limactl hostagent'", refused.message)
+        self.assertNotIn("systemctl reboot", refused.message)
 
 
 class TestLimaInitrdTimeoutNamesItsBootLog(unittest.TestCase):

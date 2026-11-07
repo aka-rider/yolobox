@@ -6,6 +6,8 @@ import io
 import json
 import os
 import shutil
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -38,7 +40,7 @@ def as_instance(name):
 
 class TestALostInstance(unittest.TestCase):
     def test_a_deleted_named_instance_is_created_with_limactl_not_yo_up(self):
-        with as_instance(INSTANCE_B):
+        with as_instance(INSTANCE_B), host_cpus(16):
             hint = yo.LIMA.vm_lost_hint(None)
             self.assertIn("instance second no longer exists — create it with:", hint)
             self.assertIn("limactl create --name second", hint)
@@ -263,10 +265,30 @@ class TestSshPort(unittest.TestCase):
                         yo.box.driver.ssh_port()
                 self.assertIn("ssh.localPort %d" % port, caught.exception.message)
                 self.assertIn(
-                    "limactl stop second && limactl edit second --set "
-                    "'.ssh.localPort=<a free port in 49152-65535>'",
+                    "yo -m second down && limactl edit --tty=false second --set "
+                    "'.ssh.localPort=<a free port in 49152-65535>' && yo -m second up",
                     caught.exception.message,
                 )
+
+    def test_the_listener_check_refuses_a_port_past_the_last_one_with_the_remedy(
+        self,
+    ):
+        # ssh.config is lima's own file, so the port read from it gets the
+        # bounds ssh_port() gives the one read from limactl.
+        with as_instance(INSTANCE_B):
+            yo.LIMA.verify_initrd_listener(65535)
+            for port in (65536, 70000):
+                with self.subTest(port=port):
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.LIMA.verify_initrd_listener(port)
+                    self.assertIn(
+                        "second has ssh.localPort %d, which is past the last TCP "
+                        "port, 65535" % port,
+                        caught.exception.message,
+                    )
+                    self.assertIn(
+                        "yo -m second down && limactl edit", caught.exception.message
+                    )
 
     def test_the_lowest_and_highest_safe_ports_are_accepted(self):
         for port in (49152, 65535):
@@ -274,11 +296,30 @@ class TestSshPort(unittest.TestCase):
                 self.assertEqual(yo.box.driver.ssh_port(), port)
 
     def test_the_port_a_create_command_names_is_one_ssh_port_accepts(self):
-        with as_instance(INSTANCE_B):
+        with as_instance(INSTANCE_B), host_cpus(16):
             command = yo.box.driver.create_command(yo.NO_SIZE)
         self.assertIn(
             "<a free port in %d-%d>" % (yo.MIN_SSH_LOCAL_PORT, 65535), command
         )
+
+    def test_every_create_command_carries_the_cpus_the_box_would_get(self):
+        # Lima's own default CPU count is not yo's, whichever message prints it.
+        with as_instance(INSTANCE_B), host_cpus(16):
+            for size, flags in (
+                (yo.NO_SIZE, "--cpus 4"),
+                (yo.Size(None, 250, None), "--disk 250 --cpus 4"),
+                (yo.Size(24, None, 2), "--memory 24 --cpus 2"),
+            ):
+                with self.subTest(size=size):
+                    self.assertIn(
+                        "%s %s" % (flags, yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
+                        yo.box.driver.create_command(size),
+                    )
+            with fake_limactl("", listed=[]):
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.box.driver.ssh_port()
+            self.assertIn("--cpus 4 ", caught.exception.message)
+            self.assertIn("--cpus 4 ", yo.LIMA.vm_lost_hint(None))
 
     def test_an_instance_limactl_does_not_know_is_an_error_naming_the_remedy(self):
         with as_instance(INSTANCE_B), fake_limactl("", listed=[]):
@@ -354,6 +395,7 @@ class TestVmUpOnARunningBoxWithoutSshd(unittest.TestCase):
             load_dot_ssh_pub_keys=False,
             user_uid=yo.OPERATOR_GUEST_UID,
             ssh_local_port=60023,
+            vm_type="vz",
         )
         with (
             as_instance(INSTANCE_B),
@@ -382,6 +424,7 @@ def lima_info(status, port=60023):
         load_dot_ssh_pub_keys=False,
         user_uid=yo.OPERATOR_GUEST_UID,
         ssh_local_port=port,
+        vm_type="vz",
     )
 
 
@@ -811,7 +854,9 @@ class TestVmUpOnALimaConfigGap(unittest.TestCase):
             ):
                 stack.enter_context(mock.patch.object(module, name))
             stack.enter_context(
-                mock.patch.object(yo.LIMA, "config_gaps", return_value=[yo.GAP_MOUNTS])
+                mock.patch.object(
+                    yo.LIMA, "config_gaps", return_value=[yo.GAP_FORWARD_AGENT]
+                )
             )
             stack.enter_context(
                 mock.patch.object(yo.lima, "lima_instance_info", return_value=None)
@@ -823,7 +868,110 @@ class TestVmUpOnALimaConfigGap(unittest.TestCase):
             yo.vm_up()
         start.assert_called_once()
         self.assertEqual(len(notes), 1)
-        self.assertIn(yo.GAP_MOUNTS, notes[0])
+        self.assertIn(yo.GAP_FORWARD_AGENT, notes[0])
+
+
+FAKE_LIMACTL = """#!/bin/sh
+# A limactl whose stop fails on a stopped instance, as lima's does, and whose
+# edit refuses a running one. $STATE holds the status, $LOG what was applied.
+case "$1" in
+  stop)
+    [ "$(cat "$STATE")" = Running ] || { echo "instance is already stopped" >&2; exit 1; }
+    [ -z "$STOP_FAILS" ] || { echo "stop: timed out" >&2; exit 1; }
+    echo Stopped > "$STATE" ;;
+  edit)
+    [ "$2" = --tty=false ] || { echo "edit would open an editor" >&2; exit 1; }
+    [ "$(cat "$STATE")" = Running ] && { echo "cannot edit a running instance" >&2; exit 1; }
+    printf '%s\\n' "$5" >> "$LOG" ;;
+  *) echo "unexpected limactl $*" >&2; exit 1 ;;
+esac
+"""
+
+FAKE_YO = """#!/bin/sh
+# What yo down and yo up do to limactl, for the machine named or the default.
+[ "$1" = -m ] && shift 2
+case "$1" in
+  down) [ "$(cat "$STATE")" = Running ] && exec limactl stop "$NAME"; exit 0 ;;
+  up) echo up >> "$LOG" ;;
+  *) echo "unexpected yo $*" >&2; exit 1 ;;
+esac
+"""
+
+
+class TestTheEditRemedyRunsFromEitherState(unittest.TestCase):
+    """The printed `yo down && limactl edit ... && yo up` chain, run by a shell
+    against a limactl that fails to stop a stopped instance."""
+
+    def run_remedy(self, name, status, stop_fails=False):
+        bin_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, bin_dir)
+        for tool, text in (("limactl", FAKE_LIMACTL), ("yo", FAKE_YO)):
+            path = os.path.join(bin_dir, tool)
+            with open(path, "w") as handle:
+                handle.write(text)
+            os.chmod(path, 0o755)
+        state_file = os.path.join(bin_dir, "state")
+        log = os.path.join(bin_dir, "log")
+        with open(state_file, "w") as handle:
+            handle.write(status + "\n")
+        with as_instance(name):
+            remedy = yo.lima.lima_edit_command(".ssh.overVsock = false")
+        env = {
+            "PATH": bin_dir + os.pathsep + os.environ["PATH"],
+            "STATE": state_file,
+            "LOG": log,
+            "NAME": name,
+            "STOP_FAILS": "1" if stop_fails else "",
+        }
+        completed = subprocess.run(
+            ["sh", "-c", remedy], env=env, capture_output=True, text=True
+        )
+        applied = open(log).read().splitlines() if os.path.exists(log) else []
+        return completed, applied
+
+    def test_a_stopped_or_running_box_is_edited_and_started_again(self):
+        for name in (yo.DEFAULT_INSTANCE, INSTANCE_B):
+            for status in ("Stopped", "Running"):
+                with self.subTest(name=name, status=status):
+                    completed, applied = self.run_remedy(name, status)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(applied, [".ssh.overVsock = false", "up"])
+
+    def test_a_stop_that_fails_ends_the_chain_before_the_edit(self):
+        completed, applied = self.run_remedy(INSTANCE_B, "Running", stop_fails=True)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(applied, [])
+
+
+class TestTheUidRemedyRecreatesANamedInstanceInFull(FakeHome):
+    def test_destroy_then_limactl_create_then_bootstrap_with_the_remembered_ref(
+        self,
+    ):
+        # `yo -m NAME bootstrap` refuses to create a named instance, so the
+        # chain must create it between the destroy and the bootstrap.
+        for ref, version in ((None, ""), ("github:x/y/z", " --version github:x/y/z")):
+            with self.subTest(ref=ref):
+                with (
+                    as_instance(INSTANCE_B),
+                    host_cpus(16),
+                    mock.patch.object(
+                        yo.state, "remembered_flake_ref", return_value=ref
+                    ),
+                ):
+                    message = yo.LIMA.config_gap_message([yo.GAP_OPERATOR_UID])
+                self.assertIn(
+                    "yo -m second destroy --yes && limactl create --name second "
+                    "--set '.ssh.localPort=<a free port in 49152-65535>' --cpus 4 %s "
+                    "&& yo -m second bootstrap%s"
+                    % (yo.SCRIPT_DIR / "lima" / "yolobox.yaml", version),
+                    message,
+                )
+
+    def test_the_default_instance_is_recreated_by_bootstrap_alone(self):
+        with mock.patch.object(yo.state, "remembered_flake_ref", return_value=None):
+            self.assertEqual(
+                yo.LIMA.recreate_command(), "yo destroy --yes && yo bootstrap"
+            )
 
 
 class TestRemediesNameTheMachine(FakeHome):
