@@ -5,9 +5,10 @@ paths it names (/run/wrappers/bin, /run/current-system/sw/bin, the cidata
 binary, its /tmp scratch directories) pointed at a scratch directory. A fake
 `sudo` drops sudo's own options and runs the command, so "as the agent" runs
 as the test's own account; the fakes for getcap, stat, systemctl, journalctl,
-ssh, ssh-add, getent, id and strace answer what each test bakes in. Only the
-checks that judge a tool's answer are covered: the ones that need a kernel
-(sysctls, modules, io_uring) are the live box's.
+ssh, ssh-add, getent, id, strace, findmnt, ls, ps, loginctl and busctl answer
+what each test bakes in. Only the checks that judge a tool's answer are
+covered: the ones that need a kernel (sysctls, modules, io_uring) are the
+live box's.
 
 Tools whose absence skips tests: GNU find (`-printf`).
 """
@@ -116,14 +117,19 @@ class BoxCheck(unittest.TestCase):
             ["bash", "-c", program],
             capture_output=True,
             text=True,
-            env=dict(
-                os.environ,
-                PATH=os.pathsep.join([str(self.bin), os.environ.get("PATH", "")]),
-                HOME=str(self.home),
-                **(env or {}),
-            ),
+            env=self.environment(env or {}),
             timeout=60,
         )
+
+    def environment(self, overrides):
+        """The fake bin first on PATH, the scratch home; `overrides` win."""
+        env = dict(
+            os.environ,
+            PATH=os.pathsep.join([str(self.bin), os.environ.get("PATH", "")]),
+            HOME=str(self.home),
+        )
+        env.update(overrides)
+        return env
 
     def assert_ok(self, result, text):
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -296,6 +302,122 @@ class BoxCheck(unittest.TestCase):
         )
         self.assert_ok(
             result, "ok: agent is uid 1000 in the groups: dialout users video"
+        )
+
+    # -- /proc hidepid --------------------------------------------------
+
+    PROC_OPTIONS = "rw,nosuid,nodev,noexec,relatime,hidepid=invisible,gid=1"
+
+    def proc(self, options=PROC_OPTIONS, ls="enoent", ps_users=("agent",)):
+        self.fake("findmnt", '#!/bin/sh\nprintf "%s\\n"\n' % options)
+        self.fake(
+            "ls",
+            {
+                "enoent": '#!/bin/sh\nprintf "ls: cannot access %s: No such file or directory\\n" "$1" >&2\nexit 2\n',
+                "eacces": '#!/bin/sh\nprintf "ls: cannot open directory %s: Permission denied\\n" "$1" >&2\nexit 2\n',
+                "lists": '#!/bin/sh\nprintf "cmdline\\nenviron\\n"\n',
+            }[ls],
+        )
+        self.fake(
+            "ps",
+            "#!/bin/sh\n" + "".join('printf "%-8s\\n"\n' % u for u in ps_users),
+        )
+
+    def test_a_proc_the_agent_cannot_see_into_passes(self):
+        self.proc()
+        self.assert_ok(
+            self.run_check("check_hidepid"), "ok: the agent sees neither /proc/1 nor"
+        )
+
+    def test_a_missing_findmnt_fails(self):
+        # PATH holds the fake bin alone, so no findmnt of the host's steps in.
+        self.proc()
+        (self.bin / "findmnt").unlink()
+        self.assert_fail(
+            self.run_check("check_hidepid", env={"PATH": str(self.bin)}),
+            "findmnt -no OPTIONS /proc failed",
+        )
+
+    def test_an_empty_options_string_fails(self):
+        self.proc(options="")
+        self.assert_fail(
+            self.run_check("check_hidepid"), "findmnt printed no options for /proc"
+        )
+
+    def test_a_proc_without_hidepid_fails(self):
+        self.proc(options="rw,nosuid,nodev,noexec,relatime")
+        self.assert_fail(
+            self.run_check("check_hidepid"),
+            "/proc is mounted without hidepid=invisible",
+        )
+
+    def test_a_proc_with_another_gid_fails(self):
+        self.proc(options="rw,nosuid,nodev,noexec,relatime,hidepid=invisible,gid=100")
+        self.assert_fail(
+            self.run_check("check_hidepid"), "/proc is mounted without gid=1"
+        )
+
+    def test_an_agent_that_lists_pid_1_fails(self):
+        self.proc(ls="lists")
+        self.assert_fail(self.run_check("check_hidepid"), "the agent listed /proc/1")
+
+    def test_a_pid_that_is_visible_but_unreadable_fails(self):
+        self.proc(ls="eacces")
+        self.assert_fail(
+            self.run_check("check_hidepid"),
+            "ls /proc/1 as the agent failed, but not with ENOENT",
+        )
+
+    def test_a_ps_that_shows_another_account_fails(self):
+        self.proc(ps_users=("agent", "root"))
+        self.assert_fail(
+            self.run_check("check_hidepid"),
+            "ps as the agent lists the processes of 'agent root'",
+        )
+
+    def test_a_ps_that_shows_nothing_fails(self):
+        self.proc(ps_users=())
+        self.assert_fail(
+            self.run_check("check_hidepid"),
+            "ps as the agent lists the processes of ''",
+        )
+
+    # -- the agent's session services under hidepid ----------------------
+
+    def session_services(self, herdr="active", loginctl_rc=0, busctl_rc=0):
+        self.fake(
+            "systemctl",
+            '#!/bin/sh\nprintf "%s\\n"\n[ "%s" = active ]\n' % (herdr, herdr),
+        )
+        self.fake("loginctl", "#!/bin/sh\nexit %d\n" % loginctl_rc)
+        self.fake("busctl", "#!/bin/sh\nexit %d\n" % busctl_rc)
+
+    def test_services_that_answer_the_agent_pass(self):
+        self.session_services()
+        self.assert_ok(
+            self.run_check("check_agent_session_services"),
+            "ok: the agent's user manager, logind and the system bus answer the agent",
+        )
+
+    def test_a_herdr_server_that_is_not_active_fails(self):
+        self.session_services(herdr="failed")
+        self.assert_fail(
+            self.run_check("check_agent_session_services"),
+            "herdr-server is failed under the agent's user manager",
+        )
+
+    def test_a_logind_that_lost_the_agent_fails(self):
+        self.session_services(loginctl_rc=1)
+        self.assert_fail(
+            self.run_check("check_agent_session_services"),
+            "loginctl user-status agent failed as the agent",
+        )
+
+    def test_a_system_bus_that_refuses_the_agent_fails(self):
+        self.session_services(busctl_rc=1)
+        self.assert_fail(
+            self.run_check("check_agent_session_services"),
+            "busctl status failed as the agent",
         )
 
     # -- the 1Password proxy, sshd, tailscale, containers --------------
