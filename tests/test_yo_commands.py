@@ -1668,7 +1668,8 @@ class TestAtomicWriteIsDurable(FakeHome):
         with mock.patch.object(yo.os, "fsync", side_effect=synced.append):
             yo.proc.atomic_write(target, "text", 0o600)
         self.assertEqual(len(synced), 2)
-        self.assertEqual(open(target).read(), "text")
+        with open(target) as written:
+            self.assertEqual(written.read(), "text")
 
     def test_the_writes_own_error_is_raised_when_the_cleanup_fails_too(self):
         target = os.path.join(self.home, "file")

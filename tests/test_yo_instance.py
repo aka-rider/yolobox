@@ -926,8 +926,10 @@ class TestTheEditRemedyRunsFromEitherState(unittest.TestCase):
         completed = subprocess.run(
             ["sh", "-c", remedy], env=env, capture_output=True, text=True
         )
-        applied = open(log).read().splitlines() if os.path.exists(log) else []
-        return completed, applied
+        if not os.path.exists(log):
+            return completed, []
+        with open(log) as applied:
+            return completed, applied.read().splitlines()
 
     def test_a_stopped_or_running_box_is_edited_and_started_again(self):
         for name in (yo.DEFAULT_INSTANCE, INSTANCE_B):
