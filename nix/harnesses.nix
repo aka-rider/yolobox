@@ -145,7 +145,7 @@ let
 
       install_claude() {
         if [ -z "$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null || true)" ]; then
-          curl -fsSL https://claude.ai/install.sh | bash -s latest
+          curl -fsSL --proto '=https' --tlsv1.2 https://claude.ai/install.sh | bash -s latest
         fi
         # Unconditional: the guarantee upstream documents covers updates, not
         # the initial `claude install` the installer script runs.
@@ -158,7 +158,7 @@ let
       # to migrate; the npm package is removed here instead.
       install_pi() {
         [ -x "$HOME/.pi/agent/bin/pi" ] \
-          || curl -fsSL https://pi.dev/install.sh | bash
+          || curl -fsSL --proto '=https' --tlsv1.2 https://pi.dev/install.sh | bash
         [ ! -d "$HOME/.local/lib/node_modules/@earendil-works/pi-coding-agent" ] \
           || npm uninstall -g @earendil-works/pi-coding-agent
         link_bin pi "$HOME/.pi/agent/bin/pi"
