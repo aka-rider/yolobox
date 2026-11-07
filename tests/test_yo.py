@@ -2209,9 +2209,10 @@ class TestEnsureAgentSshConfig(FakeHome):
         self.assertIn("  ForwardAgent no\n", alias)
 
     @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_agent_role_never_forwards_even_if_a_later_host_block_says_yes(self):
+    def test_no_user_forwards_even_if_a_later_host_block_says_yes(self):
         # A user's own "Host lima-yolobox / ForwardAgent yes" sits after the
-        # Include; ssh keeps the first value, so the owned block must win.
+        # Include; ssh keeps the first value, so the owned blocks must win, for
+        # the operator too: only `yo ssh` forwards, by its own command line.
         self.write_config(LIMA_BLOCK + "\nHost lima-yolobox\n  ForwardAgent yes\n")
         yo.ensure_agent_ssh_config()
 
@@ -2226,7 +2227,7 @@ class TestEnsureAgentSshConfig(FakeHome):
             return [line for line in proc.stdout.splitlines() if "forwardagent" in line]
 
         self.assertEqual(forwardagent("agent"), ["forwardagent no"])
-        self.assertEqual(forwardagent("user"), ["forwardagent yes"])
+        self.assertEqual(forwardagent("user"), ["forwardagent no"])
 
     @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
     def test_every_connection_gives_up_on_a_guest_that_stops_answering(self):
@@ -4081,6 +4082,53 @@ class TestLimaConfigGaps(FakeHome):
             self.assertIsNone(yo.box.driver.keepalive_pid())
 
 
+class TestNoOperatorRoleForwardsTheMacsAgent(FakeHome):
+    """A lima instance created with ssh.forwardAgent true writes `ForwardAgent
+    yes` into its own Host block. The agent block covers the agent role and the
+    herdr alias; the pin block covers every other connection through the file,
+    the operator roles included, since ssh keeps the first value. Only `yo ssh`
+    forwards, by its own command line."""
+
+    def write_lima_config_forwarding(self):
+        os.makedirs(yo.instance_dir(), exist_ok=True)
+        with open(yo.ssh_cfg(), "w") as handle:
+            handle.write(
+                LIMA_ALIAS_BLOCK.replace(
+                    "  User user\n", "  ForwardAgent yes\n  User user\n"
+                )
+            )
+        with mock.patch.object(yo.ui, "err"):
+            yo.ensure_agent_ssh_config()
+
+    def effective_forward_agent(self, argv):
+        completed = subprocess.run(
+            list(argv) + ["-G", yo.box.vm_host],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        (line,) = [
+            line
+            for line in completed.stdout.splitlines()
+            if line.startswith("forwardagent ")
+        ]
+        return line.split(" ", 1)[1]
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_every_role_reads_no_over_limas_yes(self):
+        self.write_lima_config_forwarding()
+        for role in (yo.OPERATOR, yo.AGENT):
+            with self.subTest(role=role):
+                argv = ["ssh"] + yo.ssh_options(role)
+                self.assertEqual(self.effective_forward_agent(argv), "no")
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_yo_ssh_still_forwards_the_1password_socket_from_its_command_line(self):
+        self.write_lima_config_forwarding()
+        argv = ["ssh"] + yo.ssh_options(yo.OPERATOR) + yo.forward_agent_opts()
+        self.assertEqual(self.effective_forward_agent(argv), yo.LIMA.op_sock())
+
+
 class TestNormalizePortForward(unittest.TestCase):
     def test_a_bare_guest_port_gets_lima_defaults(self):
         self.assertEqual(
@@ -4184,32 +4232,45 @@ class TestLimaSettingGapMessage(unittest.TestCase):
             self.assertIn(needle, message)
 
 
-class TestVmUpRefusesOnlyTheLimaGapsThatLockTheOperatorOut(FakeHome):
+class TestVmUpRefusesOnlyTheLimaGapsThatBreakThePromises(FakeHome):
+    def refused_vm_up(self, gaps):
+        with (
+            mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
+            mock.patch.object(yo.LIMA, "vm_status") as status,
+            mock.patch.object(yo.agent, "luks_passphrase") as passphrase,
+            mock.patch.object(yo.forwards, "vm_services") as services,
+        ):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.vm_up()
+        status.assert_not_called()
+        passphrase.assert_not_called()
+        services.assert_not_called()
+        return caught.exception.message
+
     def test_ssh_over_vsock_refuses_before_the_vm_is_touched_naming_the_fix(self):
         for gaps in (
             [yo.GAP_SSH_OVER_VSOCK],
-            [yo.OP_GUEST_SOCK, yo.GAP_MOUNTS, yo.GAP_SSH_OVER_VSOCK],
+            [yo.OP_GUEST_SOCK, yo.GAP_FORWARD_AGENT, yo.GAP_SSH_OVER_VSOCK],
         ):
             with self.subTest(gaps=gaps):
-                with (
-                    mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
-                    mock.patch.object(yo.LIMA, "vm_status") as status,
-                    mock.patch.object(yo.agent, "luks_passphrase") as passphrase,
-                    mock.patch.object(yo.forwards, "vm_services") as services,
-                ):
-                    with self.assertRaises(yo.YoError) as caught:
-                        yo.vm_up()
-                self.assertIn(
-                    "--set '.ssh.overVsock = false'", caught.exception.message
-                )
-                status.assert_not_called()
-                passphrase.assert_not_called()
-                services.assert_not_called()
+                message = self.refused_vm_up(gaps)
+                self.assertIn("--set '.ssh.overVsock = false'", message)
+
+    def test_a_host_mount_refuses_before_the_vm_is_touched_naming_the_fix(self):
+        # The one promise the box makes is no host mounts: a box with one must
+        # not start, and the remedy edits the instance without deleting anything.
+        message = self.refused_vm_up([yo.OP_GUEST_SOCK, yo.GAP_MOUNTS])
+        self.assertIn("--set '.mounts = []'", message)
+        self.assertNotIn("destroy", message)
 
     def test_every_other_lima_gap_is_only_a_note(self):
-        others = [gap for gap in yo.LIMA_SETTING_GAPS if gap != yo.GAP_SSH_OVER_VSOCK]
+        others = [gap for gap in yo.LIMA_SETTING_GAPS if gap not in yo.LIMA_FATAL_GAPS]
         others += list(yo.LIMA_MANUAL_GAPS)
         self.assertEqual(yo.LIMA.fatal_gaps(others + [yo.OP_GUEST_SOCK, ""]), [])
+        self.assertEqual(
+            yo.LIMA.fatal_gaps(others + [yo.GAP_MOUNTS, yo.GAP_SSH_OVER_VSOCK]),
+            [yo.GAP_MOUNTS, yo.GAP_SSH_OVER_VSOCK],
+        )
 
 
 class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):

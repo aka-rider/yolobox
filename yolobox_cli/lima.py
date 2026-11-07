@@ -137,11 +137,14 @@ LIMA_MANUAL_GAPS = {
 }
 
 # The gaps vm_up refuses to start with. Every other gap is a note: the healing
-# step adds a missing forward live, and the rest leak but lock nobody out. Over
-# vsock, the initrd that unlocks the disk cannot answer, and the guest's sshd
-# admits the operator only from 192.168.5.2, which a vsock peer, having no IP
-# address, never is (nix/base.md).
-LIMA_FATAL_GAPS = frozenset([GAP_SSH_OVER_VSOCK])
+# step adds a missing forward live, and the rest leak but lock nobody out and
+# break no promise the box makes. Over vsock, the initrd that unlocks the disk
+# cannot answer, and the guest's sshd admits the operator only from
+# 192.168.5.2, which a vsock peer, having no IP address, never is
+# (nix/base.md). A mount hands the agent a host directory, which is the one
+# thing the box promises never to do; its remedy edits the instance and
+# deletes nothing, so refusing costs the operator no work.
+LIMA_FATAL_GAPS = frozenset([GAP_SSH_OVER_VSOCK, GAP_MOUNTS])
 
 # ssh.localPort in lima/yolobox.yaml: where lima's hostagent listens on the Mac
 # for the default instance. state.driver().ssh_port() answers for any instance.

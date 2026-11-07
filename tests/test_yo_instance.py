@@ -811,7 +811,9 @@ class TestVmUpOnALimaConfigGap(unittest.TestCase):
             ):
                 stack.enter_context(mock.patch.object(module, name))
             stack.enter_context(
-                mock.patch.object(yo.LIMA, "config_gaps", return_value=[yo.GAP_MOUNTS])
+                mock.patch.object(
+                    yo.LIMA, "config_gaps", return_value=[yo.GAP_FORWARD_AGENT]
+                )
             )
             stack.enter_context(
                 mock.patch.object(yo.lima, "lima_instance_info", return_value=None)
@@ -823,7 +825,7 @@ class TestVmUpOnALimaConfigGap(unittest.TestCase):
             yo.vm_up()
         start.assert_called_once()
         self.assertEqual(len(notes), 1)
-        self.assertIn(yo.GAP_MOUNTS, notes[0])
+        self.assertIn(yo.GAP_FORWARD_AGENT, notes[0])
 
 
 class TestRemediesNameTheMachine(FakeHome):
