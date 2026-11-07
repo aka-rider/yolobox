@@ -2182,3 +2182,28 @@ class TestGuestNicNameIsOneFact(unittest.TestCase):
 
     def test_the_nix_modules_name_the_interface_the_domain_slot_produces(self):
         self.assertEqual(nix_nic_names(), {libvirt_nic_name()})
+
+
+class TestSshdSettingsHoldTheirStories(unittest.TestCase):
+    """Three sshd lines in nix/base.nix each carry a story elsewhere: yo cp's
+    "no guest shell runs" needs the in-process sftp server, root never logs
+    in to stage 2, and the agent's Match block must not swallow later lines."""
+
+    def base_nix(self):
+        return nix_code(REPO / "nix" / "base.nix")
+
+    def test_the_sftp_server_is_the_in_process_one(self):
+        self.assertIn(
+            'services.openssh.sftpServerExecutable = "internal-sftp";', self.base_nix()
+        )
+
+    def test_root_login_is_off_in_stage_2(self):
+        self.assertIn('PermitRootLogin = "no";', self.base_nix())
+
+    def test_the_agent_match_block_is_closed(self):
+        (extra,) = re.findall(
+            r"services\.openssh\.extraConfig = ''\n(.*?)'';", self.base_nix(), re.S
+        )
+        lines = [line.strip() for line in extra.splitlines() if line.strip()]
+        self.assertEqual(lines[0], "Match User ${agentUser}")
+        self.assertEqual(lines[-1], "Match all")

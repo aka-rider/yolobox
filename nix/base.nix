@@ -252,8 +252,16 @@ in
   services.openssh.settings = {
     PasswordAuthentication = false;
     KbdInteractiveAuthentication = false;
-    PermitRootLogin = "prohibit-password";
+    # root is locked and AllowUsers below never lists it; this says so in
+    # the one place sshd reads first. The initrd's sshd, where root is the
+    # unlock login, renders its own config (nix/luks.nix).
+    PermitRootLogin = "no";
   };
+  # `yo cp` rides scp's sftp mode, and the story (yo.md, "yo cp") rests on no
+  # guest shell running for a transfer. An external sftp-server is spawned
+  # through the user's login shell (`$SHELL -c`), which sources the agent's
+  # ~/.zshenv first; the in-process server runs no shell at all.
+  services.openssh.sftpServerExecutable = "internal-sftp";
   # The operator logs in only from the gateway, which the agent cannot spoof
   # off enp0s1, so its 1Password agent is no way in (nix/base.md, "No host OS ...").
   services.openssh.settings.AllowUsers = [ "${username}@192.168.5.2" agentUser ];
@@ -286,11 +294,14 @@ in
       exec ${pkgs.coreutils}/bin/cat ${lib.escapeShellArg "/etc/ssh/authorized_keys.d/${username}"}
     '';
   };
+  # `Match all` closes the block: a Match block runs to the end of the file,
+  # so a later extraConfig line would otherwise apply to the agent only.
   services.openssh.extraConfig = ''
     Match User ${agentUser}
       AuthorizedKeysFile none
       AuthorizedKeysCommand /etc/ssh/agent-authorized-keys
       AuthorizedKeysCommandUser root
+    Match all
   '';
 
   systemd.tmpfiles.rules = [
