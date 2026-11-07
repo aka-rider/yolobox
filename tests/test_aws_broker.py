@@ -656,7 +656,7 @@ class TestWatchedPidExit(unittest.TestCase):
         ):
             with self.assertRaises(Exited):
                 gone = broker.BoundSocket("/no/such/socket", (0, 0))
-                broker.wait_for_pid_exit(7, [gone], wait_for_exit)
+                broker.wait_for_pid_exit(7, [gone], broker.EventLog(), wait_for_exit)
         exit_.assert_called_once_with(status)
         return "\n".join(str(call.args[0]) for call in log.call_args_list)
 
@@ -731,6 +731,39 @@ class TestSigterm(SocketDirCase):
         self.assertEqual(broker_proc.wait(30), 0, broker_proc.stderr.read())
         self.assertFalse(os.path.lexists(self.sock))
         self.assertFalse(os.path.lexists(self.ctl))
+
+    def test_sigterm_writes_the_count_of_the_window_still_open(self):
+        # A flood inside one window is counted, and the count line is written
+        # only when the window closes. A broker stopped before that would lose
+        # it, so the exit path closes the window first.
+        broker_proc = subprocess.Popen(
+            [sys.executable, BROKER_PATH, "--socket", self.sock]
+            + ["--control-socket", self.ctl, "--watch-pid", str(os.getpid())]
+            + ["--allow", "dev"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(broker_proc.stderr.close)
+        self.addCleanup(broker_proc.stdout.close)
+        self.addCleanup(broker_proc.kill)
+        self.assertEqual(broker_proc.stdout.readline(), "READY\n")
+        flood = 5
+        for _ in range(flood):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(5)
+                client.connect(self.sock)
+                client.sendall(b"GET /nope HTTP/1.0\r\n\r\n")
+                while client.recv(4096):
+                    pass  # the answer is logged before it is written
+        broker_proc.terminate()
+        status = broker_proc.wait(30)
+        logged = broker_proc.stderr.read()
+        self.assertEqual(status, 0, logged)
+        self.assertIn(f"also: {flood - 1} x answered 404", logged)
+        self.assertLess(
+            logged.index("answered 404"), logged.index("SIGTERM; shutting down")
+        )
 
 
 @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
