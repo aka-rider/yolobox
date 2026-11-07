@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -69,7 +70,7 @@ def process_json(**overrides):
 
 
 def aws_result(stdout="", stderr="", returncode=0):
-    """What `aws` printed, as the bytes subprocess.run hands back; text is UTF-8."""
+    """What `aws` printed, as the bytes run_aws hands back; text is UTF-8."""
     return subprocess.CompletedProcess(
         [],
         returncode,
@@ -128,6 +129,74 @@ class TestSanitize(unittest.TestCase):
             expected = "?" if code in controls else char
             with self.subTest(code=hex(code)):
                 self.assertEqual(broker.sanitize(char), expected)
+
+
+class TestEventLog(unittest.TestCase):
+    """What a kind of event costs in broker.log: one line per window, then a count."""
+
+    def setUp(self):
+        patch = mock.patch.object(broker, "log")
+        self.log = patch.start()
+        self.addCleanup(patch.stop)
+        self.clock = mock.patch.object(broker.time, "monotonic", return_value=1000.0)
+        self.now = self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.events = broker.EventLog(window=60)
+
+    def lines(self):
+        return [call.args[0] for call in self.log.call_args_list]
+
+    def test_the_first_event_of_a_kind_is_written_with_its_detail(self):
+        self.events.note("answered 404", "GET /nope HTTP/1.0")
+        self.events.note("deadline passed")
+        self.assertEqual(
+            self.lines(), ["answered 404: GET /nope HTTP/1.0", "deadline passed"]
+        )
+
+    def test_repeats_inside_the_window_cost_nothing_until_it_closes(self):
+        for n in range(1000):
+            self.events.note("answered 404", f"GET /nope{n} HTTP/1.0")
+            self.events.note("answered 403", f"GET /creds/x{n} HTTP/1.0")
+        self.assertEqual(len(self.lines()), 2)
+        self.events.close_window()
+        self.assertEqual(len(self.lines()), 3)
+        self.assertIn("999 x answered 404", self.lines()[-1])
+        self.assertIn("999 x answered 403", self.lines()[-1])
+
+    def test_closing_an_empty_or_unrepeated_window_writes_nothing(self):
+        self.events.close_window()
+        self.events.note("once")
+        self.events.close_window()
+        self.assertEqual(self.lines(), ["once"])
+
+    def test_the_window_closes_at_the_first_event_after_it_passed(self):
+        self.events.note("answered 404", "first")
+        self.events.note("answered 404", "second")
+        self.now.return_value = 1059.9
+        self.events.note("answered 404", "third")
+        self.assertEqual(self.lines(), ["answered 404: first"])
+        self.now.return_value = 1060.0
+        self.events.note("answered 404", "fourth")
+        self.assertEqual(
+            self.lines(),
+            [
+                "answered 404: first",
+                "in the last 60s, also: 2 x answered 404",
+                "answered 404: fourth",
+            ],
+        )
+
+    def test_a_zero_window_writes_every_event(self):
+        events = broker.EventLog(window=0)
+        for _ in range(3):
+            events.note("answered 404", "x")
+        self.assertEqual(self.lines(), ["answered 404: x"] * 3)
+
+    def test_detail_is_clipped_so_a_request_head_cannot_fill_a_line(self):
+        self.events.note("answered 404", "x" * (broker.LOGGED_DETAIL_MAX + 100))
+        (line,) = self.lines()
+        self.assertLess(len(line), broker.LOGGED_DETAIL_MAX + 50)
+        self.assertIn("(100 more)", line)
 
 
 class TestParseArgs(unittest.TestCase):
@@ -199,7 +268,7 @@ class TestParseExpiration(unittest.TestCase):
 
 class TestExportCredentials(unittest.TestCase):
     def run_export(self, result):
-        with mock.patch.object(broker.subprocess, "run", return_value=result):
+        with mock.patch.object(broker, "run_aws", return_value=result):
             return broker.export_credentials("dev")
 
     def test_good_output_returns_the_four_fields(self):
@@ -227,11 +296,8 @@ class TestExportCredentials(unittest.TestCase):
     def test_a_hung_cli_is_killed_after_the_mint_timeout_and_the_message_says_so(self):
         timed_out = subprocess.TimeoutExpired("aws", 7)
         with mock.patch.object(broker, "MINT_TIMEOUT_SECONDS", 7):
-            with mock.patch.object(
-                broker.subprocess, "run", side_effect=timed_out
-            ) as run:
+            with mock.patch.object(broker, "run_aws", side_effect=timed_out):
                 creds, err = broker.export_credentials("dev")
-        self.assertEqual(run.call_args.kwargs["timeout"], 7)
         self.assertIsNone(creds)
         self.assertIn("timed out after 7s", err)
 
@@ -296,16 +362,86 @@ class TestExportCredentials(unittest.TestCase):
                 self.assertTrue(err)
 
     def test_error_text_never_carries_secret_values(self):
-        _, err = self.run_export(aws_result(process_json(Expiration="soon")))
-        for secret in ["s3cr3t-value", "token-value", "AKIAEXAMPLE"]:
-            self.assertNotIn(secret, err)
+        for name, result in [
+            ("unusable expiration", aws_result(process_json(Expiration="soon"))),
+            (
+                "a failure that printed the credentials",
+                aws_result(process_json(), returncode=1),
+            ),
+            (
+                "a failure with stderr and the credentials",
+                aws_result(process_json(), stderr="warning: x", returncode=1),
+            ),
+        ]:
+            with self.subTest(name):
+                creds, err = self.run_export(result)
+                self.assertIsNone(creds)
+                for secret in ["s3cr3t-value", "token-value", "AKIAEXAMPLE"]:
+                    self.assertNotIn(secret, err)
+
+    def test_a_failure_without_stderr_says_how_much_stdout_there_was(self):
+        _, err = self.run_export(aws_result("12345", returncode=1))
+        self.assertIn("exit 1", err)
+        self.assertIn("5 bytes of stdout", err)
+        self.assertNotIn("12345", err)
+
+
+# A stand-in for `aws` that hangs, with a grandchild that holds the FIFO named
+# by $MINT_FIFO open: a reader of the FIFO sees EOF only once the grandchild
+# is dead.
+HUNG_AWS_WITH_GRANDCHILD = """#!/bin/sh
+sh -c 'exec 3>"$MINT_FIFO"; echo started >&3; exec sleep 600' &
+exec sleep 600
+"""
+
+
+class MintGrandchild(unittest.TestCase):
+    """A fake aws on PATH whose grandchild reports through a FIFO."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        fake = Path(self.tmp, "aws")
+        fake.write_text(HUNG_AWS_WITH_GRANDCHILD)
+        fake.chmod(0o755)
+        self.fifo = os.path.join(self.tmp, "fifo")
+        os.mkfifo(self.fifo)
+        self.env = {"PATH": self.tmp + ":" + os.environ["PATH"], "MINT_FIFO": self.fifo}
+
+    def grandchild_started(self):
+        """Block until the grandchild opened the FIFO; keep the read end."""
+        self.reader = os.open(self.fifo, os.O_RDONLY)
+        self.addCleanup(os.close, self.reader)
+        self.assertEqual(os.read(self.reader, 8), b"started\n")
+
+    def assert_grandchild_dead(self):
+        ready, _, _ = select.select([self.reader], [], [], 10)
+        self.assertEqual(ready, [self.reader], "the grandchild still holds the FIFO")
+        self.assertEqual(os.read(self.reader, 8), b"")
+
+
+class TestMintTimeoutEndsTheWholeProcessGroup(MintGrandchild):
+    def test_the_grandchild_of_a_timed_out_mint_is_dead_too(self):
+        # The grandchild reaches the FIFO milliseconds after `aws` starts; the
+        # timeout is the feature's own, long enough for it to get there.
+        started = threading.Thread(target=self.grandchild_started, daemon=True)
+        started.start()
+        with mock.patch.dict(os.environ, self.env):
+            with mock.patch.object(broker, "MINT_TIMEOUT_SECONDS", 2):
+                creds, err = broker.export_credentials("dev")
+        started.join(10)
+        self.assertFalse(started.is_alive(), "the grandchild never opened the FIFO")
+        self.assertIsNone(creds)
+        self.assertIn("timed out", err)
+        self.assert_grandchild_dead()
+        self.assertEqual(broker.running_mints, set())
 
 
 class TestMintOutputThatIsNotUtf8(unittest.TestCase):
     def test_a_failure_with_non_utf8_output_is_an_error_not_an_exception(self):
         with mock.patch.object(
-            broker.subprocess,
-            "run",
+            broker,
+            "run_aws",
             return_value=aws_result(returncode=255, stderr=b"bad \xff\xfe byte"),
         ):
             creds, err = broker.export_credentials("dev")
@@ -313,19 +449,17 @@ class TestMintOutputThatIsNotUtf8(unittest.TestCase):
         self.assertIn("bad \ufffd\ufffd byte", err)
 
     def test_a_success_with_non_utf8_output_is_an_error_not_an_exception(self):
-        with mock.patch.object(
-            broker.subprocess, "run", return_value=aws_result(b"\xff\xfe")
-        ):
+        with mock.patch.object(broker, "run_aws", return_value=aws_result(b"\xff\xfe")):
             creds, err = broker.export_credentials("dev")
         self.assertIsNone(creds)
         self.assertIn("unparseable", err)
 
     def test_the_remint_throttle_still_counts_a_mint_that_printed_non_utf8(self):
-        state = broker.State("dev", 3600.0)
+        state = broker.State("dev", 3600.0, broker.EventLog())
         with mock.patch.object(broker, "log"):
             with mock.patch.object(
-                broker.subprocess,
-                "run",
+                broker,
+                "run_aws",
                 return_value=aws_result(returncode=255, stderr=b"\xff"),
             ) as run:
                 self.assertIsNone(state.get())
@@ -376,7 +510,7 @@ class TestReclaimSocketPath(SocketDirCase):
 
     def test_refuses_a_symlink_to_a_live_socket(self):
         real = os.path.join(self.dir, "real.sock")
-        server, _ = broker.bind_guest_server(real, {}, 1)
+        server, _ = broker.bind_guest_server(real, {}, 1, broker.EventLog())
         self.addCleanup(server.server_close)
         os.symlink(real, self.sock)
         out = self.fails(broker.reclaim_socket_path, self.sock)
@@ -384,14 +518,14 @@ class TestReclaimSocketPath(SocketDirCase):
         self.assertTrue(os.path.islink(self.sock))
 
     def test_removes_a_stale_socket(self):
-        server, _ = broker.bind_guest_server(self.sock, {}, 1)
+        server, _ = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
         server.server_close()  # closed but the file remains: stale
         self.assertTrue(os.path.exists(self.sock))
         broker.reclaim_socket_path(self.sock)
         self.assertFalse(os.path.exists(self.sock))
 
     def test_refuses_a_live_socket(self):
-        server, _ = broker.bind_guest_server(self.sock, {}, 1)
+        server, _ = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
         self.addCleanup(server.server_close)
         self.fails(broker.reclaim_socket_path, self.sock)
         self.assertTrue(os.path.exists(self.sock))
@@ -399,13 +533,13 @@ class TestReclaimSocketPath(SocketDirCase):
 
 class TestUnlinkIfSameIdentity(SocketDirCase):
     def test_removes_the_file_with_that_identity(self):
-        server, identity = broker.bind_guest_server(self.sock, {}, 1)
+        server, identity = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
         server.server_close()
         broker.unlink_if_same_identity(self.sock, identity)
         self.assertFalse(os.path.lexists(self.sock))
 
     def test_leaves_a_newer_file_alone(self):
-        server, identity = broker.bind_guest_server(self.sock, {}, 1)
+        server, identity = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
         server.server_close()
         # Made while the old socket still exists, then renamed over it: Linux
         # hands a freed inode number straight to the next file, which would
@@ -420,7 +554,7 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
         self.assertIn("not the socket this broker bound", log.call_args.args[0])
 
     def test_a_path_that_cannot_be_inspected_is_logged_not_ignored(self):
-        server, identity = broker.bind_guest_server(self.sock, {}, 1)
+        server, identity = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
         server.server_close()
         with mock.patch.object(broker.os, "lstat", side_effect=PermissionError("no")):
             with mock.patch.object(broker, "log") as log:
@@ -430,7 +564,7 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
         self.assertTrue(os.path.lexists(self.sock))
 
     def test_a_failing_unlink_is_logged_not_ignored(self):
-        server, identity = broker.bind_guest_server(self.sock, {}, 1)
+        server, identity = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
         server.server_close()
         with mock.patch.object(broker.os, "unlink", side_effect=PermissionError("no")):
             with mock.patch.object(broker, "log") as log:
@@ -440,7 +574,7 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
 
     def test_does_not_follow_a_symlink_to_the_identity(self):
         real = os.path.join(self.dir, "real.sock")
-        server, identity = broker.bind_guest_server(real, {}, 1)
+        server, identity = broker.bind_guest_server(real, {}, 1, broker.EventLog())
         server.server_close()
         os.symlink(real, self.sock)
         with mock.patch.object(broker, "log") as log:
@@ -550,6 +684,22 @@ class TestMain(SocketDirCase):
         self.assertIn("ERROR=registration of a watch", out.getvalue())
         self.assertFalse(os.path.lexists(self.sock))
 
+    @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+    def test_a_watched_pid_that_is_not_running_is_a_handshake_error(self):
+        gone = subprocess.Popen([sys.executable, "-c", ""])
+        gone.wait()
+        argv = ["aws-broker", "--socket", self.sock, "--control-socket", self.ctl]
+        argv += ["--watch-pid", str(gone.pid), "--allow", "dev"]
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                broker.main()
+        self.assertEqual(
+            out.getvalue(), f"ERROR=watched pid {gone.pid} is not running\n"
+        )
+        self.assertFalse(os.path.lexists(self.sock))
+        self.assertFalse(os.path.lexists(self.ctl))
+
 
 @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
 class TestSigterm(SocketDirCase):
@@ -581,6 +731,36 @@ class TestSigterm(SocketDirCase):
         self.assertEqual(broker_proc.wait(30), 0, broker_proc.stderr.read())
         self.assertFalse(os.path.lexists(self.sock))
         self.assertFalse(os.path.lexists(self.ctl))
+
+
+@unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+class TestStoppedBrokerEndsItsMints(MintGrandchild, SocketDirCase):
+    def setUp(self):
+        MintGrandchild.setUp(self)
+        SocketDirCase.setUp(self)
+
+    def test_sigterm_ends_a_mint_in_flight_and_its_grandchild(self):
+        broker_proc = subprocess.Popen(
+            [sys.executable, BROKER_PATH, "--socket", self.sock]
+            + ["--control-socket", self.ctl, "--watch-pid", str(os.getpid())]
+            + ["--allow", "dev"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, **self.env},
+        )
+        self.addCleanup(broker_proc.stderr.close)
+        self.addCleanup(broker_proc.stdout.close)
+        self.addCleanup(broker_proc.kill)
+        self.assertEqual(broker_proc.stdout.readline(), "READY\n")
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.connect(self.sock)
+        client.sendall(b"GET /creds/dev HTTP/1.0\r\n\r\n")
+        self.grandchild_started()
+        broker_proc.terminate()
+        self.assertEqual(broker_proc.wait(30), 0, broker_proc.stderr.read())
+        self.assert_grandchild_dead()
 
 
 # The head of every script below: load the broker file as a module to wrap one
@@ -758,24 +938,13 @@ class TestSocketLock(SocketDirCase):
         self.assertTrue(done.stdout.startswith("ERROR=cannot open lock file"))
 
 
-class TestPidAlive(WaitingChild):
-    def test_a_running_process_is_alive(self):
-        self.assertTrue(broker.pid_alive(self.child.pid))
-
-    def test_a_process_owned_by_someone_else_is_alive(self):
-        self.assertTrue(broker.pid_alive(1))
-
-    def test_a_reaped_process_is_not_alive(self):
-        self.child.stdin.close()
-        self.child.wait()
-        self.assertFalse(broker.pid_alive(self.child.pid))
-
-
 class TestBindServer(SocketDirCase):
     def test_socket_is_mode_0600_and_umask_is_restored(self):
         before = os.umask(0o022)
         try:
-            server, identity = broker.bind_guest_server(self.sock, {}, 1)
+            server, identity = broker.bind_guest_server(
+                self.sock, {}, 1, broker.EventLog()
+            )
             self.addCleanup(server.server_close)
             self.assertEqual(os.umask(0o022), 0o022)
         finally:
@@ -787,7 +956,7 @@ class TestBindServer(SocketDirCase):
 
     def test_bind_failure_is_a_handshake_error(self):
         missing = os.path.join(self.dir, "no-such-dir", "s.sock")
-        out = self.fails(broker.bind_server, missing, {}, 1)
+        out = self.fails(broker.bind_server, missing, {}, 1, broker.EventLog())
         self.assertIn("cannot bind", out)
 
 
@@ -802,12 +971,19 @@ class ServedBroker(SocketDirCase):
         log_patch = mock.patch.object(broker, "log")
         self.log = log_patch.start()
         self.addCleanup(log_patch.stop)
-        self.states = {p: broker.State(p, self.min_remint_interval) for p in self.allow}
+        # A window no test outlives: what a test logs is the first line of each
+        # kind, and the count line when it calls close_window itself.
+        self.events = broker.EventLog(window=3600)
+        self.states = {
+            p: broker.State(p, self.min_remint_interval, self.events)
+            for p in self.allow
+        }
         self.serve(
             broker.bind_guest_server(
                 self.sock,
                 self.states,
                 4242,
+                self.events,
                 max_concurrent=self.max_concurrent,
                 max_connections=self.max_connections,
             )[0]
@@ -859,11 +1035,9 @@ class ServedBroker(SocketDirCase):
         """Mock the aws CLI: one result forever, or each result in turn. Returns
         the mock, whose calls are the mints."""
         if len(results) == 1:
-            patch = mock.patch.object(broker.subprocess, "run", return_value=results[0])
+            patch = mock.patch.object(broker, "run_aws", return_value=results[0])
         else:
-            patch = mock.patch.object(
-                broker.subprocess, "run", side_effect=list(results)
-            )
+            patch = mock.patch.object(broker, "run_aws", side_effect=list(results))
         run = patch.start()
         self.addCleanup(patch.stop)
         return run
@@ -875,14 +1049,27 @@ class ServedBroker(SocketDirCase):
 
 
 class TestServedRequests(ServedBroker):
-    def test_health_reports_pid_watch_pid_and_sorted_allow(self):
+    def test_the_guests_health_says_the_broker_is_up_and_names_no_host_pid(self):
         status, body = self.get("/health")
         self.assertEqual(status, 200)
-        data = json.loads(body)
-        self.assertEqual(sorted(data), ["allow", "pid", "watch_pid"])
-        self.assertEqual(data["allow"], ["dev", "prod"])
-        self.assertEqual(data["watch_pid"], 4242)
-        self.assertEqual(data["pid"], os.getpid())
+        self.assertEqual(json.loads(body), {"ok": True})
+        self.assertNotIn(str(os.getpid()), body)
+        self.assertNotIn("4242", body)
+
+    def test_the_server_header_names_no_python_version(self):
+        raw = self.exchange(b"GET /health HTTP/1.0\r\n\r\n")
+        self.assertIn(b"\r\nServer: aws-broker\r\n", raw)
+        self.assertNotIn(b"Python", raw)
+
+    def test_a_bad_request_or_method_gets_the_generic_text_not_the_stdlib_page(self):
+        for request in [b"BREW / HTTP/1.0\r\n\r\n", b"not http at all\r\n\r\n"]:
+            with self.subTest(request=request):
+                raw = self.exchange(request)
+                head, _, body = raw.partition(b"\r\n\r\n")
+                self.assertIn(int(head.split()[1]), (400, 501))
+                self.assertIn(b"Content-Type: text/plain\r\n", head)
+                self.assertEqual(body, broker.REQUEST_FAILED_BODY.encode())
+                self.assertNotIn(b"Python", raw)
 
     def test_json_and_text_replies_say_what_they_are(self):
         for path, content_type in [
@@ -993,6 +1180,65 @@ class TestServedRequests(ServedBroker):
             self.assertNotIn(secret, self.logged())
 
 
+class TestLogCostOfAGuest(ServedBroker):
+    """Whatever the guest sends, broker.log grows by a bounded, secret-free amount."""
+
+    flood = 50
+
+    def close_early(self, release):
+        """A /creds/ request whose client hangs up before the answer is written."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.connect(self.sock)
+            c.sendall(b"GET /creds/dev HTTP/1.0\r\n\r\n")
+            self.assertTrue(release.wait(10))
+        # The handler writes only once the client has closed, so the write fails.
+
+    def test_a_client_that_hangs_up_early_costs_one_line_and_no_traceback(self):
+        in_mint = threading.Event()
+        closed = threading.Event()
+
+        def mint_once_the_client_is_gone(*args, **kwargs):
+            in_mint.set()
+            self.assertTrue(closed.wait(10))
+            return aws_result(process_json())
+
+        run = self.aws(aws_result(process_json()))
+        run.side_effect = mint_once_the_client_is_gone
+        self.close_early(in_mint)
+        closed.set()
+        # The mint ends the request; the next request runs after it.
+        self.assertEqual(self.get("/health")[0], 200)
+        self.assertNotIn("Traceback", self.logged())
+        self.assertEqual(self.logged().count("client connection failed"), 1)
+
+    def test_a_flood_of_refused_requests_costs_one_line_per_kind_then_a_count(self):
+        for _ in range(self.flood):
+            self.assertEqual(self.get("/nope")[0], 404)
+            self.assertEqual(self.get("/creds/other")[0], 403)
+            self.assertEqual(
+                self.exchange(b"BREW / HTTP/1.0\r\n\r\n")[:12], b"HTTP/1.0 501"
+            )
+        self.assertEqual(self.log.call_count, 3)
+        self.events.close_window()
+        self.assertEqual(self.log.call_count, 4)
+        for kind in ["answered 404", "answered 403", "answered 501"]:
+            self.assertIn(f"{self.flood - 1} x {kind}", self.logged())
+
+    def test_a_flood_of_requests_that_crash_the_handler_costs_one_traceback(self):
+        with mock.patch.object(
+            broker.GuestHandler, "_creds_route", side_effect=ValueError("x")
+        ):
+            for _ in range(self.flood):
+                self.assertEqual(self.get("/creds/dev")[0], 500)
+        self.assertEqual(self.logged().count("Traceback"), 1)
+
+    def test_a_flood_of_requests_for_a_profile_that_cannot_mint_costs_one_detail(self):
+        self.aws(aws_result(returncode=255, stderr="SSO session expired"))
+        for _ in range(self.flood):
+            self.assertEqual(self.get("/creds/dev")[0], 500)
+        self.assertEqual(self.logged().count("SSO session expired"), 1)
+
+
 def minted(token, seconds):
     return aws_result(process_json(SessionToken=token, Expiration=expires_in(seconds)))
 
@@ -1046,6 +1292,81 @@ class TestCredentialCache(ServedBroker):
         self.assertEqual(self.served_token("dev"), "for-dev")
         profiles = [call.args[0][4] for call in run.call_args_list]
         self.assertEqual(profiles, ["dev", "prod"])
+
+
+class TestRefreshInsideTheWindow(ServedBroker):
+    """A cache inside the re-mint window is still valid: one request refreshes
+    it, and the others are served the cache instead of waiting for the lock."""
+
+    def hung_refresh(self):
+        """The second mint blocks until `release`; `in_mint` says it started."""
+        in_mint = threading.Event()
+        release = threading.Event()
+        first = [minted("first", 300)]
+
+        def mint(*args, **kwargs):
+            if first:
+                return first.pop()
+            in_mint.set()
+            self.assertTrue(release.wait(10))
+            return minted("second", 3600)
+
+        self.aws(minted("unused", 3600)).side_effect = mint
+        self.addCleanup(release.set)
+        return in_mint, release
+
+    def test_the_cache_is_served_while_another_request_refreshes_it(self):
+        in_mint, release = self.hung_refresh()
+        self.assertEqual(self.served_token(), "first")
+        refresher = threading.Thread(target=self.served_token)
+        refresher.start()
+        self.addCleanup(refresher.join)
+        self.assertTrue(in_mint.wait(10))
+        with mock.patch.object(broker, "PROFILE_LOCK_TIMEOUT_SECONDS", 0.2):
+            self.assertEqual(self.served_token(), "first")
+        release.set()
+        refresher.join(10)
+        self.assertEqual(self.served_token(), "second")
+
+    def test_a_refresh_in_progress_is_not_started_twice(self):
+        in_mint, release = self.hung_refresh()
+        self.assertEqual(self.served_token(), "first")
+        refresher = threading.Thread(target=self.served_token)
+        refresher.start()
+        self.addCleanup(refresher.join)
+        self.assertTrue(in_mint.wait(10))
+        for _ in range(3):
+            self.assertEqual(self.served_token(), "first")
+        release.set()
+        refresher.join(10)
+        self.assertEqual(self.served_token(), "second")
+        self.assertEqual(self.states["dev"].events, self.events)
+
+    def test_a_request_with_nothing_cached_still_waits_for_the_mint(self):
+        in_mint = threading.Event()
+        release = threading.Event()
+
+        def first_mint(*args, **kwargs):
+            in_mint.set()
+            self.assertTrue(release.wait(10))
+            return minted("shared", 3600)
+
+        run = self.aws(minted("unused", 3600))
+        run.side_effect = first_mint
+        self.addCleanup(release.set)
+        waiters = []
+        threads = [
+            threading.Thread(target=lambda: waiters.append(self.served_token()))
+            for _ in range(3)
+        ]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(in_mint.wait(10))
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(waiters, ["shared"] * 3)
+        self.assertEqual(run.call_count, 1)
 
 
 class TestRemintThrottle(ServedBroker):
@@ -1198,7 +1519,7 @@ class TestSingleSlot(ServedBroker):
         self.assertTrue(in_mint.wait(10))
         status, body = self.get("/health")
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["allow"], ["dev", "prod"])
+        self.assertEqual(json.loads(body), {"ok": True})
         self.assertEqual(self.get("/creds/prod")[0], 503)
 
 
@@ -1296,7 +1617,9 @@ class TestControlSocket(ServedBroker):
 
     def setUp(self):
         super().setUp()
-        self.serve(broker.bind_control_server(self.ctl, self.states, 4242)[0])
+        self.serve(
+            broker.bind_control_server(self.ctl, self.states, 4242, self.events)[0]
+        )
 
     def test_health_is_answered_while_the_guest_socket_refuses_every_connection(self):
         self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
@@ -1312,7 +1635,7 @@ class TestControlSocket(ServedBroker):
 
 class TestBindServers(SocketDirCase):
     def test_both_sockets_are_bound_and_both_identities_recorded(self):
-        bound = broker.bind_servers(self.sock, self.ctl, {}, 1)
+        bound = broker.bind_servers(self.sock, self.ctl, {}, 1, broker.EventLog())
         self.addCleanup(bound.guest.server_close)
         self.addCleanup(bound.control.server_close)
         self.assertEqual([b.path for b in bound.sockets], [self.sock, self.ctl])
@@ -1323,12 +1646,14 @@ class TestBindServers(SocketDirCase):
 
     def test_a_control_socket_that_cannot_be_bound_leaves_no_guest_socket(self):
         missing = os.path.join(self.dir, "no-such-dir", "c.sock")
-        out = self.fails(broker.bind_servers, self.sock, missing, {}, 1)
+        out = self.fails(
+            broker.bind_servers, self.sock, missing, {}, 1, broker.EventLog()
+        )
         self.assertIn("cannot bind", out)
         self.assertFalse(os.path.lexists(self.sock))
 
     def test_unlinking_the_bound_sockets_removes_both(self):
-        bound = broker.bind_servers(self.sock, self.ctl, {}, 1)
+        bound = broker.bind_servers(self.sock, self.ctl, {}, 1, broker.EventLog())
         bound.guest.server_close()
         bound.control.server_close()
         broker.unlink_bound(bound.sockets)
@@ -1346,7 +1671,7 @@ class TestControlSocketReclaim(SocketDirCase):
     def test_a_live_control_socket_stops_a_second_broker_and_leaves_no_guest_socket(
         self,
     ):
-        live, _ = broker.bind_guest_server(self.ctl, {}, 1)
+        live, _ = broker.bind_guest_server(self.ctl, {}, 1, broker.EventLog())
         self.addCleanup(live.server_close)
         done = subprocess.run(
             [sys.executable, BROKER_PATH, *self.broker_args()],
@@ -1363,7 +1688,7 @@ class TestControlSocketReclaim(SocketDirCase):
 
     @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
     def test_a_stale_control_socket_is_replaced(self):
-        stale, _ = broker.bind_guest_server(self.ctl, {}, 1)
+        stale, _ = broker.bind_guest_server(self.ctl, {}, 1, broker.EventLog())
         stale.server_close()  # closed but the file remains
         child = subprocess.Popen(
             [sys.executable, BROKER_PATH, *self.broker_args()],
