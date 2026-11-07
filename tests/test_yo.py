@@ -1197,8 +1197,8 @@ class TestCpFromGuestNeverLandsControlPaths(CpFromGuestHarness):
         self.assertEqual(self.read("dest/proj/ok.txt"), "ok")
         self.assertIn('skipped "proj/.git"', reported)
 
-    def test_every_version_control_editor_and_direnv_name_is_skipped(self):
-        for name in (".hg", ".svn", ".idea", ".ENVRC", ".Vscode"):
+    def test_every_version_control_hook_editor_and_direnv_name_is_skipped(self):
+        for name in (".hg", ".svn", ".jj", ".husky", ".idea", ".ENVRC", ".Vscode"):
             with self.subTest(name=name):
                 shutil.rmtree("dest", ignore_errors=True)
                 os.makedirs("dest")
@@ -1743,7 +1743,9 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
         # find exits 1 when a directory under a source is unreadable, and its
         # stderr names it; the copy is refused with that name, escaped.
         os.makedirs("dest")
-        guest = FakeGuest(self.FILES, {}, self.scp_sources, self.scp_destinations, False)
+        guest = FakeGuest(
+            self.FILES, {}, self.scp_sources, self.scp_destinations, False
+        )
         said = {}
 
         def failing(role, argv, **kwargs):

@@ -274,7 +274,9 @@ def remove_staging(path: str) -> None:
         remove_tree(path)
     except Exception as failure:
         reason = (
-            ui.os_error_reason(failure) if isinstance(failure, OSError) else str(failure)
+            ui.os_error_reason(failure)
+            if isinstance(failure, OSError)
+            else str(failure)
         )
         raise YoError(
             'cannot remove the staging directory "%s": %s; delete it by hand'
@@ -282,12 +284,14 @@ def remove_staging(path: str) -> None:
         )
 
 
-# Names that make git, an editor or direnv execute what a tree says the next
-# time the operator touches it. A pulled guest tree never lands these: the
+# Names that make git, jj, an editor or direnv execute what a tree says the
+# next time the operator touches it. A pulled guest tree never lands these: the
 # agent writes them (yo.md, "Downloads never land control paths").
 # Compared with casefold(), because APFS folds names with Unicode case folding
 # (.GIT and .vſcode are .git and .vscode).
-LANDING_CONTROL_NAMES = frozenset({".git", ".hg", ".svn", ".envrc", ".vscode", ".idea"})
+LANDING_CONTROL_NAMES = frozenset(
+    {".git", ".hg", ".svn", ".jj", ".husky", ".envrc", ".vscode", ".idea"}
+)
 
 
 # Build output and dependency installs a pulled tree never lands: the project's
