@@ -679,6 +679,10 @@ esac
             """
 for a in "$@"; do
   if [ "$a" = -f ]; then
+    if [ -n "${FAKE_FOLLOW_FAILS:-}" ]; then
+      echo "journalctl: cannot read the journal" >&2
+      exit 9
+    fi
     exec 3< "$FAKE_JOURNAL_FIFO"
     echo journal-ready > "$FAKE_READY_FIFO"
     exec cat <&3
@@ -877,9 +881,11 @@ class TestUnlockAnswersAsks(UnlockScript):
         self.assertEqual(len(self.replies()), 1)
         self.assertEqual(self.out.count(b"answered id="), 1)
 
-    def test_each_ask_file_is_answered_separately(self):
+    def test_each_ask_with_its_own_id_is_answered_separately(self):
         self.write_ask("ask.a", socket="/run/fake/a.sock")
-        self.write_ask("ask.b", socket="/run/fake/b.sock")
+        self.write_ask(
+            "ask.b", socket="/run/fake/b.sock", ask_id="yolobox:luks-migrate"
+        )
         self.start()
         self.wait_until_streams_are_up()
         self.sync_with_the_loop()
@@ -887,6 +893,25 @@ class TestUnlockAnswersAsks(UnlockScript):
             sorted(r.split()[2] for r in self.replies()),
             ["/run/fake/a.sock", "/run/fake/b.sock"],
         )
+
+    def test_an_id_asked_again_after_its_answer_is_a_rejected_passphrase(self):
+        # systemd-cryptsetup re-asks a wrong passphrase up to its tries and the
+        # migration re-asks until one opens the disk: the second ask is the
+        # verdict, and no second argon2 run is bought with the same answer.
+        self.write_ask("ask.a")
+        self.start()
+        self.wait_until_streams_are_up()
+        self.sync_with_the_loop()
+        self.assertEqual(len(self.replies()), 1)
+        (self.ask_dir / "ask.a").unlink()
+        self.write_ask("ask.b", socket="/run/fake/again.sock")
+        self.send("inotify", str(self.ask_dir / "ask.b"))
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("the passphrase does not open /dev/fake", err)
+        self.assertIn("%s asked again" % self.ASK_ID, err)
+        self.assertEqual(len(self.replies()), 1)
+        self.assertNotIn("unlocked", out)
 
     def test_a_failed_reply_is_reported_and_retried_on_the_next_event(self):
         self.write_ask("ask.a")
@@ -933,7 +958,8 @@ class TestUnlockOutcomes(UnlockScript):
         rc, out, err = self.finish()
         self.assertEqual(rc, 2, err)
         self.assertIn("yolobox: /dev/vda2 is too full", err)
-        self.assertIn("encrypting /dev/fake failed", err)
+        self.assertIn("the in-place encryption of /dev/fake failed", err)
+        self.assertIn("ends with the state it left the disk in", err)
         self.assertNotIn("unlocked", out)
 
     def test_a_cryptsetup_unit_that_fails_after_the_answer_exits_1_naming_the_passphrase(
@@ -1033,14 +1059,29 @@ class TestUnlockOutcomes(UnlockScript):
         rc, out, err = self.finish()
         self.assertEqual(rc, 0, err)
 
-    def test_both_streams_ending_with_nothing_unlocked_exits_3(self):
+    def assertOneWriterEndingExits3AtOnce(self, fifo, writer):
+        # The FIFO reaches EOF only when both writers are gone, so a lone dead
+        # writer used to leave the helper waiting until yo's deadline.
         self.start()
         self.wait_until_streams_are_up()
-        self.close_fifo("journal")
-        self.close_fifo("inotify")
+        self.close_fifo(fifo)
         rc, out, err = self.finish()
         self.assertEqual(rc, 3, err)
-        self.assertIn("lost the ask-password watch", err)
+        self.assertIn("%s ended (exit 0)" % writer, err)
+        self.assertNotIn("unlocked", out)
+
+    def test_the_journal_feed_ending_with_nothing_unlocked_exits_3_at_once(self):
+        self.assertOneWriterEndingExits3AtOnce("journal", "journalctl")
+
+    def test_the_ask_watch_ending_with_nothing_unlocked_exits_3_at_once(self):
+        self.assertOneWriterEndingExits3AtOnce("inotify", "inotifywait")
+
+    def test_a_journal_feed_that_fails_to_start_is_reported_with_its_own_words(self):
+        self.start(FAKE_FOLLOW_FAILS="1")
+        rc, out, err = self.finish()
+        self.assertEqual(rc, 3, err)
+        self.assertIn("journalctl ended (exit 9)", err)
+        self.assertIn("journalctl: cannot read the journal", out + err)
 
 
 class TestUnlockAfterAFailedAttempt(UnlockScript):
