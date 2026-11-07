@@ -33,10 +33,13 @@ let
   ];
 
   # Setuid and capability wrappers the box keeps, each with the privilege it
-  # must carry. `capabilities` is the comma separated list `getcap` prints,
-  # including the cap_setpcap that nixpkgs adds to every capability wrapper.
-  # It is compared sorted, so a value may list its names in any order. See
-  # nix/hardening.md.
+  # must carry and the binary it must wrap. `capabilities` is the comma
+  # separated list `getcap` prints, including the cap_setpcap that nixpkgs
+  # adds to every capability wrapper. It is compared sorted, so a value may
+  # list its names in any order. `source` is the path nixpkgs' own module
+  # gives the wrapper (security/sudo.nix, security/pam.nix,
+  # programs/shadow.nix), so a kept name pointed at another binary fails the
+  # rebuild. See nix/hardening.md.
   #
   # `group` and `permissions` are compared too. A capability wrapper ignores
   # its `setuid` option and takes its mode from `permissions` alone, so a
@@ -51,12 +54,15 @@ let
   wheelOnly = { group = "wheel"; permissions = groupOnly; };
   setuidRoot = open // { setuid = true; capabilities = ""; };
   capRoot = capabilities: open // { setuid = false; inherit capabilities; };
+  wrapping = source: { inherit source; };
+  sudoBin = "${config.security.sudo.package.out}/bin";
+  shadowBin = "${config.security.loginDefs.package.out}/bin";
   keptWrappers = {
-    sudo = setuidRoot // wheelOnly;
-    sudoedit = setuidRoot // wheelOnly;
-    unix_chkpwd = setuidRoot;
-    newuidmap = capRoot "cap_setpcap,cap_setuid";
-    newgidmap = capRoot "cap_setgid,cap_setpcap";
+    sudo = setuidRoot // wheelOnly // wrapping "${sudoBin}/sudo";
+    sudoedit = setuidRoot // wheelOnly // wrapping "${sudoBin}/sudoedit";
+    unix_chkpwd = setuidRoot // wrapping "${config.security.pam.package}/bin/unix_chkpwd";
+    newuidmap = capRoot "cap_setpcap,cap_setuid" // wrapping "${shadowBin}/newuidmap";
+    newgidmap = capRoot "cap_setgid,cap_setpcap" // wrapping "${shadowBin}/newgidmap";
   };
   # The one spelling of a capability list that both sides are compared in:
   # unique, byte-sorted, comma separated. "" has no names and stays "".
@@ -88,32 +94,48 @@ let
 
   have = w: {
     inherit (w) program setuid setgid owner group permissions;
+    source = toString w.source;
     capabilities = getcapSpelling w.capabilities;
   };
   want = name: e: {
     program = name;
-    inherit (e) setuid capabilities group permissions;
+    inherit (e) setuid capabilities group permissions source;
     setgid = false;
     owner = "root";
   };
-  # An extraWrappers entry may be narrower than `open`: with mode u+rx,g+x
-  # only root and one group can exec it (nixpkgs' wireshark gives dumpcap that),
-  # which is never wider than `open`, so its group is taken as given.
+  # An extraWrappers entry names no source: the box's own module gives it one,
+  # and the basename rule below is what checks it. It may also be narrower
+  # than `open`: with mode u+rx,g+x only root and one group can exec it
+  # (nixpkgs' wireshark gives dumpcap that), which is never wider than
+  # `open`, so its group is taken as given.
   expected = name: w:
     let e = expectedWrappers.${name}; in
-    if !(keptWrappers ? ${name}) && w.permissions == groupOnly
-    then e // { inherit (w) group permissions; }
-    else e;
+    if keptWrappers ? ${name} then e
+    else e // { source = toString w.source; }
+      // lib.optionalAttrs (w.permissions == groupOnly) { inherit (w) group permissions; };
   wrongPrivilege = lib.filterAttrs
     (name: w: have w != want name (expected name w))
     (lib.getAttrs (lib.intersectLists enabledNames allowedNames) enabledWrappers);
+  # An extra wrapper must wrap the binary of its own name: `dumpcap` wrapping
+  # bash would carry dumpcap's capabilities into a shell.
+  misnamedSource = lib.filterAttrs
+    (name: w: baseNameOf (toString w.source) != name)
+    (lib.getAttrs (lib.intersectLists enabledNames (lib.attrNames cfg.extraWrappers)) enabledWrappers);
 
   # Refused from any source, an extraWrappers entry included. CAP_SYS_PTRACE
   # attaches to root's processes and hands the agent root (CONSTITUTION,
-  # nix/base.md#same-uid-ptrace); CAP_SYS_ADMIN and the CAP_DAC_* pair reach
-  # what other uids own.
+  # nix/base.md#same-uid-ptrace); the rest each reach root in one step: see the
+  # capability table in nix/hardening.md. cap_setuid and cap_setgid are root
+  # by another name, and only the two id-map helpers carry one each.
+  forbiddenCapNames = [
+    "cap_sys_ptrace" "cap_sys_admin" "cap_dac_" "cap_sys_module" "cap_sys_rawio"
+    "cap_setfcap" "cap_fowner" "cap_chown" "cap_bpf" "cap_sys_boot" "cap_mknod"
+  ];
+  idMapWrappers = [ "newuidmap" "newgidmap" ];
+  forbiddenCapsOf = name:
+    forbiddenCapNames ++ lib.optionals (!(lib.elem name idMapWrappers)) [ "cap_setuid" "cap_setgid" ];
   forbiddenCaps = lib.filterAttrs
-    (_: w: lib.any (c: lib.hasInfix c (lib.toLower w.capabilities)) [ "cap_sys_ptrace" "cap_sys_admin" "cap_dac_" ])
+    (name: w: lib.any (c: lib.hasInfix c (lib.toLower w.capabilities)) (forbiddenCapsOf name))
     enabledWrappers;
 in
 {
@@ -129,9 +151,10 @@ in
       `getcap` lists them (include the cap_setpcap that nixpkgs adds).
       The empty string means a setuid-root wrapper with no capabilities.
       The wrapper must be owned by root with nixpkgs' default permissions
-      and group root, or with the permissions `u+rx,g+x` and any group.
+      and group root, or with the permissions `u+rx,g+x` and any group,
+      and its source must be a binary of the wrapper's own name.
       Evaluation fails when an enabled wrapper differs in program name,
-      setuid, setgid, owner, group, permissions or capabilities.
+      source, setuid, setgid, owner, group, permissions or capabilities.
     '';
   };
 
@@ -173,9 +196,16 @@ in
         );
       }
       {
+        assertion = misnamedSource == { };
+        message = lib.concatStringsSep "\n" (
+          [ "An extra wrapper wraps a binary of another name, which the box never allows (nix/hardening.nix):" ]
+          ++ lib.mapAttrsToList (name: w: "${name}: source ${toString w.source}") misnamedSource
+        );
+      }
+      {
         assertion = forbiddenCaps == { };
         message = lib.concatStringsSep "\n" (
-          [ "A wrapper carries cap_sys_ptrace, cap_sys_admin or a cap_dac_* capability, which the box never allows (nix/hardening.nix):" ]
+          [ "A wrapper carries a capability the box never allows (${lib.concatStringsSep ", " forbiddenCapNames}, or cap_setuid/cap_setgid outside ${lib.concatStringsSep "/" idMapWrappers}; nix/hardening.nix):" ]
           ++ lib.mapAttrsToList (name: w: "${name}: ${w.capabilities}") forbiddenCaps
         );
       }

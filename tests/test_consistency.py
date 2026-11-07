@@ -1469,7 +1469,7 @@ class TestHardeningWrapperAllowlistHasOneSpelling(unittest.TestCase):
         text = HARDENING_CHECK.read_text()
         for name in ("newuidmap", "newgidmap"):
             (nix_caps,) = re.findall(
-                r'^\s*%s = capRoot "([^"]*)";' % name,
+                r'^\s*%s = capRoot "([^"]*)"' % name,
                 nix_code(HARDENING_NIX),
                 re.M,
             )

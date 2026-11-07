@@ -337,8 +337,9 @@ jobs:
       # case evaluates the toplevel of a configuration extended with one module.
       # The refusal must name the offender, or it failed for some other reason,
       # and the control proves the same wrapper evaluates without the forbidden
-      # capability. `! cmd` never fails a `bash -e` step, hence the explicit
-      # exits.
+      # capability. The extra wrapper is named after the binary it wraps,
+      # because an extra wrapper's source must carry its name. `! cmd` never
+      # fails a `bash -e` step, hence the explicit exits.
       - name: Check the wrapper allowlist refuses what it must
         run: |
           toplevel() {
@@ -356,17 +357,27 @@ jobs:
             fi
             grep -F -- "$2" wrappers.err
           }
-          # $1 the capabilities, $2 the group (root when omitted). The group is
-          # an argument because Nix refuses a second x.group in the same set.
+          # $1 the capabilities, $2 the group (root when omitted), $3 the
+          # binary (sleep when omitted). The group is an argument because Nix
+          # refuses a second sleep.group in the same set.
           wrapper() {
-            echo "security.wrappers.x = { source = \"\${pkgs.coreutils}/bin/true\"; owner = \"root\"; group = \"${2:-root}\"; capabilities = \"$1+ep\"; };"
+            echo "security.wrappers.sleep = { source = \"\${pkgs.coreutils}/bin/${3:-sleep}\"; owner = \"root\"; group = \"${2:-root}\"; capabilities = \"$1+ep\"; };"
           }
-          toplevel "$(wrapper cap_net_raw) yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap\";" > /dev/null
-          refused "$(wrapper cap_net_raw,cap_sys_admin) yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap,cap_sys_admin\";" 'x: cap_net_raw,cap_sys_admin+ep'
+          toplevel "$(wrapper cap_net_raw) yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap\";" > /dev/null
+          refused "$(wrapper cap_net_raw,cap_sys_admin) yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap,cap_sys_admin\";" 'sleep: cap_net_raw,cap_sys_admin+ep'
+          # Each capability that reaches root in one step is refused on its
+          # own, and cap_setuid everywhere but on the two id-map helpers.
+          for cap in cap_sys_module cap_sys_rawio cap_setfcap cap_fowner cap_chown cap_bpf cap_sys_boot cap_mknod cap_setuid cap_setgid; do
+            refused "$(wrapper $cap) yolobox.hardening.extraWrappers.sleep = \"$cap,cap_setpcap\";" "sleep: $cap+ep"
+          done
           refused 'yolobox.hardening.extraWrappers.sudo = "";' 'names kept wrappers (sudo)'
           # group and permissions are privilege too: a mode with an s makes a
           # capability wrapper setuid, and sudo is wheel-only.
-          toplevel "$(wrapper cap_net_raw wireshark) security.wrappers.x.permissions = \"u+rx,g+x\"; yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap\";" > /dev/null
-          refused "$(wrapper cap_net_raw) security.wrappers.x.permissions = \"u+rxs,g+x,o+x\"; yolobox.hardening.extraWrappers.x = \"cap_net_raw,cap_setpcap\";" 'x: have'
+          toplevel "$(wrapper cap_net_raw wireshark) security.wrappers.sleep.permissions = \"u+rx,g+x\"; yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap\";" > /dev/null
+          refused "$(wrapper cap_net_raw) security.wrappers.sleep.permissions = \"u+rxs,g+x,o+x\"; yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap\";" 'sleep: have'
           refused 'security.wrappers.sudo.group = lib.mkForce "root";' 'sudo: have'
           refused 'security.wrappers.sudo.permissions = lib.mkForce "u+rx,g+x,o+x";' 'sudo: have'
+          # The source is privilege too: a kept name pointed at a shell is a
+          # setuid shell, and an extra wrapper must wrap a binary of its name.
+          refused 'security.wrappers.unix_chkpwd.source = lib.mkForce "${pkgs.bash}/bin/bash";' 'unix_chkpwd: have'
+          refused "$(wrapper cap_net_raw root true) yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap\";" 'sleep: source'
