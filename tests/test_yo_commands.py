@@ -113,11 +113,16 @@ class TestFlakeRef(FakeHome):
             with self.subTest(ref=ref):
                 self.assertTrue(yo.flake_ref(ref).endswith(ref))
 
-    def test_bootstrap_refuses_an_old_release_as_a_usage_error(self):
+    def test_bootstrap_refuses_an_old_release_as_a_usage_error_before_the_preflight(
+        self,
+    ):
         stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            with self.assertRaises(SystemExit) as caught:
-                yo.build_parser().parse_args(["bootstrap", "--version", "1.9.1"])
+        with mock.patch.object(
+            yo.proc, "require_tool", side_effect=AssertionError("preflight ran")
+        ):
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    yo.main(["bootstrap", "--version", "1.9.1"])
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("cannot build release 1.9.1", stderr.getvalue())
 

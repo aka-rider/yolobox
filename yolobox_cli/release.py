@@ -95,11 +95,20 @@ def flake_ref(version: Optional[str]) -> str:
     ref = named_flake_ref(version)
     old = old_release(ref)
     if old is not None:
-        raise YoError(
-            "cannot build release %s, %s — build it with that release's own yo "
-            "instead, %s" % (old, OLD_RELEASE_WHY, old_release_yo(old))
-        )
+        raise YoError(old_release_refusal(old))
     return ref
+
+
+def old_release_refusal(old: str) -> str:
+    return (
+        "cannot build release %s, %s — build it with that release's own yo "
+        "instead, %s"
+        % (
+            old,
+            OLD_RELEASE_WHY,
+            old_release_yo(old),
+        )
+    )
 
 
 def own_release_ref() -> Optional[str]:
@@ -165,11 +174,23 @@ def named_flake_ref(version: str) -> str:
 
 
 def bootstrap_version(value: str) -> str:
-    """argparse `type=` of `bootstrap --version`: a bad ref is a usage error."""
+    """argparse `type=` of `bootstrap --version`: the ref the value names, a bad
+    one a usage error. It reads no state: the old-release check names the
+    machine in its remedy, and main() chooses the machine only after parsing
+    (old_release_problem)."""
     try:
-        return flake_ref(value)
+        return named_flake_ref(value)
     except YoError as failure:
         raise argparse.ArgumentTypeError(failure.message)
+
+
+def old_release_problem(args: argparse.Namespace) -> Optional[str]:
+    """The usage error of a `bootstrap --version` that names a release this yo
+    cannot build (old_release), once the machine is chosen; None otherwise."""
+    if args.version is None:
+        return None
+    old = old_release(args.version)
+    return None if old is None else old_release_refusal(old)
 
 
 def rebuild_hint() -> str:

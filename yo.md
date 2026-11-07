@@ -246,7 +246,7 @@ Each instance's blocks live in that instance's own `ssh.config`, so writing one 
 
 ## bootstrap --version
 
-`yo bootstrap --version REF` chooses what the box builds from. Without it the box builds from this `yo`'s own release, `github:aka-rider/yolobox/v<version>`, so a `brew upgrade` moves the next bootstrap with it. The value is resolved while the command line is parsed (`flake_ref()`), so a refused one (`yo bootstrap --version 1.7`) exits 2 with the usage line before `limactl` is looked for. Exactly three spellings are accepted:
+`yo bootstrap --version REF` chooses what the box builds from. Without it the box builds from this `yo`'s own release, `github:aka-rider/yolobox/v<version>`, so a `brew upgrade` moves the next bootstrap with it. The spelling is checked while the command line is parsed (`bootstrap_version()`, which calls `named_flake_ref()` and reads nothing else, because a `type=` callable runs before `main()` has chosen the machine), and the release check below runs in `main()` right after the machine is chosen (`old_release_problem()`, so its remedy can name `-m`), still before `limactl` is looked for. Either refusal (`yo bootstrap --version 1.7`, `yo bootstrap --version 1.9.1`) exits 2 with the usage line. Exactly three spellings are accepted:
 
 - `1.7.2` or `v1.7.2` is that release tag.
 - `main`, `my-branch` or `v1.7.2-rc1` is a branch or tag on `aka-rider/yolobox`. It has no `/`, starts with a letter or digit and contains only letters, digits, `.`, `_` and `-`.
