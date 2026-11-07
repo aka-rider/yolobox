@@ -91,4 +91,7 @@ in
   # ffmpeg-full, not the default ffmpeg: nixpkgs' default build is
   # --disable-xlib/--disable-libxcb*, so x11grab doesn't exist in it.
   environment.systemPackages = [ pkgs.chromium pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord ];
+  # Reachable by name, so CI can build the package on its own: its check
+  # phase (shellcheck) runs only in a build (nix/display.md).
+  system.build.yoloboxScreenRecord = screenRecord;
 }

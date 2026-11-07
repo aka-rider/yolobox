@@ -50,3 +50,9 @@ To recognise a regression, look for the exact pi error string coming back. It me
 - Default ffmpeg has no x11grab, so `nix/display.nix` uses `ffmpeg-full`.
 - Two sessions share one browser. Chromium's singleton lock forwards the second launch, which is slow. That is not isolation and not a failure.
 - Chromium's storage flushes lazily, so a session killed without `browser_close` can lose its last write.
+
+## Shellcheck at the build's severity
+
+`pkgs.writeShellApplication` builds the screen recorder and `yolobox-guest`, and its check phase runs shellcheck over the finished script with no `-S`, so at shellcheck's default severity, where `info` and `style` findings fail too. CI and the command in CLAUDE.md ran `shellcheck -S warning`, which passes those. A live round found the gap: the recorder's `record "$out" "$log" ... >>"$log"` took the log's path as an argument and appended to it in the same command, an SC2094 at `info`, which CI passed and the box build failed on, so `yo bootstrap` stopped at the build. Recognise the shape by a bootstrap failing in `nixos-rebuild` with a shellcheck finding naming a `/nix/store/...-<script>/bin/<script>` path and a code CI never showed.
+
+Two things close it. The lint job and CLAUDE.md's command run shellcheck with no `-S`, the severity the box uses, so the two verdicts agree. And CI's x86_64 eval leg builds the two packages (`system.build.yoloboxGuestScript` and `system.build.yoloboxScreenRecord`, passthroughs the modules add for this), because evaluating the configuration computes a derivation path and never runs a check phase: an evaluation cannot see a shellcheck failure, only a build can, and nixpkgs' shellcheck and the pinned wheel need not be the same version. A finding at the new severity is fixed in the code; a `# shellcheck disable=` is for a true false positive only, with its one-line reason beside it.

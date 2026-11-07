@@ -1239,7 +1239,10 @@ class TestShellcheckListsAgree(unittest.TestCase):
     ones in verify.yml. A script added to one list only is either skipped by CI
     or never run by the person changing it."""
 
-    COMMAND = re.compile(r"shellcheck -S warning ([^#\n]+)")
+    # The scripts follow `shellcheck` directly: a `-S` in between would not
+    # match, because the box build runs shellcheck at its default severity, and
+    # so must both lists (nix/display.md).
+    COMMAND = re.compile(r"shellcheck ((?:\S+\.sh ?)+)")
 
     def scripts_in(self, path):
         found = self.COMMAND.findall(path.read_text())

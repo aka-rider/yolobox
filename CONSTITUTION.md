@@ -153,6 +153,7 @@ Identify whether you are running on the host (macOS or Linux) or in the guest (L
 - ALWAYS run `nixos-rebuild switch` unpiped, and read its exit code. A pipe through `tail` reports a failed bootloader install as exit 0. [story](nix/base.md#the-esp-holds-one-kernel)
 - ALWAYS check `df /boot`, and compare `readlink /run/current-system` with `readlink /nix/var/nix/profiles/system`, when a switch behaves strangely. Disagreement means the box runs one generation and the profile claims another, so do not garbage-collect. [story](nix/base.md#the-esp-holds-one-kernel)
 - ALWAYS use the `path` option, not `environment.PATH`, in a systemd unit. NixOS already defines the latter for every service, so a second definition conflicts.
+- ALWAYS run shellcheck at writeShellApplication's severity (no -S); the box build runs it at that level and fails at bootstrap on what CI at -S warning would pass. [story](nix/display.md#shellcheck-at-the-builds-severity)
 
 ## Display and browsers
 

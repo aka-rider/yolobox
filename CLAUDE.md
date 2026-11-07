@@ -211,7 +211,7 @@ Tests, all under `tests/`:
 ```sh
 python3 -m unittest discover -s tests        # CI runs 3.9 and the newest 3.x
 uvx ruff@0.17.2 check . && uvx ruff@0.17.2 format --check .   # see below
-shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/display/yolobox-screen-record.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh   # verify.yml's list
+shellcheck nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/display/yolobox-screen-record.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh   # verify.yml's list; no -S, the box build runs shellcheck at its default severity
 YOLOBOX_USERNAME=$(id -un) YOLOBOX_FLAKE_REF=github:aka-rider/yolobox/ci nix flake check --impure
 ```
 

@@ -34,8 +34,12 @@ jobs:
           "$RUNNER_TEMP/shellcheck/bin/pip" install shellcheck-py==0.11.0.1
           echo "$RUNNER_TEMP/shellcheck/bin" >> "$GITHUB_PATH"
 
+      # No -S: the box builds two of these scripts with writeShellApplication,
+      # whose check phase runs shellcheck at its default severity, so a finding
+      # below `warning` that passes here fails the box build at `yo bootstrap`
+      # (nix/display.md, "Shellcheck at the build's severity").
       - name: Shellcheck every tracked shell script
-        run: shellcheck -S warning nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/display/yolobox-screen-record.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh
+        run: shellcheck nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/display/yolobox-screen-record.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh
 
   # yo is stdlib Python, so the only axis is the Python version: 3.9 is the
   # floor yo promises, the newest 3.x catches the other direction. One runner,
@@ -153,6 +157,20 @@ jobs:
         run: |
           nix build .#yolobox
           ./result/bin/yo --version | grep -Fx "yolobox $(cat .version)"
+
+      # The guest script and the screen recorder are writeShellApplication
+      # packages, whose check phase runs shellcheck at its default severity
+      # inside the build. An evaluation never runs that phase, so only a build
+      # proves the box's own shellcheck passes; the lint job above runs the
+      # repo's pinned shellcheck at the same severity, and this step holds
+      # nixpkgs' shellcheck to the same verdict. Only the x86_64 leg can
+      # build (nix/display.md, "Shellcheck at the build's severity").
+      - name: Build the two shellchecked script packages
+        if: matrix.system == 'x86_64-linux'
+        run: |
+          nix build --impure --no-link \
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxGuestScript \
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxScreenRecord
 
       # A yo older than the flake still passes YOLOBOX_HOST_OS. The box must
       # be the same derivation whatever it says, or unset (nix/base.md).

@@ -30,4 +30,7 @@ in
   # subcommands from this helper (gc-machine as the operator, everything
   # else as the agent).
   environment.systemPackages = [ yoloboxGuest ];
+  # Reachable by name, so CI can build the package on its own: its check
+  # phase (shellcheck) runs only in a build (nix/display.md).
+  system.build.yoloboxGuestScript = yoloboxGuest;
 }
