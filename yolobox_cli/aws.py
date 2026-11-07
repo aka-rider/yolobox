@@ -82,8 +82,23 @@ def aws_broker_ctl_sock() -> str:
 AWS_REGION_RE = re.compile(r"[a-z]{2,4}(-[a-z]+)+-\d+", re.ASCII)
 
 
+def aws_config_path() -> str:
+    """The AWS config file the host's `aws` reads, so the one yo allow-lists from.
+
+    The broker inherits yo's environment, so its `aws configure
+    export-credentials` honours AWS_CONFIG_FILE; the allowlist must come from
+    the same file or the two disagree on which profiles exist. An empty
+    variable is the default, as the CLI treats it.
+    """
+    configured = os.environ.get("AWS_CONFIG_FILE")
+    if configured:
+        return os.path.expanduser(configured)
+    return os.path.join(state.home(), ".aws", "config")
+
+
 def aws_allowlist() -> List[Tuple[str, str]]:
-    config_path = os.path.join(state.home(), ".aws", "config")
+    config_path = aws_config_path()
+    shown = state.tilde(config_path)
     parser = configparser.ConfigParser(interpolation=None)
     try:
         # parser.read() skips a file it cannot open, which would read an
@@ -116,9 +131,9 @@ def aws_allowlist() -> List[Tuple[str, str]]:
                 continue
             if name in defined_by:
                 ui.err(
-                    "yo: [%s] and [%s] in ~/.aws/config both name the profile '%s' — "
+                    "yo: [%s] and [%s] in %s both name the profile '%s' — "
                     "using [%s], ignoring the earlier one"
-                    % (defined_by[name], section, name, section)
+                    % (defined_by[name], section, shown, name, section)
                 )
             defined_by[name] = section
         allowed: List[Tuple[str, str]] = []
@@ -131,14 +146,14 @@ def aws_allowlist() -> List[Tuple[str, str]]:
             region = parser.get(section, "region", fallback="")
             if not region:
                 ui.err(
-                    "yo: profile '%s' has no region in ~/.aws/config — excluded from the guest AWS config"
-                    % name
+                    "yo: profile '%s' has no region in %s — excluded from the guest AWS config"
+                    % (name, shown)
                 )
                 continue
             if not AWS_REGION_RE.fullmatch(region):
                 ui.err(
-                    "yo: profile '%s' has region %r in ~/.aws/config, which is not an AWS region name — excluded from the guest AWS config"
-                    % (name, region)
+                    "yo: profile '%s' has region %r in %s, which is not an AWS region name — excluded from the guest AWS config"
+                    % (name, region, shown)
                 )
                 continue
             allowed.append((name, region))
@@ -381,10 +396,12 @@ YO_BROKER_LOCK_NAME = "aws-broker.yo.lock"
 
 
 def disable_aws_broker() -> None:
+    # The removal is under the lock too, so it cannot land between another
+    # yo's start and its push and leave a broker running with no guest config.
     try:
         with state.host_state_lock(YO_BROKER_LOCK_NAME, wait=True):
             kill_broker_in(aws_broker_health())
-        sshx.ssh_run(AGENT, ["rm", "-f", GUEST_AWS_CONFIG_PATH], check=True)
+            sshx.ssh_run(AGENT, ["rm", "-f", GUEST_AWS_CONFIG_PATH], check=True)
     except YoError as failure:
         raise BrokerDisableError(failure.message, failure.code)
 
@@ -402,32 +419,30 @@ def broker_needs_restart(
 
 
 def ensure_aws_broker() -> bool:
-    if shutil.which("aws") is None:
-        ui.err(
-            "yo: 'aws' is not on this host's PATH — no AWS credentials broker started"
-        )
-        disable_aws_broker()
-        return False
-    allowed = aws_allowlist()
-    if not allowed:
-        ui.err(
-            "yo: no SSO profiles in ~/.aws/config — no AWS credentials broker started"
-        )
-        disable_aws_broker()
-        return False
-
-    pid = state.driver().keepalive_pid()
-    if pid is None:
-        raise YoError(state.driver().keepalive_pid_error())
-
-    allowed_names = sorted(name for name, _ in allowed)
-    # Check, kill and start are one step: two yos racing through them would each
-    # see no broker, and the second to start would fail on the first one's.
+    # Reading the allowlist and the pid, checking, killing, starting and
+    # pushing the guest config are one step under yo's lock. Two yos racing
+    # through them would each see no broker, and the second to start would fail
+    # on the first one's; one that read the pid or the config before the other
+    # restarted the broker would then replace a good broker with a stale one,
+    # or push a guest config that names other profiles than the broker serves.
     with state.host_state_lock(YO_BROKER_LOCK_NAME, wait=True):
-        health = aws_broker_health()
-        if broker_needs_restart(health, pid, allowed_names):
-            kill_broker_in(health)
-            start_aws_broker(pid, allowed_names)
-
-    push_aws_guest_files(allowed)
-    return True
+        if shutil.which("aws") is None:
+            why_not = "'aws' is not on this host's PATH"
+            allowed: List[Tuple[str, str]] = []
+        else:
+            allowed = aws_allowlist()
+            why_not = "no SSO profiles in %s" % state.tilde(aws_config_path())
+        if allowed:
+            pid = state.driver().keepalive_pid()
+            if pid is None:
+                raise YoError(state.driver().keepalive_pid_error())
+            allowed_names = sorted(name for name, _ in allowed)
+            health = aws_broker_health()
+            if broker_needs_restart(health, pid, allowed_names):
+                kill_broker_in(health)
+                start_aws_broker(pid, allowed_names)
+            push_aws_guest_files(allowed)
+            return True
+    ui.err("yo: %s — no AWS credentials broker started" % why_not)
+    disable_aws_broker()
+    return False
