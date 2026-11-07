@@ -279,6 +279,16 @@ jobs:
           test "$($NIX_EVAL --json --apply 'map (sw: sw.size)' .#nixosConfigurations.yolobox.config.swapDevices)" = "[$default]"
           test "$(size 4096)" = '[4096]'
           test "$(size 0)" = '[]'
+          # The growth guard sits on the unit nixpkgs names for the file, and
+          # 0 removes the old file (nix/base.md).
+          test "$($NIX_EVAL --json --apply 'units: units."mkswap-var-swapfile".serviceConfig ? ExecStartPre' .#nixosConfigurations.yolobox.config.systemd.services)" = true
+          $NIX_EVAL --json --expr "
+            let
+              box = (builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
+                modules = [ { yolobox.swapSizeMiB = 0; } ];
+              };
+            in box.config.systemd.tmpfiles.rules
+          " | grep -F '"r /var/swapfile"'
 
       # nix cannot check the egress rule files (nft needs netlink, which the
       # build sandbox forbids), and a rule file that fails to load leaves the
