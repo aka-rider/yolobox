@@ -3272,6 +3272,16 @@ class TestVmUpResizes(LibvirtCase):
         self.assertIsNone(error)
         self.assertEqual(self.driver.current_size().cpus, 2)
 
+    def test_less_memory_is_never_refused_by_a_full_host(self):
+        # A plain `yo up` would start the box at its 16 GiB unjudged, so a
+        # shrink to 8 cannot fit worse than that.
+        self.host_memory(8 << 20)
+        error, _ = self.vm_up(self.box.Size(8, None, None))
+        self.assertIsNone(error)
+        self.assertEqual(self.driver.current_size().memory_gib, 8)
+        error, _ = self.vm_up(self.box.Size(9, None, None))
+        self.assertIn("does not fit on this host", error.message)
+
     def test_a_virsh_that_refuses_a_setting_stops_before_the_start(self):
         self.host.fail["setvcpus"] = "error: too many vCPUs"
         error, stubs = self.vm_up(self.box.Size(None, None, 2))

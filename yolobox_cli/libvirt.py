@@ -732,8 +732,10 @@ class LibvirtDriver:
         )
 
     def resize_refusal(self, current: BoxSize, wanted: BoxSize) -> Optional[str]:
-        # A box that keeps its memory is not judged by the host's room again.
-        if wanted.memory_gib == current.memory_gib:
+        # Only more memory is judged by the host's room: a box that keeps its
+        # memory, or asks for less, fits no worse than the `yo up` without a
+        # flag that would start it at its current size unjudged.
+        if wanted.memory_gib <= current.memory_gib:
             return None
         return self.memory_fit_refusal(wanted.memory_gib)
 
