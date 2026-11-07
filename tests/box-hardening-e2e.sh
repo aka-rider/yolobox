@@ -5,10 +5,21 @@
 #
 #   tests/box-hardening-e2e.sh <instance> [EXTRA_WRAPPERS...]
 #
-# <instance>        lima instance name, as for `yo -m <instance>`.
+# <instance>        lima instance name, as for `yo -m <instance>`. The default
+#                   machine (`yolobox`) is the one a person works in, so it is
+#                   refused unless FORCE=1 is set.
 # EXTRA_WRAPPERS    names (or name=caps) of the setuid wrappers the instance's own
 #                   /etc/yolobox/local.nix adds via
 #                   yolobox.hardening.extraWrappers (e.g. a VPN client's split-tunnel helper).
+# ONLY              passed through to the guest script (hardening or compat);
+#                   unset runs both halves.
+# EXTRA_AGENT_GROUPS
+#                   passed through: the groups the instance's local.nix adds
+#                   the agent to. The tailscale pin's version is read from
+#                   this checkout (nix/pkgs/tailscale.nix) and passed as
+#                   TAILSCALE_VERSION; with no pin file, none is compared.
+# YO                the yo to drive the box with; the default is this
+#                   checkout's, so the test never runs another install's.
 #
 # Steps, in order; the first failure stops the run and names its step:
 #   1. yo up
@@ -16,7 +27,8 @@
 #   3. yo status: exit 0 (it exits 1 on any warning), egress table in place, network ok
 #   4. yo cp round trip of a temp file
 #   5. yo down, yo up: the LUKS unlock and a boot with the new kernel
-#      parameters. 1Password may ask for Touch ID.
+#      parameters. 1Password may ask for Touch ID. The kernel's boot_id must
+#      change, or the box never rebooted.
 #   6. the guest check again, now on the rebooted kernel
 #
 # bash 3.2 compatible: macOS /bin/bash is 3.2, so no associative arrays, no
@@ -30,15 +42,31 @@ fi
 inst=$1
 shift
 extra_wrappers="$*"
+only=${ONLY:-}
+agent_groups=${EXTRA_AGENT_GROUPS:-}
 
 here=$(cd "$(dirname "$0")" && pwd)
 check_script="${here}/box-hardening-check.sh"
+yo=${YO:-"${here}/../yo"}
+tailscale_pin="${here}/../nix/pkgs/tailscale.nix"
 [ -f "${check_script}" ] || { echo "FAIL: ${check_script} is missing" >&2; exit 1; }
-command -v yo >/dev/null || { echo "FAIL: yo is not on PATH" >&2; exit 1; }
+[ -x "${yo}" ] || { echo "FAIL: ${yo} is not an executable yo" >&2; exit 1; }
+tailscale_version=""
+if [ -f "${tailscale_pin}" ]; then
+    tailscale_version=$(sed -n 's/^  version = "\([0-9.]*\)";$/\1/p' "${tailscale_pin}")
+    [ -n "${tailscale_version}" ] || { echo "FAIL: ${tailscale_pin} has no version line" >&2; exit 1; }
+fi
 
-# The names travel inside one single-quoted word of the remote command line,
-# so they must not be able to close the quote. `=` and `,` are in because the
-# documented form is name=caps (dumpcap=cap_net_raw,cap_setpcap).
+# The default machine is never a throwaway (yolobox_cli/config.py DEFAULT_INSTANCE).
+if [ "${inst}" = yolobox ] && [ "${FORCE:-}" != 1 ]; then
+    echo "FAIL: '${inst}' is the default machine, which this test reboots; use a throwaway instance, or FORCE=1" >&2
+    exit 64
+fi
+
+# The names, the groups and ONLY travel inside single-quoted words of the
+# remote command line, so they must not be able to close the quote. `=` and
+# `,` are in because the documented form is name=caps
+# (dumpcap=cap_net_raw,cap_setpcap).
 for name in "$@"; do
     case ${name} in
     *[!A-Za-z0-9._,=-]* | '')
@@ -47,6 +75,21 @@ for name in "$@"; do
         ;;
     esac
 done
+for name in ${agent_groups}; do
+    case ${name} in
+    *[!A-Za-z0-9._-]*)
+        echo "FAIL: '${name}' is not a plausible group name" >&2
+        exit 64
+        ;;
+    esac
+done
+case ${only} in
+'' | hardening | compat) ;;
+*)
+    echo "FAIL: ONLY must be hardening, compat or unset, got '${only}'" >&2
+    exit 64
+    ;;
+esac
 
 step=""
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/box-hardening-e2e.XXXXXX")
@@ -58,7 +101,7 @@ guest_dir_used=""
 cleanup() {
     local status=$?
     if [ -n "${guest_dir_used}" ]; then
-        yo -m "${inst}" ssh "sudo rm -rf ${guest_dir}" </dev/null ||
+        "${yo}" -m "${inst}" ssh "sudo rm -rf ${guest_dir}" </dev/null ||
             echo "WARN: could not remove ${guest_dir} on ${inst}" >&2
     fi
     rm -rf "${tmp}"
@@ -78,21 +121,27 @@ begin() {
 # The check script reads from stdin via `bash -s`, so it needs no copy in the
 # guest. yo passes the one word to ssh, which hands it to the operator's shell.
 guest_check() {
-    yo -m "${inst}" ssh "EXTRA_WRAPPERS='${extra_wrappers}' bash -s" <"${check_script}"
+    "${yo}" -m "${inst}" ssh "EXTRA_WRAPPERS='${extra_wrappers}' EXTRA_AGENT_GROUPS='${agent_groups}' TAILSCALE_VERSION='${tailscale_version}' ONLY='${only}' bash -s" <"${check_script}"
+}
+
+# The kernel's boot id: a new one per boot, so a `yo down; yo up` that left
+# the box running shows as the same id.
+guest_boot_id() {
+    "${yo}" -m "${inst}" ssh cat /proc/sys/kernel/random/boot_id </dev/null
 }
 
 # Not `yo ... status | grep`: a failing grep must not hide yo's own exit code.
 check_status() {
     local out
-    out=$(yo -m "${inst}" status) || {
+    out=$("${yo}" -m "${inst}" status) || {
         printf '%s\n' "${out}"
         echo "yo status exited non-zero: one of its lines above is a warning" >&2
         return 1
     }
     printf '%s\n' "${out}"
-    printf '%s\n' "${out}" | grep -qx 'egress: host and LAN blocked' ||
+    grep -qx 'egress: host and LAN blocked' <<<"${out}" ||
         { echo "status has no 'egress: host and LAN blocked' line" >&2; return 1; }
-    printf '%s\n' "${out}" | grep -q '^network: ok' ||
+    grep -q '^network: ok' <<<"${out}" ||
         { echo "status has no 'network: ok' line" >&2; return 1; }
 }
 
@@ -106,13 +155,15 @@ cp_round_trip() {
     printf 'box-hardening %s %s\n' "$$" "$(date +%s)" >"${payload}"
     mkdir "${back}"
     guest_dir_used=1
-    yo -m "${inst}" cp "${payload}" ":${guest_dir}/payload"
-    yo -m "${inst}" cp ":${guest_dir}/payload" "${back}"
+    "${yo}" -m "${inst}" cp "${payload}" ":${guest_dir}/payload"
+    "${yo}" -m "${inst}" cp ":${guest_dir}/payload" "${back}"
     cmp "${payload}" "${back}/payload"
 }
 
 begin "1. yo up"
-yo -m "${inst}" up
+"${yo}" -m "${inst}" up
+boot_before=$(guest_boot_id)
+[ -n "${boot_before}" ] || { echo "the guest printed no boot_id" >&2; exit 1; }
 
 begin "2. guest hardening and compatibility checks"
 guest_check
@@ -124,8 +175,13 @@ begin "4. yo cp round trip"
 cp_round_trip
 
 begin "5. yo down, yo up (reboot; 1Password may prompt for the disk key)"
-yo -m "${inst}" down
-yo -m "${inst}" up
+"${yo}" -m "${inst}" down
+"${yo}" -m "${inst}" up
+boot_after=$(guest_boot_id)
+[ -n "${boot_after}" ] || { echo "the guest printed no boot_id after the restart" >&2; exit 1; }
+[ "${boot_after}" != "${boot_before}" ] ||
+    { echo "the boot_id is still ${boot_before}: the box did not reboot" >&2; exit 1; }
+echo "boot_id ${boot_before} -> ${boot_after}"
 
 begin "6. guest checks again after the reboot"
 guest_check
