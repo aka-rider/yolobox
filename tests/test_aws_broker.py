@@ -1204,9 +1204,15 @@ class TestLogCostOfAGuest(ServedBroker):
 
         run = self.aws(aws_result(process_json()))
         run.side_effect = mint_once_the_client_is_gone
+        # The handler's thread logs the failed write after the mint; the server
+        # answers other connections meanwhile, so the line is waited for.
+        failed_write_logged = threading.Event()
+        self.log.side_effect = lambda line: (
+            failed_write_logged.set() if "client connection failed" in line else None
+        )
         self.close_early(in_mint)
         closed.set()
-        # The mint ends the request; the next request runs after it.
+        self.assertTrue(failed_write_logged.wait(10))
         self.assertEqual(self.get("/health")[0], 200)
         self.assertNotIn("Traceback", self.logged())
         self.assertEqual(self.logged().count("client connection failed"), 1)
