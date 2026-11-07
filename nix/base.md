@@ -120,6 +120,12 @@ The box is built from `github:OWNER/REPO/REF#yolobox` with `YOLOBOX_USERNAME`, `
 
 `nix/base.nix` therefore sets `nix.nixPath` to `nixpkgs=flake:nixpkgs` plus a `nixos-config` that only throws: `this box is built from a flake ref: run \`yolobox-guest rebuild switch\` (or \`boot\`) instead of nixos-rebuild`. `yolobox-guest rebuild` reads the box's own stamps and sets all three variables ([nix/guest/yolobox-guest.md](guest/yolobox-guest.md)). `nixos-rebuild switch --rollback` does not evaluate a config, so it still works. A `nixos-rebuild --flake` names its config itself and never reads `<nixos-config>`.
 
+## Activation snippets
+
+`system.activationScripts.<name>` snippets are spliced into one bash script, and NixOS's runner (`system/activation/activation-script.nix`) wraps each one: it sets `_localstatus=0`, runs the snippet's text, and reports `Activation script snippet '<name>' failed` when `_localstatus` is nonzero. The runner's `trap ... ERR` is what sets it, along with `_status`, which the whole script exits with at the end, after `/run/current-system` has been pointed at the new generation.
+
+So a snippet never `exit`s. An `exit 1` leaves the script at that line: every later snippet is skipped, `/run/current-system` is not updated, and the failure is reported only by the exit code. `lockRootAndAgent` once did that on a missing shadow entry. It now runs `false` and `continue`s: the ERR trap fires on the `false`, the snippet is named in the output, the loop goes on to the next account, the rest of activation runs, and the switch still exits nonzero. The ERR trap does fire inside an `if` body and a `{ }` group after `||`, which is the shape the snippet uses; it does not fire for the command in an `if` condition or before a `||`, which is why the failing `getent` sits in the condition and the `false` in the body.
+
 ## /etc/environment
 
 nixos-lima's `lima-init.nix` sets `environment.etc.environment.source = "/mnt/lima-cidata/etc_environment"`, and mounts the cidata disk with `mode=0700,dmode=0700,uid=0`. So `/etc/environment` resolved to a file only root can read. Every user manager's environment generator reported `Failed to chase '…/systemd-262/lib/environment.d/99-environment.conf': Permission denied` (that file is systemd's link to `/etc/environment`), followed by `Failed to acquire watch file descriptor: Permission denied`, at login and again at each switch.

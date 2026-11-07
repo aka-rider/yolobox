@@ -200,12 +200,19 @@ in
   # a box whose accounts already exist (a hand-run `sudo passwd root` would
   # stick). This enforces the lock on every activation. A field already
   # starting with ! or * is locked and left alone; `passwd -l` would prefix
-  # another !. A missing shadow entry fails the activation outright.
+  # another !. A missing shadow entry fails the activation: the `false`
+  # trips the runner's ERR trap, which marks this snippet failed and makes
+  # the activation exit nonzero after the later snippets have run. An
+  # `exit` here would skip them instead (nix/base.md, "Activation snippets").
   system.activationScripts.lockRootAndAgent = {
     deps = [ "users" ];
     text = ''
       for account in root ${agentUser}; do
-        entry="$(${pkgs.getent}/bin/getent shadow "$account")" || { echo "lockRootAndAgent: no shadow entry for $account" >&2; exit 1; }
+        if ! entry="$(${pkgs.getent}/bin/getent shadow "$account")"; then
+          echo "lockRootAndAgent: no shadow entry for $account" >&2
+          false
+          continue
+        fi
         field="''${entry#*:}"; field="''${field%%:*}"
         case "$field" in
           '!'*|'*'*) ;;
