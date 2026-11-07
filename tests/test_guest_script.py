@@ -845,6 +845,10 @@ esac
 """
 
 REF = "github:aka-rider/yolobox/v1.9.1"
+REV = "0123456789abcdef0123456789abcdef01234567"
+NAR = "sha256-" + "A" * 43 + "="
+# What a rebuild builds on a box yo bootstrap stamped: the commit and its hash.
+PINNED = "github:aka-rider/yolobox/%s?narHash=%s" % (REV, NAR)
 
 
 class RebuildCase(GuestScript):
@@ -857,17 +861,25 @@ class RebuildCase(GuestScript):
             tool.chmod(0o755)
         self.stamps = self.tmp / "stamps"
         self.stamps.mkdir()
+        self.state = self.tmp / "state"
+        self.state.mkdir()
         self.sudo_argv = self.tmp / "sudo-argv"
         self.env.update(
             YOLOBOX_STAMPS=str(self.stamps),
+            YOLOBOX_STATE_DIR=str(self.state),
             FAKE_SUDO_ARGV=str(self.sudo_argv),
             FAKE_USER="alice",
         )
         self.stamp("flake-ref", REF + "\n")
         self.stamp("hostname", "yolobox-e2e\n")
+        self.state_stamp("flake-rev", REV + "\n")
+        self.state_stamp("flake-narhash", NAR + "\n")
 
     def stamp(self, name, text):
         (self.stamps / name).write_bytes(text.encode())
+
+    def state_stamp(self, name, text):
+        (self.state / name).write_bytes(text.encode())
 
     def rebuild(self, *args, uid=501, sudo_rc=0):
         return self.run_script(
@@ -909,9 +921,67 @@ class TestRebuild(RebuildCase):
                         "--impure",
                         "--refresh",
                         "--flake",
-                        REF + "#yolobox",
+                        PINNED + "#yolobox",
                     ],
                 )
+                self.assertNotIn("no commit stamp", result.stderr)
+
+    def test_a_box_no_yo_stamped_builds_the_ref_by_name_and_says_so(self):
+        # Built by a yo older than the stamps: it follows the ref, as before,
+        # with one line that says the next bootstrap pins it. A hash without
+        # a commit is what an interrupted bootstrap leaves, and counts the same.
+        for present in ((), ("flake-narhash",)):
+            with self.subTest(present=present):
+                for name in ("flake-rev", "flake-narhash"):
+                    (self.state / name).unlink(missing_ok=True)
+                for name in present:
+                    self.state_stamp(name, NAR + "\n")
+                result = self.rebuild("switch")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.sudo_argv_list()[-1], REF + "#yolobox")
+                self.assertIn("no commit stamp in %s" % self.state, result.stderr)
+                self.assertIn("yo bootstrap pins it", result.stderr)
+
+    def test_a_commit_stamp_that_is_not_one_commit_is_refused_naming_the_file(self):
+        for text in (
+            "",
+            "\n",
+            REV + "\n" + REV + "\n",
+            "main\n",
+            REV[:-1] + "\n",
+            REV + "0\n",
+            REV.upper() + "\n",
+            REV + "?narHash=x\n",
+            "-" + REV[1:] + "\n",
+        ):
+            with self.subTest(text=text[:40]):
+                self.state_stamp("flake-rev", text)
+                self.assert_refused(
+                    self.rebuild("switch"), 1, str(self.state / "flake-rev")
+                )
+
+    def test_a_hash_stamp_that_is_not_one_sri_sha256_is_refused_naming_the_file(
+        self,
+    ):
+        path = self.state / "flake-narhash"
+        for text in (
+            None,
+            "",
+            "\n",
+            NAR + "\n" + NAR + "\n",
+            "sha256-" + "A" * 42 + "=\n",
+            "sha256-" + "A" * 44 + "\n",
+            "sha512-" + "A" * 43 + "=\n",
+            NAR.replace("A", "#", 1) + "\n",
+            NAR + "#evil\n",
+            NAR + " \n",
+        ):
+            with self.subTest(text=text if text is None else text[:40]):
+                if text is None:
+                    path.unlink()
+                else:
+                    self.state_stamp("flake-narhash", text)
+                self.assert_refused(self.rebuild("switch"), 1, str(path))
 
     def test_anything_but_one_switch_or_boot_is_a_usage_error(self):
         for args in (
@@ -975,10 +1045,13 @@ class TestRebuild(RebuildCase):
     def test_a_stamp_without_a_trailing_newline_is_read_whole(self):
         self.stamp("flake-ref", REF)
         self.stamp("hostname", "yolobox-e2e")
+        self.state_stamp("flake-rev", REV)
+        self.state_stamp("flake-narhash", NAR)
         result = self.rebuild("switch")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("YOLOBOX_FLAKE_REF=" + REF, self.sudo_argv_list())
         self.assertIn("YOLOBOX_HOSTNAME=yolobox-e2e", self.sudo_argv_list())
+        self.assertEqual(self.sudo_argv_list()[-1], PINNED + "#yolobox")
 
     def test_the_exit_code_of_the_rebuild_is_the_helpers(self):
         self.assertEqual(self.rebuild("switch", sudo_rc=4).returncode, 4)
@@ -1020,7 +1093,7 @@ class TestRebuildLock(RebuildCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.ran.read_text(),
-            "boot --impure --refresh --flake %s#yolobox\n" % REF
+            "boot --impure --refresh --flake %s#yolobox\n" % PINNED
             + "alice yolobox-e2e %s\n" % REF,
         )
 

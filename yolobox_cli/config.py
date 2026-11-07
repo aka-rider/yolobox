@@ -11,6 +11,11 @@ from .ui import YoError
 
 # Rewritten at build time: nix substituteInPlace, Homebrew inreplace.
 YO_VERSION = "dev"
+# The commit this yo was built from, rewritten by nix alone (flake.nix passes
+# self.rev; a dirty tree has none and stays "dev"). Brew builds from a release
+# tarball with no git metadata, so a brew yo keeps "dev" here and builds its
+# release tag instead (release.own_release_ref).
+YO_SOURCE_REV = "dev"
 
 DEFAULT_INSTANCE = "yolobox"
 # One DNS label (RFC 1123, lowercase). flake.nix matches the same pattern against

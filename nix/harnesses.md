@@ -185,6 +185,21 @@ here:
   the removal of pi's old npm package (see [pi](#pi)), where that package was
   installed.
 
+### Unpinned installers
+
+Both phases fetch a vendor script and run it, `curl -fsSL --proto '=https'
+--tlsv1.2 https://claude.ai/install.sh | bash -s latest` and the same for
+`https://pi.dev/install.sh`. Neither script is checksummed, on purpose: the
+vendors change them without notice, so a pinned hash would break every fresh
+box at the vendor's next edit, and the tools they install self-update anyway
+(`claude update`, `pi update`), as the agent, past any hash the box could hold.
+The two curl flags are what can be pinned: the fetch never follows a redirect
+off https and never negotiates below TLS 1.2. The rest of the boundary is that
+the installs run as the agent, inside the agent's home, with no `sudo`: a bad
+script gets what the agent already has, which is the box's hostile side by
+design (`docs/accounts.md`), and nothing of the operator's or root's. The
+supply-chain entry in `TODO.md` records this beside the flake pin.
+
 ## pi
 
 pi installs through its vendor's `install.sh`, not `npm install -g`.

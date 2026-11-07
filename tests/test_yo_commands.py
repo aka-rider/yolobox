@@ -32,10 +32,53 @@ def env_without(*names):
 
 
 class TestFlakeRef(FakeHome):
+    def setUp(self):
+        super().setUp()
+        # The hint asks the box whether its helper rebuilds; these tests are
+        # about the long command a box without it gets.
+        helper = mock.patch.object(yo.release, "helper_rebuilds", return_value=False)
+        helper.start()
+        self.addCleanup(helper.stop)
+
     def remember(self, ref):
         os.makedirs(os.path.dirname(yo.flake_ref_file()), exist_ok=True)
         with open(yo.flake_ref_file(), "w") as handle:
             handle.write(ref)
+
+    def test_a_box_whose_helper_rebuilds_is_told_to_use_it(self):
+        # yolobox-guest rebuild builds the stamped commit; the long command
+        # would follow the ref's tip past the pin.
+        self.remember("github:you/yolobox/x")
+        with mock.patch.object(yo.release, "helper_rebuilds", return_value=True):
+            self.assertEqual(yo.rebuild_hint(), "yo ssh yolobox-guest rebuild switch")
+
+    def test_a_remembered_old_release_is_answered_without_asking_the_box(self):
+        # That flake cannot be built by this yo at all, so the helper changes
+        # nothing, and a hint built while an error is reported asks nothing.
+        self.remember("github:aka-rider/yolobox/v1.9.1")
+        with (
+            mock.patch.object(yo.config, "YO_VERSION", A_RELEASE),
+            mock.patch.object(
+                yo.release, "helper_rebuilds", side_effect=AssertionError
+            ),
+        ):
+            self.assertIn("to keep it on release 1.9.1", yo.rebuild_hint())
+
+    def test_a_build_stamped_with_its_commit_builds_that_commit_not_its_version(self):
+        # A `nix run github:aka-rider/yolobox` yo is built from main while its
+        # .version names the last release; building the tag would skew the box.
+        rev = "0" * 40
+        with (
+            mock.patch.object(yo.config, "YO_VERSION", A_RELEASE),
+            mock.patch.object(yo.config, "YO_SOURCE_REV", rev),
+        ):
+            self.assertEqual(yo.flake_ref(None), "github:aka-rider/yolobox/" + rev)
+            self.assertEqual(yo.flake_ref("1.9.2"), "github:aka-rider/yolobox/v1.9.2")
+        with (
+            mock.patch.object(yo.config, "YO_VERSION", "dev"),
+            mock.patch.object(yo.config, "YO_SOURCE_REV", rev),
+        ):
+            self.assertEqual(yo.flake_ref(None), "github:aka-rider/yolobox/" + rev)
 
     def test_dev_build_without_a_version_refuses_with_no_pinned_flake(self):
         with mock.patch.object(yo.config, "YO_VERSION", "dev"):
@@ -358,6 +401,33 @@ class TestFlakeRef(FakeHome):
         with open(yo.flake_ref_file(), "wb") as handle:
             handle.write(b"github:x/y/\xff\n")
         self.assertEqual(yo.remembered_flake_ref(), "github:x/y/\udcff")
+
+
+class TestHelperRebuildsProbe(FakeHome):
+    """rebuild_hint asks the box whether its yolobox-guest has `rebuild`, with
+    no argument: its usage exit is the one yes, and a box that cannot be
+    reached is a no, never an error inside a hint."""
+
+    def test_only_the_usage_exit_of_the_helper_counts(self):
+        for exit_code, uses_helper in (
+            (2, True),
+            (64, False),
+            (127, False),
+            (0, False),
+        ):
+            with self.subTest(exit_code=exit_code):
+                probe = mock.Mock(returncode=exit_code, stdout="", stderr="")
+                with mock.patch.object(yo.sshx, "ssh_run", return_value=probe) as ssh:
+                    self.assertEqual(yo.release.helper_rebuilds(), uses_helper)
+                ssh.assert_called_once()
+                self.assertEqual(ssh.call_args.args[1], ["yolobox-guest", "rebuild"])
+
+    def test_an_unreachable_box_is_a_no(self):
+        unreachable = mock.Mock(
+            returncode=yo.config.SSH_UNREACHABLE, stdout="", stderr=""
+        )
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=unreachable):
+            self.assertFalse(yo.release.helper_rebuilds())
 
 
 class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
@@ -821,7 +891,11 @@ class TestBootstrapRebootDecision(FakeHome):
     def setUp(self):
         super().setUp()
         # Resolving the ref is TestBootstrapWarnsBeforeEncryptingInPlace's.
-        locked = mock.patch.object(yo.release, "locked_rev", return_value="0" * 40)
+        locked = mock.patch.object(
+            yo.release,
+            "locked_rev",
+            return_value=yo.release.LockedSource("0" * 40, "sha256-" + "A" * 43 + "="),
+        )
         locked.start()
         self.addCleanup(locked.stop)
         for module, name in (
@@ -976,9 +1050,13 @@ class TestBootstrapRebootDecision(FakeHome):
 
     def test_the_disk_is_grown_only_after_the_build_and_the_reboot(self):
         events = []
-        yo.sshx.ssh_run.side_effect = lambda *a, **k: (
-            events.append("build") or mock.Mock(returncode=0, stdout="", stderr="")
-        )
+
+        def fake_ssh_run(role, argv, **kwargs):
+            if "nixos-rebuild" in argv:
+                events.append("build")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        yo.sshx.ssh_run.side_effect = fake_ssh_run
         yo.vm_up.side_effect = lambda **k: events.append("vm_up") or b"p" * 64
         args = yo.build_parser().parse_args(
             ["bootstrap", "--version", "main", "--disk", "250"]
@@ -1162,8 +1240,12 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
     def run_bootstrap(self, fstype, df_line, rebuild_exit=0):
         rebuilds = self.rebuilds = []
         self.resolved = []
+        # Every box command in order, with what ssh fed it: (argv, stdin).
+        self.calls = []
+        stamps = iter(self.stamp_results)
 
         def fake_ssh_run(role, argv, **kwargs):
+            self.calls.append((list(argv), kwargs.get("stdin")))
             if argv[:2] == ["lsblk", "-dno"]:
                 return mock.Mock(returncode=0, stdout=fstype + "\n", stderr="")
             if argv == yo.guest.ROOT_USAGE_PROBE:
@@ -1176,6 +1258,10 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
             if argv[:3] == ["nix", "flake", "metadata"]:
                 self.resolved.append(argv)
                 return self.metadata
+            if argv[0] == "cat":
+                return self.previous
+            if argv[:2] == ["sudo", "install"]:
+                return next(stamps)
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         args = yo.build_parser().parse_args(["bootstrap", "--version", "github:x/y/z"])
@@ -1198,18 +1284,67 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
         return rebuilds
 
     REV = "0123456789abcdef0123456789abcdef01234567"
-    metadata = mock.Mock(
-        returncode=0, stdout=json.dumps({"locked": {"rev": REV}}), stderr=""
-    )
+    NAR = "sha256-" + "A" * 42 + "+="
+
+    def setUp(self):
+        super().setUp()
+        self.metadata = self.metadata_answer(self.REV, self.NAR)
+        # A box no yo has stamped: cat finds no file.
+        self.previous = mock.Mock(returncode=1, stdout="", stderr="No such file")
+        self.stamp_results = [
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+        ]
+
+    def metadata_answer(self, rev, nar_hash):
+        locked = {"locked": {"rev": rev, "narHash": nar_hash}}
+        return mock.Mock(returncode=0, stdout=json.dumps(locked), stderr="")
 
     def test_the_build_names_the_commit_the_ref_resolves_to_before_it_runs(self):
         self.run_bootstrap("crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /")
-        self.assertIn("building github:x/y/z at %s" % self.REV, " ".join(self.stdout))
+        self.assertIn(
+            "building github:x/y/z at %s (%s)" % (self.REV, self.NAR),
+            " ".join(self.stdout),
+        )
+        self.assertNotIn("the last bootstrap built", " ".join(self.stdout))
         # --refresh, or nix would answer from an old fetch of a moving branch.
         self.assertEqual(
             self.resolved,
             [["nix", "flake", "metadata", "--json", "--refresh", "github:x/y/z"]],
         )
+
+    def test_a_box_stamped_by_an_earlier_bootstrap_is_told_what_moves(self):
+        old_rev, old_nar = "f" * 40, "sha256-" + "B" * 43 + "="
+        self.previous = mock.Mock(
+            returncode=0, stdout="%s\n%s\n" % (old_rev, old_nar), stderr=""
+        )
+        self.run_bootstrap("crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /")
+        self.assertIn(
+            "the last bootstrap built %s (%s)" % (old_rev, old_nar),
+            " ".join(self.stdout),
+        )
+        # The same pair again is not news.
+        self.previous = mock.Mock(
+            returncode=0, stdout="%s\n%s\n" % (self.REV, self.NAR), stderr=""
+        )
+        self.run_bootstrap("crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /")
+        self.assertNotIn("the last bootstrap built", " ".join(self.stdout))
+
+    def test_stamps_that_do_not_parse_are_said_and_the_bootstrap_goes_on(self):
+        for text in (
+            "",
+            "lizard\n",
+            "%s\n" % self.REV,
+            "%s\n%s\n" % (self.NAR, self.REV),
+        ):
+            with self.subTest(text=text[:20]):
+                self.previous = mock.Mock(returncode=0, stdout=text, stderr="")
+                rebuilds = self.run_bootstrap(
+                    "crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /"
+                )
+                self.assertEqual(len(rebuilds), 1)
+                self.assertIn("do not hold a commit and its narHash", self.stderr)
+                self.assertNotIn("the last bootstrap built", " ".join(self.stdout))
 
     def test_a_ref_the_box_cannot_resolve_stops_before_the_build(self):
         for metadata, needle in (
@@ -1219,11 +1354,17 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
             (
                 mock.Mock(
                     returncode=0,
-                    stdout=json.dumps({"locked": {"rev": "main"}}),
+                    stdout=json.dumps({"locked": {"rev": self.REV}}),
                     stderr="",
                 ),
-                "not a commit",
+                "no locked commit and narHash",
             ),
+            (self.metadata_answer("main", self.NAR), "not a commit"),
+            (self.metadata_answer(None, self.NAR), "not a commit"),
+            (self.metadata_answer(self.REV, "sha256-" + "A" * 43), "not an SRI"),
+            (self.metadata_answer(self.REV, "sha1-" + "A" * 43 + "="), "not an SRI"),
+            (self.metadata_answer(self.REV, self.NAR + "#x"), "not an SRI"),
+            (self.metadata_answer(self.REV, 42), "not an SRI"),
         ):
             with self.subTest(needle=needle):
                 self.metadata = metadata
@@ -1234,6 +1375,62 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
                 self.assertIn(needle, caught.exception.message)
                 self.assertEqual(self.rebuilds, [])
 
+    def stamp_writes(self):
+        return [
+            (argv, stdin)
+            for argv, stdin in self.calls
+            if argv[:2] == ["sudo", "install"]
+        ]
+
+    def test_the_commit_and_hash_are_stamped_into_the_box_after_the_build(self):
+        # Hash first, then commit (release.write_stamps says why), each fed on
+        # stdin to a root install, and only once the build has succeeded.
+        self.run_bootstrap("crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /")
+        install = ["sudo", "install", "-D", "-m", "0644", "/dev/stdin"]
+        self.assertEqual(
+            self.stamp_writes(),
+            [
+                (
+                    install + ["/var/lib/yolobox/flake-narhash"],
+                    (self.NAR + "\n").encode(),
+                ),
+                (install + ["/var/lib/yolobox/flake-rev"], (self.REV + "\n").encode()),
+            ],
+        )
+        argvs = [argv for argv, _ in self.calls]
+        self.assertLess(
+            argvs.index(self.rebuilds[0]),
+            argvs.index(install + ["/var/lib/yolobox/flake-narhash"]),
+        )
+
+    def test_a_failed_build_stamps_nothing(self):
+        with self.assertRaises(yo.YoError):
+            self.run_bootstrap(
+                "crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /", rebuild_exit=1
+            )
+        self.assertEqual(self.stamp_writes(), [])
+
+    def test_a_stamp_the_box_refuses_fails_the_bootstrap_saying_the_system_is_built(
+        self,
+    ):
+        for failing in (0, 1):
+            with self.subTest(failing=failing):
+                self.stamp_results = [
+                    mock.Mock(returncode=0, stdout="", stderr=""),
+                    mock.Mock(returncode=0, stdout="", stderr=""),
+                ]
+                self.stamp_results[failing] = mock.Mock(
+                    returncode=1, stdout="", stderr="read-only file system"
+                )
+                with self.assertRaises(yo.YoError) as caught:
+                    self.run_bootstrap(
+                        "crypto_LUKS", "/dev/mapper/root 1000 990 10 99% /"
+                    )
+                self.assertIn("read-only file system", caught.exception.message)
+                self.assertIn("the system is built", caught.exception.message)
+                self.assertIn("yo bootstrap", caught.exception.message)
+                self.assertEqual(len(self.stamp_writes()), failing + 1)
+
     def test_an_unencrypted_disk_gets_the_no_interruption_warning(self):
         rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /")
         self.assertEqual(len(rebuilds), 1)
@@ -1242,7 +1439,8 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
 
     def test_the_rebuild_builds_the_resolved_commit_and_stamps_the_ref(self):
         # The commit yo printed is the one built, even if the branch moves in
-        # between; the box still stamps the branch it follows.
+        # between, and nix refuses a tree of another NAR hash; the box still
+        # stamps the branch it follows.
         rebuilds = self.run_bootstrap("ext4", "/dev/vda2 1000 500 500 50% /")
         self.assertEqual(
             rebuilds[0],
@@ -1261,7 +1459,7 @@ class TestBootstrapWarnsBeforeEncryptingInPlace(FakeHome):
                 "--impure",
                 "--refresh",
                 "--flake",
-                "github:x/y/%s#yolobox" % self.REV,
+                "github:x/y/%s?narHash=%s#yolobox" % (self.REV, self.NAR),
             ],
         )
 
@@ -3275,7 +3473,7 @@ class TestGuestDetailIsQuotedInEveryNotCheckedLine(unittest.TestCase):
                     stdout=self.guest(GUEST_FORGERY),
                     stderr=self.guest(""),
                 ),
-                "nix flake metadata printed no locked commit for github:x/y/z:\n",
+                "nix flake metadata printed no locked commit and narHash for github:x/y/z:\n",
             ),
         ):
             with self.subTest(head=head):

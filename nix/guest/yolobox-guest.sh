@@ -83,6 +83,17 @@ want_args() {
         exit 2
     fi
 }
+# Where yo bootstrap stamps the commit it built and the NAR hash of its tree
+# (yo's STATE_DIR, REV_STAMP and NARHASH_STAMP): state, never the system, so
+# a docs-only commit keeps the generation. A box bootstrapped by an older yo
+# has neither file. The YOLOBOX_STATE_DIR override is a test seam.
+YOLOBOX_STATE_DIR="${YOLOBOX_STATE_DIR:-/var/lib/yolobox}"
+
+# What the two stamps must hold before either reaches the --flake argument,
+# equal to yo's COMMIT_RE and NARHASH_RE: a commit, and an SRI sha256 (43
+# base64 characters and one '='). Matched whole, so they carry no anchors.
+REV_RE='[0-9a-f]{40}'
+NARHASH_RE='sha256-[A-Za-z0-9+/]{43}='
 
 # Sets EXPR to a find expression matching any of the given directory names.
 build_expr() {
@@ -890,20 +901,53 @@ read_stamp() {
     printf '%s\n' "${value}"
 }
 
+# Prints the flake a rebuild of `ref` builds: the stamped commit with its NAR
+# hash (github:OWNER/REPO/<rev>?narHash=<hash>, as yo bootstrap built it; nix
+# refuses a tree whose hash differs), or, on a box no yo has stamped, the ref
+# by name, said aloud. A commit stamp that is missing its hash, or either
+# stamp that is not one value of its shape, refuses naming the file: the
+# stamps are root's, so this is defence in depth for the --flake argument.
+# A hash without a commit is what an interrupted bootstrap leaves, and it is
+# ignored.
+pinned_flake() {
+    local ref=$1 rev nar
+    if [ ! -f "${YOLOBOX_STATE_DIR}/flake-rev" ]; then
+        printf 'yolobox-guest: rebuild: no commit stamp in %s (the box was bootstrapped by an older yo), so this builds %s at its tip; yo bootstrap pins it\n' \
+            "${YOLOBOX_STATE_DIR}" "${ref}" >&2
+        printf '%s\n' "${ref}"
+        return 0
+    fi
+    rev=$(read_stamp "${YOLOBOX_STATE_DIR}/flake-rev") || return 1
+    if [[ ! "${rev}" =~ ^${REV_RE}$ ]]; then
+        printf 'yolobox-guest: rebuild: %s/flake-rev is not a commit; run yo bootstrap on the host to rewrite it\n' \
+            "${YOLOBOX_STATE_DIR}" >&2
+        return 1
+    fi
+    nar=$(read_stamp "${YOLOBOX_STATE_DIR}/flake-narhash") || return 1
+    if [[ ! "${nar}" =~ ^${NARHASH_RE}$ ]]; then
+        printf 'yolobox-guest: rebuild: %s/flake-narhash is not an SRI sha256; run yo bootstrap on the host to rewrite it\n' \
+            "${YOLOBOX_STATE_DIR}" >&2
+        return 1
+    fi
+    printf '%s/%s?narHash=%s\n' "${ref%/*}" "${rev}" "${nar}"
+}
+
 # The one way to rebuild the box from inside it: the flake ref and hostname
 # come from the stamps of the build that made the box, so a hand rebuild can
-# neither rename an -m machine nor switch trees. A different ref goes through
-# `yo bootstrap --version` on the host. Only switch and boot, because they are
-# the actions that keep the box what yo built. The flags are yo's
-# NIX_REBUILD_FLAGS: --refresh, because a stamped branch moves and nix would
-# reuse an hour-old fetch of it.
+# neither rename an -m machine nor switch trees, and the commit and NAR hash
+# come from what yo bootstrap stamped, so it cannot move along a branch
+# either (pinned_flake). A different ref goes through `yo bootstrap --version`
+# on the host. Only switch and boot, because they are the actions that keep
+# the box what yo built. The flags are yo's NIX_REBUILD_FLAGS: --refresh,
+# because an unstamped box builds the ref by name, and a branch moves while
+# nix would reuse an hour-old fetch of it.
 cmd_rebuild() {
     want_args rebuild 'rebuild switch|boot' 1 "$@"
     if [ "$1" != switch ] && [ "$1" != boot ]; then
         printf 'yolobox-guest: rebuild: usage: rebuild switch|boot\n' >&2
         exit 2
     fi
-    local action=$1 uid user ref host
+    local action=$1 uid user ref host flake
     uid=$(id -u)
     if [ "${uid}" != "${OPERATOR_UID}" ]; then
         printf 'yolobox-guest: rebuild: run as the operator (uid %s), not uid %s\n' \
@@ -922,11 +966,12 @@ cmd_rebuild() {
             "${YOLOBOX_STAMPS}" >&2
         exit 1
     fi
+    flake=$(pinned_flake "${ref}") || exit 1
     user=$(id -un)
     local status=0
     sudo env "YOLOBOX_USERNAME=${user}" "YOLOBOX_HOSTNAME=${host}" \
         "YOLOBOX_FLAKE_REF=${ref}" flock -n -E "${REBUILD_BUSY_EXIT}" "${REBUILD_LOCK}" \
-        nixos-rebuild "${action}" --impure --refresh --flake "${ref}#yolobox" || status=$?
+        nixos-rebuild "${action}" --impure --refresh --flake "${flake}#yolobox" || status=$?
     if [ "${status}" -eq "${REBUILD_BUSY_EXIT}" ]; then
         printf 'yolobox-guest: rebuild: another rebuild is running (it holds %s); wait for it to finish\n' \
             "${REBUILD_LOCK}" >&2

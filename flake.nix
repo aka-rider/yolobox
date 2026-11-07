@@ -80,7 +80,14 @@
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
-          yolobox = pkgs.callPackage ./nix/pkgs/yolobox.nix { src = self; inherit version; };
+          # self.rev exists only for a clean git tree (a fetched github: ref
+          # always is one); a dirty tree builds a yo that keeps "dev" there
+          # and so builds its release tag, like a brew yo.
+          yolobox = pkgs.callPackage ./nix/pkgs/yolobox.nix {
+            src = self;
+            inherit version;
+            sourceRev = self.rev or "dev";
+          };
         in {
           inherit yolobox;
           default = yolobox;

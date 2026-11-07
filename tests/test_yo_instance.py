@@ -991,7 +991,11 @@ class TestRemediesNameTheMachine(FakeHome):
             )
 
     def test_another_machine_is_named_in_the_remedies(self):
-        with as_instance("box2"), mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
+        with (
+            as_instance("box2"),
+            mock.patch.object(yo.config, "YO_VERSION", A_RELEASE),
+            mock.patch.object(yo.release, "helper_rebuilds", return_value=False),
+        ):
             self.assertEqual(yo.yo_cmd("up"), "yo -m box2 up")
             self.assertIn(
                 "yo -m box2 bootstrap", yo.version_drift(A_RELEASE, "0.9.0", None)

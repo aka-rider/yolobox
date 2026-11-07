@@ -8,9 +8,10 @@ import os
 import pwd
 import re
 import shlex
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from . import config, proc, sshx, state, ui
+from .config import HELPER
 from .ui import YoError
 
 
@@ -128,11 +129,17 @@ def old_release_refusal(old: str) -> str:
 
 
 def own_release_ref() -> Optional[str]:
-    """This yo's own release ref; None for an unreleased build, which has none
-    it can build: `dev`, or a build of main whose .version still names a
-    release that predates FIRST_HOST_OS_FREE_RELEASE. A build of main stamped
-    with a later release cannot be told from that release and claims it
-    (docs/distribution.md)."""
+    """The ref this yo builds by default: the commit it was built from when nix
+    stamped one (YO_SOURCE_REV), else its release tag. None for an unreleased
+    build, which has none it can build: `dev`, or a build of main whose
+    .version still names a release that predates FIRST_HOST_OS_FREE_RELEASE.
+
+    The commit comes first because a `nix run github:aka-rider/yolobox` yo is
+    built from main while its .version names the last release: building that
+    tag would give a box of another tree than the yo, and `yo status` would
+    report a skew no bootstrap can fix (docs/distribution.md)."""
+    if config.YO_SOURCE_REV != "dev":
+        return "%s/%s" % (UPSTREAM_FLAKE, config.YO_SOURCE_REV)
     if config.YO_VERSION == "dev":
         return None
     ref = "%s/v%s" % (UPSTREAM_FLAKE, config.YO_VERSION)
@@ -245,6 +252,8 @@ def rebuild_hint() -> str:
                 )
             )
             ref = None
+    if helper_rebuilds():
+        return "%s %s rebuild switch" % (state.yo_cmd("ssh"), HELPER)
     if ref is None:
         try:
             ref = flake_ref(None)
@@ -261,14 +270,28 @@ def rebuild_hint() -> str:
     )
 
 
+def helper_rebuilds() -> bool:
+    """Whether the box's yolobox-guest has `rebuild`, which builds the commit
+    the last bootstrap stamped (nix/guest/yolobox-guest.md#rebuild). With no
+    argument it prints its usage and exits 2 before touching sudo; an older
+    helper exits 64, a box without one 127, and a box that cannot be reached
+    gets the long command, to paste once it is up."""
+    try:
+        probe = sshx.probe(sshx.OPERATOR, [HELPER, "rebuild"])
+    except sshx.Unreachable:
+        return False
+    return probe.returncode == 2
+
+
 # The flags of every nixos-rebuild yo runs or prints, and yolobox-guest's
 # `rebuild` passes the same (tests/test_consistency.py). --impure lets the
 # flake read the nix_env variables. --refresh refetches the ref: a branch
 # moves, and nix would otherwise reuse a fetch younger than tarball-ttl (an
 # hour) and silently build the commit it held then. yo bootstrap's own build
 # names a commit (nixos_rebuild_argv), so there the flag is harmless; it
-# matters for locked_rev's lookup and for the printed hint and yolobox-guest's
-# rebuild, which build the ref by name.
+# matters for locked_rev's lookup, for the printed long-form hint and for
+# yolobox-guest's rebuild on a box no bootstrap has stamped, which build the
+# ref by name.
 NIX_REBUILD_FLAGS = ("--impure", "--refresh")
 
 
@@ -293,13 +316,17 @@ def rebuild_busy_message() -> str:
     )
 
 
-def nixos_rebuild_argv(action: str, username: str, ref: str, rev: str) -> List[str]:
-    """The box's `sudo ... flock ... nixos-rebuild ACTION` of `ref` at commit `rev`.
+def nixos_rebuild_argv(
+    action: str, username: str, ref: str, source: "LockedSource"
+) -> List[str]:
+    """The box's `sudo ... flock ... nixos-rebuild ACTION` of `ref` at `source`.
 
-    It builds the commit itself (github:OWNER/REPO/<rev>), so what yo printed
-    is what is built, even if the branch moves meanwhile. YOLOBOX_FLAKE_REF
-    stays `ref`, so the box stamps the branch it follows, and the system is the
-    same derivation either way: it depends on the source, not on its name."""
+    It builds the commit itself (github:OWNER/REPO/<rev>?narHash=<hash>), so
+    what yo printed is what is built, even if the branch moves meanwhile, and
+    nix refuses a tree whose NAR hash is not the one metadata saw.
+    YOLOBOX_FLAKE_REF stays `ref`, so the box stamps the branch it follows, and
+    the system is the same derivation either way: it depends on the source,
+    not on its name."""
     return [
         "sudo",
         *nix_env(username, ref),
@@ -312,13 +339,14 @@ def nixos_rebuild_argv(action: str, username: str, ref: str, rev: str) -> List[s
         action,
         *NIX_REBUILD_FLAGS,
         "--flake",
-        "%s#yolobox" % pinned_ref(ref, rev),
+        "%s#yolobox" % pinned_ref(ref, source),
     ]
 
 
-def pinned_ref(ref: str, rev: str) -> str:
-    """github:OWNER/REPO/<rev> for `ref` (github:OWNER/REPO/REF), at commit `rev`."""
-    return "%s/%s" % (ref.rsplit("/", 1)[0], rev)
+def pinned_ref(ref: str, source: "LockedSource") -> str:
+    """github:OWNER/REPO/<rev>?narHash=<hash> for `ref` (github:OWNER/REPO/REF)
+    at `source`. yolobox-guest's `rebuild` spells it the same from the stamps."""
+    return "%s/%s?narHash=%s" % (ref.rsplit("/", 1)[0], source.rev, source.nar_hash)
 
 
 VERSION_STAMP = "/etc/yolobox/version"
@@ -345,16 +373,30 @@ def built_by() -> Optional[str]:
     return ui.shown(version[:STAMP_SHOWN_CHARS])
 
 
+# A commit, and the SRI NAR hash of its tree (sha256 in base64: 43 characters
+# and one `=`). yolobox-guest's `rebuild` matches the stamps against the same
+# two (REV_RE, NARHASH_RE; tests/test_consistency.py) before either reaches
+# an argv.
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+NARHASH_RE = re.compile(r"sha256-[A-Za-z0-9+/]{43}=")
 
 
-def locked_rev(ref: str) -> str:
-    """The commit `ref` names now, fetched afresh by the box's own nix.
+class LockedSource(NamedTuple):
+    """What a ref resolved to: the commit and the NAR hash of its tree."""
+
+    rev: str
+    nar_hash: str
+
+
+def locked_rev(ref: str) -> LockedSource:
+    """What `ref` names now, fetched afresh by the box's own nix.
 
     A branch moves, so the rebuild that follows builds this commit by name
-    (nixos_rebuild_argv), not the branch. Not stamped into the system: a
-    stamp would make every commit a new generation, and with it a reboot,
-    even for one that changes only docs."""
+    (nixos_rebuild_argv), not the branch, and the NAR hash makes nix refuse a
+    tree that differs from the one this metadata saw. Both are stamped as
+    state (write_stamps), never into the system: a stamp there would make
+    every commit a new generation, and with it a reboot, even for one that
+    changes only docs."""
     completed = sshx.probe(
         sshx.OPERATOR,
         ["nix", "flake", "metadata", "--json", "--refresh", ref],
@@ -365,15 +407,82 @@ def locked_rev(ref: str) -> str:
             % (ref, completed.returncode, proc.what_it_said(completed))
         )
     try:
-        rev = json.loads(completed.stdout)["locked"]["rev"]
+        locked = json.loads(completed.stdout)["locked"]
+        rev, nar_hash = locked["rev"], locked["narHash"]
     except (ValueError, KeyError, TypeError):
         raise YoError(
-            "nix flake metadata printed no locked commit for %s%s"
+            "nix flake metadata printed no locked commit and narHash for %s%s"
             % (ref, proc.what_it_said(completed))
         )
     if not isinstance(rev, str) or not COMMIT_RE.fullmatch(rev):
         raise YoError("nix flake metadata locked %s at %r, not a commit" % (ref, rev))
-    return rev
+    if not isinstance(nar_hash, str) or not NARHASH_RE.fullmatch(nar_hash):
+        raise YoError(
+            "nix flake metadata locked %s with narHash %r, not an SRI sha256"
+            % (ref, nar_hash)
+        )
+    return LockedSource(rev, nar_hash)
+
+
+# Where yo bootstrap stamps what it built, one line each: the commit and the
+# NAR hash of its tree. State under /var/lib, root's and world-readable,
+# written by yo after nixos-rebuild succeeds and never by nix, so the system
+# derivation does not depend on them. yolobox-guest's `rebuild` reads them
+# from the same paths (tests/test_consistency.py) and builds exactly that
+# tree; nix/base.nix declares the directory to tmpfiles.
+STATE_DIR = "/var/lib/yolobox"
+REV_STAMP = STATE_DIR + "/flake-rev"
+NARHASH_STAMP = STATE_DIR + "/flake-narhash"
+
+
+def stamp_argv(path: str) -> List[str]:
+    """The box's `sudo install` of `path` from what ssh feeds it on stdin."""
+    return ["sudo", "install", "-D", "-m", "0644", "/dev/stdin", path]
+
+
+def write_stamps(source: LockedSource) -> None:
+    """Stamp `source` into the box, the NAR hash first: a failed first write
+    leaves the pair the last bootstrap wrote, and a failed second leaves a
+    hash without a commit, which `rebuild` ignores and follows the ref."""
+    for path, value in ((NARHASH_STAMP, source.nar_hash), (REV_STAMP, source.rev)):
+        completed = sshx.probe(
+            sshx.OPERATOR, stamp_argv(path), stdin=(value + "\n").encode()
+        )
+        if completed.returncode != 0:
+            raise YoError(
+                "%s (the system is built, but the box's `%s rebuild` cannot pin "
+                "this commit until %s succeeds)"
+                % (
+                    proc.failed_message(
+                        shlex.join(stamp_argv(path)),
+                        completed.returncode,
+                        proc.failure_detail(completed),
+                        "on the box",
+                    ),
+                    HELPER,
+                    state.yo_cmd("bootstrap"),
+                )
+            )
+
+
+def read_stamps() -> Optional[LockedSource]:
+    """What the last bootstrap stamped; None for a box with no stamps, which an
+    older yo built. A pair that does not parse is said, then overwritten."""
+    completed = sshx.probe(sshx.OPERATOR, ["cat", REV_STAMP, NARHASH_STAMP])
+    if completed.returncode != 0:
+        return None
+    lines = completed.stdout.splitlines()
+    if (
+        len(lines) == 2
+        and COMMIT_RE.fullmatch(lines[0])
+        and NARHASH_RE.fullmatch(lines[1])
+    ):
+        return LockedSource(lines[0], lines[1])
+    ui.err(
+        "yo: %s and %s on the box do not hold a commit and its narHash; this "
+        "bootstrap rewrites them" % (REV_STAMP, NARHASH_STAMP)
+    )
+    return None
 
 
 def helper_skew(what: str) -> str:

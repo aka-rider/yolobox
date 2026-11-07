@@ -3,6 +3,7 @@
 , makeWrapper
 , src
 , version
+, sourceRev
 , fzf
 , openssh
 , python3
@@ -44,8 +45,12 @@ stdenvNoCC.mkDerivation {
     install -Dm755 aws-broker "$out/libexec/yolobox/aws-broker"
     cp -r yolobox_cli "$out/libexec/yolobox/yolobox_cli"
     ${if stdenvNoCC.hostPlatform.isDarwin then darwinFiles else linuxFiles}
+    # The commit too, so a yo built from main builds that very tree, not the
+    # tag .version names (release.own_release_ref). Brew patches only the
+    # version: a release tarball has no commit to stamp.
     substituteInPlace "$out/libexec/yolobox/yolobox_cli/config.py" \
-      --replace-fail 'YO_VERSION = "dev"' 'YO_VERSION = "${version}"'
+      --replace-fail 'YO_VERSION = "dev"' 'YO_VERSION = "${version}"' \
+      --replace-fail 'YO_SOURCE_REV = "dev"' 'YO_SOURCE_REV = "${sourceRev}"'
 
     patchShebangs "$out/libexec/yolobox/yo" "$out/libexec/yolobox/aws-broker"
 

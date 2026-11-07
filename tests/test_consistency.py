@@ -2355,3 +2355,71 @@ class TestProcMountOptionsHaveOneSpelling(unittest.TestCase):
             for o in options
         ]
         self.assertEqual(spelled.split(), rendered)
+
+
+class TestRevStampsAreOneFact(unittest.TestCase):
+    """yo bootstrap writes the commit and NAR hash stamps that yolobox-guest's
+    `rebuild` reads: the paths, and the shape each value must have before it
+    reaches an argv, are spelled on both sides. The stamps are state under
+    /var/lib, which base.nix declares to tmpfiles and never renders into the
+    system, so a docs-only commit keeps the generation."""
+
+    def test_the_state_directory_and_the_two_files_are_yos(self):
+        state_dir = re.fullmatch(
+            r"\$\{YOLOBOX_STATE_DIR:-(.*)\}", guest_script_constant("YOLOBOX_STATE_DIR")
+        )
+        self.assertIsNotNone(state_dir, "YOLOBOX_STATE_DIR lost its override spelling")
+        self.assertEqual(state_dir.group(1), yo.release.STATE_DIR)
+        read = set(
+            re.findall(
+                r'"\$\{YOLOBOX_STATE_DIR\}/([a-z-]+)"',
+                guest_script_function("pinned_flake"),
+            )
+        )
+        yo_files = {
+            os.path.basename(path)
+            for path in (yo.release.REV_STAMP, yo.release.NARHASH_STAMP)
+        }
+        self.assertEqual(read, yo_files)
+        for path in (yo.release.REV_STAMP, yo.release.NARHASH_STAMP):
+            self.assertEqual(os.path.dirname(path), yo.release.STATE_DIR)
+
+    def test_the_value_shapes_are_yos(self):
+        self.assertEqual(guest_script_constant("REV_RE"), yo.release.COMMIT_RE.pattern)
+        self.assertEqual(
+            guest_script_constant("NARHASH_RE"), yo.release.NARHASH_RE.pattern
+        )
+
+    def test_base_nix_declares_the_directory_and_renders_neither_stamp(self):
+        base = (REPO / "nix" / "base.nix").read_text()
+        self.assertIn('"d %s 0755 root root -"' % yo.release.STATE_DIR, base)
+        for path in (yo.release.REV_STAMP, yo.release.NARHASH_STAMP):
+            self.assertNotIn(path, base)
+            self.assertNotIn('"yolobox/%s"' % os.path.basename(path), base)
+
+
+class TestYoSourceRevLiteral(unittest.TestCase):
+    """nix stamps the commit a yo was built from into config.py (as it does
+    the version), so a yo built from main builds that tree and not the tag its
+    .version names. Brew builds from a tarball with no commit, so it must not
+    touch the literal: a brew yo stays `dev` there and builds its tag."""
+
+    def literal_lines(self, name):
+        text = (REPO / "yolobox_cli" / "config.py").read_text()
+        return text.splitlines().count('%s = "dev"' % name)
+
+    def test_config_has_exactly_one_line_that_is_the_dev_source_rev_literal(self):
+        self.assertEqual(self.literal_lines("YO_SOURCE_REV"), 1)
+
+    def test_nix_patches_the_literal_from_the_flakes_own_rev_and_brew_does_not(self):
+        nix = (REPO / "nix" / "pkgs" / "yolobox.nix").read_text()
+        self.assertIn(
+            """--replace-fail 'YO_SOURCE_REV = "dev"' 'YO_SOURCE_REV = "${sourceRev}"'""",
+            nix,
+        )
+        self.assertIn("\n, sourceRev\n", nix, "yolobox.nix takes no sourceRev")
+        flake = (REPO / "flake.nix").read_text()
+        self.assertIn('sourceRev = self.rev or "dev";', flake)
+        self.assertNotIn(
+            "YO_SOURCE_REV", (REPO / "homebrew" / "yolobox.rb").read_text()
+        )
