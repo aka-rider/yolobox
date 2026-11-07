@@ -152,6 +152,14 @@ let
   # podman's socket group is root-equivalent (nix/podman.nix).
   forbiddenAgentGroups = [ "wheel" "systemd-journal" "adm" "podman" ];
   forbiddenGroupsHeld = lib.intersectLists forbiddenAgentGroups agentGroups;
+
+  # /proc with hidepid: the agent sees no pid but its own, so it cannot read
+  # the operator's or root's cmdline, environ or fds while a command runs.
+  # gid= names the one group that still sees every pid, wheel, so the
+  # operator's tools work as before. The first three repeat nixpkgs' default
+  # (tasks/filesystems.nix), so the list reads whole. tests/box-hardening-check.sh
+  # reads the mount back; test_consistency.py compares the two spellings.
+  procOptions = [ "nosuid" "noexec" "nodev" "hidepid=invisible" "gid=${toString config.users.groups.wheel.gid}" ];
 in
 {
   options.yolobox.hardening.extraWrappers = lib.mkOption {
@@ -199,6 +207,13 @@ in
     security.wrappers = lib.genAttrs
       [ "su" "sg" "newgrp" "chsh" "passwd" "mount" "umount" ]
       (_: { enable = false; });
+
+    # NixOS remounts a special filesystem on switch, so this needs no reboot.
+    boot.specialFileSystems."/proc".options = procOptions;
+    # logind reads /proc/<pid> of every session it tracks. CAP_SYS_PTRACE is
+    # what exempts a process from hidepid, and logind's unit drops it from
+    # its bounding set, so logind takes the gid= group instead.
+    systemd.services.systemd-logind.serviceConfig.SupplementaryGroups = [ "wheel" ];
 
     assertions = [
       {

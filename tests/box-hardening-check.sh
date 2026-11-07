@@ -23,7 +23,8 @@
 # The hardening half proves the box holds against the agent: sysctls, kernel
 # parameters, blocked modules (sockets and link kinds), io_uring, the
 # wrapper set and each wrapper's privilege, no setuid su, sudo closed to the
-# agent, root and the agent locked, the agent's groups, the 1Password proxy
+# agent, root and the agent locked, the agent's groups, /proc hiding every
+# other account's pids from the agent, the 1Password proxy
 # confined, sshd's settings, the tailscale pin, no forwarding, the gateway's
 # ssh port closed to the agent and to its containers, the operator refused
 # to the agent's forwarded 1Password agent (SKIP, and nothing tested, when
@@ -34,7 +35,8 @@
 #
 # The compat half proves nothing the agent needs broke: net-check, the kept
 # qdisc, podman, chromium, a nix build, strace -p, the harness binaries, the
-# herdr server's oom_score_adj, rosetta on an aarch64 guest, the host OS stamp
+# herdr server's oom_score_adj, the agent's user manager, logind and the
+# system bus answering the agent, rosetta on an aarch64 guest, the host OS stamp
 # absent, the Lima guest agent running exactly when Lima's cidata ships it,
 # `yolobox-guest rebuild` present, github.com's host key pinned.
 #
@@ -61,6 +63,9 @@ readonly GATEWAY_ADDR=192.168.5.2
 readonly GUEST_ADDR=192.168.5.15
 # What sshd logs when AllowUsers refuses a name (openssh auth.c allowed_user).
 readonly ALLOWUSERS_REFUSAL="not allowed because not listed in AllowUsers"
+# /proc's mount options (nix/hardening.nix procOptions); gid=1 is wheel, the
+# one group that sees every pid.
+readonly PROC_OPTIONS="nosuid noexec nodev hidepid=invisible gid=1"
 
 WORK=""
 AGENT_HOME=""
@@ -586,6 +591,34 @@ check_accounts_locked() {
     ok "${AGENT_USER} is uid ${AGENT_UID} in the groups: ${want}"
 }
 
+# /proc is mounted with hidepid (nix/hardening.nix procOptions), so the agent
+# sees no pid but its own: not root's, not the operator's. The mount is read
+# back whole first, because a lost nosuid or gid= is as much a regression as
+# a lost hidepid. Then the agent is made to look: at pid 1, at this operator
+# shell, and at the whole table through ps.
+check_hidepid() {
+    local options opt pid out users
+    options=$(findmnt -no OPTIONS /proc) || fail "findmnt -no OPTIONS /proc failed: the mount cannot be read back"
+    [ -n "${options}" ] || fail "findmnt printed no options for /proc"
+    for opt in ${PROC_OPTIONS}; do
+        grep -qxF -- "${opt}" <<<"${options//,/$'\n'}" || fail "/proc is mounted without ${opt}: ${options}"
+    done
+    ok "/proc is mounted with ${PROC_OPTIONS// /,}"
+    for pid in 1 $$; do
+        if out=$(as_agent_bare "${SYSBIN}/ls" "/proc/${pid}" 2>&1); then
+            fail "the agent listed /proc/${pid} (${out//$'\n'/ })"
+        fi
+        case ${out} in
+        *"No such file or directory"*) ;;
+        *) fail "ls /proc/${pid} as the agent failed, but not with ENOENT, so the pid is visible and only unreadable: ${out}" ;;
+        esac
+    done
+    users=$(as_agent_bare "${SYSBIN}/ps" -eo user= | awk '{ print $1 }' | LC_ALL=C sort -u | paste -sd' ' -) ||
+        fail "ps -eo user failed as the agent"
+    [ "${users}" = "${AGENT_USER}" ] || fail "ps as the agent lists the processes of '${users}', want ${AGENT_USER} alone"
+    ok "the agent sees neither /proc/1 nor /proc/$$ (the operator's shell), and ps shows it ${AGENT_USER}'s processes alone"
+}
+
 # The forwarded 1Password socket reaches the agent through a proxy unit
 # (nix/base.nix, docs/ssh.md) that must hold nothing but the two sockets: no
 # writable system, no homes, no network, unix sockets only. The positive
@@ -846,6 +879,7 @@ hardening_checks() {
     check_no_su
     check_sudo_refuses_agent
     check_accounts_locked
+    check_hidepid
     check_proxy_confined
     check_sshd_settings
     check_tailscale_version
@@ -1064,6 +1098,21 @@ check_herdr_server_oom_score() {
     ok "${unit} runs with oom_score_adj ${score}"
 }
 
+# What hidepid must leave working for the agent: its user manager (the same
+# uid, so unaffected), logind (which runs with wheel as a supplementary group,
+# nix/hardening.nix, and tracks the lingering agent) and the system bus
+# (dbus-broker reads a peer's credentials from the socket, not from /proc).
+check_agent_session_services() {
+    local state
+    state=$(as_agent systemctl --user is-active herdr-server) ||
+        fail "herdr-server is ${state:-unknown} under the agent's user manager"
+    as_agent loginctl --no-pager user-status "${AGENT_USER}" >/dev/null ||
+        fail "loginctl user-status ${AGENT_USER} failed as the agent: logind no longer tracks the agent"
+    as_agent busctl --no-pager status >/dev/null ||
+        fail "busctl status failed as the agent: the system bus does not answer it"
+    ok "the agent's user manager, logind and the system bus answer the agent"
+}
+
 check_rosetta() {
     local hello
     [ "$(head -n 1 /proc/sys/fs/binfmt_misc/rosetta)" = enabled ] ||
@@ -1085,6 +1134,7 @@ compat_checks() {
     check_strace
     check_vendors
     check_herdr_server_oom_score
+    check_agent_session_services
     # Rosetta follows the guest's CPU, as nix/base.nix gates it: an aarch64
     # guest runs only under Lima/vz on Apple silicon and must have it.
     if [ "$(uname -m)" = aarch64 ]; then

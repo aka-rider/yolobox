@@ -50,6 +50,12 @@ So the agent is not in the group, and `xvfb` and `openbox` are the agent's own u
 
 Recognise a regression by `id` as the agent listing anything but `users`, or by `journalctl -u sshd` as the agent printing system entries at all. Without the group it can show only the agent's own messages.
 
+## No /proc of other accounts
+
+The journal is not the only place the operator's command lines sit. While a command runs, its argv is in `/proc/<pid>/cmdline`, readable by every uid on a default `/proc`, so an agent polling that file could read the operator's `sudo` lines and root's unit arguments as they ran. `nix/hardening.nix` mounts `/proc` with `hidepid=invisible` and `wheel` as the `gid=` group: the agent sees only pids of its own uid, with the rest absent rather than unreadable, and the operator, in `wheel`, sees everything. logind gets `wheel` as a supplementary group because it reads `/proc/<pid>` of every session it tracks without the capability that would exempt it. The journal entry under [/proc](../nix/hardening.md#proc) in `nix/hardening.md` lists what was checked to be unaffected.
+
+Recognise a regression by `ls /proc/1` as the agent succeeding, or by `ps -eo user` as the agent naming any account but `agent`. `tests/box-hardening-check.sh` checks both.
+
 ## What the split does not do
 
 The split narrows what an agent can do. It does not isolate or contain it. The agent no longer has root by construction and cannot obtain it without a kernel exploit, which is a real narrowing. Left untouched by it, in plain terms:

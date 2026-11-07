@@ -2306,3 +2306,30 @@ class TestOperatorNamePatternHasOneSpelling(unittest.TestCase):
             r'builtins\.match "([^"]+)" username', nix_code(REPO / "nix" / "base.nix")
         )
         self.assertEqual(pattern, yo.libvirt.OPERATOR_ACCOUNT_RE.pattern)
+
+
+class TestProcMountOptionsHaveOneSpelling(unittest.TestCase):
+    """nix/hardening.nix mounts /proc with hidepid and wheel as the gid= group
+    (procOptions); tests/box-hardening-check.sh reads the mount back
+    (PROC_OPTIONS). The gid is read from the wheel group in nix and spelled as
+    the number findmnt prints in the script, where 1 is nixpkgs' ids.gids.wheel."""
+
+    WHEEL_GID = 1
+    GID_FROM_WHEEL = "gid=${toString config.users.groups.wheel.gid}"
+
+    def test_the_check_script_expects_the_proc_options_hardening_nix_sets(self):
+        options = hardening_nix_list("procOptions")
+        self.assertIn("hidepid=invisible", options)
+        self.assertIn(self.GID_FROM_WHEEL, options)
+        self.assertIn(
+            'boot.specialFileSystems."/proc".options = procOptions;',
+            nix_code(HARDENING_NIX),
+        )
+        (spelled,) = re.findall(
+            r'^readonly PROC_OPTIONS="([^"]*)"$', HARDENING_CHECK.read_text(), re.M
+        )
+        rendered = [
+            "gid=%d" % self.WHEEL_GID if o == self.GID_FROM_WHEEL else o
+            for o in options
+        ]
+        self.assertEqual(spelled.split(), rendered)
