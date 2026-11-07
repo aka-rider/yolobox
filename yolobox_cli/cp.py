@@ -72,7 +72,9 @@ def resolve_cp_operands(operands: List[str], cwd_mirror: Optional[str]) -> CpPla
             % state.yo_cmd("enter")
         )
     if sources_are_guest:
-        guest_paths = [resolve_guest_operand(source, cwd_mirror) for source in sources]
+        guest_paths = guest_sources(
+            [resolve_guest_operand(source, cwd_mirror) for source in sources]
+        )
         return CpPlan(
             direction="from_guest", local_paths=[dest], guest_paths=guest_paths
         )
@@ -82,8 +84,28 @@ def resolve_cp_operands(operands: List[str], cwd_mirror: Optional[str]) -> CpPla
     )
 
 
+def guest_sources(resolved: List[str]) -> List[str]:
+    """The sources of a download, each once, in the order given. Two sources
+    with one name would meet in the staging directory and merge silently, and
+    APFS folds case, so two names that differ only in case would meet too."""
+    sources = list(dict.fromkeys(resolved))
+    by_name: Dict[str, str] = {}
+    for source in sources:
+        name = posixpath.basename(source).casefold()
+        if name in by_name:
+            raise YoError(
+                'sources "%s" and "%s" would land under one name; copy them one at a time'
+                % (ui.shown(by_name[name]), ui.shown(source))
+            )
+        by_name[name] = source
+    return sources
+
+
 def cp_mkdir_target(dest_operand: str, resolved_dest: str, source_count: int) -> str:
-    if dest_operand == ":" or dest_operand.endswith("/") or source_count > 1:
+    # A spelling whose last component is empty (":", ":x/"), "." or ".." names
+    # a directory, as it does for cp; so does any destination of two sources.
+    names_a_directory = posixpath.basename(dest_operand[1:]) in ("", ".", "..")
+    if names_a_directory or source_count > 1:
         return resolved_dest
     return os.path.dirname(resolved_dest)
 
@@ -114,7 +136,16 @@ def walk_failure(failure: OSError) -> None:
     )
 
 
-def refuse_symlinks_in(source: str) -> None:
+def lstat_mode(path: str) -> int:
+    try:
+        return os.lstat(path).st_mode
+    except OSError as failure:
+        raise YoError(
+            "cannot read %s: %s" % (ui.shown(path), ui.os_error_reason(failure))
+        )
+
+
+def refuse_symlinks_in(operand: str) -> None:
     # scp -r follows symlinks and uploads what they point at, so a link the
     # agent pushed into a repo (leak -> ~/.ssh/id_ed25519) would copy a file
     # the user never named into the guest.
@@ -124,19 +155,19 @@ def refuse_symlinks_in(source: str) -> None:
             % (ui.shown(link), ui.shown(os.readlink(link)))
         )
 
-    # lstat of "link/" follows the link, so a trailing slash would hide it.
-    source = source.rstrip("/") or "/"
-    try:
-        mode = os.lstat(source).st_mode
-    except OSError as failure:
-        raise YoError(
-            "cannot read %s: %s" % (ui.shown(source), ui.os_error_reason(failure))
-        )
-    if stat.S_ISLNK(mode):
-        refuse(source)
-    if not stat.S_ISDIR(mode):
+    # Each component the user typed is judged on its own, because lstat judges
+    # only the last one: "link/", "link/.", "link/file" and "link/../x" all
+    # resolve the link. The cwd itself is not judged, only what lies below it.
+    path = "/" if os.path.isabs(operand) else os.getcwd()
+    for name in operand.split("/"):
+        if name in ("", "."):
+            continue
+        path = os.path.join(path, name)
+        if stat.S_ISLNK(lstat_mode(path)):
+            refuse(path)
+    if not stat.S_ISDIR(lstat_mode(path)):
         return
-    walk = os.walk(source, onerror=walk_failure, followlinks=False)
+    walk = os.walk(path, onerror=walk_failure, followlinks=False)
     for directory, subdirs, files in walk:
         for name in subdirs + files:
             path = os.path.join(directory, name)
@@ -153,8 +184,8 @@ def cmd_cp(args: argparse.Namespace) -> None:
         ui.err("yo: guest path %s -> %s" % (operand, resolved))
     local_paths = [local_cp_operand(path) for path in plan.local_paths]
     if plan.direction == "to_guest":
-        for source in local_paths:
-            refuse_symlinks_in(source)
+        for operand in plan.local_paths:
+            refuse_symlinks_in(operand)
         target = cp_mkdir_target(
             args.paths[-1], plan.guest_paths[0], len(plan.local_paths)
         )
@@ -217,15 +248,17 @@ def unlock_tree(path: str) -> None:
     # left (a read-only Go module cache refuses to lose its children). Group
     # and other bits stay as scp made them, so a landed directory keeps the
     # mode scp -p gave it. Symlinks are never followed: chmod would reach the
-    # Mac file they point at.
-    mode = os.lstat(path).st_mode
-    if stat.S_ISLNK(mode):
-        return
-    os.chmod(path, stat.S_IMODE(mode) | 0o700)
-    with os.scandir(path) as entries:
-        subdirs = [e.path for e in entries if e.is_dir(follow_symlinks=False)]
-    for subdir in subdirs:
-        unlock_tree(subdir)
+    # Mac file they point at. A stack, not recursion: a pulled tree can be
+    # deeper than the interpreter's frame limit.
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        mode = os.lstat(directory).st_mode
+        if stat.S_ISLNK(mode):
+            continue
+        os.chmod(directory, stat.S_IMODE(mode) | 0o700)
+        with os.scandir(directory) as entries:
+            pending += [e.path for e in entries if e.is_dir(follow_symlinks=False)]
 
 
 def remove_tree(path: str) -> None:
@@ -234,21 +267,31 @@ def remove_tree(path: str) -> None:
 
 
 def remove_staging(path: str) -> None:
+    # Any failure, not only an OSError: shutil.rmtree recurses, and a tree too
+    # deep for it raises RecursionError, which must not replace the copy's own
+    # error with a traceback.
     try:
         remove_tree(path)
-    except OSError as failure:
+    except Exception as failure:
+        reason = (
+            ui.os_error_reason(failure)
+            if isinstance(failure, OSError)
+            else str(failure)
+        )
         raise YoError(
             'cannot remove the staging directory "%s": %s; delete it by hand'
-            % (ui.shown(path), ui.os_error_reason(failure))
+            % (ui.shown(path), reason)
         )
 
 
-# Names that make git, an editor or direnv execute what a tree says the next
-# time the operator touches it. A pulled guest tree never lands these: the
+# Names that make git, jj, an editor or direnv execute what a tree says the
+# next time the operator touches it. A pulled guest tree never lands these: the
 # agent writes them (yo.md, "Downloads never land control paths").
 # Compared with casefold(), because APFS folds names with Unicode case folding
 # (.GIT and .vſcode are .git and .vscode).
-LANDING_CONTROL_NAMES = frozenset({".git", ".hg", ".svn", ".envrc", ".vscode", ".idea"})
+LANDING_CONTROL_NAMES = frozenset(
+    {".git", ".hg", ".svn", ".jj", ".husky", ".envrc", ".vscode", ".idea"}
+)
 
 
 # Build output and dependency installs a pulled tree never lands: the project's
@@ -319,11 +362,16 @@ class GuestEntry:
 GUEST_RECORD = "%y\t%m\t%T@\t%p\\0"
 
 # What a record may say, as narrowly as find prints it: one type letter, an
-# octal mode, a decimal time, then the path, which may hold tabs and newlines.
+# octal mode of at most four digits (%m prints the permission bits, 7777 at
+# most), a decimal time, then the path, which may hold tabs and newlines.
 # Narrow, because int() and float() also take "0o7", "1_0", "nan" and "inf".
 GUEST_RECORD_RE = re.compile(
-    r"([a-zA-Z])\t([0-7]{1,6})\t([0-9]{1,11}(?:\.[0-9]+)?)\t(.+)", re.DOTALL
+    r"([a-zA-Z])\t([0-7]{1,4})\t([0-9]{1,10}(?:\.[0-9]+)?)\t(.+)", re.DOTALL
 )
+
+# The largest mtime a filesystem keeps: APFS and ext4 store signed 64-bit
+# nanoseconds, and os.utime past that is an OverflowError, not an OSError.
+MAX_MTIME = 2**63 / 10**9
 
 
 def parse_guest_record(
@@ -336,7 +384,7 @@ def parse_guest_record(
     # directory, past the control-path and merge checks.
     text = os.fsdecode(record)
     fields = GUEST_RECORD_RE.fullmatch(text)
-    if fields is None:
+    if fields is None or float(fields.group(3)) >= MAX_MTIME:
         raise YoError("the guest's listing has a malformed record: %r" % text)
     kind, mode, mtime, path = fields.groups()
     clean = posixpath.normpath(path) == path
@@ -361,9 +409,16 @@ def list_guest(
     # ssh_run quotes them, so no wildcard in them is expanded.
     done = sshx.ssh_run(AGENT, ["find", "-H"] + list(starts) + list(tests), binary=True)
     if done.returncode != 0:
+        # find's stderr names what it could not read (an unreadable directory
+        # under /tmp); it is guest text, so it is shown as one escaped line.
+        # Its stdout is the listing, never the reason.
         raise YoError(
-            "cannot list %s in the guest: %s"
-            % (", ".join(starts), proc.failure_detail(done))
+            "cannot list %s in the guest (find exited %d): %s"
+            % (
+                ", ".join(starts),
+                done.returncode,
+                ui.shown(done.stderr.strip()) or "it said nothing",
+            )
         )
     entries: Dict[str, GuestEntry] = {}
     for record in done.stdout.split(b"\0"):
@@ -420,9 +475,13 @@ def find_build_output(sources: Sequence[str]) -> List[Tuple[str, str]]:
     for path in confirmed:
         if not any(path.startswith(kept + "/") for kept in outermost):
             outermost.append(path)
+    # A path under two sources (":~/proj/sub :~/proj") is reached from both,
+    # so both are walked; attributed to one, the other would be fetched whole.
     return [
-        (next(source for source in sources if path.startswith(source + "/")), path)
+        (source, path)
         for path in outermost
+        for source in sources
+        if path.startswith(source + "/")
     ]
 
 
@@ -575,6 +634,19 @@ def land_staged(moves: Sequence[Tuple[str, str]]) -> None:
 
 
 def download_from_guest(sources: Sequence[str], dest: str) -> None:
+    # The one place an OSError from the staging and landing (a chmod, utime or
+    # listdir on the Mac) becomes a message instead of a traceback. The staging
+    # directory is already gone by the time it gets here.
+    try:
+        stage_and_land(sources, dest)
+    except OSError as failure:
+        reason = ui.os_error_reason(failure)
+        if failure.filename is not None:
+            reason = "%s: %s" % (ui.shown(str(failure.filename)), reason)
+        raise YoError("the copy failed: %s" % reason)
+
+
+def stage_and_land(sources: Sequence[str], dest: str) -> None:
     # sources are guest paths, not yet escaped for scp.
     # scp into a staging directory beside the destination instead of onto it:
     # scp writes through any symlink it meets there, so a link the agent

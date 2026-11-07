@@ -491,6 +491,17 @@ class TestResolveCpOperands(unittest.TestCase):
         self.assertEqual(plan.guest_paths, [self.MIRROR + "/a", self.MIRROR + "/b"])
         self.assertEqual(plan.local_paths, ["dest"])
 
+    def test_a_guest_source_named_twice_is_taken_once(self):
+        plan = yo.resolve_cp_operands([":a", ":b", ":a/", ":./a", "dest"], self.MIRROR)
+        self.assertEqual(plan.guest_paths, [self.MIRROR + "/a", self.MIRROR + "/b"])
+
+    def test_guest_sources_that_would_land_under_one_name_are_refused(self):
+        # They would merge in the staging directory, and APFS folds case.
+        for operands in ((":x/log", ":y/Log"), (":~", ":/tmp/agent"), (":a/x", ":x")):
+            with self.subTest(operands=operands):
+                with self.assertRaisesRegex(yo.YoError, "would land under one name"):
+                    yo.resolve_cp_operands(list(operands) + ["dest"], self.MIRROR)
+
 
 class TestCpMkdirTarget(unittest.TestCase):
     def test_colon_dest_uses_resolved_dest_itself(self):
@@ -514,6 +525,14 @@ class TestCpMkdirTarget(unittest.TestCase):
             yo.cp_mkdir_target(":file.txt", "/home/agent/src/proj/file.txt", 1),
             "/home/agent/src/proj",
         )
+
+    def test_a_dest_whose_last_component_is_a_dot_names_the_directory_itself(self):
+        # ":." and ":./" mean ":"; "x/." and "x/.." mean the directory, as for cp.
+        for spelling in (":.", ":./", ":x/.", ":x/..", ":..", ":~/.", ":/tmp/."):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(
+                    yo.cp_mkdir_target(spelling, "/home/agent/d", 1), "/home/agent/d"
+                )
 
 
 class CpHarness(FakeHome):
@@ -1178,8 +1197,8 @@ class TestCpFromGuestNeverLandsControlPaths(CpFromGuestHarness):
         self.assertEqual(self.read("dest/proj/ok.txt"), "ok")
         self.assertIn('skipped "proj/.git"', reported)
 
-    def test_every_version_control_editor_and_direnv_name_is_skipped(self):
-        for name in (".hg", ".svn", ".idea", ".ENVRC", ".Vscode"):
+    def test_every_version_control_hook_editor_and_direnv_name_is_skipped(self):
+        for name in (".hg", ".svn", ".jj", ".husky", ".idea", ".ENVRC", ".Vscode"):
             with self.subTest(name=name):
                 shutil.rmtree("dest", ignore_errors=True)
                 os.makedirs("dest")
@@ -1335,6 +1354,61 @@ class TestCpFromGuestNeverLandsBuildOutput(CpFromGuestHarness):
         self.assertEqual(self.read("dest/proj/ok"), "1")
 
 
+class TestCpFromGuestFailsWithAMessage(CpFromGuestHarness):
+    """A Mac-side failure while staging or landing is a message that names the
+    file and the reason, never a traceback, and the staging directory goes."""
+
+    def test_an_os_error_while_landing_is_a_message_and_staging_is_removed(self):
+        os.makedirs("dest")
+        real_listdir = os.listdir
+
+        def listdir(path="."):
+            if ".yo-cp-" in str(path):
+                raise OSError(errno.EIO, "Input/output error", path)
+            return real_listdir(path)
+
+        with mock.patch.object(yo.cp.os, "listdir", listdir):
+            with self.assertRaises(yo.YoError) as caught:
+                self.pull({"proj/a\x1b[2J": "1"})
+        message = caught.exception.message
+        self.assertIn("the copy failed: ", message)
+        self.assertIn("/dest/.yo-cp-", message)
+        self.assertIn("Input/output error", message)
+        self.assertNotIn("\x1b", message)
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_a_cleanup_failure_that_is_no_os_error_joins_the_copys_own_error(self):
+        os.makedirs("dest")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                yo.cp.shutil,
+                "rmtree",
+                side_effect=RecursionError("maximum recursion depth exceeded"),
+            ),
+            mock.patch.object(
+                yo.ui, "err", side_effect=lambda line="": stderr.write(line + "\n")
+            ),
+            self.assertRaises(yo.YoError) as caught,
+        ):
+            self.copy([":~/proj", "dest/"], {"proj/a": "1"}, scp_fails=True)
+        self.assertEqual(caught.exception.message, "scp failed")
+        self.assertIn("cannot remove the staging directory", stderr.getvalue())
+        self.assertIn("maximum recursion depth exceeded", stderr.getvalue())
+
+    def test_a_tree_deeper_than_the_frame_limit_is_unlocked(self):
+        dirs = [os.path.join(self.cwd, "deep")]
+        for _ in range(sys.getrecursionlimit() + 100):
+            dirs.append(os.path.join(dirs[-1], "d"))
+        for directory in dirs:
+            os.mkdir(directory)
+        # Bottom up by hand: shutil.rmtree recurses too, on Python 3.9.
+        self.addCleanup(lambda: [os.rmdir(d) for d in reversed(dirs)])
+        os.chmod(dirs[-1], 0)
+        yo.unlock_tree(dirs[0])
+        self.assertEqual(stat.S_IMODE(os.stat(dirs[-1]).st_mode) & 0o700, 0o700)
+
+
 class TestCpFromGuestKeepsDirectoryModes(CpFromGuestHarness):
     """A directory made beside build output gets the mode OpenSSH's sftp client
     gives one: the guest's mode with the owner's rwx added."""
@@ -1405,6 +1479,21 @@ class TestCpFromGuestNeverFetchesBuildOutput(CpFromGuestHarness):
         os.makedirs("dest")
         self.pull({"proj/a": "1", "proj/sub/b": "2"})
         self.assertEqual(self.scp_sources, [["/home/agent/proj"]])
+
+    def test_build_output_under_two_nested_sources_crosses_through_neither(self):
+        # Attributed to the inner source alone, the outer one was fetched whole.
+        os.makedirs("dest")
+        self.copy(
+            [":~/proj/sub", ":~/proj", "dest/"],
+            {"proj/sub/node_modules/x": "dep", "proj/sub/a": "1", "proj/b": "2"},
+        )
+        self.assertEqual(
+            self.landed(), ["dest/proj/b", "dest/proj/sub/a", "dest/sub/a"]
+        )
+        self.assertEqual(
+            self.requested(),
+            ["/home/agent/proj/b", "/home/agent/proj/sub/a", "/home/agent/proj/sub/a"],
+        )
 
     def test_a_nested_target_that_proves_nothing_is_still_searched(self):
         os.makedirs("dest")
@@ -1630,6 +1719,7 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
             "d\t755",
             "garbage",
             "d\t999\t1.0\t/home/agent/proj/node_modules",
+            "d\t77777\t1.0\t/home/agent/proj/node_modules",
             "d\t0o755\t1.0\t/home/agent/proj/node_modules",
             "d\t-755\t1.0\t/home/agent/proj/node_modules",
             "d\t755\tsoon\t/home/agent/proj/node_modules",
@@ -1637,6 +1727,8 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
             "d\t755\tinf\t/home/agent/proj/node_modules",
             "d\t755\t1_0\t/home/agent/proj/node_modules",
             "d\t755\t99999999999999999999\t/home/agent/proj/node_modules",
+            "d\t755\t99999999999\t/home/agent/proj/node_modules",
+            "d\t755\t9223372037\t/home/agent/proj/node_modules",
             "dd\t755\t1.0\t/home/agent/proj/node_modules",
             "\t755\t1.0\t/home/agent/proj/node_modules",
         ):
@@ -1646,6 +1738,48 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
                         self.first_listing_adds(os.fsencode(malformed) + b"\0")
                     )
                 self.assertIn(repr(malformed), caught.exception.message)
+
+    def test_a_find_that_failed_names_what_it_could_not_read_on_one_line(self):
+        # find exits 1 when a directory under a source is unreadable, and its
+        # stderr names it; the copy is refused with that name, escaped.
+        os.makedirs("dest")
+        guest = FakeGuest(
+            self.FILES, {}, self.scp_sources, self.scp_destinations, False
+        )
+        said = {}
+
+        def failing(role, argv, **kwargs):
+            done = guest.ssh_run(role, argv, **kwargs)
+            if argv[0] == "find":
+                done.returncode = 1
+                done.stderr = said["stderr"]
+            return done
+
+        for stderr in ("find: '/home/agent/proj/lock\x1bed': Permission denied\n", ""):
+            with self.subTest(stderr=stderr):
+                said["stderr"] = stderr
+                with (
+                    mock.patch.object(yo.proc, "run", guest.scp),
+                    mock.patch.object(yo.sshx, "ssh_run", failing),
+                    self.assertRaises(yo.YoError) as caught,
+                ):
+                    yo.cmd_cp(yo.build_parser().parse_args(["cp", ":~/proj", "dest/"]))
+                message = caught.exception.message
+                self.assertIn("find exited 1", message)
+                self.assertNotIn("\n", message)
+                self.assertNotIn("\x1b", message)
+                if stderr:
+                    self.assertIn("proj/lock\\x1bed': Permission denied", message)
+                else:
+                    self.assertIn("it said nothing", message)
+        self.assertEqual(self.scp_sources, [])
+
+    def test_the_largest_mode_and_mtime_a_filesystem_holds_are_accepted(self):
+        # %m prints 7777 at most; APFS and ext4 keep an mtime as int64 nanoseconds.
+        entry = yo.parse_guest_record(
+            b"d\t7777\t9223372036\t/home/agent/proj/x", ["/home/agent/proj"], False
+        )
+        self.assertEqual((entry.mode, entry.mtime), (0o7777, 9223372036.0))
 
     def test_two_records_that_disagree_about_one_path_are_refused(self):
         self.refused(
@@ -1758,6 +1892,17 @@ class TestCpRefusesSymlinks(CpHarness):
         Path("real/secret").write_text("x")
         os.symlink("real", "lnk")
         self.refused(["lnk/", ":~/x"], os.path.join(self.cwd, "lnk"))
+
+    def test_a_symlink_typed_as_a_parent_component_is_refused(self):
+        # lstat judges the last component only, so "lnk/." and "lnk/secret"
+        # resolve the link, and so does "lnk/../real/x".
+        os.makedirs("real/sub")
+        Path("real/secret").write_text("x")
+        os.symlink("real", "lnk")
+        for spelling in ("lnk/.", "lnk/secret", "lnk/sub", "lnk/../real/secret"):
+            with self.subTest(spelling=spelling):
+                self.refused([spelling, ":~/x"], os.path.join(self.cwd, "lnk"))
+        self.refused([os.path.join(self.cwd, "lnk/secret"), ":~/x"], "lnk")
 
     def test_a_missing_source_is_refused_naming_it(self):
         self.refused(["nope", ":~/x"], os.path.join(self.cwd, "nope"))
