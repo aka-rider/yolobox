@@ -46,6 +46,8 @@ The agent cannot reach an operator-owned socket directly, so `nix/base.nix` prox
 
 `nix/lib/agent-env.nix` is the one place that points the agent at the proxy, with `SSH_AUTH_SOCK=/run/yolobox/op-agent.sock`. Its header comment lists every process that gets it. `cmd_enter` arranges no forward of its own, and landing in the guest is the whole of what it does here.
 
+The forwarded agent serves every key the vault offers, the box's own login key among them: lima's key on a Mac is a file, but on a Linux host the operator is the 1Password item `yolobox-operator`, one key for every box of that host, and the agent account's `AuthorizedKeysCommand` serves it too. So the agent can sign with the key that logs in to its own box and to every other box of the host, as either account. What makes that signature worthless from inside a box is `AllowUsers` in `nix/base.nix`, which admits both accounts only from the gateway address 192.168.5.2, where every `yo` and herdr session arrives through the host's forward, and the `nixos-fw` rule that stops the agent from claiming that address over loopback (see [docs/linux-host.md](linux-host.md#the-operators-key)).
+
 ## yo ssh forwards per session
 
 A positive `ForwardAgent` never goes into `~/.lima/yolobox/ssh.config`. The only value the owned blocks carry is `no` (see [above](#forwardagent-no)). That file is shared by every ssh role `yo` spawns, so a `ForwardAgent yes` there would reach `yo code` and `yo zed` too, not only the one command that asked for it.

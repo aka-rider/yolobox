@@ -279,9 +279,13 @@ in
   # through the user's login shell (`$SHELL -c`), which sources the agent's
   # ~/.zshenv first; the in-process server runs no shell at all.
   services.openssh.sftpServerExecutable = "internal-sftp";
-  # The operator logs in only from the gateway, which the agent cannot spoof
-  # off enp0s1, so its 1Password agent is no way in (nix/base.md, "No host OS ...").
-  services.openssh.settings.AllowUsers = [ "${username}@192.168.5.2" agentUser ];
+  # Both accounts log in only from the gateway, where every yo and herdr
+  # session arrives, and which the agent cannot spoof off enp0s1. The agent
+  # holds the forwarded 1Password agent, which serves the operator's key, and
+  # on a Linux host that one key opens every box of the host: from anywhere
+  # else (the tailnet, loopback) neither account is a way in
+  # (docs/linux-host.md, "The operator's key"; nix/base.md, "No host OS ...").
+  services.openssh.settings.AllowUsers = [ "${username}@192.168.5.2" "${agentUser}@192.168.5.2" ];
   # Every host connection arrives from the gateway, so a penalty on it locks
   # the host out; yo reads the banner mark (nix/base.md, "sshd penalties").
   services.openssh.settings.PerSourcePenaltyExemptList = "192.168.5.2";

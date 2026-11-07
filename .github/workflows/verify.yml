@@ -216,7 +216,7 @@ jobs:
       - name: Check the operator rules are on every box
         run: |
           box=.#nixosConfigurations.yolobox.config
-          test "$($NIX_EVAL --json "$box.services.openssh.settings.AllowUsers")" = '["ci@192.168.5.2","agent"]'
+          test "$($NIX_EVAL --json "$box.services.openssh.settings.AllowUsers")" = '["ci@192.168.5.2","agent@192.168.5.2"]'
           $NIX_EVAL --raw "$box.networking.firewall.extraCommands" |
             grep -F 'iptables -I nixos-fw 1 ! -i enp0s1 -s 192.168.5.2 -j DROP'
 
