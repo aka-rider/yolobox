@@ -18,6 +18,10 @@ table inet yolobox-egress {
     ip6 daddr { fc00::/7, fe80::/10, ff00::/8, 64:ff9b:1::/48 } limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
     ip6 daddr { fc00::/7, fe80::/10, ff00::/8, 64:ff9b:1::/48 } counter reject with icmpx type admin-prohibited
   }
+  chain forward {
+    type filter hook forward priority -20; policy drop;
+    limit rate 6/minute burst 3 packets log prefix "yolobox-egress: forward: " level warn
+  }
   chain postrouting {
     type filter hook postrouting priority -20; policy accept;
     ct direction reply accept

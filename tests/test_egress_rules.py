@@ -28,6 +28,15 @@ V4_REJECT = (
 )
 DHCP = "udp sport 68 udp dport 67 ip daddr { 255.255.255.255, 192.168.5.2 } accept\n"
 DNS_UDP = "ip daddr 192.168.5.2 udp dport 53 accept\n"
+FORWARD_LOG = (
+    "    limit rate 6/minute burst 3 packets log prefix"
+    ' "yolobox-egress: forward: " level warn\n'
+)
+FORWARD_CHAIN = (
+    "  chain forward {\n    type filter hook forward priority -20; policy drop;\n"
+    + FORWARD_LOG
+    + "  }\n"
+)
 
 
 def broken(text, old, new):
@@ -46,7 +55,12 @@ class TestFullRules(unittest.TestCase):
         egress_rules.check_rules(broken(RULES, "    \n", "    " + lan))
 
     def test_a_lan_entry_holding_the_gateway_fails(self):
-        for entry in ("192.168.5.2/32", "192.168.5.0/24", "192.168.0.0/16", "0.0.0.0/0"):
+        for entry in (
+            "192.168.5.2/32",
+            "192.168.5.0/24",
+            "192.168.0.0/16",
+            "0.0.0.0/0",
+        ):
             with self.subTest(entry=entry):
                 lan = "ip daddr { 10.1.2.3/32, %s } accept\n" % entry
                 with self.assertRaisesRegex(egress_rules.RuleError, "unexpected rule"):
@@ -135,6 +149,38 @@ class TestFullRules(unittest.TestCase):
     def test_the_tunnel_file_is_not_the_default_file(self):
         with self.assertRaisesRegex(egress_rules.RuleError, "the chains are"):
             egress_rules.check_rules(TUNNEL)
+
+    def test_a_forward_chain_that_lets_anything_through_fails(self):
+        for name, old, new, message in (
+            (
+                "accept policy",
+                "forward priority -20; policy drop",
+                "forward priority -20; policy accept",
+                "policy drop",
+            ),
+            (
+                "an accept rule",
+                FORWARD_LOG,
+                FORWARD_LOG + "    ct direction reply accept\n",
+                "forward chain",
+            ),
+            (
+                "a log that accepts",
+                FORWARD_LOG,
+                FORWARD_LOG.replace("level warn", "level warn accept"),
+                "forward chain",
+            ),
+            (
+                "another prefix",
+                FORWARD_LOG,
+                FORWARD_LOG.replace("forward: ", "blocked: "),
+                "forward chain",
+            ),
+            ("no chain", FORWARD_CHAIN, "", "the chains are"),
+        ):
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(egress_rules.RuleError, message):
+                    egress_rules.check_rules(broken(RULES, old, new))
 
     def test_a_missing_reply_accept_fails(self):
         with self.assertRaisesRegex(egress_rules.RuleError, "replies"):
@@ -299,10 +345,43 @@ class TestRecoveryRules(unittest.TestCase):
             )
 
     def test_the_wrong_priority_fails(self):
-        with self.assertRaisesRegex(egress_rules.RuleError, "priority -20"):
-            egress_rules.check_recovery(
-                broken(RECOVERY, "priority -20", "priority -10")
-            )
+        for hook in ("output", "forward"):
+            with self.subTest(hook=hook):
+                with self.assertRaisesRegex(egress_rules.RuleError, "priority -20"):
+                    egress_rules.check_recovery(
+                        broken(RECOVERY, hook + " priority -20", hook + " priority -10")
+                    )
+
+    def test_a_forward_chain_with_any_rule_fails(self):
+        for name, old, new, message in (
+            (
+                "accept policy",
+                "forward priority -20; policy drop",
+                "forward priority -20; policy accept",
+                "policy drop",
+            ),
+            (
+                "a reply accept",
+                "policy drop;\n",
+                "policy drop;\n    ct direction reply accept\n",
+                "forward chain has rules",
+            ),
+            (
+                "a log",
+                "policy drop;\n",
+                "policy drop;\n" + FORWARD_LOG,
+                "forward chain has rules",
+            ),
+            (
+                "no chain",
+                "  chain forward_recovery {\n    type filter hook forward priority -20; policy drop;\n  }\n",
+                "",
+                "the chains are",
+            ),
+        ):
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(egress_rules.RuleError, message):
+                    egress_rules.check_recovery(broken(RECOVERY, old, new))
 
     def test_the_full_file_is_not_the_recovery_file(self):
         with self.assertRaisesRegex(egress_rules.RuleError, "the chains are"):

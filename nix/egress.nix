@@ -119,6 +119,10 @@ let
     "}"
   ]);
 
+  # The output hook judges only what the box itself sends. A box that routes
+  # (ip_forward set by a local.nix, rootful containers) would pass a packet
+  # through the forward hook instead, which no output chain sees, so the
+  # forward chain drops every forwarded packet: the box routes for nobody.
   # One atomic nft transaction: `table`, `delete table` and `table {..}` in one
   # file, so a reload swaps the rules with no instant at which the table is
   # missing. builtins.toFile, not pkgs.writeText: the text names no store path,
@@ -143,6 +147,10 @@ let
         ip daddr { ${blockedV4} } counter reject with icmpx type admin-prohibited
         ip6 daddr { ${blockedV6} } limit rate ${logRate} log prefix "yolobox-egress: blocked: " level warn
         ip6 daddr { ${blockedV6} } counter reject with icmpx type admin-prohibited
+      }
+      chain forward {
+        type filter hook forward priority ${hookPriority}; policy drop;
+        limit rate ${logRate} log prefix "yolobox-egress: forward: " level warn
       }${rewrittenChain}
     }
   '';
@@ -163,6 +171,9 @@ let
         icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
         limit rate ${logRate} log prefix "yolobox-egress: recovery: " level warn
         counter reject with icmpx type admin-prohibited
+      }
+      chain forward_recovery {
+        type filter hook forward priority ${hookPriority}; policy drop;
       }
     }
   '';
