@@ -120,6 +120,14 @@ The box is built from `github:OWNER/REPO/REF#yolobox` with `YOLOBOX_USERNAME`, `
 
 `nix/base.nix` therefore sets `nix.nixPath` to `nixpkgs=flake:nixpkgs` plus a `nixos-config` that only throws: `this box is built from a flake ref: run \`yolobox-guest rebuild switch\` (or \`boot\`) instead of nixos-rebuild`. `yolobox-guest rebuild` reads the box's own stamps and sets all three variables ([nix/guest/yolobox-guest.md](guest/yolobox-guest.md)). `nixos-rebuild switch --rollback` does not evaluate a config, so it still works. A `nixos-rebuild --flake` names its config itself and never reads `<nixos-config>`.
 
+## The proxies carry no privilege
+
+`opProxy` in `nix/base.nix` runs `systemd-socket-proxyd` as the operator for the 1Password and AWS broker sockets (see [docs/ssh.md](../docs/ssh.md#1password-reaches-the-agent)). It has to: the forwarded sockets are operator-owned and the proxy is what hands them to the agent. The agent speaks to the proxy over the agent-facing socket, so every byte proxyd parses is agent-chosen input running under the operator's uid, and with `kernel.yama.ptrace_scope = 0` (see [Same-uid ptrace](#same-uid-ptrace)) a process of the operator's uid can attach to the operator's other processes, the ssh session holding the reverse forwards among them.
+
+proxyd copies bytes between two unix sockets and needs nothing else, so the service states that. `ProtectSystem=strict` and `ProtectHome=true` make the filesystem read-only and hide every home, the operator's included, which still lets it connect: a unix `connect(2)` needs write permission on the socket inode, not on the mount, and the kernel's `inode_permission` refuses writes on a read-only mount only for regular files, directories and symlinks. `PrivateNetwork=true` and `RestrictAddressFamilies=AF_UNIX` leave it loopback-less with unix sockets only. `SystemCallFilter=@system-service` and an empty `CapabilityBoundingSet` take the rest. The listener itself is systemd's, created before the service and passed in as a file descriptor, so none of this touches it.
+
+Recognise a regression with `systemctl show -p ProtectSystem,ProtectHome,PrivateNetwork,RestrictAddressFamilies yolobox-op-agent.service`, which must print `strict`, `yes`, `yes` and `AF_UNIX`, and with `ssh-add -L` as the agent, which must still list the operator's key through the proxy.
+
 ## Activation snippets
 
 `system.activationScripts.<name>` snippets are spliced into one bash script, and NixOS's runner (`system/activation/activation-script.nix`) wraps each one: it sets `_localstatus=0`, runs the snippet's text, and reports `Activation script snippet '<name>' failed` when `_localstatus` is nonzero. The runner's `trap ... ERR` is what sets it, along with `_status`, which the whole script exits with at the end, after `/run/current-system` has been pointed at the new generation.

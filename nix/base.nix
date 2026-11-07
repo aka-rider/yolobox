@@ -23,6 +23,16 @@ let
         User = username;
         NoNewPrivileges = true;
         PrivateTmp = true;
+        # The proxy runs as the operator, whose processes the agent cannot
+        # ptrace, but a bug in proxyd itself would run as the operator: it
+        # gets only what copying bytes between two unix sockets needs
+        # (nix/base.md, "The proxies carry no privilege").
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateNetwork = true;
+        RestrictAddressFamilies = "AF_UNIX";
+        SystemCallFilter = "@system-service";
+        CapabilityBoundingSet = "";
         ExecStart = "${config.systemd.package}/lib/systemd/systemd-socket-proxyd /run/yolobox-op/${target}";
       };
     };
