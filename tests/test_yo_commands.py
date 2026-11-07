@@ -3359,7 +3359,7 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
         self.assertIn("limactl start exited 1", caught.exception.message)
         self.assertEqual(box.stops, 0)
 
-    def test_a_failed_migration_says_the_plaintext_is_intact_and_ends_the_start(self):
+    def test_a_failed_migration_points_at_the_journal_line_and_ends_the_start(self):
         box = FakeBox(
             self,
             statuses=["Stopped", "Running"],
@@ -3367,7 +3367,7 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
         )
         with self.assertRaises(yo.YoError) as caught:
             box.up()
-        self.assertIn("plaintext intact", caught.exception.message)
+        self.assertIn("what the disk holds now", caught.exception.message)
         self.assertIn("no space", caught.exception.message)
         self.assertTrue(box.starts[0].terminated)
 

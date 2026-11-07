@@ -458,8 +458,10 @@ def helper_failure_message(attempt: HelperRun) -> str:
         )
     if code == HELPER_EXIT_MIGRATION_FAILED:
         return (
-            "encrypting the disk failed in the initrd; the box is still in its initrd "
-            "with the plaintext intact. Inspect it as root: %s\n%s"
+            "the in-place encryption failed in the initrd; the box is still in its "
+            "initrd, and the last journal line below says what the disk holds now "
+            "(still plaintext, partly encrypted, or encrypted but not finalized). "
+            "Inspect it as root: %s\n%s"
             % (initrd_root_ssh_command("journalctl -u yolobox-luks-migrate"), stderr)
         )
     if code == HELPER_EXIT_ROOT_MOUNT_FAILED:
