@@ -847,6 +847,19 @@ class TestDomainTemplate(LibvirtCase):
                 "<nvram template='/home/op/vars.fd'>"
                 "/var/lib/libvirt/qemu/nvram/yolobox-box_VARS.qcow2</nvram>"
             ),
+            # A prefix under /usr/share/ that walks back out of it.
+            "value:os/nvram@template=/usr/share/../../../etc/shadow": (
+                "<nvram template='/usr/share/../../../etc/shadow'>"
+                "/var/lib/libvirt/qemu/nvram/yolobox-box_VARS.qcow2</nvram>"
+            ),
+            "value:os/nvram@template=/usr/share/edk2/./OVMF_VARS_4M.qcow2": (
+                "<nvram template='/usr/share/edk2/./OVMF_VARS_4M.qcow2'>"
+                "/var/lib/libvirt/qemu/nvram/yolobox-box_VARS.qcow2</nvram>"
+            ),
+            "value:os/nvram@template=/usr/share/": (
+                "<nvram template='/usr/share/'>"
+                "/var/lib/libvirt/qemu/nvram/yolobox-box_VARS.qcow2</nvram>"
+            ),
             "text:os/nvram=/var/lib/libvirt/qemu/nvram/other_VARS.qcow2": (
                 "<nvram template='/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2'>"
                 "/var/lib/libvirt/qemu/nvram/other_VARS.qcow2</nvram>"
