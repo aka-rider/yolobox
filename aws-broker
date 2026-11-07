@@ -24,7 +24,6 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from yolobox_cli.common import (  # noqa: E402
     PROFILE_NAME_PATTERN,
     PROFILE_NAME_RE,
-    pid_alive,
     pid_exit_watch,
     sanitize,
 )
@@ -868,9 +867,6 @@ def bind_servers(socket_path, control_path, states, watch_pid, events):
 
 def main():
     args = parse_args()
-
-    if not pid_alive(args.watch_pid):
-        fail(f"watched pid {args.watch_pid} is not running")
 
     with held_socket_lock(args.socket):
         reclaim_socket_path(args.socket)

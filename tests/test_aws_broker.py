@@ -684,6 +684,22 @@ class TestMain(SocketDirCase):
         self.assertIn("ERROR=registration of a watch", out.getvalue())
         self.assertFalse(os.path.lexists(self.sock))
 
+    @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+    def test_a_watched_pid_that_is_not_running_is_a_handshake_error(self):
+        gone = subprocess.Popen([sys.executable, "-c", ""])
+        gone.wait()
+        argv = ["aws-broker", "--socket", self.sock, "--control-socket", self.ctl]
+        argv += ["--watch-pid", str(gone.pid), "--allow", "dev"]
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                broker.main()
+        self.assertEqual(
+            out.getvalue(), f"ERROR=watched pid {gone.pid} is not running\n"
+        )
+        self.assertFalse(os.path.lexists(self.sock))
+        self.assertFalse(os.path.lexists(self.ctl))
+
 
 @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
 class TestSigterm(SocketDirCase):
@@ -920,19 +936,6 @@ class TestSocketLock(SocketDirCase):
         )
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertTrue(done.stdout.startswith("ERROR=cannot open lock file"))
-
-
-class TestPidAlive(WaitingChild):
-    def test_a_running_process_is_alive(self):
-        self.assertTrue(broker.pid_alive(self.child.pid))
-
-    def test_a_process_owned_by_someone_else_is_alive(self):
-        self.assertTrue(broker.pid_alive(1))
-
-    def test_a_reaped_process_is_not_alive(self):
-        self.child.stdin.close()
-        self.child.wait()
-        self.assertFalse(broker.pid_alive(self.child.pid))
 
 
 class TestBindServer(SocketDirCase):
