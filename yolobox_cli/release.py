@@ -130,7 +130,9 @@ def old_release_refusal(old: str) -> str:
 def own_release_ref() -> Optional[str]:
     """This yo's own release ref; None for an unreleased build, which has none
     it can build: `dev`, or a build of main whose .version still names a
-    release that predates FIRST_HOST_OS_FREE_RELEASE."""
+    release that predates FIRST_HOST_OS_FREE_RELEASE. A build of main stamped
+    with a later release cannot be told from that release and claims it
+    (docs/distribution.md)."""
     if config.YO_VERSION == "dev":
         return None
     ref = "%s/v%s" % (UPSTREAM_FLAKE, config.YO_VERSION)
