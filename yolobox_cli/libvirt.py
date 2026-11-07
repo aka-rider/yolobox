@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from typing import (
     Callable,
     Dict,
@@ -51,7 +52,7 @@ from .config import (
     SCRIPT_DIR,
 )
 from .driver import RUNNING, BoxSize, Removal, Size, StopRefused
-from .libvirt_host import GUEST_SSH_PORT, LIBVIRT_URI, VM_USER, DomainInfo
+from .libvirt_host import GUEST_SSH_PORT, LIBVIRT_POOL, LIBVIRT_URI, VM_USER
 from .sshx import OPERATOR
 from .ui import YoError
 
@@ -61,7 +62,6 @@ from .ui import YoError
 # layer (see linux/host-setup.md). The host's preflight and the domain XML policy
 # are in libvirt_host.py. Pure helpers first, then the driver, which calls them
 # and virsh by name at call time.
-LIBVIRT_POOL = "default"
 # The 1Password item whose public key is the operator's login, in cidata.
 OPERATOR_KEY_ITEM = "yolobox-operator"
 OPERATOR_ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]*")
@@ -77,12 +77,16 @@ HOST_MEMORY_RESERVE_GIB = 4
 LIBVIRT_STOP_TIMEOUT = 300
 # What `virsh event --timeout` prints, then exits 1, when no more events came.
 EVENT_TIMEOUT_LINE = "event loop timed out"
-# virsh domstate words. "in shutdown" is a guest still going down, and the only
-# word besides "shut off" that a stop waits through ("blocked" is a running guest
-# idling on I/O).
+# virsh domstate words. A guest is up in two of them ("blocked" is a running
+# guest idling on I/O), and both read as RUNNING. "in shutdown" is a guest
+# still going down, and the only other word a stop waits through.
 STATE_OFF = "shut off"
 STATE_SHUTTING_DOWN = "in shutdown"
-STATES_STOPPING = ("running", "blocked", STATE_SHUTTING_DOWN)
+RUNNING_STATES = ("running", "blocked")
+STATES_STOPPING = RUNNING_STATES + (STATE_SHUTTING_DOWN,)
+# What `virsh start` says when passt cannot bind in PASST_DIR: the ACL mask was
+# recomputed by another passt domain's start after yo checked it.
+PASST_BIND_DENIED = "Failed to bind UNIX domain socket"
 # The states a guest stays in until someone acts: the verb and virsh command
 # that bring it back (state_hint).
 STATE_REMEDIES = {
@@ -431,12 +435,12 @@ def virsh_removal(what: str, *args: str) -> Removal:
     return Removal(what, remove)
 
 
-def yolobox_domains() -> List[DomainInfo]:
-    """Every domain on the system connection that carries yolobox's metadata.
+def domain_roots() -> List[ET.Element]:
+    """The XML of every domain on the system connection, yolobox's or not.
 
-    A foreign domain is only checked for the tag: its XML is never read strictly,
-    so one odd domain of another tool cannot stop yo. A domain undefined between
-    the listing and its dumpxml is not counted; any other failure is an error.
+    A domain undefined between the listing and its dumpxml is not counted; any
+    other failure is an error. A foreign domain's XML is read leniently by
+    whoever uses it, so one odd domain of another tool cannot stop yo.
     """
     roots = []
     for name in domain_names():
@@ -445,11 +449,7 @@ def yolobox_domains() -> List[DomainInfo]:
             raise_unless_undefined("dumpxml", name, dump)
             continue
         roots.append(libvirt_host.domain_root(dump.stdout))
-    return [
-        libvirt_host.domain_info(root)
-        for root in roots
-        if libvirt_host.domain_marker(root) is not None
-    ]
+    return roots
 
 
 def volume_names() -> List[str]:
@@ -458,6 +458,22 @@ def volume_names() -> List[str]:
     if not separators:
         raise YoError("virsh vol-list printed no table: %s" % "\n".join(rows))
     return [row.split()[0] for row in rows[separators[0] + 1 :] if row.strip()]
+
+
+def host_firmware() -> libvirt_host.HostFirmware:
+    """The emulator and the firmware loaders libvirt runs the template's
+    machine with, the one canonical answer a defined domain may carry."""
+    return libvirt_host.parse_domcapabilities(
+        libvirt_host.virsh(
+            "domcapabilities",
+            "--virttype",
+            "kvm",
+            "--arch",
+            "x86_64",
+            "--machine",
+            "q35",
+        ).stdout
+    )
 
 
 class LibvirtDriver:
@@ -501,7 +517,33 @@ class LibvirtDriver:
         return os.path.join(state.home(), ".1password/agent.sock")
 
     def domain_exists(self) -> bool:
-        return domain_name() in domain_names()
+        """Whether this machine's domain is defined. A domain of that name that
+        yo did not define for this machine (no yolobox:instance tag, or another
+        instance's) is an error, never "exists": every command reaches the
+        domain through here, so yo never stops, resizes or destroys a domain
+        of another tool that happens to carry a box's name."""
+        name = domain_name()
+        if name not in domain_names():
+            return False
+        dump = libvirt_host.virsh("dumpxml", name, check=False)
+        if dump.returncode != 0:
+            raise_unless_undefined("dumpxml", name, dump)
+            return False
+        marker = libvirt_host.domain_marker(libvirt_host.domain_root(dump.stdout))
+        if marker != state.box.name:
+            raise YoError(
+                "domain %s on %s is not %s's: yo defines a domain with a "
+                "yolobox:instance tag holding the machine's name, and this one "
+                "%s. yo never touches a domain it did not define — rename or "
+                "remove it with virsh, or pick another machine name (-m)"
+                % (
+                    name,
+                    LIBVIRT_URI,
+                    state.box.name,
+                    "has none" if marker is None else "says %r" % marker,
+                )
+            )
+        return True
 
     def require_domain(self) -> None:
         if not self.domain_exists():
@@ -523,7 +565,13 @@ class LibvirtDriver:
         return port
 
     def allocate_host_port(self) -> int:
-        taken = [port for info in yolobox_domains() for port in info.forward_ports]
+        # Every domain's forwards count, not only the boxes': a shut-off domain
+        # of another tool holds no socket, so only its XML shows its port.
+        taken = [
+            port
+            for root in domain_roots()
+            for port in libvirt_host.forwarded_host_ports(root)
+        ]
         return lowest_free_port(
             libvirt_host.read_port_window(), taken, loopback_port_bound
         )
@@ -625,7 +673,7 @@ class LibvirtDriver:
         if not self.domain_exists():
             return None
         domain_state = self.domain_state()
-        return RUNNING if domain_state == "running" else domain_state
+        return RUNNING if domain_state in RUNNING_STATES else domain_state
 
     def domain_state(self) -> str:
         """virsh's own word for the state: "running", "in shutdown", "shut off"..."""
@@ -684,8 +732,10 @@ class LibvirtDriver:
         )
 
     def resize_refusal(self, current: BoxSize, wanted: BoxSize) -> Optional[str]:
-        # A box that keeps its memory is not judged by the host's room again.
-        if wanted.memory_gib == current.memory_gib:
+        # Only more memory is judged by the host's room: a box that keeps its
+        # memory, or asks for less, fits no worse than the `yo up` without a
+        # flag that would start it at its current size unjudged.
+        if wanted.memory_gib <= current.memory_gib:
             return None
         return self.memory_fit_refusal(wanted.memory_gib)
 
@@ -718,6 +768,7 @@ class LibvirtDriver:
             state.box.name,
             uid,
             gid,
+            host_firmware(),
         )
 
     def config_notes(self) -> List[str]:
@@ -943,11 +994,36 @@ class LibvirtDriver:
         gap = libvirt_host.passt_dir_gap()
         if gap is not None:
             raise YoError(gap)
-        libvirt_host.virsh("start", domain_name())
+        self.start_domain()
         # libvirt starts no foreground process: the domain is Running as soon as
         # `virsh start` returns, and unlock_disk judges it by its state alone.
         unlock.unlock_disk(passphrase)
         unlock.wait_for_operator()
+
+    def start_domain(self) -> None:
+        """`virsh start`, tried once more when passt could not bind its socket.
+
+        Another passt domain starting between yo's ACL check and this start
+        recomputes the directory's mask (docs/linux-host.md, "The passt socket
+        directory"); the hook restores it at that domain's `started begin`. So
+        the ACL is read again: short, and the start is refused with the remedy;
+        restored, and the start is tried once more, whose failure is final.
+        """
+        started = libvirt_host.virsh("start", domain_name(), check=False)
+        if started.returncode == 0:
+            return
+        if PASST_BIND_DENIED not in (started.stderr or ""):
+            raise YoError(
+                proc.failed_message(
+                    "virsh start %s" % domain_name(),
+                    started.returncode,
+                    proc.failure_detail(started),
+                )
+            )
+        gap = libvirt_host.passt_dir_gap()
+        if gap is not None:
+            raise YoError(gap)
+        libvirt_host.virsh("start", domain_name())
 
     def stop(self) -> None:
         if not self.domain_exists():

@@ -57,7 +57,40 @@ HERDR = "/opt/herdr/bin/herdr"
 HOST_MEMORY_GIB = 64
 DOMAIN_CPUS = 8
 # The virsh subcommands that only look.
-READS = frozenset({"list", "dumpxml", "domstate", "dominfo", "vol-list", "vol-info"})
+READS = frozenset(
+    {
+        "list",
+        "dumpxml",
+        "domstate",
+        "dominfo",
+        "domcapabilities",
+        "vol-list",
+        "vol-info",
+    }
+)
+# What `virsh domcapabilities` says of the host's q35 kvm machine, cut to the
+# two things the domain policy reads from it.
+EMULATOR = "/usr/bin/qemu-system-x86_64"
+LOADER = "/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2"
+DOMCAPABILITIES_XML = """\
+<domainCapabilities>
+  <path>%s</path>
+  <domain>kvm</domain>
+  <machine>pc-q35-11.1</machine>
+  <arch>x86_64</arch>
+  <os supported='yes'>
+    <loader supported='yes'>
+      <value>/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.qcow2</value>
+      <value>%s</value>
+      <value>/usr/share/edk2/ovmf/OVMF_CODE.fd</value>
+      <enum name='type'>
+        <value>rom</value>
+        <value>pflash</value>
+      </enum>
+    </loader>
+  </os>
+</domainCapabilities>
+""" % (EMULATOR, LOADER)
 # The virsh subcommands that edit a domain's definition.
 WRITES = frozenset({"setmaxmem", "setmem", "setvcpus"})
 # What ssh prints when nothing listens behind the box's port: a domain that is off.
@@ -113,6 +146,7 @@ class FakeHost:
         self.states = {}  # name -> domstate word
         self.volumes = {}  # name -> bytes uploaded
         self.fail = {}  # virsh subcommand -> stderr it fails with
+        self.fail_once = {}  # the same, for the next call of the subcommand only
         self.interrupted = {}  # virsh subcommand -> the exception that ends it
         self.capacity = {}  # volume name -> bytes, as vol-create-as and vol-resize set
         self.iso_inputs = []  # (directory, file names) at each xorriso call
@@ -277,6 +311,8 @@ class FakeHost:
             raise self.interrupted[sub]
         if sub in self.fail:
             return completed(returncode=1, stderr=self.fail[sub])
+        if sub in self.fail_once:
+            return completed(returncode=1, stderr=self.fail_once.pop(sub))
         if sub == "shutdown":
             self.states[args[0]] = self.shutdown_state
             return completed()
@@ -326,6 +362,8 @@ class FakeHost:
                     stderr="error: failed to get domain '%s'\n" % args[0],
                 )
             return completed(self.domains[args[0]])
+        if sub == "domcapabilities":
+            return completed(DOMCAPABILITIES_XML)
         if sub == "domstate":
             return completed(self.states[args[0]] + "\n")
         if sub == "define":
@@ -495,9 +533,11 @@ class LibvirtCase(FakeHome):
         return False
 
 
-# `virsh dumpxml` of a defined domain, as libvirt 12.8 stores one: what the
-# template produces plus what libvirt adds (uuid, emulator, controllers, ps2
-# input, audio, watchdog, addresses, labels). Its DAC label is the vm account's.
+# `virsh dumpxml` of a running domain, as libvirt 12.8 prints one: what the
+# template produces plus what libvirt adds when it defines it (uuid, the
+# resolved firmware, emulator, controllers, ps2 input, audio, watchdog,
+# addresses) and when it runs it (the id, pty paths, aliases, labels). Its DAC
+# label is the vm account's.
 LIBVIRT_STORED_DOMAIN = """\
 <domain type='kvm' id='10'>
   <name>yolobox-yolobox</name>
@@ -533,7 +573,7 @@ LIBVIRT_STORED_DOMAIN = """\
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type='volume' device='disk'>
-      <driver name='qemu' type='qcow2'/>
+      <driver name='qemu' type='qcow2' discard='unmap' detect_zeroes='unmap'/>
       <source pool='default' volume='yolobox-yolobox.qcow2' index='2'/>
       <backingStore/>
       <target dev='vda' bus='virtio'/>
@@ -584,6 +624,7 @@ LIBVIRT_STORED_DOMAIN = """\
       </portForward>
       <model type='virtio'/>
       <backend type='passt'/>
+      <mtu size='65520'/>
       <alias name='net0'/>
       <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x0'/>
     </interface>
@@ -647,76 +688,295 @@ class TestDomainTemplate(LibvirtCase):
         return [child.tag for child in ET.fromstring(xml).find("devices")]
 
     def gaps(self, info, instance="box"):
-        return self.box.domain_gaps(info, instance, VM_UID, VM_GID)
+        return self.box.domain_gaps(info, instance, VM_UID, VM_GID, self.firmware())
+
+    def firmware(self):
+        return self.box.HostFirmware(EMULATOR, frozenset({LOADER}))
 
     def with_device(self, element):
         return self.render().replace("<video>", element + "<video>")
 
-    def test_every_path_between_the_guest_and_the_host_is_a_gap_named_in_the_message(
-        self,
-    ):
+    def with_rng(self, element):
+        return re.sub(r"<rng .*?</rng>", element, self.render(), flags=re.S)
+
+    def assert_gaps(self, xml, *gaps):
+        found = self.gaps(self.box.parse_domain(xml))
+        self.assertEqual(found, list(gaps))
+        for gap in gaps:
+            self.assertIn(gap, self.driver.config_gap_message(found))
+
+    def test_every_device_tag_the_template_lacks_is_a_gap_named_in_the_message(self):
         broken = {
-            "device:graphics": "<graphics type='vnc'/>",
-            "device:vsock": "<vsock model='virtio'/>",
-            "device:filesystem": "<filesystem type='mount'/>",
-            "device:channel": "<channel type='pty'/>",
-            "device:hostdev": "<hostdev/>",
-            "device:tpm": "<tpm model='tpm-crb'/>",
-            "device:shmem": "<shmem name='x'/>",
-            "device:redirdev": "<redirdev bus='usb' type='spicevmc'/>",
-            "device:smartcard": "<smartcard mode='passthrough' type='tcp'/>",
-            "device:parallel": "<parallel type='pty'/>",
-            "device:input[type=passthrough]": "<input type='passthrough'/>",
-            "device:input[type=evdev]": "<input type='evdev'/>",
-            "device:serial[type=tcp]": "<serial type='tcp'/>",
-            "device:console[type=unix]": "<console type='unix'/>",
-            "device:disk[type=file]": "<disk type='file' device='disk'/>",
-            "device:controller[type=virtio-serial]": (
+            "graphics": "<graphics type='vnc'/>",
+            "vsock": "<vsock model='virtio'/>",
+            "filesystem": "<filesystem type='mount'/>",
+            "channel": "<channel type='pty'/>",
+            "hostdev": "<hostdev/>",
+            "tpm": "<tpm model='tpm-crb'/>",
+            "shmem": "<shmem name='x'/>",
+            "redirdev": "<redirdev bus='usb' type='spicevmc'/>",
+            "smartcard": "<smartcard mode='passthrough' type='tcp'/>",
+            "parallel": "<parallel type='pty'/>",
+            "iommu": "<iommu model='intel'/>",
+            "panic": "<panic model='isa'/>",
+        }
+        for tag, element in broken.items():
+            with self.subTest(tag=tag):
+                self.assert_gaps(self.with_device(element), "element:devices/" + tag)
+
+    def test_a_device_of_the_templates_tag_with_another_type_is_a_gap(self):
+        broken = {
+            "value:devices/input@type=passthrough": "<input type='passthrough' bus='ps2'/>",
+            "value:devices/input@type=evdev": "<input type='evdev' bus='ps2'/>",
+            "value:devices/controller@type=virtio-serial": (
                 "<controller type='virtio-serial'/>"
             ),
-            "device:audio[type=pulseaudio]": "<audio id='1' type='pulseaudio'/>",
-            "device:serial[type=]": "<serial/>",
-            "device:rng[backend=egd]": (
-                "<rng model='virtio'><backend model='egd' type='unix'>"
-                "<source mode='connect' path='/run/host.sock'/></backend></rng>"
+            "value:devices/audio@type=pulseaudio": "<audio id='1' type='pulseaudio'/>",
+        }
+        for gap, element in broken.items():
+            with self.subTest(gap=gap):
+                self.assert_gaps(self.with_device(element), gap)
+        base = self.render()
+        changed = {
+            "value:devices/serial@type=tcp": base.replace(
+                "<serial type='pty'>", "<serial type='tcp'>"
             ),
-            "device:rng[backend=]": "<rng model='virtio'/>",
-            "device:rng[backend=random:/home/op/secret]": (
+            "value:devices/console@type=unix": base.replace(
+                "<console type='pty'>", "<console type='unix'>"
+            ),
+            "value:devices/memballoon@model=virtio": base.replace(
+                "<memballoon model='none'/>", "<memballoon model='virtio'/>"
+            ),
+        }
+        for gap, xml in changed.items():
+            with self.subTest(gap=gap):
+                self.assert_gaps(xml, gap)
+
+    def test_a_second_serial_or_console_is_a_gap(self):
+        for tag in ("serial", "console"):
+            with self.subTest(tag=tag):
+                self.assert_gaps(
+                    self.with_device("<%s type='pty'/>" % tag),
+                    "repeated:devices/" + tag,
+                )
+
+    def test_a_disk_that_is_not_a_pool_volume_of_this_box_is_a_gap(self):
+        base = self.render()
+        broken = {
+            "value:devices/disk@type=file": base.replace(
+                "<disk type='volume' device='disk'>", "<disk type='file' device='disk'>"
+            ),
+            "value:devices/disk@device=lun": base.replace(
+                "<disk type='volume' device='disk'>",
+                "<disk type='volume' device='lun'>",
+            ),
+            "value:devices/disk/source@pool=homes": base.replace(
+                "pool='default' volume='yolobox-box.qcow2'",
+                "pool='homes' volume='yolobox-box.qcow2'",
+            ),
+            "value:devices/disk/source@volume=other.qcow2": base.replace(
+                "volume='yolobox-box.qcow2'", "volume='other.qcow2'"
+            ),
+            "attribute:devices/disk/source@file": base.replace(
+                "volume='yolobox-box.qcow2'",
+                "volume='yolobox-box.qcow2' file='/etc/shadow'",
+            ),
+            "element:devices/disk/source/seclabel": base.replace(
+                "volume='yolobox-box.qcow2'/>",
+                "volume='yolobox-box.qcow2'><seclabel model='dac' relabel='no'/></source>",
+            ),
+            "element:devices/disk/seclabel": base.replace(
+                "<target dev='vda' bus='virtio'/>",
+                "<target dev='vda' bus='virtio'/><seclabel model='selinux' relabel='no'/>",
+            ),
+            "element:devices/disk/shareable": base.replace(
+                "<target dev='vda' bus='virtio'/>",
+                "<target dev='vda' bus='virtio'/><shareable/>",
+            ),
+            "value:devices/disk/driver@discard=ignore": base.replace(
+                "discard='unmap'", "discard='ignore'"
+            ),
+            "attribute:devices/disk/driver@cache": base.replace(
+                "<driver name='qemu' type='raw'/>",
+                "<driver name='qemu' type='raw' cache='unsafe'/>",
+            ),
+        }
+        for gap, xml in broken.items():
+            with self.subTest(gap=gap):
+                self.assert_gaps(xml, gap)
+
+    def test_a_backing_store_is_a_gap_in_each_of_its_parts(self):
+        # libvirt stores an empty <backingStore/>; one with a file is a host path.
+        xml = self.render().replace(
+            "<target dev='vda' bus='virtio'/>",
+            "<backingStore type='file'><source file='/home/op/base.qcow2'/>"
+            "</backingStore><target dev='vda' bus='virtio'/>",
+        )
+        self.assert_gaps(
+            xml,
+            "attribute:devices/disk/backingStore@type",
+            "element:devices/disk/backingStore/source",
+        )
+
+    def test_a_boot_from_a_host_file_or_another_firmware_is_a_gap(self):
+        base = self.render()
+        broken = {
+            "element:os/kernel": "<kernel>/home/op/vmlinuz</kernel>",
+            "element:os/initrd": "<initrd>/home/op/initrd.img</initrd>",
+            "element:os/cmdline": "<cmdline>init=/bin/sh</cmdline>",
+            "element:os/dtb": "<dtb>/home/op/x.dtb</dtb>",
+            "element:os/smbios": "<smbios mode='host'/>",
+            "element:os/acpi": "<acpi><table type='slic'>/home/op/slic.dat</table></acpi>",
+            "text:os/loader=/home/op/evil.fd": (
+                "<loader readonly='yes' type='pflash'>/home/op/evil.fd</loader>"
+            ),
+            "value:os/loader@readonly=no": (
+                "<loader readonly='no' type='pflash'>%s</loader>" % LOADER
+            ),
+            "text:os/nvram=/home/op/vars.fd": (
+                "<nvram template='/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2'>"
+                "/home/op/vars.fd</nvram>"
+            ),
+            "value:os/nvram@template=/home/op/vars.fd": (
+                "<nvram template='/home/op/vars.fd'>"
+                "/var/lib/libvirt/qemu/nvram/yolobox-box_VARS.qcow2</nvram>"
+            ),
+            "text:os/nvram=/var/lib/libvirt/qemu/nvram/other_VARS.qcow2": (
+                "<nvram template='/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2'>"
+                "/var/lib/libvirt/qemu/nvram/other_VARS.qcow2</nvram>"
+            ),
+        }
+        for gap, element in broken.items():
+            with self.subTest(gap=gap):
+                self.assert_gaps(
+                    base.replace("<boot dev='hd'/>", element + "<boot dev='hd'/>"), gap
+                )
+        self.assert_gaps(
+            base.replace(
+                "enabled='no' name='secure-boot'", "enabled='yes' name='secure-boot'"
+            ),
+            "value:os/firmware/feature@enabled=yes",
+        )
+
+    def test_an_emulator_other_than_the_hosts_is_a_gap(self):
+        xml = self.render().replace(
+            "<devices>", "<devices><emulator>/home/op/qemu-wrapper</emulator>"
+        )
+        self.assert_gaps(xml, "text:devices/emulator=/home/op/qemu-wrapper")
+
+    def test_an_interface_that_reaches_a_host_file_or_a_second_port_is_a_gap(self):
+        base = self.render()
+        broken = {
+            "element:devices/interface/rom": base.replace(
+                "<mtu size='65520'/>",
+                "<mtu size='65520'/><rom file='/home/op/rom.bin'/>",
+            ),
+            "attribute:devices/interface/backend@logFile": base.replace(
+                "<backend type='passt'/>",
+                "<backend type='passt' logFile='/etc/shadow'/>",
+            ),
+            "attribute:devices/interface/backend@upstream": base.replace(
+                "<backend type='passt'/>", "<backend type='passt' upstream='eth0'/>"
+            ),
+            "element:devices/interface/source": base.replace(
+                "<backend type='passt'/>",
+                "<backend type='passt'/><source dev='/dev/net/tun'/>",
+            ),
+            "repeated:devices/interface/portForward/range": base.replace(
+                "<range start='61000' to='22'/>",
+                "<range start='61000' to='22'/><range start='61001' to='22'/>",
+            ),
+            "attribute:devices/interface/portForward/range@end": base.replace(
+                "<range start='61000' to='22'/>",
+                "<range start='61000' end='61100' to='22'/>",
+            ),
+            "value:devices/interface/portForward/range@to=80": base.replace(
+                "<range start='61000' to='22'/>", "<range start='61000' to='80'/>"
+            ),
+            "repeated:devices/interface/portForward": base.replace(
+                "</portForward>",
+                "</portForward><portForward proto='tcp' address='127.0.0.1'>"
+                "<range start='61001' to='22'/></portForward>",
+            ),
+            "value:devices/interface/ip@address=192.168.5.16": base.replace(
+                "address='192.168.5.15'", "address='192.168.5.16'"
+            ),
+            "value:devices/interface/route@gateway=192.168.5.1": base.replace(
+                "gateway='192.168.5.2'", "gateway='192.168.5.1'"
+            ),
+        }
+        for gap, xml in broken.items():
+            with self.subTest(gap=gap):
+                self.assert_gaps(xml, gap)
+
+    def test_a_serial_log_a_base_label_or_a_qemu_argument_is_a_gap(self):
+        base = self.render()
+        qemu = "http://libvirt.org/schemas/domain/qemu/1.0"
+        broken = {
+            "element:devices/serial/log": base.replace(
+                "<serial type='pty'>",
+                "<serial type='pty'><log file='/home/op/serial.log'/>",
+            ),
+            "element:seclabel/baselabel": base.replace(
+                "<seclabel type='dynamic' model='selinux' relabel='yes'/>",
+                "<seclabel type='dynamic' model='selinux' relabel='yes'>"
+                "<baselabel>system_u:system_r:unconfined_t:s0</baselabel></seclabel>",
+            ),
+            "text:seclabel/label=system_u:system_r:unconfined_t:s0:c1,c2": base.replace(
+                "<seclabel type='dynamic' model='selinux' relabel='yes'/>",
+                "<seclabel type='dynamic' model='selinux' relabel='yes'>"
+                "<label>system_u:system_r:unconfined_t:s0:c1,c2</label></seclabel>",
+            ),
+            "element:qemu:commandline": base.replace(
+                "<domain type='kvm'>", "<domain type='kvm' xmlns:qemu='%s'>" % qemu
+            ).replace("</domain>", "<qemu:commandline/></domain>"),
+            "element:sysinfo": base.replace(
+                "</domain>", "<sysinfo type='smbios'/></domain>"
+            ),
+            "element:launchSecurity": base.replace(
+                "</domain>", "<launchSecurity type='sev'/></domain>"
+            ),
+            "element:{urn:other}extra": base.replace(
+                "</domain>", "<x:extra xmlns:x='urn:other'/></domain>"
+            ),
+            "element:metadata/{urn:other}note": base.replace(
+                "</metadata>", "<x:note xmlns:x='urn:other'/></metadata>"
+            ),
+        }
+        for gap, xml in broken.items():
+            with self.subTest(gap=gap):
+                self.assert_gaps(xml, gap)
+
+    def test_an_rng_that_reads_anything_but_the_hosts_entropy_devices_is_a_gap(self):
+        broken = {
+            "value:devices/rng/backend@model=egd": (
+                "<rng model='virtio'><backend model='egd'>/dev/urandom</backend></rng>"
+            ),
+            "missing:devices/rng/backend": "<rng model='virtio'/>",
+            "text:devices/rng/backend=/home/op/secret": (
                 "<rng model='virtio'>"
                 "<backend model='random'>/home/op/secret</backend></rng>"
             ),
         }
         for gap, element in broken.items():
             with self.subTest(gap=gap):
-                gaps = self.gaps(self.box.parse_domain(self.with_device(element)))
-                self.assertEqual(gaps, [gap])
-                self.assertIn(gap, self.driver.config_gap_message(gaps))
-
-    def test_a_root_element_the_template_does_not_have_is_a_gap_named_in_the_message(
-        self,
-    ):
-        qemu = "http://libvirt.org/schemas/domain/qemu/1.0"
-        for gap, element in (
-            ("element:qemu:commandline", "<qemu:commandline/>"),
-            ("element:sysinfo", "<sysinfo type='smbios'/>"),
-            ("element:{urn:other}extra", "<x:extra xmlns:x='urn:other'/>"),
-        ):
-            with self.subTest(gap=gap):
-                xml = (
-                    self.render()
-                    .replace(
-                        "<domain type='kvm'>",
-                        "<domain type='kvm' xmlns:qemu='%s'>" % qemu,
-                    )
-                    .replace("</domain>", element + "</domain>")
-                )
-                self.assertEqual(self.gaps(self.box.parse_domain(xml)), [gap])
+                self.assert_gaps(self.with_rng(element), gap)
+        self.assert_gaps(
+            self.with_rng(
+                "<rng model='virtio'><backend model='egd' type='unix'>"
+                "<source mode='connect' path='/run/host.sock'/></backend></rng>"
+            ),
+            "value:devices/rng/backend@model=egd",
+            "attribute:devices/rng/backend@type",
+            "text:devices/rng/backend=",
+            "element:devices/rng/backend/source",
+        )
 
     def test_a_device_that_is_there_twice_is_one_gap(self):
         xml = self.with_device("<shmem name='a'/><shmem name='b'/>")
-        self.assertEqual(self.gaps(self.box.parse_domain(xml)), ["device:shmem"])
+        self.assert_gaps(xml, "element:devices/shmem")
 
-    def test_a_domain_as_libvirt_stores_it_after_define_has_no_gap(self):
+    def test_a_domain_as_libvirt_runs_it_has_no_gap(self):
         xml = LIBVIRT_STORED_DOMAIN.replace(
             "+955:+953", "+%d:+%d" % (VM_UID, VM_GID)
         ).replace("MEMORY_KIB", str(self.box.LIBVIRT_MEMORY_GIB << 20))
@@ -725,11 +985,25 @@ class TestDomainTemplate(LibvirtCase):
     def test_both_host_entropy_devices_are_no_gap(self):
         for path in ("/dev/urandom", "/dev/random"):
             with self.subTest(path=path):
-                xml = self.with_device(
+                xml = self.with_rng(
                     "<rng model='virtio'><backend model='random'>%s</backend></rng>"
                     % path
                 )
                 self.assertEqual(self.gaps(self.box.parse_domain(xml)), [])
+
+    def test_the_hosts_firmware_is_read_from_domcapabilities(self):
+        firmware = self.box.parse_domcapabilities(DOMCAPABILITIES_XML)
+        self.assertEqual(firmware.emulator, EMULATOR)
+        self.assertIn(LOADER, firmware.loaders)
+        for text in (
+            "",
+            "<domainCapabilities/>",
+            "<domainCapabilities><path>/usr/bin/qemu</path></domainCapabilities>",
+            "<x",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(self.box.YoError):
+                    self.box.parse_domcapabilities(text)
 
     def test_a_rendered_domain_has_no_config_gap(self):
         info = self.box.parse_domain(self.render())
@@ -791,23 +1065,33 @@ class TestDomainTemplate(LibvirtCase):
     def test_every_guarantee_the_template_gives_is_noticed_when_it_goes_missing(self):
         base = self.render()
         broken = {
-            "device:graphics": base.replace("<video>", "<graphics type='vnc'/><video>"),
-            "device:channel": base.replace("<video>", "<channel type='pty'/><video>"),
-            "device:hostdev": base.replace("<video>", "<hostdev/><video>"),
+            "element:devices/graphics": base.replace(
+                "<video>", "<graphics type='vnc'/><video>"
+            ),
+            "element:devices/channel": base.replace(
+                "<video>", "<channel type='pty'/><video>"
+            ),
+            "element:devices/hostdev": base.replace("<video>", "<hostdev/><video>"),
             "seclabel.selinux": base.replace(
                 "<seclabel type='dynamic' model='selinux' relabel='yes'/>", ""
             ),
             "seclabel.dac": base.replace(
                 "type='static' model='dac'", "type='dynamic' model='dac'"
             ),
-            "metadata": base.replace("<yolobox:instance", "<yolobox:other").replace(
-                "</yolobox:instance>", "</yolobox:other>"
-            ),
+            "metadata": re.sub(r"<yolobox:instance.*?</yolobox:instance>", "", base),
             "portForward.address": base.replace(" address='127.0.0.1'>", ">"),
         }
         for gap, xml in broken.items():
             with self.subTest(gap=gap):
                 self.assertEqual(self.gaps(self.box.parse_domain(xml)), [gap])
+
+    def test_a_forward_off_loopback_is_the_address_gap_and_a_value_gap(self):
+        xml = self.render().replace("address='127.0.0.1'", "address='0.0.0.0'")
+        self.assert_gaps(
+            xml,
+            "value:devices/interface/portForward@address=0.0.0.0",
+            "portForward.address",
+        )
 
     def test_a_dac_label_that_is_not_the_vm_account_is_a_gap(self):
         base = self.render()
@@ -817,9 +1101,7 @@ class TestDomainTemplate(LibvirtCase):
                     "<label>+%d:+%d</label>" % (VM_UID, VM_GID),
                     "<label>%s</label>" % label,
                 )
-                self.assertEqual(
-                    self.gaps(self.box.parse_domain(xml)), ["seclabel.dac"]
-                )
+                self.assertIn("seclabel.dac", self.gaps(self.box.parse_domain(xml)))
 
     def test_a_seclabel_that_does_not_relabel_is_a_gap(self):
         base = self.render()
@@ -840,7 +1122,8 @@ class TestDomainTemplate(LibvirtCase):
     def test_the_dac_label_is_judged_against_the_account_asked_for(self):
         info = self.box.parse_domain(self.render())
         self.assertEqual(
-            self.box.domain_gaps(info, "box", VM_UID + 1, VM_GID), ["seclabel.dac"]
+            self.box.domain_gaps(info, "box", VM_UID + 1, VM_GID, self.firmware()),
+            ["seclabel.dac"],
         )
 
     def test_a_network_that_is_not_one_passt_interface_is_a_gap(self):
@@ -863,8 +1146,10 @@ class TestDomainTemplate(LibvirtCase):
                 self.assertIn("interface", gaps)
 
     def test_a_domain_of_another_instance_is_a_metadata_gap(self):
-        info = self.box.parse_domain(self.render(name="other"))
-        self.assertEqual(self.gaps(info), ["metadata"])
+        xml = self.render().replace(
+            ">box</yolobox:instance>", ">other</yolobox:instance>"
+        )
+        self.assert_gaps(xml, "metadata")
 
     def test_unparseable_xml_is_an_error_not_an_empty_domain(self):
         with self.assertRaisesRegex(self.box.YoError, "unparseable XML"):
@@ -900,6 +1185,13 @@ class TestHostPortWindow(LibvirtCase):
     def test_the_window_is_read_from_the_kernels_file(self):
         self.range_file.write_text("1024 49151\n")
         self.assertEqual(self.box.read_port_window().start, 49152)
+
+    def test_the_window_never_dips_into_the_registered_ports(self):
+        # A host whose ephemeral range ends early does not hand yo port 30001,
+        # where a registered service may listen.
+        for text, first in (("1024 30000", 49152), ("1024 49150", 49152)):
+            with self.subTest(text=text):
+                self.assertEqual(self.box.host_port_window(text).start, first)
 
     def test_an_unreadable_file_is_an_error(self):
         self.range_file.unlink()
@@ -945,7 +1237,9 @@ class TestPortAllocation(LibvirtCase):
             with self.assertRaisesRegex(self.box.YoError, "cannot probe 127.0.0.1:80"):
                 self.box.loopback_port_bound(80)
 
-    def test_the_driver_skips_ports_other_boxes_forward_but_not_other_domains(self):
+    def test_the_driver_skips_ports_every_domain_forwards_boxes_or_not(self):
+        # A shut-off domain of another tool holds no socket, so only its XML
+        # shows the port it will take when it starts.
         self.host.tagged_domain("first", FIRST_PORT)
         self.host.tagged_domain("second", FIRST_PORT + 1)
         untagged = self.box.domain_xml(
@@ -959,10 +1253,17 @@ class TestPortAllocation(LibvirtCase):
         self.host.domains["plain"] = re.sub(
             r"<metadata>.*</metadata>", "", untagged, flags=re.S
         )
+        self.host.states["plain"] = "shut off"
+        self.host.domains["span"] = (
+            "<domain><name>span</name><devices><interface><portForward>"
+            "<range start='%d' end='%d'/></portForward></interface></devices></domain>"
+            % (FIRST_PORT + 3, FIRST_PORT + 5)
+        )
+        self.host.states["span"] = "shut off"
         with mock.patch.object(
             self.box.libvirt, "loopback_port_bound", return_value=False
         ):
-            self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 2)
+            self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 6)
 
     def test_a_domain_undefined_while_yo_reads_the_others_is_skipped(self):
         self.host.tagged_domain("first", FIRST_PORT)
@@ -997,14 +1298,15 @@ class TestPortAllocation(LibvirtCase):
         ):
             self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 1)
 
-    def test_the_same_xml_in_a_yolobox_domain_is_an_error_not_a_skip(self):
-        self.host.domains["ours"] = self.FOREIGN.replace(
+    def test_the_same_xml_in_this_machines_domain_is_an_error_not_a_skip(self):
+        self.host.domains["yolobox-box"] = self.FOREIGN.replace(
             "<devices>",
-            "<metadata><yolobox:instance xmlns:yolobox='%s'>x</yolobox:instance>"
+            "<metadata><yolobox:instance xmlns:yolobox='%s'>box</yolobox:instance>"
             "</metadata><devices>" % self.box.DOMAIN_NS,
         )
+        self.host.states["yolobox-box"] = "running"
         with self.assertRaises(self.box.YoError) as caught:
-            self.driver.allocate_host_port()
+            self.driver.ssh_port()
         self.assertIn("no numeric start", caught.exception.message)
 
     def test_the_driver_skips_a_port_bound_on_the_host(self):
@@ -1541,9 +1843,14 @@ class TestStatusAndGaps(LibvirtCase):
         self.assertIsNone(self.driver.vm_status())
         self.assertEqual(self.driver.config_gaps(), [])
 
-    def test_running_is_running_and_other_states_keep_their_words(self):
+    def test_running_and_blocked_are_running_and_other_states_keep_their_words(self):
+        # "blocked" is a running guest idling on I/O; the same word set keeps
+        # a stop waiting through it (require_stoppable).
         self.host.tagged_domain("box", FIRST_PORT)
         self.assertEqual(self.driver.vm_status(), "Running")
+        self.host.states["yolobox-box"] = "blocked"
+        self.assertEqual(self.driver.vm_status(), "Running")
+        self.driver.require_stoppable("blocked")
         self.host.states["yolobox-box"] = "shut off"
         self.assertEqual(self.driver.vm_status(), "shut off")
 
@@ -1569,10 +1876,10 @@ class TestStatusAndGaps(LibvirtCase):
         self.host.domains["yolobox-box"] = self.host.domains["yolobox-box"].replace(
             "<video>", "<tpm model='tpm-crb'/><video>"
         )
-        self.assertEqual(self.driver.config_gaps(), ["device:tpm"])
+        self.assertEqual(self.driver.config_gaps(), ["element:devices/tpm"])
         self.assertIn(
             "undefine --nvram yolobox-box",
-            self.driver.config_gap_message(["device:tpm"]),
+            self.driver.config_gap_message(["element:devices/tpm"]),
         )
 
     def refusal(self, memory_gib=None, disk_gib=None):
@@ -1778,6 +2085,47 @@ class TestStatusAndGaps(LibvirtCase):
                 "YOLOBOX_FLAKE_REF=github:x/y/z",
             ],
         )
+
+
+class TestOwnDomain(LibvirtCase):
+    """A domain yo reaches by name must carry its own tag."""
+
+    def test_a_domain_of_this_name_that_yo_did_not_define_is_an_error_not_a_box(self):
+        # Every command reaches the domain through domain_exists, so none
+        # stops, resizes or destroys a domain of another tool.
+        tagged = self.host.domains.get
+        self.host.tagged_domain("box", FIRST_PORT)
+        foreign = re.sub(
+            r"<metadata>.*</metadata>", "", tagged("yolobox-box"), flags=re.S
+        )
+        other = tagged("yolobox-box").replace(
+            ">box</yolobox:instance>", ">other</yolobox:instance>"
+        )
+        for xml, said in ((foreign, "has none"), (other, "says 'other'")):
+            with self.subTest(said=said):
+                self.host.domains["yolobox-box"] = xml
+                for look in (
+                    self.driver.vm_status,
+                    self.driver.ssh_port,
+                    self.driver.stop,
+                    self.driver.removals,
+                    self.driver.config_gaps,
+                ):
+                    with self.assertRaises(self.box.YoError) as caught:
+                        look()
+                    self.assertIn("domain yolobox-box", caught.exception.message)
+                    self.assertIn("is not box's", caught.exception.message)
+                    self.assertIn(said, caught.exception.message)
+        self.assertEqual(
+            [sub for sub in self.host.subcommands() if sub not in READS], []
+        )
+
+    def test_a_domain_undefined_between_the_listing_and_its_tag_read_does_not_exist(
+        self,
+    ):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.before_dumpxml = lambda name: self.host.domains.pop(name, None)
+        self.assertFalse(self.driver.domain_exists())
 
 
 class TestKeepalive(LibvirtCase):
@@ -2776,7 +3124,7 @@ class TestVmUpWithAGap(LibvirtCase):
         with mock.patch.object(self.box.agent, "luks_passphrase") as passphrase:
             with self.assertRaises(self.box.YoError) as caught:
                 self.box.vm_up()
-        self.assertIn("device:tpm", caught.exception.message)
+        self.assertIn("element:devices/tpm", caught.exception.message)
         self.assertIn("undefine --nvram yolobox-box", caught.exception.message)
         passphrase.assert_not_called()
         self.assertNotIn("start", self.host.subcommands())
@@ -2926,6 +3274,16 @@ class TestVmUpResizes(LibvirtCase):
         error, _ = self.vm_up(self.box.Size(None, None, 2))
         self.assertIsNone(error)
         self.assertEqual(self.driver.current_size().cpus, 2)
+
+    def test_less_memory_is_never_refused_by_a_full_host(self):
+        # A plain `yo up` would start the box at its 16 GiB unjudged, so a
+        # shrink to 8 cannot fit worse than that.
+        self.host_memory(8 << 20)
+        error, _ = self.vm_up(self.box.Size(8, None, None))
+        self.assertIsNone(error)
+        self.assertEqual(self.driver.current_size().memory_gib, 8)
+        error, _ = self.vm_up(self.box.Size(9, None, None))
+        self.assertIn("does not fit on this host", error.message)
 
     def test_a_virsh_that_refuses_a_setting_stops_before_the_start(self):
         self.host.fail["setvcpus"] = "error: too many vCPUs"
@@ -3164,6 +3522,50 @@ class TestStart(LibvirtCase):
         with self.assertRaisesRegex(self.box.YoError, "sudo setfacl -m u:yolobox-vm"):
             self.start()
         self.assertNotIn("start", self.host.subcommands())
+
+    BIND_DENIED = (
+        "error: Failed to start domain 'yolobox-box'\nerror: internal error: "
+        "Could not start 'passt': Failed to bind UNIX domain socket: Permission denied"
+    )
+
+    def test_a_passt_that_could_not_bind_is_started_once_more_after_the_acl_held(
+        self,
+    ):
+        # Another passt domain's start reset the mask between yo's check and
+        # the start; the hook restored it at that domain's `started begin`.
+        self.host.fail_once["start"] = self.BIND_DENIED
+        self.start()
+        self.assertEqual(len(self.host.calls_of("start")), 2)
+        self.assertEqual(self.host.states["yolobox-box"], "running")
+
+    def test_a_passt_that_could_not_bind_with_the_acl_still_short_is_the_remedy(self):
+        self.host.fail_once["start"] = self.BIND_DENIED
+        acl = [getfacl_listing(), getfacl_listing(mask="r-x")]
+        run = self.host.run
+
+        def acl_changes_under_yo(argv, **kwargs):
+            if argv[0] == "getfacl":
+                self.host.acl = acl.pop(0)
+            return run(argv, **kwargs)
+
+        with (
+            mock.patch.object(self.box.proc, "run", acl_changes_under_yo),
+            self.assertRaisesRegex(self.box.YoError, "sudo setfacl -m u:yolobox-vm"),
+        ):
+            self.start()
+        self.assertEqual(len(self.host.calls_of("start")), 1)
+
+    def test_a_start_that_fails_for_any_other_reason_is_not_retried(self):
+        self.host.fail_once["start"] = "error: internal error: lizard"
+        with self.assertRaisesRegex(self.box.YoError, r"virsh start .*lizard"):
+            self.start()
+        self.assertEqual(len(self.host.calls_of("start")), 1)
+
+    def test_a_second_bind_failure_is_final(self):
+        self.host.fail["start"] = self.BIND_DENIED
+        with self.assertRaisesRegex(self.box.YoError, "Failed to bind"):
+            self.start()
+        self.assertEqual(len(self.host.calls_of("start")), 2)
 
     def test_the_port_is_chosen_and_the_domain_defined_under_the_lock(self):
         held = []

@@ -16,6 +16,9 @@ UNIT_DEST="/etc/systemd/system/yolobox-host.service"
 POLKIT_RULE="/etc/polkit-1/rules.d/50-yolobox-libvirt.rules"
 PASST_TMPFILES="/etc/tmpfiles.d/yolobox-passt.conf"
 PASST_DIR="/run/libvirt/qemu/passt"
+# libvirt's own account, which creates that directory; the hook refuses a
+# directory owned by anyone else.
+PASST_OWNER="qemu"
 PASST_HOOK="/etc/libvirt/hooks/qemu.d/50-yolobox-passt"
 POOL_NAME="default"
 POOL_PATH="/var/lib/libvirt/images"
@@ -78,6 +81,15 @@ dnf install -y libvirt-daemon-kvm libvirt-client edk2-ovmf passt passt-selinux x
 # version gate and the network step. virtnetworkd is started only so the
 # `default` network can be switched off.
 step "(d) libvirt daemons"
+# The host table is tied to virtqemud (RequiredBy=, step g), and the passt hook
+# is read by it. The monolithic libvirtd would start domains past both, so a
+# host that still runs or enables it is refused, not silently switched over
+# under its running domains.
+for unit in libvirtd.service libvirtd.socket; do
+  if systemctl is-enabled --quiet "$unit" || systemctl is-active --quiet "$unit"; then
+    die "the monolithic $unit is enabled or active; yolobox gates its host table and passt hook on virtqemud, which libvirtd would bypass. Switch the host to the modular daemons first (stop every domain, then: systemctl disable --now libvirtd.service libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket) and run this again"
+  fi
+done
 systemctl enable --now virtqemud.socket virtstoraged.socket virtnetworkd.socket
 
 # The daemon's version counts, not the client's: the daemon starts passt. A daemon
@@ -132,13 +144,15 @@ fi
 # /run is a tmpfs, so a tmpfiles rule re-applies it on every boot, before
 # virtqemud starts. See linux/host-setup.md.
 step "(j) passt socket directory"
+# A symlink there would send the ACL, and the hook's, to whatever it points at.
+[[ ! -L $PASST_DIR ]] || die "$PASST_DIR is a symlink, which libvirt never makes; remove it and run this again"
 cat >"$PASST_TMPFILES" <<RULE
-d $PASST_DIR 0755 qemu qemu -
+d $PASST_DIR 0755 $PASST_OWNER $PASST_OWNER -
 a+ $PASST_DIR - - - - u:$VM_USER:rwx,m::rwx
 RULE
 chmod 0644 "$PASST_TMPFILES"
 systemd-tmpfiles --create "$PASST_TMPFILES"
-setfacl -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
+setfacl -P -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
 
 # libvirt recomputes that directory's ACL mask whenever it starts another passt
 # domain, which cuts yolobox-vm's entry down to r-x. A qemu hook re-applies the
