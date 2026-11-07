@@ -223,6 +223,7 @@ in
       "net.core.bpf_jit_harden" = 2;
       "kernel.io_uring_disabled" = 2;
       "dev.tty.ldisc_autoload" = 0;
+      "dev.tty.legacy_tiocsti" = 0;
       "fs.protected_fifos" = 2;
       "fs.protected_regular" = 2;
       "fs.suid_dumpable" = 0;
