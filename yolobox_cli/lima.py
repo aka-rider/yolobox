@@ -407,6 +407,7 @@ class LimaDriver:
     """macOS: one Lima instance per machine, run by the vz driver."""
 
     name = "lima"
+    keepalive_name = "host agent"
     instances_dir = ".lima"
     initrd_identity = ".lima/_config/user"
     start_command = "limactl start"

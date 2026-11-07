@@ -10,7 +10,7 @@ import re
 import shlex
 from typing import List, Optional, Tuple
 
-from . import config, sshx, state, ui
+from . import config, proc, sshx, state, ui
 from .ui import YoError
 
 
@@ -49,12 +49,18 @@ def release_triple(version: str) -> Optional[Tuple[int, int, int]]:
     return major, minor, patch
 
 
-def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
+def version_drift(
+    host: str, guest: Optional[str], built_from: Optional[str]
+) -> Optional[str]:
     """What to do about a box built by another release than this yo, or None.
 
     A box built by a newer release is not rebuilt by this yo: `yo bootstrap`
     would build the older release over it. Versions that are not X.Y.Z cannot be
     ordered, so a box that differs from this yo is advised the rebuild.
+    `built_from` is the ref the box was bootstrapped from with --version
+    (state.remembered_flake_ref()), or None: the rebuild advised then names
+    that ref, because a plain `yo bootstrap` would move the box to this yo's
+    release and forget the ref.
     """
     if guest is None or host == "dev" or host == guest:
         return None
@@ -70,10 +76,20 @@ def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
             "(%s would build %s over it)"
             % (guest, host, state.yo_cmd("bootstrap"), host)
         )
-    return "yo: this host's yo is %s but the box was built by %s — rebuild it: %s" % (
-        host,
-        guest,
-        state.yo_cmd("bootstrap"),
+    if built_from is None:
+        return (
+            "yo: this host's yo is %s but the box was built by %s — rebuild it: %s"
+            % (host, guest, state.yo_cmd("bootstrap"))
+        )
+    return (
+        "yo: this host's yo is %s but the box was built by %s from %s — rebuild it "
+        "from that ref: %s"
+        % (
+            host,
+            guest,
+            built_from,
+            state.yo_cmd("bootstrap", "--version", shlex.quote(built_from)),
+        )
     )
 
 
@@ -95,17 +111,28 @@ def flake_ref(version: Optional[str]) -> str:
     ref = named_flake_ref(version)
     old = old_release(ref)
     if old is not None:
-        raise YoError(
-            "cannot build release %s, %s — build it with that release's own yo "
-            "instead, %s" % (old, OLD_RELEASE_WHY, old_release_yo(old))
-        )
+        raise YoError(old_release_refusal(old))
     return ref
+
+
+def old_release_refusal(old: str) -> str:
+    return (
+        "cannot build release %s, %s — build it with that release's own yo "
+        "instead, %s"
+        % (
+            old,
+            OLD_RELEASE_WHY,
+            old_release_yo(old),
+        )
+    )
 
 
 def own_release_ref() -> Optional[str]:
     """This yo's own release ref; None for an unreleased build, which has none
     it can build: `dev`, or a build of main whose .version still names a
-    release that predates FIRST_HOST_OS_FREE_RELEASE."""
+    release that predates FIRST_HOST_OS_FREE_RELEASE. A build of main stamped
+    with a later release cannot be told from that release and claims it
+    (docs/distribution.md)."""
     if config.YO_VERSION == "dev":
         return None
     ref = "%s/v%s" % (UPSTREAM_FLAKE, config.YO_VERSION)
@@ -165,11 +192,23 @@ def named_flake_ref(version: str) -> str:
 
 
 def bootstrap_version(value: str) -> str:
-    """argparse `type=` of `bootstrap --version`: a bad ref is a usage error."""
+    """argparse `type=` of `bootstrap --version`: the ref the value names, a bad
+    one a usage error. It reads no state: the old-release check names the
+    machine in its remedy, and main() chooses the machine only after parsing
+    (old_release_problem)."""
     try:
-        return flake_ref(value)
+        return named_flake_ref(value)
     except YoError as failure:
         raise argparse.ArgumentTypeError(failure.message)
+
+
+def old_release_problem(args: argparse.Namespace) -> Optional[str]:
+    """The usage error of a `bootstrap --version` that names a release this yo
+    cannot build (old_release), once the machine is chosen; None otherwise."""
+    if args.version is None:
+        return None
+    old = old_release(args.version)
+    return None if old is None else old_release_refusal(old)
 
 
 def rebuild_hint() -> str:
@@ -322,15 +361,15 @@ def locked_rev(ref: str) -> str:
     )
     if completed.returncode != 0:
         raise YoError(
-            "the box could not resolve %s (nix flake metadata, exit %d): %s"
-            % (ref, completed.returncode, completed.stderr.strip() or "no output")
+            "the box could not resolve %s (nix flake metadata, exit %d)%s"
+            % (ref, completed.returncode, proc.what_it_said(completed))
         )
     try:
         rev = json.loads(completed.stdout)["locked"]["rev"]
     except (ValueError, KeyError, TypeError):
         raise YoError(
-            "nix flake metadata printed no locked commit for %s: %s"
-            % (ref, completed.stdout.strip()[:200] or "no output")
+            "nix flake metadata printed no locked commit for %s%s"
+            % (ref, proc.what_it_said(completed))
         )
     if not isinstance(rev, str) or not COMMIT_RE.fullmatch(rev):
         raise YoError("nix flake metadata locked %s at %r, not a commit" % (ref, rev))
@@ -338,7 +377,7 @@ def locked_rev(ref: str) -> str:
 
 
 def helper_skew(what: str) -> str:
-    drift = version_drift(config.YO_VERSION, built_by())
+    drift = version_drift(config.YO_VERSION, built_by(), state.remembered_flake_ref())
     if drift:
         return "%s.\n    %s" % (what, drift[len("yo: ") :])
     return "%s.\n    rebuild it: %s" % (what, rebuild_hint())

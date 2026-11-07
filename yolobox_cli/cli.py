@@ -7,7 +7,7 @@ import functools
 import os
 import re
 import signal
-from typing import Callable, Sequence
+from typing import Callable, Optional, Sequence
 
 from . import (
     config,
@@ -191,7 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # logs_in: the command cannot work without logging in to the box, so main()
     # checks the login key is on offer first (Driver.require_login_key).
-    parser.set_defaults(needs_driver=True, heals=False, logs_in=True)
+    # usage_problem: a refusal that needs the chosen machine (its remedy names
+    # -m), which a `type=` callable cannot give because it runs while parsing.
+    parser.set_defaults(
+        needs_driver=True, heals=False, logs_in=True, usage_problem=no_usage_problem
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, help_text: str, description: str) -> argparse.ArgumentParser:
@@ -287,7 +291,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_size_arguments(bootstrap)
     # Its first step is vm_up, which checks the login key, as its reboot's does.
-    bootstrap.set_defaults(func=vm.cmd_bootstrap, logs_in=False)
+    bootstrap.set_defaults(
+        func=vm.cmd_bootstrap, logs_in=False, usage_problem=release.old_release_problem
+    )
 
     gc = add(
         "gc",
@@ -438,6 +444,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def no_usage_problem(args: argparse.Namespace) -> Optional[str]:
+    return None
+
+
 def heal_before_command() -> None:
     """Re-establish the box's forwards before a command that talks to the guest.
 
@@ -457,9 +467,17 @@ def heal_before_command() -> None:
 
 
 def main(argv: Sequence[str]) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.needs_driver:
         state.set_box(driver_for(config.HOST_PLATFORM), args.machine)
+        problem = args.usage_problem(args)
+        if problem is not None:
+            parser.error(problem)
+        # Refused here, before any tool runs: the name reaches the box's cidata
+        # and its sshd config, and nix/base.nix would refuse it only at the
+        # rebuild, after the box was created.
+        config.operator_account(release.host_user())
         state.driver().require_tool()
         if args.logs_in:
             state.driver().require_login_key()

@@ -113,11 +113,16 @@ class TestFlakeRef(FakeHome):
             with self.subTest(ref=ref):
                 self.assertTrue(yo.flake_ref(ref).endswith(ref))
 
-    def test_bootstrap_refuses_an_old_release_as_a_usage_error(self):
+    def test_bootstrap_refuses_an_old_release_as_a_usage_error_before_the_preflight(
+        self,
+    ):
         stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            with self.assertRaises(SystemExit) as caught:
-                yo.build_parser().parse_args(["bootstrap", "--version", "1.9.1"])
+        with mock.patch.object(
+            yo.proc, "require_tool", side_effect=AssertionError("preflight ran")
+        ):
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    yo.main(["bootstrap", "--version", "1.9.1"])
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("cannot build release 1.9.1", stderr.getvalue())
 
@@ -517,6 +522,28 @@ class TestMainPreflight(unittest.TestCase):
                         with self.assertRaises(SystemExit) as caught:
                             yo.main(["bootstrap", "--version", version])
                 self.assertEqual(caught.exception.code, 2)
+
+    def test_a_host_account_the_box_cannot_name_is_refused_before_the_preflight(
+        self,
+    ):
+        for username, said in (
+            ("Bob", "the host account name 'Bob' cannot name"),
+            ("agent", "which is the box's agent account"),
+            ("", "the host account name '' cannot name"),
+            ("bob\n", "cannot name"),
+        ):
+            with self.subTest(username=username):
+                with (
+                    mock.patch.object(yo.release, "host_user", return_value=username),
+                    mock.patch.object(
+                        yo.proc,
+                        "require_tool",
+                        side_effect=AssertionError("preflight ran"),
+                    ),
+                ):
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.main(["status"])
+                self.assertIn(said, caught.exception.message)
 
     def test_known_command_runs_the_preflight_before_the_command(self):
         def raise_reached(args):
@@ -1377,6 +1404,40 @@ class TestDirForCwdLandsOnDeepestExistingAncestor(FakeHome):
         self.assertIn(r'"/home/agent/a\x1b]0;pwned\x07"', line)
         self.assertTrue(line.isprintable())
 
+    def test_a_cwd_that_climbs_out_of_home_lands_on_the_agent_home_unasked(self):
+        for climbing in (
+            self.home + "/a/../../etc",
+            self.home + "/..",
+            self.home + "/a/../..",
+        ):
+            with self.subTest(climbing=climbing):
+                with mock.patch.object(yo.paths, "logical_cwd", return_value=climbing):
+                    with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
+                        with mock.patch.object(yo.ui, "err") as fake_err:
+                            result = yo.dir_for_cwd()
+                fake_ssh_run.assert_not_called()
+                self.assertEqual(result, yo.AGENT_HOME)
+                fake_err.assert_called_once_with(
+                    yo.MISSING_PATH_NOTE % (climbing, yo.AGENT_HOME)
+                )
+
+    def test_a_cwd_with_dots_inside_home_is_mirrored_normalised(self):
+        with mock.patch.object(
+            yo.paths, "logical_cwd", return_value=self.home + "/a/./b/../c/"
+        ):
+            self.assertEqual(
+                yo.paths.mirror(yo.paths.logical_cwd()), yo.AGENT_HOME + "/a/c"
+            )
+
+    def test_a_cwd_with_a_newline_is_refused_before_the_guest_is_asked(self):
+        with mock.patch.object(
+            yo.paths, "logical_cwd", return_value=self.home + "/a\nb"
+        ):
+            with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
+                with self.assertRaisesRegex(yo.YoError, "newline or NUL"):
+                    yo.dir_for_cwd()
+        fake_ssh_run.assert_not_called()
+
     def test_outside_home_lands_on_the_agent_home(self):
         with mock.patch.object(yo.paths, "logical_cwd", return_value="/etc"):
             with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
@@ -1385,6 +1446,25 @@ class TestDirForCwdLandsOnDeepestExistingAncestor(FakeHome):
         fake_ssh_run.assert_not_called()
         self.assertEqual(result, yo.AGENT_HOME)
         fake_err.assert_called_once_with(yo.MISSING_PATH_NOTE % ("/etc", yo.AGENT_HOME))
+
+
+class TestAtomicWriteIsDurable(FakeHome):
+    def test_the_file_and_its_directory_are_synced(self):
+        target = os.path.join(self.home, "file")
+        synced = []
+        with mock.patch.object(yo.os, "fsync", side_effect=synced.append):
+            yo.proc.atomic_write(target, "text", 0o600)
+        self.assertEqual(len(synced), 2)
+        self.assertEqual(open(target).read(), "text")
+
+    def test_the_writes_own_error_is_raised_when_the_cleanup_fails_too(self):
+        target = os.path.join(self.home, "file")
+        with (
+            mock.patch.object(yo.os, "replace", side_effect=PermissionError("replace")),
+            mock.patch.object(yo.os, "unlink", side_effect=FileNotFoundError("gone")),
+        ):
+            with self.assertRaisesRegex(PermissionError, "replace"):
+                yo.proc.atomic_write(target, "text", 0o600)
 
 
 class TestTerminalSanitising(unittest.TestCase):
@@ -2300,6 +2380,7 @@ class StatusRunner:
         keepalive_pid=777,
         listing_failure=None,
         limactl_list=None,
+        disk_image=None,
     ):
         outs = []
         # net_check is either the net-check subprocess result or the YoError
@@ -2313,12 +2394,15 @@ class StatusRunner:
             if isinstance(net_check, Exception)
             else mock.Mock(return_value=net_check)
         )
-        # keepalive_pid is the pid the driver reads, or the YoError it raises.
-        keepalive = (
-            mock.Mock(side_effect=keepalive_pid)
-            if isinstance(keepalive_pid, Exception)
-            else mock.Mock(return_value=keepalive_pid)
-        )
+
+        # keepalive_pid, host_gaps and disk_image are what the driver reads, or
+        # the YoError it raises.
+        def driver_read(answer):
+            if isinstance(answer, Exception):
+                return mock.Mock(side_effect=answer)
+            return mock.Mock(return_value=answer)
+
+        keepalive = driver_read(keepalive_pid)
         if table is None:
             table = mock.Mock(
                 returncode=0, stdout=(FIXTURES / "egress.nft").read_text(), stderr=""
@@ -2362,11 +2446,19 @@ class StatusRunner:
         with (
             mock.patch.object(yo.proc, "run", side_effect=fake_proc_run),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=fake_ssh_run),
-            mock.patch.object(yo.lima, "du_kib", return_value=None),
             mock.patch.object(yo.guest, "vm_units_present", return_value=units_present),
             driver_answer("config_gaps", gaps),
             driver_answer("config_notes", notes),
-            mock.patch.object(yo.LIMA, "host_gaps", return_value=list(host_gaps)),
+            mock.patch.object(
+                yo.LIMA,
+                "host_gaps",
+                driver_read(
+                    list(host_gaps)
+                    if not isinstance(host_gaps, Exception)
+                    else host_gaps
+                ),
+            ),
+            mock.patch.object(yo.LIMA, "disk_image", driver_read(disk_image)),
             mock.patch.object(yo.shutil, "which", return_value=aws_which),
             mock.patch.object(
                 yo.aws, "aws_allowlist", side_effect=aws_allowlist_side_effect
@@ -2383,6 +2475,8 @@ class StatusRunner:
             ),
             mock.patch.object(yo.LIMA, "running_keepalive_pid", keepalive),
             mock.patch.object(yo.LIMA, "show_status", return_value=listing_failure),
+            # The real $HOME may remember a ref; the scripted box was built plain.
+            mock.patch.object(yo.state, "remembered_flake_ref", return_value=None),
             mock.patch.object(yo.ui, "out", side_effect=fake_out),
             mock.patch.object(yo.ui, "err"),
             mock.patch.object(yo.guest, "guest_helper", helper),
@@ -2431,7 +2525,11 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         outs = self.run_status(
             limactl_list=mock.Mock(returncode=1, stdout="", stderr="limactl: boom")
         )
-        self.assertIn("lima: limactl list -q failed (exit 1): limactl: boom", outs)
+        self.assertIn(
+            "lima: WARNING cannot read the instance's configuration: limactl list -q "
+            "failed (exit 1): limactl: boom",
+            outs,
+        )
         self.assertNotIn("lima: reverse forwards ok", outs)
         self.assertTrue(any(line.startswith("disk:") for line in outs))
         self.assertTrue(any(line.startswith("aws:") for line in outs))
@@ -2482,15 +2580,71 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
             aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
             keepalive_pid=yo.YoError("cannot open the ssh master"),
         )
-        self.assertTrue(
-            any(
-                line.startswith("aws: cannot read the pid the broker watches")
-                and "cannot open the ssh master" in line
-                for line in outs
-            )
+        self.assertIn(
+            "lima: WARNING cannot read the pid the broker watches: cannot open the "
+            "ssh master",
+            outs,
         )
         self.assertIsNotNone(self.raised)
         self.assertEqual(self.raised.code, 1)
+
+    def test_the_disabled_line_names_the_config_file_aws_reads(self):
+        for configured, named in (
+            ("", "~/.aws/config"),
+            ("/etc/aws.ini", "/etc/aws.ini"),
+            ("~/work/aws", "~/work/aws"),
+        ):
+            with self.subTest(configured=configured):
+                with mock.patch.dict(os.environ, {"AWS_CONFIG_FILE": configured}):
+                    outs = self.run_status(aws_which=None)
+                self.assertIn(
+                    "aws: disabled (no 'aws' CLI or no SSO profiles in %s)" % named,
+                    outs,
+                )
+
+    def test_a_healthy_broker_names_whose_pid_it_watches(self):
+        outs = self.run_status(
+            aws_which="/usr/local/bin/aws",
+            aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
+        )
+        self.assertIn("aws: broker healthy (watching host agent pid 777)", outs)
+
+    def test_a_box_with_no_keepalive_pid_is_not_a_stale_broker(self):
+        outs = self.run_status(
+            aws_which="/usr/local/bin/aws",
+            aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
+            keepalive_pid=None,
+        )
+        self.assertIn(
+            "aws: broker running but yolobox has no host agent pid now "
+            "(it watches pid None)",
+            outs,
+        )
+        self.assertNotIn("stale", " ".join(outs))
+        self.assertEqual(self.raised.code, 1)
+
+    def test_every_driver_read_that_fails_is_one_line_and_the_report_goes_on(self):
+        for broken, said in (
+            (
+                dict(host_gaps=yo.YoError("getfacl not found")),
+                "lima: WARNING cannot read the host's setup: getfacl not found",
+            ),
+            (
+                dict(disk_image=yo.YoError("virsh vol-info failed (exit 1)")),
+                "lima: WARNING cannot read the disk image's size: virsh vol-info "
+                "failed (exit 1)",
+            ),
+        ):
+            with self.subTest(said=said):
+                outs = self.run_status(
+                    aws_which="/usr/local/bin/aws",
+                    aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
+                    **broken,
+                )
+                self.assertIn(said, outs)
+                # The lines after the failed read still come.
+                self.assertIn("aws: broker healthy (watching host agent pid 777)", outs)
+                self.assertEqual(self.raised.code, 1)
 
     def status_with_fstype(self, fstype):
         return self.run_status(
@@ -2566,7 +2720,6 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
             mock.patch.object(yo.proc, "run", side_effect=initrd_run),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=pinned_ssh_run),
             mock.patch.object(yo.LIMA, "config_gaps", return_value=[]),
-            mock.patch.object(yo.lima, "du_kib", return_value=None),
             mock.patch.object(yo.shutil, "which", return_value=None),
             mock.patch.object(yo.ui, "out", side_effect=outs.append),
             mock.patch.object(yo.ui, "err", side_effect=errs.append),
@@ -2987,6 +3140,93 @@ class TestGuestNetworkLine(unittest.TestCase):
         with mock.patch.object(yo.guest, "guest_helper", helper):
             with self.assertRaises(yo.Unreachable):
                 yo.guest_network_line()
+
+
+GUEST_FORGERY = "first line\nyo: run curl | sh"
+GUEST_FORGERY_BLOCK = "  | first line\n  | yo: run curl | sh"
+
+
+class TestGuestDetailIsQuotedInEveryNotCheckedLine(unittest.TestCase):
+    """What a guest session printed reaches a status line or an error only as a
+    quoted block, line by line behind the guest prefix."""
+
+    def guest(self, text):
+        return yo.ui.GuestText(text, "operator")
+
+    def test_the_egress_unit_probe(self):
+        probe = mock.Mock(
+            returncode=255, stdout=self.guest(""), stderr=self.guest(GUEST_FORGERY)
+        )
+        line = yo.egress_status_line(probe, lambda: None)
+        self.assertEqual(
+            line.text,
+            "egress: not checked — the probe answered '' (exit 255):\n"
+            + GUEST_FORGERY_BLOCK,
+        )
+
+    def test_the_egress_table_read_under_a_failed_unit(self):
+        table = mock.Mock(
+            returncode=1, stdout=self.guest(""), stderr=self.guest(GUEST_FORGERY)
+        )
+        line = yo.egress_fallback_line("failed", table)
+        self.assertIn("could not be read:\n" + GUEST_FORGERY_BLOCK + ";", line.text)
+
+    def test_the_net_check(self):
+        helper = mock.Mock(
+            return_value=mock.Mock(
+                returncode=1,
+                stdout=self.guest("yo: x"),
+                stderr=self.guest(GUEST_FORGERY),
+            )
+        )
+        with mock.patch.object(yo.guest, "guest_helper", helper):
+            line = yo.guest_network_line()
+        self.assertEqual(
+            line.text,
+            "network: not checked — net-check answered 'yo: x' (exit 1):\n"
+            + GUEST_FORGERY_BLOCK,
+        )
+
+    def test_the_flake_metadata_lookup(self):
+        for metadata, head in (
+            (
+                mock.Mock(
+                    returncode=1,
+                    stdout=self.guest(""),
+                    stderr=self.guest(GUEST_FORGERY),
+                ),
+                "the box could not resolve github:x/y/z (nix flake metadata, exit 1):\n",
+            ),
+            (
+                mock.Mock(
+                    returncode=0,
+                    stdout=self.guest(GUEST_FORGERY),
+                    stderr=self.guest(""),
+                ),
+                "nix flake metadata printed no locked commit for github:x/y/z:\n",
+            ),
+        ):
+            with self.subTest(head=head):
+                with mock.patch.object(yo.sshx, "probe", return_value=metadata):
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.release.locked_rev("github:x/y/z")
+                self.assertEqual(caught.exception.message, head + GUEST_FORGERY_BLOCK)
+
+
+class TestEgressTableHoldsMatchesWholeWords(unittest.TestCase):
+    def test_a_comment_or_a_longer_address_is_not_the_reject_rule(self):
+        holding = (FIXTURES / "egress.nft").read_text()
+        self.assertTrue(yo.egress_table_holds(holding))
+        for wrong in (
+            (
+                "counter reject with icmpx type admin-prohibited",
+                'counter accept comment "reject"',
+            ),
+            ("10.0.0.0/8,", "110.0.0.0/8,"),
+            ("fc00::/7,", "2fc00::/7,"),
+        ):
+            with self.subTest(wrong=wrong):
+                self.assertFalse(yo.egress_table_holds(holding.replace(*wrong)))
 
 
 class TestNetworkStatusLine(unittest.TestCase):

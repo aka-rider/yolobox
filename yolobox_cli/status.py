@@ -8,7 +8,7 @@ import json
 import shlex
 import shutil
 import subprocess
-from typing import Callable, List, NamedTuple, Optional
+from typing import Callable, List, NamedTuple, Optional, Tuple, TypeVar
 
 from . import aws, config, forwards, guest, proc, release, sshx, state, ui, unlock, vm
 from .config import LUKS_DEVICE, MIB, PROXY_SOCKET_UNITS
@@ -21,6 +21,29 @@ from .vm import DiskState
 # `yo status` warns when the guest's / is this full.
 DISK_WARN_PERCENT = 90
 
+Read = TypeVar("Read")
+
+
+def driver_lines(
+    what: str, read: Callable[[], Read], lines_of: Callable[[Read], List[StatusLine]]
+) -> List[StatusLine]:
+    """The report's lines from one read of the host driver: what `lines_of`
+    makes of the value, or one warning naming `what` could not be read. Every
+    driver read `yo status` makes goes through here, so a host tool that fails
+    (virsh, getfacl, limactl) costs the report one line, never the rest of it."""
+    try:
+        value = read()
+    except YoError as failure:
+        return [
+            StatusLine(
+                "%s: WARNING cannot read %s: %s"
+                % (state.driver().name, what, failure.message),
+                True,
+            )
+        ]
+    return lines_of(value)
+
+
 # One operator round trip: tailscale's own status JSON. `command -v` first, so
 # a box predating nix/tailscale.nix answers with a marker instead of a bare
 # "not found".
@@ -28,6 +51,23 @@ TAILSCALE_PROBE = (
     "command -v tailscale >/dev/null 2>&1 || { echo %s; exit 0; }; "
     "tailscale status --json"
 ) % shlex.quote("NO_TAILSCALE")
+
+
+def answered(what: str, completed: subprocess.CompletedProcess) -> str:
+    """`WHAT answered 'STDOUT' (exit N)`, then its stderr, for a probe that did
+    not answer the question asked. The stdout is one escaped line (ui.shown);
+    the stderr of a guest session a quoted block, a host tool's as it is."""
+    stderr = completed.stderr
+    if isinstance(stderr, ui.GuestText):
+        said = ui.quoted_block(stderr)
+    else:
+        said = stderr.strip()
+    return "%s answered %r (exit %d)%s" % (
+        what,
+        ui.shown(completed.stdout.strip()),
+        completed.returncode,
+        proc.said_suffix(said) if said else "",
+    )
 
 
 def guest_field(text: str, key: str) -> str:
@@ -94,10 +134,24 @@ EGRESS_PRIVATE_V4 = "10.0.0.0/8"
 EGRESS_PRIVATE_V6 = "fc00::/7"
 
 
+def rule_words(line: str) -> List[str]:
+    """An nft rule as words: set braces and commas dropped, so an address and a
+    verdict are matched as whole words, never as substrings of another word or
+    of a comment."""
+    return line.replace("{", " ").replace("}", " ").replace(",", " ").split()
+
+
+def rejects(line: str, family: str, network: str) -> bool:
+    words = rule_words(line)
+    return words[:2] == [family, "daddr"] and network in words and "reject" in words
+
+
 def egress_table_holds(listing: str) -> bool:
     # Structural invariants only. lanAllow and tunnelInterfaces boxes add
     # accepts and a postrouting chain, so comparing rule content would raise
-    # a false alarm on exactly those boxes.
+    # a false alarm on exactly those boxes. This catches a table that was
+    # flushed, emptied or replaced by accident; a root that forges one that
+    # passes has already won, so adversaries are not the subject (yo.md).
     lines = [line.strip() for line in listing.splitlines()]
     has_output_hook = any(
         line.startswith("type filter hook output") for line in lines
@@ -109,14 +163,8 @@ def egress_table_holds(listing: str) -> bool:
         and '"tailscale0"' in line
         for line in lines
     )
-    rejects_v4 = any(
-        "ip daddr" in line and EGRESS_PRIVATE_V4 in line and "reject" in line
-        for line in lines
-    )
-    rejects_v6 = any(
-        "ip6 daddr" in line and EGRESS_PRIVATE_V6 in line and "reject" in line
-        for line in lines
-    )
+    rejects_v4 = any(rejects(line, "ip", EGRESS_PRIVATE_V4) for line in lines)
+    rejects_v6 = any(rejects(line, "ip6", EGRESS_PRIVATE_V6) for line in lines)
     return has_output_hook and has_local_accept and rejects_v4 and rejects_v6
 
 
@@ -218,7 +266,7 @@ def egress_fallback_line(
     elif tier is EgressTier.UNREADABLE:
         what = (
             "the egress rules failed to load (%s) and the live table could not be "
-            "read: %s" % (unit, table.stderr.strip() or "no message")
+            "read%s" % (unit, proc.what_it_said(table))
         )
     else:
         what = (
@@ -256,15 +304,7 @@ def egress_status_line(
             True,
         )
     if load_state != "loaded" or not active_state:
-        stderr = probe.stderr.strip()
-        return StatusLine(
-            "egress: not checked — the probe answered %r (exit %d)%s"
-            % (
-                probe.stdout.strip(),
-                probe.returncode,
-                ": " + stderr if stderr else "",
-            )
-        )
+        return StatusLine("egress: not checked — %s" % answered("the probe", probe))
     if active_state == "active":
         return egress_active_line(read_table())
     return egress_fallback_line(active_state, read_table())
@@ -355,14 +395,8 @@ def guest_network_line() -> StatusLine:
         return StatusLine("network: not checked — %s" % e.message)
     check = parse_net_check(completed.stdout)
     if check is None:
-        stderr = completed.stderr.strip()
         return StatusLine(
-            "network: not checked — net-check answered %r (exit %d)%s"
-            % (
-                completed.stdout.strip(),
-                completed.returncode,
-                ": " + stderr if stderr else "",
-            )
+            "network: not checked — %s" % answered("net-check", completed)
         )
     return network_status_line(check)
 
@@ -385,7 +419,9 @@ def status_guest_services(report: Report) -> None:
         "yolobox: host yo %s, box built by %s"
         % (config.YO_VERSION, guest_version or unknown_note)
     )
-    drift = release.version_drift(config.YO_VERSION, guest_version)
+    drift = release.version_drift(
+        config.YO_VERSION, guest_version, state.remembered_flake_ref()
+    )
     if drift:
         report.warn(drift)
 
@@ -475,25 +511,44 @@ def disk_lines(vm_reachable: bool) -> List[StatusLine]:
             )
     if vm_reachable:
         lines.append(encryption_line())
-    image = state.driver().disk_image()
-    if image is not None:
-        label, image_kib = image
-        lines.append(
-            StatusLine(
-                "disk: image %s allocates %dGiB on this host"
-                % (label, image_kib // MIB)
-            )
+    return lines + driver_lines(
+        "the disk image's size", state.driver().disk_image, disk_image_lines
+    )
+
+
+def disk_image_lines(image: Optional[Tuple[str, int]]) -> List[StatusLine]:
+    if image is None:
+        return []
+    label, image_kib = image
+    return [
+        StatusLine(
+            "disk: image %s allocates %dGiB on this host" % (label, image_kib // MIB)
         )
-    return lines
+    ]
 
 
-def host_gap_line(gap: str) -> StatusLine:
-    return StatusLine("%s: WARNING %s" % (state.driver().name, gap), True)
+def host_gap_lines(gaps: List[str]) -> List[StatusLine]:
+    return [
+        StatusLine("%s: WARNING %s" % (state.driver().name, gap), True) for gap in gaps
+    ]
+
+
+def config_lines(gaps_and_notes: Tuple[List[str], List[str]]) -> List[StatusLine]:
+    gaps, notes = gaps_and_notes
+    driver = state.driver()
+    if gaps:
+        lines = [
+            StatusLine("%s: %s" % (driver.name, driver.config_gap_message(gaps)), True)
+        ]
+    else:
+        lines = [StatusLine("%s: reverse forwards ok" % driver.name)]
+    return lines + [StatusLine("%s: %s" % (driver.name, note)) for note in notes]
 
 
 def aws_lines(vm_reachable: bool) -> List[StatusLine]:
     disabled = StatusLine(
-        "aws: disabled (no 'aws' CLI or no SSO profiles in ~/.aws/config)"
+        "aws: disabled (no 'aws' CLI or no SSO profiles in %s)"
+        % state.tilde(aws.aws_config_path())
     )
     if shutil.which("aws") is None:
         return [disabled]
@@ -513,46 +568,54 @@ def aws_lines(vm_reachable: bool) -> List[StatusLine]:
             not forward_up,
         )
     ]
-    try:
-        pid = state.driver().running_keepalive_pid()
-    except YoError as failure:
-        lines.append(
-            StatusLine(
-                "aws: cannot read the pid the broker watches: %s" % failure.message,
-                True,
-            )
-        )
-        return lines
+    return lines + driver_lines(
+        "the pid the broker watches",
+        state.driver().running_keepalive_pid,
+        broker_lines,
+    )
+
+
+def broker_lines(pid: Optional[int]) -> List[StatusLine]:
+    """The broker's line against `pid`, the one it should be watching (None: the
+    host has no such process now)."""
+    keepalive = state.driver().keepalive_name
     health = aws.aws_broker_health()
     if health.state is aws.BrokerState.UNREACHABLE:
-        lines.append(
+        return [
             StatusLine(
                 "aws: broker not reachable on this host's %s"
                 % aws.aws_broker_ctl_sock(),
                 True,
             )
-        )
-    elif health.state is aws.BrokerState.NO_CONTROL:
-        lines.append(
+        ]
+    if health.state is aws.BrokerState.NO_CONTROL:
+        return [
             StatusLine(
                 "aws: broker has no control socket (started by an older yo); "
                 "%s replaces it" % state.yo_cmd("up"),
                 True,
             )
-        )
-    elif pid is not None and aws.checked_pid(health.info.get("watch_pid")) == pid:
-        lines.append(
-            StatusLine("aws: broker healthy (watching hostagent pid %s)" % pid)
-        )
-    else:
-        lines.append(
+        ]
+    watched = health.info.get("watch_pid")
+    if pid is None:
+        return [
             StatusLine(
-                "aws: broker running but stale (watching pid %s, current hostagent pid %s)"
-                % (health.info.get("watch_pid"), pid),
+                "aws: broker running but %s has no %s pid now (it watches pid %s)"
+                % (state.box.name, keepalive, watched),
                 True,
             )
+        ]
+    if aws.checked_pid(watched) == pid:
+        return [
+            StatusLine("aws: broker healthy (watching %s pid %s)" % (keepalive, pid))
+        ]
+    return [
+        StatusLine(
+            "aws: broker running but stale (watching pid %s, current %s pid %s)"
+            % (watched, keepalive, pid),
+            True,
         )
-    return lines
+    ]
 
 
 def initrd_disk_line(reading: unlock.InitrdReading) -> str:
@@ -626,23 +689,16 @@ def cmd_status(args: argparse.Namespace) -> None:
             vm_reachable = False
             report.warn("vm: lost while probing — %s" % lost.message)
 
-    try:
-        gaps = state.driver().config_gaps()
-        notes = state.driver().config_notes()
-    except YoError as unreadable:
-        report.warn("%s: %s" % (state.driver().name, unreadable.message))
-    else:
-        if gaps:
-            report.warn(
-                "%s: %s"
-                % (state.driver().name, state.driver().config_gap_message(gaps))
-            )
-        else:
-            ui.out("%s: reverse forwards ok" % state.driver().name)
-        for note in notes:
-            report.emit(StatusLine("%s: %s" % (state.driver().name, note)))
-    for gap in state.driver().host_gaps():
-        report.emit(host_gap_line(gap))
+    for line in driver_lines(
+        "the instance's configuration",
+        lambda: (state.driver().config_gaps(), state.driver().config_notes()),
+        config_lines,
+    ):
+        report.emit(line)
+    for line in driver_lines(
+        "the host's setup", state.driver().host_gaps, host_gap_lines
+    ):
+        report.emit(line)
 
     for line in aws_lines(vm_reachable):
         report.emit(line)
