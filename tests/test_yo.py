@@ -515,6 +515,14 @@ class TestCpMkdirTarget(unittest.TestCase):
             "/home/agent/src/proj",
         )
 
+    def test_a_dest_whose_last_component_is_a_dot_names_the_directory_itself(self):
+        # ":." and ":./" mean ":"; "x/." and "x/.." mean the directory, as for cp.
+        for spelling in (":.", ":./", ":x/.", ":x/..", ":..", ":~/.", ":/tmp/."):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(
+                    yo.cp_mkdir_target(spelling, "/home/agent/d", 1), "/home/agent/d"
+                )
+
 
 class CpHarness(FakeHome):
     def setUp(self):

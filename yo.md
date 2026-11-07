@@ -49,7 +49,7 @@ Moving `TMPDIR` under `~` instead was rejected for two reasons. It changes the e
 
 ### The multi-source case
 
-scp itself requires the destination to be a directory once more than one source is given. That is why `cp_mkdir_target()` runs `mkdir -p` against the destination itself, rather than its parent, whenever there is more than one source, DST is `:`, or DST ends in `/`. The rule is scp's, not one `yo` invented.
+scp itself requires the destination to be a directory once more than one source is given. That is why `cp_mkdir_target()` runs `mkdir -p` against the destination itself, rather than its parent, whenever there is more than one source or DST's last component is empty (`:`, `:x/`), `.` or `..` (`:.`, `:./`, `:x/.`), the spellings that name a directory for cp too. The rule is scp's, not one `yo` invented. An earlier `yo` read only `:` and a trailing `/` that way, so `yo cp a :.` made the parent of the mirror and then handed scp a mirror that might not exist, which scp took as a file to create.
 
 ### What reaches scp's argv
 

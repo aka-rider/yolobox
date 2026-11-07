@@ -83,7 +83,10 @@ def resolve_cp_operands(operands: List[str], cwd_mirror: Optional[str]) -> CpPla
 
 
 def cp_mkdir_target(dest_operand: str, resolved_dest: str, source_count: int) -> str:
-    if dest_operand == ":" or dest_operand.endswith("/") or source_count > 1:
+    # A spelling whose last component is empty (":", ":x/"), "." or ".." names
+    # a directory, as it does for cp; so does any destination of two sources.
+    names_a_directory = posixpath.basename(dest_operand[1:]) in ("", ".", "..")
+    if names_a_directory or source_count > 1:
         return resolved_dest
     return os.path.dirname(resolved_dest)
 
