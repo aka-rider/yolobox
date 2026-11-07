@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from typing import (
     Callable,
     Dict,
@@ -51,7 +52,7 @@ from .config import (
     SCRIPT_DIR,
 )
 from .driver import RUNNING, BoxSize, Removal, Size, StopRefused
-from .libvirt_host import GUEST_SSH_PORT, LIBVIRT_URI, VM_USER, DomainInfo
+from .libvirt_host import GUEST_SSH_PORT, LIBVIRT_POOL, LIBVIRT_URI, VM_USER
 from .sshx import OPERATOR
 from .ui import YoError
 
@@ -61,7 +62,6 @@ from .ui import YoError
 # layer (see linux/host-setup.md). The host's preflight and the domain XML policy
 # are in libvirt_host.py. Pure helpers first, then the driver, which calls them
 # and virsh by name at call time.
-LIBVIRT_POOL = "default"
 # The 1Password item whose public key is the operator's login, in cidata.
 OPERATOR_KEY_ITEM = "yolobox-operator"
 OPERATOR_ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]*")
@@ -431,12 +431,12 @@ def virsh_removal(what: str, *args: str) -> Removal:
     return Removal(what, remove)
 
 
-def yolobox_domains() -> List[DomainInfo]:
-    """Every domain on the system connection that carries yolobox's metadata.
+def domain_roots() -> List[ET.Element]:
+    """The XML of every domain on the system connection, yolobox's or not.
 
-    A foreign domain is only checked for the tag: its XML is never read strictly,
-    so one odd domain of another tool cannot stop yo. A domain undefined between
-    the listing and its dumpxml is not counted; any other failure is an error.
+    A domain undefined between the listing and its dumpxml is not counted; any
+    other failure is an error. A foreign domain's XML is read leniently by
+    whoever uses it, so one odd domain of another tool cannot stop yo.
     """
     roots = []
     for name in domain_names():
@@ -445,11 +445,7 @@ def yolobox_domains() -> List[DomainInfo]:
             raise_unless_undefined("dumpxml", name, dump)
             continue
         roots.append(libvirt_host.domain_root(dump.stdout))
-    return [
-        libvirt_host.domain_info(root)
-        for root in roots
-        if libvirt_host.domain_marker(root) is not None
-    ]
+    return roots
 
 
 def volume_names() -> List[str]:
@@ -523,7 +519,13 @@ class LibvirtDriver:
         return port
 
     def allocate_host_port(self) -> int:
-        taken = [port for info in yolobox_domains() for port in info.forward_ports]
+        # Every domain's forwards count, not only the boxes': a shut-off domain
+        # of another tool holds no socket, so only its XML shows its port.
+        taken = [
+            port
+            for root in domain_roots()
+            for port in libvirt_host.forwarded_host_ports(root)
+        ]
         return lowest_free_port(
             libvirt_host.read_port_window(), taken, loopback_port_bound
         )

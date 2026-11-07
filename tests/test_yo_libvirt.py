@@ -901,6 +901,13 @@ class TestHostPortWindow(LibvirtCase):
         self.range_file.write_text("1024 49151\n")
         self.assertEqual(self.box.read_port_window().start, 49152)
 
+    def test_the_window_never_dips_into_the_registered_ports(self):
+        # A host whose ephemeral range ends early does not hand yo port 30001,
+        # where a registered service may listen.
+        for text, first in (("1024 30000", 49152), ("1024 49150", 49152)):
+            with self.subTest(text=text):
+                self.assertEqual(self.box.host_port_window(text).start, first)
+
     def test_an_unreadable_file_is_an_error(self):
         self.range_file.unlink()
         with self.assertRaises(self.box.YoError) as caught:
@@ -945,7 +952,9 @@ class TestPortAllocation(LibvirtCase):
             with self.assertRaisesRegex(self.box.YoError, "cannot probe 127.0.0.1:80"):
                 self.box.loopback_port_bound(80)
 
-    def test_the_driver_skips_ports_other_boxes_forward_but_not_other_domains(self):
+    def test_the_driver_skips_ports_every_domain_forwards_boxes_or_not(self):
+        # A shut-off domain of another tool holds no socket, so only its XML
+        # shows the port it will take when it starts.
         self.host.tagged_domain("first", FIRST_PORT)
         self.host.tagged_domain("second", FIRST_PORT + 1)
         untagged = self.box.domain_xml(
@@ -959,10 +968,17 @@ class TestPortAllocation(LibvirtCase):
         self.host.domains["plain"] = re.sub(
             r"<metadata>.*</metadata>", "", untagged, flags=re.S
         )
+        self.host.states["plain"] = "shut off"
+        self.host.domains["span"] = (
+            "<domain><name>span</name><devices><interface><portForward>"
+            "<range start='%d' end='%d'/></portForward></interface></devices></domain>"
+            % (FIRST_PORT + 3, FIRST_PORT + 5)
+        )
+        self.host.states["span"] = "shut off"
         with mock.patch.object(
             self.box.libvirt, "loopback_port_bound", return_value=False
         ):
-            self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 2)
+            self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 6)
 
     def test_a_domain_undefined_while_yo_reads_the_others_is_skipped(self):
         self.host.tagged_domain("first", FIRST_PORT)
@@ -997,14 +1013,15 @@ class TestPortAllocation(LibvirtCase):
         ):
             self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 1)
 
-    def test_the_same_xml_in_a_yolobox_domain_is_an_error_not_a_skip(self):
-        self.host.domains["ours"] = self.FOREIGN.replace(
+    def test_the_same_xml_in_this_machines_domain_is_an_error_not_a_skip(self):
+        self.host.domains["yolobox-box"] = self.FOREIGN.replace(
             "<devices>",
-            "<metadata><yolobox:instance xmlns:yolobox='%s'>x</yolobox:instance>"
+            "<metadata><yolobox:instance xmlns:yolobox='%s'>box</yolobox:instance>"
             "</metadata><devices>" % self.box.DOMAIN_NS,
         )
+        self.host.states["yolobox-box"] = "running"
         with self.assertRaises(self.box.YoError) as caught:
-            self.driver.allocate_host_port()
+            self.driver.ssh_port()
         self.assertIn("no numeric start", caught.exception.message)
 
     def test_the_driver_skips_a_port_bound_on_the_host(self):

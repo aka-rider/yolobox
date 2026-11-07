@@ -83,6 +83,11 @@ RNG_BACKENDS = frozenset({("random", "/dev/urandom"), ("random", "/dev/random")}
 QEMU_NS = "{http://libvirt.org/schemas/domain/qemu/1.0}"
 
 GUEST_SSH_PORT = 22
+LIBVIRT_POOL = "default"
+# Where libvirt keeps a domain's EFI variable store, and where a firmware
+# descriptor's variable-store template comes from (domain_shape).
+NVRAM_DIR = "/var/lib/libvirt/qemu/nvram"
+FIRMWARE_DIR = "/usr/share/"
 PORT_RANGE_FILE = "/proc/sys/net/ipv4/ip_local_port_range"
 MEMINFO_FILE = "/proc/meminfo"
 MEMTOTAL_RE = re.compile(r"^MemTotal:\s+(\d+) kB$", re.M)
@@ -149,6 +154,12 @@ def parse_daemon_version(version_output: str) -> Tuple[int, ...]:
     return parse_version(found.group(1))
 
 
+# The first port the window may start at: IANA's registered ports end at
+# 49151, and a host whose ephemeral range ends below that would otherwise hand
+# yo a port a registered service may listen on.
+DYNAMIC_PORTS_START = 49152
+
+
 def host_port_window(range_text: str) -> range:
     """The host ports yo may bind: the ones above the kernel's ephemeral range.
 
@@ -160,7 +171,9 @@ def host_port_window(range_text: str) -> range:
         raise YoError(
             "%s holds %r, not two port numbers" % (PORT_RANGE_FILE, range_text)
         )
-    first = int(fields[1]) + 1
+    # Never below the dynamic ports: a host whose range ends at 30000 would
+    # otherwise offer 30001-49151, where registered services listen.
+    first = max(int(fields[1]) + 1, DYNAMIC_PORTS_START)
     if first > MAX_PORT:
         raise YoError(
             "the kernel's ephemeral port range ends at %s (%s), so no host port is "
@@ -178,6 +191,20 @@ def read_port_window() -> range:
         raise YoError(
             "cannot read %s: %s" % (PORT_RANGE_FILE, ui.os_error_reason(failure))
         )
+
+
+def forwarded_host_ports(root: ET.Element) -> List[int]:
+    """Every host port any domain's <portForward> takes, read leniently: a
+    range whose start or end is not a number is skipped, since a foreign
+    domain's XML is never read strictly."""
+    ports = []
+    for rng in root.findall("devices/interface/portForward/range"):
+        start, end = rng.get("start", ""), rng.get("end", "")
+        if not proc.is_ascii_number(start):
+            continue
+        last = int(end) if proc.is_ascii_number(end) else int(start)
+        ports.extend(range(int(start), last + 1))
+    return ports
 
 
 def host_memory_bytes() -> int:

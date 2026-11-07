@@ -38,12 +38,12 @@ Recognise a missing table with `nft list table inet yolobox-host` (needs root) o
 
 ## Host ports
 
-Nothing in the guest is mirrored onto the host. The only ports on the host's `127.0.0.1` are each box's ssh forward and the forwards `yo port GUEST_PORT` opens, and both come from one window: every port above the second field of `/proc/sys/net/ipv4/ip_local_port_range`, which is 61000-65535 with the kernel default.
+Nothing in the guest is mirrored onto the host. The only ports on the host's `127.0.0.1` are each box's ssh forward and the forwards `yo port GUEST_PORT` opens, and both come from one window: every port above the second field of `/proc/sys/net/ipv4/ip_local_port_range`, which is 61000-65535 with the kernel default, and never below 49152 (`DYNAMIC_PORTS_START`), where IANA's registered ports end.
 
-- The kernel never picks a port in that window as a source port, and no registered or well-known service lives there. Lima's mirror needed a deny-list of OAuth callback ports because it mirrors everything in a range. A window above the ephemeral range needs no list, which could always miss one.
+- The kernel never picks a port in that window as a source port, and no registered or well-known service lives there. Lima's mirror needed a deny-list of OAuth callback ports because it mirrors everything in a range. A window above the ephemeral range needs no list, which could always miss one. The 49152 floor is what keeps that true on a host whose range ends early: with `1024 30000` the window would otherwise start at 30001, among the registered ports.
 - `yo` reads the range at run time. A host that moved the range's end up to 65535 has an empty window, and `yo` refuses to run, naming `net.ipv4.ip_local_port_range`. With no free port left in it, `yo` says `no free host port in A-B`.
 - The window is also the cap. It holds every instance's ssh forward and every open `yo port` forward, so a default host fits about 4,500 of them together.
-- Choosing a port and taking it is one step under a lock, so two `yo` processes never pick the same port. A port is free when nothing is bound to it on `127.0.0.1` and no yolobox-tagged domain forwards it.
+- Choosing a port and taking it is one step under a lock, so two `yo` processes never pick the same port. A port is free when nothing is bound to it on `127.0.0.1` and no domain on `qemu:///system` forwards it, a box's or another tool's (`forwarded_host_ports`, read leniently from each domain's XML, a `start`-`end` range whole). The bind probe alone missed a shut-off foreign domain, which holds no socket until it starts and then collides with the box's forward.
 - The `portForward` address is always `127.0.0.1`. A `portForward` without an address binds every host address, which would put the box's sshd on the LAN. `config_gaps()` treats any other address as a fatal gap.
 
 ## The operator's key
