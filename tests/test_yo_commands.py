@@ -2327,6 +2327,7 @@ class StatusRunner:
         keepalive_pid=777,
         listing_failure=None,
         limactl_list=None,
+        disk_image=None,
     ):
         outs = []
         # net_check is either the net-check subprocess result or the YoError
@@ -2340,12 +2341,15 @@ class StatusRunner:
             if isinstance(net_check, Exception)
             else mock.Mock(return_value=net_check)
         )
-        # keepalive_pid is the pid the driver reads, or the YoError it raises.
-        keepalive = (
-            mock.Mock(side_effect=keepalive_pid)
-            if isinstance(keepalive_pid, Exception)
-            else mock.Mock(return_value=keepalive_pid)
-        )
+
+        # keepalive_pid, host_gaps and disk_image are what the driver reads, or
+        # the YoError it raises.
+        def driver_read(answer):
+            if isinstance(answer, Exception):
+                return mock.Mock(side_effect=answer)
+            return mock.Mock(return_value=answer)
+
+        keepalive = driver_read(keepalive_pid)
         if table is None:
             table = mock.Mock(
                 returncode=0, stdout=(FIXTURES / "egress.nft").read_text(), stderr=""
@@ -2389,11 +2393,19 @@ class StatusRunner:
         with (
             mock.patch.object(yo.proc, "run", side_effect=fake_proc_run),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=fake_ssh_run),
-            mock.patch.object(yo.lima, "du_kib", return_value=None),
             mock.patch.object(yo.guest, "vm_units_present", return_value=units_present),
             driver_answer("config_gaps", gaps),
             driver_answer("config_notes", notes),
-            mock.patch.object(yo.LIMA, "host_gaps", return_value=list(host_gaps)),
+            mock.patch.object(
+                yo.LIMA,
+                "host_gaps",
+                driver_read(
+                    list(host_gaps)
+                    if not isinstance(host_gaps, Exception)
+                    else host_gaps
+                ),
+            ),
+            mock.patch.object(yo.LIMA, "disk_image", driver_read(disk_image)),
             mock.patch.object(yo.shutil, "which", return_value=aws_which),
             mock.patch.object(
                 yo.aws, "aws_allowlist", side_effect=aws_allowlist_side_effect
@@ -2458,7 +2470,11 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         outs = self.run_status(
             limactl_list=mock.Mock(returncode=1, stdout="", stderr="limactl: boom")
         )
-        self.assertIn("lima: limactl list -q failed (exit 1): limactl: boom", outs)
+        self.assertIn(
+            "lima: WARNING cannot read the instance's configuration: limactl list -q "
+            "failed (exit 1): limactl: boom",
+            outs,
+        )
         self.assertNotIn("lima: reverse forwards ok", outs)
         self.assertTrue(any(line.startswith("disk:") for line in outs))
         self.assertTrue(any(line.startswith("aws:") for line in outs))
@@ -2509,15 +2525,57 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
             aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
             keepalive_pid=yo.YoError("cannot open the ssh master"),
         )
-        self.assertTrue(
-            any(
-                line.startswith("aws: cannot read the pid the broker watches")
-                and "cannot open the ssh master" in line
-                for line in outs
-            )
+        self.assertIn(
+            "lima: WARNING cannot read the pid the broker watches: cannot open the "
+            "ssh master",
+            outs,
         )
         self.assertIsNotNone(self.raised)
         self.assertEqual(self.raised.code, 1)
+
+    def test_a_healthy_broker_names_whose_pid_it_watches(self):
+        outs = self.run_status(
+            aws_which="/usr/local/bin/aws",
+            aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
+        )
+        self.assertIn("aws: broker healthy (watching host agent pid 777)", outs)
+
+    def test_a_box_with_no_keepalive_pid_is_not_a_stale_broker(self):
+        outs = self.run_status(
+            aws_which="/usr/local/bin/aws",
+            aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
+            keepalive_pid=None,
+        )
+        self.assertIn(
+            "aws: broker running but yolobox has no host agent pid now "
+            "(it watches pid None)",
+            outs,
+        )
+        self.assertNotIn("stale", " ".join(outs))
+        self.assertEqual(self.raised.code, 1)
+
+    def test_every_driver_read_that_fails_is_one_line_and_the_report_goes_on(self):
+        for broken, said in (
+            (
+                dict(host_gaps=yo.YoError("getfacl not found")),
+                "lima: WARNING cannot read the host's setup: getfacl not found",
+            ),
+            (
+                dict(disk_image=yo.YoError("virsh vol-info failed (exit 1)")),
+                "lima: WARNING cannot read the disk image's size: virsh vol-info "
+                "failed (exit 1)",
+            ),
+        ):
+            with self.subTest(said=said):
+                outs = self.run_status(
+                    aws_which="/usr/local/bin/aws",
+                    aws_allowlist_side_effect=lambda: [("work", "us-east-1")],
+                    **broken,
+                )
+                self.assertIn(said, outs)
+                # The lines after the failed read still come.
+                self.assertIn("aws: broker healthy (watching host agent pid 777)", outs)
+                self.assertEqual(self.raised.code, 1)
 
     def status_with_fstype(self, fstype):
         return self.run_status(
@@ -2593,7 +2651,6 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
             mock.patch.object(yo.proc, "run", side_effect=initrd_run),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=pinned_ssh_run),
             mock.patch.object(yo.LIMA, "config_gaps", return_value=[]),
-            mock.patch.object(yo.lima, "du_kib", return_value=None),
             mock.patch.object(yo.shutil, "which", return_value=None),
             mock.patch.object(yo.ui, "out", side_effect=outs.append),
             mock.patch.object(yo.ui, "err", side_effect=errs.append),

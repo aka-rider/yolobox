@@ -154,6 +154,7 @@ class Driver(Protocol):
     """
 
     name: str  # what messages call the driver ("lima: ...")
+    keepalive_name: str  # whose pid keepalive_pid() is ("host agent", "ssh master")
     instances_dir: str  # instance directories, relative to $HOME
     start_command: str  # the background process unlock_disk watches
     off_status: str  # what vm_status() says of a VM that is stopped

@@ -472,6 +472,7 @@ class LibvirtDriver:
     """Linux: one libvirt domain per machine, on the system connection."""
 
     name = "libvirt"
+    keepalive_name = "ssh master"
     instances_dir = ".local/state/yolobox/instances"
     start_command = "virsh start"
     off_status = STATE_OFF
