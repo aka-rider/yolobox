@@ -133,12 +133,22 @@ class ReverseForward:
     alive: Callable[[subprocess.CompletedProcess], bool]
 
 
+# `ssh-add -l` with SIGPIPE ignored, which exec keeps. The agent-side socket
+# unit accepts every connection, and right after a boot its proxy finds no
+# forward behind it and closes the connection at once; ssh-add's request then
+# races that close, and a write after it is EPIPE. Ignored, EPIPE is ssh-add's
+# own exit 1 (a dead forward); by default it is death by SIGPIPE, which ssh
+# reports as 255, the code of a box out of reach (docs/ssh.md#healing-reverse-
+# forwards).
+OP_PROBE = ("sh", "-c", "trap '' PIPE; exec ssh-add -l")
+
+
 def one_password_forward() -> ReverseForward:
     return ReverseForward(
         "1password",
         OP_GUEST_SOCK,
         state.driver().op_sock(),
-        ("ssh-add", "-l"),
+        OP_PROBE,
         op_probe_alive,
     )
 
@@ -179,10 +189,14 @@ def heal_lock() -> ContextManager[None]:
 
 def heal_reverse_forward(forward: ReverseForward) -> bool:
     with heal_lock():
-        # sshx.probe: an agent that cannot log in at all (ssh's 255) is not a
-        # dead forward, and tearing a live forward down would not cure it.
+        # sshx.probe: an agent that cannot log in at all (ssh's 255 with its
+        # reason) is not a dead forward, and tearing a live forward down would
+        # not cure it. A probe that died on the box (255, nothing said) is one.
         if forward.alive(sshx.probe(AGENT, list(forward.probe))):
             return True
+        # The operator's master, opened on purpose: `-O` control commands need
+        # a live one and open none, and after a boot there is none yet.
+        sshx.ssh_run(OPERATOR, ["true"], mux=True, check=True)
         proc.run(forward_control_cmd("cancel", forward), check=False)
         sshx.ssh_run(OPERATOR, ["rm", "-f", forward.guest_path], mux=True, check=True)
         proc.run(forward_control_cmd("forward", forward), check=True)

@@ -159,15 +159,32 @@ def unreachable(role: SshRole, said: str = "") -> Unreachable:
     return Unreachable("%s\n%s" % (message, block) if block else message)
 
 
+def transport_failed(completed: subprocess.CompletedProcess) -> bool:
+    """Whether ssh itself failed to connect, as opposed to the command it ran.
+
+    ssh exits 255 for both: when it cannot connect, and when the command on the
+    box died of a signal (sshd reports an exit-signal, and ssh has no exit code
+    to pass on). Only the first has ssh's own words on stderr (`Connection
+    refused`, `Permission denied`, a changed host key); a command killed by a
+    signal leaves ssh silent. So 255 with nothing said is a command that died,
+    and only 255 with a reason is the box out of reach (docs/ssh.md#healing-
+    reverse-forwards: a probe killed by SIGPIPE was once read as a lost box).
+    """
+    return completed.returncode == SSH_UNREACHABLE and bool(
+        (completed.stderr or "").strip()
+    )
+
+
 def probe(role: SshRole, argv: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
     """ssh_run for a caller that reads the exit code as a fact about the box.
 
     ssh itself exits 255 when it cannot connect, so that code says nothing about
-    the command: it raises Unreachable before anyone interprets it.
+    the command: it raises Unreachable before anyone interprets it
+    (transport_failed tells that 255 from a command's death by signal).
     """
     completed = ssh_run(role, argv, **kwargs)
-    if completed.returncode == SSH_UNREACHABLE:
-        raise unreachable(role, completed.stderr or "")
+    if transport_failed(completed):
+        raise unreachable(role, completed.stderr)
     return completed
 
 
@@ -212,12 +229,12 @@ def account_status() -> Tuple[AccountStatus, str]:
     # reach, with what that session said; `true` failing there is a box that
     # answers but is broken (an rc file that exits), not one that is away.
     operator_probe = ssh_run(OPERATOR, ["true"])
-    if operator_probe.returncode == SSH_UNREACHABLE:
+    if transport_failed(operator_probe):
         return AccountStatus.UNREACHABLE, ui.quoted_block(operator_probe.stderr)
     if operator_probe.returncode != 0:
         raise box_failure("ssh %s true" % state.box.vm_host, operator_probe)
     lookup = ssh_run(OPERATOR, ["getent", "passwd", AGENT_USER])
-    if lookup.returncode == SSH_UNREACHABLE:
+    if transport_failed(lookup):
         return AccountStatus.UNREACHABLE, ui.quoted_block(lookup.stderr)
     if lookup.returncode == GETENT_KEY_NOT_FOUND:
         return AccountStatus.OPERATOR_ONLY, ""

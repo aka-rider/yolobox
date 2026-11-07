@@ -424,7 +424,7 @@ class TestHelperRebuildsProbe(FakeHome):
 
     def test_an_unreachable_box_is_a_no(self):
         unreachable = mock.Mock(
-            returncode=yo.config.SSH_UNREACHABLE, stdout="", stderr=""
+            returncode=yo.config.SSH_UNREACHABLE, stdout="", stderr=LOST_SSH_STDERR
         )
         with mock.patch.object(yo.sshx, "ssh_run", return_value=unreachable):
             self.assertFalse(yo.release.helper_rebuilds())
@@ -1785,6 +1785,11 @@ class TestEditorUris(unittest.TestCase):
         self.assertEqual(yo.editor_uri_path(path), path)
 
 
+# What ssh itself says when it cannot connect: a lost box always has a reason
+# on stderr, where a command that died on the box leaves ssh silent.
+LOST_SSH_STDERR = "ssh: connect to host 127.0.0.1 port 60022: Connection refused\n"
+
+
 class TestProbe(unittest.TestCase):
     # ssh exits 255 when it cannot connect, so that code says nothing about the
     # command it was to run. The four callers that read an exit code as a fact
@@ -1794,7 +1799,9 @@ class TestProbe(unittest.TestCase):
         return mock.patch.object(
             yo.sshx,
             "ssh_run",
-            return_value=mock.Mock(returncode=yo.SSH_UNREACHABLE, stdout="", stderr=""),
+            return_value=mock.Mock(
+                returncode=yo.SSH_UNREACHABLE, stdout="", stderr=LOST_SSH_STDERR
+            ),
         )
 
     def test_a_command_that_ran_is_returned_whatever_it_exited_with(self):
@@ -1814,6 +1821,19 @@ class TestProbe(unittest.TestCase):
                     % (who, who),
                 ):
                     yo.sshx.probe(role, ["true"])
+
+    def test_exit_255_with_nothing_said_is_the_commands_death_not_a_lost_box(self):
+        # sshd reports a command killed by a signal as an exit-signal, and ssh
+        # exits 255 for it without a word; a lost box always has ssh's reason.
+        died = mock.Mock(returncode=yo.SSH_UNREACHABLE, stdout="", stderr="")
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=died):
+            self.assertIs(yo.sshx.probe(yo.AGENT, ["ssh-add", "-l"]), died)
+        self.assertFalse(yo.sshx.transport_failed(died))
+        self.assertTrue(
+            yo.sshx.transport_failed(
+                mock.Mock(returncode=yo.SSH_UNREACHABLE, stderr="Permission denied")
+            )
+        )
 
     def test_probe_passes_ssh_run_options_through(self):
         with mock.patch.object(
@@ -1839,7 +1859,9 @@ class TestProbe(unittest.TestCase):
     def test_the_skew_message_does_not_guess_a_version_when_the_box_is_lost(self):
         def run(role, argv, **kwargs):
             if argv[:1] == ["cat"]:
-                return mock.Mock(returncode=yo.SSH_UNREACHABLE, stdout="", stderr="")
+                return mock.Mock(
+                    returncode=yo.SSH_UNREACHABLE, stdout="", stderr=LOST_SSH_STDERR
+                )
             return mock.Mock(returncode=0)
 
         with mock.patch.object(yo.sshx, "ssh_run", side_effect=run):
@@ -1852,6 +1874,8 @@ class TestGuestOutNamesALostBox(unittest.TestCase):
     # (ssh exit 255) must say so, not read as the empty output of a command
     # that found nothing.
     def answering(self, code, stdout="", stderr=""):
+        if code == yo.SSH_UNREACHABLE:
+            stderr = LOST_SSH_STDERR
         return mock.patch.object(
             yo.sshx,
             "ssh_run",
@@ -2502,27 +2526,76 @@ class TestHealReverseForward(FakeHome):
 
         self.assertTrue(result)
         kinds = [c[0] for c in calls]
-        self.assertEqual(kinds, ["probe", "run", "ssh_run", "run", "probe"])
-        self.assertEqual(calls[1][1][-5:-2], ["-O", "cancel", "-R"])
-        self.assertFalse(calls[1][2])
-        self.assertEqual(calls[2][2], ["rm", "-f", "/guest"])
-        self.assertEqual(calls[3][1][-5:-2], ["-O", "forward", "-R"])
-        self.assertTrue(calls[3][2])
+        self.assertEqual(kinds, ["probe", "ssh_run", "run", "ssh_run", "run", "probe"])
+        # The operator's master is opened first: the -O commands need one.
+        self.assertEqual(calls[1][1:], (yo.OPERATOR, ["true"], True))
+        self.assertEqual(calls[2][1][-5:-2], ["-O", "cancel", "-R"])
+        self.assertFalse(calls[2][2])
+        self.assertEqual(calls[3][1:], (yo.OPERATOR, ["rm", "-f", "/guest"], True))
+        self.assertEqual(calls[4][1][-5:-2], ["-O", "forward", "-R"])
+        self.assertTrue(calls[4][2])
+
+    def test_a_probe_that_died_on_the_box_is_a_dead_forward_and_is_reissued(self):
+        # Right after a boot the proxy behind the agent's socket closes the
+        # connection at once, and a probe that wrote into it dies of SIGPIPE:
+        # ssh exits 255 for the exit-signal and says nothing. That is the
+        # forward being dead, not the box being lost, so it is re-issued.
+        forward = yo.ReverseForward(
+            "x", "/guest", "/host", ("probe",), lambda proc: proc.returncode == 0
+        )
+        probes = []
+
+        def fake_ssh_run(role, argv, **kwargs):
+            if argv == ["probe"]:
+                probes.append(role)
+                code = 0 if len(probes) >= 2 else yo.SSH_UNREACHABLE
+                return mock.Mock(returncode=code, stdout="", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(yo.proc, "run") as fake_run,
+            mock.patch.object(yo.sshx, "ssh_run", side_effect=fake_ssh_run),
+        ):
+            self.assertTrue(yo.heal_reverse_forward(forward))
+        self.assertEqual(probes, [yo.AGENT, yo.AGENT])
+        self.assertEqual(
+            [call.args[0][-5:-2] for call in fake_run.call_args_list],
+            [["-O", "cancel", "-R"], ["-O", "forward", "-R"]],
+        )
+
+    def test_the_1password_probe_runs_ssh_add_with_sigpipe_ignored(self):
+        # Under bash, a signal ignored at entry shows in `trap -p` and cannot be
+        # reset, so the fake ssh-add reports exactly what exec handed it.
+        with tempfile.TemporaryDirectory() as path:
+            fake = os.path.join(path, "ssh-add")
+            with open(fake, "w") as script:
+                script.write(
+                    "#!/usr/bin/env bash\n"
+                    '[ "$1" = -l ] || exit 64\n'
+                    "trap -p PIPE | grep -q \"trap -- '' SIGPIPE\" || exit 7\n"
+                    "echo ignored\n"
+                )
+            os.chmod(fake, 0o755)
+            env = {**os.environ, "PATH": path + os.pathsep + os.environ["PATH"]}
+            ran = subprocess.run(
+                list(yo.OP_PROBE), env=env, capture_output=True, text=True
+            )
+        self.assertEqual((ran.returncode, ran.stdout), (0, "ignored\n"), ran.stderr)
 
     def test_an_agent_that_cannot_log_in_is_unreachable_not_a_dead_forward(self):
         forward = yo.ReverseForward(
             "x", "/guest", "/host", ("probe",), lambda proc: proc.returncode == 0
         )
-        refused = mock.Mock(
-            returncode=yo.SSH_UNREACHABLE, stdout="", stderr="Permission denied"
-        )
-        with (
-            mock.patch.object(yo.sshx, "ssh_run", return_value=refused),
-            mock.patch.object(yo.proc, "run") as fake_run,
-        ):
-            with self.assertRaises(yo.Unreachable):
-                yo.heal_reverse_forward(forward)
-        fake_run.assert_not_called()
+        for said in ("Permission denied (publickey).", LOST_SSH_STDERR):
+            refused = mock.Mock(returncode=yo.SSH_UNREACHABLE, stdout="", stderr=said)
+            with (
+                self.subTest(said=said),
+                mock.patch.object(yo.sshx, "ssh_run", return_value=refused),
+                mock.patch.object(yo.proc, "run") as fake_run,
+            ):
+                with self.assertRaises(yo.Unreachable):
+                    yo.heal_reverse_forward(forward)
+                fake_run.assert_not_called()
 
     def test_the_heal_holds_the_machines_forward_lock(self):
         forward = yo.ReverseForward("x", "/guest", "/host", ("probe",), lambda p: True)
@@ -3211,7 +3284,7 @@ class TestCmdStatusExitCode(StatusRunner, unittest.TestCase):
             "host gap": dict(host_gaps=["the passt socket directory is read-only"]),
             "units missing": dict(units_present=False),
             "1password forward down": dict(
-                ssh_answer=self.answers(["ssh-add"], returncode=2)
+                ssh_answer=self.answers(list(yo.OP_PROBE), returncode=2)
             ),
             "proxy unit failed": dict(
                 ssh_answer=self.answers(["systemctl", "show"], stdout="failed\n")
@@ -3413,7 +3486,9 @@ class TestCmdStatusExitCode(StatusRunner, unittest.TestCase):
     def test_losing_the_box_midway_fails_the_run_and_still_reports_the_rest(self):
         def lost(role, argv):
             if argv[:1] == ["cat"]:
-                return mock.Mock(returncode=yo.SSH_UNREACHABLE, stdout="", stderr="")
+                return mock.Mock(
+                    returncode=yo.SSH_UNREACHABLE, stdout="", stderr=LOST_SSH_STDERR
+                )
             return None
 
         outs = self.assertFailsTheRun(ssh_answer=lost)
