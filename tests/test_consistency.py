@@ -1036,6 +1036,11 @@ class TestThePasstHookNamesWhatYoNames(unittest.TestCase):
             "/etc/libvirt/hooks/qemu.d/50-yolobox-passt",
         )
 
+    def test_the_hook_refuses_any_owner_but_the_one_host_setup_creates(self):
+        self.assertEqual(
+            self.hook_value("DIR_OWNER"), host_setup_assignment("PASST_OWNER")
+        )
+
 
 class TestTheIncludeLineServesBothDrivers(unittest.TestCase):
     def test_it_globs_exactly_each_drivers_instance_files(self):
@@ -1956,6 +1961,7 @@ class TestHostSetupCanBeRerun(unittest.TestCase):
         started="",
         active=False,
         table_installed=False,
+        libvirtd=False,
     ):
         """Run host-setup.sh from the text `first` up to the text `last`, after
         its definitions, from a scratch checkout that lacks the file
@@ -1964,8 +1970,9 @@ class TestHostSetupCanBeRerun(unittest.TestCase):
         `started` is what `systemctl show` prints for virtqemud's start;
         `hook_mtime` pre-installs the hook with that mtime; `table_installed`
         pre-installs the table and its unit, identical to the repo's; `active`
-        is whether the table unit is active. virsh speaks German unless
-        LC_ALL=C, as a translated virsh would on a German host."""
+        is whether the table unit is active; `libvirtd` whether the monolithic
+        libvirtd is enabled or active. virsh speaks German unless LC_ALL=C, as
+        a translated virsh would on a German host."""
         if subprocess.run(["stat", "--version"], capture_output=True).returncode:
             self.skipTest("needs GNU stat and install")
         text = HOST_SETUP.read_text()
@@ -1991,7 +1998,7 @@ class TestHostSetupCanBeRerun(unittest.TestCase):
             "systemctl": (
                 "case $1 in\n"
                 '  show) printf "%s\\n" "$FAKE_STARTED" ;;\n'
-                '  is-active) exit "$FAKE_IS_ACTIVE" ;;\n'
+                '  is-enabled|is-active) case "$*" in *libvirtd*) exit "${FAKE_LIBVIRTD:-1}" ;; *) exit "$FAKE_IS_ACTIVE" ;; esac ;;\n'
                 '  *) echo "$*" >>"$CALLS" ;;\n'
                 "esac"
             ),
@@ -2051,6 +2058,7 @@ class TestHostSetupCanBeRerun(unittest.TestCase):
                 "CALLS": str(calls),
                 "FAKE_STARTED": started,
                 "FAKE_IS_ACTIVE": "0" if active else "3",
+                "FAKE_LIBVIRTD": "0" if libvirtd else "1",
             },
         )
         return result, calls.read_text().splitlines()
@@ -2074,6 +2082,18 @@ class TestHostSetupCanBeRerun(unittest.TestCase):
                 self.assertRegex(result.stderr, r"missing \S*/%s$" % re.escape(name))
         result, _ = self.run_slice('HERE="', 'step "')
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_host_with_the_monolithic_libvirtd_is_refused_before_the_daemons_change(
+        self,
+    ):
+        self.assertEqual(
+            self.run_steps("(d)", "(b)"),
+            ["enable --now virtqemud.socket virtstoraged.socket virtnetworkd.socket"],
+        )
+        result, calls = self.run_slice('step "(d)', 'step "(b)', libvirtd=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("monolithic libvirtd.service", result.stderr)
+        self.assertEqual(calls, [])
 
     def test_the_default_network_is_switched_off_on_a_host_that_speaks_german(self):
         self.assertEqual(

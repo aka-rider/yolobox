@@ -343,16 +343,18 @@ check_process_confinement() {
 # `instance=<marker or ->`, `ssh_port=<host port or ->` and `gaps=<names>`
 # (domain_gaps, space separated, empty for a domain the template made). $1 is
 # the instance name the metadata must carry. python runs isolated (-I) and
-# imports yo's package from this checkout, so the rule has one spelling.
+# imports yo's package from this checkout, so the rule has one spelling, and
+# asks the host's domcapabilities for the emulator and loaders the way yo does
+# (libvirt.host_firmware), on the same qemu:///system connection.
 domain_report() {
     python3 -I -c '
 import sys
 sys.path.insert(0, sys.argv[1])
-from yolobox_cli import libvirt_host
+from yolobox_cli import libvirt, libvirt_host
 info = libvirt_host.parse_domain(sys.stdin.read())
 print("instance=%s" % (info.instance if info.instance is not None else "-"))
 print("ssh_port=%s" % (info.ssh_port if info.ssh_port is not None else "-"))
-print("gaps=%s" % " ".join(libvirt_host.domain_gaps(info, sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))))
+print("gaps=%s" % " ".join(libvirt_host.domain_gaps(info, sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), libvirt.host_firmware())))
 ' "${REPO_ROOT}" "$1" "$(id -u "${VM_ACCOUNT}")" "$(id -g "${VM_ACCOUNT}")"
 }
 
