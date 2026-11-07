@@ -400,7 +400,7 @@ class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
     def test_a_lost_operator_is_unreachable(self):
         self.assertEqual(
             self.status(255, 255, 0, "no route\n"),
-            (yo.AccountStatus.UNREACHABLE, "no route"),
+            (yo.AccountStatus.UNREACHABLE, "  | no route"),
         )
 
     def test_a_failing_agent_login_never_advises_destroying_the_box(self):
@@ -1435,10 +1435,10 @@ class TestStreamedOutputIsFiltered(unittest.TestCase):
         )
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
-            proc = yo.run([sys.executable, "-c", script], filtered=True)
+            proc = yo.run([sys.executable, "-c", script], filtered=True, guest="agent")
         self.assertEqual(proc.returncode, 3)
-        self.assertEqual(stdout.getvalue(), "o?]52;c;eA==?\n")
-        self.assertEqual(stderr.getvalue(), "e?[2J\n")
+        self.assertEqual(stdout.getvalue(), "  | o?]52;c;eA==?\n")
+        self.assertEqual(stderr.getvalue(), "  | e?[2J\n")
 
     def test_options_a_streamed_run_would_drop_are_refused_not_ignored(self):
         for option in (
@@ -1451,7 +1451,7 @@ class TestStreamedOutputIsFiltered(unittest.TestCase):
             with self.subTest(option=option):
                 with mock.patch.object(yo.proc, "run_filtered") as streamed:
                     with self.assertRaisesRegex(ValueError, next(iter(option))):
-                        yo.run(["true"], filtered=True, **option)
+                        yo.run(["true"], filtered=True, guest="agent", **option)
                 streamed.assert_not_called()
 
 
@@ -1513,7 +1513,9 @@ class TestProbe(unittest.TestCase):
             with self.subTest(role=who), self.lost_ssh():
                 with self.assertRaisesRegex(
                     yo.Unreachable,
-                    "cannot reach yolobox as %s — is it up\\? yo status" % who,
+                    "cannot reach yolobox as %s \\(the %s's ssh session exited 255, "
+                    "ssh's own code for no connection\\) — is it up\\? yo status"
+                    % (who, who),
                 ):
                     yo.sshx.probe(role, ["true"])
 
@@ -1595,7 +1597,7 @@ class TestGuestOutNamesALostBox(unittest.TestCase):
         for name, read in reads:
             with self.subTest(read=name), self.answering(yo.SSH_UNREACHABLE):
                 with self.assertRaisesRegex(
-                    yo.Unreachable, "cannot reach yolobox as operator — is it up\\?"
+                    yo.Unreachable, "cannot reach yolobox as operator .*— is it up\\?"
                 ):
                     read()
 
@@ -1672,50 +1674,40 @@ class TestGuestHelperSkew(unittest.TestCase):
             result = yo.guest_helper(yo.AGENT, "projects")
         self.assertIs(result, main_proc)
 
-    # A streamed run (yo gc) passes the tiers' output straight through, so
-    # there is no captured stderr to match the marker against. The two skews
-    # are told apart by asking the box whether the helper exists at all.
-    def streamed_ssh_run(self, main_proc, helper_present):
-        def run(role, argv, **kwargs):
-            if argv[:1] == ["cat"]:
-                return mock.Mock(returncode=0, stdout="1.1.0\n", stderr="")
-            if argv[:2] == ["command", "-v"]:
-                return mock.Mock(
-                    returncode=0 if helper_present else 1, stdout="", stderr=""
-                )
-            return main_proc
-
-        return run
+    # A streamed run (yo gc) shows the tiers' output as it comes, and keeps the
+    # tail of stderr, so the same marker rule decides skew there: a gc tier whose
+    # own child exits 64 without the marker is a failed tier, not an old box.
+    def streamed(self, returncode, stderr):
+        return mock.Mock(returncode=returncode, stderr=stderr, stdout=None)
 
     def test_streamed_absent_helper_names_yo_bootstrap(self):
-        main_proc = mock.Mock(returncode=127, stderr=None, stdout=None)
+        main_proc = self.streamed(127, "bash: yolobox-guest: command not found")
         with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             with mock.patch.object(
-                yo.sshx,
-                "ssh_run",
-                side_effect=self.streamed_ssh_run(main_proc, helper_present=False),
+                yo.sshx, "ssh_run", side_effect=self.fake_ssh_run(main_proc)
             ):
                 with self.assertRaises(yo.YoError) as caught:
                     yo.guest_helper(yo.OPERATOR, "gc-machine", stream=True)
         self.assertIn("yo bootstrap", caught.exception.message)
+        self.assertIn("the operator's session exited 127", caught.exception.message)
 
     def test_streamed_unknown_subcommand_names_the_subcommand(self):
-        main_proc = mock.Mock(returncode=64, stderr=None, stdout=None)
+        main_proc = self.streamed(64, "yolobox-guest: unknown subcommand 'gc-machine'")
         with mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             with mock.patch.object(
-                yo.sshx,
-                "ssh_run",
-                side_effect=self.streamed_ssh_run(main_proc, helper_present=True),
+                yo.sshx, "ssh_run", side_effect=self.fake_ssh_run(main_proc)
             ):
                 with self.assertRaises(yo.YoError) as caught:
                     yo.guest_helper(yo.OPERATOR, "gc-machine", stream=True)
         self.assertIn("gc-machine", caught.exception.message)
 
-    def test_streamed_tier_failure_is_not_reinterpreted_as_skew(self):
-        main_proc = mock.Mock(returncode=1, stderr=None, stdout=None)
-        with mock.patch.object(yo.sshx, "ssh_run", return_value=main_proc):
-            result = yo.guest_helper(yo.OPERATOR, "gc-machine", stream=True)
-        self.assertIs(result, main_proc)
+    def test_streamed_exit_64_without_the_marker_is_a_failed_tier_not_skew(self):
+        for code, stderr in ((64, "make: *** [clean] Error 64"), (1, "")):
+            main_proc = self.streamed(code, stderr)
+            with self.subTest(code=code):
+                with mock.patch.object(yo.sshx, "ssh_run", return_value=main_proc):
+                    result = yo.guest_helper(yo.OPERATOR, "gc-machine", stream=True)
+                self.assertIs(result, main_proc)
 
 
 class TestGcArgv(unittest.TestCase):
@@ -1755,7 +1747,7 @@ class TestHelperFailureMessage(unittest.TestCase):
         self.assertEqual(
             self.message(yo.HELPER_EXIT_INTERNAL, stderr),
             "the initrd helper failed unexpectedly; the line below names the "
-            "command that failed:\n" + stderr,
+            "command that failed:\n  | " + stderr,
         )
 
     def test_every_documented_code_has_its_own_message(self):
@@ -1774,7 +1766,7 @@ class TestHelperFailureMessage(unittest.TestCase):
 
     def test_an_undocumented_code_is_named_with_its_number(self):
         self.assertEqual(
-            self.message(9, "boom"), "the initrd helper failed with exit 9: boom"
+            self.message(9, "boom"), "the initrd helper failed with exit 9:\n  | boom"
         )
 
 

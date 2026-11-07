@@ -3428,8 +3428,8 @@ class TestDisableAwsBrokerFailsLoudly(FakeHome):
             ),
             mock.patch.object(yo.sshconfig, "ensure_agent_ssh_config"),
             mock.patch.object(
-                yo.subprocess,
-                "run",
+                yo.proc,
+                "run_capped",
                 return_value=subprocess.CompletedProcess([], returncode, b"", stderr),
             ),
         ):
@@ -3437,7 +3437,7 @@ class TestDisableAwsBrokerFailsLoudly(FakeHome):
 
     def test_a_guest_config_that_cannot_be_removed_is_an_error_not_a_note(self):
         with self.assertRaisesRegex(
-            yo.aws.BrokerDisableError, "rm -f .*aws-config.*Permission denied"
+            yo.aws.BrokerDisableError, r"rm -f .*aws-config.*\n  \| Permission denied"
         ):
             self.disable_with_ssh_exit(1, b"Permission denied")
 
@@ -3582,6 +3582,11 @@ class TestLimaDestroy(FakeHome):
         self.lines = []
         for patcher in (
             mock.patch.object(yo.subprocess, "run", side_effect=self.subprocess_run),
+            mock.patch.object(
+                yo.proc,
+                "run_capped",
+                side_effect=lambda argv, **kw: self.subprocess_run(argv),
+            ),
             mock.patch.object(yo.shutil, "which", return_value=None),
             mock.patch.object(yo.ui, "out", side_effect=self.lines.append),
         ):
@@ -4397,7 +4402,7 @@ class TestTailscaleStatusLine(unittest.TestCase):
     def test_unparseable_output_surfaces_stderr(self):
         line = yo.tailscale_status_line("", "failed to connect to local tailscaled")
         self.assertIn(
-            "status unreadable: failed to connect to local tailscaled", line.text
+            "status unreadable:\n  | failed to connect to local tailscaled", line.text
         )
         self.assertTrue(line.warning)
 
@@ -4405,7 +4410,7 @@ class TestTailscaleStatusLine(unittest.TestCase):
         for payload in ("null", "[]"):
             with self.subTest(payload=payload):
                 line = yo.tailscale_status_line(payload + "\n", "")
-                self.assertIn("status unreadable: " + payload, line.text)
+                self.assertIn("status unreadable:\n  | " + payload, line.text)
                 self.assertTrue(line.warning)
 
     def test_silent_failure_says_no_output(self):

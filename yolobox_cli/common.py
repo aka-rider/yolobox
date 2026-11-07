@@ -9,8 +9,10 @@ from typing import Callable, NamedTuple, Optional
 
 # Guest-controlled text reaches yo's terminal output and aws-broker's log
 # (ssh stderr, paths, helper output). A terminal acts on escape sequences and C1
-# controls, so they are shown as "?". Tab and newline stay.
-CONTROL_BYTES_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# controls, so they are shown as "?". Tab and newline stay. A lone surrogate (an
+# undecodable byte read with surrogateescape) is "?" too: a strict stdout cannot
+# encode it, and the print would fail instead of the line showing.
+CONTROL_BYTES_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
 
 # A valid profile name must start with an alphanumeric, so it can never read as
 # an option. yo filters the guest's profiles with it and the broker refuses any

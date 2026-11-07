@@ -309,6 +309,10 @@ def initrd_state() -> InitrdReading:
     return InitrdReading(verdict, "")
 
 
+# Whose session the initrd helper's text is, for ui.GuestText.
+INITRD_SESSION = "initrd root"
+
+
 @dataclass(frozen=True)
 class HelperRun:
     """One run of the initrd's yolobox-unlock over ssh."""
@@ -354,10 +358,15 @@ def run_initrd_helper(passphrase: bytes) -> HelperRun:
                 line = raw.decode("utf-8", "replace").rstrip("\n")
                 streamed = True
                 migrated = migrated or "id=%s" % MIGRATE_ASK_ID in line
-                ui.out(line)
+                ui.out(ui.quoted_line(line))
             collector.join()
             returncode = child.wait()
-        return HelperRun(returncode, "\n".join(stderr_lines), migrated, streamed)
+        return HelperRun(
+            returncode,
+            ui.GuestText("\n".join(stderr_lines), INITRD_SESSION),
+            migrated,
+            streamed,
+        )
 
 
 class Verdict(enum.Enum):
@@ -395,7 +404,7 @@ def initrd_root_ssh_command(remote_command: str) -> str:
 
 
 def helper_failure_message(attempt: HelperRun) -> str:
-    code, stderr = attempt.returncode, attempt.stderr
+    code, stderr = attempt.returncode, ui.quoted_block(attempt.stderr)
     if code == SSH_UNREACHABLE:
         return stderr or "ssh to 127.0.0.1:%d failed with exit %d and no message" % (
             state.driver().ssh_port(),
@@ -428,7 +437,7 @@ def helper_failure_message(attempt: HelperRun) -> str:
             "the initrd helper failed unexpectedly; the line below names the command "
             "that failed:\n%s" % stderr
         )
-    return "the initrd helper failed with exit %d: %s" % (code, stderr)
+    return "the initrd helper failed with exit %d:\n%s" % (code, stderr)
 
 
 def deadline_after(
@@ -501,7 +510,7 @@ def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -
         verdict = judge_helper_run(attempt)
         if verdict in (Verdict.UNLOCKED, Verdict.DROPPED):
             for line in attempt.stderr.splitlines():
-                ui.err(line)
+                ui.err(ui.quoted_line(line))
         if verdict is Verdict.UNLOCKED:
             return migrated_any
         if verdict is Verdict.FAILED:

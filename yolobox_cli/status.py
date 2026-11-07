@@ -44,8 +44,12 @@ def tailscale_status_line(stdout: str, stderr: str) -> StatusLine:
     try:
         backend = json.loads(stdout)["BackendState"]
     except (ValueError, KeyError, TypeError):
-        detail = stderr.strip() or stdout.strip() or "no output"
-        return StatusLine("tailscale: WARNING status unreadable: %s" % detail, True)
+        detail = ui.quoted_block(stderr) or ui.quoted_block(stdout)
+        return StatusLine(
+            "tailscale: WARNING status unreadable"
+            + (":\n" + detail if detail else ": no output"),
+            True,
+        )
     if backend == "NeedsLogin":
         return StatusLine(
             "tailscale: not logged in (optional) — to join a tailnet: %s"
@@ -58,7 +62,7 @@ def tailscale_status_line(stdout: str, stderr: str) -> StatusLine:
     if backend != "Running":
         return StatusLine(
             "tailscale: WARNING %s — fix with: %s"
-            % (backend, state.yo_cmd("ssh", "sudo", "tailscale", "up")),
+            % (ui.shown(str(backend)), state.yo_cmd("ssh", "sudo", "tailscale", "up")),
             True,
         )
     return StatusLine("tailscale: Running")

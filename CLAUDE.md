@@ -164,6 +164,8 @@ Tests, all under `tests/`:
   fact equal, and the package's import and packaging conventions.
 - `test_guest_script.py`: runs the guest script's functions under bash.
 - `test_yo_luks.py`: the passphrase derivation and the ssh agent protocol.
+- `test_yo_guest_text.py`: the guest-text chokepoint: what a guest session prints
+  is tagged, capped, and quoted before `out()` or `err()` show it. `yo.md#output-filter`.
 - `test_egress_rules.py`: runs `tests/egress_rules.py` on the rendered egress
   rule files in `tests/fixtures/`, and on broken copies, and runs the two
   `nix/egress/` scripts with a fake `nft`. CI diffs the fixtures

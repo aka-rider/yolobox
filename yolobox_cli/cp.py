@@ -362,8 +362,8 @@ def list_guest(
     done = sshx.ssh_run(AGENT, ["find", "-H"] + list(starts) + list(tests), binary=True)
     if done.returncode != 0:
         raise YoError(
-            "cannot list %s in the guest: %s"
-            % (", ".join(starts), proc.failure_detail(done))
+            "cannot list %s in the guest%s"
+            % (", ".join(starts), proc.what_it_said(done))
         )
     entries: Dict[str, GuestEntry] = {}
     for record in done.stdout.split(b"\0"):

@@ -21,6 +21,11 @@ class SshRole:
     own_control_path: bool
     pins_host_key: bool = True
 
+    @property
+    def name(self) -> str:
+        """The account the role logs in as, for a message: "operator" or the agent's."""
+        return self.user or "operator"
+
 
 # getent's exit code for a key the database does not hold.
 GETENT_KEY_NOT_FOUND = 2
@@ -64,9 +69,14 @@ def stop_master(role: SshRole, failure: str) -> None:
     """Ask the role's ssh master to quit, and raise `failure` (then ssh's stderr)
     when one still answers. What counts is that none is left: a master that died
     on its own since the caller looked makes the exit fail, and that is fine."""
-    exit_run = proc.run(ssh_argv(role, "-O", "exit", state.box.vm_host, mux=True))
+    exit_run = proc.run(
+        ssh_argv(role, "-O", "exit", state.box.vm_host, mux=True), guest=role.name
+    )
     if master_alive(role):
-        raise YoError("%s: %s" % (failure, exit_run.stderr.strip() or "no output"))
+        said = ui.quoted_block(exit_run.stderr)
+        raise YoError(
+            "%s:\n%s" % (failure, said) if said else "%s (ssh said nothing)" % failure
+        )
 
 
 def agent_master_removals() -> List[Removal]:
@@ -101,11 +111,10 @@ def ssh_run(
     capture: bool = True,
     check: bool = False,
     merge_stderr: bool = False,
-    inherit_stdin: bool = False,
     binary: bool = False,
     filtered: bool = False,
 ) -> subprocess.CompletedProcess:
-    no_stdin = ["-n"] if stdin is None and not inherit_stdin else []
+    no_stdin = ["-n"] if stdin is None else []
     return proc.run(
         ssh_argv(role, *no_stdin, state.box.vm_host, shlex.join(argv), mux=mux),
         capture=capture,
@@ -115,6 +124,7 @@ def ssh_run(
         merge_stderr=merge_stderr,
         binary=binary,
         filtered=filtered,
+        guest=role.name,
     )
 
 
@@ -122,12 +132,16 @@ class Unreachable(YoError):
     """ssh could not reach the box at all (exit 255), as opposed to a command that failed there."""
 
 
-def unreachable(role: SshRole) -> Unreachable:
-    return Unreachable(
-        state.not_up_hint(
-            "cannot reach %s as %s" % (state.box.name, role.user or "operator")
-        )
+def unreachable(role: SshRole, said: str = "") -> Unreachable:
+    """The role's session exited 255, with what ssh printed (`said`), if anything.
+    The message says whose session and which code, since a command the agent runs
+    on the box can exit 255 too: the reader can then tell the two apart."""
+    message = state.not_up_hint(
+        "cannot reach %s as %s (the %s's ssh session exited %d, ssh's own code for "
+        "no connection)" % (state.box.name, role.name, role.name, SSH_UNREACHABLE)
     )
+    block = ui.quoted_block(said)
+    return Unreachable("%s\n%s" % (message, block) if block else message)
 
 
 def probe(role: SshRole, argv: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
@@ -138,7 +152,7 @@ def probe(role: SshRole, argv: Sequence[str], **kwargs) -> subprocess.CompletedP
     """
     completed = ssh_run(role, argv, **kwargs)
     if completed.returncode == SSH_UNREACHABLE:
-        raise unreachable(role)
+        raise unreachable(role, completed.stderr or "")
     return completed
 
 
@@ -173,16 +187,17 @@ def account_status() -> Tuple[AccountStatus, str]:
     """Which accounts work, as (status, detail).
 
     The detail of AGENT_FAILING is the failed probe's exit code and stderr, and that
-    of UNREACHABLE what ssh said; the others have none.
+    of UNREACHABLE what ssh said, both as display text (a quoted block); the others
+    have none.
     """
     agent_probe = ssh_run(AGENT, ["true"])
     if agent_probe.returncode == 0:
         return AccountStatus.AGENT, ""
     if ssh_run(OPERATOR, ["true"]).returncode != 0:
-        return AccountStatus.UNREACHABLE, agent_probe.stderr.rstrip("\n")
+        return AccountStatus.UNREACHABLE, ui.quoted_block(agent_probe.stderr)
     lookup = ssh_run(OPERATOR, ["getent", "passwd", AGENT_USER])
     if lookup.returncode == SSH_UNREACHABLE:
-        return AccountStatus.UNREACHABLE, lookup.stderr.rstrip("\n")
+        return AccountStatus.UNREACHABLE, ui.quoted_block(lookup.stderr)
     if lookup.returncode == GETENT_KEY_NOT_FOUND:
         return AccountStatus.OPERATOR_ONLY, ""
     if lookup.returncode != 0:
@@ -200,7 +215,7 @@ def require_agent_account() -> None:
         return
     if status is AccountStatus.AGENT_FAILING:
         ui.err("yo: cannot ssh into %s as '%s'." % (state.box.name, AGENT_USER))
-        ui.err("    The account exists, but its login fails: %s" % detail)
+        ui.err("    The account exists, but its login fails:\n%s" % detail)
         ui.err(
             "    Its shell startup files (~/.bashrc, ~/.profile) are the usual cause; "
             "inspect them as the operator: %s" % state.yo_cmd("ssh")
