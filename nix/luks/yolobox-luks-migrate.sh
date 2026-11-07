@@ -23,18 +23,38 @@ align=$((4 * mib))
 # sector size is.
 sector_bytes=512
 progress_seconds=30
+# Where the kernel says whether the disk offloads write-zeroes; a test points
+# it elsewhere.
+sysfs_block="${YOLOBOX_SYSFS_BLOCK:-/sys/class/block}"
 
+# What the disk holds right now, for the failure line below. Every write that
+# changes it updates this first, so the line is right whatever fails after.
+disk_state="still plaintext, not encrypted"
+report_failure() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "yolobox-luks-migrate: failed (exit ${rc}); ${device} is ${disk_state}" >&2
+  fi
+}
+trap report_failure EXIT
+
+# Asks until a passphrase arrives; with $1 = verify, until one that opens the
+# LUKS device. A rejected passphrase fails nothing: the unit stays at its ask
+# and the next `yo up` answers it (yolobox-unlock exits 1 on the second ask).
+# A plain ext4 device has nothing to verify against, so encrypt trusts the
+# first answer.
 read_key() {
-  if [ -n "${YOLOBOX_LUKS_KEY_FILE:-}" ]; then
-    # Test hook; the initrd never sets this.
-    key=$(cat "$YOLOBOX_LUKS_KEY_FILE")
-  else
+  while :; do
     key=$(systemd-ask-password --no-tty --timeout=0 --id=yolobox:luks-migrate "yolobox: passphrase to encrypt ${device} in place")
-  fi
-  if [ -z "$key" ]; then
-    echo "yolobox: no passphrase given" >&2
-    exit 2
-  fi
+    if [ -z "$key" ]; then
+      echo "yolobox: no passphrase given" >&2
+      exit 2
+    fi
+    if [ "$1" = trust ] || printf '%s' "$key" | cryptsetup open --test-passphrase --key-file - "$device"; then
+      return 0
+    fi
+    echo "yolobox: the passphrase does not open ${device}, asking again" >&2
+  done
 }
 
 fs_block_size() {
@@ -69,10 +89,18 @@ fsck_ok() {
   fi
 }
 
+# A header field as luksDump prints it: `Label:          yolobox-luks`.
+header_field() {
+  awk -v name="$1" -F: '$1 == name {sub(/^[[:space:]]+/, "", $2); print $2; exit}' <<<"$dump"
+}
+
 # Sets the global `state`. Called plainly, never inside $(...), so its exit
-# ends the script.
+# ends the script. The label says the disk is finished; the subsystem, written
+# with the header at the start of encrypt, says it is ours and unfinished. A
+# LUKS disk with neither was not encrypted by this script, and finalizing it
+# would discard everything past a filesystem it may not even hold.
 detect_state() {
-  local type dump
+  local type
   if ! cryptsetup isLuks "$device"; then
     type=$(blkid -o value -s TYPE "$device" || true)
     if [ "$type" != ext4 ]; then
@@ -84,13 +112,18 @@ detect_state() {
   fi
   # Captured first: `cmd | grep -q` under pipefail is a trap.
   dump=$(cryptsetup luksDump "$device")
-  if grep -q '^Requirements:.*online-reencrypt' <<<"$dump"; then
-    state=resume
-  elif [ "$(blkid -o value -s LABEL "$device")" = "$label" ]; then
+  if [ "$(header_field Label)" = "$label" ]; then
     # Quoted because shellcheck reads a bare `done` after `=` as the keyword (SC1010).
     state="done"
+  elif [ "$(header_field Subsystem)" != "$label" ]; then
+    echo "yolobox: ${device} is LUKS but not marked as a yolobox migration (LUKS2 subsystem '${label}'); refusing to touch it" >&2
+    exit 3
+  elif grep -q '^Requirements:.*online-reencrypt' <<<"$dump"; then
+    state=resume
+    disk_state="partly encrypted; the next boot resumes the encryption"
   else
     state=finalize
+    disk_state="encrypted but not finalized; the next boot finishes it"
   fi
 }
 
@@ -122,9 +155,13 @@ encrypt() {
     exit 7
   fi
   resize2fs "$device" "$target"
+  disk_state="partly encrypted; the next boot resumes the encryption"
+  # --subsystem marks the header as this script's work from its first byte;
+  # the label comes only with finalize (detect_state reads both).
   printf '%s' "$key" | cryptsetup reencrypt --batch-mode --progress-frequency "$progress_seconds" \
-    --encrypt --type luks2 --cipher aes-xts-plain64 --key-size 512 --pbkdf argon2id \
+    --encrypt --type luks2 --cipher aes-xts-plain64 --key-size 512 --pbkdf argon2id --subsystem "$label" \
     --reduce-device-size "${header_room_mib}M" --device-size "$region" --key-file - "$device"
+  disk_state="encrypted but not finalized; the next boot finishes it"
   echo "yolobox-luks-migrate: encrypt done"
 }
 
@@ -132,7 +169,27 @@ resume() {
   echo "yolobox-luks-migrate: resume ${device}"
   printf '%s' "$key" | cryptsetup reencrypt --batch-mode --progress-frequency "$progress_seconds" \
     --resume-only --key-file - "$device"
+  disk_state="encrypted but not finalized; the next boot finishes it"
   echo "yolobox-luks-migrate: resume done"
+}
+
+# Discard is advisory: a backend that ignores it (qemu's default
+# discard=ignore) keeps the plaintext in the image file. So the tail is zeroed
+# first, then discarded, which gives the image its holes back where discard
+# works. The zeroing goes through the disk's write-zeroes offload, where the
+# host turns it into metadata; without the offload the kernel would write every
+# zero by hand and the image file would grow by the whole tail, so only the
+# discard runs and the journal says so.
+clear_plaintext() {
+  local offset=$1 length=$2 max
+  max=$(cat "${sysfs_block}/$(basename "$device")/../queue/write_zeroes_max_bytes" 2>/dev/null || true)
+  case "$max" in
+    '' | *[!0-9]* | 0)
+      echo "yolobox-luks-migrate: ${device} offloads no write-zeroes (${max:-unknown}); the old plaintext is only discarded, which a host that ignores discard keeps"
+      ;;
+    *) blkdiscard -z -f --offset "$offset" --length "$length" "$device" ;;
+  esac
+  blkdiscard -f --offset "$offset" --length "$length" "$device"
 }
 
 # Finalize opens the partition under a private name, never `$mapper`. The
@@ -159,7 +216,7 @@ finalize() {
     total=$(blockdev --getsize64 "$device")
     # The never-shrunk tail and reencrypt's temporary copy still hold plaintext.
     if [ "$plaintext_tail" -lt "$total" ]; then
-      blkdiscard -f --offset "$plaintext_tail" --length $((total - plaintext_tail)) "$device"
+      clear_plaintext "$plaintext_tail" $((total - plaintext_tail))
     fi
     fsck_ok "/dev/mapper/${scratch}"
     resize2fs "/dev/mapper/${scratch}"
@@ -167,10 +224,14 @@ finalize() {
   rc=$?
   set -e
   # Closed in every case: systemd-cryptsetup cannot open the device while the
-  # scratch mapping holds it.
-  cryptsetup close "$scratch"
+  # scratch mapping holds it. A close that fails is reported with whatever
+  # failed before it, not in place of it.
+  if ! cryptsetup close "$scratch"; then
+    echo "yolobox: cryptsetup close ${scratch} failed; ${device} is still held by that mapping" >&2
+    rc=5
+  fi
   if [ "$rc" -ne 0 ]; then
-    echo "yolobox: finalize failed (exit $rc), ${device} left closed" >&2
+    echo "yolobox: finalize failed (exit $rc), ${device} left unlabelled" >&2
     exit 5
   fi
   cryptsetup config --label "$label" "$device"
@@ -180,8 +241,8 @@ finalize() {
 detect_state
 case "$state" in
   done) exit 0 ;;
-  encrypt) read_key; encrypt; finalize ;;
-  resume) read_key; resume; finalize ;;
-  finalize) read_key; finalize ;;
+  encrypt) read_key trust; encrypt; finalize ;;
+  resume) read_key verify; resume; finalize ;;
+  finalize) read_key verify; finalize ;;
   *) echo "yolobox: unknown state '$state'" >&2; exit 6 ;;
 esac
