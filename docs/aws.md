@@ -1,6 +1,6 @@
 # AWS credentials
 
-Every allow-listed SSO profile on the Mac is available to every process in the VM, and each process picks its own with `AWS_PROFILE=<name>`. A broker on the Mac mints the credentials and the guest reaches it over a reverse unix socket. This page explains why the box works that way and how to recognise each piece failing. The rules are in `CONSTITUTION.md`.
+Every allow-listed SSO profile on the host (a Mac or a Linux PC) is available to every process in the VM, and each process picks its own with `AWS_PROFILE=<name>`. A broker on the host mints the credentials and the guest reaches it over a reverse unix socket. This page explains why the box works that way and how to recognise each piece failing. The rules are in `CONSTITUTION.md`.
 
 ## Design
 
@@ -48,14 +48,14 @@ Because `AWS_CONFIG_FILE` replaces the guest's own AWS config path, an agent-wri
 
 ## Transport
 
-Why `credential_process` and not the container credential provider? botocore dials the container provider only as an HTTP(S) URI and has no unix-socket form. Once the broker moved to a unix socket, that provider stopped being a candidate. `credential_process` runs any command and reads process-credential JSON from its stdout, so `yolobox-guest aws-creds P` can `curl --unix-socket` the Mac-side broker.
+Why `credential_process` and not the container credential provider? botocore dials the container provider only as an HTTP(S) URI and has no unix-socket form. Once the broker moved to a unix socket, that provider stopped being a candidate. `credential_process` runs any command and reads process-credential JSON from its stdout, so `yolobox-guest aws-creds P` can `curl --unix-socket` the host-side broker.
 
 Why a unix socket and not a forwarded TCP port? A VPN on the host that blackholes lima's gateway blackholes every guest connection to `192.168.5.2:<port>`, the path a TCP `-R` forward relies on (see [A VPN that blackholes lima's gateway](host-network.md#a-vpn-that-blackholes-limas-gateway)). Lima's reverse unix-socket forwards ride lima's own ssh connection and are unaffected. 1Password's forward already had that shape (see [1Password reaches the agent](ssh.md#1password-reaches-the-agent)), so the broker uses it too.
 
 The chain has four links:
 
-1. `aws-broker` binds `~/.local/state/yolobox/aws-broker.sock` on the Mac, born `0600`.
-2. Lima reverses it to `/run/yolobox-op/aws-broker.sock` in the guest, bound as the operator exactly like 1Password's.
+1. `aws-broker` binds `~/.local/state/yolobox/aws-broker.sock` on the host, born `0600`.
+2. Lima (on a Linux host, the operator's ssh master; see [docs/linux-host.md](linux-host.md)) reverses it to `/run/yolobox-op/aws-broker.sock` in the guest, bound as the operator exactly like 1Password's.
 3. `opProxy` in `nix/base.nix`, the same chokepoint that proxies 1Password, bridges it through `systemd-socket-proxyd` to an agent-owned `/run/yolobox/aws-broker.sock`.
 4. `yolobox-guest aws-creds` calls that socket.
 
@@ -63,9 +63,9 @@ The broker binds a second socket, `~/.local/state/yolobox/aws-broker.ctl.sock`, 
 
 No bearer token guards any of the forwarded chain. The filesystem permissions on the last socket are the whole authorization boundary, as for 1Password. [Healing reverse forwards](ssh.md#healing-reverse-forwards) covers how `yo` revives a dead forward.
 
-There is exactly one broker socket, not one URL per profile, so the Mac and the guest do not share a port or address to keep in sync. `nix/lib/agent-env.nix` has `awsBrokerSock`, the one place that names the agent-facing path. It sits outside the exported `env` attrset because it names a proxy target, not a variable an agent process should export. `nix/guest.nix` folds it into `YOLOBOX_AWS_BROKER_SOCK` through `runtimeEnv`, so `yolobox-guest.sh` reads it from the environment.
+There is exactly one broker socket, not one URL per profile, so the host and the guest do not share a port or address to keep in sync. `nix/lib/agent-env.nix` has `awsBrokerSock`, the one place that names the agent-facing path. It sits outside the exported `env` attrset because it names a proxy target, not a variable an agent process should export. `nix/guest.nix` folds it into `YOLOBOX_AWS_BROKER_SOCK` through `runtimeEnv`, so `yolobox-guest.sh` reads it from the environment.
 
-The Mac-side half still has to be kept in sync by hand:
+The host-side half still has to be kept in sync by hand:
 
 - `AWS_BROKER_GUEST_SOCK` in `yolobox_cli/config.py` (folded into `LIMA_PORT_FORWARDS` in `yolobox_cli/lima.py`).
 - `AGENT_AWS_BROKER_SOCK` in `yolobox_cli/config.py`, the target of its health probe. `TestAgentEnvMatchesYoSockets` checks it against `agent-env.nix`.
@@ -95,9 +95,9 @@ On a Linux host there is no hostagent, so the broker follows the operator's ssh 
 
 ## Minting
 
-Minting is lazy and per profile. Each profile has its own lock, cache and throttle, so one profile's expired SSO session never blocks another's `/creds/<P>` request. A cache inside the re-mint window (`REMINT_WINDOW_SECONDS`, 600 s before expiry) is still valid, so the one request that finds the profile's lock free refreshes it and every other request is served the cache at once; a mint can take `MINT_TIMEOUT_SECONDS`, and before this a request that arrived during a refresh waited for the lock and got `503` after `PROFILE_LOCK_TIMEOUT_SECONDS` although the credentials it needed were in the cache. Only a request with nothing usable waits for a mint. An IAM user's long-lived keys never expire and must never enter the guest this way, so a request for such a profile is a request-time 500. `aws sso login --profile P` on the Mac heals a running guest session with no re-enter, because the next `/creds/<P>` hit simply mints again.
+Minting is lazy and per profile. Each profile has its own lock, cache and throttle, so one profile's expired SSO session never blocks another's `/creds/<P>` request. A cache inside the re-mint window (`REMINT_WINDOW_SECONDS`, 600 s before expiry) is still valid, so the one request that finds the profile's lock free refreshes it and every other request is served the cache at once; a mint can take `MINT_TIMEOUT_SECONDS`, and before this a request that arrived during a refresh waited for the lock and got `503` after `PROFILE_LOCK_TIMEOUT_SECONDS` although the credentials it needed were in the cache. Only a request with nothing usable waits for a mint. An IAM user's long-lived keys never expire and must never enter the guest this way, so a request for such a profile is a request-time 500. `aws sso login --profile P` on the host heals a running guest session with no re-enter, because the next `/creds/<P>` hit simply mints again.
 
-Every failure of a request the broker has read answers with the same clean 500. The body is ``mint failed: run `aws sso login --profile P` on the Mac; the detail is in broker.log`` and nothing else. The detail (`aws`'s stderr, Mac paths, account ids, a traceback) goes to `broker.log` and never to the guest, because the guest is the untrusted side and the response is the one channel it reads. That includes an exception raised inside the handler, which must not drop the connection and reach `credential_process` as an unexplained empty reply. A connection over the connection bound, or a request head over the cap, is the one exception: it is closed before there is a request to answer, so it gets no answer at all (see [Bounds on one request](#bounds-on-one-request)). The mint also validates what `aws configure export-credentials` returned: a JSON object, four non-empty string fields (a message names the field, never its value), and a parseable `Expiration`.
+Every failure of a request the broker has read answers with the same clean 500. The body is ``mint failed: run `aws sso login --profile P` on the host; the detail is in broker.log`` and nothing else. The detail (`aws`'s stderr, host paths, account ids, a traceback) goes to `broker.log` and never to the guest, because the guest is the untrusted side and the response is the one channel it reads. That includes an exception raised inside the handler, which must not drop the connection and reach `credential_process` as an unexplained empty reply. A connection over the connection bound, or a request head over the cap, is the one exception: it is closed before there is a request to answer, so it gets no answer at all (see [Bounds on one request](#bounds-on-one-request)). The mint also validates what `aws configure export-credentials` returned: a JSON object, four non-empty string fields (a message names the field, never its value), and a parseable `Expiration`.
 
 A failing `aws configure export-credentials` is logged with its stderr only, never its stdout: a CLI that fails after printing the credentials would otherwise put them in `broker.log`. The line says how many bytes of stdout there were instead.
 
@@ -131,6 +131,6 @@ A connection lives under one wall-clock deadline, `REQUEST_DEADLINE_SECONDS` (60
 
 `cmd_aws_creds` in `nix/guest/yolobox-guest.sh` runs `curl -sS -g --fail-with-body --unix-socket "${YOLOBOX_AWS_BROKER_SOCK}" "http://broker/creds/${profile}"` after the name check. `-g` stops curl globbing `[]` and `{}` in the URL, so a name cannot expand into several requests. Curl's stdout and stderr are captured apart. The success body is JSON that the AWS SDK reads from this command's stdout, so a curl warning must never join it, and on failure both curl's error and the body go to stderr.
 
-Three curl exit codes mean "the broker is unreachable" and get the `yo up`-on-the-Mac remedy instead of curl's generic message: 7 (connection refused, so the proxy socket unit itself is absent, an old box), 52 and 56 (empty reply, connection reset). The last two are the common case. The agent-side `yolobox-aws-broker.socket` accepts a connection whether or not anything real listens behind lima's forward, so a dead forward or a dead Mac-side broker reads as a broken connection mid-request. `op_probe_alive` has the same two-faced exit code for 1Password.
+Three curl exit codes mean "the broker is unreachable" and get the `yo up`-on-the-host remedy instead of curl's generic message: 7 (connection refused, so the proxy socket unit itself is absent, an old box), 52 and 56 (empty reply, connection reset). The last two are the common case. The agent-side `yolobox-aws-broker.socket` accepts a connection whether or not anything real listens behind lima's forward, so a dead forward or a dead host-side broker reads as a broken connection mid-request. `op_probe_alive` has the same two-faced exit code for 1Password.
 
 `yo aws-check` is the doctor. It runs `ensure_aws_broker()` for real, then for each profile section in the guest's `AWS_CONFIG_FILE` runs `AWS_PROFILE=P aws sts get-caller-identity` in the VM and asserts a role ARN comes back.

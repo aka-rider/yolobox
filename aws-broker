@@ -551,10 +551,10 @@ class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
 
 
 # The 500 body the guest sees. Everything that could carry detail (aws
-# stderr, Mac paths, account ids) stays in broker.log.
+# stderr, host paths, account ids) stays in broker.log.
 def mint_failed_body(profile):
     return (
-        f"mint failed: run `aws sso login --profile {profile}` on the Mac; "
+        f"mint failed: run `aws sso login --profile {profile}` on the host; "
         "the detail is in broker.log\n"
     )
 
@@ -793,10 +793,10 @@ class GuestHandler(HealthHandler):
 def bind_server(socket_path, handler_factory, max_connections, events):
     """Bind the 0600 unix socket and return (server, (st_dev, st_ino))."""
     # Only the socket file's own mode governs who can connect: no bearer
-    # token guards these requests, and this file only ever runs on the Mac,
-    # which has no separate agent account — 0600 restricts the socket to
-    # this user's own processes, with no window where it is
-    # world-connectable. bind() creates the socket file at mode 0777 &
+    # token guards these requests, and this file only ever runs on the host
+    # (a Mac or a Linux PC), as the operator, with no separate agent account
+    # there — 0600 restricts the socket to this user's own processes, with
+    # no window where it is world-connectable. bind() creates the socket file at mode 0777 &
     # ~umask, so clearing every group/other/execute bit needs umask 0o177,
     # not the 0o077 that a regular file's 0666 default would call for.
     old_umask = os.umask(0o177)

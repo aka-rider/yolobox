@@ -681,7 +681,7 @@ cmd_aws_creds() {
     case "${rc}" in
     7 | 52 | 56)
         # shellcheck disable=SC2016
-        printf 'yolobox-guest: AWS broker socket %s not answering; run `yo up` on the Mac\n' "${YOLOBOX_AWS_BROKER_SOCK}" >&2
+        printf 'yolobox-guest: AWS broker socket %s not answering; run `yo up` on the host\n' "${YOLOBOX_AWS_BROKER_SOCK}" >&2
         exit 1
         ;;
     esac

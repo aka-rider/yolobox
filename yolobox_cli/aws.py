@@ -70,7 +70,8 @@ def checked_pid(value: object) -> Optional[int]:
 
 
 def aws_broker_sock() -> str:
-    """The socket Lima forwards into the guest."""
+    """The socket forwarded into the guest: by Lima on a Mac, by the operator's
+    ssh master on a Linux host."""
     return os.path.join(state.state_dir(), "aws-broker.sock")
 
 
