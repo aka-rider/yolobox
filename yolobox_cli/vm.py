@@ -722,13 +722,9 @@ def grow_to_asked_disk(wanted_gib: int, passphrase: Optional[agent.Passphrase]) 
     """
     current_gib = state.driver().current_size().disk_gib
     if wanted_gib == current_gib:
-        if root_has_room_to_grow(wanted_gib):
-            finish_previous_grow(wanted_gib, passphrase or agent.luks_passphrase())
-        else:
-            ui.out(
-                "the root already fills the %dGiB ceiling; nothing left to grow"
-                % wanted_gib
-            )
+        # A root that fills the ceiling is the asked size, which `up` says
+        # nothing about; "nothing left to grow" is an explicit disk-grow's line.
+        finish_grow_at_ceiling(wanted_gib, passphrase)
         return
     try:
         require_growable_guest()
@@ -803,6 +799,17 @@ def finish_previous_grow(ceiling_gib: int, passphrase: agent.Passphrase) -> None
     )
 
 
+def finish_grow_at_ceiling(
+    ceiling_gib: int, passphrase: Optional[agent.Passphrase]
+) -> bool:
+    """Finish a grow that stopped after the ceiling moved, if the root is short of
+    it: True when one was finished. The passphrase is asked for only then."""
+    if not root_has_room_to_grow(ceiling_gib):
+        return False
+    finish_previous_grow(ceiling_gib, passphrase or agent.luks_passphrase())
+    return True
+
+
 @agent.clearing_passphrases
 def cmd_disk_grow(args: argparse.Namespace) -> None:
     wanted = args.size
@@ -826,6 +833,13 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
     # of a bigger disk derives it before the stop, and heals the services on
     # the restart.
     passphrase = vm_up(run_services=wanted == current_gib)
+    if wanted == current_gib:
+        if not finish_grow_at_ceiling(wanted, passphrase):
+            ui.out(
+                "the root already fills the %dGiB ceiling; nothing left to grow"
+                % wanted
+            )
+        return
     grow_to_asked_disk(wanted, passphrase)
 
 

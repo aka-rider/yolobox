@@ -4676,6 +4676,27 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         self.assertEqual(self.order, [{"run_services": False}])
 
 
+class TestUpAtTheBoxsOwnDiskSize(unittest.TestCase):
+    """`yo up --disk N` on a box already at N, with nothing to finish, is the
+    asked size: it prints nothing (the "nothing left to grow" line belongs to an
+    explicit `yo disk-grow`) and never asks for the passphrase."""
+
+    def test_a_root_that_fills_the_ceiling_prints_nothing(self):
+        driver = mock.Mock()
+        driver.current_size.return_value = yo.BoxSize(4, 40, 2)
+        with (
+            mock.patch.object(yo.state, "driver", return_value=driver),
+            mock.patch.object(yo.vm, "root_has_room_to_grow", return_value=False),
+            mock.patch.object(yo.vm, "finish_previous_grow") as finish,
+            mock.patch.object(yo.agent, "luks_passphrase") as passphrase,
+            mock.patch.object(yo.ui, "out") as out,
+        ):
+            yo.grow_to_asked_disk(40, None)
+        out.assert_not_called()
+        finish.assert_not_called()
+        passphrase.assert_not_called()
+
+
 class TestUpGrowsTheDiskOfAStoppedBox(FakeHome):
     """`yo up --disk N` boots the box, checks the guest, then grows as `yo disk-grow N`."""
 
