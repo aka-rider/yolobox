@@ -2,6 +2,12 @@
 
 The code is `nix/podman.nix`. It turns on rootless podman with the docker-compatible socket, prunes weekly as the agent, and sets the box's logging defaults in `containers.conf`.
 
+## The agent's podman
+
+Every container runs as the agent, so the podman socket and `DOCKER_HOST` are the agent's. `systemd.user.sockets.podman` carries `ConditionUser=agent`, and the `DOCKER_HOST` export in `environment.extraInit` sits in a guard on the account name, like the agent's environment in `nix/base.nix`. Before that, every user manager on the box, the operator's included, started a podman API socket at login, and every shell pointed `DOCKER_HOST` at a socket its own manager owned: a `docker` command the operator ran by habit would have built a second, root-less storage under the operator's home, apart from the agent's. CONSTITUTION's rule that every `ConditionUser=` names the agent covers it, and `TestEveryUserUnitIsTheAgents` in `tests/test_consistency.py` reads every `systemd.user.*` unit in `nix/` for the condition.
+
+Check it as the operator with `systemctl --user status podman.socket`, which must say the condition failed, and `printenv DOCKER_HOST`, which must print nothing; as the agent both are set.
+
 ## Container output and the journal
 
 Symptom: the journal grows far beyond what the box's services explain. Containers with healthchecks on a short interval feed it through three emitters:

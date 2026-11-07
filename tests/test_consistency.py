@@ -395,7 +395,7 @@ class TestOnlyBaseNixSeesTheOperator(unittest.TestCase):
 
     def test_no_module_but_base_nix_names_the_operator_variable(self):
         for path in sorted((REPO / "nix").rglob("*.nix")):
-            if path.name == "base.nix":
+            if path == REPO / "nix" / "base.nix":
                 continue
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 with self.subTest(path=str(path.relative_to(REPO)), line=number):
@@ -1469,7 +1469,7 @@ class TestHardeningWrapperAllowlistHasOneSpelling(unittest.TestCase):
         text = HARDENING_CHECK.read_text()
         for name in ("newuidmap", "newgidmap"):
             (nix_caps,) = re.findall(
-                r'^\s*%s = capRoot "([^"]*)";' % name,
+                r'^\s*%s = capRoot "([^"]*)"' % name,
                 nix_code(HARDENING_NIX),
                 re.M,
             )
@@ -2182,3 +2182,87 @@ class TestGuestNicNameIsOneFact(unittest.TestCase):
 
     def test_the_nix_modules_name_the_interface_the_domain_slot_produces(self):
         self.assertEqual(nix_nic_names(), {libvirt_nic_name()})
+
+
+class TestSshdSettingsHoldTheirStories(unittest.TestCase):
+    """Three sshd lines in nix/base.nix each carry a story elsewhere: yo cp's
+    "no guest shell runs" needs the in-process sftp server, root never logs
+    in to stage 2, and the agent's Match block must not swallow later lines."""
+
+    def base_nix(self):
+        return nix_code(REPO / "nix" / "base.nix")
+
+    def test_the_sftp_server_is_the_in_process_one(self):
+        self.assertIn(
+            'services.openssh.sftpServerExecutable = "internal-sftp";', self.base_nix()
+        )
+
+    def test_root_login_is_off_in_stage_2(self):
+        self.assertIn('PermitRootLogin = "no";', self.base_nix())
+
+    def test_the_agent_match_block_is_closed(self):
+        (extra,) = re.findall(
+            r"services\.openssh\.extraConfig = ''\n(.*?)'';", self.base_nix(), re.S
+        )
+        lines = [line.strip() for line in extra.splitlines() if line.strip()]
+        self.assertEqual(lines[0], "Match User ${agentUser}")
+        self.assertEqual(lines[-1], "Match all")
+
+
+class TestEveryUserUnitIsTheAgents(unittest.TestCase):
+    """CONSTITUTION: every ConditionUser= names agentUser. Each user unit a
+    module declares, as a block or as one dotted line, must carry the
+    condition, or the operator's user manager runs it too (nix/podman.md)."""
+
+    UNIT_RE = re.compile(r"systemd\.user\.(services|sockets|timers|paths)\.([\w-]+)")
+    CONDITION = "ConditionUser = agentUser;"
+
+    def block_after(self, text, start):
+        """The text of the `{ ... }` that starts at the first brace after start."""
+        begin = text.index("{", start)
+        depth = 0
+        for i in range(begin, len(text)):
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            if depth == 0:
+                return text[begin : i + 1]
+        self.fail("unbalanced braces after offset %d" % start)
+
+    def conditioned_units(self, text):
+        units = set()
+        for m in self.UNIT_RE.finditer(text):
+            kind, name = m.groups()
+            rest = text[m.end() :].lstrip()
+            if rest.startswith("= {") and self.CONDITION in self.block_after(
+                text, m.end()
+            ):
+                units.add((kind, name))
+            elif rest.startswith(".unitConfig.ConditionUser = agentUser;"):
+                units.add((kind, name))
+        return units
+
+    def test_every_user_unit_names_the_agent(self):
+        for path in sorted((REPO / "nix").rglob("*.nix")):
+            text = nix_code(path)
+            declared = {m.groups() for m in self.UNIT_RE.finditer(text)}
+            if not declared:
+                continue
+            with self.subTest(file=path.name):
+                self.assertEqual(declared - self.conditioned_units(text), set())
+
+    def test_the_check_sees_an_unconditioned_unit(self):
+        text = 'systemd.user.sockets.x.wantedBy = [ "sockets.target" ];'
+        self.assertEqual(self.conditioned_units(text), set())
+        block = "systemd.user.services.x = { unitConfig.ConditionUser = agentUser; };"
+        self.assertEqual(self.conditioned_units(block), {("services", "x")})
+
+
+class TestOperatorNamePatternHasOneSpelling(unittest.TestCase):
+    """The operator's name reaches sshd config, tmpfiles rules and shell
+    scripts, so nix/base.nix asserts its shape; the libvirt driver refuses
+    the same names on the host before it writes cidata (docs/accounts.md)."""
+
+    def test_base_nix_and_the_libvirt_driver_accept_the_same_names(self):
+        (pattern,) = re.findall(
+            r'builtins\.match "([^"]+)" username', nix_code(REPO / "nix" / "base.nix")
+        )
+        self.assertEqual(pattern, yo.libvirt.OPERATOR_ACCOUNT_RE.pattern)

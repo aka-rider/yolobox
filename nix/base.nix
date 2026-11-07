@@ -23,6 +23,16 @@ let
         User = username;
         NoNewPrivileges = true;
         PrivateTmp = true;
+        # The proxy runs as the operator, whose processes the agent cannot
+        # ptrace, but a bug in proxyd itself would run as the operator: it
+        # gets only what copying bytes between two unix sockets needs
+        # (nix/base.md, "The proxies carry no privilege").
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateNetwork = true;
+        RestrictAddressFamilies = "AF_UNIX";
+        SystemCallFilter = "@system-service";
+        CapabilityBoundingSet = "";
         ExecStart = "${config.systemd.package}/lib/systemd/systemd-socket-proxyd /run/yolobox-op/${target}";
       };
     };
@@ -200,12 +210,19 @@ in
   # a box whose accounts already exist (a hand-run `sudo passwd root` would
   # stick). This enforces the lock on every activation. A field already
   # starting with ! or * is locked and left alone; `passwd -l` would prefix
-  # another !. A missing shadow entry fails the activation outright.
+  # another !. A missing shadow entry fails the activation: the `false`
+  # trips the runner's ERR trap, which marks this snippet failed and makes
+  # the activation exit nonzero after the later snippets have run. An
+  # `exit` here would skip them instead (nix/base.md, "Activation snippets").
   system.activationScripts.lockRootAndAgent = {
     deps = [ "users" ];
     text = ''
       for account in root ${agentUser}; do
-        entry="$(${pkgs.getent}/bin/getent shadow "$account")" || { echo "lockRootAndAgent: no shadow entry for $account" >&2; exit 1; }
+        if ! entry="$(${pkgs.getent}/bin/getent shadow "$account")"; then
+          echo "lockRootAndAgent: no shadow entry for $account" >&2
+          false
+          continue
+        fi
         field="''${entry#*:}"; field="''${field%%:*}"
         case "$field" in
           '!'*|'*'*) ;;
@@ -252,8 +269,16 @@ in
   services.openssh.settings = {
     PasswordAuthentication = false;
     KbdInteractiveAuthentication = false;
-    PermitRootLogin = "prohibit-password";
+    # root is locked and AllowUsers below never lists it; this says so in
+    # the one place sshd reads first. The initrd's sshd, where root is the
+    # unlock login, renders its own config (nix/luks.nix).
+    PermitRootLogin = "no";
   };
+  # `yo cp` rides scp's sftp mode, and the story (yo.md, "yo cp") rests on no
+  # guest shell running for a transfer. An external sftp-server is spawned
+  # through the user's login shell (`$SHELL -c`), which sources the agent's
+  # ~/.zshenv first; the in-process server runs no shell at all.
+  services.openssh.sftpServerExecutable = "internal-sftp";
   # The operator logs in only from the gateway, which the agent cannot spoof
   # off enp0s1, so its 1Password agent is no way in (nix/base.md, "No host OS ...").
   services.openssh.settings.AllowUsers = [ "${username}@192.168.5.2" agentUser ];
@@ -286,11 +311,14 @@ in
       exec ${pkgs.coreutils}/bin/cat ${lib.escapeShellArg "/etc/ssh/authorized_keys.d/${username}"}
     '';
   };
+  # `Match all` closes the block: a Match block runs to the end of the file,
+  # so a later extraConfig line would otherwise apply to the agent only.
   services.openssh.extraConfig = ''
     Match User ${agentUser}
       AuthorizedKeysFile none
       AuthorizedKeysCommand /etc/ssh/agent-authorized-keys
       AuthorizedKeysCommandUser root
+    Match all
   '';
 
   systemd.tmpfiles.rules = [
