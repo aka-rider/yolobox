@@ -549,8 +549,11 @@ def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -
     session_ran = False
     deadline: Optional[float] = None
     refused_since: Optional[float] = None
+    # Both outcomes are named: a seed image's disk is not encrypted yet, and its
+    # boot ends here with no ask at all.
     ui.err(
-        "yo: waiting for %s's initrd to ask for its disk passphrase" % state.box.name
+        "yo: waiting for %s to boot: its initrd to ask for the disk passphrase, "
+        "or its sshd to answer if the disk is not encrypted" % state.box.name
     )
     while True:
         # The banner decides what this round may do (Endpoint): the helper,

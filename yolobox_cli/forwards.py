@@ -225,17 +225,23 @@ def units_missing_note() -> str:
     )
 
 
-def account_problem(status: AccountStatus, detail: str) -> str:
+class AgentMissing(YoError):
+    """The box has no agent account at all (AccountStatus.OPERATOR_ONLY). Its
+    message is the destroy remedy; vm.heal_services tells the seed image, which
+    has the operator only too, apart first."""
+
+
+def account_problem(status: AccountStatus, detail: str) -> YoError:
     """Why the forwards cannot be healed: the agent account they serve is not
     there, or cannot log in. Healing anyway would read its failed login as a
     dead forward and tear a live one down."""
     if status is AccountStatus.OPERATOR_ONLY:
-        return (
+        return AgentMissing(
             "%s has no agent account to forward anything to (it predates the "
             "operator/agent split); rebuild it: %s"
             % (state.box.name, state.destroy_then_bootstrap_command())
         )
-    return (
+    return YoError(
         "the agent account's login on %s fails, so its forwards were not checked "
         "(its shell startup files are the usual cause; inspect them as the "
         "operator: %s):\n%s" % (state.box.name, state.yo_cmd("ssh"), detail)
@@ -247,7 +253,7 @@ def vm_services() -> None:
     if status is AccountStatus.UNREACHABLE:
         raise sshx.unreachable(OPERATOR)
     if status is not AccountStatus.AGENT:
-        raise YoError(account_problem(status, detail))
+        raise account_problem(status, detail)
     if not guest.vm_units_present():
         ui.err("yo: %s" % units_missing_note())
         return

@@ -13,7 +13,6 @@ from . import (
     config,
     cp,
     driver,
-    forwards,
     proc,
     release,
     session,
@@ -456,7 +455,7 @@ def heal_before_command() -> None:
     into a box whose broker or forwards are broken.
     """
     try:
-        forwards.vm_services()
+        vm.heal_services()
     except sshx.Unreachable:
         raise
     except YoError as failure:

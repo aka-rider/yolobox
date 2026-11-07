@@ -2326,6 +2326,56 @@ class TestVmServicesSkipsOnAnOldBox(unittest.TestCase):
         fake_forward.assert_called_once()
 
 
+class TestUpOnAFreshImageSaysBootstrap(unittest.TestCase):
+    """A seed image has the operator only, as a box from before the agent
+    account does, but its remedy is a bootstrap, not a destroy."""
+
+    def up(self, agent_missing, stamp, fstype):
+        services = mock.Mock(
+            side_effect=yo.forwards.AgentMissing(
+                "rebuild it: yo destroy --yes && yo bootstrap"
+            )
+            if agent_missing
+            else None
+        )
+        with (
+            mock.patch.object(
+                yo.vm, "preflight", return_value=(yo.RUNNING, yo.NO_SIZE, None)
+            ),
+            mock.patch.object(
+                yo.unlock, "boot_stage", return_value=yo.BootStage.STAGE2
+            ),
+            mock.patch.object(yo.sshconfig, "ensure_agent_ssh_config"),
+            mock.patch.object(yo.guest, "ensure_guest_known_hosts"),
+            mock.patch.object(yo.forwards, "vm_services", services),
+            mock.patch.object(yo.release, "built_by", return_value=stamp) as built_by,
+            mock.patch.object(yo.vm, "luks_device_fstype", return_value=fstype),
+            mock.patch.object(yo.ui, "out") as out,
+        ):
+            yo.vm_up()
+        return built_by, [call.args[0] for call in out.call_args_list]
+
+    def test_no_agent_no_stamp_and_a_plain_disk_is_the_seed_image(self):
+        _, lines = self.up(agent_missing=True, stamp=None, fstype="ext4")
+        self.assertEqual(lines, ["yolobox is not bootstrapped yet; run: yo bootstrap"])
+
+    def test_no_agent_and_no_stamp_on_an_encrypted_disk_keeps_the_destroy_remedy(self):
+        with self.assertRaises(yo.forwards.AgentMissing) as caught:
+            self.up(agent_missing=True, stamp=None, fstype="crypto_LUKS")
+        self.assertIn("yo destroy --yes", caught.exception.message)
+
+    def test_no_agent_on_a_stamped_box_keeps_the_destroy_remedy(self):
+        for fstype in ("ext4", "crypto_LUKS", ""):
+            with self.subTest(fstype=fstype):
+                with self.assertRaises(yo.forwards.AgentMissing):
+                    self.up(agent_missing=True, stamp="1.2.3", fstype=fstype)
+
+    def test_a_box_with_its_agent_is_never_asked_whether_it_is_the_seed_image(self):
+        built_by, lines = self.up(agent_missing=False, stamp=None, fstype="ext4")
+        built_by.assert_not_called()
+        self.assertEqual(lines, [])
+
+
 class TestVmServicesRunsHealersIndependently(unittest.TestCase):
     def setUp(self):
         status_patcher = mock.patch.object(
@@ -3941,6 +3991,10 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
         box.up()
         self.assertEqual(len(box.starts), 1)
         box.vm_services.assert_called_once_with()
+        # The wait line names the plain boot too: a seed image never asks.
+        self.assertIn(
+            "or its sshd to answer if the disk is not encrypted", box.stderr.getvalue()
+        )
 
     def test_a_finished_lima_start_with_a_silent_operator_waits_for_the_deadline(
         self,

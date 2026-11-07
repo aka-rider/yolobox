@@ -181,8 +181,33 @@ def vm_up(
     sshconfig.ensure_agent_ssh_config()
     guest.ensure_guest_known_hosts()
     if run_services:
-        forwards.vm_services()
+        heal_services()
     return passphrase
+
+
+def heal_services() -> None:
+    """forwards.vm_services, with the seed image told apart from the box that
+    predates the agent account: both have the operator only, and only the old
+    one is to be destroyed. The seed image is asked about only once the heal
+    has found the operator alone, so a normal box costs no extra probe."""
+    try:
+        forwards.vm_services()
+    except forwards.AgentMissing:
+        if not fresh_image():
+            raise
+        ui.out(
+            "%s is not bootstrapped yet; run: %s"
+            % (state.box.name, state.yo_cmd("bootstrap"))
+        )
+
+
+def fresh_image() -> bool:
+    """Whether the box is the seed image, never bootstrapped: no version stamp
+    and a plain root disk. A box bootstrapped before the stamp existed has an
+    encrypted disk, and one bootstrapped since has the stamp."""
+    if release.built_by() is not None:
+        return False
+    return classify_disk(luks_device_fstype()) is DiskState.PLAIN_EXT4
 
 
 class DiskState(enum.Enum):
