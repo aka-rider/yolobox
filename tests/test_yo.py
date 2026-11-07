@@ -3717,6 +3717,77 @@ class TestLimaConfigGaps(FakeHome):
                     ):
                         yo.LIMA.config_gaps()
 
+    def test_a_listing_without_a_config_object_is_an_error_not_a_box_without_gaps(
+        self,
+    ):
+        # A null or scalar config would read as every setting unset, which is
+        # every gap at once, or as none: both wrong for a listing yo cannot read.
+        for config, said in (
+            (None, "printed config as None, not a JSON object"),
+            ("lizard", "printed config as 'lizard', not a JSON object"),
+            ([], "printed config as [], not a JSON object"),
+            (MISSING, "printed no config for yolobox"),
+        ):
+            with self.subTest(config=config):
+                data = {"hostAgentPID": 5, "status": "Stopped"}
+                if config is not MISSING:
+                    data["config"] = config
+                with fake_limactl(json.dumps(data)):
+                    for read in (
+                        yo.LIMA.config_gaps,
+                        yo.LIMA.vm_status,
+                        yo.LIMA.keepalive_pid,
+                    ):
+                        with self.assertRaises(yo.YoError) as caught:
+                            read()
+                        self.assertIn(
+                            "limactl list yolobox --json", caught.exception.message
+                        )
+                        self.assertIn(said, caught.exception.message)
+
+    def test_an_ssh_or_user_that_is_not_an_object_is_an_error(self):
+        for config in (
+            {"ssh": None},
+            {"ssh": 1},
+            {"ssh": {}, "user": None},
+            {"ssh": {}, "user": "lizard"},
+        ):
+            with self.subTest(config=config):
+                with fake_limactl(json.dumps({"config": config})):
+                    with self.assertRaisesRegex(yo.YoError, "not a JSON object"):
+                        yo.LIMA.config_gaps()
+
+    def test_a_broken_instance_is_an_error_quoting_what_lima_said(self):
+        # Lima refuses to start or stop it; a listing that hid that would
+        # report gaps on a box nothing can edit.
+        data = {
+            "status": "Broken",
+            "errors": ["ha.pid is stale", {"not": "a string"}, ""],
+        }
+        with fake_limactl(json.dumps(data)):
+            for read in (yo.LIMA.config_gaps, yo.LIMA.keepalive_pid):
+                with self.assertRaises(yo.YoError) as caught:
+                    read()
+                message = caught.exception.message
+                self.assertIn("reports yolobox as Broken: ha.pid is stale", message)
+                self.assertIn("limactl list yolobox", message)
+                self.assertNotIn("delete", message.replace("Do not delete", ""))
+            # The status itself stays readable: the callers that decide by it
+            # (the wait for sshd, a resize) say where to look themselves.
+            self.assertEqual(yo.LIMA.vm_status(), "Broken")
+
+    def test_a_broken_instance_without_a_reason_is_still_an_error(self):
+        for errors in (MISSING, None, [], [{}], "lizard"):
+            with self.subTest(errors=errors):
+                data = {"status": "Broken", "config": {}}
+                if errors is not MISSING:
+                    data["errors"] = errors
+                with fake_limactl(json.dumps(data)):
+                    with self.assertRaisesRegex(
+                        yo.YoError, "as Broken and prints no reason"
+                    ):
+                        yo.LIMA.config_gaps()
+
     def test_present_reverse_rules_are_no_gaps(self):
         with self.mock_lima_list(self.restated_forwards()):
             self.assertEqual(yo.LIMA.config_gaps(), [])

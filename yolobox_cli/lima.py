@@ -151,6 +151,21 @@ SSH_LOCAL_PORT = 60022
 
 LIMA_STOP_TIMEOUT = 300
 
+# limactl's status for an instance it cannot load: a lima.yaml it refuses, or a
+# hostagent pid file left behind.
+BROKEN = "Broken"
+
+
+class BrokenInstance(YoError):
+    """limactl reports the instance as Broken; the message quotes what it says.
+
+    Every reader of the instance's settings raises it, since a listing that
+    lima could not load has no settings to judge. vm_status() alone turns it
+    back into the status, for the callers that decide by the status and say
+    where to look themselves.
+    """
+
+
 # st_blocks counts blocks of this size whatever the filesystem's own is (POSIX).
 STAT_BLOCK_BYTES = 512
 
@@ -215,22 +230,66 @@ def lima_instance_info() -> Optional[LimaInfo]:
             "%s did not print one JSON object: %r"
             % (shlex.join(argv), completed.stdout.strip()[:200])
         )
+    status = data.get("status", "")
+    if status == BROKEN:
+        raise BrokenInstance(broken_instance_message(argv, data))
+    if "config" not in data:
+        raise YoError(
+            "%s printed no config for %s" % (shlex.join(argv), state.box.name)
+        )
+    config = json_object(data, "config", argv)
+    ssh = json_object(config, "ssh", argv)
+    user = json_object(config, "user", argv)
     pid = data.get("hostAgentPID")
-    config = data.get("config", {})
-    ssh = config.get("ssh", {})
-    user = config.get("user", {})
     forwards = config.get("portForwards", [])
     return LimaInfo(
         host_agent_pid=aws.checked_pid(pid),
         port_forwards=forwards if isinstance(forwards, list) else [],
         mounts=config.get("mounts"),
         forward_agent=ssh.get("forwardAgent") is True,
-        status=data.get("status", ""),
+        status=status,
         over_vsock=ssh.get("overVsock"),
         propagate_proxy_env=config.get("propagateProxyEnv"),
         load_dot_ssh_pub_keys=ssh.get("loadDotSSHPubKeys"),
         user_uid=user.get("uid"),
         ssh_local_port=ssh.get("localPort"),
+    )
+
+
+def json_object(parent: dict, key: str, argv: Sequence[str]) -> dict:
+    """`parent[key]`, which must be a JSON object; a missing key is an empty one.
+
+    A null or a scalar there is a listing yo cannot read, never a box with
+    every setting unset: that would report every gap, or none.
+    """
+    value = parent.get(key, {})
+    if not isinstance(value, dict):
+        raise YoError(
+            "%s printed %s as %r, not a JSON object" % (shlex.join(argv), key, value)
+        )
+    return value
+
+
+def broken_instance_message(argv: Sequence[str], data: dict) -> str:
+    """Why lima reports the instance as Broken, as far as the listing says."""
+    errors = data.get("errors")
+    said = (
+        "; ".join(error for error in errors if isinstance(error, str) and error)
+        if isinstance(errors, list)
+        else ""
+    )
+    return (
+        "%s reports %s as Broken%s. Lima cannot load the instance, so nothing "
+        "starts or stops it until that is mended: `limactl list %s` shows what "
+        "lima says, and %s holds its files. Do not delete it to make the message "
+        "go away: the disk is in there"
+        % (
+            shlex.join(argv),
+            state.box.name,
+            ": " + said if said else " and prints no reason",
+            state.box.name,
+            state.box.tilde_dir,
+        )
     )
 
 
@@ -452,7 +511,10 @@ class LimaDriver:
         )
 
     def vm_status(self) -> Optional[str]:
-        info = lima_instance_info()
+        try:
+            info = lima_instance_info()
+        except BrokenInstance:
+            return BROKEN
         return info.status if info is not None else None
 
     def creation_refusal(self, size: Size) -> Optional[str]:
