@@ -100,7 +100,8 @@ def parse_yaml_list_entries(lines):
 
 
 def canonical_forwards(entries):
-    return sorted(json.dumps(entry, sort_keys=True) for entry in entries)
+    # In order: lima takes the first matching rule, so the order is the setting.
+    return [json.dumps(entry, sort_keys=True) for entry in entries]
 
 
 def word_in(word, text):

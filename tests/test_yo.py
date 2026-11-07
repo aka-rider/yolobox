@@ -3662,7 +3662,7 @@ class TestLimaConfigGaps(FakeHome):
         self,
         forwards,
         host_agent_pid=123,
-        mounts=None,
+        mounts=MISSING,
         forward_agent=None,
         over_vsock=False,
         propagate_proxy_env=False,
@@ -3670,7 +3670,7 @@ class TestLimaConfigGaps(FakeHome):
         user_uid=501,
     ):
         config = {"portForwards": forwards}
-        if mounts is not None:
+        if mounts is not MISSING:
             config["mounts"] = mounts
         config["ssh"] = {}
         if forward_agent is not None:
@@ -3786,10 +3786,35 @@ class TestLimaConfigGaps(FakeHome):
                 with self.mock_lima_list(self.replacing_udp_rule(rule)):
                     self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_UDP_FORWARDS])
 
-    def test_an_ipv6_unspecified_udp_ignore_rule_covers_every_listener(self):
+    def test_a_udp_rule_spelled_unlike_the_restate_is_a_gap_even_when_it_covers_all(
+        self,
+    ):
+        # "::" ignores every listener as 0.0.0.0 does, but the check compares
+        # the instance with what the restate writes, and the restate is the
+        # remedy either way.
         rule = self.udp_ignore_rule(guestIP="::")
         with self.mock_lima_list(self.replacing_udp_rule(rule)):
-            self.assertEqual(yo.LIMA.config_gaps(), [])
+            self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_UDP_FORWARDS])
+
+    def test_a_udp_forward_before_the_catch_all_is_a_gap(self):
+        # Lima takes the first matching rule, so the catch-all after it
+        # ignores nothing on that port: 41641 is mirrored onto the Mac.
+        forward = {
+            "proto": "udp",
+            "guestIP": "127.0.0.1",
+            "guestIPMustBeZero": False,
+            "guestPortRange": [41641, 41641],
+            "hostIP": "0.0.0.0",
+            "hostPortRange": [41641, 41641],
+        }
+        forwards = [forward, *self.restated_forwards()]
+        self.assertEqual(self.gaps_for(forwards), [yo.GAP_UDP_FORWARDS])
+
+    def test_a_forward_of_any_protocol_before_the_catch_alls_is_both_gaps(self):
+        forwards = [{"guestPort": 4321}, *self.restated_forwards()]
+        self.assertEqual(
+            self.gaps_for(forwards), [yo.GAP_UDP_FORWARDS, yo.GAP_TCP_FORWARDS]
+        )
 
     def test_a_blanket_udp_rule_that_forwards_instead_of_ignoring_is_a_gap(self):
         forwarding = self.udp_ignore_rule(ignore=False)
@@ -3811,9 +3836,18 @@ class TestLimaConfigGaps(FakeHome):
         with self.mock_lima_list(self.restated_forwards(), mounts=mounts):
             self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_MOUNTS])
 
-    def test_an_empty_mount_list_is_no_gap(self):
-        with self.mock_lima_list(self.restated_forwards(), mounts=[]):
-            self.assertEqual(yo.LIMA.config_gaps(), [])
+    def test_an_empty_or_omitted_mount_list_is_no_gap(self):
+        # Lima leaves an empty list out of its JSON.
+        for mounts in ([], None):
+            with self.subTest(mounts=mounts):
+                with self.mock_lima_list(self.restated_forwards(), mounts=mounts):
+                    self.assertEqual(yo.LIMA.config_gaps(), [])
+
+    def test_mounts_that_are_not_a_list_are_a_gap_not_a_clean_bill(self):
+        for mounts in ("lizard", {"location": "/Users/x"}, 0, True, ""):
+            with self.subTest(mounts=mounts):
+                with self.mock_lima_list(self.restated_forwards(), mounts=mounts):
+                    self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_MOUNTS])
 
     def test_forward_agent_is_reported(self):
         with self.mock_lima_list(self.restated_forwards(), forward_agent=True):

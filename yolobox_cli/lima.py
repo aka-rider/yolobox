@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import shlex
@@ -163,7 +162,7 @@ STAT_BLOCK_BYTES = 512
 class LimaInfo:
     host_agent_pid: Optional[int]
     port_forwards: List[dict]
-    mounts: list
+    mounts: object  # as limactl reports it: None when the instance has none
     forward_agent: bool
     status: str
     over_vsock: Optional[bool]
@@ -221,11 +220,10 @@ def lima_instance_info() -> Optional[LimaInfo]:
     ssh = config.get("ssh", {})
     user = config.get("user", {})
     forwards = config.get("portForwards", [])
-    mounts = config.get("mounts", [])
     return LimaInfo(
         host_agent_pid=aws.checked_pid(pid),
         port_forwards=forwards if isinstance(forwards, list) else [],
-        mounts=mounts if isinstance(mounts, list) else [],
+        mounts=config.get("mounts"),
         forward_agent=ssh.get("forwardAgent") is True,
         status=data.get("status", ""),
         over_vsock=ssh.get("overVsock"),
@@ -238,32 +236,6 @@ def lima_instance_info() -> Optional[LimaInfo]:
 
 def operator_uid_readable(info: LimaInfo) -> bool:
     return isinstance(info.user_uid, int) and not isinstance(info.user_uid, bool)
-
-
-def ignores_all_guest_udp(forward: object) -> bool:
-    """Whether a normalized portForwards entry ignores UDP listeners on every address.
-
-    Lima's matcher skips an ignore rule for a listener bound to 0.0.0.0 or ::
-    unless the rule's own guestIP is unspecified too, and it matches a listener
-    on a specific address only when the rule's guestIPMustBeZero is false
-    (see lima/yolobox.md, "Guest UDP is never mirrored").
-    """
-    if not isinstance(forward, dict):
-        return False
-    guest_ip = forward.get("guestIP")
-    try:
-        unspecified = (
-            isinstance(guest_ip, str) and ipaddress.ip_address(guest_ip).is_unspecified
-        )
-    except ValueError:
-        unspecified = False
-    return (
-        forward.get("ignore") is True
-        and forward.get("proto") == "udp"
-        and forward.get("guestPortRange") == [1, MAX_PORT]
-        and unspecified
-        and forward.get("guestIPMustBeZero") is False
-    )
 
 
 def normalize_port_forward(rule: dict) -> dict:
@@ -300,18 +272,20 @@ def normalize_port_forward(rule: dict) -> dict:
     }
 
 
-def tcp_forward_rules(forwards: Sequence[object]) -> List[dict]:
-    """The ordered, normalized rules that decide which TCP listeners are mirrored.
+def listener_rules(forwards: Sequence[object], proto: str) -> List[dict]:
+    """The ordered, normalized rules that decide which `proto` listeners are mirrored.
 
-    The reverse socket rules have their own checks and every UDP rule has its
-    own gap. Order counts: lima takes the first matching rule.
+    A rule of the other protocol never matches a listener of this one, and the
+    reverse socket rules match sockets, not listeners, and have their own
+    checks. Order counts: lima takes the first matching rule, so a forward
+    placed before the catch-all is as much a gap as a missing catch-all.
     """
     rules = [
         normalize_port_forward(forward)
         for forward in forwards
         if isinstance(forward, dict) and "guestSocket" not in forward
     ]
-    return [rule for rule in rules if rule["proto"] != "udp"]
+    return [rule for rule in rules if rule["proto"] in (proto, "any")]
 
 
 def lima_edit_command(expression: str) -> str:
@@ -564,13 +538,13 @@ class LimaDriver:
                 for forward in info.port_forwards
             )
         ]
-        if not any(ignores_all_guest_udp(forward) for forward in info.port_forwards):
-            gaps.append(GAP_UDP_FORWARDS)
-        if tcp_forward_rules(info.port_forwards) != tcp_forward_rules(
-            LIMA_PORT_FORWARDS
-        ):
-            gaps.append(GAP_TCP_FORWARDS)
-        if info.mounts:
+        for proto, gap in (("udp", GAP_UDP_FORWARDS), ("tcp", GAP_TCP_FORWARDS)):
+            if listener_rules(info.port_forwards, proto) != listener_rules(
+                LIMA_PORT_FORWARDS, proto
+            ):
+                gaps.append(gap)
+        # Lima omits an empty mounts list; anything but a list is not "none".
+        if info.mounts not in (None, []):
             gaps.append(GAP_MOUNTS)
         if info.forward_agent:
             gaps.append(GAP_FORWARD_AGENT)
