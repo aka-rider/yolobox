@@ -38,14 +38,21 @@ let
 
   # lanAllow entries are checked here, so a typo fails the evaluation and never
   # reaches nft, where it would drop the box into recovery mode. No leading
-  # zeros: inet_pton rejects them.
+  # zeros: inet_pton rejects them. An address with bits set past the prefix
+  # (192.168.1.20/24) is refused too: nft would load it as the network it lies
+  # in, 192.168.1.0/24, and open a whole LAN where one host was meant.
   cidrSplit = entry: builtins.match "([^/]+)/(0|[1-9][0-9]{0,2})" entry;
   octet = "(0|[1-9][0-9]{0,2})";
   v4Octets = addr: builtins.match "${octet}\\.${octet}\\.${octet}\\.${octet}" addr;
   v6Groups = part: if part == "" then [ ] else lib.splitString ":" part;
+  pow2 = n: lib.foldl (x: _: x * 2) 1 (lib.range 1 n);
+  # The low `bits` bits of `n` are zero.
+  lowBitsClear = bits: n: builtins.bitAnd n (pow2 bits - 1) == 0;
   isV4Addr = addr:
     let octets = v4Octets addr;
     in octets != null && lib.all (o: builtins.fromJSON o <= 255) octets;
+  v4Number = addr: lib.foldl (n: o: n * 256 + builtins.fromJSON o) 0 (v4Octets addr);
+  isV4Network = addr: prefix: lowBitsClear (32 - prefix) (v4Number addr);
   # "::" stands for one or more zero groups, so a compressed address has at
   # most 7 written groups and an uncompressed one exactly 8.
   isV6Addr = addr:
@@ -56,12 +63,30 @@ let
     lib.all (g: builtins.match "[0-9a-fA-F]{1,4}" g != null) groups
     && (if lib.length parts == 1 then lib.length groups == 8
         else lib.length parts == 2 && lib.length groups <= 7);
-  isCidr = isAddr: maxPrefix: entry:
-    let split = cidrSplit entry;
-    in split != null && isAddr (lib.elemAt split 0)
-    && builtins.fromJSON (lib.elemAt split 1) <= maxPrefix;
-  isV4 = isCidr isV4Addr 32;
-  isV6 = isCidr isV6Addr 128;
+  # The eight groups as numbers, "::" expanded to the zero groups it stands for.
+  v6Numbers = addr:
+    let
+      parts = map v6Groups (lib.splitString "::" addr);
+      written = lib.concatLists parts;
+      zeros = lib.genList (_: "0") (8 - lib.length written);
+      groups = if lib.length parts == 1 then written
+        else lib.head parts ++ zeros ++ lib.last parts;
+    in map (g: (builtins.fromTOML "n = 0x${g}").n) groups;
+  # The group the prefix ends in keeps its low bits clear, and every group
+  # after it is zero.
+  isV6Network = addr: prefix:
+    lib.all lib.id (lib.imap0 (i: g:
+      if i * 16 + 16 <= prefix then true
+      else if i * 16 >= prefix then g == 0
+      else lowBitsClear (i * 16 + 16 - prefix) g) (v6Numbers addr));
+  isCidr = isAddr: isNetwork: maxPrefix: entry:
+    let
+      split = cidrSplit entry;
+      addr = lib.elemAt split 0;
+      prefix = builtins.fromJSON (lib.elemAt split 1);
+    in split != null && isAddr addr && prefix <= maxPrefix && isNetwork addr prefix;
+  isV4 = isCidr isV4Addr isV4Network 32;
+  isV6 = isCidr isV6Addr isV6Network 128;
   lanV4 = builtins.filter isV4 cfg.lanAllow;
   lanV6 = builtins.filter isV6 cfg.lanAllow;
   notCidr = builtins.filter (entry: !(isV4 entry || isV6 entry)) cfg.lanAllow;
