@@ -1664,6 +1664,7 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
             "d\t755",
             "garbage",
             "d\t999\t1.0\t/home/agent/proj/node_modules",
+            "d\t77777\t1.0\t/home/agent/proj/node_modules",
             "d\t0o755\t1.0\t/home/agent/proj/node_modules",
             "d\t-755\t1.0\t/home/agent/proj/node_modules",
             "d\t755\tsoon\t/home/agent/proj/node_modules",
@@ -1671,6 +1672,8 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
             "d\t755\tinf\t/home/agent/proj/node_modules",
             "d\t755\t1_0\t/home/agent/proj/node_modules",
             "d\t755\t99999999999999999999\t/home/agent/proj/node_modules",
+            "d\t755\t99999999999\t/home/agent/proj/node_modules",
+            "d\t755\t9223372037\t/home/agent/proj/node_modules",
             "dd\t755\t1.0\t/home/agent/proj/node_modules",
             "\t755\t1.0\t/home/agent/proj/node_modules",
         ):
@@ -1680,6 +1683,13 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
                         self.first_listing_adds(os.fsencode(malformed) + b"\0")
                     )
                 self.assertIn(repr(malformed), caught.exception.message)
+
+    def test_the_largest_mode_and_mtime_a_filesystem_holds_are_accepted(self):
+        # %m prints 7777 at most; APFS and ext4 keep an mtime as int64 nanoseconds.
+        entry = yo.parse_guest_record(
+            b"d\t7777\t9223372036\t/home/agent/proj/x", ["/home/agent/proj"], False
+        )
+        self.assertEqual((entry.mode, entry.mtime), (0o7777, 9223372036.0))
 
     def test_two_records_that_disagree_about_one_path_are_refused(self):
         self.refused(

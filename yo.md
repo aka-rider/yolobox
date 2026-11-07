@@ -111,7 +111,7 @@ Everything else is unchanged: each guest path is still glob-escaped for scp (fin
 
 `list_guest` therefore treats the whole output as input to validate, and `parse_guest_record` raises a `YoError` that names the record (`repr`, so an escape sequence in it cannot drive the terminal) for each of these:
 
-- a record that does not match `type TAB octal-mode TAB decimal-time TAB path` exactly (a banner, a truncated line, `nan`, `0o7`, `1_0`);
+- a record that does not match `type TAB octal-mode TAB decimal-time TAB path` exactly (a banner, a truncated line, `nan`, `0o7`, `1_0`), or whose mode has more than the four octal digits `%m` prints, or whose time is past 2^63 nanoseconds, the most APFS and ext4 store (`os.utime` past it is an OverflowError, not an OSError);
 - a path that is not clean (`posixpath.normpath(path) == path` fails: a `.` or `..` component, an empty one, a trailing slash) or is not strictly under a named source (the second listing also prints the sources themselves, and only they may appear as-is);
 - two different accounts of one path (overlapping sources print a path twice, alike, and that is fine);
 - in the build-output listing, a record find was not asked for: a directory not named like build output, a file not named like a manifest, or any other type.

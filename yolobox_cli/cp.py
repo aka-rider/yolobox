@@ -350,11 +350,16 @@ class GuestEntry:
 GUEST_RECORD = "%y\t%m\t%T@\t%p\\0"
 
 # What a record may say, as narrowly as find prints it: one type letter, an
-# octal mode, a decimal time, then the path, which may hold tabs and newlines.
+# octal mode of at most four digits (%m prints the permission bits, 7777 at
+# most), a decimal time, then the path, which may hold tabs and newlines.
 # Narrow, because int() and float() also take "0o7", "1_0", "nan" and "inf".
 GUEST_RECORD_RE = re.compile(
-    r"([a-zA-Z])\t([0-7]{1,6})\t([0-9]{1,11}(?:\.[0-9]+)?)\t(.+)", re.DOTALL
+    r"([a-zA-Z])\t([0-7]{1,4})\t([0-9]{1,10}(?:\.[0-9]+)?)\t(.+)", re.DOTALL
 )
+
+# The largest mtime a filesystem keeps: APFS and ext4 store signed 64-bit
+# nanoseconds, and os.utime past that is an OverflowError, not an OSError.
+MAX_MTIME = 2**63 / 10**9
 
 
 def parse_guest_record(
@@ -367,7 +372,7 @@ def parse_guest_record(
     # directory, past the control-path and merge checks.
     text = os.fsdecode(record)
     fields = GUEST_RECORD_RE.fullmatch(text)
-    if fields is None:
+    if fields is None or float(fields.group(3)) >= MAX_MTIME:
         raise YoError("the guest's listing has a malformed record: %r" % text)
     kind, mode, mtime, path = fields.groups()
     clean = posixpath.normpath(path) == path
