@@ -234,7 +234,9 @@ finalize() {
     echo "yolobox: finalize failed (exit $rc), ${device} left unlabelled" >&2
     exit 5
   fi
-  cryptsetup config --label "$label" "$device"
+  # --subsystem again: `config --label` alone clears the mark encrypt set
+  # (cryptsetup 2.8.8), and detect_state must still read a labelled disk as ours.
+  cryptsetup config --label "$label" --subsystem "$label" "$device"
   echo "yolobox-luks-migrate: finalize done"
 }
 

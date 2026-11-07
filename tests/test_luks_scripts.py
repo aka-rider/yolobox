@@ -207,7 +207,7 @@ class TestMigrateEncryptsPlainExt4(MigrateScript):
             "e2fsck -f -y /dev/mapper/" + SCRATCH,
             "resize2fs /dev/mapper/" + SCRATCH,
             "cryptsetup close " + SCRATCH,
-            "cryptsetup config --label %s %s" % (LABEL, DEVICE),
+            "cryptsetup config --label %s --subsystem %s %s" % (LABEL, LABEL, DEVICE),
         )
 
     def test_reencrypt_covers_the_shrunken_region_at_the_default_sector_size(self):
@@ -357,7 +357,7 @@ class TestMigrateStates(MigrateScript):
             "cryptsetup reencrypt --batch-mode --progress-frequency 30 --resume-only",
             "cryptsetup open",
             "cryptsetup close " + SCRATCH,
-            "cryptsetup config --label",
+            "cryptsetup config --label %s --subsystem %s %s" % (LABEL, LABEL, DEVICE),
         )
         self.assertFalse([c for c in calls if c.startswith("resize2fs -P")])
 
@@ -413,7 +413,7 @@ class TestMigrateStates(MigrateScript):
             "blkdiscard",
             "resize2fs /dev/mapper/" + SCRATCH,
             "cryptsetup close " + SCRATCH,
-            "cryptsetup config --label %s %s" % (LABEL, DEVICE),
+            "cryptsetup config --label %s --subsystem %s %s" % (LABEL, LABEL, DEVICE),
         )
         self.assertFalse([c for c in calls if c.startswith("cryptsetup reencrypt")])
         self.assertFalse([c for c in calls if c.startswith("resize2fs " + DEVICE)])
