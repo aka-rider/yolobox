@@ -1,6 +1,11 @@
 [Unit]
 Description=Reject yolobox guest traffic to the host and private networks
 Before=virtqemud.service
+# After the host's own firewall managers: an nftables.conf that starts with
+# `flush ruleset` would otherwise drop this table at boot while the unit stays
+# active. No PartOf= either: nothing may stop or restart this table with
+# another unit.
+After=nftables.service firewalld.service
 
 # No ExecStop, on purpose: stopping the unit must never open the host. The
 # table stays loaded until someone deletes it by hand.
