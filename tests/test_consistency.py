@@ -2208,6 +2208,19 @@ class TestAgentAccountIsOneFact(unittest.TestCase):
     def test_the_acceptance_check_uses_the_agent_uid_base_nix_declares(self):
         self.assertEqual(shell_constant(HARDENING_CHECK, "AGENT_UID"), nix_agent_uid())
 
+    def test_the_acceptance_check_names_the_keys_command_base_nix_gives_sshd(self):
+        # base.nix spells the command in sshd's own syntax, inside extraConfig,
+        # not as a nix binding, so this reads the sshd line.
+        found = re.findall(
+            r"^\s*AuthorizedKeysCommand (\S+)$",
+            (REPO / "nix" / "base.nix").read_text(),
+            re.M,
+        )
+        self.assertEqual(len(found), 1, "base.nix must set AuthorizedKeysCommand once")
+        self.assertEqual(
+            shell_constant(HARDENING_CHECK, "AGENT_KEYS_COMMAND"), found[0]
+        )
+
 
 class TestGuestHelperAnswersUnknownSubcommandsAsYoExpects(unittest.TestCase):
     """`yo` reads exit 64 plus a marker on stderr as "this box predates the
