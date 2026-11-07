@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import io
 import os
 import shlex
@@ -36,15 +37,29 @@ def read_text_file(
 
 
 def atomic_write(path: str, content: str, mode: int) -> None:
-    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+    """Write `content` to `path` in one step: a temporary file beside it, synced
+    to disk, renamed over it, and the directory synced so the new name survives
+    a crash. A failure removes the temporary file and raises as it was."""
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory)
     try:
         with os.fdopen(fd, "w", errors="surrogateescape") as handle:
             handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
     except BaseException:
-        os.unlink(tmp_path)
+        # The write's own error is the one to raise; the temporary file may
+        # already be gone (an interrupt landing after the rename).
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
         raise
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def delete_path(path: str, delete: Callable[[str], None]) -> None:

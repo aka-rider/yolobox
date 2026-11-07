@@ -1448,6 +1448,25 @@ class TestDirForCwdLandsOnDeepestExistingAncestor(FakeHome):
         fake_err.assert_called_once_with(yo.MISSING_PATH_NOTE % ("/etc", yo.AGENT_HOME))
 
 
+class TestAtomicWriteIsDurable(FakeHome):
+    def test_the_file_and_its_directory_are_synced(self):
+        target = os.path.join(self.home, "file")
+        synced = []
+        with mock.patch.object(yo.os, "fsync", side_effect=synced.append):
+            yo.proc.atomic_write(target, "text", 0o600)
+        self.assertEqual(len(synced), 2)
+        self.assertEqual(open(target).read(), "text")
+
+    def test_the_writes_own_error_is_raised_when_the_cleanup_fails_too(self):
+        target = os.path.join(self.home, "file")
+        with (
+            mock.patch.object(yo.os, "replace", side_effect=PermissionError("replace")),
+            mock.patch.object(yo.os, "unlink", side_effect=FileNotFoundError("gone")),
+        ):
+            with self.assertRaisesRegex(PermissionError, "replace"):
+                yo.proc.atomic_write(target, "text", 0o600)
+
+
 class TestTerminalSanitising(unittest.TestCase):
     def printed(self, func, text):
         stream = io.StringIO()
