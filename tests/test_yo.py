@@ -3668,8 +3668,9 @@ class TestLimaConfigGaps(FakeHome):
         propagate_proxy_env=False,
         load_dot_ssh_pub_keys=False,
         user_uid=501,
+        vm_type="vz",
     ):
-        config = {"portForwards": forwards}
+        config = {"portForwards": forwards, "vmType": vm_type}
         if mounts is not MISSING:
             config["mounts"] = mounts
         config["ssh"] = {}
@@ -3990,6 +3991,18 @@ class TestLimaConfigGaps(FakeHome):
         self.assertIn("yo ssh id -u", message)
         for destructive in ("destroy", "limactl delete", "bootstrap", "--set"):
             self.assertNotIn(destructive, message)
+
+    def test_a_vm_type_other_than_vz_is_a_note_naming_the_recreate_not_a_gap(self):
+        # The box works without the rosetta share; the remedy deletes it.
+        for value in ("qemu", None, 1):
+            with self.subTest(vm_type=value):
+                with self.mock_lima_list(self.restated_forwards(), vm_type=value):
+                    self.assertEqual(yo.LIMA.config_gaps(), [])
+                    (note,) = yo.LIMA.config_notes()
+                self.assertIn("vmType %r, not vz" % value, note)
+                self.assertIn("yo destroy --yes && yo bootstrap", note)
+        with self.mock_lima_list(self.restated_forwards(), vm_type="vz"):
+            self.assertEqual(yo.LIMA.config_notes(), [])
 
     def test_the_uid_gap_says_to_recreate_the_instance_not_to_edit_it(self):
         message = yo.LIMA.config_gap_message([yo.GAP_OPERATOR_UID])
@@ -4391,6 +4404,7 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
             load_dot_ssh_pub_keys=False,
             user_uid=yo.OPERATOR_GUEST_UID,
             ssh_local_port=yo.SSH_LOCAL_PORT,
+            vm_type="vz",
         )
         with (
             mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),

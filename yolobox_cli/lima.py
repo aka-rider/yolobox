@@ -131,7 +131,7 @@ LIMA_MANUAL_GAPS = {
         "user.uid only when it creates an instance, and `limactl edit` cannot "
         "change file ownership. Push out what you need, then recreate the "
         "instance from lima/yolobox.yaml, which pins the uid" % OPERATOR_GUEST_UID,
-        lambda: state.destroy_then_bootstrap_command(),
+        lambda: LIMA.recreate_command(),
     ),
 }
 
@@ -148,6 +148,9 @@ LIMA_FATAL_GAPS = frozenset([GAP_SSH_OVER_VSOCK, GAP_MOUNTS])
 # ssh.localPort in lima/yolobox.yaml: where lima's hostagent listens on the Mac
 # for the default instance. state.driver().ssh_port() answers for any instance.
 SSH_LOCAL_PORT = 60022
+
+# The vmType lima/yolobox.yaml pins; the rosetta share exists under it only.
+LIMA_VM_TYPE = "vz"
 
 LIMA_STOP_TIMEOUT = 300
 
@@ -185,6 +188,7 @@ class LimaInfo:
     load_dot_ssh_pub_keys: Optional[bool]
     user_uid: object  # the operator's uid as lima created it
     ssh_local_port: object  # as limactl reports it: 0 means lima picks per start
+    vm_type: object  # as limactl reports it
 
 
 def lima_instance_exists() -> bool:
@@ -253,6 +257,7 @@ def lima_instance_info() -> Optional[LimaInfo]:
         load_dot_ssh_pub_keys=ssh.get("loadDotSSHPubKeys"),
         user_uid=user.get("uid"),
         ssh_local_port=ssh.get("localPort"),
+        vm_type=config.get("vmType"),
     )
 
 
@@ -364,25 +369,30 @@ def lima_edit_command(expression: str) -> str:
 
 
 def refuse_mirrored_ssh_port(port: int) -> None:
-    """Refuse an ssh port another box's listener can claim.
+    """Refuse an ssh port another box's listener can claim, or that no socket has.
 
     Lima mirrors every guest TCP port up to MIRRORED_TCP_PORTS[1] onto the
     host's 127.0.0.1, and the disk unlock sends the passphrase to the ssh port
     without checking the host key. The one check for the port read from
     limactl (ssh_port) and the port read from ssh.config (the listener check
-    before every passphrase).
+    before every passphrase), so a port past the last one is refused here too.
     """
-    if port >= MIN_SSH_LOCAL_PORT:
+    if MIN_SSH_LOCAL_PORT <= port <= MAX_PORT:
         return
+    why = (
+        "which another box's listener can claim: lima mirrors every guest TCP "
+        "port up to %d onto the host's 127.0.0.1, and the disk unlock sends the "
+        "passphrase to this port without checking the host key" % MIRRORED_TCP_PORTS[1]
+        if port < MIN_SSH_LOCAL_PORT
+        else "which is past the last TCP port, %d" % MAX_PORT
+    )
     raise YoError(
-        "%s has ssh.localPort %d, which another box's listener can claim: lima "
-        "mirrors every guest TCP port up to %d onto the host's 127.0.0.1, and "
-        "the disk unlock sends the passphrase to this port without checking "
-        "the host key. Stop the instance and move it to a port in %d-%d:\n    %s"
+        "%s has ssh.localPort %d, %s. Stop the instance and move it to a port in "
+        "%d-%d:\n    %s"
         % (
             state.box.name,
             port,
-            MIRRORED_TCP_PORTS[1],
+            why,
             MIN_SSH_LOCAL_PORT,
             MAX_PORT,
             lima_edit_command(
@@ -444,7 +454,12 @@ class LimaDriver:
         )
 
     def create_command(self, size: Size) -> str:
-        # lima/yolobox.yaml fixes the default instance's port; any other needs its own.
+        """The `limactl create` that makes this instance at `size`, to print.
+
+        It carries the CPU count the box would get when --cpus was not asked,
+        since lima's own default is not yo's. lima/yolobox.yaml fixes the
+        default instance's port; any other needs its own.
+        """
         port = (
             []
             if state.box.name == DEFAULT_INSTANCE
@@ -461,10 +476,20 @@ class LimaDriver:
                 "--name",
                 state.box.name,
                 *port,
-                *size.flags(),
+                *size.for_creation().flags(),
                 str(SCRIPT_DIR / "lima" / "yolobox.yaml"),
             ]
         )
+
+    def recreate_command(self) -> str:
+        """Delete this machine and make it again, with the `limactl create` a
+        named instance needs between the two (bootstrap's `yo up` creates only
+        the default one)."""
+        destroy, _, bootstrap = state.destroy_then_bootstrap_command().partition(" && ")
+        create = (
+            [] if state.box.name == DEFAULT_INSTANCE else [self.create_command(NO_SIZE)]
+        )
+        return " && ".join([destroy, *create, bootstrap])
 
     def ssh_port(self) -> int:
         """Where lima's hostagent listens on the Mac for this instance's sshd.
@@ -528,11 +553,9 @@ class LimaDriver:
             if size.asked
             else ""
         )
-        # The command carries the CPU count the box would get, since lima's own
-        # default is not yo's.
         return "instance %s does not exist — create it with:\n    %s%s" % (
             state.box.name,
-            self.create_command(size.for_creation()),
+            self.create_command(size),
             rerun,
         )
 
@@ -629,21 +652,40 @@ class LimaDriver:
 
     def config_notes(self) -> List[str]:
         info = lima_instance_info()
-        if info is None or operator_uid_readable(info):
+        if info is None:
             return []
-        return [
-            "%s reports no user.uid in `limactl list --json`, so yo cannot tell "
-            "whether the operator's uid is %d, as nix/base.md declares. Nothing says "
-            "the box is wrong. Check by hand, and recreate the instance only if it "
-            "is not %d: limactl list --json %s (config.user.uid), or %s"
-            % (
-                state.box.name,
-                OPERATOR_GUEST_UID,
-                OPERATOR_GUEST_UID,
-                state.box.name,
-                state.yo_cmd("ssh", "id", "-u"),
+        notes = []
+        if not operator_uid_readable(info):
+            notes.append(
+                "%s reports no user.uid in `limactl list --json`, so yo cannot tell "
+                "whether the operator's uid is %d, as nix/base.md declares. Nothing "
+                "says the box is wrong. Check by hand, and recreate the instance only "
+                "if it is not %d: limactl list --json %s (config.user.uid), or %s"
+                % (
+                    state.box.name,
+                    OPERATOR_GUEST_UID,
+                    OPERATOR_GUEST_UID,
+                    state.box.name,
+                    state.yo_cmd("ssh", "id", "-u"),
+                )
             )
-        ]
+        if info.vm_type != LIMA_VM_TYPE:
+            # No gap: the box works, only without the rosetta share, and the
+            # remedy deletes it, so `yo status` must not fail for ever on it.
+            notes.append(
+                "%s runs on vmType %r, not %s as lima/yolobox.yaml pins, so the "
+                "rosetta share, which lets the box run x86_64 binaries, is not "
+                "there. Nothing else is wrong. Lima reads vmType when it creates an "
+                "instance, so to get %s push out what you need, then recreate it: %s"
+                % (
+                    state.box.name,
+                    info.vm_type,
+                    LIMA_VM_TYPE,
+                    LIMA_VM_TYPE,
+                    self.recreate_command(),
+                )
+            )
+        return notes
 
     def fatal_gaps(self, gaps: Sequence[str]) -> List[str]:
         return [gap for gap in gaps if gap in LIMA_FATAL_GAPS]
