@@ -474,10 +474,14 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
 
     # Resolved in the box first, so a branch that did not move, or one nix
     # would have served from an old fetch, shows before the build; then that
-    # very commit is built, whatever the branch does meanwhile.
-    rev = release.locked_rev(ref)
-    report.ok("building %s at %s" % (ref, rev))
-    rebuild_argv = release.nixos_rebuild_argv("boot", release.host_user(), ref, rev)
+    # very commit is built, whatever the branch does meanwhile. The last
+    # bootstrap's pair is shown beside it when this one moves the box.
+    previous = release.read_stamps()
+    source = release.locked_rev(ref)
+    report.ok("building %s at %s (%s)" % (ref, source.rev, source.nar_hash))
+    if previous is not None and previous != source:
+        report.ok("the last bootstrap built %s (%s)" % previous)
+    rebuild_argv = release.nixos_rebuild_argv("boot", release.host_user(), ref, source)
     rebuild = sshx.ssh_run(
         OPERATOR,
         rebuild_argv,
@@ -499,6 +503,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         proc.atomic_write(state.flake_ref_file(), ref + "\n", FILE_MODE_PRIVATE)
     else:
         proc.delete_file(state.flake_ref_file())
+    # Stamped as state after the build, so the box's own rebuild pins this
+    # commit and the system derivation never depends on it (release.py).
+    release.write_stamps(source)
     report.ok("built from %s" % ref)
 
     profile, booted = booted_generations(report)

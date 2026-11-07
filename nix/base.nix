@@ -293,8 +293,13 @@ in
       AuthorizedKeysCommandUser root
   '';
 
+  # /var/lib/yolobox holds what yo bootstrap stamped after the build (the
+  # commit and NAR hash it built, release.py's STATE_DIR): state, not the
+  # system, so a docs-only commit keeps the generation. Nothing here writes
+  # the files; `yolobox-guest rebuild` reads them.
   systemd.tmpfiles.rules = [
     "d /run/yolobox-op 0700 ${username} users -"
+    "d /var/lib/yolobox 0755 root root -"
   ];
 
   environment.localBinInPath = true;

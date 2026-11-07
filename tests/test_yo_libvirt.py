@@ -2000,7 +2000,13 @@ class TestStop(LibvirtCase):
             mock.patch.object(
                 self.box.vm, "guest_generations", return_value=("g1", "g0")
             ),
-            mock.patch.object(self.box.release, "locked_rev", return_value="0" * 40),
+            mock.patch.object(
+                self.box.release,
+                "locked_rev",
+                return_value=self.box.release.LockedSource(
+                    "0" * 40, "sha256-" + "A" * 43 + "="
+                ),
+            ),
             mock.patch.object(
                 self.box.sshx,
                 "ssh_run",
