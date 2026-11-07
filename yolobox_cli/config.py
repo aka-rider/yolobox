@@ -95,15 +95,18 @@ GIB = 1024 * MIB
 
 # The smallest box `yo up --memory/--disk` creates, and why
 # (yo.md#several-machines). The reasons are printed with a refused flag.
-# The memory floor is a guess, never measured: it was 8 only because that was
-# the first default. The default stays 16 (LIBVIRT_MEMORY_GIB in libvirt.py,
-# lima/yolobox.yaml on a Mac). A box this small leans on its swapfile, 16 GiB
-# by default (nix/swap.nix), for `nixos-rebuild`'s evaluation. TODO.md carries
-# the live check.
-MIN_MEMORY_GIB = 2
+# The memory floor is measured, on a libvirt box: the first `yo bootstrap`
+# runs on the seed image, which has no swap until stage 2 makes the 16 GiB
+# swapfile (nix/swap.nix), and its nix needs about 1.4 GB resident. At 2 GiB
+# the guest's OOM killer ended nix after 166 s (`Out of memory: Killed process
+# (nix) ... anon-rss:1364620kB`, PSI full avg10 12.44 before it); at 4 GiB the
+# bootstrap took 184 s with a 1.78 GB peak. The default stays 16
+# (LIBVIRT_MEMORY_GIB in libvirt.py, lima/yolobox.yaml on a Mac), and a box
+# this small leans on the swapfile for every later `nixos-rebuild`.
+MIN_MEMORY_GIB = 4
 MIN_MEMORY_WHY = (
     "the box builds its own system, and with less the nix evaluator is OOM-killed "
-    "even with its swapfile"
+    "during the first bootstrap, before the box has a swapfile"
 )
 MIN_DISK_GIB = 40
 MIN_DISK_WHY = (
