@@ -202,6 +202,7 @@ Tests, all under `tests/`:
 - `test_yo_libvirt.py`: the libvirt driver against a fake host.
   `test_libvirt_hook.py`: runs the passt ACL hook with a fake `setfacl`.
   `test_yo_instance.py`: `-m/--machine`.
+- `AGENTS.md` says how to run the acceptance scripts on a throwaway box.
 - A few tests skip when a tool is missing (GNU find, gawk, git, ssh, nix, a
   Python with `pidfd_open` or `kqueue`). The docstring at the top of each test
   module names the tools whose absence makes its classes skip.
