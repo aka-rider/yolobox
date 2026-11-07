@@ -882,6 +882,23 @@ def guest_script_constant(name: str) -> str:
     return found.group(1).strip("'\"")
 
 
+class TestClaudeLauncherWatch(unittest.TestCase):
+    """harnesses.nix watches the launcher with PathChanged. PathModified fires
+    on every write, and one claude download is thousands of writes, past the
+    path unit's trigger limit (nix/harnesses.md)."""
+
+    def test_the_path_unit_watches_with_path_changed_not_path_modified(self):
+        text = (REPO / "nix" / "harnesses.nix").read_text()
+        unit = re.search(
+            r"systemd\.user\.paths\.yolobox-claude-launcher = \{(.*?)\n    \};",
+            text,
+            re.S,
+        )
+        self.assertIsNotNone(unit, "harnesses.nix declares no launcher path unit")
+        self.assertIn("pathConfig.PathChanged", unit.group(1))
+        self.assertNotIn("PathModified", unit.group(1))
+
+
 class TestGuestRebuildMatchesYoAndTheBox(unittest.TestCase):
     """`yolobox-guest rebuild` repeats facts yo and base.nix own: the flake ref
     shape, the nix variables and the operator's uid."""
@@ -889,6 +906,11 @@ class TestGuestRebuildMatchesYoAndTheBox(unittest.TestCase):
     def test_the_flake_ref_shape_is_yos(self):
         self.assertEqual(
             guest_script_constant("FLAKE_REF_RE"), yo.GITHUB_FLAKE_RE.pattern
+        )
+
+    def test_the_hostname_shape_is_yos(self):
+        self.assertEqual(
+            guest_script_constant("HOSTNAME_RE"), yo.HOSTNAME_LABEL_RE.pattern
         )
 
     def test_the_rebuild_sets_exactly_the_variables_yo_sets(self):
