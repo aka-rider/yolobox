@@ -62,7 +62,7 @@ def answered(what: str, completed: subprocess.CompletedProcess) -> str:
         said = ui.quoted_block(stderr)
     else:
         said = stderr.strip()
-    return "%s answered %r (exit %d)%s" % (
+    return "%s answered '%s' (exit %d)%s" % (
         what,
         ui.shown(completed.stdout.strip()),
         completed.returncode,
@@ -230,7 +230,7 @@ def egress_tier(table: subprocess.CompletedProcess) -> EgressTier:
 def egress_fallback_line(
     active_state: str, table: subprocess.CompletedProcess
 ) -> StatusLine:
-    unit = "%s %s" % (EGRESS_UNIT, active_state)
+    unit = "%s %s" % (EGRESS_UNIT, ui.shown(active_state))
     # The unit has no ExecStop, so a stopped unit leaves the full table loaded.
     # Its chain is a plain "output" like an old recovery table's: only the
     # structure tells them apart, so judge that first.
@@ -442,7 +442,7 @@ def status_guest_services(report: Report) -> None:
             ).stdout.strip()
             report.emit(
                 StatusLine(
-                    "proxy: %s is %s" % (unit, unit_state or "unknown"),
+                    "proxy: %s is %s" % (unit, ui.shown(unit_state) or "unknown"),
                     unit_state != "active",
                 )
             )
@@ -475,10 +475,10 @@ def encryption_line() -> StatusLine:
     if disk_state is DiskState.UNREADABLE:
         return StatusLine("disk: cannot read the type of %s" % LUKS_DEVICE)
     if disk_state is DiskState.ENCRYPTED:
-        return StatusLine("disk: %s is %s" % (LUKS_DEVICE, fstype))
+        return StatusLine("disk: %s is %s" % (LUKS_DEVICE, ui.shown(fstype)))
     return StatusLine(
         "disk: %s is %s — NOT encrypted; rebuild and reboot: %s"
-        % (LUKS_DEVICE, fstype, state.yo_cmd("bootstrap")),
+        % (LUKS_DEVICE, ui.shown(fstype), state.yo_cmd("bootstrap")),
         True,
     )
 

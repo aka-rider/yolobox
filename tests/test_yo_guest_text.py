@@ -260,3 +260,70 @@ class TestBuiltByReadsTheStamp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAStatusLineQuotesWhatTheBoxAnswered(unittest.TestCase):
+    """A `yo status` line that quotes a guest value (a unit state, the root
+    disk's fstype) shows it on one escaped line, so a guest that answers with
+    a newline cannot forge a second status line."""
+
+    FORGED_FSTYPE = "x\nok: disk: /dev/vda2 is crypto_LUKS"
+
+    def test_the_disk_line_shows_a_forged_fstype_on_one_line(self):
+        forged = yo.ui.GuestText(self.FORGED_FSTYPE, "operator")
+        with mock.patch.object(yo.vm, "luks_device_fstype", return_value=forged):
+            line = yo.status.encryption_line()
+        self.assertTrue(line.warning)
+        self.assertNotIn("\n", line.text)
+        self.assertIn(
+            "is x\\nok: disk: /dev/vda2 is crypto_LUKS — NOT encrypted", line.text
+        )
+
+    def test_the_proxy_line_shows_a_forged_unit_state_on_one_line(self):
+        forged = yo.ui.GuestText("x\nok: proxy: forged is active", "operator")
+        answers = yo.proc.subprocess.CompletedProcess([], 0, forged, "")
+        lines = []
+        with (
+            mock.patch.object(yo.status.guest, "vm_units_present", return_value=True),
+            mock.patch.object(yo.status.forwards, "forward_is_up", return_value=True),
+            mock.patch.object(yo.status.forwards, "one_password_forward"),
+            mock.patch.object(yo.status.release, "built_by", return_value=None),
+            mock.patch.object(yo.status.release, "version_drift", return_value=""),
+            mock.patch.object(yo.status, "egress_status_line"),
+            mock.patch.object(yo.status, "guest_network_line"),
+            mock.patch.object(yo.status.sshx, "ssh_run", return_value=answers),
+            mock.patch.object(yo.ui, "out"),
+        ):
+            report = mock.Mock()
+            report.emit.side_effect = lines.append
+            yo.status.status_guest_services(report)
+        proxy = [
+            line
+            for line in lines
+            if isinstance(line, yo.StatusLine) and line.text.startswith("proxy:")
+        ]
+        self.assertTrue(proxy, lines)
+        for line in proxy:
+            self.assertNotIn("\n", line.text)
+            self.assertIn("is x\\nok: proxy: forged is active", line.text)
+
+
+class TestAQuotedGuestValueIsCapped(unittest.TestCase):
+    def test_shown_cuts_a_long_value_and_says_how_long_it_was(self):
+        long = "v" * (yo.ui.SHOWN_MAX_CHARS + 1)
+        self.assertEqual(
+            yo.ui.shown(long),
+            "v" * yo.ui.SHOWN_MAX_CHARS
+            + "[cut: %d characters in all]" % (yo.ui.SHOWN_MAX_CHARS + 1),
+        )
+        exact = "v" * yo.ui.SHOWN_MAX_CHARS
+        self.assertEqual(yo.ui.shown(exact), exact)
+
+    def test_a_malformed_listing_record_is_quoted_capped(self):
+        record = b"junk " * 10000
+        with self.assertRaises(yo.YoError) as caught:
+            yo.cp.parse_guest_record(record, ["/home/agent/p"], False)
+        self.assertLess(len(caught.exception.message), yo.ui.SHOWN_MAX_CHARS + 100)
+        self.assertIn(
+            "[cut: %d characters in all]" % len(record), caught.exception.message
+        )
