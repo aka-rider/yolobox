@@ -631,7 +631,7 @@ def root_usage_before_grow() -> guest.RootUsage:
 
 
 def grow_running_disk(
-    current_gib: int, wanted_gib: int, passphrase: Optional[bytes] = None
+    current_gib: int, wanted_gib: int, passphrase: Optional[agent.Passphrase] = None
 ) -> None:
     """Raise the running box's disk from `current_gib` to `wanted_gib`, and grow into it.
 
@@ -679,7 +679,7 @@ def grow_running_disk(
         )
 
 
-def grow_to_asked_disk(wanted_gib: int, passphrase: Optional[bytes]) -> None:
+def grow_to_asked_disk(wanted_gib: int, passphrase: Optional[agent.Passphrase]) -> None:
     """After `yo up --disk` or `yo bootstrap --disk` has the box up: grow its disk to `wanted_gib`.
 
     A box vm_up just created already has it. A box whose ceiling is already
@@ -717,7 +717,10 @@ def grow_to_asked_disk(wanted_gib: int, passphrase: Optional[bytes]) -> None:
 
 
 def grow_mapping_and_filesystem(
-    passphrase: bytes, ceiling_gib: int, before: guest.RootUsage, finishing: bool
+    passphrase: agent.Passphrase,
+    ceiling_gib: int,
+    before: guest.RootUsage,
+    finishing: bool,
 ) -> None:
     """Grow the LUKS mapping and the filesystem into the raised ceiling, and verify."""
     # systemd-growfs cannot resize a keyring-keyed LUKS2 mapping, so the
@@ -760,7 +763,7 @@ def grow_mapping_and_filesystem(
     )
 
 
-def finish_previous_grow(ceiling_gib: int, passphrase: bytes) -> None:
+def finish_previous_grow(ceiling_gib: int, passphrase: agent.Passphrase) -> None:
     """On the running box, grow the mapping and filesystem into a ceiling already raised."""
     require_growable_guest()
     grow_mapping_and_filesystem(

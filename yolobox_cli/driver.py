@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 import os
-from typing import Callable, List, NamedTuple, Optional, Protocol, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    List,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 from .config import GIB
 from .ui import YoError
+
+if TYPE_CHECKING:
+    # Only for the annotation: agent imports state, which imports this module.
+    from . import agent
 
 
 class StopRefused(YoError):
@@ -205,7 +218,7 @@ class Driver(Protocol):
     def verify_initrd_listener(self, port: int) -> None: ...  # YoError: not the VM's
     # Start, unlock, operator's ssh. `size` is for a start that creates the
     # instance; vm_up passes NO_SIZE for one that exists.
-    def start(self, passphrase: bytes, size: Size) -> None: ...
+    def start(self, passphrase: agent.Passphrase, size: Size) -> None: ...
     def stop(self) -> None: ...  # YoError when it will not stop
     def force_stop(self) -> None: ...  # a hard power-off, for an initrd box
     def force_stop_command(self) -> str: ...  # what force_stop() does, to paste
