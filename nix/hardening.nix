@@ -160,10 +160,11 @@ let
   # /proc with hidepid: the agent sees no pid but its own, so it cannot read
   # the operator's or root's cmdline, environ or fds while a command runs.
   # gid= names the one group that still sees every pid, wheel, so the
-  # operator's tools work as before. The first three repeat nixpkgs' default
-  # (tasks/filesystems.nix), so the list reads whole. tests/box-hardening-check.sh
-  # reads the mount back; test_consistency.py compares the two spellings.
-  procOptions = [ "nosuid" "noexec" "nodev" "hidepid=invisible" "gid=${toString config.users.groups.wheel.gid}" ];
+  # operator's tools work as before. The list holds only what the box adds:
+  # nixpkgs' nosuid,noexec,nodev (tasks/filesystems.nix) merge in, and stating
+  # them again mounts each twice. tests/box-hardening-check.sh reads the whole
+  # mount back; test_consistency.py compares the two spellings.
+  procOptions = [ "hidepid=invisible" "gid=${toString config.users.groups.wheel.gid}" ];
 in
 {
   options.yolobox.hardening.extraWrappers = lib.mkOption {

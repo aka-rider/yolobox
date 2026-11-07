@@ -63,8 +63,9 @@ readonly GATEWAY_ADDR=192.168.5.2
 readonly GUEST_ADDR=192.168.5.15
 # What sshd logs when AllowUsers refuses a name (openssh auth.c allowed_user).
 readonly ALLOWUSERS_REFUSAL="not allowed because not listed in AllowUsers"
-# /proc's mount options (nix/hardening.nix procOptions); gid=1 is wheel, the
-# one group that sees every pid.
+# /proc's mount options: nixpkgs' three defaults, then the two
+# nix/hardening.nix procOptions adds; gid=1 is wheel, the one group that sees
+# every pid.
 readonly PROC_OPTIONS="nosuid noexec nodev hidepid=invisible gid=1"
 
 WORK=""

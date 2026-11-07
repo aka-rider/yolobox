@@ -2331,13 +2331,16 @@ class TestOperatorNamePatternHasOneSpelling(unittest.TestCase):
 
 
 class TestProcMountOptionsHaveOneSpelling(unittest.TestCase):
-    """nix/hardening.nix mounts /proc with hidepid and wheel as the gid= group
-    (procOptions); tests/box-hardening-check.sh reads the mount back
-    (PROC_OPTIONS). The gid is read from the wheel group in nix and spelled as
-    the number findmnt prints in the script, where 1 is nixpkgs' ids.gids.wheel."""
+    """nix/hardening.nix adds hidepid and wheel as the gid= group to /proc's
+    mount (procOptions), on top of nixpkgs' three defaults, which it must not
+    restate or the mount carries each twice; tests/box-hardening-check.sh reads
+    the whole mount back (PROC_OPTIONS). The gid is read from the wheel group
+    in nix and spelled as the number findmnt prints in the script, where 1 is
+    nixpkgs' ids.gids.wheel."""
 
     WHEEL_GID = 1
     GID_FROM_WHEEL = "gid=${toString config.users.groups.wheel.gid}"
+    NIXPKGS_DEFAULTS = ["nosuid", "noexec", "nodev"]
 
     def test_the_check_script_expects_the_proc_options_hardening_nix_sets(self):
         options = hardening_nix_list("procOptions")
@@ -2354,7 +2357,7 @@ class TestProcMountOptionsHaveOneSpelling(unittest.TestCase):
             "gid=%d" % self.WHEEL_GID if o == self.GID_FROM_WHEEL else o
             for o in options
         ]
-        self.assertEqual(spelled.split(), rendered)
+        self.assertEqual(spelled.split(), self.NIXPKGS_DEFAULTS + rendered)
 
 
 class TestRevStampsAreOneFact(unittest.TestCase):
