@@ -1840,9 +1840,14 @@ class TestStatusAndGaps(LibvirtCase):
         self.assertIsNone(self.driver.vm_status())
         self.assertEqual(self.driver.config_gaps(), [])
 
-    def test_running_is_running_and_other_states_keep_their_words(self):
+    def test_running_and_blocked_are_running_and_other_states_keep_their_words(self):
+        # "blocked" is a running guest idling on I/O; the same word set keeps
+        # a stop waiting through it (require_stoppable).
         self.host.tagged_domain("box", FIRST_PORT)
         self.assertEqual(self.driver.vm_status(), "Running")
+        self.host.states["yolobox-box"] = "blocked"
+        self.assertEqual(self.driver.vm_status(), "Running")
+        self.driver.require_stoppable("blocked")
         self.host.states["yolobox-box"] = "shut off"
         self.assertEqual(self.driver.vm_status(), "shut off")
 

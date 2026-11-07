@@ -77,12 +77,16 @@ HOST_MEMORY_RESERVE_GIB = 4
 LIBVIRT_STOP_TIMEOUT = 300
 # What `virsh event --timeout` prints, then exits 1, when no more events came.
 EVENT_TIMEOUT_LINE = "event loop timed out"
-# virsh domstate words. "in shutdown" is a guest still going down, and the only
-# word besides "shut off" that a stop waits through ("blocked" is a running guest
-# idling on I/O).
+# virsh domstate words. A guest is up in two of them ("blocked" is a running
+# guest idling on I/O), and both read as RUNNING. "in shutdown" is a guest
+# still going down, and the only other word a stop waits through.
 STATE_OFF = "shut off"
 STATE_SHUTTING_DOWN = "in shutdown"
-STATES_STOPPING = ("running", "blocked", STATE_SHUTTING_DOWN)
+RUNNING_STATES = ("running", "blocked")
+STATES_STOPPING = RUNNING_STATES + (STATE_SHUTTING_DOWN,)
+# What `virsh start` says when passt cannot bind in PASST_DIR: the ACL mask was
+# recomputed by another passt domain's start after yo checked it.
+PASST_BIND_DENIED = "Failed to bind UNIX domain socket"
 # The states a guest stays in until someone acts: the verb and virsh command
 # that bring it back (state_hint).
 STATE_REMEDIES = {
@@ -669,7 +673,7 @@ class LibvirtDriver:
         if not self.domain_exists():
             return None
         domain_state = self.domain_state()
-        return RUNNING if domain_state == "running" else domain_state
+        return RUNNING if domain_state in RUNNING_STATES else domain_state
 
     def domain_state(self) -> str:
         """virsh's own word for the state: "running", "in shutdown", "shut off"..."""
