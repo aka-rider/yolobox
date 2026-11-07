@@ -23,8 +23,8 @@ TUNNEL = (FIXTURES / "egress-tunnel.nft").read_text()
 FIRST_RULE = 'oifname { "lo", "tailscale0" } accept\n'
 V4_REJECT = (
     "    ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12,"
-    " 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter reject with icmpx"
-    " type admin-prohibited\n"
+    " 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }"
+    " counter reject with icmpx type admin-prohibited\n"
 )
 DHCP = "udp sport 68 udp dport 67 ip daddr { 255.255.255.255, 192.168.5.2 } accept\n"
 DNS_UDP = "ip daddr 192.168.5.2 udp dport 53 accept\n"
@@ -53,7 +53,8 @@ class TestFullRules(unittest.TestCase):
     def test_every_blocked_range_must_be_rejected(self):
         for old, new in (
             ("169.254.0.0/16, ", ""),
-            (", 255.255.255.255 } counter", " } counter"),
+            ("198.18.0.0/15, ", ""),
+            (", 240.0.0.0/4 } counter", " } counter"),
             ("fc00::/7, ", ""),
             (", 64:ff9b:1::/48 } counter", " } counter"),
             ("ff00::/8, ", ""),
@@ -163,7 +164,8 @@ DEFER = "    ct status dnat accept\n"
 POST_ACCEPT = 'ct status dnat oifname { "lo", "tailscale0", "wg0" } accept\n'
 POST_V4_DROP = (
     "    ct status dnat ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16,"
-    " 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter drop\n"
+    " 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4,"
+    " 240.0.0.0/4 } counter drop\n"
 )
 
 

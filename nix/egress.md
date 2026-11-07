@@ -6,7 +6,7 @@ The code is `nix/egress.nix`. It is always on. The box reaches the internet thro
 
 Lima's gateway, 192.168.5.2, is gvproxy's NAT to the host's own loopback, on every port (`natTable()` in lima's `pkg/networks/usernet/gvproxy.go`). A guest that connects to 192.168.5.2:5432 reaches whatever listens on the host's `127.0.0.1:5432`, a database or a dev server the user never meant to share. A guest connection to the host's LAN address, or to any host on the LAN, also leaves through gvproxy. So the table rejects, with `reject with icmpx type admin-prohibited` (a blocked program fails at once instead of timing out):
 
-- IPv4: `10.0.0.0/8`, `100.64.0.0/10`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16` (which holds the Lima subnet), `224.0.0.0/4` and `255.255.255.255`;
+- IPv4: `10.0.0.0/8`, `100.64.0.0/10`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24` (the per-host protocol assignments, among them the CLAT and DS-Lite addresses), `192.168.0.0/16` (which holds the Lima subnet), `198.18.0.0/15` (see [A fake-IP proxy](#a-fake-ip-proxy-on-the-host)), `224.0.0.0/4` and `240.0.0.0/4` (reserved, and the limited broadcast `255.255.255.255` inside it);
 - IPv6: `fc00::/7`, `fe80::/10`, `ff00::/8` and `64:ff9b:1::/48`.
 
 These are accepted before the rejects are judged:
@@ -76,9 +76,14 @@ A name is checked when the box is evaluated: 1 to 15 characters of `A-Za-z0-9_.-
 
 That is by design: the tailnet access policy is the gate. Close it there, with a policy that does not let the box's tag or user reach the host's node. Do not expect this table to.
 
+## A fake-IP proxy on the host
+
+A fake-IP proxy (Clash, Surge, mihomo and their kin) answers every name with an address in `198.18.0.0/15` and connects on the guest's behalf when the guest connects to that address. Every name: a LAN hostname or the host's own name gets a fake address too, and the proxy then connects to the private address behind it. So through that range the guest reaches any LAN host, and the host itself, by name, and this table never sees a private address. That is why `198.18.0.0/15` is in the blocked set, although an earlier version left it out to keep such a box online.
+
+A box on a Mac behind such a proxy has no internet until its operator opts in, with `yolobox.network.lanAllow = [ "198.18.0.0/15" ]` in `local.nix`, which re-opens the relay with the consequence above. On a Linux host the host table blocks the range for the guest's uid as well, and `lanAllow` does nothing there, so a fake-IP proxy on a Linux host and a box do not mix. Entries in `lanAllow` are the operator's explicit choice, see [`lanAllow`](#lanallow).
+
 ## Residuals
 
-- A fake-IP proxy on the host answers every name with an address in `198.18.0.0/15`. The table does not block that range: the box reaches the internet through the proxy, which is the host's own choice, and a block would take the whole box offline.
 - A guest connection to the host's public address leaves through the NAT and returns through the host's network. The table cannot tell it from any other internet traffic, so a service the host exposes on its public address stays reachable (the hairpin). The same holds for any host address outside the blocked sets, such as a public IPv4 address assigned directly on the host's LAN interface.
 - `AF_VSOCK` to the host is unjudged. The table is an output hook on IP traffic, so netfilter never sees `AF_VSOCK`. Lima runs with `overVsock:false`, so no host-side listener exists and a connect to host CID 2 is answered with a connection reset. Nothing is reachable today. A future host-side vsock listener would sit entirely outside the table's reach.
 - No global IPv6. Lima's NAT gives the guest no global IPv6 address. `enp0s1` has only a link-local `fe80` address, there is no IPv6 default route, and only `tailscale0` carries a ULA. So the IPv6 form of the host-address hairpin is unreachable on a current box. The `fc00::/7`, `fe80::/10` and `ff00::/8` rejects still cover the v6 addresses that exist.

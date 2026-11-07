@@ -21,8 +21,11 @@ let
 
   # Everything on the host or a private network the guest can address: RFC1918,
   # the Lima subnet inside it, CGNAT (tailscale0 is accepted before this is
-  # judged), link-local, multicast and the limited broadcast.
-  blockedV4 = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255";
+  # judged), the per-host protocol block 192.0.0.0/24, a fake-IP proxy's
+  # 198.18.0.0/15 (a relay to the LAN by name, nix/egress.md), link-local,
+  # multicast, and 240.0.0.0/4 with the limited broadcast inside it. Keep the
+  # set equal to linux/yolobox-host.nft's.
+  blockedV4 = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4";
   blockedV6 = "fc00::/7, fe80::/10, ff00::/8, 64:ff9b:1::/48";
 
   # Runs after the hooks that change a packet (mangle -150, dstnat -100), so
