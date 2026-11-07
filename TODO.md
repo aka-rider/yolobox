@@ -68,7 +68,6 @@ Each item names the check that settles it. Delete the item when the check has pa
 
 ## `yo` and the repo
 
-- `tests/test_screen_record.py`'s `test_stop_that_times_out_says_so_and_keeps_the_pid_file` errored once in a full `unittest discover` run on a loaded Linux host and passed in every rerun, alone and in the suite; the traceback was not kept. It starts a real recorder and a fake `waitpid` that times out, so it is wall-clock-shaped. If it errors again, keep the traceback and look at what `start` or `stop` was waiting on.
 - The `unit` job in `.github/workflows/verify.yml` is pinned to `ubuntu-24.04`, because setup-python has no 3.9 build for ubuntu-latest's 26.04 image. The pin will age out when GitHub retires the 24.04 image. Then run the leg in a `python:3.9` container as a non-root user with `jq` and `gawk` installed (as root with those missing, 26 tests fail and 2 skip), or drop the floor along with the host's Xcode Python 3.9.
 - GitHub `environment: release` protection for HOMEBREW_TAP_TOKEN not configured.
 - `session.pick_project` shows `?` in fzf for control bytes in a project name. Showing `ui.shown(name)` would also mean mapping the picked line back to the real name.

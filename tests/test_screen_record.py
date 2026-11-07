@@ -8,12 +8,14 @@ once it records and then idles until SIGINT, or it fails first, as $FAKE_FFMPEG
 tells it. The pid file lives in a scratch HOME.
 
 The tests read /proc/<pid>/stat and the kernel's boot_id, which only Linux
-has; the script is for the guest, so they skip elsewhere. Tools whose absence
-skips tests: util-linux `flock` and `waitpid` (2.40 or newer).
+has, and wait for the recorder's wrapper on a pidfd (`os.pidfd_open`); the
+script is for the guest, so they skip elsewhere. Tools whose absence skips
+tests: util-linux `flock` and `waitpid` (2.40 or newer).
 """
 
 import ctypes
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -78,6 +80,7 @@ def starttime_of(pid):
 
 
 @unittest.skipUnless(BOOT_ID.exists(), "needs /proc/<pid>/stat and boot_id")
+@unittest.skipUnless(hasattr(os, "pidfd_open"), "needs os.pidfd_open")
 @unittest.skipUnless(shutil.which("flock"), "needs util-linux flock")
 class TestScreenRecord(unittest.TestCase):
     def setUp(self):
@@ -152,11 +155,31 @@ class TestScreenRecord(unittest.TestCase):
         self.fail("no %s= line in the pid file:\n%s" % (key, self.pid_file.read_text()))
 
     def kill_recorder(self):
-        if self.pid_file.exists():
-            try:
-                os.kill(int(self.pid_file_field("pid")), signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # already stopped
+        """End the recording `start` left behind, wrapper included.
+
+        The wrapper writes ffmpeg's status into the state directory once
+        ffmpeg is gone, so the scratch HOME must outlive the wrapper: a file
+        appearing in a directory that rmtree is emptying ends the cleanup
+        with ENOTEMPTY.
+        """
+        if not self.pid_file.exists():
+            return
+        try:
+            os.kill(int(self.pid_file_field("pid")), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # already stopped
+        self.await_exit(int(self.pid_file_field("wrapper")))
+
+    def await_exit(self, pid):
+        """Block until `pid`, which is nobody's child here, has exited."""
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return  # exited and reaped
+        try:
+            select.select([fd], [], [])
+        finally:
+            os.close(fd)
 
     def adopt_orphans(self):
         """Make this process the reaper of the recorder `start` leaves behind.
