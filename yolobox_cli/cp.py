@@ -114,7 +114,16 @@ def walk_failure(failure: OSError) -> None:
     )
 
 
-def refuse_symlinks_in(source: str) -> None:
+def lstat_mode(path: str) -> int:
+    try:
+        return os.lstat(path).st_mode
+    except OSError as failure:
+        raise YoError(
+            "cannot read %s: %s" % (ui.shown(path), ui.os_error_reason(failure))
+        )
+
+
+def refuse_symlinks_in(operand: str) -> None:
     # scp -r follows symlinks and uploads what they point at, so a link the
     # agent pushed into a repo (leak -> ~/.ssh/id_ed25519) would copy a file
     # the user never named into the guest.
@@ -124,19 +133,19 @@ def refuse_symlinks_in(source: str) -> None:
             % (ui.shown(link), ui.shown(os.readlink(link)))
         )
 
-    # lstat of "link/" follows the link, so a trailing slash would hide it.
-    source = source.rstrip("/") or "/"
-    try:
-        mode = os.lstat(source).st_mode
-    except OSError as failure:
-        raise YoError(
-            "cannot read %s: %s" % (ui.shown(source), ui.os_error_reason(failure))
-        )
-    if stat.S_ISLNK(mode):
-        refuse(source)
-    if not stat.S_ISDIR(mode):
+    # Each component the user typed is judged on its own, because lstat judges
+    # only the last one: "link/", "link/.", "link/file" and "link/../x" all
+    # resolve the link. The cwd itself is not judged, only what lies below it.
+    path = "/" if os.path.isabs(operand) else os.getcwd()
+    for name in operand.split("/"):
+        if name in ("", "."):
+            continue
+        path = os.path.join(path, name)
+        if stat.S_ISLNK(lstat_mode(path)):
+            refuse(path)
+    if not stat.S_ISDIR(lstat_mode(path)):
         return
-    walk = os.walk(source, onerror=walk_failure, followlinks=False)
+    walk = os.walk(path, onerror=walk_failure, followlinks=False)
     for directory, subdirs, files in walk:
         for name in subdirs + files:
             path = os.path.join(directory, name)
@@ -153,8 +162,8 @@ def cmd_cp(args: argparse.Namespace) -> None:
         ui.err("yo: guest path %s -> %s" % (operand, resolved))
     local_paths = [local_cp_operand(path) for path in plan.local_paths]
     if plan.direction == "to_guest":
-        for source in local_paths:
-            refuse_symlinks_in(source)
+        for operand in plan.local_paths:
+            refuse_symlinks_in(operand)
         target = cp_mkdir_target(
             args.paths[-1], plan.guest_paths[0], len(plan.local_paths)
         )

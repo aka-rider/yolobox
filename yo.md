@@ -64,7 +64,9 @@ The aim is that neither a file name on the Mac nor one in the guest can steer sc
 
 `scp -r` follows symlinks and uploads what they point at. A link an agent left in a repo (`leak -> ~/.ssh/id_ed25519`) would therefore copy a file the user never named into the guest. `refuse_symlinks_in()` walks each source without following links before anything leaves, and the first symlink stops the copy, before even the `mkdir -p` in the guest. A source that cannot be read is refused by name too, not skipped.
 
-The guest side is not checked. The test exists to keep the Mac's private files from entering the guest, and a guest source is something the agent could already read, with that account's own permissions as the boundary. A trailing slash on an upload source is stripped before the check, because `lstat("link/")` follows the link and would hide a symlink.
+The guest side is not checked. The test exists to keep the Mac's private files from entering the guest, and a guest source is something the agent could already read, with that account's own permissions as the boundary.
+
+The operand is judged as typed, one component at a time, because `lstat` judges only the last component of a path and resolves the rest: `link/`, `link/.`, `link/file` and `link/../x` all pass through the link. An earlier `yo` stripped the trailing slash and then checked the whole operand once, so `yo cp assets/. :` with `assets -> ~/.ssh` uploaded the keys. Now each component below the cwd (or below `/`, for an absolute spelling) is `lstat`ed in turn and the first symlink stops the copy, which is why an absolute spelling through macOS's `/tmp` or `/var` is refused too: the message names the link's target, and the real path works. The cwd itself is never a component the user typed, and `os.getcwd()` is the physical path anyway.
 
 ### Downloads stage, then merge
 

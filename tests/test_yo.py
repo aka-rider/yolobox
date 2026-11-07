@@ -1759,6 +1759,17 @@ class TestCpRefusesSymlinks(CpHarness):
         os.symlink("real", "lnk")
         self.refused(["lnk/", ":~/x"], os.path.join(self.cwd, "lnk"))
 
+    def test_a_symlink_typed_as_a_parent_component_is_refused(self):
+        # lstat judges the last component only, so "lnk/." and "lnk/secret"
+        # resolve the link, and so does "lnk/../real/x".
+        os.makedirs("real/sub")
+        Path("real/secret").write_text("x")
+        os.symlink("real", "lnk")
+        for spelling in ("lnk/.", "lnk/secret", "lnk/sub", "lnk/../real/secret"):
+            with self.subTest(spelling=spelling):
+                self.refused([spelling, ":~/x"], os.path.join(self.cwd, "lnk"))
+        self.refused([os.path.join(self.cwd, "lnk/secret"), ":~/x"], "lnk")
+
     def test_a_missing_source_is_refused_naming_it(self):
         self.refused(["nope", ":~/x"], os.path.join(self.cwd, "nope"))
 
