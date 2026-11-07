@@ -2182,3 +2182,30 @@ class TestGuestNicNameIsOneFact(unittest.TestCase):
 
     def test_the_nix_modules_name_the_interface_the_domain_slot_produces(self):
         self.assertEqual(nix_nic_names(), {libvirt_nic_name()})
+
+
+class TestYoSourceRevLiteral(unittest.TestCase):
+    """nix stamps the commit a yo was built from into config.py (as it does
+    the version), so a yo built from main builds that tree and not the tag its
+    .version names. Brew builds from a tarball with no commit, so it must not
+    touch the literal: a brew yo stays `dev` there and builds its tag."""
+
+    def literal_lines(self, name):
+        text = (REPO / "yolobox_cli" / "config.py").read_text()
+        return text.splitlines().count('%s = "dev"' % name)
+
+    def test_config_has_exactly_one_line_that_is_the_dev_source_rev_literal(self):
+        self.assertEqual(self.literal_lines("YO_SOURCE_REV"), 1)
+
+    def test_nix_patches_the_literal_from_the_flakes_own_rev_and_brew_does_not(self):
+        nix = (REPO / "nix" / "pkgs" / "yolobox.nix").read_text()
+        self.assertIn(
+            """--replace-fail 'YO_SOURCE_REV = "dev"' 'YO_SOURCE_REV = "${sourceRev}"'""",
+            nix,
+        )
+        self.assertIn("\n, sourceRev\n", nix, "yolobox.nix takes no sourceRev")
+        flake = (REPO / "flake.nix").read_text()
+        self.assertIn('sourceRev = self.rev or "dev";', flake)
+        self.assertNotIn(
+            "YO_SOURCE_REV", (REPO / "homebrew" / "yolobox.rb").read_text()
+        )

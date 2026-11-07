@@ -235,7 +235,7 @@ Each instance's blocks live in that instance's own `ssh.config`, so writing one 
 
 ## bootstrap --version
 
-`yo bootstrap --version REF` chooses what the box builds from. Without it the box builds from this `yo`'s own release, `github:aka-rider/yolobox/v<version>`, so a `brew upgrade` moves the next bootstrap with it. The value is resolved while the command line is parsed (`flake_ref()`), so a refused one (`yo bootstrap --version 1.7`) exits 2 with the usage line before `limactl` is looked for. Exactly three spellings are accepted:
+`yo bootstrap --version REF` chooses what the box builds from. Without it the box builds from this `yo`'s own source (`own_release_ref()`): the commit nix built it from when it stamped one (`YO_SOURCE_REV`, what `nix run github:aka-rider/yolobox` gives), else its release, `github:aka-rider/yolobox/v<version>`, so a `brew upgrade` moves the next bootstrap with it (see [docs/distribution.md](docs/distribution.md#flake-ref-not-a-checkout)). The value is resolved while the command line is parsed (`flake_ref()`), so a refused one (`yo bootstrap --version 1.7`) exits 2 with the usage line before `limactl` is looked for. Exactly three spellings are accepted:
 
 - `1.7.2` or `v1.7.2` is that release tag.
 - `main`, `my-branch` or `v1.7.2-rc1` is a branch or tag on `aka-rider/yolobox`. It has no `/`, starts with a letter or digit and contains only letters, digits, `.`, `_` and `-`.
@@ -332,3 +332,5 @@ Output streamed live goes through it too. `yo gc` and `yo aws-check` show the gu
 `YO_VERSION = "dev"` in `yolobox_cli/config.py` must survive as that exact literal assignment, unreformatted. `nix/pkgs/yolobox.nix` overwrites it with `--replace-fail` and `homebrew/yolobox.rb` with `inreplace`. Both match the literal text, and either patch is how a release build gets its real version baked in.
 
 Reformat that line by reflowing it, requoting it or changing its text in any way, and the Nix build fails loudly at `--replace-fail`, which is the safer failure. The brew formula's `inreplace` can silently no-op and ship a binary that still reports `dev`. `TestYoVersionLiteral` fails when `config.py` stops having exactly one line that is that literal, and a consistency test fails when either packager patches a different file than the one holding it, so the reformat is caught before the release, not by it.
+
+`YO_SOURCE_REV = "dev"` on the next lines is the same kind of literal, patched by nix alone with the flake's `self.rev` (`sourceRev` in `nix/pkgs/yolobox.nix`), so a `yo` built from a commit builds that commit rather than the tag its version names. Brew must not patch it: a release tarball has no commit, and a brew `yo` builds its tag. `TestYoSourceRevLiteral` holds all three facts.

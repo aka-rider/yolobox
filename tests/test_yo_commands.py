@@ -37,6 +37,22 @@ class TestFlakeRef(FakeHome):
         with open(yo.flake_ref_file(), "w") as handle:
             handle.write(ref)
 
+    def test_a_build_stamped_with_its_commit_builds_that_commit_not_its_version(self):
+        # A `nix run github:aka-rider/yolobox` yo is built from main while its
+        # .version names the last release; building the tag would skew the box.
+        rev = "0" * 40
+        with (
+            mock.patch.object(yo.config, "YO_VERSION", A_RELEASE),
+            mock.patch.object(yo.config, "YO_SOURCE_REV", rev),
+        ):
+            self.assertEqual(yo.flake_ref(None), "github:aka-rider/yolobox/" + rev)
+            self.assertEqual(yo.flake_ref("1.9.2"), "github:aka-rider/yolobox/v1.9.2")
+        with (
+            mock.patch.object(yo.config, "YO_VERSION", "dev"),
+            mock.patch.object(yo.config, "YO_SOURCE_REV", rev),
+        ):
+            self.assertEqual(yo.flake_ref(None), "github:aka-rider/yolobox/" + rev)
+
     def test_dev_build_without_a_version_refuses_with_no_pinned_flake(self):
         with mock.patch.object(yo.config, "YO_VERSION", "dev"):
             with self.assertRaises(yo.YoError) as caught:

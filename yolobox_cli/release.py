@@ -103,9 +103,17 @@ def flake_ref(version: Optional[str]) -> str:
 
 
 def own_release_ref() -> Optional[str]:
-    """This yo's own release ref; None for an unreleased build, which has none
-    it can build: `dev`, or a build of main whose .version still names a
-    release that predates FIRST_HOST_OS_FREE_RELEASE."""
+    """The ref this yo builds by default: the commit it was built from when nix
+    stamped one (YO_SOURCE_REV), else its release tag. None for an unreleased
+    build, which has none it can build: `dev`, or a build of main whose
+    .version still names a release that predates FIRST_HOST_OS_FREE_RELEASE.
+
+    The commit comes first because a `nix run github:aka-rider/yolobox` yo is
+    built from main while its .version names the last release: building that
+    tag would give a box of another tree than the yo, and `yo status` would
+    report a skew no bootstrap can fix (docs/distribution.md)."""
+    if config.YO_SOURCE_REV != "dev":
+        return "%s/%s" % (UPSTREAM_FLAKE, config.YO_SOURCE_REV)
     if config.YO_VERSION == "dev":
         return None
     ref = "%s/v%s" % (UPSTREAM_FLAKE, config.YO_VERSION)
