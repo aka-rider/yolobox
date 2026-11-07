@@ -74,7 +74,7 @@ Mac side:
 
 - `yo`: the launcher, a few lines that import `yolobox_cli/` and call
   `cli.entry`. `yolobox_cli/`: the CLI, Python 3.9 and the stdlib only, one
-  module per concern. `yo.md` has the layout. `yolobox_cli/lima.py` is the
+  module per concern; `yo.md#package-layout` names each module and what it owns. `yolobox_cli/lima.py` is the
   Mac's driver and ships only to macOS; `yolobox_cli/libvirt.py` and
   `libvirt_host.py` are the Linux host's and ship only there.
 - `aws-broker`: the credential broker `yo` starts and stops on the Mac.
@@ -106,7 +106,9 @@ Box configuration (Nix):
   and the swapfile it sizes. `nix/base.md#memory-pressure`.
 - `nix/luks.nix` and `nix/luks/`: the root disk's encryption. `luks.nix` is
   the initrd configuration, `apps.nix` defines the three scripts that run
-  there. `docs/disk-encryption.md`.
+  there, and `facts.nix` holds the literals both import (the device, the
+  mapper, the LUKS label), tied to `yo`'s by `test_consistency.py`.
+  `docs/disk-encryption.md`.
 - `nix/agentic.nix`: only an imports list for `harnesses.nix`,
   `herd-server.nix` and `display.nix`.
 - `nix/harnesses.nix`: the `claude` launcher and the user service that
@@ -166,8 +168,15 @@ Tests, all under `tests/`:
 - `test_yo_luks.py`: the passphrase derivation and the ssh agent protocol.
 - `test_yo_guest_text.py`: the guest-text chokepoint: what a guest session prints
   is tagged, capped, and quoted before `out()` or `err()` show it. `yo.md#output-filter`.
+- `test_yo_cli_nobox.py`: `cli.entry` before a machine is chosen: no argparse
+  `type=` callable may read the box.
+- `test_yo_aws.py`: `yo`'s side of the AWS broker, the allow-listed config and
+  the broker lock.
+- `test_box_checks.py`: `box-hardening-check.sh`'s functions, sourced and run
+  under bash against fakes, for the checks that judge a tool's answer.
 - `test_egress_rules.py`: runs `tests/egress_rules.py` on the rendered egress
-  rule files in `tests/fixtures/`, and on broken copies, and runs the two
+  rule files in `tests/fixtures/` (`egress.nft`, `egress-recovery.nft`,
+  `egress-lastresort.nft`, `egress-tunnel.nft`), and on broken copies, and runs the two
   `nix/egress/` scripts with a fake `nft`. CI diffs the fixtures
   against a fresh render; `render-tunnel-egress.sh` renders the one with
   `tunnelInterfaces`. `nix/egress.md`.
@@ -177,13 +186,16 @@ Tests, all under `tests/`:
 - `box-hardening-check.sh` and `box-hardening-e2e.sh`: the acceptance test for
   `nix/hardening.nix`. The first runs inside a box as the operator and checks
   that the hardening holds and nothing the agent needs broke. Its environment
-  takes `EXTRA_WRAPPERS` (space-separated wrapper names a box adds, each optionally `=caps`) and
+  takes `EXTRA_WRAPPERS` (space-separated wrapper names a box adds, each optionally `=caps`),
+  `EXTRA_AGENT_GROUPS` (the groups a box's `local.nix` adds the agent to),
+  `TAILSCALE_VERSION` (what the tailscale pin must report) and
   `ONLY=hardening|compat`. The second, `box-hardening-e2e.sh <instance> [EXTRA_WRAPPERS...]`,
-  runs on the host against a throwaway lima instance and drives the first
-  across a reboot. Run them by hand, `unittest` does not. `nix/hardening.md`.
+  runs on the host against a throwaway lima instance, forwards those
+  variables, and drives the first across a reboot. Run them by hand, `unittest` does not. `nix/hardening.md`.
   The first also checks, on every box, that the agent cannot log in as the
   operator, and that the box holds no host OS stamp.
-- `box-libvirt-check.sh NAME`: runs on a Linux host against a running box. It
+- `box-libvirt-check.sh NAME`: runs on a Linux host against a running box,
+  from the checkout, with `python3` on the host (it imports `yolobox_cli`). It
   checks the sVirt and DAC confinement, the domain's devices and the host
   layer (it deletes the guest egress table for a while and restores it).
   Never run it against a box mid-work. `docs/linux-host.md`.
@@ -215,10 +227,24 @@ YOLOBOX_USERNAME=$(id -un) YOLOBOX_FLAKE_REF=github:aka-rider/yolobox/ci nix fla
 - Python 3.9 is the floor because the Mac's Xcode Python is 3.9. Neither host
   has nix: the Mac usually lacks it, and the Linux host has none on purpose.
   So test yolobox inside a yolobox: run the nix commands, and the shellcheck
-  list, in the guest.
+  list, in the guest. The in-guest copy must be operator-owned: `yo cp` lands
+  files as the agent (uid 1000) and a `yo ssh` session is the operator (uid
+  501), so on a `yo cp` copy git reports `dubious ownership` and nix's libgit2
+  refuses the tree (`repository path ... is not owned by current user`).
+  Pipe an archive in instead, which lands owned by the operator and clean:
+  `git -C <checkout> archive HEAD | yo ssh 'mkdir -p /tmp/yb && tar -x -C /tmp/yb'`
+  (or `cp -r` the `yo cp` copy as the operator). The guest operator has no
+  `python3` on `PATH`, so the `verify.yml` steps that pipe into python (the
+  host-key fingerprints, `tests/egress_rules.py`) run there as
+  `nix shell nixpkgs#python3 -c '...'`.
 - `nix/base.nix` imports `/etc/yolobox/local.nix` when it exists, so a flake
   check inside a box also evaluates that file. CI's `eval` job in
-  `.github/workflows/verify.yml` proves a box without it evaluates.
+  `.github/workflows/verify.yml` proves a box without it evaluates. A box
+  whose `local.nix` imports a module older than an assertion (one that
+  gives the agent a group without naming it in
+  `yolobox.hardening.extraAgentGroups`, say) fails the check by design; to
+  evaluate CI's box inside such a box, extend the configuration with
+  `extendModules { modules = [ { disabledModules = [ "/etc/yolobox/local.nix" ]; } ]; }`.
 - Nix needs `YOLOBOX_USERNAME=$(id -un)`, `YOLOBOX_FLAKE_REF` (a full
   `github:OWNER/REPO/REF`, the tree the box is built from) and `--impure` on
   every command, because the flake has no pure way to learn these host facts.
@@ -230,8 +256,11 @@ YOLOBOX_USERNAME=$(id -un) YOLOBOX_FLAKE_REF=github:aka-rider/yolobox/ci nix fla
   one lowercase DNS label, else the flake throws. `yo` sets it per machine
   (`yolobox-<name>` for `-m <name>`), and the box stamps it into
   `/etc/yolobox/hostname`. A hand rebuild inside the box is
-  `yolobox-guest rebuild switch` (or `boot`), which reads both stamps and sets
-  all three variables. The guest's CPU is the evaluating nix's own system, so
+  `yolobox-guest rebuild switch` (or `boot`), which reads the two `/etc/yolobox`
+  stamps and sets all three variables, and, when `yo bootstrap` has stamped
+  `/var/lib/yolobox/flake-rev` and `flake-narhash`, builds
+  `github:OWNER/REPO/<rev>?narHash=<hash>` instead of the ref's tip
+  (`nix/guest/yolobox-guest.md#rebuild`). The guest's CPU is the evaluating nix's own system, so
   check an Apple silicon Mac box's `aarch64` guest from an x86_64 machine with
   `nix eval --impure --system aarch64-linux ...`, and an Intel Mac's guest with
   `--system x86_64-linux`. An older `yo` also passes `YOLOBOX_HOST_OS`; the
