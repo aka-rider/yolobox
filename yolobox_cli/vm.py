@@ -247,6 +247,7 @@ def asked_size(args: argparse.Namespace) -> Size:
     return Size(args.memory, args.disk, args.cpus)
 
 
+@agent.clearing_passphrases
 def cmd_up(args: argparse.Namespace) -> None:
     size = asked_size(args)
     passphrase = vm_up(size=size)
@@ -459,6 +460,7 @@ def cmd_destroy(args: argparse.Namespace) -> None:
         )
 
 
+@agent.clearing_passphrases
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     report = Report()
     ref = args.version if args.version is not None else release.flake_ref(None)
@@ -766,6 +768,7 @@ def finish_previous_grow(ceiling_gib: int, passphrase: bytes) -> None:
     )
 
 
+@agent.clearing_passphrases
 def cmd_disk_grow(args: argparse.Namespace) -> None:
     wanted = args.size
 
