@@ -10,6 +10,13 @@ let
   launcherLink = "${homeDir}/.local/bin/claude";
   claudeVersionsDir = "${homeDir}/.local/share/claude/versions";
 
+  # What counts as an installed claude under claudeVersionsDir: an executable
+  # file whose name is a version (2.1.268, 2.2.0-beta.1), for the launcher,
+  # the keeper and the install probe alike. The installer drops a download
+  # under a temporary name first, and nothing else may be picked or pruned.
+  versionRe = "[0-9]+(\\.[0-9]+)*(-[A-Za-z0-9.]+)?";
+  versionFile = "-maxdepth 1 -type f -perm -u+x -regextype posix-extended -regex '.*/${versionRe}'";
+
   # Exists while the system's network is up. A user unit cannot order itself
   # after a system unit, so the system side drops this flag and a user path
   # unit waits for it (nix/harnesses.md#install-phases).
@@ -33,11 +40,19 @@ let
     text = ''
       versions="${claudeVersionsDir}"
 
-      # Newest executable under $versions. Extra find tests go in "$@". No
-      # versions directory is no install; any other find error is shown.
+      # The binaries under $versions are the agent's own downloads, so any
+      # other account running them runs agent-written code with its own
+      # privileges. The launcher is world-readable under /etc; this is its gate.
+      if [ "$(${pkgs.coreutils}/bin/id -un)" != ${lib.escapeShellArg agentUser} ]; then
+        echo "claude: this launcher runs binaries the agent installed; run it as ${agentUser}, not $(${pkgs.coreutils}/bin/id -un)" >&2
+        exit 1
+      fi
+
+      # Newest installed version under $versions. Extra find tests go in "$@".
+      # No versions directory is no install; any other find error is shown.
       newest_version() {
         [ -d "$versions" ] || return 0
-        ${pkgs.findutils}/bin/find "$versions" -maxdepth 1 -type f -perm -u+x "$@" -printf '%f\n' \
+        ${pkgs.findutils}/bin/find "$versions" ${versionFile} "$@" -printf '%f\n' \
           | ${pkgs.coreutils}/bin/sort -V | ${pkgs.coreutils}/bin/tail -n 1 || true
       }
 
@@ -87,7 +102,7 @@ let
       # buys, at ~330 MB each.
       older=""
       if [ -d "${claudeVersionsDir}" ]; then
-        older="$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -printf '%f\n' | sort -V | head -n "-$keep_versions" || true)"
+        older="$(find "${claudeVersionsDir}" ${versionFile} -printf '%f\n' | sort -V | head -n "-$keep_versions" || true)"
       fi
       if [ -n "$older" ]; then
         while IFS= read -r version; do
@@ -144,7 +159,7 @@ let
       }
 
       install_claude() {
-        if [ -z "$(find "${claudeVersionsDir}" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null || true)" ]; then
+        if [ -z "$(find "${claudeVersionsDir}" ${versionFile} -print -quit 2>/dev/null || true)" ]; then
           curl -fsSL https://claude.ai/install.sh | bash -s latest
         fi
         # Unconditional: the guarantee upstream documents covers updates, not
@@ -255,11 +270,17 @@ in
     # unnoticed until the next rebuild. This closes it at the moment it opens.
     # The service writes only when something is actually wrong, so the write it
     # makes retriggers the watch exactly once and then settles.
+    # PathChanged, not PathModified: the latter fires on every write, and one
+    # ~330 MB download is thousands of writes in under the path unit's own
+    # trigger limit of 200 per 2 s (trigger-limit-hit, path unit failed).
+    # PathChanged fires on create, close-after-write, delete, move and attrib:
+    # a handful per download, and the trigger limit stays as the guard
+    # against a loop.
     systemd.user.paths.yolobox-claude-launcher = {
       description = "Watch the agent's claude launcher and version store";
       unitConfig.ConditionUser = agentUser;
       wantedBy = [ "paths.target" ];
-      pathConfig.PathModified = [ "%h/.local/bin" "%h/.local/share/claude/versions" ];
+      pathConfig.PathChanged = [ "%h/.local/bin" "%h/.local/share/claude/versions" ];
     };
     # The path unit only fires on a change, and a version too fresh to prune
     # then becomes prunable with nothing left to change, so the same service
@@ -273,10 +294,11 @@ in
         Persistent = true;
       };
     };
-    # StartLimitIntervalSec = 0 because the path unit above fires on every
-    # write into the version store, and one ~330 MB download is thousands of
-    # them: systemd's default burst limit would trip and leave the path unit
-    # failed.
+    # StartLimitIntervalSec = 0 because the path unit above starts this on
+    # every file event in two directories, its own relink and prune included,
+    # and a burst past systemd's default five starts in ten seconds would
+    # leave the path unit failed. The work per start is a few readlinks and
+    # one find, so no limit is the right limit.
     systemd.user.services.yolobox-claude-launcher = {
       description = "Re-assert the box's claude launcher and prune old versions";
       unitConfig = {
@@ -293,12 +315,16 @@ in
     # and forks only once the lease is applied and resolvconf has written the
     # resolver, so "dhcpcd.service started" is the event "the network works".
     # Nothing else pulls in network-online.target, so this unit wants dhcpcd
-    # itself. RemainAfterExit keeps the flag for the whole boot; the stop
-    # removes it, so a flag never outlives the network state it describes.
+    # itself. RemainAfterExit keeps the flag while dhcpcd runs; bindsTo stops
+    # this unit, and its stop removes the flag, when dhcpcd stops or dies, so
+    # the flag never outlives the network state it describes. A dhcpcd
+    # restarted by hand does not bring it back: the install it gates has run
+    # by then, or retries on its own.
     systemd.services.yolobox-network-ready = {
       description = "Flag that the network is up, for the agent's install unit";
       wantedBy = [ "multi-user.target" ];
       wants = [ "dhcpcd.service" ];
+      bindsTo = [ "dhcpcd.service" ];
       after = [ "dhcpcd.service" ];
       serviceConfig = {
         Type = "oneshot";

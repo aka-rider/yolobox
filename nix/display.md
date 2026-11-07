@@ -37,6 +37,7 @@ To recognise a regression, look for the exact pi error string coming back. It me
 ## Learned the hard way
 
 - `openbox` waits for the X socket in `ExecStartPre`. A `Restart=` loop trips systemd's start limit and stays failed.
+- `xvfb` has `Restart=always` with `RestartSec=2` and `StartLimitIntervalSec=0`. With the defaults, an Xvfb that dies more than five times in ten seconds stays down until the next boot, and every headed browser run falls back to headless with no error of its own (see Browsers); with no pause, a crash loop would spin a CPU. Recognise a dead display by `systemctl --user status xvfb` as the agent.
 - Use `${pkgs.xvfb}/bin/Xvfb`. `lib.getExe` on it names a binary that does not exist.
 - No tmpfiles rule for `/tmp/.X11-unix`. systemd ships one.
 - The screen-record pid file lives in `~/.local/state/yolobox`, because `/run/user/$UID` dies at logout while the backgrounded `ffmpeg` survives. `SIGINT` finalizes the mp4 and `SIGKILL` corrupts it. The file survives a reboot too, and the kernel reuses its pid, so the file records the process identity, `pid=`, `start=` (field 22 of `/proc/<pid>/stat`, the start time in clock ticks since boot) and `boot=` (the kernel's `boot_id`), and `start` and `stop` trust it only when all three still match and otherwise remove it. The first version checked `/proc/<pid>/comm` for `ffmpeg` instead, and before that nothing: `stop` sent `SIGINT` to whatever agent process had the pid, and `start` refused with "already recording". Recognise a stale file by `stop` saying "stale pid file" after a reboot.

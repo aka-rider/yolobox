@@ -51,6 +51,18 @@ either way, and `claude update` works and is welcome.
   claude writes a new version straight into `versions/` and the newest file
   can be half-downloaded. A lone binary, as on a first install, is used
   anyway, since the alternative is no claude for a minute.
+- It picks only files whose name is a version (`versionRe` in
+  `harnesses.nix`: digits and dots, with an optional `-suffix`), and the
+  keeper prunes only those; the install probe counts only those. The three
+  used to take any executable file in `versions/`, so a download under a
+  temporary name, or anything else dropped there, could be run as the newest
+  claude, pruned as an old one, or read as "claude is installed".
+- It refuses to run for any account but the agent, with `run it as agent`
+  on stderr and exit 1. The launcher sits world-readable under `/etc`, and
+  what it execs are the agent's own downloads: the operator or root typing
+  `claude` would run agent-written code with their privileges, which is the
+  one thing the two accounts exist to prevent (see
+  [docs/accounts.md](../docs/accounts.md)).
 
 ### claude's own "Fix" warning
 
@@ -77,6 +89,17 @@ write it causes settles instead of looping. The tmpfiles rules at boot and on
 `switch` are the backstop for the window the path unit cannot see, an install
 made while no user manager of the agent's was running.
 
+The watch is `PathChanged`, not `PathModified`. `PathModified` adds
+`IN_MODIFY`, one event per `write()`, and a path unit has a trigger limit of
+its own (`TriggerLimitIntervalSec=2s`, `TriggerLimitBurst=200`), separate from
+the service's start limit: one ~330 MB download is thousands of writes in
+under two seconds, the path unit fails with `trigger-limit-hit`, and nothing
+watches the launcher until something resets it. `PathChanged` fires on
+create, close-after-write, delete, move and attribute change, a handful of
+events per download, so the limit is never near and stays as the guard
+against a real loop. Recognise the old failure by `systemctl --user status
+yolobox-claude-launcher.path` showing `failed` with `Trigger limit hit`.
+
 Three properties it must keep:
 
 - **Rank first, settle second.** The keeper ranks all versions, so a fresh
@@ -89,11 +112,11 @@ Three properties it must keep:
   fresh to prune becomes prunable with nothing left to change. The
   `yolobox-claude-launcher.timer` (`Persistent=true`, so a missed hour runs at
   the next login) runs the same service.
-- **`StartLimitIntervalSec=0`.** The path unit fires on every write into the
-  version store, and one large download is thousands of them. Systemd's
-  default limit (five starts in ten seconds) trips in the first second, and the
-  tripped service leaves the path unit failed too, which stops it watching
-  until something resets it. The work per start is a few `readlink`s and a
+- **`StartLimitIntervalSec=0`.** The path unit starts the service on every
+  file event in two directories, its own relink and prune included, and a
+  burst past systemd's default limit (five starts in ten seconds) leaves the
+  service, and with it the path unit, failed, which stops it watching until
+  something resets it. The work per start is a few `readlink`s and a
   `find`, so no limit is the right limit.
 
 Check that pruning is alive with `ls ~/.local/share/claude/versions` as the
@@ -119,7 +142,12 @@ here:
   log shows `leased 192.168.5.15` a moment before `Started DHCP Client`. Nothing
   else activates `network-online.target` on this box, so the unit names dhcpcd
   itself. It is a `RemainAfterExit` oneshot that creates
-  `/run/yolobox-network-ready` and removes it when stopped. The agent's path
+  `/run/yolobox-network-ready` and removes it when stopped, and it is bound
+  to dhcpcd (`BindsTo=`), so when dhcpcd stops or dies the flag unit stops
+  and the flag goes with it; a plain `Wants=` propagated no stop, and the
+  flag outlived the lease it described. A dhcpcd restarted by hand does not
+  recreate the flag, and need not: the install it gates has run by then, or
+  is retrying on its own. The agent's path
   unit `yolobox-harness-install.path` has `PathExists` on that file, wanted by
   `default.target`; systemd watches it with inotify and starts the service when
   it appears. The service has no `wantedBy` of its own. `Restart=on-failure`

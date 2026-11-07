@@ -21,6 +21,21 @@ workspace opened on the saved `yolobox` machine. `cmd_enter` says so on
 stderr when `HERDR_ENV=1`, meaning the command itself runs inside a herdr
 pane. Inside the guest, navigation is left to the agent's own shell setup. Nothing named `yo` exists in the guest.
 
+### The server's PATH and a pane's
+
+`nix/herd-server.nix` gives the server `path = [ "/run/current-system/sw" ]`,
+which replaces `PATH` with that one bin directory: no `/run/wrappers/bin`
+and no `~/.local/bin`, where the claude launcher and pi live. That is enough
+for the server itself, which only needs the agent's shell. A pane runs that
+shell, zsh, interactively, and NixOS's `/etc/zshenv` sources
+`/etc/set-environment` whenever `__NIXOS_SET_ENVIRONMENT_DONE` is unset,
+which it is under a systemd user service. So the pane's `PATH` is rebuilt
+from the system's: packages, `/run/wrappers/bin` and, through
+`environment.localBinInPath`, `~/.local/bin`. Recognise a regression by
+`command -v claude` in a pane answering anything but
+`/home/agent/.local/bin/claude`, or `podman` failing on `newuidmap`, which
+lives only in `/run/wrappers/bin`.
+
 ### Recognising an agent outside a machine pane
 
 An agent started anywhere but a machine pane shows this shape:
