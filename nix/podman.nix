@@ -18,8 +18,13 @@
   };
 
   # Rootless-only: no dockerSocket.enable, no podman group (would grant
-  # root-equivalent access and split storage from the rootless CLI).
-  systemd.user.sockets.podman.wantedBy = [ "sockets.target" ];
+  # root-equivalent access and split storage from the rootless CLI). The
+  # socket is the agent's: the operator's user manager runs no podman
+  # (nix/podman.md, "The agent's podman").
+  systemd.user.sockets.podman = {
+    unitConfig.ConditionUser = agentUser;
+    wantedBy = [ "sockets.target" ];
+  };
 
   # autoPrune.enable renders a system-scope timer running as root, which has
   # nothing to prune on a rootless-only box; prune as the account that owns
@@ -43,8 +48,11 @@
     };
   };
 
-  # $XDG_RUNTIME_DIR must expand at login, not at eval time.
+  # $XDG_RUNTIME_DIR must expand at login, not at eval time. Only the agent
+  # has the socket, so only its shells name it.
   environment.extraInit = ''
-    export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"
+    if [ "$(id -un)" = ${lib.escapeShellArg agentUser} ]; then
+      export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"
+    fi
   '';
 }

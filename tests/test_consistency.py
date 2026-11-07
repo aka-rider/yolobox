@@ -2207,3 +2207,48 @@ class TestSshdSettingsHoldTheirStories(unittest.TestCase):
         lines = [line.strip() for line in extra.splitlines() if line.strip()]
         self.assertEqual(lines[0], "Match User ${agentUser}")
         self.assertEqual(lines[-1], "Match all")
+
+
+class TestEveryUserUnitIsTheAgents(unittest.TestCase):
+    """CONSTITUTION: every ConditionUser= names agentUser. Each user unit a
+    module declares, as a block or as one dotted line, must carry the
+    condition, or the operator's user manager runs it too (nix/podman.md)."""
+
+    UNIT_RE = re.compile(r"systemd\.user\.(services|sockets|timers|paths)\.([\w-]+)")
+    CONDITION = "ConditionUser = agentUser;"
+
+    def block_after(self, text, start):
+        """The text of the `{ ... }` that starts at the first brace after start."""
+        begin = text.index("{", start)
+        depth = 0
+        for i in range(begin, len(text)):
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            if depth == 0:
+                return text[begin : i + 1]
+        self.fail("unbalanced braces after offset %d" % start)
+
+    def conditioned_units(self, text):
+        units = set()
+        for m in self.UNIT_RE.finditer(text):
+            kind, name = m.groups()
+            rest = text[m.end() :].lstrip()
+            if rest.startswith("= {") and self.CONDITION in self.block_after(text, m.end()):
+                units.add((kind, name))
+            elif rest.startswith(".unitConfig.ConditionUser = agentUser;"):
+                units.add((kind, name))
+        return units
+
+    def test_every_user_unit_names_the_agent(self):
+        for path in sorted((REPO / "nix").rglob("*.nix")):
+            text = nix_code(path)
+            declared = {m.groups() for m in self.UNIT_RE.finditer(text)}
+            if not declared:
+                continue
+            with self.subTest(file=path.name):
+                self.assertEqual(declared - self.conditioned_units(text), set())
+
+    def test_the_check_sees_an_unconditioned_unit(self):
+        text = "systemd.user.sockets.x.wantedBy = [ \"sockets.target\" ];"
+        self.assertEqual(self.conditioned_units(text), set())
+        block = "systemd.user.services.x = { unitConfig.ConditionUser = agentUser; };"
+        self.assertEqual(self.conditioned_units(block), {("services", "x")})
