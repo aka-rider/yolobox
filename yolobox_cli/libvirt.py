@@ -994,11 +994,36 @@ class LibvirtDriver:
         gap = libvirt_host.passt_dir_gap()
         if gap is not None:
             raise YoError(gap)
-        libvirt_host.virsh("start", domain_name())
+        self.start_domain()
         # libvirt starts no foreground process: the domain is Running as soon as
         # `virsh start` returns, and unlock_disk judges it by its state alone.
         unlock.unlock_disk(passphrase)
         unlock.wait_for_operator()
+
+    def start_domain(self) -> None:
+        """`virsh start`, tried once more when passt could not bind its socket.
+
+        Another passt domain starting between yo's ACL check and this start
+        recomputes the directory's mask (docs/linux-host.md, "The passt socket
+        directory"); the hook restores it at that domain's `started begin`. So
+        the ACL is read again: short, and the start is refused with the remedy;
+        restored, and the start is tried once more, whose failure is final.
+        """
+        started = libvirt_host.virsh("start", domain_name(), check=False)
+        if started.returncode == 0:
+            return
+        if PASST_BIND_DENIED not in (started.stderr or ""):
+            raise YoError(
+                proc.failed_message(
+                    "virsh start %s" % domain_name(),
+                    started.returncode,
+                    proc.failure_detail(started),
+                )
+            )
+        gap = libvirt_host.passt_dir_gap()
+        if gap is not None:
+            raise YoError(gap)
+        libvirt_host.virsh("start", domain_name())
 
     def stop(self) -> None:
         if not self.domain_exists():

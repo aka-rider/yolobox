@@ -146,6 +146,7 @@ class FakeHost:
         self.states = {}  # name -> domstate word
         self.volumes = {}  # name -> bytes uploaded
         self.fail = {}  # virsh subcommand -> stderr it fails with
+        self.fail_once = {}  # the same, for the next call of the subcommand only
         self.interrupted = {}  # virsh subcommand -> the exception that ends it
         self.capacity = {}  # volume name -> bytes, as vol-create-as and vol-resize set
         self.iso_inputs = []  # (directory, file names) at each xorriso call
@@ -310,6 +311,8 @@ class FakeHost:
             raise self.interrupted[sub]
         if sub in self.fail:
             return completed(returncode=1, stderr=self.fail[sub])
+        if sub in self.fail_once:
+            return completed(returncode=1, stderr=self.fail_once.pop(sub))
         if sub == "shutdown":
             self.states[args[0]] = self.shutdown_state
             return completed()
@@ -3519,6 +3522,50 @@ class TestStart(LibvirtCase):
         with self.assertRaisesRegex(self.box.YoError, "sudo setfacl -m u:yolobox-vm"):
             self.start()
         self.assertNotIn("start", self.host.subcommands())
+
+    BIND_DENIED = (
+        "error: Failed to start domain 'yolobox-box'\nerror: internal error: "
+        "Could not start 'passt': Failed to bind UNIX domain socket: Permission denied"
+    )
+
+    def test_a_passt_that_could_not_bind_is_started_once_more_after_the_acl_held(
+        self,
+    ):
+        # Another passt domain's start reset the mask between yo's check and
+        # the start; the hook restored it at that domain's `started begin`.
+        self.host.fail_once["start"] = self.BIND_DENIED
+        self.start()
+        self.assertEqual(len(self.host.calls_of("start")), 2)
+        self.assertEqual(self.host.states["yolobox-box"], "running")
+
+    def test_a_passt_that_could_not_bind_with_the_acl_still_short_is_the_remedy(self):
+        self.host.fail_once["start"] = self.BIND_DENIED
+        acl = [getfacl_listing(), getfacl_listing(mask="r-x")]
+        run = self.host.run
+
+        def acl_changes_under_yo(argv, **kwargs):
+            if argv[0] == "getfacl":
+                self.host.acl = acl.pop(0)
+            return run(argv, **kwargs)
+
+        with (
+            mock.patch.object(self.box.proc, "run", acl_changes_under_yo),
+            self.assertRaisesRegex(self.box.YoError, "sudo setfacl -m u:yolobox-vm"),
+        ):
+            self.start()
+        self.assertEqual(len(self.host.calls_of("start")), 1)
+
+    def test_a_start_that_fails_for_any_other_reason_is_not_retried(self):
+        self.host.fail_once["start"] = "error: internal error: lizard"
+        with self.assertRaisesRegex(self.box.YoError, r"virsh start .*lizard"):
+            self.start()
+        self.assertEqual(len(self.host.calls_of("start")), 1)
+
+    def test_a_second_bind_failure_is_final(self):
+        self.host.fail["start"] = self.BIND_DENIED
+        with self.assertRaisesRegex(self.box.YoError, "Failed to bind"):
+            self.start()
+        self.assertEqual(len(self.host.calls_of("start")), 2)
 
     def test_the_port_is_chosen_and_the_domain_defined_under_the_lock(self):
         held = []
