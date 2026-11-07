@@ -923,6 +923,7 @@ class TestBootstrapRebootDecision(FakeHome):
                 yo.vm, "guest_generations", side_effect=[("g1", "g0"), ("g1", "g1")]
             ),
             mock.patch.object(yo.proc, "run"),
+            mock.patch.object(yo.LIMA, "stop"),
             mock.patch.object(yo.vm, "grow_to_asked_disk") as grow,
         ):
             yo.cmd_bootstrap(args)
@@ -962,6 +963,7 @@ class TestBootstrapRebootDecision(FakeHome):
                 yo.vm, "guest_generations", side_effect=[("g1", "g0"), ("g1", "g1")]
             ),
             mock.patch.object(yo.proc, "run"),
+            mock.patch.object(yo.LIMA, "stop"),
             mock.patch.object(yo.vm, "grow_to_asked_disk") as grow,
         ):
             yo.cmd_bootstrap(args)
@@ -3676,13 +3678,21 @@ class TestLimaStop(FakeHome):
         self.assertIn("limactl hostagent", caught.exception.message)
         self.assertNotIn("systemctl reboot", caught.exception.message)
 
-    def test_a_stop_that_failed_for_another_reason_is_not_called_a_hang(self):
+    def test_a_stop_that_failed_on_a_box_no_longer_running_is_not_called_a_hang(self):
         failed = subprocess.CompletedProcess(["limactl", "stop"], 1, None, None)
-        with mock.patch.object(yo.subprocess, "run", return_value=failed):
-            with self.assertRaises(yo.YoError) as caught:
-                yo.LIMA.stop()
-        self.assertIn("failed", caught.exception.message)
-        self.assertNotIn("kill -9", caught.exception.message)
+        for status in ("Stopped", "Broken", None):
+            with self.subTest(status=status):
+                with (
+                    mock.patch.object(
+                        yo.LIMA, "vm_status", side_effect=["Running", status]
+                    ),
+                    mock.patch.object(yo.subprocess, "run", return_value=failed),
+                ):
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.LIMA.stop()
+                self.assertNotIsInstance(caught.exception, yo.StopRefused)
+                self.assertIn("limactl stop yolobox failed", caught.exception.message)
+                self.assertNotIn("kill -9", caught.exception.message)
 
     def assert_unlock_lock_held(self):
         with self.assertRaises(yo.LockBusy):
@@ -3727,7 +3737,6 @@ class TestLimaStop(FakeHome):
                 self.down(stage).assert_called_once_with(
                     ["limactl", "stop", "yolobox"],
                     capture=False,
-                    check=True,
                     timeout=yo.LIMA_STOP_TIMEOUT,
                 )
 
@@ -3737,7 +3746,6 @@ class TestLimaStop(FakeHome):
         fake_run.assert_called_with(
             ["limactl", "stop", "--force", "yolobox"],
             capture=False,
-            check=True,
             timeout=yo.LIMA_STOP_TIMEOUT,
         )
 

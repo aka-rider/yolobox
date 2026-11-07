@@ -6,6 +6,8 @@ import io
 import json
 import os
 import shutil
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -263,8 +265,8 @@ class TestSshPort(unittest.TestCase):
                         yo.box.driver.ssh_port()
                 self.assertIn("ssh.localPort %d" % port, caught.exception.message)
                 self.assertIn(
-                    "limactl stop second && limactl edit second --set "
-                    "'.ssh.localPort=<a free port in 49152-65535>'",
+                    "yo -m second down && limactl edit --tty=false second --set "
+                    "'.ssh.localPort=<a free port in 49152-65535>' && yo -m second up",
                     caught.exception.message,
                 )
 
@@ -826,6 +828,78 @@ class TestVmUpOnALimaConfigGap(unittest.TestCase):
         start.assert_called_once()
         self.assertEqual(len(notes), 1)
         self.assertIn(yo.GAP_FORWARD_AGENT, notes[0])
+
+
+FAKE_LIMACTL = """#!/bin/sh
+# A limactl whose stop fails on a stopped instance, as lima's does, and whose
+# edit refuses a running one. $STATE holds the status, $LOG what was applied.
+case "$1" in
+  stop)
+    [ "$(cat "$STATE")" = Running ] || { echo "instance is already stopped" >&2; exit 1; }
+    [ -z "$STOP_FAILS" ] || { echo "stop: timed out" >&2; exit 1; }
+    echo Stopped > "$STATE" ;;
+  edit)
+    [ "$2" = --tty=false ] || { echo "edit would open an editor" >&2; exit 1; }
+    [ "$(cat "$STATE")" = Running ] && { echo "cannot edit a running instance" >&2; exit 1; }
+    printf '%s\\n' "$5" >> "$LOG" ;;
+  *) echo "unexpected limactl $*" >&2; exit 1 ;;
+esac
+"""
+
+FAKE_YO = """#!/bin/sh
+# What yo down and yo up do to limactl, for the machine named or the default.
+[ "$1" = -m ] && shift 2
+case "$1" in
+  down) [ "$(cat "$STATE")" = Running ] && exec limactl stop "$NAME"; exit 0 ;;
+  up) echo up >> "$LOG" ;;
+  *) echo "unexpected yo $*" >&2; exit 1 ;;
+esac
+"""
+
+
+class TestTheEditRemedyRunsFromEitherState(unittest.TestCase):
+    """The printed `yo down && limactl edit ... && yo up` chain, run by a shell
+    against a limactl that fails to stop a stopped instance."""
+
+    def run_remedy(self, name, status, stop_fails=False):
+        bin_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, bin_dir)
+        for tool, text in (("limactl", FAKE_LIMACTL), ("yo", FAKE_YO)):
+            path = os.path.join(bin_dir, tool)
+            with open(path, "w") as handle:
+                handle.write(text)
+            os.chmod(path, 0o755)
+        state_file = os.path.join(bin_dir, "state")
+        log = os.path.join(bin_dir, "log")
+        with open(state_file, "w") as handle:
+            handle.write(status + "\n")
+        with as_instance(name):
+            remedy = yo.lima.lima_edit_command(".ssh.overVsock = false")
+        env = {
+            "PATH": bin_dir + os.pathsep + os.environ["PATH"],
+            "STATE": state_file,
+            "LOG": log,
+            "NAME": name,
+            "STOP_FAILS": "1" if stop_fails else "",
+        }
+        completed = subprocess.run(
+            ["sh", "-c", remedy], env=env, capture_output=True, text=True
+        )
+        applied = open(log).read().splitlines() if os.path.exists(log) else []
+        return completed, applied
+
+    def test_a_stopped_or_running_box_is_edited_and_started_again(self):
+        for name in (yo.DEFAULT_INSTANCE, INSTANCE_B):
+            for status in ("Stopped", "Running"):
+                with self.subTest(name=name, status=status):
+                    completed, applied = self.run_remedy(name, status)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(applied, [".ssh.overVsock = false", "up"])
+
+    def test_a_stop_that_fails_ends_the_chain_before_the_edit(self):
+        completed, applied = self.run_remedy(INSTANCE_B, "Running", stop_fails=True)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(applied, [])
 
 
 class TestRemediesNameTheMachine(FakeHome):

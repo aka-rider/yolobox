@@ -4853,6 +4853,33 @@ class TestLimaStopHangOffersTheKillOnlyPastTheInitrd(unittest.TestCase):
         self.assertNotIn(yo.LIMA.force_stop_command(), message)
 
 
+class TestLimaStopThatExitsNonZeroOnARunningBox(unittest.TestCase):
+    """lima's stop has its own deadline and exits 1 past it, with the box still
+    running: the same hang, so the same way out."""
+
+    def failed_stop(self, stop, statuses):
+        failed = subprocess.CompletedProcess(["limactl", "stop"], 1, None, None)
+        with (
+            mock.patch.object(yo.LIMA, "vm_status", side_effect=statuses),
+            mock.patch.object(yo.subprocess, "run", return_value=failed),
+        ):
+            with self.assertRaises(yo.StopRefused) as caught:
+                stop()
+        return caught.exception
+
+    def test_a_polite_stop_carries_the_hang_recovery_and_its_exit(self):
+        refused = self.failed_stop(yo.LIMA.stop, ["Running", "Running"])
+        self.assertEqual(refused.reason, "limactl stop yolobox failed (exit 1)")
+        self.assertIn("If yo ssh true succeeds", refused.message)
+        self.assertIn("do not kill the hostagent", refused.message)
+
+    def test_a_forced_stop_carries_the_hostagent_kill_alone(self):
+        refused = self.failed_stop(yo.LIMA.force_stop, ["Running"])
+        self.assertEqual(refused.reason, "limactl stop --force yolobox failed (exit 1)")
+        self.assertIn("kill -9 any 'limactl hostagent'", refused.message)
+        self.assertNotIn("systemctl reboot", refused.message)
+
+
 class TestLimaInitrdTimeoutNamesItsBootLog(unittest.TestCase):
     def test_serialv_log_keeps_the_boot_so_it_is_named(self):
         text = yo.unlock.initrd_timeout_error(False).message

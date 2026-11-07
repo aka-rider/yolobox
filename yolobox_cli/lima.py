@@ -21,7 +21,7 @@ from .config import (
     SCRIPT_DIR,
     USAGE_EXIT,
 )
-from .driver import NO_SIZE, BoxSize, Removal, Size, StopRefused
+from .driver import NO_SIZE, RUNNING, BoxSize, Removal, Size, StopRefused
 from .ui import RunTimeout, YoError
 
 
@@ -289,8 +289,15 @@ def listener_rules(forwards: Sequence[object], proto: str) -> List[dict]:
 
 
 def lima_edit_command(expression: str) -> str:
-    return "limactl stop %s && limactl edit %s --set '%s' && %s" % (
-        state.box.name,
+    """The pasteable chain that applies `expression` to the stopped instance.
+
+    It starts with `yo down`, not `limactl stop`: lima's stop exits 1 on an
+    instance that is already stopped, and the chain must run from either
+    state. `--tty=false` declines lima's "start the instance now?" prompt, so
+    the start is `yo up`'s, with its unlock.
+    """
+    return "%s && limactl edit --tty=false %s --set '%s' && %s" % (
+        state.yo_cmd("down"),
         state.box.name,
         expression,
         state.yo_cmd("up"),
@@ -703,15 +710,20 @@ class LimaDriver:
         return "limactl stop --force %s" % state.box.name
 
     def limactl_stop(self, args: List[str], hang_recovery: str) -> None:
+        argv = ["limactl", "stop", *args]
         try:
-            proc.run(
-                ["limactl", "stop", *args],
-                capture=False,
-                check=True,
-                timeout=LIMA_STOP_TIMEOUT,
-            )
+            completed = proc.run(argv, capture=False, timeout=LIMA_STOP_TIMEOUT)
         except RunTimeout as failure:
             raise StopRefused(failure.message, hang_recovery)
+        if completed.returncode == 0:
+            return
+        # Its output went to the terminal, so the message carries the exit only.
+        failed = proc.failed_message(shlex.join(argv), completed.returncode, None)
+        # A stop that gave up on a box still running needs the hang's recovery;
+        # one that failed on a box lima reports as not running is only a failure.
+        if self.vm_status() == RUNNING:
+            raise StopRefused(failed, hang_recovery)
+        raise YoError(failed)
 
     def stop_command(self) -> str:
         return "limactl stop %s" % state.box.name
