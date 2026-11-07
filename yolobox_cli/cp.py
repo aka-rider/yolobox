@@ -248,15 +248,17 @@ def unlock_tree(path: str) -> None:
     # left (a read-only Go module cache refuses to lose its children). Group
     # and other bits stay as scp made them, so a landed directory keeps the
     # mode scp -p gave it. Symlinks are never followed: chmod would reach the
-    # Mac file they point at.
-    mode = os.lstat(path).st_mode
-    if stat.S_ISLNK(mode):
-        return
-    os.chmod(path, stat.S_IMODE(mode) | 0o700)
-    with os.scandir(path) as entries:
-        subdirs = [e.path for e in entries if e.is_dir(follow_symlinks=False)]
-    for subdir in subdirs:
-        unlock_tree(subdir)
+    # Mac file they point at. A stack, not recursion: a pulled tree can be
+    # deeper than the interpreter's frame limit.
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        mode = os.lstat(directory).st_mode
+        if stat.S_ISLNK(mode):
+            continue
+        os.chmod(directory, stat.S_IMODE(mode) | 0o700)
+        with os.scandir(directory) as entries:
+            pending += [e.path for e in entries if e.is_dir(follow_symlinks=False)]
 
 
 def remove_tree(path: str) -> None:
@@ -265,12 +267,18 @@ def remove_tree(path: str) -> None:
 
 
 def remove_staging(path: str) -> None:
+    # Any failure, not only an OSError: shutil.rmtree recurses, and a tree too
+    # deep for it raises RecursionError, which must not replace the copy's own
+    # error with a traceback.
     try:
         remove_tree(path)
-    except OSError as failure:
+    except Exception as failure:
+        reason = (
+            ui.os_error_reason(failure) if isinstance(failure, OSError) else str(failure)
+        )
         raise YoError(
             'cannot remove the staging directory "%s": %s; delete it by hand'
-            % (ui.shown(path), ui.os_error_reason(failure))
+            % (ui.shown(path), reason)
         )
 
 
@@ -622,6 +630,19 @@ def land_staged(moves: Sequence[Tuple[str, str]]) -> None:
 
 
 def download_from_guest(sources: Sequence[str], dest: str) -> None:
+    # The one place an OSError from the staging and landing (a chmod, utime or
+    # listdir on the Mac) becomes a message instead of a traceback. The staging
+    # directory is already gone by the time it gets here.
+    try:
+        stage_and_land(sources, dest)
+    except OSError as failure:
+        reason = ui.os_error_reason(failure)
+        if failure.filename is not None:
+            reason = "%s: %s" % (ui.shown(str(failure.filename)), reason)
+        raise YoError("the copy failed: %s" % reason)
+
+
+def stage_and_land(sources: Sequence[str], dest: str) -> None:
     # sources are guest paths, not yet escaped for scp.
     # scp into a staging directory beside the destination instead of onto it:
     # scp writes through any symlink it meets there, so a link the agent

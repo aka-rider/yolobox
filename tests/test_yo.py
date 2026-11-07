@@ -1354,6 +1354,61 @@ class TestCpFromGuestNeverLandsBuildOutput(CpFromGuestHarness):
         self.assertEqual(self.read("dest/proj/ok"), "1")
 
 
+class TestCpFromGuestFailsWithAMessage(CpFromGuestHarness):
+    """A Mac-side failure while staging or landing is a message that names the
+    file and the reason, never a traceback, and the staging directory goes."""
+
+    def test_an_os_error_while_landing_is_a_message_and_staging_is_removed(self):
+        os.makedirs("dest")
+        real_listdir = os.listdir
+
+        def listdir(path="."):
+            if ".yo-cp-" in str(path):
+                raise OSError(errno.EIO, "Input/output error", path)
+            return real_listdir(path)
+
+        with mock.patch.object(yo.cp.os, "listdir", listdir):
+            with self.assertRaises(yo.YoError) as caught:
+                self.pull({"proj/a\x1b[2J": "1"})
+        message = caught.exception.message
+        self.assertIn("the copy failed: ", message)
+        self.assertIn("/dest/.yo-cp-", message)
+        self.assertIn("Input/output error", message)
+        self.assertNotIn("\x1b", message)
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_a_cleanup_failure_that_is_no_os_error_joins_the_copys_own_error(self):
+        os.makedirs("dest")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                yo.cp.shutil,
+                "rmtree",
+                side_effect=RecursionError("maximum recursion depth exceeded"),
+            ),
+            mock.patch.object(
+                yo.ui, "err", side_effect=lambda line="": stderr.write(line + "\n")
+            ),
+            self.assertRaises(yo.YoError) as caught,
+        ):
+            self.copy([":~/proj", "dest/"], {"proj/a": "1"}, scp_fails=True)
+        self.assertEqual(caught.exception.message, "scp failed")
+        self.assertIn("cannot remove the staging directory", stderr.getvalue())
+        self.assertIn("maximum recursion depth exceeded", stderr.getvalue())
+
+    def test_a_tree_deeper_than_the_frame_limit_is_unlocked(self):
+        dirs = [os.path.join(self.cwd, "deep")]
+        for _ in range(sys.getrecursionlimit() + 100):
+            dirs.append(os.path.join(dirs[-1], "d"))
+        for directory in dirs:
+            os.mkdir(directory)
+        # Bottom up by hand: shutil.rmtree recurses too, on Python 3.9.
+        self.addCleanup(lambda: [os.rmdir(d) for d in reversed(dirs)])
+        os.chmod(dirs[-1], 0)
+        yo.unlock_tree(dirs[0])
+        self.assertEqual(stat.S_IMODE(os.stat(dirs[-1]).st_mode) & 0o700, 0o700)
+
+
 class TestCpFromGuestKeepsDirectoryModes(CpFromGuestHarness):
     """A directory made beside build output gets the mode OpenSSH's sftp client
     gives one: the guest's mode with the owner's rwx added."""
