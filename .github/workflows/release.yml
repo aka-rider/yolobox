@@ -28,6 +28,8 @@ jobs:
     timeout-minutes: 45
     env:
       TAG: ${{ github.event.release.tag_name }}
+    outputs:
+      sha: ${{ steps.tree.outputs.sha }}
     steps:
       - name: Refuse a tag that is not vMAJOR.MINOR.PATCH
         run: |
@@ -41,6 +43,15 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+
+      - id: tree
+        name: Record the tree the formula is built from
+        run: |
+          set -euo pipefail
+          # `release` checks this commit out, so the tree it stamps and
+          # archives is the one brew installed and tested here, not whatever
+          # main holds by the time that job starts.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install the formula from a local tarball and run its test
         run: |
@@ -105,7 +116,9 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          # The commit brew built and tested, not main by name: one tree for
+          # both jobs. The guard below checks main against it.
+          ref: ${{ needs.brew.outputs.sha }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -136,21 +149,37 @@ jobs:
       - name: Assert the release tag is the tip of main
         run: |
           set -euo pipefail
-          # The next steps force-move this tag. A tag cut from an older commit
-          # or another branch would then silently republish different content
-          # under the same name, so refuse rather than move it.
+          # HEAD is the tree brew built and tested. The next steps force-move
+          # the tag onto a stamp of it, so main must still be at that tree and
+          # the tag must name it. A tag cut from an older commit or another
+          # branch, or a main that moved after brew tested it, would silently
+          # republish different content under the same name, so refuse rather
+          # than move it. The one other shape accepted is what this workflow's
+          # own failed run leaves behind, the stamp pushed and the tag not yet
+          # moved: a `release: <version> [skip ci]` commit that changes only
+          # .version, directly on top of the tree. stamp_of says whether $1 is
+          # such a stamp of $2.
+          stamp_of() {
+              [ "$(git rev-parse "$1^")" = "$2" ] \
+                  && [ "$(git log -1 --format=%s "$1")" = "release: ${TAG#v} [skip ci]" ] \
+                  && [ "$(git diff-tree --no-commit-id --name-only -r "$1")" = ".version" ]
+          }
           git fetch --force --tags origin
+          git fetch origin main
+          built="$(git rev-parse HEAD)"
+          main_sha="$(git rev-parse FETCH_HEAD)"
+          if [ "$main_sha" != "$built" ]; then
+              if ! stamp_of "$main_sha" "$built"; then
+                  echo "::error::main is at ${main_sha}, not the tree brew built and tested (${built}); refusing to release either"
+                  exit 1
+              fi
+              # Our own stamp from the failed run: continue from it, so the
+              # stamp step below is a no-op and the tag lands on it.
+              git checkout -q "$main_sha"
+          fi
           tag_sha="$(git rev-parse "refs/tags/${TAG}^{commit}")"
           head_sha="$(git rev-parse HEAD)"
-          if [ "$tag_sha" = "$head_sha" ]; then
-              exit 0
-          fi
-          # A run that pushed the stamp but died before moving the tag leaves the
-          # tag one commit behind, on the commit the stamp was made from. Accept
-          # exactly that shape: HEAD is our own stamp and changes nothing else.
-          if [ "$tag_sha" = "$(git rev-parse HEAD^)" ] \
-              && [ "$(git log -1 --format=%s HEAD)" = "release: ${TAG#v} [skip ci]" ] \
-              && [ "$(git diff-tree --no-commit-id --name-only -r HEAD)" = ".version" ]; then
+          if [ "$tag_sha" = "$head_sha" ] || stamp_of "$head_sha" "$tag_sha"; then
               exit 0
           fi
           echo "::error::${TAG} points at ${tag_sha}, not the tip of main (${head_sha}); refusing to move it"
