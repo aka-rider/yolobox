@@ -45,12 +45,18 @@ def mirror(mac_path: str) -> Optional[str]:
     # Both spellings of $HOME: when $HOME goes through a symlink (macOS's /var),
     # a cwd the shell did not report (no usable $PWD) comes back from getcwd()
     # resolved. Only the prefix is matched; the rest of the path stays as spelled.
+    # $PWD is the shell's word and may hold `..`, so the mirror is normalised
+    # lexically (as a shell resolves a logical path, never through symlinks)
+    # and placed only if it stays under the guest home.
     home = state.home()
     for host in dict.fromkeys((home.rstrip("/"), os.path.realpath(home).rstrip("/"))):
         if mac_path == host:
             return AGENT_HOME
         if mac_path.startswith(host + "/"):
-            return AGENT_HOME + "/" + mac_path[len(host) + 1 :]
+            mirrored = os.path.normpath(AGENT_HOME + "/" + mac_path[len(host) + 1 :])
+            if mirrored == AGENT_HOME or mirrored.startswith(AGENT_HOME + "/"):
+                return mirrored
+            return None
     return None
 
 
@@ -62,6 +68,9 @@ def dir_for_cwd() -> str:
     if desired is None:
         ui.err(MISSING_PATH_NOTE % (ui.shown(logical_cwd()), AGENT_HOME))
         return AGENT_HOME
+    # Checked before it is sent: the helper is asked only for a path under the
+    # guest home, with no newline a forged answer could hide behind.
+    desired = guest_path(desired)
     reported = guest.guest_helper_check(
         guest.guest_helper(AGENT, "landing-dir", [desired]), "landing-dir"
     ).stdout.strip("\n")

@@ -1404,6 +1404,40 @@ class TestDirForCwdLandsOnDeepestExistingAncestor(FakeHome):
         self.assertIn(r'"/home/agent/a\x1b]0;pwned\x07"', line)
         self.assertTrue(line.isprintable())
 
+    def test_a_cwd_that_climbs_out_of_home_lands_on_the_agent_home_unasked(self):
+        for climbing in (
+            self.home + "/a/../../etc",
+            self.home + "/..",
+            self.home + "/a/../..",
+        ):
+            with self.subTest(climbing=climbing):
+                with mock.patch.object(yo.paths, "logical_cwd", return_value=climbing):
+                    with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
+                        with mock.patch.object(yo.ui, "err") as fake_err:
+                            result = yo.dir_for_cwd()
+                fake_ssh_run.assert_not_called()
+                self.assertEqual(result, yo.AGENT_HOME)
+                fake_err.assert_called_once_with(
+                    yo.MISSING_PATH_NOTE % (climbing, yo.AGENT_HOME)
+                )
+
+    def test_a_cwd_with_dots_inside_home_is_mirrored_normalised(self):
+        with mock.patch.object(
+            yo.paths, "logical_cwd", return_value=self.home + "/a/./b/../c/"
+        ):
+            self.assertEqual(
+                yo.paths.mirror(yo.paths.logical_cwd()), yo.AGENT_HOME + "/a/c"
+            )
+
+    def test_a_cwd_with_a_newline_is_refused_before_the_guest_is_asked(self):
+        with mock.patch.object(
+            yo.paths, "logical_cwd", return_value=self.home + "/a\nb"
+        ):
+            with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
+                with self.assertRaisesRegex(yo.YoError, "newline or NUL"):
+                    yo.dir_for_cwd()
+        fake_ssh_run.assert_not_called()
+
     def test_outside_home_lands_on_the_agent_home(self):
         with mock.patch.object(yo.paths, "logical_cwd", return_value="/etc"):
             with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
