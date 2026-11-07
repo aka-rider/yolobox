@@ -491,6 +491,17 @@ class TestResolveCpOperands(unittest.TestCase):
         self.assertEqual(plan.guest_paths, [self.MIRROR + "/a", self.MIRROR + "/b"])
         self.assertEqual(plan.local_paths, ["dest"])
 
+    def test_a_guest_source_named_twice_is_taken_once(self):
+        plan = yo.resolve_cp_operands([":a", ":b", ":a/", ":./a", "dest"], self.MIRROR)
+        self.assertEqual(plan.guest_paths, [self.MIRROR + "/a", self.MIRROR + "/b"])
+
+    def test_guest_sources_that_would_land_under_one_name_are_refused(self):
+        # They would merge in the staging directory, and APFS folds case.
+        for operands in ((":x/log", ":y/Log"), (":~", ":/tmp/agent"), (":a/x", ":x")):
+            with self.subTest(operands=operands):
+                with self.assertRaisesRegex(yo.YoError, "would land under one name"):
+                    yo.resolve_cp_operands(list(operands) + ["dest"], self.MIRROR)
+
 
 class TestCpMkdirTarget(unittest.TestCase):
     def test_colon_dest_uses_resolved_dest_itself(self):
@@ -1413,6 +1424,21 @@ class TestCpFromGuestNeverFetchesBuildOutput(CpFromGuestHarness):
         os.makedirs("dest")
         self.pull({"proj/a": "1", "proj/sub/b": "2"})
         self.assertEqual(self.scp_sources, [["/home/agent/proj"]])
+
+    def test_build_output_under_two_nested_sources_crosses_through_neither(self):
+        # Attributed to the inner source alone, the outer one was fetched whole.
+        os.makedirs("dest")
+        self.copy(
+            [":~/proj/sub", ":~/proj", "dest/"],
+            {"proj/sub/node_modules/x": "dep", "proj/sub/a": "1", "proj/b": "2"},
+        )
+        self.assertEqual(
+            self.landed(), ["dest/proj/b", "dest/proj/sub/a", "dest/sub/a"]
+        )
+        self.assertEqual(
+            self.requested(),
+            ["/home/agent/proj/b", "/home/agent/proj/sub/a", "/home/agent/proj/sub/a"],
+        )
 
     def test_a_nested_target_that_proves_nothing_is_still_searched(self):
         os.makedirs("dest")

@@ -72,7 +72,9 @@ def resolve_cp_operands(operands: List[str], cwd_mirror: Optional[str]) -> CpPla
             % state.yo_cmd("enter")
         )
     if sources_are_guest:
-        guest_paths = [resolve_guest_operand(source, cwd_mirror) for source in sources]
+        guest_paths = guest_sources(
+            [resolve_guest_operand(source, cwd_mirror) for source in sources]
+        )
         return CpPlan(
             direction="from_guest", local_paths=[dest], guest_paths=guest_paths
         )
@@ -80,6 +82,23 @@ def resolve_cp_operands(operands: List[str], cwd_mirror: Optional[str]) -> CpPla
     return CpPlan(
         direction="to_guest", local_paths=list(sources), guest_paths=guest_paths
     )
+
+
+def guest_sources(resolved: List[str]) -> List[str]:
+    """The sources of a download, each once, in the order given. Two sources
+    with one name would meet in the staging directory and merge silently, and
+    APFS folds case, so two names that differ only in case would meet too."""
+    sources = list(dict.fromkeys(resolved))
+    by_name: Dict[str, str] = {}
+    for source in sources:
+        name = posixpath.basename(source).casefold()
+        if name in by_name:
+            raise YoError(
+                'sources "%s" and "%s" would land under one name; copy them one at a time'
+                % (ui.shown(by_name[name]), ui.shown(source))
+            )
+        by_name[name] = source
+    return sources
 
 
 def cp_mkdir_target(dest_operand: str, resolved_dest: str, source_count: int) -> str:
@@ -432,9 +451,13 @@ def find_build_output(sources: Sequence[str]) -> List[Tuple[str, str]]:
     for path in confirmed:
         if not any(path.startswith(kept + "/") for kept in outermost):
             outermost.append(path)
+    # A path under two sources (":~/proj/sub :~/proj") is reached from both,
+    # so both are walked; attributed to one, the other would be fetched whole.
     return [
-        (next(source for source in sources if path.startswith(source + "/")), path)
+        (source, path)
         for path in outermost
+        for source in sources
+        if path.startswith(source + "/")
     ]
 
 
