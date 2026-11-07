@@ -45,10 +45,19 @@ class TestFullRules(unittest.TestCase):
         lan = "ip daddr { 192.168.1.20/32 } accept\n    ip6 daddr { fd00:1::/64 } accept\n"
         egress_rules.check_rules(broken(RULES, "    \n", "    " + lan))
 
-    def test_a_lan_entry_naming_the_gateway_fails(self):
-        lan = "ip daddr { 192.168.5.2/32 } accept\n"
-        with self.assertRaisesRegex(egress_rules.RuleError, "unexpected rule"):
-            egress_rules.check_rules(broken(RULES, "    \n", "    " + lan))
+    def test_a_lan_entry_holding_the_gateway_fails(self):
+        for entry in ("192.168.5.2/32", "192.168.5.0/24", "192.168.0.0/16", "0.0.0.0/0"):
+            with self.subTest(entry=entry):
+                lan = "ip daddr { 10.1.2.3/32, %s } accept\n" % entry
+                with self.assertRaisesRegex(egress_rules.RuleError, "unexpected rule"):
+                    egress_rules.check_rules(broken(RULES, "    \n", "    " + lan))
+
+    def test_a_lan_entry_beside_the_gateway_passes(self):
+        # Not a substring test: 192.168.5.20 contains "192.168.5.2".
+        for entry in ("192.168.5.20/32", "192.168.5.3/32", "192.168.5.200/29"):
+            with self.subTest(entry=entry):
+                lan = "ip daddr { %s } accept\n" % entry
+                egress_rules.check_rules(broken(RULES, "    \n", "    " + lan))
 
     def test_every_blocked_range_must_be_rejected(self):
         for old, new in (

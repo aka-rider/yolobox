@@ -12,6 +12,7 @@ diffs the fixtures against it so they cannot drift
         <egressLastResortRules> <tunnel egressRules>
 """
 
+import ipaddress
 import re
 import sys
 
@@ -42,8 +43,10 @@ DNS = [
 ]
 ND = "icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept"
 MLD = "icmpv6 type { mld-listener-report, mld2-listener-report } ip6 daddr ff02::/16 accept"
-# A lanAllow entry: the user's own opt-in, so any address set but the gateway.
+# A lanAllow entry: the user's own opt-in, so any address set but one that
+# holds the gateway.
 LAN = re.compile(r"ip6? daddr \{ [0-9a-fA-F:./, ]+ \} accept")
+V4_TOKEN = re.compile(r"\d+\.\d+\.\d+\.\d+(?:/\d+)?")
 REJECT = "counter reject with icmpx type admin-prohibited"
 
 BLOCKED_V4 = {
@@ -67,6 +70,15 @@ class RuleError(AssertionError):
 def require(condition, message):
     if not condition:
         raise RuleError(message)
+
+
+def addresses_gateway(rule):
+    """The rule names an address or a network that holds the gateway."""
+    gateway = ipaddress.ip_address(GATEWAY)
+    return any(
+        gateway in ipaddress.ip_network(token, strict=False)
+        for token in V4_TOKEN.findall(rule)
+    )
 
 
 def chains(text):
@@ -172,14 +184,14 @@ def check_output(accepts_and_tail):
     require(all(d in accepts for d in DNS), "the gateway's DNS is not accepted")
     for rule in accepts:
         known = rule in [REPLY, DHCP, ND, MLD, *DNS]
-        lan = LAN.fullmatch(rule) is not None and GATEWAY not in rule
+        lan = LAN.fullmatch(rule) is not None and not addresses_gateway(rule)
         require(known or lan, "unexpected rule before the rejects: %s" % rule)
     require(
         [r for r in accepts if "dport 67" in r] == [DHCP],
         "a port 67 rule other than the DHCP one",
     )
     require(
-        [r for r in accepts if GATEWAY in r] == [DHCP, *DNS],
+        [r for r in accepts if addresses_gateway(r)] == [DHCP, *DNS],
         "the gateway is addressed by more than its DHCP and port 53 accepts",
     )
     check_blocked(tail, "", REJECT)
