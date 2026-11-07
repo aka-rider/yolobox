@@ -2005,9 +2005,32 @@ class TestVmServicesSkipsOnAnOldBox(unittest.TestCase):
         fake_aws.assert_not_called()
         fake_forward.assert_not_called()
 
+    def test_a_box_with_no_agent_account_is_not_healed_and_names_the_rebuild(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.run_vm_services(agent_ok=False, operator_ok=True, units_ok=False)
+        self.assertIn("no agent account", caught.exception.message)
+        self.assertIn("yo bootstrap", caught.exception.message)
+
+    def test_an_agent_whose_login_fails_is_not_healed_and_its_words_are_shown(self):
+        with (
+            mock.patch.object(yo.aws, "ensure_aws_broker") as fake_aws,
+            mock.patch.object(yo.forwards, "ensure_forwards") as fake_forward,
+            mock.patch.object(
+                yo.sshx,
+                "account_status",
+                return_value=(yo.AccountStatus.AGENT_FAILING, "  | rc: boom"),
+            ),
+        ):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.vm_services()
+        self.assertIn("login on yolobox fails", caught.exception.message)
+        self.assertIn("  | rc: boom", caught.exception.message)
+        fake_aws.assert_not_called()
+        fake_forward.assert_not_called()
+
     def test_missing_units_skips_naming_bootstrap(self):
         fake_aws, fake_forward, fake_err = self.run_vm_services(
-            agent_ok=False, operator_ok=True, units_ok=False
+            agent_ok=True, operator_ok=True, units_ok=False
         )
         fake_aws.assert_not_called()
         fake_forward.assert_not_called()
@@ -2154,6 +2177,37 @@ class TestHealReverseForward(FakeHome):
         self.assertEqual(calls[2][2], ["rm", "-f", "/guest"])
         self.assertEqual(calls[3][1][-5:-2], ["-O", "forward", "-R"])
         self.assertTrue(calls[3][2])
+
+    def test_an_agent_that_cannot_log_in_is_unreachable_not_a_dead_forward(self):
+        forward = yo.ReverseForward(
+            "x", "/guest", "/host", ("probe",), lambda proc: proc.returncode == 0
+        )
+        refused = mock.Mock(
+            returncode=yo.SSH_UNREACHABLE, stdout="", stderr="Permission denied"
+        )
+        with (
+            mock.patch.object(yo.sshx, "ssh_run", return_value=refused),
+            mock.patch.object(yo.proc, "run") as fake_run,
+        ):
+            with self.assertRaises(yo.Unreachable):
+                yo.heal_reverse_forward(forward)
+        fake_run.assert_not_called()
+
+    def test_the_heal_holds_the_machines_forward_lock(self):
+        forward = yo.ReverseForward("x", "/guest", "/host", ("probe",), lambda p: True)
+        held = []
+
+        def probe(role, argv, **kwargs):
+            try:
+                with yo.state.host_state_lock("yolobox.forwards.lock", wait=False):
+                    held.append(False)
+            except yo.LockBusy:
+                held.append(True)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(yo.sshx, "ssh_run", side_effect=probe):
+            yo.heal_reverse_forward(forward)
+        self.assertEqual(held, [True])
 
 
 class TestEnsureOpForward(unittest.TestCase):
