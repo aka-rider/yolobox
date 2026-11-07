@@ -513,7 +513,33 @@ class LibvirtDriver:
         return os.path.join(state.home(), ".1password/agent.sock")
 
     def domain_exists(self) -> bool:
-        return domain_name() in domain_names()
+        """Whether this machine's domain is defined. A domain of that name that
+        yo did not define for this machine (no yolobox:instance tag, or another
+        instance's) is an error, never "exists": every command reaches the
+        domain through here, so yo never stops, resizes or destroys a domain
+        of another tool that happens to carry a box's name."""
+        name = domain_name()
+        if name not in domain_names():
+            return False
+        dump = libvirt_host.virsh("dumpxml", name, check=False)
+        if dump.returncode != 0:
+            raise_unless_undefined("dumpxml", name, dump)
+            return False
+        marker = libvirt_host.domain_marker(libvirt_host.domain_root(dump.stdout))
+        if marker != state.box.name:
+            raise YoError(
+                "domain %s on %s is not %s's: yo defines a domain with a "
+                "yolobox:instance tag holding the machine's name, and this one "
+                "%s. yo never touches a domain it did not define — rename or "
+                "remove it with virsh, or pick another machine name (-m)"
+                % (
+                    name,
+                    LIBVIRT_URI,
+                    state.box.name,
+                    "has none" if marker is None else "says %r" % marker,
+                )
+            )
+        return True
 
     def require_domain(self) -> None:
         if not self.domain_exists():

@@ -132,9 +132,14 @@ A domain can go away while `yo` waits for it: the host's OOM killer ends its qem
 
 The way back after an OOM kill is less memory or more free memory on the host. The domain keeps the memory it was defined with, so `yo -m NAME down && virsh -c qemu:///system undefine --nvram yolobox-NAME`, which keeps the disk, then `yo -m NAME up --memory N`. A `yo bootstrap` that was rebooting into its new generation finishes when it is run again: the built generation is already the boot default.
 
+## Only its own domain
+
+A domain `yo` reaches by name must be its own. `LibvirtDriver.domain_exists()` reads the named domain's `yolobox:instance` tag before any command acts on it, and a domain of that name with no tag, or another machine's, stops the command with `domain yolobox-NAME ... is not NAME's`; `yo` never stops, resizes or destroys a domain it did not define. Earlier, `yo -m NAME destroy --yes` removed any domain called `yolobox-NAME`.
+
 ## Recognising failures
 
 - `yo` refuses with a message naming `host-setup.sh`: a precondition is missing. The message says which: `virsh`, the connection to `qemu:///system`, the daemon's version, `yolobox-host.service`, the `yolobox-vm` account or the port window.
+- A command stops with `domain yolobox-NAME on qemu:///system is not NAME's`: another tool defined a domain with a box's name, or a box's domain was renamed. `yo` touches neither; rename or remove it with `virsh`, or use another `-m` name.
 - `yo up --memory`, `--disk` or `--cpus` says the box `is running with ...` (or paused, and so on): a size changes only while the domain is shut off, so `yo down` first (see [Sizing a box](#sizing-a-box)). `... disk is N GiB and --disk M is smaller`: a disk cannot shrink. `... already holds a finished N GiB disk`: the domain is gone but its volume is not, and `--disk` asks for another size. `--memory N does not fit on this host`: ask for at most what it names, or stop one of the domains it lists (see [Sizing a box](#sizing-a-box)).
 - `yo up` or `yo bootstrap` ends with `... is shut off, not Running, while yo waited for ...`: the domain went away under `yo`, possibly by the host's OOM killer (see [A domain that dies under yo](#a-domain-that-dies-under-yo)).
 - `yo up` raises a gap message before asking for the passphrase: the live domain differs from the template. Read the gap, then recreate the domain. A gap right after a libvirt or firmware package upgrade (`text:os/loader=...`, `text:devices/emulator=...`) means libvirt now resolves the firmware or emulator to a path `virsh domcapabilities` no longer lists; redefine the domain so libvirt resolves it again.

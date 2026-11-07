@@ -2079,6 +2079,47 @@ class TestStatusAndGaps(LibvirtCase):
         )
 
 
+class TestOwnDomain(LibvirtCase):
+    """A domain yo reaches by name must carry its own tag."""
+
+    def test_a_domain_of_this_name_that_yo_did_not_define_is_an_error_not_a_box(self):
+        # Every command reaches the domain through domain_exists, so none
+        # stops, resizes or destroys a domain of another tool.
+        tagged = self.host.domains.get
+        self.host.tagged_domain("box", FIRST_PORT)
+        foreign = re.sub(
+            r"<metadata>.*</metadata>", "", tagged("yolobox-box"), flags=re.S
+        )
+        other = tagged("yolobox-box").replace(
+            ">box</yolobox:instance>", ">other</yolobox:instance>"
+        )
+        for xml, said in ((foreign, "has none"), (other, "says 'other'")):
+            with self.subTest(said=said):
+                self.host.domains["yolobox-box"] = xml
+                for look in (
+                    self.driver.vm_status,
+                    self.driver.ssh_port,
+                    self.driver.stop,
+                    self.driver.removals,
+                    self.driver.config_gaps,
+                ):
+                    with self.assertRaises(self.box.YoError) as caught:
+                        look()
+                    self.assertIn("domain yolobox-box", caught.exception.message)
+                    self.assertIn("is not box's", caught.exception.message)
+                    self.assertIn(said, caught.exception.message)
+        self.assertEqual(
+            [sub for sub in self.host.subcommands() if sub not in READS], []
+        )
+
+    def test_a_domain_undefined_between_the_listing_and_its_tag_read_does_not_exist(
+        self,
+    ):
+        self.host.tagged_domain("box", FIRST_PORT)
+        self.host.before_dumpxml = lambda name: self.host.domains.pop(name, None)
+        self.assertFalse(self.driver.domain_exists())
+
+
 class TestKeepalive(LibvirtCase):
     def pid(self, output):
         self.host.master_output = output
