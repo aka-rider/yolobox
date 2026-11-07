@@ -413,31 +413,54 @@ class State:
         self.creds = creds
         self.events.note(f"{self.profile}: minted", f"expires {creds['Expiration']}")
 
-    # Returns fresh-enough creds, or None when nothing usable is left.
-    # Re-mints synchronously (holding the lock) when the cache is within
-    # REMINT_WINDOW_SECONDS of expiry, throttled to at most one attempt per
-    # min-remint-interval — a mint failure while the cache is still
-    # genuinely unexpired keeps serving the stale cache rather than 500ing.
-    # Raises ProfileBusy when the lock stays taken, so one hung mint cannot
-    # park every slot behind it.
+    def _remint_unless_throttled_locked(self):
+        """At most one attempt per min-remint-interval: a failing mint (an
+        expired SSO login) is retried that often, not on every request."""
+        throttled = (
+            self.last_mint_attempt is not None
+            and (time.monotonic() - self.last_mint_attempt) < self.min_remint_interval
+        )
+        if not throttled:
+            self._remint_locked()
+
+    def usable(self):
+        """The cached credentials while they have not expired, else None."""
+        creds = self.creds
+        if creds is None or seconds_to_expiry(creds["Expiration"]) <= 0:
+            return None
+        return creds
+
+    # Returns usable creds, or None when nothing usable is left. A cache
+    # within REMINT_WINDOW_SECONDS of expiry is minted again by the one
+    # request that finds the lock free, while every other request is served
+    # the cache: it is still valid, and a mint can take MINT_TIMEOUT_SECONDS.
+    # A request with nothing usable has to wait for a mint, and raises
+    # ProfileBusy when the lock stays taken, so one hung mint cannot park every
+    # slot behind it. A failed refresh keeps serving the cache until it expires.
     def get(self):
+        creds = self.usable()
+        if creds is None:
+            return self._wait_for_a_mint()
+        if seconds_to_expiry(creds["Expiration"]) < REMINT_WINDOW_SECONDS:
+            self._refresh_unless_in_progress()
+        return self.usable()
+
+    def _refresh_unless_in_progress(self):
+        if not self.lock.acquire(blocking=False):
+            return
+        try:
+            self._remint_unless_throttled_locked()
+        finally:
+            self.lock.release()
+
+    def _wait_for_a_mint(self):
         if not self.lock.acquire(timeout=PROFILE_LOCK_TIMEOUT_SECONDS):
             raise ProfileBusy(self.profile)
         try:
-            needs_remint = (
-                self.creds is None
-                or seconds_to_expiry(self.creds["Expiration"]) < REMINT_WINDOW_SECONDS
-            )
-            throttled = (
-                self.last_mint_attempt is not None
-                and (time.monotonic() - self.last_mint_attempt)
-                < self.min_remint_interval
-            )
-            if needs_remint and not throttled:
-                self._remint_locked()
-            if self.creds is None or seconds_to_expiry(self.creds["Expiration"]) <= 0:
-                return None
-            return self.creds
+            # The mint this request queued behind may have filled the cache.
+            if self.usable() is None:
+                self._remint_unless_throttled_locked()
+            return self.usable()
         finally:
             self.lock.release()
 

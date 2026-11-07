@@ -1216,6 +1216,81 @@ class TestCredentialCache(ServedBroker):
         self.assertEqual(profiles, ["dev", "prod"])
 
 
+class TestRefreshInsideTheWindow(ServedBroker):
+    """A cache inside the re-mint window is still valid: one request refreshes
+    it, and the others are served the cache instead of waiting for the lock."""
+
+    def hung_refresh(self):
+        """The second mint blocks until `release`; `in_mint` says it started."""
+        in_mint = threading.Event()
+        release = threading.Event()
+        first = [minted("first", 300)]
+
+        def mint(*args, **kwargs):
+            if first:
+                return first.pop()
+            in_mint.set()
+            self.assertTrue(release.wait(10))
+            return minted("second", 3600)
+
+        self.aws(minted("unused", 3600)).side_effect = mint
+        self.addCleanup(release.set)
+        return in_mint, release
+
+    def test_the_cache_is_served_while_another_request_refreshes_it(self):
+        in_mint, release = self.hung_refresh()
+        self.assertEqual(self.served_token(), "first")
+        refresher = threading.Thread(target=self.served_token)
+        refresher.start()
+        self.addCleanup(refresher.join)
+        self.assertTrue(in_mint.wait(10))
+        with mock.patch.object(broker, "PROFILE_LOCK_TIMEOUT_SECONDS", 0.2):
+            self.assertEqual(self.served_token(), "first")
+        release.set()
+        refresher.join(10)
+        self.assertEqual(self.served_token(), "second")
+
+    def test_a_refresh_in_progress_is_not_started_twice(self):
+        in_mint, release = self.hung_refresh()
+        self.assertEqual(self.served_token(), "first")
+        refresher = threading.Thread(target=self.served_token)
+        refresher.start()
+        self.addCleanup(refresher.join)
+        self.assertTrue(in_mint.wait(10))
+        for _ in range(3):
+            self.assertEqual(self.served_token(), "first")
+        release.set()
+        refresher.join(10)
+        self.assertEqual(self.served_token(), "second")
+        self.assertEqual(self.states["dev"].events, self.events)
+
+    def test_a_request_with_nothing_cached_still_waits_for_the_mint(self):
+        in_mint = threading.Event()
+        release = threading.Event()
+
+        def first_mint(*args, **kwargs):
+            in_mint.set()
+            self.assertTrue(release.wait(10))
+            return minted("shared", 3600)
+
+        run = self.aws(minted("unused", 3600))
+        run.side_effect = first_mint
+        self.addCleanup(release.set)
+        waiters = []
+        threads = [
+            threading.Thread(target=lambda: waiters.append(self.served_token()))
+            for _ in range(3)
+        ]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(in_mint.wait(10))
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(waiters, ["shared"] * 3)
+        self.assertEqual(run.call_count, 1)
+
+
 class TestRemintThrottle(ServedBroker):
     min_remint_interval = 3600.0
 
