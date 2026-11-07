@@ -112,19 +112,17 @@ await_first_progress() {
 # ffmpeg's parent for the whole recording, so that its exit status is known:
 # `stop` is not its parent and can only learn that it exited. Runs in the
 # background with start's stdout, stderr and lock closed, so that start
-# returns as soon as the verdict is in. Reports one verdict line to the
-# verdict fifo: `recording <pid> <starttime>`, `exited <status>` or
+# returns as soon as the verdict is in, and with its stderr on the
+# recording's log, which ffmpeg inherits: the log is opened once, by start,
+# and no child has a log redirection to fail at. Reports one verdict line to
+# the verdict fifo: `recording <pid> <starttime>`, `exited <status>` or
 # `timeout`, and after ffmpeg exits writes its status to $status_file.
 record() {
-  local out="$1" log="$2" pid starttime ready code
-  # The fifo before the log: a redirection that fails ends the child before
-  # the ones after it, and a fifo nobody opens for writing blocks its reader
-  # (this function) forever. start created the log, so the order is a
-  # second line of defence.
+  local out="$1" pid starttime ready code
   ffmpeg -nostdin -loglevel error -progress pipe:3 -f x11grab \
     -video_size 1920x1080 -framerate 15 -i "${DISPLAY:-:0}" -c:v libx264 \
     -preset ultrafast -pix_fmt yuv420p "$out" \
-    3>"$progress_fifo" >/dev/null 2>"$log" &
+    3>"$progress_fifo" >/dev/null &
   pid=$!
   # Read before anything else: bash reaps a child the moment it exits, and
   # /proc goes with it. Empty means ffmpeg is already gone; `wait` says why.
@@ -194,7 +192,7 @@ cmd_start() {
   exec 5<>"$verdict_fifo"
   # The wrapper gives up start's stdout and stderr, else a caller reading
   # them waits for the recording to end, and the lock, else stop cannot take it.
-  record "$out" "$log" </dev/null >>"$log" 2>&1 5>&- 9>&- &
+  record "$out" </dev/null >>"$log" 2>&1 5>&- 9>&- &
   wrapper=$!
 
   verdict=''
