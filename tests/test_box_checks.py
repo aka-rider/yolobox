@@ -5,7 +5,7 @@ paths it names (/run/wrappers/bin, /run/current-system/sw/bin, the cidata
 binary, its /tmp scratch directories) pointed at a scratch directory. A fake
 `sudo` drops sudo's own options and runs the command, so "as the agent" runs
 as the test's own account; the fakes for getcap, stat, systemctl, journalctl,
-ssh, ssh-add, getent, id, strace, findmnt, ls, ps, loginctl and busctl answer
+ssh, ssh-add, sshd, getent, id, strace, findmnt, ls, ps, loginctl and busctl answer
 what each test bakes in. Only the checks that judge a tool's answer are
 covered: the ones that need a kernel (sysctls, modules, io_uring) are the
 live box's.
@@ -28,7 +28,6 @@ WRAPPERS_LINE = "readonly WRAPPERS=/run/wrappers/bin"
 SYSBIN_LINE = "readonly SYSBIN=/run/current-system/sw/bin"
 CIDATA_BINARY = "/mnt/lima-cidata/lima-guestagent"
 WORK_TEMPLATE = "/tmp/hk-check.XXXXXX"
-KEY_TEMPLATE = "/tmp/hk-agent-key.XXXXXX"
 MAIN_CALL = 'main "$@" </dev/null\n'
 
 FAKE_SUDO = """#!/bin/sh
@@ -51,8 +50,6 @@ REAL_TOOLS = (
     "kill",
     "mkdir",
     "touch",
-    "cat",
-    "grep",
     "mv",
     "ln",
 )
@@ -104,7 +101,6 @@ class BoxCheck(unittest.TestCase):
             (SYSBIN_LINE, "readonly SYSBIN=%s" % self.bin),
             (CIDATA_BINARY, str(self.tmp / "lima-guestagent")),
             (WORK_TEMPLATE, str(self.tmp / "hk-check.XXXXXX")),
-            (KEY_TEMPLATE, str(self.tmp / "hk-agent-key.XXXXXX")),
             (MAIN_CALL, ""),
         ):
             self.assertEqual(text.count(old), 1, old)
@@ -568,23 +564,21 @@ class BoxCheck(unittest.TestCase):
         self.assert_fail(result, "systemd-tmpfiles --create succeeded")
         self.assertFalse((self.home / ".config" / "zed").exists())
 
-    # -- the operator's login ------------------------------------------
+    # -- the logins off the gateway --------------------------------------
 
     def ssh_fakes(
-        self,
-        agent_rc=0,
-        operator_out="Permission denied (publickey).",
-        operator_rc=255,
-        keys_rc=0,
+        self, out="Permission denied (publickey).", rc=255, keys_rc=0, logs_in=()
     ):
+        """ssh refuses every target with `out` and `rc`; the user@addr
+        targets in `logs_in` log in instead."""
         self.fake(
             "ssh",
             "#!/bin/sh\n"
             "for a; do case $a in *@*) target=$a ;; esac; done\n"
             "case $target in\n"
-            'agent@*) printf "Permission denied (publickey).\\n" >&2; exit %d ;;\n'
-            '*) printf "%s\\n" >&2; exit %d ;;\n'
-            "esac\n" % (agent_rc, operator_out, operator_rc),
+            + "".join("%s) exit 0 ;;\n" % target for target in logs_in)
+            + '*) printf "%s\\n" >&2; exit %d ;;\n' % (out, rc)
+            + "esac\n",
         )
         self.fake(
             "ssh-add",
@@ -602,90 +596,122 @@ class BoxCheck(unittest.TestCase):
             "esac\n" % "\\n".join(lines),
         )
 
-    def refusals(self):
+    PROBED = [
+        (user, addr)
+        for user in (OPERATOR, "agent")
+        for addr in ("127.0.0.1", "192.168.5.15")
+    ]
+
+    def refusals(self, but=None):
         return [
-            "User %s from %s %s" % (OPERATOR, addr, ALLOWUSERS)
-            for addr in ("127.0.0.1", "192.168.5.15")
+            "User %s from %s %s" % (user, addr, ALLOWUSERS)
+            for user, addr in self.PROBED
+            if (user, addr) != but
         ]
 
-    def test_an_allowusers_refusal_in_the_journal_passes(self):
+    def test_an_allowusers_refusal_of_each_account_and_address_passes(self):
         self.ssh_fakes()
         self.journal(self.refusals())
-        result = self.run_check("check_operator_login_refused %s" % OPERATOR)
-        self.assert_ok(
-            result, "ok: sshd refuses op at 192.168.5.15 because of AllowUsers"
-        )
+        result = self.run_check("check_logins_refused_off_gateway %s" % OPERATOR)
+        for user, addr in self.PROBED:
+            self.assert_ok(
+                result, "ok: sshd refuses %s at %s because of AllowUsers" % (user, addr)
+            )
 
     def test_a_refusal_the_journal_does_not_explain_fails(self):
-        self.ssh_fakes()
-        self.journal(["Connection closed by authenticating user op 127.0.0.1"])
-        result = self.run_check("check_operator_login_refused %s" % OPERATOR)
-        self.assert_fail(
-            result,
-            "sshd refused op at 127.0.0.1, but its journal does not say AllowUsers",
-        )
+        for user, addr in self.PROBED:
+            with self.subTest(user=user, addr=addr):
+                self.ssh_fakes()
+                self.journal(
+                    self.refusals(but=(user, addr))
+                    + ["Connection closed by authenticating user %s %s" % (user, addr)]
+                )
+                result = self.run_check(
+                    "check_logins_refused_off_gateway %s" % OPERATOR
+                )
+                self.assert_fail(
+                    result,
+                    "sshd refused %s at %s, but its journal does not say AllowUsers"
+                    % (user, addr),
+                )
 
-    def test_a_forwarded_key_the_box_does_not_authorize_is_a_skip(self):
-        self.ssh_fakes(agent_rc=255)
-        self.journal(self.refusals())
-        result = self.run_check("check_operator_login_refused %s" % OPERATOR)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("SKIP: sshd's refusal of op was NOT tested", result.stderr)
-        self.assertNotIn("ok: sshd refuses", result.stdout)
-
-    def test_an_operator_login_from_the_agent_fails(self):
-        self.ssh_fakes(operator_out="", operator_rc=0)
-        self.journal(self.refusals())
-        result = self.run_check("check_operator_login_refused %s" % OPERATOR)
-        self.assert_fail(result, "the agent logged in as op at 127.0.0.1")
+    def test_a_login_from_the_agent_fails(self):
+        for user, addr in self.PROBED:
+            with self.subTest(user=user, addr=addr):
+                self.ssh_fakes(logs_in=("%s@%s" % (user, addr),))
+                self.journal(self.refusals())
+                result = self.run_check(
+                    "check_logins_refused_off_gateway %s" % OPERATOR
+                )
+                self.assert_fail(
+                    result, "the agent logged in as %s at %s" % (user, addr)
+                )
 
     def test_a_connection_closed_before_authentication_fails(self):
-        self.ssh_fakes(operator_out="Connection closed by 127.0.0.1 port 22")
+        self.ssh_fakes(out="Connection closed by 127.0.0.1 port 22")
         self.journal(self.refusals())
-        result = self.run_check("check_operator_login_refused %s" % OPERATOR)
+        result = self.run_check("check_logins_refused_off_gateway %s" % OPERATOR)
         self.assert_fail(
             result, "ssh as op at 127.0.0.1 failed, but not with Permission denied"
         )
 
+    def test_a_forwarded_agent_without_a_key_is_a_skip(self):
+        self.ssh_fakes(keys_rc=1)
+        self.journal(self.refusals())
+        result = self.run_check("check_logins_refused_off_gateway %s" % OPERATOR)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SKIP: sshd's refusal of op and agent", result.stderr)
+        self.assertNotIn("ok: sshd refuses", result.stdout)
+
     def test_an_unreachable_ssh_agent_fails(self):
         self.ssh_fakes(keys_rc=2)
-        result = self.run_check("check_operator_login_refused %s" % OPERATOR)
+        result = self.run_check("check_logins_refused_off_gateway %s" % OPERATOR)
         self.assert_fail(result, "ssh-add -L exited 2")
 
     # -- the agent's own authorized_keys -------------------------------
 
-    def planted_key_fakes(self, ssh_rc):
+    def agent_sshd_config(
+        self,
+        keys_file="none",
+        command="/etc/ssh/agent-authorized-keys",
+        command_user="root",
+        owner_mode="root 555",
+    ):
         self.fake(
-            "ssh-keygen",
+            "sshd",
             "#!/bin/sh\n"
-            "for a; do case $prev in -f) f=$a ;; -C) c=$a ;; esac; prev=$a; done\n"
-            'printf "private\\n" >"$f"; printf "ssh-ed25519 AAAA %s\\n" "$c" >"$f.pub"\n',
+            'printf "authorizedkeysfile %s\\nauthorizedkeyscommand %s\\nauthorizedkeyscommanduser %s\\n"\n'
+            % (keys_file, command, command_user),
         )
-        self.fake(
-            "ssh",
-            '#!/bin/sh\nprintf "Permission denied (publickey).\\n" >&2\nexit %d\n'
-            % ssh_rc,
-        )
+        self.fake("stat", '#!/bin/sh\nprintf "%s\\n"\n' % owner_mode)
 
-    def test_a_planted_key_that_is_refused_passes_and_is_taken_out(self):
-        self.planted_key_fakes(ssh_rc=255)
-        authorized = self.home / ".ssh" / "authorized_keys"
-        authorized.parent.mkdir()
-        authorized.write_text("ssh-ed25519 BBBB theirs\n")
-        result = self.run_check("stage_helpers; check_agent_authorized_keys_ignored")
+    def test_no_keys_file_and_a_root_run_command_pass(self):
+        self.agent_sshd_config()
         self.assert_ok(
-            result,
-            "ok: a key the agent writes to its own authorized_keys does not log it in",
+            self.run_check("check_agent_authorized_keys_ignored"),
+            "ok: sshd reads the agent's keys from root's /etc/ssh/agent-authorized-keys",
         )
-        self.assertEqual(authorized.read_text(), "ssh-ed25519 BBBB theirs\n")
 
-    def test_a_planted_key_that_logs_in_fails(self):
-        self.planted_key_fakes(ssh_rc=0)
-        result = self.run_check(
-            "stage_helpers; trap cleanup EXIT; check_agent_authorized_keys_ignored"
+    def test_sshd_that_reads_the_agents_authorized_keys_fails(self):
+        self.agent_sshd_config(keys_file=".ssh/authorized_keys")
+        self.assert_fail(
+            self.run_check("check_agent_authorized_keys_ignored"),
+            "sshd -T for agent from 192.168.5.2 lacks 'authorizedkeysfile none'",
         )
-        self.assert_fail(result, "the agent logged in with a key it wrote")
-        self.assertFalse((self.home / ".ssh" / "authorized_keys").exists())
+
+    def test_a_command_run_as_the_agent_fails(self):
+        self.agent_sshd_config(command_user="agent")
+        self.assert_fail(
+            self.run_check("check_agent_authorized_keys_ignored"),
+            "sshd -T for agent from 192.168.5.2 lacks 'authorizedkeyscommanduser root'",
+        )
+
+    def test_a_command_the_agent_could_write_fails(self):
+        self.agent_sshd_config(owner_mode="agent 755")
+        self.assert_fail(
+            self.run_check("check_agent_authorized_keys_ignored"),
+            "/etc/ssh/agent-authorized-keys is agent 755, want root 555",
+        )
 
     # -- the Lima guest agent -------------------------------------------
 
