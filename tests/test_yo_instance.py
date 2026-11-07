@@ -307,7 +307,7 @@ class TestSshPort(unittest.TestCase):
 class TestNothingFallsBackToTheDefaultPortForAnotherInstance(FakeHome):
     def test_the_initrd_probe_before_lima_wrote_ssh_config_uses_the_created_port(self):
         with as_instance(INSTANCE_B), fake_limactl(limactl_json(60023)):
-            argv = yo.initrd_ssh_argv("true")
+            argv = yo.initrd_ssh_argv("true", yo.initrd_endpoint())
         self.assertIn("Port=60023", argv)
         self.assertNotIn("Port=%d" % yo.SSH_LOCAL_PORT, argv)
 
@@ -316,7 +316,7 @@ class TestNothingFallsBackToTheDefaultPortForAnotherInstance(FakeHome):
             with self.assertRaisesRegex(
                 yo.YoError, "second has ssh\\.localPort 0, which is not a"
             ):
-                yo.initrd_ssh_argv("true")
+                yo.initrd_ssh_argv("true", yo.initrd_endpoint())
 
     def test_every_message_that_names_the_port_names_the_instances(self):
         attempt = yo.HelperRun(

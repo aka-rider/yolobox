@@ -4384,6 +4384,9 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
         with (
             mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
             mock.patch.object(yo.lima, "lima_instance_info", return_value=running),
+            mock.patch.object(
+                yo.unlock, "endpoint_kind", return_value=yo.Endpoint.STAGE2
+            ),
             mock.patch.object(yo.unlock, "stage2_up", return_value=True),
             mock.patch.object(yo.sshconfig, "ensure_agent_ssh_config"),
             mock.patch.object(yo.guest, "ensure_guest_known_hosts"),
@@ -4777,9 +4780,11 @@ class TestStatusWithVmDown(unittest.TestCase):
             mock.patch.object(yo.LIMA, "config_gaps", lambda: []),
             mock.patch.object(yo.LIMA, "config_notes", lambda: []),
             mock.patch.object(
-                yo.unlock, "sshd_answers", lambda user: yo.SshOutcome.NOT_LISTENING
+                yo.unlock,
+                "sshd_answers",
+                lambda endpoint, user: yo.SshOutcome.NOT_LISTENING,
             ),
-            mock.patch.object(yo.unlock, "ssh_banner", lambda: ""),
+            mock.patch.object(yo.unlock, "ssh_banner", lambda endpoint: ""),
             mock.patch.object(yo.shutil, "which", lambda name: None),
         ):
             with self.assertRaises(yo.YoError) as caught:
@@ -4836,7 +4841,7 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
         port = self.serve(banner)
         asked = []
 
-        def answers(user):
+        def answers(endpoint, user):
             asked.append(user)
             return operator if user != "root" else root
 
@@ -4859,7 +4864,6 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
         for banner in (
             "SSH-2.0-OpenSSH_10.6\r\n",
             "SSH-2.0-OpenSSH_10.6 %s-old\r\n" % yo.STAGE2_SSH_BANNER_MARK,
-            "",
         ):
             with self.subTest(banner=banner):
                 self.assertEqual(
@@ -4873,22 +4877,84 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
             (yo.BootStage.UNKNOWN, ["op", "root"]),
         )
 
-    def test_no_banner_and_no_login_is_nothing_answering(self):
+    def test_an_empty_banner_offers_no_login_at_all(self):
+        # Nothing listening, or an sshd that sent nothing in time: whoever it
+        # is, it was not shown root, whatever a login would have answered.
         for banner in (None, ""):
             with self.subTest(banner=banner):
-                self.assertEqual(
-                    self.boot_stage(banner, root=yo.SshOutcome.NOT_LISTENING),
-                    (yo.BootStage.NONE, ["op", "root"]),
-                )
+                self.assertEqual(self.boot_stage(banner), (yo.BootStage.NONE, []))
 
-    def test_a_port_nothing_listens_on_is_asked_for_root_too(self):
-        self.assertEqual(self.boot_stage(None), (yo.BootStage.INITRD, ["op", "root"]))
-
-    def test_a_stage2_that_admits_the_operator_is_stage2_without_a_banner_read(self):
+    def test_a_stage2_that_admits_the_operator_is_stage2_off_an_unmarked_banner(self):
+        # Built before the mark: the operator's login is what tells it apart.
         self.assertEqual(
-            self.boot_stage(None, operator=yo.SshOutcome.ANSWERED),
+            self.boot_stage(
+                "SSH-2.0-OpenSSH_10.6\r\n", operator=yo.SshOutcome.ANSWERED
+            ),
             (yo.BootStage.STAGE2, ["op"]),
         )
+
+
+class TestUnlockDiskSendsThePassphraseOnlyToAnUnmarkedSshd(unittest.TestCase):
+    """The passphrase goes to root over an unpinned channel, so the banner is
+    read before every helper run: a marked stage 2, the one switch-root lands
+    in, is asked for the operator and nothing else."""
+
+    DROPPED = yo.HelperRun(yo.SSH_UNREACHABLE, "", False, True)
+
+    def run_unlock(self, kinds, operator_answers, helper_runs):
+        kinds = iter(kinds)
+        operator_answers = iter(operator_answers)
+        helper_runs = iter(helper_runs)
+        helper_calls = []
+        driver = mock.Mock()
+        driver.vm_status.return_value = yo.driver.RUNNING
+
+        def helper(passphrase):
+            helper_calls.append(passphrase)
+            return next(helper_runs)
+
+        with (
+            mock.patch.object(yo.sshconfig, "initrd_endpoint", return_value=None),
+            mock.patch.object(yo.unlock, "endpoint_kind", lambda endpoint: next(kinds)),
+            mock.patch.object(
+                yo.unlock,
+                "sshd_answers",
+                lambda endpoint, user: next(operator_answers),
+            ),
+            mock.patch.object(yo.unlock, "run_initrd_helper", helper),
+            mock.patch.object(yo.state, "driver", return_value=driver),
+            mock.patch.object(yo.state, "box", mock.Mock(name="box")),
+            mock.patch.object(yo.ui, "err"),
+            mock.patch.object(yo.time, "sleep"),
+        ):
+            yo.unlock_disk(b"secret")
+        return helper_calls
+
+    def test_after_the_session_dropped_a_marked_stage2_never_sees_the_helper(self):
+        helper_calls = self.run_unlock(
+            kinds=[yo.Endpoint.INITRD, yo.Endpoint.NONE] + [yo.Endpoint.STAGE2] * 2,
+            # The new stage 2 refuses the operator once (its key not written
+            # yet): that round gets no helper either, only the next probe.
+            operator_answers=[yo.SshOutcome.REFUSED, yo.SshOutcome.ANSWERED],
+            helper_runs=[self.DROPPED],
+        )
+        self.assertEqual(helper_calls, [b"secret"])
+
+    def test_a_marked_stage2_that_refuses_the_operator_is_retried_without_root(self):
+        helper_calls = self.run_unlock(
+            kinds=[yo.Endpoint.STAGE2, yo.Endpoint.STAGE2],
+            operator_answers=[yo.SshOutcome.REFUSED, yo.SshOutcome.ANSWERED],
+            helper_runs=[],
+        )
+        self.assertEqual(helper_calls, [])
+
+    def test_nothing_listening_gets_no_helper_and_no_login(self):
+        helper_calls = self.run_unlock(
+            kinds=[yo.Endpoint.NONE, yo.Endpoint.STAGE2],
+            operator_answers=[yo.SshOutcome.ANSWERED],
+            helper_runs=[],
+        )
+        self.assertEqual(helper_calls, [])
 
 
 class TestLimaStopHangOffersTheKillOnlyPastTheInitrd(unittest.TestCase):
@@ -4980,7 +5046,7 @@ class TestSshBannerReadsTheWholeLine(unittest.TestCase):
             "create_connection",
             lambda address, timeout: self.Client(client, received),
         ):
-            return yo.unlock.ssh_banner()
+            return yo.unlock.ssh_banner(yo.sshconfig.InitrdEndpoint("127.0.0.1", 1, ()))
 
     def test_a_line_sent_in_two_segments_is_read_whole(self):
         mark = yo.STAGE2_SSH_BANNER_MARK.encode()

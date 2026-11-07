@@ -2562,6 +2562,9 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
 
         with (
             mock.patch.object(yo.proc, "run", side_effect=initrd_run),
+            mock.patch.object(
+                yo.unlock, "ssh_banner", return_value="SSH-2.0-OpenSSH_10.6"
+            ),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=pinned_ssh_run),
             mock.patch.object(yo.LIMA, "config_gaps", return_value=[]),
             mock.patch.object(yo.lima, "du_kib", return_value=None),
@@ -3197,7 +3200,6 @@ class FakeBox:
         self.starts = []
         self.helpers = []
         self.running_since = None
-        self.operator_answered = True
         self.stdout = io.StringIO()
         self.stderr = io.StringIO()
         self.luks_passphrase = mock.Mock(return_value=b"a" * 64)
@@ -3233,11 +3235,14 @@ class FakeBox:
             raise AssertionError("yo is polling forever")
         self.clock += seconds
 
-    def ssh_banner(self):
-        # boot_stage reads the banner over a real TCP connection to the box's
-        # port, which a real box on this machine would answer. A refused port
-        # sends no banner; any other sshd sends one without the stage-2 mark.
-        return "SSH-2.0-OpenSSH_10.0" if self.operator_answered else ""
+    def ssh_banner(self, endpoint):
+        # yo reads the banner over a real TCP connection to the box's port,
+        # which a real box on this machine would answer. The port sends no
+        # banner while both logins would find nothing listening; any other
+        # sshd sends one without the stage-2 mark.
+        if self.operator[0] == NOT_LISTENING and self.root[0] == NOT_LISTENING:
+            return ""
+        return "SSH-2.0-OpenSSH_10.0"
 
     def run(self, argv, **kwargs):
         argv = list(argv)
@@ -3256,8 +3261,6 @@ class FakeBox:
             user = next(a for a in argv if a.startswith("User=")).split("=", 1)[1]
             script = self.root if user == "root" else self.operator
             code, stderr = self.next(script)
-            if script is self.operator:
-                self.operator_answered = (code, stderr) != NOT_LISTENING
             return subprocess.CompletedProcess(argv, code, "", stderr)
         raise AssertionError("unexpected run: %r" % argv)
 
@@ -3392,7 +3395,10 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
         self.assertIn("sysroot.mount failed", message)
         self.assertIn("journalctl -b", message)
         # The remedy is the command yo itself runs, not a second spelling of it.
-        self.assertIn(shlex.join(yo.initrd_ssh_argv("journalctl -b")), message)
+        self.assertIn(
+            shlex.join(yo.initrd_ssh_argv("journalctl -b", yo.initrd_endpoint())),
+            message,
+        )
 
     def test_an_empty_passphrase_at_the_helper_is_reported_as_such(self):
         box = FakeBox(self, statuses=["Stopped", "Running"], helpers=[([], 4, "")])

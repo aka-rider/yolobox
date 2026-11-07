@@ -199,6 +199,10 @@ FIRST_CONTACT_OPTS = [
 ]
 
 
+# Where ssh.config may send the box's port: this host, by any of its spellings.
+LOOPBACK_HOSTNAMES = ("127.0.0.1", "localhost", "::1")
+
+
 class InitrdEndpoint(NamedTuple):
     """Where, and as whom, the pre-unlock probes reach the initrd's sshd."""
 
@@ -224,12 +228,29 @@ def initrd_endpoint() -> InitrdEndpoint:
         raise YoError(
             "%s names the port %r, not a number" % (state.ssh_cfg(), host_block.port)
         )
+    if host_block.hostname not in LOOPBACK_HOSTNAMES:
+        # Everything that trusts the unpinned channel assumes the port is on
+        # this host: libvirt's owner check reads the local listener, and Lima's
+        # mirror is loopback-only. A box reached elsewhere would get the
+        # passphrase with neither check behind it.
+        raise YoError(
+            "%s names the host %r for %s, which is not a loopback address (%s): "
+            "the disk passphrase goes to the box's forwarded port on this host only"
+            % (
+                state.ssh_cfg(),
+                host_block.hostname,
+                state.box.vm_host,
+                ", ".join(LOOPBACK_HOSTNAMES),
+            )
+        )
     return InitrdEndpoint(
         host_block.hostname, int(host_block.port), host_block.identity_files
     )
 
 
-def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:
+def initrd_ssh_argv(
+    remote: str, endpoint: InitrdEndpoint, user: str = "root"
+) -> List[str]:
     # Before the disk is unlocked only the initrd's sshd answers, with a host key
     # it generated this boot. Nothing is pinned, so whoever holds the loopback
     # port is trusted with the answer: on macOS that is lima's hostagent, running
@@ -237,8 +258,9 @@ def initrd_ssh_argv(remote: str, user: str = "root") -> List[str]:
     # and state.driver().verify_initrd_listener() checks the owner before every
     # passphrase is sent. And no pinned role may be used here: accept-new would
     # write the initrd's key into known_hosts, and every stage-2 connection after
-    # it would be refused.
-    hostname, port, identities = initrd_endpoint()
+    # it would be refused. The caller reads the endpoint once, so the listener
+    # it checked is the one this dials.
+    hostname, port, identities = endpoint
     return (
         [
             "ssh",

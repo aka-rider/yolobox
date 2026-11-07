@@ -520,7 +520,7 @@ class TestInitrdState(FakeHome):
 
     def test_an_ssh_that_failed_in_silence_still_gives_a_cause(self):
         reading = self.reading_after(subprocess.CompletedProcess([], 255, "", ""))
-        self.assertIn("no message", reading.cause)
+        self.assertIn("with no output", reading.cause)
 
     def test_output_no_state_matches_is_unknown_and_quoted(self):
         reading = self.reading_after(subprocess.CompletedProcess([], 0, "lizard\n", ""))
@@ -536,19 +536,19 @@ class TestInitrdSshArgv(FakeHome):
 
     def test_takes_host_port_and_key_from_limas_block(self):
         self.write_ssh_config(
-            'Host lima-yolobox\n  Hostname 127.0.0.2\n  Port 61234\n  IdentityFile "/k/user"\n'
+            'Host lima-yolobox\n  Hostname localhost\n  Port 61234\n  IdentityFile "/k/user"\n'
         )
-        argv = yo.initrd_ssh_argv("true")
-        self.assertEqual(argv[-2:], ["127.0.0.2", "true"])
+        argv = yo.initrd_ssh_argv("true", yo.initrd_endpoint())
+        self.assertEqual(argv[-2:], ["localhost", "true"])
         self.assertIn("Port=61234", argv)
         self.assertEqual(argv[argv.index("-i") + 1], "/k/user")
 
     def test_offers_every_key_of_limas_block_in_order(self):
         self.write_ssh_config(
-            'Host lima-yolobox\n  Hostname 127.0.0.2\n  Port 61234\n  IdentityFile "/k/user"\n'
+            'Host lima-yolobox\n  Hostname localhost\n  Port 61234\n  IdentityFile "/k/user"\n'
             '  IdentityFile "/k/second"\n  Port 1\n'
         )
-        argv = yo.initrd_ssh_argv("true")
+        argv = yo.initrd_ssh_argv("true", yo.initrd_endpoint())
         self.assertEqual(
             [argv[i + 1] for i, arg in enumerate(argv) if arg == "-i"],
             ["/k/user", "/k/second"],
@@ -556,7 +556,7 @@ class TestInitrdSshArgv(FakeHome):
         self.assertIn("Port=61234", argv)
 
     def test_falls_back_to_limas_defaults_without_the_file(self):
-        argv = yo.initrd_ssh_argv("true")
+        argv = yo.initrd_ssh_argv("true", yo.initrd_endpoint())
         self.assertEqual(argv[-2:], ["127.0.0.1", "true"])
         self.assertIn("Port=%d" % yo.SSH_LOCAL_PORT, argv)
         self.assertEqual(
@@ -564,21 +564,40 @@ class TestInitrdSshArgv(FakeHome):
         )
 
     def test_logs_in_as_root_unless_told_otherwise(self):
-        self.assertIn("User=root", yo.initrd_ssh_argv("true"))
-        self.assertIn("User=someone", yo.initrd_ssh_argv("true", user="someone"))
+        self.assertIn("User=root", yo.initrd_ssh_argv("true", yo.initrd_endpoint()))
+        self.assertIn(
+            "User=someone",
+            yo.initrd_ssh_argv("true", yo.initrd_endpoint(), user="someone"),
+        )
 
     def test_pins_nothing_and_never_reads_a_config_file(self):
-        argv = yo.initrd_ssh_argv("true")
+        argv = yo.initrd_ssh_argv("true", yo.initrd_endpoint())
         self.assertEqual(argv[argv.index("-F") + 1], "/dev/null")
         self.assertNotIn(yo.ssh_cfg(), argv)
         for index in range(0, len(yo.FIRST_CONTACT_OPTS), 2):
             self.assertIn(yo.FIRST_CONTACT_OPTS[index + 1], argv)
         self.assertIn("BatchMode=yes", argv)
 
+    def test_a_host_that_is_not_this_one_is_refused_naming_the_file(self):
+        # The owner check and Lima's mirror both assume the port is local, so
+        # a block that sends the passphrase elsewhere is refused, not obeyed.
+        os.makedirs(yo.instance_dir())
+        for hostname in ("192.168.5.15", "box.example", "127.0.0.1.1", "lizard"):
+            with self.subTest(hostname=hostname):
+                with open(yo.ssh_cfg(), "w") as handle:
+                    handle.write(
+                        "Host lima-yolobox\n  Hostname %s\n  Port 61234\n"
+                        '  IdentityFile "/k/user"\n' % hostname
+                    )
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.initrd_endpoint()
+                self.assertIn(yo.ssh_cfg(), caught.exception.message)
+                self.assertIn("not a loopback address", caught.exception.message)
+
     def test_an_unreadable_config_is_an_error_not_a_fallback(self):
         os.makedirs(yo.ssh_cfg())
         with self.assertRaisesRegex(yo.YoError, "cannot read"):
-            yo.initrd_ssh_argv("true")
+            yo.initrd_ssh_argv("true", yo.initrd_endpoint())
 
 
 if __name__ == "__main__":

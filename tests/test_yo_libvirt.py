@@ -144,6 +144,9 @@ class FakeHost:
         self.virsh_envs = []  # the environment of each `virsh` run
         # The guest's sshds, for the `ssh ... true` probes: argv -> (code, stderr).
         self.sshd = lambda argv: (0, "")
+        # What the box's port sends before any login: an sshd without the
+        # stage-2 mark, unless a test says the port is silent ("") or marked.
+        self.banner = "SSH-2.0-OpenSSH_10.6"
         # The initrd's yolobox-unlock session: (stdout lines, exit code, stderr).
         self.helper = None
         # What `herdr machine list --json` prints, entry by entry.
@@ -429,6 +432,9 @@ class LibvirtCase(FakeHome):
             ),
             mock.patch.object(self.box.release, "host_user", return_value=OPERATOR),
             mock.patch.object(self.box.shutil, "which", fake_which),
+            mock.patch.object(
+                self.box.unlock, "ssh_banner", lambda endpoint: self.host.banner
+            ),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -1323,7 +1329,7 @@ class TestSshConfig(LibvirtCase):
     def test_the_initrd_probe_uses_the_agent_and_the_public_key(self):
         os.makedirs(self.box.instance_dir())
         self.driver.write_ssh_config(61234)
-        argv = self.box.initrd_ssh_argv("true")
+        argv = self.box.initrd_ssh_argv("true", self.box.initrd_endpoint())
         self.assertIn("IdentityAgent=%s" % self.driver.op_sock(), argv)
         self.assertEqual(
             argv[argv.index("-i") + 1],
@@ -1333,14 +1339,14 @@ class TestSshConfig(LibvirtCase):
 
     def test_the_initrd_probe_before_the_config_exists_names_the_public_key(self):
         with mock.patch.object(self.driver, "ssh_port", return_value=61234):
-            argv = self.box.initrd_ssh_argv("true")
+            argv = self.box.initrd_ssh_argv("true", self.box.initrd_endpoint())
         self.assertTrue(argv[argv.index("-i") + 1].endswith("/box/operator.pub"))
 
     def test_lima_keeps_its_private_key_and_no_agent(self):
         mac = load_yo("yo_mac_initrd")
         self.addCleanup(unload_yo, "yo_mac_initrd")
         with mock.patch.object(mac.box.driver, "ssh_port", return_value=60022):
-            argv = mac.initrd_ssh_argv("true")
+            argv = mac.initrd_ssh_argv("true", mac.initrd_endpoint())
         self.assertIn("IdentityAgent=none", argv)
         self.assertTrue(argv[argv.index("-i") + 1].endswith(".lima/_config/user"))
 
