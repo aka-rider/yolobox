@@ -385,7 +385,9 @@ def parse_guest_record(
     text = os.fsdecode(record)
     fields = GUEST_RECORD_RE.fullmatch(text)
     if fields is None or float(fields.group(3)) >= MAX_MTIME:
-        raise YoError("the guest's listing has a malformed record: %r" % text)
+        raise YoError(
+            "the guest's listing has a malformed record: '%s'" % ui.shown(text)
+        )
     kind, mode, mtime, path = fields.groups()
     clean = posixpath.normpath(path) == path
     under = any(path.startswith(start + "/") for start in starts) or (
@@ -393,8 +395,8 @@ def parse_guest_record(
     )
     if not (clean and under):
         raise YoError(
-            "the guest's listing has a path that is not a clean path under %s: %r"
-            % (", ".join(starts), text)
+            "the guest's listing has a path that is not a clean path under %s: '%s'"
+            % (", ".join(starts), ui.shown(text))
         )
     return GuestEntry(kind, int(mode, 8), float(mtime), path)
 
@@ -429,7 +431,8 @@ def list_guest(
         # cannot both be true.
         if entries.setdefault(entry.path, entry) != entry:
             raise YoError(
-                "the guest's listing describes %r twice, differently" % entry.path
+                "the guest's listing describes '%s' twice, differently"
+                % ui.shown(entry.path)
             )
     return entries
 
@@ -463,7 +466,8 @@ def find_build_output(sources: Sequence[str]) -> List[Tuple[str, str]]:
         # find was asked for these names and types only.
         if posixpath.basename(entry.path) not in asked.get(entry.kind, ()):
             raise YoError(
-                "the guest's listing has a path find was not asked for: %r" % entry.path
+                "the guest's listing has a path find was not asked for: '%s'"
+                % ui.shown(entry.path)
             )
     manifests_present = {path for path, entry in found.items() if entry.kind == "f"}
     confirmed = sorted(

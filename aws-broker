@@ -83,6 +83,8 @@ LOGGED_PATH_MAX = 256
 LOGGED_DETAIL_MAX = 4096
 # How long EventLog collapses repeats of a kind of event into a count.
 LOG_WINDOW_SECONDS = 60
+# How long the exit path waits for EventLog's lock before writing the count anyway.
+EXIT_LOG_WAIT_SECONDS = 1.0
 
 
 def clip(text, limit=LOGGED_PATH_MAX):
@@ -132,6 +134,21 @@ class EventLog:
     def close_window(self):
         with self.lock:
             self._close_window_locked()
+
+    def close_window_at_exit(self):
+        """close_window on the way out, so the count of a window still open
+        reaches the log. The SIGTERM handler runs on the main thread, which
+        serves the guest socket and can itself be inside note() holding the
+        lock (a refused connection is noted there), so a plain acquire could
+        wait on itself forever. Waits a moment for whoever holds it, then
+        writes the summary anyway: the process exits next, and a count off by
+        the one event in flight beats a broker that never exits."""
+        held = self.lock.acquire(timeout=EXIT_LOG_WAIT_SECONDS)
+        try:
+            self._close_window_locked()
+        finally:
+            if held:
+                self.lock.release()
 
     def _close_window_locked(self):
         repeats = {kind: n for kind, n in self.repeats.items() if n}
@@ -259,21 +276,25 @@ def unlink_bound(sockets):
         unlink_if_same_identity(bound.path, bound.identity)
 
 
-def exit_cleanly(why, sockets, status):
+def exit_cleanly(why, sockets, events, status):
+    events.close_window_at_exit()
     log(f"{why}; shutting down")
     kill_running_mints()
     unlink_bound(sockets)
     os._exit(status)
 
 
-def wait_for_pid_exit(pid, sockets, wait_for_exit):
+def wait_for_pid_exit(pid, sockets, events, wait_for_exit):
     try:
         wait_for_exit()
     except OSError as failure:
         exit_cleanly(
-            f"waiting for pid {pid} failed: {failure}", sockets, EXIT_WATCH_FAILED
+            f"waiting for pid {pid} failed: {failure}",
+            sockets,
+            events,
+            EXIT_WATCH_FAILED,
         )
-    exit_cleanly(f"watched pid {pid} exited", sockets, EXIT_OK)
+    exit_cleanly(f"watched pid {pid} exited", sockets, events, EXIT_OK)
 
 
 EXPIRATION_RE = re.compile(
@@ -892,7 +913,9 @@ def main():
         )
         signal.signal(
             signal.SIGTERM,
-            lambda signum, frame: exit_cleanly("SIGTERM", bound.sockets, EXIT_OK),
+            lambda signum, frame: exit_cleanly(
+                "SIGTERM", bound.sockets, events, EXIT_OK
+            ),
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, before_bind_mask)
 
@@ -905,7 +928,7 @@ def main():
 
     threading.Thread(
         target=wait_for_pid_exit,
-        args=(args.watch_pid, bound.sockets, wait_for_exit),
+        args=(args.watch_pid, bound.sockets, events, wait_for_exit),
         daemon=True,
     ).start()
     threading.Thread(target=bound.control.serve_forever, daemon=True).start()
@@ -913,6 +936,7 @@ def main():
     try:
         bound.guest.serve_forever()
     finally:
+        events.close_window()
         unlink_bound(bound.sockets)
 
 

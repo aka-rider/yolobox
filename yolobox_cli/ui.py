@@ -74,18 +74,27 @@ def err(line: str = "") -> None:
     print(common.sanitize(line), file=sys.stderr, flush=True)
 
 
-def shown(text: str) -> str:
-    """`text`, a name that came from the guest, as one printable line inside a message.
+SHOWN_MAX_CHARS = 500
 
-    A plain name is returned as it is. One with a control character, a newline
-    (which could start a forged message line), a bidi override or an undecodable
-    byte gets python's backslash escapes, so the reader sees what it holds.
-    Messages that name a guest file go through this; out() and err() still
+
+def shown(text: str) -> str:
+    """`text`, a value that came from the guest, as one printable line inside a
+    message: a name, a unit state, what a probe answered.
+
+    A plain value is returned as it is, as a plain str whatever the input's
+    type. One with a control character, a newline (which could start a forged
+    message line), a bidi override or an undecodable byte gets python's
+    backslash escapes, so the reader sees what it holds. One longer than
+    SHOWN_MAX_CHARS is cut there, with a marker that says how long it was, so
+    a guest cannot fill the terminal through a message that quotes it.
+    Messages that quote a guest value go through this; out() and err() still
     replace control characters, but only as an unreadable "?".
     """
-    if text.isprintable():
-        return str(text)
-    return repr(text)[1:-1]
+    cut = str(text[:SHOWN_MAX_CHARS])
+    display = cut if cut.isprintable() else repr(cut)[1:-1]
+    if len(text) > SHOWN_MAX_CHARS:
+        display += "[cut: %d characters in all]" % len(text)
+    return display
 
 
 # Every line a guest printed is shown behind this, so a reader (and a test) tells

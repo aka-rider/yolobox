@@ -626,7 +626,7 @@ def vda2_size_for_report() -> str:
         sizes = sshx.guest_out(["lsblk", "-no", "SIZE", "/dev/vda2"]).splitlines()
     except YoError as error:
         return "unreadable: %s" % error.message
-    return sizes[0] if sizes else "unreadable: lsblk printed nothing"
+    return ui.shown(sizes[0]) if sizes else "unreadable: lsblk printed nothing"
 
 
 def root_usage_before_grow() -> guest.RootUsage:
@@ -811,7 +811,8 @@ def guest_device_bytes(device: str) -> int:
     if not proc.is_ascii_number(size):
         raise YoError(
             state.not_up_hint(
-                "cannot read the size of %s (lsblk answered %r)" % (device, size)
+                "cannot read the size of %s (lsblk answered '%s')"
+                % (device, ui.shown(size))
             )
         )
     return int(size)
@@ -847,8 +848,8 @@ def root_has_room_to_grow(ceiling_gib: int) -> bool:
         return False
     if disk_state is not DiskState.ENCRYPTED:
         raise YoError(
-            "cannot tell whether %s's root fills its disk: lsblk reports %r for %s"
-            % (state.box.name, fstype, LUKS_DEVICE)
+            "cannot tell whether %s's root fills its disk: lsblk reports '%s' for %s"
+            % (state.box.name, ui.shown(fstype), LUKS_DEVICE)
         )
     require_partition_grown(ceiling_gib)
     mapping = "/dev/mapper/%s" % LUKS_MAPPER

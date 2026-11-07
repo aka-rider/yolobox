@@ -9,13 +9,14 @@ Only libvirt.py imports this module.
 from __future__ import annotations
 
 import os
+import posixpath
 import pwd
 import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Tuple, Union
 
 from . import proc, ui
 from .config import KIB, LOOPBACK, MAX_PORT, SCRIPT_DIR
@@ -183,8 +184,9 @@ def host_memory_bytes() -> int:
     return int(found.group(1)) * KIB
 
 
-# A value rule: the strings admitted, or a pattern a value must match in full.
-Rule = Union[FrozenSet[str], "re.Pattern[str]"]
+# A value rule: the strings admitted, a pattern a value must match in full, or
+# a predicate of the value.
+Rule = Union[FrozenSet[str], "re.Pattern[str]", Callable[[str], bool]]
 ANY = re.compile(r".*", re.S)
 DIGITS = re.compile(r"\d+")
 HEX = re.compile(r"(0x)?[0-9a-fA-F]+")
@@ -193,6 +195,7 @@ PTY_PATH = re.compile(r"/dev/pts/\d+")
 # else (a <baselabel> would be a gap on its own, as an element not in shape).
 SVIRT_LABEL = re.compile(r"system_u:system_r:svirt_t:s0:c\d+,c\d+")
 DAC_LABEL = re.compile(r"\+\d+:\+\d+")
+WHITESPACE = re.compile(r"\s")
 
 
 def one_of(*values: str) -> FrozenSet[str]:
@@ -202,7 +205,23 @@ def one_of(*values: str) -> FrozenSet[str]:
 def admits(rule: Rule, value: str) -> bool:
     if isinstance(rule, frozenset):
         return value in rule
-    return rule.fullmatch(value) is not None
+    if isinstance(rule, re.Pattern):
+        return rule.fullmatch(value) is not None
+    return rule(value)
+
+
+def firmware_template(value: str) -> bool:
+    """An nvram template is a file strictly under FIRMWARE_DIR, spelled as one
+    clean path: no `..`, `.`, empty or trailing component, no whitespace. A
+    prefix match alone admitted `/usr/share/../../../etc/shadow`. libvirt's
+    domcapabilities lists the loader images, not the templates, so there is no
+    host-given set to check it against."""
+    return (
+        value.startswith(FIRMWARE_DIR)
+        and value != FIRMWARE_DIR
+        and posixpath.normpath(value) == value
+        and not WHITESPACE.search(value)
+    )
 
 
 class Shape(NamedTuple):
@@ -325,7 +344,7 @@ def domain_shape(instance: str, firmware: HostFirmware) -> Shape:
                     ),
                     "nvram": E(
                         attrs={
-                            "template": re.compile(re.escape(FIRMWARE_DIR) + r"\S+"),
+                            "template": firmware_template,
                             "templateFormat": one_of("raw", "qcow2"),
                             "format": one_of("raw", "qcow2"),
                         },

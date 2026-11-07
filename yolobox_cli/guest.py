@@ -169,19 +169,20 @@ def guest_root_usage() -> RootUsage:
     lines = completed.stdout.splitlines()
     if len(lines) != ROOT_USAGE_LINES:
         raise YoError(
-            "cannot read the VM's root usage from df: expected %d lines, got %r"
-            % (ROOT_USAGE_LINES, completed.stdout)
+            "cannot read the VM's root usage from df: expected %d lines, got '%s'"
+            % (ROOT_USAGE_LINES, ui.shown(completed.stdout))
         )
     human_line, kib_line = lines[1], lines[3]
     fields = kib_line.split()
     total, used = df_kib(fields, 1), df_kib(fields, 2)
     if total is None or used is None:
         raise YoError(
-            "cannot read the VM's root usage from df: no sizes in %r" % kib_line
+            "cannot read the VM's root usage from df: no sizes in '%s'"
+            % ui.shown(kib_line)
         )
     if total == 0:
         raise YoError(
-            "cannot read the VM's root usage from df: it reports a total of 0 KiB in %r"
-            % kib_line
+            "cannot read the VM's root usage from df: it reports a total of 0 KiB in '%s'"
+            % ui.shown(kib_line)
         )
     return RootUsage(human_line, total, used)
