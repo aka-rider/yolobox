@@ -12,9 +12,14 @@ let
     "cfg80211" "mac80211" "bluetooth" "btusb"
     # rare socket families
     "sctp" "rds" "tipc" "x25" "psnap" "llc2" "can" "atm" "ieee802154"
-    "phonet" "nfc" "af_key"
+    "phonet" "nfc" "af_key" "mctp"
     # more socket families that autoload from a socket() call
-    "rxrpc" "kcm" "smc" "qrtr" "pppoe" "l2tp_ppp"
+    "rxrpc" "kcm" "smc" "qrtr" "pppoe" "l2tp_ppp" "pptp" "l2tp_core"
+    # netlink families that autoload from a socket() call
+    "scsi_transport_iscsi" "xfrm_user"
+    # link kinds a user namespace's root can create with `ip link add`;
+    # bridge, veth and tun stay (podman, tailscale)
+    "vxlan" "geneve" "bareudp" "gtp" "hsr" "macsec" "bonding" "team" "ipvlan"
     # net/sched: a user namespace's root can attach any of these to its own
     # netns. Nothing on the box shapes traffic; sch_fq_codel, the default
     # qdisc, is the one that stays.
