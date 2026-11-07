@@ -381,3 +381,30 @@ jobs:
           # setuid shell, and an extra wrapper must wrap a binary of its name.
           refused 'security.wrappers.unix_chkpwd.source = lib.mkForce "${pkgs.bash}/bin/bash";' 'unix_chkpwd: have'
           refused "$(wrapper cap_net_raw root true) yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap\";" 'sleep: source'
+
+      # The agent is in no supplementary group unless the box's local.nix says
+      # so twice, and in wheel never (nix/hardening.md, "The agent's groups").
+      # Membership counts from either side: extraGroups on the account, or
+      # members on the group.
+      - name: Check the agent's groups are asserted
+        run: |
+          toplevel() {
+            $NIX_EVAL --raw --expr "
+              let
+                box = (builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
+                  modules = [ ({ pkgs, lib, ... }: { $1 }) ];
+                };
+              in box.config.system.build.toplevel.drvPath
+            "
+          }
+          refused() {
+            if toplevel "$1" 2> groups.err; then
+              echo "evaluated: $1"; exit 1
+            fi
+            grep -F -- "$2" groups.err
+          }
+          toplevel 'users.groups.wireshark = {}; users.users.agent.extraGroups = [ "wireshark" ]; yolobox.hardening.extraAgentGroups = [ "wireshark" ];' > /dev/null
+          refused 'users.groups.wireshark = {}; users.users.agent.extraGroups = [ "wireshark" ];' 'supplementary groups (wireshark) differ'
+          refused 'users.groups.wireshark = {}; users.groups.wireshark.members = [ "agent" ];' 'supplementary groups (wireshark) differ'
+          refused 'yolobox.hardening.extraAgentGroups = [ "wireshark" ];' 'differ from yolobox.hardening.extraAgentGroups (wireshark)'
+          refused 'users.users.agent.extraGroups = [ "wheel" ]; yolobox.hardening.extraAgentGroups = [ "wheel" ];' 'The agent is in wheel'

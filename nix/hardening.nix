@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, agentUser, ... }:
 let
   cfg = config.yolobox.hardening;
 
@@ -142,6 +142,16 @@ let
   forbiddenCaps = lib.filterAttrs
     (name: w: lib.any (c: lib.hasInfix c (lib.toLower w.capabilities)) (forbiddenCapsOf name))
     enabledWrappers;
+
+  # The agent's supplementary groups, from the group side, so a
+  # `users.groups.<g>.members` entry counts as much as `extraGroups`.
+  agentGroups = lib.attrNames (lib.filterAttrs (_: g: lib.elem agentUser g.members) config.users.groups);
+  sortedNames = names: lib.sort lib.lessThan (lib.unique names);
+  # The groups no escape hatch grants: wheel is sudo, the other three read the
+  # system journal with the operator's sudo lines (docs/accounts.md), and
+  # podman's socket group is root-equivalent (nix/podman.nix).
+  forbiddenAgentGroups = [ "wheel" "systemd-journal" "adm" "podman" ];
+  forbiddenGroupsHeld = lib.intersectLists forbiddenAgentGroups agentGroups;
 in
 {
   options.yolobox.hardening.extraWrappers = lib.mkOption {
@@ -160,6 +170,20 @@ in
       and its source must be a binary of the wrapper's own name.
       Evaluation fails when an enabled wrapper differs in program name,
       source, setuid, setgid, owner, group, permissions or capabilities.
+    '';
+  };
+
+  options.yolobox.hardening.extraAgentGroups = lib.mkOption {
+    type = lib.types.listOf lib.types.str;
+    default = [ ];
+    example = [ "wireshark" ];
+    description = ''
+      Supplementary groups the agent account holds on top of its primary
+      group. The agent is in no group by default (docs/accounts.md), and
+      evaluation fails when its groups differ from this list, so a box that
+      gives it one names it here as well as in `users.users.<agent>.extraGroups`,
+      in its /etc/yolobox/local.nix. wheel, systemd-journal, adm and podman
+      are refused whatever this list says.
     '';
   };
 
@@ -213,6 +237,14 @@ in
           [ "A wrapper carries a capability the box never allows (${lib.concatStringsSep ", " forbiddenCapNames}, or cap_setuid/cap_setgid outside ${lib.concatStringsSep "/" idMapWrappers}; nix/hardening.nix):" ]
           ++ lib.mapAttrsToList (name: w: "${name}: ${w.capabilities}") forbiddenCaps
         );
+      }
+      {
+        assertion = sortedNames agentGroups == sortedNames cfg.extraAgentGroups;
+        message = "The agent's supplementary groups (${lib.concatStringsSep ", " agentGroups}) differ from yolobox.hardening.extraAgentGroups (${lib.concatStringsSep ", " cfg.extraAgentGroups}). The agent is in no group by default (docs/accounts.md); a box that adds one names it in both, in /etc/yolobox/local.nix (nix/hardening.md).";
+      }
+      {
+        assertion = forbiddenGroupsHeld == [ ];
+        message = "The agent is in ${lib.concatStringsSep ", " forbiddenGroupsHeld}, which the box never allows and no extraAgentGroups entry lifts (CONSTITUTION, docs/accounts.md).";
       }
     ];
 
