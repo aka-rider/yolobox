@@ -326,10 +326,10 @@ jobs:
               if builtins.all (a: a.assertion) box.config.assertions then \"accepted\" else \"rejected\"
             "
           }
-          for entry in 300.1.1.1/8 10.0.0.0/33 lizard fd00::/129 ::::/64 010.0.0.0/8; do
+          for entry in 300.1.1.1/8 10.0.0.0/33 lizard fd00::/129 ::::/64 010.0.0.0/8 192.168.1.20/24 fd00::1/64 fd00::1:0/96 1.0.0.0/7; do
             test "$(check "$entry")" = rejected || { echo "not rejected: $entry"; exit 1; }
           done
-          for entry in 192.168.1.20/32 fd00:1::/64; do
+          for entry in 192.168.1.20/32 fd00:1::/64 fd00::1/128 255.255.255.255/32 0.0.0.0/0 ::/0 2001:db8:0:0:0:0:0:8000/113; do
             test "$(check "$entry")" = accepted || { echo "not accepted: $entry"; exit 1; }
           done
 

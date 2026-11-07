@@ -2,8 +2,8 @@
 
 The rule files are what the kernel runs, so this reads their text and not the
 Nix that builds them. `check_rules`, `check_tunnel_rules`, `check_recovery` and
-`check_lastresort` raise `RuleError` at the first property a file lacks. The host has no nix, so
-the unit tests feed them fixtures copied from a render
+`check_lastresort` raise `RuleError` at the first property a file lacks. The
+host has no nix, so the unit tests feed them fixtures copied from a render
 (tests/test_egress_rules.py); CI runs this file against a fresh render, and
 diffs the fixtures against it so they cannot drift
 (.github/workflows/verify.yml):
@@ -12,6 +12,7 @@ diffs the fixtures against it so they cannot drift
         <egressLastResortRules> <tunnel egressRules>
 """
 
+import ipaddress
 import re
 import sys
 
@@ -20,6 +21,12 @@ HOOK = "type filter hook output priority -20; policy accept;"
 POSTROUTING_HOOK = "type filter hook postrouting priority -20; policy accept;"
 # The last-resort chain denies by policy and has no reject rule to get wrong.
 DROP_HOOK = "type filter hook output priority -20; policy drop;"
+# The box routes for nobody: a forwarded packet is dropped by policy, and the
+# full file logs it (nix/egress.md).
+FORWARD_HOOK = "type filter hook forward priority -20; policy drop;"
+FORWARD_LOG = re.compile(
+    r'limit rate .* log prefix "yolobox-egress: forward: " level warn'
+)
 GATEWAY = "192.168.5.2"
 
 LO_AND_TAILNET = 'oifname { "lo", "tailscale0" } accept'
@@ -42,8 +49,10 @@ DNS = [
 ]
 ND = "icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept"
 MLD = "icmpv6 type { mld-listener-report, mld2-listener-report } ip6 daddr ff02::/16 accept"
-# A lanAllow entry: the user's own opt-in, so any address set but the gateway.
+# A lanAllow entry: the user's own opt-in, so any address set but one that
+# holds the gateway.
 LAN = re.compile(r"ip6? daddr \{ [0-9a-fA-F:./, ]+ \} accept")
+V4_TOKEN = re.compile(r"\d+\.\d+\.\d+\.\d+(?:/\d+)?")
 REJECT = "counter reject with icmpx type admin-prohibited"
 
 BLOCKED_V4 = {
@@ -51,9 +60,11 @@ BLOCKED_V4 = {
     "100.64.0.0/10",
     "169.254.0.0/16",
     "172.16.0.0/12",
+    "192.0.0.0/24",
     "192.168.0.0/16",
+    "198.18.0.0/15",
     "224.0.0.0/4",
-    "255.255.255.255",
+    "240.0.0.0/4",
 }
 BLOCKED_V6 = {"fc00::/7", "fe80::/10", "ff00::/8", "64:ff9b:1::/48"}
 
@@ -65,6 +76,15 @@ class RuleError(AssertionError):
 def require(condition, message):
     if not condition:
         raise RuleError(message)
+
+
+def addresses_gateway(rule):
+    """The rule names an address or a network that holds the gateway."""
+    gateway = ipaddress.ip_address(GATEWAY)
+    return any(
+        gateway in ipaddress.ip_network(token, strict=False)
+        for token in V4_TOKEN.findall(rule)
+    )
 
 
 def chains(text):
@@ -99,8 +119,10 @@ def chains(text):
 # name is part of what a file must have.
 HOOKS = {
     "output": HOOK,
+    "forward": FORWARD_HOOK,
     "postrouting": POSTROUTING_HOOK,
     "output_recovery": HOOK,
+    "forward_recovery": FORWARD_HOOK,
     "output_lastresort": DROP_HOOK,
 }
 
@@ -126,14 +148,30 @@ def blocked_set(rule, family, ending):
     return set(found.group(1).split(", "))
 
 
+def check_forward(rules, logged):
+    """The forward chain holds nothing but, in the full file, a rate-limited
+    log: the policy drops, and a rule could only let a forwarded packet pass."""
+    if logged:
+        require(
+            len(rules) == 1 and FORWARD_LOG.fullmatch(rules[0]) is not None,
+            "the forward chain is not one rate-limited log of a dropped packet: %s"
+            % rules,
+        )
+    else:
+        require(rules == [], "the forward chain has rules: %s" % rules)
+
+
 def check_rules(text):
     """The full rule file: lo and the tailnet leave, the host and private
-    networks are rejected, and only the gateway's DNS and DHCP are let through."""
-    rules = chain_rules(chains(text), ["output"])
+    networks are rejected, only the gateway's DNS and DHCP are let through,
+    and nothing is forwarded."""
+    found = chains(text)
+    rules = chain_rules(found, ["output", "forward"])
     require(
         rules[:1] == [LO_AND_TAILNET], "the first rule is not the lo+tailscale0 accept"
     )
     check_output(rules[1:])
+    check_forward(found["forward"][1:], logged=True)
 
 
 def check_tunnel_rules(text):
@@ -141,7 +179,8 @@ def check_tunnel_rules(text):
     in the first rule, and a DNATed packet is judged in postrouting, by the
     interface it leaves by, against the same interfaces and ranges."""
     found = chains(text)
-    rules = chain_rules(found, ["output", "postrouting"])
+    rules = chain_rules(found, ["output", "forward", "postrouting"])
+    check_forward(found["forward"][1:], logged=True)
     first = TUNNEL_IFACES.fullmatch(rules[0]) if rules else None
     require(first is not None, "the first rule is not lo+tailscale0+tunnels accept")
     require(
@@ -170,14 +209,14 @@ def check_output(accepts_and_tail):
     require(all(d in accepts for d in DNS), "the gateway's DNS is not accepted")
     for rule in accepts:
         known = rule in [REPLY, DHCP, ND, MLD, *DNS]
-        lan = LAN.fullmatch(rule) is not None and GATEWAY not in rule
+        lan = LAN.fullmatch(rule) is not None and not addresses_gateway(rule)
         require(known or lan, "unexpected rule before the rejects: %s" % rule)
     require(
         [r for r in accepts if "dport 67" in r] == [DHCP],
         "a port 67 rule other than the DHCP one",
     )
     require(
-        [r for r in accepts if GATEWAY in r] == [DHCP, *DNS],
+        [r for r in accepts if addresses_gateway(r)] == [DHCP, *DNS],
         "the gateway is addressed by more than its DHCP and port 53 accepts",
     )
     check_blocked(tail, "", REJECT)
@@ -204,8 +243,11 @@ def check_blocked(tail, prefix, verdict):
 
 
 def check_recovery(text):
-    """The recovery file: only lo, replies, DHCP and ND, then an unconditional reject."""
-    rules = chain_rules(chains(text), ["output_recovery"])
+    """The recovery file: only lo, replies, DHCP and ND, then an unconditional
+    reject, and a bare forward chain that drops."""
+    found = chains(text)
+    rules = chain_rules(found, ["output_recovery", "forward_recovery"])
+    check_forward(found["forward_recovery"][1:], logged=False)
     require(
         rules[:-2] == [LO, REPLY, DHCP, ND],
         "recovery accepts something other than lo, replies, DHCP and ND",
