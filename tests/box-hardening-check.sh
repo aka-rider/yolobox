@@ -386,26 +386,30 @@ check_modules() {
 # the module rtnl-link-KIND, before the kernel looks at the kind's options.
 # The blocked kinds must be refused as unsupported, with their module not
 # loaded; the positive control is a bridge, which stays, and must attach.
-# `kind|module|options`, one per word.
+# `kind|module|parent|options`, one per word: a kind on top of another device
+# (macsec, ipvlan) takes `link PARENT` before the name, where iproute2 reads
+# it; after `type KIND` every word is the kind's own option, and `link` there
+# is a usage error (`macsec: unknown command "link"?`), not the kernel's
+# refusal. hsr's slaves are its own options.
 check_link_kinds() {
-    local entry kind module options out loaded
+    local entry kind module parent options out loaded
     as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/ip" link add b0 type bridge ||
         fail "the agent could not add a bridge in its own namespace, so a refused link kind would prove nothing"
     ok "the agent can add a bridge in its own namespace"
     for entry in \
-        "vxlan|vxlan|id 1 dstport 4789" \
-        "geneve|geneve|id 1 remote 192.0.2.1" \
-        "bareudp|bareudp|dstport 6635 ethertype ipv4" \
-        "gtp|gtp|role sgsn" \
-        "hsr|hsr|slave1 lo slave2 lo" \
-        "macsec|macsec|link lo" \
-        "bond|bonding|" \
-        "team|team|" \
-        "ipvlan|ipvlan|link lo mode l2"; do
-        IFS='|' read -r kind module options <<<"${entry}"
+        "vxlan|vxlan||id 1 dstport 4789" \
+        "geneve|geneve||id 1 remote 192.0.2.1" \
+        "bareudp|bareudp||dstport 6635 ethertype ipv4" \
+        "gtp|gtp||role sgsn" \
+        "hsr|hsr||slave1 lo slave2 lo" \
+        "macsec|macsec|lo|" \
+        "bond|bonding||" \
+        "team|team||" \
+        "ipvlan|ipvlan|lo|mode l2"; do
+        IFS='|' read -r kind module parent options <<<"${entry}"
         # ${options} is split on purpose: it is ip's own word list.
         # shellcheck disable=SC2086
-        if out=$(as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/ip" link add l0 type "${kind}" ${options} 2>&1); then
+        if out=$(as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/ip" link add ${parent:+link "${parent}"} l0 type "${kind}" ${options} 2>&1); then
             fail "the agent added a ${kind} link in its own namespace (${module} autoloads)"
         fi
         case ${out} in
@@ -475,7 +479,10 @@ read_wrapper_caps() {
 check_wrappers() {
     local allowlist have want name path caps expected_caps stat owner group mode
     read -ra allowlist <<<"${WRAPPER_ALLOWLIST}"
-    have=$(find "${WRAPPERS}" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+    # The trailing slash: /run/wrappers/bin is a symlink to the generation's
+    # directory, and find does not follow its start point without it.
+    have=$(find "${WRAPPERS}/" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+    [ -n "${have}" ] || fail "found no wrappers under ${WRAPPERS}, so the wrapper set cannot be checked"
     want=$(printf '%s\n' "${allowlist[@]}" "${EXTRA_NAMES[@]}" | LC_ALL=C sort -u)
     [ "${have}" = "${want}" ] || fail "${WRAPPERS} differs from the allowlist (< unexpected, > missing)
 $(diff <(printf '%s\n' "${have}") <(printf '%s\n' "${want}") || true)"
@@ -612,12 +619,14 @@ check_proxy_confined() {
 }
 
 # sshd's effective settings: sftp by the in-process server (no sftp-server
-# binary to run), and no root login at all.
+# binary to run), and no root login at all. Case-insensitive: OpenSSH 10
+# prints the keywords in their canonical case (`Subsystem sftp internal-sftp`),
+# older ones in lowercase.
 check_sshd_settings() {
     local config setting
     config=$(sudo -n sshd -T) || fail "sshd -T failed"
     for setting in "subsystem sftp internal-sftp" "permitrootlogin no"; do
-        grep -qx -- "${setting}" <<<"${config}" || fail "sshd -T lacks '${setting}'"
+        grep -qix -- "${setting}" <<<"${config}" || fail "sshd -T lacks '${setting}'"
     done
     ok "sshd runs internal-sftp and permits no root login"
 }
@@ -819,8 +828,8 @@ check_agent_authorized_keys_ignored() {
     config=$(sudo -n sshd -T -C "user=${AGENT_USER},addr=${GATEWAY_ADDR},host=${GATEWAY_ADDR}") ||
         fail "sshd -T -C for ${AGENT_USER} from ${GATEWAY_ADDR} failed"
     for setting in "authorizedkeysfile none" "authorizedkeyscommand ${AGENT_KEYS_COMMAND}" "authorizedkeyscommanduser root"; do
-        grep -qx -- "${setting}" <<<"${config}" ||
-            fail "sshd -T for ${AGENT_USER} from ${GATEWAY_ADDR} lacks '${setting}': $(grep '^authorizedkeys' <<<"${config}")"
+        grep -qix -- "${setting}" <<<"${config}" ||
+            fail "sshd -T for ${AGENT_USER} from ${GATEWAY_ADDR} lacks '${setting}': $(grep -i '^authorizedkeys' <<<"${config}")"
     done
     owner_mode=$(stat -c '%U %a' "${AGENT_KEYS_COMMAND}") || fail "cannot stat ${AGENT_KEYS_COMMAND}"
     [ "${owner_mode}" = "root 555" ] || fail "${AGENT_KEYS_COMMAND} is ${owner_mode}, want root 555"

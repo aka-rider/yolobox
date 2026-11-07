@@ -77,8 +77,11 @@ class BoxCheck(unittest.TestCase):
         self.tmp = Path(tmp.name).resolve()
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
+        # A symlink, as /run/wrappers/bin is on the box (to the generation's
+        # directory): find does not follow a start point without a trailing slash.
+        (self.tmp / "wrappers.real").mkdir()
         self.wrappers = self.tmp / "wrappers"
-        self.wrappers.mkdir()
+        self.wrappers.symlink_to(self.tmp / "wrappers.real")
         self.home = self.tmp / "home"
         self.home.mkdir()
         self.fake("sudo", FAKE_SUDO)
@@ -228,6 +231,10 @@ class BoxCheck(unittest.TestCase):
         self.wrapper("su", 0o4511)
         result = self.run_check("parse_extra_wrappers; check_wrappers")
         self.assert_fail(result, "%s differs from the allowlist" % self.wrappers)
+
+    def test_a_wrapper_directory_with_nothing_in_it_fails_closed(self):
+        result = self.run_check("parse_extra_wrappers; check_wrappers")
+        self.assert_fail(result, "found no wrappers under %s" % self.wrappers)
 
     def test_an_extra_wrapper_on_the_allowlist_is_refused(self):
         result = self.run_check(
@@ -448,7 +455,7 @@ class BoxCheck(unittest.TestCase):
     def test_sshd_settings_are_read_from_sshd_t(self):
         self.fake(
             "sshd",
-            '#!/bin/sh\nprintf "permitrootlogin %s\\nsubsystem sftp internal-sftp\\n"\n'
+            '#!/bin/sh\nprintf "PermitRootLogin %s\\nSubsystem sftp internal-sftp\\n"\n'
             % "no",
         )
         self.assert_ok(
@@ -456,7 +463,7 @@ class BoxCheck(unittest.TestCase):
         )
         self.fake(
             "sshd",
-            '#!/bin/sh\nprintf "permitrootlogin prohibit-password\\nsubsystem sftp internal-sftp\\n"\n',
+            '#!/bin/sh\nprintf "PermitRootLogin prohibit-password\\nSubsystem sftp internal-sftp\\n"\n',
         )
         self.assert_fail(
             self.run_check("check_sshd_settings"), "sshd -T lacks 'permitrootlogin no'"
@@ -504,13 +511,20 @@ class BoxCheck(unittest.TestCase):
     # -- link kinds -----------------------------------------------------
 
     def link_tools(self, refusal):
-        # unshare runs the command after its options; ip refuses every kind
-        # but the bridge; lsmod lists nothing.
+        # unshare runs the command after its options; ip parses as iproute2
+        # does (`link DEV` only before the name: after `type KIND` it is the
+        # kind's unknown option, a usage error) and refuses every kind but the
+        # bridge; lsmod lists nothing.
         self.fake("unshare", '#!/bin/sh\nshift\nexec "$@"\n')
         self.fake(
             "ip",
             "#!/bin/sh\n"
-            "for a; do case $prev in type) kind=$a ;; esac; prev=$a; done\n"
+            "for a; do\n"
+            '  if [ -n "$kind" ] && [ "$a" = link ]; then\n'
+            '    printf \'%%s: unknown command "link"?\\n\' "$kind" >&2; exit 255\n'
+            "  fi\n"
+            "  case $prev in type) kind=$a ;; esac; prev=$a\n"
+            "done\n"
             'case $kind in bridge) exit 0 ;; *) printf "%s\\n" >&2; exit 2 ;; esac\n'
             % refusal,
         )
@@ -680,7 +694,8 @@ class BoxCheck(unittest.TestCase):
         self.fake(
             "sshd",
             "#!/bin/sh\n"
-            'printf "authorizedkeysfile %s\\nauthorizedkeyscommand %s\\nauthorizedkeyscommanduser %s\\n"\n'
+            # OpenSSH 10's canonical case, which the check reads case-insensitively.
+            'printf "AuthorizedKeysFile %s\\nAuthorizedKeysCommand %s\\nAuthorizedKeysCommandUser %s\\n"\n'
             % (keys_file, command, command_user),
         )
         self.fake("stat", '#!/bin/sh\nprintf "%s\\n"\n' % owner_mode)
