@@ -395,7 +395,7 @@ class TestOnlyBaseNixSeesTheOperator(unittest.TestCase):
 
     def test_no_module_but_base_nix_names_the_operator_variable(self):
         for path in sorted((REPO / "nix").rglob("*.nix")):
-            if path.name == "base.nix":
+            if path == REPO / "nix" / "base.nix":
                 continue
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 with self.subTest(path=str(path.relative_to(REPO)), line=number):
@@ -2232,7 +2232,9 @@ class TestEveryUserUnitIsTheAgents(unittest.TestCase):
         for m in self.UNIT_RE.finditer(text):
             kind, name = m.groups()
             rest = text[m.end() :].lstrip()
-            if rest.startswith("= {") and self.CONDITION in self.block_after(text, m.end()):
+            if rest.startswith("= {") and self.CONDITION in self.block_after(
+                text, m.end()
+            ):
                 units.add((kind, name))
             elif rest.startswith(".unitConfig.ConditionUser = agentUser;"):
                 units.add((kind, name))
@@ -2248,7 +2250,19 @@ class TestEveryUserUnitIsTheAgents(unittest.TestCase):
                 self.assertEqual(declared - self.conditioned_units(text), set())
 
     def test_the_check_sees_an_unconditioned_unit(self):
-        text = "systemd.user.sockets.x.wantedBy = [ \"sockets.target\" ];"
+        text = 'systemd.user.sockets.x.wantedBy = [ "sockets.target" ];'
         self.assertEqual(self.conditioned_units(text), set())
         block = "systemd.user.services.x = { unitConfig.ConditionUser = agentUser; };"
         self.assertEqual(self.conditioned_units(block), {("services", "x")})
+
+
+class TestOperatorNamePatternHasOneSpelling(unittest.TestCase):
+    """The operator's name reaches sshd config, tmpfiles rules and shell
+    scripts, so nix/base.nix asserts its shape; the libvirt driver refuses
+    the same names on the host before it writes cidata (docs/accounts.md)."""
+
+    def test_base_nix_and_the_libvirt_driver_accept_the_same_names(self):
+        (pattern,) = re.findall(
+            r'builtins\.match "([^"]+)" username', nix_code(REPO / "nix" / "base.nix")
+        )
+        self.assertEqual(pattern, yo.libvirt.OPERATOR_ACCOUNT_RE.pattern)

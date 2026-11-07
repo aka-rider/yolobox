@@ -10,7 +10,7 @@ Lima >= 2.1.0 names the operator's home `/home/<user>.guest` (it was `/home/<use
 
 Every AI coding session runs as a second account, `agent`, a constant in `flake.nix` that is never threaded in from the host. Its uid is 1000, its home is `/home/agent`, its only group is `users`, and it is in neither `wheel` nor any sudoers rule. It has no `sudo` at all, and with `security.sudo.execWheelOnly` it cannot even execute the sudo wrapper. `yo enter`, `yo code`, and `yo zed` land there.
 
-Three assertions in `nix/base.nix` check `username` at evaluation time, because it reaches sshd config, tmpfiles rules and shell scripts. It must differ from `agent`, it must not be `root`, and it must match `[a-z_][a-z0-9_-]*`. A Mac account that fails one of these stops `nixos-rebuild` with a message naming `YOLOBOX_USERNAME`, instead of building a box that quietly merges the two accounts.
+`username` is checked at evaluation time, because it reaches sshd config, tmpfiles rules and shell scripts. `flake.nix` throws when it is `agent` or `root`, before any module runs, since either name would make two `users.users` definitions collide; one assertion in `nix/base.nix` requires it to match `[a-z_][a-z0-9_-]*`. A host account that fails one of these stops `nixos-rebuild` with a message naming `YOLOBOX_USERNAME`, instead of building a box that quietly merges the two accounts. On a Linux host `yolobox_cli/libvirt.py` applies the same pattern before it writes the cidata that creates the account, and `TestOperatorNamePatternHasOneSpelling` in `tests/test_consistency.py` keeps the two spellings equal.
 
 ## Why a new account, not a stripped one
 
