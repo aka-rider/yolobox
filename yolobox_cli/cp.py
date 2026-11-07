@@ -397,9 +397,16 @@ def list_guest(
     # ssh_run quotes them, so no wildcard in them is expanded.
     done = sshx.ssh_run(AGENT, ["find", "-H"] + list(starts) + list(tests), binary=True)
     if done.returncode != 0:
+        # find's stderr names what it could not read (an unreadable directory
+        # under /tmp); it is guest text, so it is shown as one escaped line.
+        # Its stdout is the listing, never the reason.
         raise YoError(
-            "cannot list %s in the guest: %s"
-            % (", ".join(starts), proc.failure_detail(done))
+            "cannot list %s in the guest (find exited %d): %s"
+            % (
+                ", ".join(starts),
+                done.returncode,
+                ui.shown(done.stderr.strip()) or "it said nothing",
+            )
         )
     entries: Dict[str, GuestEntry] = {}
     for record in done.stdout.split(b"\0"):

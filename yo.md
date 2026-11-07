@@ -116,6 +116,8 @@ Everything else is unchanged: each guest path is still glob-escaped for scp (fin
 - two different accounts of one path (overlapping sources print a path twice, alike, and that is fine);
 - in the build-output listing, a record find was not asked for: a directory not named like build output, a file not named like a manifest, or any other type.
 
+A `find` that exits non-zero refuses the copy too, because its listing is then incomplete: GNU find goes on past a directory it cannot read (another account's directory under `/tmp`), prints its name on stderr and exits 1, so the message carries that stderr, as one escaped line, and names the exit code. Its stdout is the listing, never the reason, so a find that said nothing is reported as that.
+
 Anything the first listing says is also checked against the second. `fetch_walked` raises when a walked directory is missing from the second listing, is no longer a directory, or has no entries, because the first listing found build output in it. That is how a real race looks too (npm deleting `node_modules` between the two finds), so the message says the tree changed and to copy again.
 
 A listing can still lie by omission or by pointing at a clean path that is not what it says, and that is harmless: a path under a named source is something the operator asked for, and everything fetched still passes `drop_control_paths` and `plan_merge`.

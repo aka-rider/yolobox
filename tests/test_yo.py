@@ -1684,6 +1684,39 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
                     )
                 self.assertIn(repr(malformed), caught.exception.message)
 
+    def test_a_find_that_failed_names_what_it_could_not_read_on_one_line(self):
+        # find exits 1 when a directory under a source is unreadable, and its
+        # stderr names it; the copy is refused with that name, escaped.
+        os.makedirs("dest")
+        guest = FakeGuest(self.FILES, {}, self.scp_sources, self.scp_destinations, False)
+        said = {}
+
+        def failing(role, argv, **kwargs):
+            done = guest.ssh_run(role, argv, **kwargs)
+            if argv[0] == "find":
+                done.returncode = 1
+                done.stderr = said["stderr"]
+            return done
+
+        for stderr in ("find: '/home/agent/proj/lock\x1bed': Permission denied\n", ""):
+            with self.subTest(stderr=stderr):
+                said["stderr"] = stderr
+                with (
+                    mock.patch.object(yo.proc, "run", guest.scp),
+                    mock.patch.object(yo.sshx, "ssh_run", failing),
+                    self.assertRaises(yo.YoError) as caught,
+                ):
+                    yo.cmd_cp(yo.build_parser().parse_args(["cp", ":~/proj", "dest/"]))
+                message = caught.exception.message
+                self.assertIn("find exited 1", message)
+                self.assertNotIn("\n", message)
+                self.assertNotIn("\x1b", message)
+                if stderr:
+                    self.assertIn("proj/lock\\x1bed': Permission denied", message)
+                else:
+                    self.assertIn("it said nothing", message)
+        self.assertEqual(self.scp_sources, [])
+
     def test_the_largest_mode_and_mtime_a_filesystem_holds_are_accepted(self):
         # %m prints 7777 at most; APFS and ext4 keep an mtime as int64 nanoseconds.
         entry = yo.parse_guest_record(
