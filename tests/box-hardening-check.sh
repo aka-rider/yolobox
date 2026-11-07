@@ -10,16 +10,26 @@
 #   through yolobox.hardening.extraWrappers in its /etc/yolobox/local.nix.
 #   Each is a name, or name=caps with the capability names getcap shows,
 #   comma-separated, in any order (dumpcap=cap_net_raw,cap_setpcap). A bare
-#   name means the wrapper carries none.
+#   name means the wrapper carries none. A name of the allowlist is refused,
+#   as the rebuild refuses it.
 # ONLY=hardening | ONLY=compat: run just one half. Unset runs both. The
 #   compat half ("nothing the agent needs broke") is the one to iterate on
 #   against a box that is not hardened yet.
 #
-# It also checks that the agent cannot log in as the operator with the
-# forwarded 1Password agent (it prints SKIP, and tests nothing, when the agent
-# lists no key), and that the firewall rule behind that is loaded; that the
-# agent's herdr-server runs with oom_score_adj >= 0; that the box was not told its host OS; that the Lima guest agent runs
-# exactly when Lima's cidata ships it; and that `yolobox-guest rebuild` exists.
+# The hardening half proves the box holds against the agent: sysctls, kernel
+# parameters, blocked modules, io_uring, the wrapper set and each wrapper's
+# privilege, no setuid su, sudo closed to the agent, root and the agent locked,
+# no forwarding, the gateway's ssh port closed, the operator refused to the
+# agent's forwarded 1Password agent (SKIP, and nothing tested, when that agent
+# authorizes no key of the box's), and the agent's own authorized_keys
+# ignored. Its probes run as the agent WITHOUT the agent's login shell, since
+# the agent edits that shell's rc files and PATH.
+#
+# The compat half proves nothing the agent needs broke: net-check, the kept
+# qdisc, podman, chromium, a nix build, strace -p, the harness binaries, the
+# herdr server's oom_score_adj, rosetta on an aarch64 guest, the host OS stamp
+# absent, the Lima guest agent running exactly when Lima's cidata ships it,
+# `yolobox-guest rebuild` present, github.com's host key pinned.
 #
 # It stops at the first broken property and names it. There is no python in
 # the box, so socket probes use perl and JSON uses jq.
@@ -30,17 +40,29 @@ set -f
 # Wrappers a hardened box keeps (nix/hardening.nix keptWrappers). Anything else in
 # /run/wrappers/bin is an unexpected setuid/capability binary.
 readonly WRAPPER_ALLOWLIST="sudo sudoedit unix_chkpwd newuidmap newgidmap"
+readonly WRAPPERS=/run/wrappers/bin
+readonly SYSBIN=/run/current-system/sw/bin
+# The agent account (flake.nix agentUser, nix/base.nix) and the forwarded
+# 1Password agent it reaches (nix/lib/agent-env.nix SSH_AUTH_SOCK).
+readonly AGENT_USER=agent
 readonly AGENT_UID=1000
+readonly AGENT_AUTH_SOCK=/run/yolobox/op-agent.sock
 readonly HK_NET=hk-test
 # The addresses of the box's own network (nix/egress.nix, libvirt/domain.xml):
 # the gateway is the host's loopback, the guest's address is enp0s1's.
 readonly GATEWAY_ADDR=192.168.5.2
 readonly GUEST_ADDR=192.168.5.15
+# What sshd logs when AllowUsers refuses a name (openssh auth.c allowed_user).
+readonly ALLOWUSERS_REFUSAL="not allowed because not listed in AllowUsers"
 
 WORK=""
+AGENT_HOME=""
 SLEEPER_PID=""
 NET_CREATED=""
 PROBE_OUT=""
+WRAPPER_CAPS=""
+PLANTED_KEY_DIR=""
+EXTRA_NAMES=()
 
 fail() {
     echo "FAIL: $*" >&2
@@ -57,7 +79,8 @@ warn() {
 
 trap 'echo "FAIL: unexpected error at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
-# Run a command as the agent, the way an AI session sees it.
+# Run a command as the agent, the way an AI session sees it. The compat half
+# uses this one: "nothing broke" is about the agent's real environment.
 #
 # `sudo -iu agent` is a login shell, so the command gets the agent's real
 # environment: PATH with ~/.local/bin (claude, pi) and
@@ -70,23 +93,68 @@ trap 'echo "FAIL: unexpected error at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 # except `$`. So callers pass plain words only; anything with quotes or `$`
 # lives in a file under $WORK and is passed by path.
 as_agent() {
-    sudo -iu agent env "XDG_RUNTIME_DIR=/run/user/${AGENT_UID}" "$@"
+    sudo -n -iu "${AGENT_USER}" env "XDG_RUNTIME_DIR=/run/user/${AGENT_UID}" "$@"
+}
+
+# Run a command as the agent with nothing of the agent's own in the way. The
+# hardening half uses this one: a probe through the login shell runs the
+# agent's rc files and the agent's ~/.local/bin first, so an agent could make
+# any refusal print. No shell, an environment of PATH and HOME alone, and
+# callers name every binary by its ${SYSBIN} path. Arguments reach the command
+# verbatim, so quotes and `$` are fine here.
+as_agent_bare() {
+    sudo -n -u "${AGENT_USER}" "${SYSBIN}/env" -i "PATH=${SYSBIN}" "HOME=${AGENT_HOME}" "$@"
 }
 
 cleanup() {
     local status=$?
     trap - ERR
     if [ -n "${SLEEPER_PID}" ]; then
-        as_agent kill "${SLEEPER_PID}" 2>/dev/null || true # already gone is fine
+        as_agent_bare "${SYSBIN}/kill" "${SLEEPER_PID}" 2>/dev/null || true # already gone is fine
     fi
     if [ -n "${NET_CREATED}" ]; then
         as_agent podman network rm -f "${HK_NET}" >/dev/null ||
             warn "cleanup: could not remove podman network ${HK_NET}"
     fi
+    if [ -n "${PLANTED_KEY_DIR}" ]; then
+        unplant_agent_key || warn "cleanup: could not remove the planted key from ${AGENT_HOME}/.ssh/authorized_keys"
+    fi
     if [ -n "${WORK}" ]; then
         rm -rf "${WORK}"
     fi
     exit "${status}"
+}
+
+# EXTRA_WRAPPERS, checked once: each word is a name, or name=caps, and no
+# name is on the allowlist (the rebuild refuses that too: the table already
+# fixes the privilege of those). Leaves the names in EXTRA_NAMES.
+parse_extra_wrappers() {
+    local extra name
+    for extra in ${EXTRA_WRAPPERS:-}; do
+        name=${extra%%=*}
+        case ${extra} in
+        *[!A-Za-z0-9._,=-]* | =* | *=) fail "EXTRA_WRAPPERS entry '${extra}' is not name or name=cap_a,cap_b" ;;
+        esac
+        case " ${WRAPPER_ALLOWLIST} " in
+        *" ${name} "*) fail "EXTRA_WRAPPERS names ${name}, which is on the allowlist; the rebuild refuses that too" ;;
+        esac
+        EXTRA_NAMES+=("${name}")
+    done
+}
+
+# The capabilities EXTRA_WRAPPERS states for a wrapper, sorted; "" when it
+# states none or does not name the wrapper.
+extra_caps_of() {
+    local name=$1 extra
+    for extra in ${EXTRA_WRAPPERS:-}; do
+        case ${extra} in
+        "${name}="*)
+            sorted_caps <<<"${extra#*=}"
+            return
+            ;;
+        esac
+    done
+    echo ""
 }
 
 # ---------------------------------------------------------------- hardening
@@ -129,13 +197,22 @@ check_sysctls() {
     ok "sysctls read back their hardened values"
 }
 
+# nix/base.nix forces networking.nat off, which is what keeps nixpkgs' nat
+# module from turning forwarding on: nothing routes for others through the box.
+check_ip_forward() {
+    local got
+    got=$(sudo -n sysctl -n net.ipv4.ip_forward) || fail "sysctl net.ipv4.ip_forward is unreadable"
+    [ "${got}" = 0 ] || fail "net.ipv4.ip_forward is ${got}, want 0: the box routes"
+    ok "net.ipv4.ip_forward is 0"
+}
+
 check_cmdline() {
     local cmdline param
     cmdline=$(cat /proc/cmdline)
     # The first three are boot.kernelParams in nix/hardening.nix (a consistency
     # test compares them); nohibernate comes from security.protectKernelImage.
     for param in slab_nomerge page_alloc.shuffle=1 debugfs=off nohibernate; do
-        printf '%s\n' "${cmdline}" | tr ' ' '\n' | grep -qxF -- "${param}" ||
+        grep -qxF -- "${param}" <<<"${cmdline// /$'\n'}" ||
             fail "kernel parameter ${param} is missing from /proc/cmdline: ${cmdline}"
         ok "kernel parameter ${param} is on the command line"
     done
@@ -204,13 +281,40 @@ case $out in
 esac
 EOF
 
-    # Starts a long sleep detached from this script and prints its pid.
-    cat >"${WORK}/sleeper.sh" <<'EOF'
+    # The strace target: a reader of the fifo, which blocks in open() until
+    # this script writes to it. Starts it detached and prints its pid.
+    mkfifo -m 644 "${WORK}/fifo"
+    cat >"${WORK}/sleeper.sh" <<EOF
 #!/usr/bin/env bash
-sleep 60 </dev/null >/dev/null 2>&1 &
-echo $!
+cat "${WORK}/fifo" </dev/null >/dev/null 2>&1 &
+echo \$!
 EOF
     chmod 755 "${WORK}/sleeper.sh"
+
+    # Plants a key of the agent's own in its ~/.ssh/authorized_keys, or takes
+    # it out again. Run as the agent: KEYDIR is the agent's directory, MARKER
+    # the key's comment. A file that was there stays, minus the planted line.
+    cat >"${WORK}/plant-key.sh" <<'EOF'
+set -eu
+keydir=$1 action=$2 marker=$3
+file=~/.ssh/authorized_keys
+case ${action} in
+plant)
+    if [ -e "${file}" ]; then touch "${keydir}/had-authorized-keys"; fi
+    mkdir -p -m 700 ~/.ssh
+    ssh-keygen -q -t ed25519 -N '' -C "${marker}" -f "${keydir}/key"
+    cat "${keydir}/key.pub" >>"${file}"
+    ;;
+unplant)
+    if [ -e "${keydir}/had-authorized-keys" ]; then
+        grep -v -F "${marker}" "${file}" >"${keydir}/kept" || true
+        cat "${keydir}/kept" >"${file}"
+    else
+        rm -f "${file}"
+    fi
+    ;;
+esac
+EOF
 
     # The name is unique per run, so the build is never a cache hit.
     cat >"${WORK}/build.nix" <<EOF
@@ -225,12 +329,12 @@ EOF
 
 # Runs a perl probe as the agent and leaves its output in PROBE_OUT. A probe
 # exits 0 when the kernel refused, 3 when the hardening did not hold. Any other
-# status means sudo, the login shell or perl broke, which says nothing about
-# the hardening, so it gets a different message.
+# status means sudo or perl broke, which says nothing about the hardening, so
+# it gets a different message.
 agent_probe() {
     local property_failed=$1 status=0
     shift
-    PROBE_OUT=$(as_agent perl "$@" 2>&1) || status=$?
+    PROBE_OUT=$(as_agent_bare "${SYSBIN}/perl" "$@" 2>&1) || status=$?
     case ${status} in
     0) ;;
     3) fail "${property_failed}: ${PROBE_OUT}" ;;
@@ -245,7 +349,7 @@ check_socket_refused() {
     agent_probe "agent could open a ${label} socket (${module} autoloads)" \
         "${WORK}/socket.pl" "${domain}" "${type}" "${proto}"
     mods=$(lsmod)
-    if printf '%s\n' "${mods}" | grep -q "^${module} "; then
+    if grep -q "^${module} " <<<"${mods}"; then
         fail "${module} is loaded in the kernel"
     fi
     ok "${label} socket refused for the agent (${PROBE_OUT}), ${module} not loaded"
@@ -257,15 +361,22 @@ check_io_uring() {
     ok "io_uring_setup ${PROBE_OUT} for the agent"
 }
 
+# modprobe -n -v NAME must print the install rule that routes NAME to bin/false.
+check_modprobe_routed() {
+    local module=$1 out
+    out=$(modprobe -n -v "${module}" 2>&1) || fail "modprobe -n -v ${module} failed: ${out}"
+    case ${out} in
+    *install*bin/false*) ;;
+    *) fail "modprobe -n -v ${module} does not hit the install rule (want install ... bin/false): ${out}" ;;
+    esac
+}
+
 check_modules() {
-    local out
     # AF_BLUETOOTH=31, SOCK_STREAM=1, BTPROTO_RFCOMM=3
     check_socket_refused bluetooth bluetooth 31 1 3
     # AF_INET=2, SOCK_STREAM=1, IPPROTO_SCTP=132
     check_socket_refused sctp sctp 2 1 132
-    out=$(modprobe -n -v bluetooth 2>&1) || fail "modprobe -n -v bluetooth failed: ${out}"
-    printf '%s\n' "${out}" | grep -q 'install' && printf '%s\n' "${out}" | grep -q 'bin/false' ||
-        fail "modprobe -n -v bluetooth does not hit the install rule (want install ... bin/false): ${out}"
+    check_modprobe_routed bluetooth
     ok "explicit modprobe of bluetooth is routed to bin/false"
 }
 
@@ -274,7 +385,7 @@ check_modules() {
 # The net/sched modules are blocked (nix/hardening.nix), except sch_fq_codel.
 check_net_sched() {
     local out status=0 loaded
-    if out=$(as_agent unshare -Urn tc qdisc add dev lo root netem delay 1ms 2>&1); then
+    if out=$(as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/tc" qdisc add dev lo root netem delay 1ms 2>&1); then
         fail "the agent attached a netem qdisc in its own namespace (sch_netem autoloads)"
     fi
     case ${out} in
@@ -282,7 +393,7 @@ check_net_sched() {
     *) fail "tc qdisc add netem failed, but not with the kernel refusing the qdisc kind: ${out}" ;;
     esac
     ok "the agent cannot attach a netem qdisc (${out})"
-    out=$(as_agent unshare -Urn bash "${WORK}/netsched.sh" 2>&1) || status=$?
+    out=$(as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/bash" "${WORK}/netsched.sh" 2>&1) || status=$?
     case ${status} in
     0) ;;
     3) fail "the agent attached a u32 classifier in its own namespace (cls_u32 autoloads): ${out}" ;;
@@ -291,10 +402,8 @@ check_net_sched() {
     esac
     ok "the agent cannot attach a u32 classifier (${out})"
     loaded=$(lsmod | awk '$1 ~ /^(cls|act|sch)_/ && $1 != "sch_fq_codel" {print $1}')
-    [ -z "${loaded}" ] || fail "net/sched modules are loaded: $(echo ${loaded})"
-    out=$(modprobe -n -v cls_u32 2>&1) || fail "modprobe -n -v cls_u32 failed: ${out}"
-    printf '%s\n' "${out}" | grep -q 'bin/false' ||
-        fail "modprobe -n -v cls_u32 does not hit the install rule (want install ... bin/false): ${out}"
+    [ -z "${loaded}" ] || fail "net/sched modules are loaded: ${loaded//$'\n'/ }"
+    check_modprobe_routed cls_u32
     ok "no cls_, act_ or sch_ module is loaded but sch_fq_codel, and cls_u32 is routed to bin/false"
 }
 
@@ -306,81 +415,115 @@ sorted_caps() {
     tr ',' '\n' | LC_ALL=C sort -u | paste -sd, -
 }
 
+# Leaves the capability names a wrapper carries in WRAPPER_CAPS, sorted; ""
+# when it carries none. getcap prints "path cap_x,cap_y=ep" or "path =
+# cap_x,cap_y+ep" by libcap version, and nothing for a file without
+# capabilities. Any other text fails: "path =ep" (no names) grants EVERY
+# capability, and so does "all=ep".
+read_wrapper_caps() {
+    local path=$1 out rest
+    out=$(getcap "${path}") || fail "getcap ${path} failed"
+    rest=${out#"${path}"}
+    rest=${rest# }
+    if [ -z "${rest}" ]; then
+        WRAPPER_CAPS=""
+        return
+    fi
+    [[ ${rest} =~ ^(=\ )?(cap_[a-z_]+(,cap_[a-z_]+)*)[=+][eip]+$ ]] ||
+        fail "getcap ${path} printed a capability text this check does not read, so it may grant every capability: '${out}'"
+    WRAPPER_CAPS=$(sorted_caps <<<"${BASH_REMATCH[2]}")
+}
+
 check_wrappers() {
-    local want have name out caps expected_caps extra
-    have=$(ls /run/wrappers/bin | sort -u)
-    want=$(printf '%s\n' ${WRAPPER_ALLOWLIST} ${EXTRA_WRAPPERS:-} | sed 's/=.*//' | sort -u)
-    [ "${have}" = "${want}" ] || fail "/run/wrappers/bin differs from the allowlist (< unexpected, > missing)
+    local allowlist have want name path caps expected_caps stat owner group mode
+    read -ra allowlist <<<"${WRAPPER_ALLOWLIST}"
+    have=$(find "${WRAPPERS}" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+    want=$(printf '%s\n' "${allowlist[@]}" "${EXTRA_NAMES[@]}" | LC_ALL=C sort -u)
+    [ "${have}" = "${want}" ] || fail "${WRAPPERS} differs from the allowlist (< unexpected, > missing)
 $(diff <(printf '%s\n' "${have}") <(printf '%s\n' "${want}") || true)"
-    ok "wrapper set is exactly: $(echo ${want})"
+    ok "wrapper set is exactly: ${want//$'\n'/ }"
 
-    for name in sudo sudoedit unix_chkpwd; do
-        [ -u "/run/wrappers/bin/${name}" ] || fail "${name} lost its setuid bit"
-    done
-    ok "sudo, sudoedit and unix_chkpwd are setuid"
-
-    # The capability names the wrapper carries; "" when it has none.
-    # getcap prints "path cap_x=ep" or "path = cap_x+ep" by libcap version.
+    # Each wrapper's privilege, as nix/hardening.nix states it: root's, never
+    # setgid, setuid exactly when it carries no capability, and sudo's pair
+    # closed to anyone outside wheel (security.sudo.execWheelOnly).
     for name in ${have}; do
-        out=$(getcap "/run/wrappers/bin/${name}") || fail "getcap ${name} failed"
-        # grep exits 1 on the empty output of a wrapper without capabilities.
-        caps=$(printf '%s\n' "${out}" | grep -o 'cap_[a-z_]*' | sorted_caps) || caps=""
+        path="${WRAPPERS}/${name}"
+        read_wrapper_caps "${path}"
+        caps=${WRAPPER_CAPS}
         case ${name} in
         # nixpkgs grants cap_setpcap beside the one the name suggests
         # (getcap: "newuidmap cap_setuid,cap_setpcap=ep").
         newuidmap) expected_caps=cap_setpcap,cap_setuid ;;
         newgidmap) expected_caps=cap_setgid,cap_setpcap ;;
-        *)
-            expected_caps=""
-            for extra in ${EXTRA_WRAPPERS:-}; do
-                case ${extra} in
-                "${name}="*) expected_caps=$(printf '%s' "${extra#*=}" | sorted_caps) ;;
-                esac
-            done
-            ;;
+        *) expected_caps=$(extra_caps_of "${name}") ;;
         esac
         [ "${caps}" = "${expected_caps}" ] ||
             fail "wrapper ${name} has capabilities '${caps}', want '${expected_caps}'"
+        stat=$(stat -c '%U %G %a' "${path}") || fail "cannot stat ${path}"
+        read -r owner group mode <<<"${stat}"
+        [ "${owner}" = root ] || fail "wrapper ${name} is owned by ${owner}, not root"
+        [ ! -g "${path}" ] || fail "wrapper ${name} is setgid"
+        if [ -z "${caps}" ]; then
+            [ -u "${path}" ] || fail "wrapper ${name} carries no capability and is not setuid: it is no wrapper"
+        else
+            [ ! -u "${path}" ] || fail "wrapper ${name} is setuid on top of its capabilities"
+        fi
+        case ${name} in
+        sudo | sudoedit)
+            [ "${group}" = wheel ] || fail "${name} is group ${group}, not wheel"
+            [ $((8#${mode} & 1)) -eq 0 ] || fail "${name} is mode ${mode}: executable by others, so the agent can run it"
+            ;;
+        esac
     done
-    ok "only newuidmap (cap_setuid, cap_setpcap), newgidmap (cap_setgid, cap_setpcap) and the EXTRA_WRAPPERS that name theirs carry capabilities"
+    ok "every wrapper is root's, none setgid, setuid exactly when it carries no capability, and sudo's pair is wheel-only"
 }
 
+# The store's plain `su` stays on the system path; without a setuid bit it
+# cannot do anything, and the allowlist above holds no su wrapper.
 check_no_su() {
-    local found resolved
-    # The store's plain `su` stays in /run/current-system/sw/bin; without a
-    # setuid wrapper it cannot do anything. What must be gone is a su the
-    # agent can run as root: no wrapper, and no setuid file behind the name.
-    found=$(as_agent bash -c "command -v su || echo NOSU") ||
-        fail "could not run bash as the agent (sudo failed): ${found}"
-    if [ "${found}" = NOSU ]; then
-        ok "su is not on the agent's PATH"
+    local resolved
+    if [ ! -e "${SYSBIN}/su" ]; then
+        ok "su is not on the system path"
         return
     fi
-    case ${found} in
-    /run/wrappers/*) fail "the agent's su is the wrapper ${found}" ;;
+    resolved=$(readlink -f "${SYSBIN}/su")
+    [ ! -u "${resolved}" ] || fail "the system's su (${resolved}) is setuid"
+    [ ! -g "${resolved}" ] || fail "the system's su (${resolved}) is setgid"
+    ok "the system's su (${resolved}) runs with the caller's own rights"
+}
+
+# The mode check above says sudo is not executable by others; this is the
+# agent trying anyway.
+check_sudo_refuses_agent() {
+    local out status=0
+    out=$(as_agent_bare "${WRAPPERS}/sudo" -n true 2>&1) || status=$?
+    [ "${status}" -ne 0 ] || fail "the agent ran sudo -n true"
+    case ${out} in
+    *"Permission denied"*) ;;
+    *) fail "sudo -n true as the agent failed (exit ${status}), but not with Permission denied: ${out}" ;;
     esac
-    resolved=$(readlink -f "${found}")
-    [ ! -u "${resolved}" ] || fail "the agent's su (${resolved}) is setuid"
-    ok "the agent's su (${found}) has no setuid wrapper"
+    ok "the agent cannot run sudo (${out})"
 }
 
-hardening_checks() {
-    check_sysctls
-    check_cmdline
-    check_modules
-    check_net_sched
-    check_io_uring
-    check_wrappers
-    check_no_su
-}
-
-# ------------------------------------------------------------ nothing broke
-
-check_net() {
-    local out
-    out=$(yolobox-guest net-check) || fail "yolobox-guest net-check exited nonzero: ${out}"
-    printf '%s\n' "${out}" | grep -qx 'egress=ok' || fail "net-check: want egress=ok, got: ${out}"
-    ok "net-check: egress=ok"
+# nix/base.nix locks root and the agent on every activation, and keeps the
+# agent out of every supplementary group (systemd-journal would show it the
+# operator's sudo lines).
+check_accounts_locked() {
+    local account entry field groups
+    for account in root "${AGENT_USER}"; do
+        entry=$(sudo -n getent shadow "${account}") || fail "no shadow entry for ${account}"
+        field=${entry#*:}
+        field=${field%%:*}
+        case ${field} in
+        '!'* | '*'*) ;;
+        *) fail "the password of ${account} is not locked (shadow field '${field}')" ;;
+        esac
+    done
+    ok "root and ${AGENT_USER} have locked passwords"
+    groups=$(id -Gn "${AGENT_USER}") || fail "id -Gn ${AGENT_USER} failed"
+    [ "${groups}" = users ] || fail "${AGENT_USER} is in groups '${groups}', want users alone"
+    [ "$(id -u "${AGENT_USER}")" = "${AGENT_UID}" ] || fail "${AGENT_USER} is not uid ${AGENT_UID}"
+    ok "${AGENT_USER} is uid ${AGENT_UID} in the group users alone"
 }
 
 # The gateway is the host's own loopback, so a connection to its port 22 would
@@ -391,48 +534,151 @@ check_gateway_ssh_closed() {
     ok "the agent cannot reach ${GATEWAY_ADDR}:22 (${PROBE_OUT})"
 }
 
+# ssh as the agent, with the forwarded agent and nothing of the agent's own:
+# no ~/.ssh/config, no known hosts. The target's identity is not the question.
+agent_ssh() {
+    as_agent_bare "SSH_AUTH_SOCK=${AGENT_AUTH_SOCK}" "${SYSBIN}/ssh" -F /dev/null \
+        -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 "$@"
+}
+
+# The journal cursor after sshd's last line, so a later read sees only what
+# the probes caused. sshd has logged at least this session's login.
+sshd_journal_cursor() {
+    local cursor
+    cursor=$(sudo -n journalctl -u sshd.service -n 1 -q -o cat --show-cursor | sed -n 's/^-- cursor: //p')
+    [ -n "${cursor}" ] || fail "sshd.service has no journal entry to read on from"
+    echo "${cursor}"
+}
+
+# sshd's lines since the cursor. --sync returns once every line logged before
+# the call is in the journal, so this needs no wait.
+sshd_journal_since() {
+    sudo -n journalctl --sync || fail "journalctl --sync failed"
+    sudo -n journalctl -u sshd.service --after-cursor="$1" -q -o cat
+}
+
 # On a Linux host the operator's key is served by the host's 1Password agent,
 # which the agent account reaches through its forwarded socket. So on every box
 # sshd must refuse the operator from every address but the gateway's, and the
 # firewall must stop the agent claiming that address over loopback.
-# The ssh probes count Permission denied as sshd's AllowUsers refusing, but ssh
-# fails the same way when the forwarded agent offers no operator key. So they
-# run only when the agent lists a key, and print a SKIP when it lists none. An
-# agent that cannot be reached at all is a FAIL.
+#
+# A Permission denied alone proves nothing: ssh fails the same way when the
+# forwarded agent offers no key the box authorizes. So the positive control
+# comes first: the same forwarded agent must log the agent account in, whose
+# authorized keys are the operator's (nix/base.nix AuthorizedKeysCommand). When
+# that is refused, the operator probes print a SKIP and test nothing. When it
+# works, each operator probe must be refused, and sshd's journal must say it
+# was AllowUsers that refused (an authorized key with any other outcome is a
+# FAIL). An agent that cannot be reached at all is a FAIL.
+#
+# sshd penalises an address that fails authentication (PerSourcePenalties,
+# enforced once the address accumulates 15 s, 5 s per failure), and only the
+# gateway is exempt. So each address below takes at most two failures per run,
+# this check's one and check_agent_authorized_keys_ignored's; a penalised
+# address shows as a connection closed before authentication, not a refusal.
 # $1 is the operator's account name.
 check_operator_login_refused() {
-    local operator=$1 addr out keys keys_status=0
-    out=$(as_agent printenv SSH_AUTH_SOCK) ||
-        fail "the agent has no SSH_AUTH_SOCK, so a login probe would prove nothing"
-    [ -n "${out}" ] || fail "the agent's SSH_AUTH_SOCK is empty"
+    local operator=$1 addr out keys keys_status=0 control_status=0 cursor journal
     # ssh-add -L exits 1 when the agent lists no identity and 2 when it cannot
     # reach the agent; only the first is a SKIP.
-    keys=$(as_agent ssh-add -L 2>&1) || keys_status=$?
+    keys=$(as_agent_bare "SSH_AUTH_SOCK=${AGENT_AUTH_SOCK}" "${SYSBIN}/ssh-add" -L 2>&1) || keys_status=$?
     case ${keys_status} in
-    0)
-        for addr in 127.0.0.1 "${GUEST_ADDR}"; do
-            if out=$(as_agent ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
-                "${operator}@${addr}" true 2>&1); then
-                fail "the agent logged in as ${operator} at ${addr} with its forwarded agent"
-            fi
-            case ${out} in
-            *"Permission denied"*) ;;
-            *) fail "ssh as ${operator} at ${addr} failed, but not with Permission denied: ${out}" ;;
-            esac
-            ok "the agent cannot log in as ${operator} at ${addr}"
-        done
-        ;;
+    0) ;;
     1)
-        echo "SKIP: sshd's refusal of ${operator} was NOT tested: the agent's forwarded ssh agent lists no key (ssh-add -L: ${keys}), so a Permission denied would not prove AllowUsers refused. Connect with an ssh agent forwarded and run this again" >&2
+        echo "SKIP: sshd's refusal of ${operator} was NOT tested: the agent's forwarded ssh agent lists no key (ssh-add -L: ${keys}). Connect with an ssh agent forwarded and run this again" >&2
+        return
         ;;
     *) fail "ssh-add -L exited ${keys_status}: the agent's ssh agent socket is unreachable (${keys})" ;;
     esac
-    # -C matches the rule by meaning; `iptables -S` prints its options in
-    # another order than the one the unit adds them in.
+    out=$(agent_ssh "${AGENT_USER}@127.0.0.1" true 2>&1) || control_status=$?
+    if [ "${control_status}" -ne 0 ]; then
+        case ${out} in
+        *"Permission denied"*)
+            echo "SKIP: sshd's refusal of ${operator} was NOT tested: the agent's forwarded ssh agent lists keys, but none logs the agent account in, so a refusal of ${operator} would prove nothing (${out}). Forward the operator's key and run this again" >&2
+            return
+            ;;
+        *) fail "the agent could not log in as itself at 127.0.0.1 with its forwarded agent (exit ${control_status}): ${out}" ;;
+        esac
+    fi
+    ok "the forwarded agent logs ${AGENT_USER} in at 127.0.0.1, so a refusal of ${operator} with it is sshd's doing"
+    cursor=$(sshd_journal_cursor)
+    for addr in 127.0.0.1 "${GUEST_ADDR}"; do
+        if out=$(agent_ssh "${operator}@${addr}" true 2>&1); then
+            fail "the agent logged in as ${operator} at ${addr} with its forwarded agent"
+        fi
+        case ${out} in
+        *"Permission denied"*) ;;
+        *) fail "ssh as ${operator} at ${addr} failed, but not with Permission denied (a penalised address closes the connection instead): ${out}" ;;
+        esac
+        journal=$(sshd_journal_since "${cursor}")
+        grep -qF "User ${operator} from ${addr} ${ALLOWUSERS_REFUSAL}" <<<"${journal}" ||
+            fail "sshd refused ${operator} at ${addr}, but its journal does not say AllowUsers did: ${journal}"
+        ok "sshd refuses ${operator} at ${addr} because of AllowUsers"
+    done
+}
+
+# The rule behind the AllowUsers entry: the agent cannot claim the gateway's
+# address over loopback. -C matches the rule by meaning; `iptables -S` prints
+# its options in another order than the one the unit adds them in.
+check_gateway_spoof_dropped() {
     sudo -n iptables -C nixos-fw ! -i enp0s1 -s "${GATEWAY_ADDR}" -j DROP ||
         fail "nixos-fw has no rule dropping ${GATEWAY_ADDR} off enp0s1: $(sudo -n iptables -S nixos-fw)"
     ok "nixos-fw drops packets claiming ${GATEWAY_ADDR} on any interface but enp0s1"
+}
+
+unplant_agent_key() {
+    as_agent_bare "${SYSBIN}/bash" "${WORK}/plant-key.sh" "${PLANTED_KEY_DIR}" unplant "hk-check-$$" || return 1
+    as_agent_bare "${SYSBIN}/rm" -rf "${PLANTED_KEY_DIR}" || return 1
+    PLANTED_KEY_DIR=""
+}
+
+# ~agent/.ssh/authorized_keys is the agent's to write, so sshd must not read
+# it (nix/base.nix: AuthorizedKeysFile none for the agent). The agent plants a
+# key of its own there and must still be refused with it; the control that
+# sshd takes a key at all is check_operator_login_refused's agent login.
+check_agent_authorized_keys_ignored() {
+    local out status=0
+    PLANTED_KEY_DIR=$(as_agent_bare "${SYSBIN}/mktemp" -d /tmp/hk-agent-key.XXXXXX) ||
+        fail "could not create a directory as the agent"
+    as_agent_bare "${SYSBIN}/bash" "${WORK}/plant-key.sh" "${PLANTED_KEY_DIR}" plant "hk-check-$$" ||
+        fail "could not plant a key in ${AGENT_HOME}/.ssh/authorized_keys as the agent"
+    out=$(as_agent_bare "${SYSBIN}/ssh" -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o IdentitiesOnly=yes \
+        -o IdentityAgent=none -i "${PLANTED_KEY_DIR}/key" "${AGENT_USER}@127.0.0.1" true 2>&1) || status=$?
+    [ "${status}" -ne 0 ] || fail "the agent logged in with a key it wrote to its own authorized_keys"
+    case ${out} in
+    *"Permission denied"*) ;;
+    *) fail "ssh with the planted key failed, but not with Permission denied: ${out}" ;;
+    esac
+    unplant_agent_key || fail "could not remove the planted key from ${AGENT_HOME}/.ssh/authorized_keys"
+    ok "a key the agent writes to its own authorized_keys does not log it in"
+}
+
+hardening_checks() {
+    check_sysctls
+    check_ip_forward
+    check_cmdline
+    check_modules
+    check_net_sched
+    check_io_uring
+    check_wrappers
+    check_no_su
+    check_sudo_refuses_agent
+    check_accounts_locked
+    check_gateway_ssh_closed
+    check_operator_login_refused "$(id -un)"
+    check_gateway_spoof_dropped
+    check_agent_authorized_keys_ignored
+}
+
+# ------------------------------------------------------------ nothing broke
+
+check_net() {
+    local out
+    out=$(yolobox-guest net-check) || fail "yolobox-guest net-check exited nonzero: ${out}"
+    grep -qx 'egress=ok' <<<"${out}" || fail "net-check: want egress=ok, got: ${out}"
+    ok "net-check: egress=ok"
 }
 
 # The guest gates each host difference on the fact it needs, so nothing tells
@@ -464,21 +710,32 @@ check_run_mount() {
     ok "/run/mount is 755"
 }
 
+# One property of a unit, from `systemctl show`.
+unit_property() {
+    systemctl show -p "$2" --value "$1" || fail "could not read ${2} of ${1}"
+}
+
 # lima-guestagent runs the binary Lima ships on its cidata disk, so it must run
 # where that binary exists (a Lima box) and be skipped, not failed, where it
-# does not (a libvirt box). /mnt/lima-cidata is root's 0700 mount.
+# does not (a libvirt box). /mnt/lima-cidata is root's 0700 mount. A unit
+# that is missing or renamed is neither: systemctl show prints inactive for
+# any name, so the unit must be loaded, and a skip must come from a condition
+# systemd evaluated (ConditionTimestamp set).
 check_guestagent() {
-    local unit=lima-guestagent.service state result
-    state=$(systemctl show -p ActiveState --value "${unit}") ||
-        fail "could not read the state of ${unit}"
+    local unit=lima-guestagent.service load state result evaluated
+    load=$(unit_property "${unit}" LoadState)
+    [ "${load}" = loaded ] || fail "${unit} is not loaded (LoadState=${load}): the unit is missing or renamed"
+    state=$(unit_property "${unit}" ActiveState)
     if sudo -n test -e /mnt/lima-cidata/lima-guestagent; then
         [ "${state}" = active ] ||
             fail "Lima's cidata ships the guest agent, but ${unit} is ${state}"
         ok "${unit} is active, and Lima's cidata ships its binary"
         return
     fi
-    result=$(systemctl show -p ConditionResult --value "${unit}") ||
-        fail "could not read the condition result of ${unit}"
+    result=$(unit_property "${unit}" ConditionResult)
+    evaluated=$(unit_property "${unit}" ConditionTimestamp)
+    [ -n "${evaluated}" ] ||
+        fail "the cidata has no guest agent, but systemd never evaluated the condition of ${unit} (ConditionTimestamp is empty)"
     [ "${result}" = no ] ||
         fail "the cidata has no guest agent, but ${unit} has ConditionResult=${result}, not no"
     [ "${state}" != failed ] || fail "the cidata has no guest agent, and ${unit} failed"
@@ -544,7 +801,7 @@ check_chromium() {
     # stderr for the failure message only.
     dom=$(as_agent timeout 120 chromium --headless=new --disable-gpu --dump-dom https://example.com 2>"${WORK}/chromium.err") ||
         fail "headless chromium failed: $(tail -n 5 "${WORK}/chromium.err")"
-    printf '%s\n' "${dom}" | grep -q Example || fail "chromium dumped a DOM without 'Example'"
+    grep -q Example <<<"${dom}" || fail "chromium dumped a DOM without 'Example'"
     ok "headless chromium renders https://example.com"
 }
 
@@ -554,19 +811,32 @@ check_nix_build() {
     ok "agent can run a sandboxed nix build"
 }
 
+# strace -p on an agent-owned process. The target blocks on the fifo; strace
+# must print its attach line, after which the fifo is written, the target
+# exits and strace follows it out. No timer orders any of it: a refused attach
+# (ptrace_scope, a seccomp or LSM rule) prints its error in the attach line's
+# place.
 check_strace() {
-    local status=0 out
+    local first rest
     SLEEPER_PID=$(as_agent "${WORK}/sleeper.sh" | tail -n 1)
     case ${SLEEPER_PID} in
     '' | *[!0-9]*) fail "could not start the strace target: '${SLEEPER_PID}'" ;;
     esac
-    # timeout exits 124 when strace was still attached after 2s: success.
-    # A refused attach (ptrace_scope, a seccomp or LSM rule) exits 1 at once.
-    out=$(as_agent timeout 2 strace -p "${SLEEPER_PID}" -e trace=none 2>&1) || status=$?
-    [ "${status}" -eq 124 ] || fail "strace -p on an agent process did not stay attached (exit ${status}): ${out}"
-    ok "strace -p attaches to an agent-owned process"
-    as_agent kill "${SLEEPER_PID}" || fail "could not kill the strace target ${SLEEPER_PID}"
+    exec 3< <(as_agent strace -p "${SLEEPER_PID}" -e trace=none 2>&1)
+    read -r -u 3 first || fail "strace -p ${SLEEPER_PID} printed nothing"
+    case ${first} in
+    *"Process ${SLEEPER_PID} attached"*) ;;
+    *) fail "strace -p on an agent process did not attach: ${first}" ;;
+    esac
+    echo go >"${WORK}/fifo"
+    rest=$(cat <&3)
+    exec 3<&-
     SLEEPER_PID=""
+    case ${rest} in
+    *"+++ exited with 0 +++"*) ;;
+    *) fail "strace -p attached, but did not follow the target to its exit: ${rest}" ;;
+    esac
+    ok "strace -p attaches to an agent-owned process and follows it to its exit"
 }
 
 # The first-boot install is a user oneshot (nix/harnesses.nix). `systemctl
@@ -576,9 +846,9 @@ check_strace() {
 # The network flag and the user manager are started first for the same reason:
 # each start blocks until its unit is up, and is a no-op when it already is.
 await_harness_install() {
-    sudo systemctl start yolobox-network-ready.service "user@${AGENT_UID}.service" ||
+    sudo -n systemctl start yolobox-network-ready.service "user@${AGENT_UID}.service" ||
         fail "the network flag or the agent's user manager did not start"
-    sudo systemctl --user -M "agent@" start yolobox-harness-install.service ||
+    sudo -n systemctl --user -M "${AGENT_USER}@" start yolobox-harness-install.service ||
         fail "yolobox-harness-install failed; see: journalctl --user -u yolobox-harness-install"
     ok "yolobox-harness-install finished"
 }
@@ -599,10 +869,10 @@ check_vendors() {
 # kills, behind the manager that holds them. nix/herd-server.nix sets 0.
 check_herdr_server_oom_score() {
     local unit=herdr-server.service pid score
-    pid=$(sudo systemctl --user -M "agent@" show -p MainPID --value "${unit}") ||
+    pid=$(sudo -n systemctl --user -M "${AGENT_USER}@" show -p MainPID --value "${unit}") ||
         fail "could not read the main pid of the agent's ${unit}"
     [ "${pid}" -gt 0 ] || fail "the agent's ${unit} is not running"
-    score=$(sudo cat "/proc/${pid}/oom_score_adj") ||
+    score=$(sudo -n cat "/proc/${pid}/oom_score_adj") ||
         fail "could not read oom_score_adj of ${unit} (pid ${pid})"
     [ "${score}" -ge 0 ] ||
         fail "${unit} runs with oom_score_adj ${score}, inherited from user@.service; it must be 0 or more"
@@ -623,7 +893,6 @@ check_rosetta() {
 
 compat_checks() {
     check_net
-    check_gateway_ssh_closed
     check_default_qdisc
     check_podman
     check_chromium
@@ -636,7 +905,6 @@ compat_checks() {
     if [ "$(uname -m)" = aarch64 ]; then
         check_rosetta
     fi
-    check_operator_login_refused "$(id -un)"
     check_no_host_os_stamp
     check_etc_environment
     check_run_mount
@@ -648,6 +916,13 @@ compat_checks() {
 main() {
     [ "$(id -u)" -ne "${AGENT_UID}" ] || fail "run this as the operator, not the agent"
     sudo -n true || fail "passwordless sudo is required (run as the operator)"
+    AGENT_HOME=$(getent passwd "${AGENT_USER}" | cut -d: -f6)
+    [ -n "${AGENT_HOME}" ] || fail "no account ${AGENT_USER} in passwd"
+    case ${ONLY:-both} in
+    both | hardening | compat) ;;
+    *) fail "ONLY must be hardening, compat or unset, got '${ONLY}'" ;;
+    esac
+    parse_extra_wrappers
     trap cleanup EXIT
     stage_helpers
     case ${ONLY:-both} in
@@ -657,7 +932,6 @@ main() {
         ;;
     hardening) hardening_checks ;;
     compat) compat_checks ;;
-    *) fail "ONLY must be hardening, compat or unset, got '${ONLY}'" ;;
     esac
     echo "box-hardening-check: all checks passed"
 }
