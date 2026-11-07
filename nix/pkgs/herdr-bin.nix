@@ -18,9 +18,11 @@ stdenvNoCC.mkDerivation {
   pname = "herdr";
   inherit version;
 
+  # A box on a CPU the pin has no hash for must say which hash to add, not
+  # fail with nix's bare "attribute missing".
   src = fetchurl {
     url = "https://github.com/herdrdev/herdr/releases/download/v${version}/${assets.${system}}";
-    hash = hashes.${system};
+    hash = hashes.${system} or (throw "yolobox.harness.herdr.hashes has no entry for ${system}, the system this guest is built for; add hashes.${system} = \"sha256-...\" for herdr ${version}");
   };
 
   dontUnpack = true;

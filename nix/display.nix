@@ -30,10 +30,18 @@ in
   # from nix/lib/agent-env.nix, the agent's environment, not from the box.
   systemd.user.services.xvfb = {
     description = "Virtual X display :0";
-    unitConfig.ConditionUser = agentUser;
+    unitConfig = {
+      ConditionUser = agentUser;
+      # The display must come back however often it dies: systemd's default
+      # five starts in ten seconds would leave the box without a display
+      # until the next boot.
+      StartLimitIntervalSec = 0;
+    };
     wantedBy = [ "default.target" ];
     serviceConfig = {
       Restart = "always";
+      # A pause between restarts, so a crash loop does not spin the CPU.
+      RestartSec = 2;
       # -xkbdir works around nixpkgs#3441 ("cannot find xkbcomp" keymap
       # failure) by pointing Xvfb straight at the store's xkb data.
       # -nolisten tcp keeps the display off the network. There is no -auth,

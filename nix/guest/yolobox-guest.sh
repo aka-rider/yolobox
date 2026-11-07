@@ -67,6 +67,23 @@ YOLOBOX_STAMPS="${YOLOBOX_STAMPS:-/etc/yolobox}"
 # leading '-'. Matched whole, so it carries no anchors.
 FLAKE_REF_RE='github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*'
 
+# The one hostname shape a rebuild accepts, equal to yo's HOSTNAME_LABEL_RE
+# and the flake's own check: one lowercase DNS label. The stamp is root's, so
+# this is defence in depth for the value handed to sudo. Matched whole.
+HOSTNAME_RE='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+
+# Exits 2 with SUB's usage line unless exactly COUNT arguments follow. Every
+# subcommand goes through it, so an argument it does not take is refused
+# instead of dropped.
+want_args() {
+    local sub=$1 usage=$2 count=$3
+    shift 3
+    if [ "$#" -ne "${count}" ]; then
+        printf 'yolobox-guest: %s: usage: %s\n' "${sub}" "${usage}" >&2
+        exit 2
+    fi
+}
+
 # Sets EXPR to a find expression matching any of the given directory names.
 build_expr() {
     EXPR=('(')
@@ -193,6 +210,20 @@ add_cache() {
     fi
 }
 
+# A cache the walk found by signature may sit inside a project checkout, where
+# git may track or see it (a vendored module cache). Then it is the project's,
+# not a cache: deleting it would dirty the worktree, so it is kept and failed
+# like a build directory. The fixed names under ~/.cache and ~/.cargo need no
+# such gate; they are the tools' own.
+add_found_cache() {
+    if git -C "${1%/*}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        && ! git_ignores "$1"; then
+        fail_not_ignored "$1"
+        return 0
+    fi
+    add_cache "$1"
+}
+
 cache_targets() {
     CACHE_PATHS=()
     local name path
@@ -218,7 +249,7 @@ cache_targets() {
         case "${path}" in
         */pkg/mod)
             if [ -d "${path}/cache/download" ]; then
-                add_cache "${path}"
+                add_found_cache "${path}"
             fi
             ;;
         *)
@@ -229,7 +260,7 @@ cache_targets() {
             if [ "${path}" != "${HOME}" ] \
                 && [ -f "${path}/trim.txt" ] \
                 && [ "$(head -n 1 "${path}/README")" = "${GO_BUILD_CACHE_HEADER}" ]; then
-                add_cache "${path}"
+                add_found_cache "${path}"
             fi
             ;;
         esac
@@ -394,11 +425,22 @@ git_ignores() {
     [ -z "${seen}" ]
 }
 
+# The remedy depends on why git does not ignore it: a .gitignore line does
+# nothing for files git already tracks.
 fail_not_ignored() {
-    fail "kept $1: git does not ignore it" \
-        "Deleting it would dirty the worktree. Add it to that repo's" \
-        ".gitignore (or remove it by hand and commit) if it really is" \
-        "build output."
+    local tracked
+    tracked="$(git -C "${1%/*}" ls-files -- "$1")" || tracked=
+    if [ -n "${tracked}" ]; then
+        fail "kept $1: git tracks files in it" \
+            "Deleting it would remove tracked files from the worktree. If it" \
+            "really is build output, \`git rm -r --cached\` it, add it to that" \
+            "repo's .gitignore and commit."
+    else
+        fail "kept $1: git does not ignore it" \
+            "Deleting it would dirty the worktree. Add it to that repo's" \
+            ".gitignore (or remove it by hand and commit) if it really is" \
+            "build output."
+    fi
 }
 
 report_deep_plan() {
@@ -478,11 +520,16 @@ project_roots() {
 }
 
 cmd_projects() {
+    want_args projects 'projects (takes no arguments)' 0 "$@"
     project_roots
 }
 
+# Prints the deepest existing ancestor of an absolute path, PATH itself when
+# it exists, and `/` when nothing under it does: yo decides what to make of
+# a landing place outside the home, so a wrong answer must not be the home.
 cmd_landing_dir() {
-    local d="${1:?landing-dir requires a path argument}"
+    want_args landing-dir 'landing-dir PATH' 1 "$@"
+    local d="$1"
     case "${d}" in
     /*) ;;
     *)
@@ -491,7 +538,7 @@ cmd_landing_dir() {
         ;;
     esac
     while [ -n "${d}" ] && [ ! -d "${d}" ]; do d="${d%/*}"; done
-    printf '%s\n' "${d:-$HOME}"
+    printf '%s\n' "${d:-/}"
 }
 
 cmd_gc_machine() {
@@ -505,6 +552,14 @@ cmd_gc_machine() {
             ;;
         esac
     done
+
+    # Every measure and step below runs under sudo. A sudo that cannot run
+    # (a caller outside wheel, a password prompt with no tty) must stop here:
+    # measure would otherwise read its failure as "absent" for every path.
+    if ! sudo -n true; then
+        printf 'yolobox-guest: gc-machine: sudo -n true failed for %s; the machine tier needs sudo\n' "$(id -un)" >&2
+        exit 1
+    fi
 
     GC_FAILED=0
     MEASURE_AS=sudo
@@ -652,7 +707,8 @@ cmd_gc_user() {
 }
 
 cmd_aws_creds() {
-    local profile="${1:?aws-creds requires a profile argument}"
+    want_args aws-creds 'aws-creds PROFILE' 1 "$@"
+    local profile="$1"
 
     # The same shape yo's allowlist enforces; checked here too because the
     # name goes into a URL path and this is the process that builds it.
@@ -691,6 +747,7 @@ cmd_aws_creds() {
 }
 
 cmd_aws_check() {
+    want_args aws-check 'aws-check (takes no arguments)' 0 "$@"
     local config_file="${AWS_CONFIG_FILE:-}"
 
     if [ -z "${config_file}" ]; then
@@ -792,10 +849,7 @@ root_free_mib() {
 # root disk, which breaks name resolution and would otherwise be blamed on the
 # network (docs/disk.md#a-full-disk-looks-like-a-dns-failure).
 cmd_net_check() {
-    if [ "$#" -ne 0 ]; then
-        printf 'yolobox-guest: net-check: usage: net-check (takes no arguments)\n' >&2
-        exit 2
-    fi
+    want_args net-check 'net-check (takes no arguments)' 0 "$@"
     local egress=dead gateway=dead rootdisk=ok free_mib
     free_mib=$(root_free_mib)
     if [ "${free_mib}" -lt "${ROOT_MIN_FREE_MIB}" ]; then
@@ -844,7 +898,8 @@ read_stamp() {
 # NIX_REBUILD_FLAGS: --refresh, because a stamped branch moves and nix would
 # reuse an hour-old fetch of it.
 cmd_rebuild() {
-    if [ "$#" -ne 1 ] || { [ "$1" != switch ] && [ "$1" != boot ]; }; then
+    want_args rebuild 'rebuild switch|boot' 1 "$@"
+    if [ "$1" != switch ] && [ "$1" != boot ]; then
         printf 'yolobox-guest: rebuild: usage: rebuild switch|boot\n' >&2
         exit 2
     fi
@@ -862,6 +917,11 @@ cmd_rebuild() {
         exit 1
     fi
     host=$(read_stamp "${YOLOBOX_STAMPS}/hostname") || exit 1
+    if [[ ! "${host}" =~ ^${HOSTNAME_RE}$ ]]; then
+        printf 'yolobox-guest: rebuild: %s/hostname is not one lowercase DNS label\n' \
+            "${YOLOBOX_STAMPS}" >&2
+        exit 1
+    fi
     user=$(id -un)
     local status=0
     sudo env "YOLOBOX_USERNAME=${user}" "YOLOBOX_HOSTNAME=${host}" \
@@ -878,12 +938,12 @@ main() {
     local sub="${1:-}"
     [ "$#" -ge 1 ] && shift
     case "${sub}" in
-    projects) cmd_projects ;;
+    projects) cmd_projects "$@" ;;
     landing-dir) cmd_landing_dir "$@" ;;
     gc-machine) cmd_gc_machine "$@" ;;
     gc-user) cmd_gc_user "$@" ;;
     aws-creds) cmd_aws_creds "$@" ;;
-    aws-check) cmd_aws_check ;;
+    aws-check) cmd_aws_check "$@" ;;
     net-check) cmd_net_check "$@" ;;
     rebuild) cmd_rebuild "$@" ;;
     *)

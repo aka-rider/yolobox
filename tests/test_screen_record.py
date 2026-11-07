@@ -7,9 +7,9 @@ tools. Like the real one, it writes a progress block to its `-progress pipe:N`
 once it records and then idles until SIGINT, or it fails first, as $FAKE_FFMPEG
 tells it. The pid file lives in a scratch HOME.
 
-The tests read /proc/<pid>/comm, which only Linux has; the script is for the
-guest, so they skip elsewhere. Tools whose absence skips tests: util-linux
-`waitpid` (2.40 or newer; the test that stops a recording).
+The tests read /proc/<pid>/stat and the kernel's boot_id, which only Linux
+has; the script is for the guest, so they skip elsewhere. Tools whose absence
+skips tests: util-linux `flock` and `waitpid` (2.40 or newer).
 """
 
 import ctypes
@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -36,8 +37,10 @@ PR_SET_CHILD_SUBREAPER = 36
 # Python, not sh: a background job of a non-interactive shell starts with SIGINT
 # ignored, and an ignored signal cannot be trapped in sh. Real ffmpeg installs
 # its own handler, as this does, and exits 255 on SIGINT.
-# $FAKE_FFMPEG is `record`, `fail`, or `await`: read one of the other two from
-# the fifo $FAKE_FFMPEG_CONTROL first.
+# $FAKE_FFMPEG is `record`, `fail`, `noisy` (records, but logs an error),
+# `crash` (records, then exits 3 once a line arrives on the fifo
+# $FAKE_FFMPEG_CONTROL) or `await` (reads one of the others from that fifo
+# first).
 FAKE_FFMPEG = """#!%s
 import os
 import signal
@@ -52,6 +55,12 @@ if mode == "fail":
     sys.exit("boom: cannot open display")
 url = sys.argv[sys.argv.index("-progress") + 1]
 os.write(int(url[len("pipe:"):]), b"frame=0\\nprogress=continue\\n")
+if mode == "noisy":
+    print("x11grab: lost the display", file=sys.stderr, flush=True)
+if mode == "crash":
+    with open(os.environ["FAKE_FFMPEG_CONTROL"]) as control:
+        control.readline()
+    sys.exit(3)
 signal.pause()
 """ % (sys.executable,)
 
@@ -59,7 +68,17 @@ signal.pause()
 FAKE_WAITPID_TIMES_OUT = "#!/bin/sh\nexit 3\n"
 
 
-@unittest.skipUnless(Path("/proc/self/comm").exists(), "needs /proc/<pid>/comm")
+BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
+
+
+def starttime_of(pid):
+    """Field 22 of /proc/<pid>/stat, the identity the script records."""
+    stat = Path("/proc/%d/stat" % pid).read_text()
+    return stat[stat.rindex(")") + 2 :].split()[19]
+
+
+@unittest.skipUnless(BOOT_ID.exists(), "needs /proc/<pid>/stat and boot_id")
+@unittest.skipUnless(shutil.which("flock"), "needs util-linux flock")
 class TestScreenRecord(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -112,14 +131,30 @@ class TestScreenRecord(unittest.TestCase):
         self.addCleanup(proc.kill)
         return proc
 
-    def write_pid_file(self, pid):
-        self.pid_file.parent.mkdir(parents=True)
-        self.pid_file.write_text("%d\n%s\n" % (pid, self.artifacts / "old.mp4"))
+    def write_pid_file(self, pid, start=None, boot=None):
+        """A pid file for `pid`, by default with its true identity."""
+        self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+        self.pid_file.write_text(
+            "pid=%d\nstart=%s\nboot=%s\nwrapper=%d\nout=%s\n"
+            % (
+                pid,
+                starttime_of(pid) if start is None else start,
+                BOOT_ID.read_text().strip() if boot is None else boot,
+                pid,
+                self.artifacts / "old.mp4",
+            )
+        )
+
+    def pid_file_field(self, key):
+        for line in self.pid_file.read_text().splitlines():
+            if line.startswith(key + "="):
+                return line[len(key) + 1 :]
+        self.fail("no %s= line in the pid file:\n%s" % (key, self.pid_file.read_text()))
 
     def kill_recorder(self):
         if self.pid_file.exists():
             try:
-                os.kill(int(self.pid_file.read_text().splitlines()[0]), signal.SIGKILL)
+                os.kill(int(self.pid_file_field("pid")), signal.SIGKILL)
             except ProcessLookupError:
                 pass  # already stopped
 
@@ -140,16 +175,86 @@ class TestScreenRecord(unittest.TestCase):
         self.addCleanup(self.kill_recorder)
         started = self.run_script("start")
         self.assertEqual(started.returncode, 0, started.stderr)
-        recorder = int(self.pid_file.read_text().splitlines()[0])
+        wrapper = int(self.pid_file_field("wrapper"))
         stopped = self.run_script("stop")
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertEqual(stopped.stdout, started.stdout)
+        self.assertEqual(stopped.stderr, "")
         self.assertFalse(self.pid_file.exists())
         self.assertEqual(
-            os.waitpid(recorder, os.WNOHANG)[0],
-            recorder,
-            "stop returned before the recorder exited",
+            os.waitpid(wrapper, os.WNOHANG)[0],
+            wrapper,
+            "stop returned before the recorder's wrapper exited",
         )
+
+    @unittest.skipUnless(shutil.which("waitpid"), "needs util-linux waitpid")
+    def test_stop_fails_when_ffmpeg_logged_an_error_and_still_prints_the_file(self):
+        self.addCleanup(self.kill_recorder)
+        self.env["FAKE_FFMPEG"] = "noisy"
+        started = self.run_script("start")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        stopped = self.run_script("stop")
+        self.assertEqual(stopped.returncode, 1, stopped.stderr)
+        self.assertEqual(stopped.stdout, started.stdout)
+        self.assertIn("may be incomplete", stopped.stderr)
+        self.assertIn("x11grab: lost the display", stopped.stderr)
+        self.assertFalse(self.pid_file.exists())
+
+    @unittest.skipUnless(shutil.which("waitpid"), "needs util-linux waitpid")
+    def test_stop_reports_a_recording_that_died_on_its_own_with_its_status(self):
+        os.mkfifo(self.control)
+        self.env["FAKE_FFMPEG"] = "crash"
+        started = self.run_script("start")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        # Opening a fifo for writing waits for its reader: the fake is running.
+        with open(self.control, "w") as control:
+            control.write("die\n")
+        status_file = self.pid_file.with_name("screen-record.status")
+        # The wrapper writes the status once it has reaped ffmpeg, then exits;
+        # it is nobody's child here, so waitpid is how to wait for it.
+        subprocess.run(
+            ["waitpid", "--exited", "--timeout", "20", self.pid_file_field("wrapper")],
+            check=True,
+        )
+        self.assertEqual(status_file.read_text(), "3\n")
+        stopped = self.run_script("stop")
+        self.assertEqual(stopped.returncode, 1, stopped.stderr)
+        self.assertEqual(stopped.stdout, started.stdout)
+        self.assertIn("already ended on its own", stopped.stderr)
+        self.assertIn("status 3", stopped.stderr)
+        self.assertFalse(self.pid_file.exists())
+        self.assertFalse(status_file.exists())
+
+    def test_start_fails_at_once_when_the_artifacts_directory_is_read_only(self):
+        """It used to hang: ffmpeg died at its redirections before opening the
+        progress fifo, and start waited on the fifo forever."""
+        self.artifacts.mkdir()
+        self.artifacts.chmod(0o555)
+        self.addCleanup(self.artifacts.chmod, 0o755)
+        started = self.run_script("start")
+        self.assertEqual(started.returncode, 1, started.stderr)
+        self.assertIn("cannot write to %s" % self.artifacts, started.stderr)
+        self.assertEqual(started.stdout, "")
+        self.assertFalse(self.pid_file.exists())
+
+    def test_a_recording_started_in_the_same_second_as_another_gets_its_own_name(
+        self,
+    ):
+        self.addCleanup(self.kill_recorder)
+        self.artifacts.mkdir()
+        now = int(time.time())
+        taken = [
+            self.artifacts
+            / time.strftime("screen-%Y%m%d-%H%M%S.mp4", time.localtime(now + delta))
+            for delta in (0, 1, 2)
+        ]
+        for path in taken:
+            path.write_text("")
+        started = self.run_script("start")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        out = Path(started.stdout.strip())
+        self.assertNotIn(out, taken)
+        self.assertRegex(out.name, r"^screen-\d{8}-\d{6}-2\.mp4$")
 
     def test_start_reports_an_ffmpeg_that_fails_at_once_and_records_nothing(self):
         self.env["FAKE_FFMPEG"] = "fail"
@@ -191,29 +296,35 @@ class TestScreenRecord(unittest.TestCase):
         self.assertEqual(again.returncode, 1, again.stderr)
         self.assertIn("already recording", again.stderr)
 
-    def test_stop_never_signals_a_live_process_that_is_not_ffmpeg(self):
+    def test_stop_never_signals_a_live_process_that_reused_the_recorders_pid(self):
+        """Same pid, other start time: the kernel handed the pid on."""
         other = self.bystander()
-        self.write_pid_file(other.pid)
+        self.write_pid_file(other.pid, start=str(int(starttime_of(other.pid)) - 1))
         result = self.run_script("stop")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("stale pid file", result.stderr)
         self.assertIsNone(other.poll(), "stop signalled an unrelated process")
         self.assertFalse(self.pid_file.exists())
 
-    def test_start_replaces_a_pid_file_naming_a_live_process_that_is_not_ffmpeg(self):
+    def test_a_pid_file_from_before_a_reboot_is_stale_whatever_its_pid_runs(self):
         other = self.bystander()
-        self.write_pid_file(other.pid)
+        self.write_pid_file(other.pid, boot="00000000-0000-0000-0000-000000000000")
+        result = self.run_script("stop")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("stale pid file", result.stderr)
+        self.assertIsNone(other.poll(), "stop signalled an unrelated process")
+
+    def test_start_replaces_a_pid_file_naming_a_process_that_reused_the_pid(self):
+        other = self.bystander()
+        self.write_pid_file(other.pid, start=str(int(starttime_of(other.pid)) - 1))
         self.addCleanup(self.kill_recorder)
         result = self.run_script("start")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotEqual(
-            self.pid_file.read_text().splitlines()[0],
-            str(other.pid),
-        )
+        self.assertNotEqual(self.pid_file_field("pid"), str(other.pid))
         self.assertIsNone(other.poll())
 
     def test_a_pid_file_that_is_not_a_number_is_stale(self):
-        for content in ("", "lizard\n", "../self\n", "-1\n"):
+        for content in ("", "lizard\n", "pid=../self\n", "pid=-1\n", "pid=\n"):
             with self.subTest(pid_file=content):
                 self.pid_file.parent.mkdir(parents=True, exist_ok=True)
                 self.pid_file.write_text(content)

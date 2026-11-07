@@ -160,10 +160,37 @@ class TestLandingDir(GuestScript):
         result = self.run_script("landing-dir", str(self.tmp))
         self.assertEqual(result.stdout, "%s\n" % self.tmp)
 
-    def test_a_path_with_no_existing_ancestor_lands_at_home(self):
+    def test_a_path_with_no_existing_ancestor_lands_at_the_root(self):
+        """yo refuses a landing place outside the home; the home itself would
+        be landed in silently."""
         result = self.run_script("landing-dir", "/yolobox-test-no-such-root/deep")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "%s\n" % self.home)
+        self.assertEqual(result.stdout, "/\n")
+
+
+class TestEverySubcommandRefusesExtraArguments(GuestScript):
+    """An argument a subcommand does not take is a usage error, exit 2, never
+    dropped; and the marker yo reads as a version skew stays out of it."""
+
+    def test_an_extra_argument_is_a_usage_error(self):
+        for argv in (
+            ("projects", "extra"),
+            ("landing-dir",),
+            ("landing-dir", "/", "extra"),
+            ("aws-creds",),
+            ("aws-creds", "p", "extra"),
+            ("aws-check", "extra"),
+            ("net-check", "extra"),
+            ("rebuild",),
+            ("rebuild", "switch", "extra"),
+        ):
+            with self.subTest(argv=argv):
+                result = self.run_script(*argv)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("usage: %s" % argv[0], result.stderr)
+                self.assertNotIn("unknown subcommand", result.stderr)
+                self.assertFalse(self.curl_was_called())
 
 
 FAKE_AWS = """#!/bin/sh
@@ -323,6 +350,24 @@ class TestGcUserGoCaches(GuestScript):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(stray.exists())
 
+    def test_a_module_cache_git_sees_inside_a_repo_is_never_a_cache(self):
+        """A vendored pkg/mod is the project's: deleting it dirties the
+        checkout and every later push is refused."""
+        subprocess.run(["git", "init", "-q", str(self.home / "repo")], check=True)
+        cache = self.module_cache("repo")
+        result = self.run_script("gc-user", "--apply")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAIL: kept %s: git does not ignore it" % cache, result.stderr)
+        self.assertTrue((cache / "cache" / "download" / "sum.db").exists())
+
+    def test_a_module_cache_git_ignores_inside_a_repo_is_removed(self):
+        subprocess.run(["git", "init", "-q", str(self.home / "repo")], check=True)
+        (self.home / "repo" / ".gitignore").write_text("pkg/\n")
+        cache = self.module_cache("repo")
+        result = self.run_script("gc-user", "--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(cache.exists())
+
 
 @unittest.skipUnless(has_gnu_find(), "gc-user --deep needs GNU find's -printf")
 class TestGcUserDeep(GuestScript):
@@ -401,6 +446,21 @@ class TestGcUserDeep(GuestScript):
         )
         self.assertTrue((root / "target" / "x").exists())
         self.assertFalse(any(line.startswith("cargo ") for line in self.log_lines()))
+
+    def test_a_node_modules_git_tracks_is_kept_with_the_remedy_for_tracked_files(self):
+        """A .gitignore line does nothing for files git already tracks, so the
+        remedy names `git rm --cached`."""
+        root = self.project("p", {"node_modules/a": "x"}, ignore="node_modules\n")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "-f", "node_modules"], check=True
+        )
+        result = self.apply()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "FAIL: kept %s/node_modules: git tracks files in it" % root, result.stderr
+        )
+        self.assertIn("git rm -r --cached", result.stderr)
+        self.assertTrue((root / "node_modules" / "a").exists())
 
     def test_ignored_node_modules_and_venv_are_removed(self):
         root = self.project(
@@ -739,6 +799,42 @@ printf '%s\\0' "$@" > "$FAKE_SUDO_ARGV"
 exit "$FAKE_SUDO_RC"
 """
 
+
+class TestGcMachineNeedsSudo(GuestScript):
+    """The machine tier runs everything under sudo, so a sudo that cannot run
+    stops it at once, instead of measuring every path as absent."""
+
+    def setUp(self):
+        super().setUp()
+        bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
+        sudo = bin_dir / "sudo"
+        sudo.write_text(FAKE_SUDO)
+        sudo.chmod(0o755)
+        self.sudo_argv = self.tmp / "sudo-argv"
+        self.env.update(FAKE_SUDO_ARGV=str(self.sudo_argv))
+
+    def gc_machine(self, *args, sudo_rc):
+        return self.run_script(
+            "gc-machine", *args, extra_env={"FAKE_SUDO_RC": str(sudo_rc)}
+        )
+
+    def test_a_sudo_that_cannot_run_fails_the_tier_before_anything_else(self):
+        for args in ((), ("--apply",)):
+            with self.subTest(args=args):
+                result = self.gc_machine(*args, sudo_rc=1)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("needs sudo", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(
+                    self.sudo_argv.read_text().split("\0")[:-1], ["-n", "true"]
+                )
+
+    def test_a_working_sudo_lets_the_report_run(self):
+        result = self.gc_machine(sudo_rc=0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("machine tier", result.stdout)
+
+
 # `id -u` answers FAKE_UID, `id -un` FAKE_USER.
 FAKE_ID = """#!/bin/sh
 case "$*" in
@@ -858,6 +954,13 @@ class TestRebuild(RebuildCase):
     def test_a_missing_flake_ref_is_refused_naming_the_file(self):
         (self.stamps / "flake-ref").unlink()
         self.assert_refused(self.rebuild("switch"), 1, str(self.stamps / "flake-ref"))
+
+    def test_a_hostname_that_is_not_one_lowercase_dns_label_is_refused(self):
+        path = self.stamps / "hostname"
+        for text in ("Yolobox", "-box", "box-", "a_b", "a b", "a.b", "x" * 64):
+            with self.subTest(text=text):
+                self.stamp("hostname", text + "\n")
+                self.assert_refused(self.rebuild("switch"), 1, str(path))
 
     def test_a_missing_or_empty_hostname_is_refused_naming_the_file(self):
         path = self.stamps / "hostname"
