@@ -213,7 +213,7 @@ class TestSshAgentClient(FakeAgent):
 class TestSshAgentClientFailures(FakeAgent):
     def test_an_empty_reply_is_refused(self):
         self.raw_reply = struct.pack(">I", 0)
-        with self.assertRaisesRegex(yo.YoError, "1Password's SSH agent at"):
+        with self.assertRaisesRegex(yo.YoError, "reply of 0 bytes"):
             yo.ssh_agent_identities(self.sock_path)
 
     def test_a_connection_closed_mid_reply_is_refused(self):

@@ -133,7 +133,11 @@ def recv_exact(conn: socket.socket, count: int) -> bytes:
 def read_agent_reply(conn: socket.socket) -> bytes:
     (length,) = struct.unpack(">I", recv_exact(conn, 4))
     if length == 0 or length > AGENT_MAX_REPLY_BYTES:
-        raise OSError("implausible reply length %d" % length)
+        # A protocol violation, not a socket that failed: named as the agent's.
+        raise YoError(
+            "the ssh agent announced a reply of %d bytes, which no agent message "
+            "has" % length
+        )
     return recv_exact(conn, length)
 
 

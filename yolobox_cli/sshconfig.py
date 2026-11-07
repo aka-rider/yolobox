@@ -28,6 +28,24 @@ AGENT_SSH_CONFIG_MARKER = (
 )
 
 
+def ssh_opt(key: str, value: str) -> List[str]:
+    """`-o key=value` for ssh's command line, the one place a value is quoted.
+
+    ssh reads an -o argument as a config line, so a value with whitespace (a
+    socket path under a $HOME with a space) is cut at the first blank unless
+    it is double-quoted, and ssh then fails with exit 255, which reads as a
+    box that cannot be reached. A value holding a double quote has no spelling
+    at all, and is refused rather than mangled."""
+    if '"' in value:
+        raise YoError(
+            "ssh's %s cannot be %r: a value with a double quote cannot be passed "
+            "to ssh" % (key, value)
+        )
+    if any(char.isspace() for char in value):
+        value = '"%s"' % value
+    return ["-o", "%s=%s" % (key, value)]
+
+
 class SshHostBlock(NamedTuple):
     """What yo reads of an instance's Host block in ssh.config."""
 
@@ -88,6 +106,9 @@ def herdr_alias_block(host_block: SshHostBlock) -> str:
             # master's, so herdr would silently ride an operator session.
             "  ControlPath none",
             "  ForwardAgent no",
+            # herdr reaches this alias through ~/.ssh/config, where a later
+            # `Host *` may switch loopback verification off; first value wins.
+            "  NoHostAuthenticationForLocalhost no",
             "  Hostname %s" % host_block.hostname,
             "  Port %s" % host_block.port,
         ]
@@ -268,26 +289,15 @@ def initrd_ssh_argv(
             "/dev/null",
         ]
         + [arg for identity in identities for arg in ("-i", identity)]
-        + [
-            "-o",
-            "IdentitiesOnly=yes",
-            "-o",
-            "IdentityAgent=%s" % state.driver().initrd_identity_agent(),
-            "-o",
-            "User=%s" % user,
-            "-o",
-            "Port=%d" % port,
-            "-o",
-            "ControlPath=none",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=%d" % SSH_CONNECT_TIMEOUT_SECONDS,
-            "-o",
-            "ServerAliveInterval=%d" % SSH_ALIVE_INTERVAL_SECONDS,
-            "-o",
-            "LogLevel=ERROR",
-        ]
+        + ssh_opt("IdentitiesOnly", "yes")
+        + ssh_opt("IdentityAgent", state.driver().initrd_identity_agent())
+        + ssh_opt("User", user)
+        + ssh_opt("Port", str(port))
+        + ssh_opt("ControlPath", "none")
+        + ssh_opt("BatchMode", "yes")
+        + ssh_opt("ConnectTimeout", str(SSH_CONNECT_TIMEOUT_SECONDS))
+        + ssh_opt("ServerAliveInterval", str(SSH_ALIVE_INTERVAL_SECONDS))
+        + ssh_opt("LogLevel", "ERROR")
         + FIRST_CONTACT_OPTS
         + [hostname, remote]
     )

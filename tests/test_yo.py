@@ -2610,12 +2610,83 @@ class TestHostKeyPinning(FakeHome):
         self.assert_pinned(self.effective(["ssh", "-F", user_config]))
 
     @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_herdrs_alias_keeps_loopback_verification_against_a_later_host_star(self):
+        # herdr reaches the alias through ~/.ssh/config, where the operator's
+        # own `Host *` may switch verification off for 127.0.0.1.
+        lima = os.path.join(self.home, ".lima", "yolobox")
+        os.makedirs(lima, exist_ok=True)
+        with open(os.path.join(lima, "ssh.config"), "w") as handle:
+            handle.write(LIMA_BLOCK + "  NoHostAuthenticationForLocalhost yes\n")
+        yo.ensure_agent_ssh_config()
+        user_config = os.path.join(self.home, ".ssh", "config")
+        os.makedirs(os.path.dirname(user_config))
+        with open(user_config, "w") as handle:
+            handle.write(
+                "Include %s\nHost *\n  NoHostAuthenticationForLocalhost yes\n"
+                % yo.ssh_cfg()
+            )
+        proc = subprocess.run(
+            ["ssh", "-F", user_config, "-G", yo.box.herdr_alias],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("nohostauthenticationforlocalhost no", proc.stdout.splitlines())
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
     def test_first_contact_overrides_all_three_pinned_keywords(self):
         self.write_lima_config()
         effective = self.effective(["ssh"] + yo.ssh_options(yo.OPERATOR_FIRST_CONTACT))
         self.assertEqual(effective["stricthostkeychecking"], "false")
         self.assertEqual(effective["userknownhostsfile"], "/dev/null")
         self.assertEqual(effective["nohostauthenticationforlocalhost"], "yes")
+
+
+class TestSshOptionValuesSurviveAHomeWithASpace(FakeHome):
+    """Every -o value goes through ssh_opt(): ssh reads the argument as a
+    config line, so an unquoted path with a blank is cut there and ssh exits
+    255, which reads as a box that cannot be reached."""
+
+    def write_lima_config(self):
+        lima = os.path.join(yo.home(), ".lima", "yolobox")
+        os.makedirs(lima, exist_ok=True)
+        with open(os.path.join(lima, "ssh.config"), "w") as handle:
+            handle.write(LIMA_ALIAS_BLOCK)
+
+    def effective(self, argv):
+        completed = subprocess.run(
+            list(argv) + ["-G", yo.box.vm_host],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return dict(line.split(" ", 1) for line in completed.stdout.splitlines())
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_the_agents_control_path_and_the_forwarded_socket_reach_ssh_whole(self):
+        home = os.path.join(self.home, "h o m e")
+        os.makedirs(home)
+        with with_home(home):
+            self.write_lima_config()
+            with mock.patch.object(yo.ui, "err"):
+                argv = ["ssh"] + yo.ssh_options(yo.AGENT, mux=True)
+                argv += yo.sshx.forward_agent_opts()
+            effective = self.effective(argv)
+            self.assertEqual(effective["controlpath"], yo.state.agent_control_path())
+            self.assertEqual(effective["forwardagent"], yo.state.driver().op_sock())
+
+    def test_a_value_with_a_double_quote_is_refused_not_mangled(self):
+        for value in ('"', 'a"b', '"a b"'):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(yo.YoError, "double quote"):
+                    yo.ssh_opt("ControlPath", value)
+
+    def test_a_plain_value_is_not_quoted_and_a_blank_one_is(self):
+        self.assertEqual(yo.ssh_opt("User", "agent"), ["-o", "User=agent"])
+        self.assertEqual(yo.ssh_opt("User", ""), ["-o", "User="])
+        self.assertEqual(
+            yo.ssh_opt("ControlPath", "/a b/c\td"), ["-o", 'ControlPath="/a b/c\td"']
+        )
 
 
 class TestEnsureGuestKnownHosts(FakeHome):

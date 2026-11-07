@@ -104,8 +104,11 @@ def ensure_herdr_machine(ssh_config_includes_the_vm: bool) -> None:
     )
     if added.returncode != 0:
         raise YoError(
-            "herdr machine add %s failed: %s"
-            % (state.box.herdr_alias, (added.stderr or added.stdout).strip())
+            proc.failed_message(
+                "herdr machine add %s" % state.box.herdr_alias,
+                added.returncode,
+                proc.failure_detail(added),
+            )
         )
 
 

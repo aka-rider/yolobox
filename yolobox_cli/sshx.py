@@ -45,11 +45,11 @@ def ssh_options(role: SshRole, mux: bool = False) -> List[str]:
     if not role.pins_host_key:
         argv += FIRST_CONTACT_OPTS
     if role.user is not None:
-        argv += ["-o", "User=%s" % role.user]
+        argv += sshconfig.ssh_opt("User", role.user)
     if not mux:
-        argv += ["-o", "ControlPath=none"]
+        argv += sshconfig.ssh_opt("ControlPath", "none")
     elif role.own_control_path:
-        argv += ["-o", "ControlPath=%s" % state.agent_control_path()]
+        argv += sshconfig.ssh_opt("ControlPath", state.agent_control_path())
     return argv
 
 
@@ -98,7 +98,7 @@ def agent_master_removals() -> List[Removal]:
 
 
 def forward_agent_opts() -> List[str]:
-    return ["-o", 'ForwardAgent="%s"' % state.driver().op_sock()]
+    return sshconfig.ssh_opt("ForwardAgent", state.driver().op_sock())
 
 
 def ssh_run(
@@ -193,8 +193,14 @@ def account_status() -> Tuple[AccountStatus, str]:
     agent_probe = ssh_run(AGENT, ["true"])
     if agent_probe.returncode == 0:
         return AccountStatus.AGENT, ""
-    if ssh_run(OPERATOR, ["true"]).returncode != 0:
-        return AccountStatus.UNREACHABLE, ui.quoted_block(agent_probe.stderr)
+    # The operator's probe is judged on its own: ssh's 255 is the box out of
+    # reach, with what that session said; `true` failing there is a box that
+    # answers but is broken (an rc file that exits), not one that is away.
+    operator_probe = ssh_run(OPERATOR, ["true"])
+    if operator_probe.returncode == SSH_UNREACHABLE:
+        return AccountStatus.UNREACHABLE, ui.quoted_block(operator_probe.stderr)
+    if operator_probe.returncode != 0:
+        raise box_failure("ssh %s true" % state.box.vm_host, operator_probe)
     lookup = ssh_run(OPERATOR, ["getent", "passwd", AGENT_USER])
     if lookup.returncode == SSH_UNREACHABLE:
         return AccountStatus.UNREACHABLE, ui.quoted_block(lookup.stderr)

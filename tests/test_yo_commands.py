@@ -357,7 +357,13 @@ class TestFlakeRef(FakeHome):
 
 class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
     def status(
-        self, agent_rc, operator_rc, getent_rc, agent_stderr="", getent_stderr=""
+        self,
+        agent_rc,
+        operator_rc,
+        getent_rc,
+        agent_stderr="",
+        getent_stderr="",
+        operator_stderr="",
     ):
         def ssh_run(role, argv, **kwargs):
             if role is yo.AGENT:
@@ -366,7 +372,7 @@ class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
                 self.assertEqual(argv, ["getent", "passwd", "agent"])
                 done = (getent_rc, getent_stderr)
             else:
-                done = (operator_rc, "")
+                done = (operator_rc, operator_stderr)
             return subprocess.CompletedProcess(argv, done[0], stdout="", stderr=done[1])
 
         with mock.patch.object(yo.sshx, "ssh_run", ssh_run):
@@ -397,11 +403,20 @@ class TestAccountStatusAsksTheBoxWhetherTheAgentExists(unittest.TestCase):
                     self.status(1, 0, 3, getent_stderr=stderr)
                 self.assertEqual(caught.exception.message, message)
 
-    def test_a_lost_operator_is_unreachable(self):
+    def test_a_lost_operator_is_unreachable_with_what_its_own_session_said(self):
         self.assertEqual(
-            self.status(255, 255, 0, "no route\n"),
+            self.status(255, 255, 0, "agent: lizard\n", operator_stderr="no route\n"),
             (yo.AccountStatus.UNREACHABLE, "  | no route"),
         )
+
+    def test_an_operator_whose_true_fails_is_a_broken_box_not_a_lost_one(self):
+        # ssh reached the box and ran the command: an rc file that exits, say.
+        with self.assertRaises(yo.YoError) as caught:
+            self.status(1, 1, 0, operator_stderr="rc: boom\n")
+        self.assertIn(
+            "ssh lima-yolobox true failed on the box (exit 1)", caught.exception.message
+        )
+        self.assertIn("rc: boom", caught.exception.message)
 
     def test_a_failing_agent_login_never_advises_destroying_the_box(self):
         with (
