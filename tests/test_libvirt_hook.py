@@ -1,6 +1,7 @@
 """linux/yolobox-libvirt-hook.sh, run under bash the way libvirt runs it:
 `HOOK <domain> <operation> <sub-operation> <extra>` with the domain XML on
-stdin, and a fake setfacl first on PATH that records its argv.
+stdin, and a fake setfacl and stat first on PATH: the first records its argv,
+the second answers for the directory's owner.
 
 Tools whose absence skips tests: none beyond bash.
 """
@@ -18,6 +19,11 @@ FAKE_SETFACL = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_SETFACL_CALLS"
 exit "$FAKE_SETFACL_RC"
 """
+# `stat -c %U DIR`: the owner libvirt gives the directory, unless a test says
+# otherwise.
+FAKE_STAT = """#!/bin/sh
+printf '%s\\n' "$FAKE_DIR_OWNER"
+"""
 
 FOREIGN_XML = "<domain type='kvm'><name>other</name><devices/></domain>"
 
@@ -29,9 +35,10 @@ class TestPasstAclHook(unittest.TestCase):
         self.tmp = Path(tmp.name)
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
-        setfacl = bin_dir / "setfacl"
-        setfacl.write_text(FAKE_SETFACL)
-        setfacl.chmod(0o755)
+        for name, body in (("setfacl", FAKE_SETFACL), ("stat", FAKE_STAT)):
+            fake = bin_dir / name
+            fake.write_text(body)
+            fake.chmod(0o755)
         self.passt_dir = self.tmp / "passt"
         self.passt_dir.mkdir()
         self.calls = self.tmp / "calls"
@@ -42,17 +49,18 @@ class TestPasstAclHook(unittest.TestCase):
             "YOLOBOX_HOOK_PASST_DIR": str(self.passt_dir),
             "FAKE_SETFACL_CALLS": str(self.calls),
             "FAKE_SETFACL_RC": "0",
+            "FAKE_DIR_OWNER": "qemu",
         }
         # A yolobox domain as libvirt hands it over: the template, filled in.
         self.yolobox_xml = TEMPLATE.read_text().replace("$name", "box")
 
-    def hook(self, operation, sub, xml, setfacl_rc=0):
+    def hook(self, operation, sub, xml, setfacl_rc=0, owner="qemu"):
         return subprocess.run(
             ["bash", str(HOOK), "yolobox-box", operation, sub, "-"],
             input=xml,
             capture_output=True,
             text=True,
-            env=dict(self.env, FAKE_SETFACL_RC=str(setfacl_rc)),
+            env=dict(self.env, FAKE_SETFACL_RC=str(setfacl_rc), FAKE_DIR_OWNER=owner),
             timeout=20,
         )
 
@@ -63,9 +71,48 @@ class TestPasstAclHook(unittest.TestCase):
 
     def assert_fixed_once(self, result):
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        # -P: the ACL goes on the directory itself, never through a symlink.
         self.assertEqual(
             self.setfacl_calls(),
-            ["-m u:yolobox-vm:rwx,m::rwx %s" % self.passt_dir],
+            ["-P -m u:yolobox-vm:rwx,m::rwx %s" % self.passt_dir],
+        )
+
+    def assert_left_alone(self, result, code, said):
+        """The hook touched nothing, said why on stderr, and exited `code`."""
+        self.assertEqual((result.returncode, result.stdout), (code, ""))
+        self.assertIn(said, result.stderr)
+        self.assertEqual(self.setfacl_calls(), [])
+
+    def test_a_symlink_or_a_file_where_the_directory_should_be_is_never_relabelled(
+        self,
+    ):
+        # setfacl follows a symlink by default: a link to /etc planted there
+        # would hand yolobox-vm rwx on /etc.
+        self.passt_dir.rmdir()
+        for make in (
+            lambda: self.passt_dir.symlink_to(self.tmp),
+            lambda: self.passt_dir.write_text(""),
+        ):
+            self.passt_dir.unlink(missing_ok=True)
+            make()
+            with self.subTest(
+                what="symlink" if self.passt_dir.is_symlink() else "file"
+            ):
+                said = "%s is not a directory" % self.passt_dir
+                self.assert_left_alone(
+                    self.hook("prepare", "begin", self.yolobox_xml), 1, said
+                )
+                self.assert_left_alone(
+                    self.hook("started", "begin", FOREIGN_XML), 0, said
+                )
+
+    def test_a_directory_another_account_owns_is_never_relabelled(self):
+        said = "%s is owned by alice, not qemu" % self.passt_dir
+        self.assert_left_alone(
+            self.hook("prepare", "begin", self.yolobox_xml, owner="alice"), 1, said
+        )
+        self.assert_left_alone(
+            self.hook("release", "end", FOREIGN_XML, owner="alice"), 0, said
         )
 
     def test_a_yolobox_domain_about_to_start_gets_the_acl(self):
