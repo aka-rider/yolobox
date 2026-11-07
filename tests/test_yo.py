@@ -4478,6 +4478,49 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
         fake_err.assert_not_called()
 
 
+class TestADiskGrowIsJudgedBeforeItsStop(FakeHome):
+    """grow_running_disk stops the box to edit the ceiling, so what would refuse
+    the restart (a fatal config gap, a dead 1Password) is checked before the
+    stop, as vm_up checks it before a start."""
+
+    def grow(self, gaps, login_failure=None):
+        self.login = mock.Mock(side_effect=login_failure)
+        self.stop = mock.Mock()
+        self.passphrase = mock.Mock(return_value=b"p" * 64)
+        with (
+            mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
+            mock.patch.object(yo.LIMA, "vm_status", return_value="Running"),
+            mock.patch.object(yo.LIMA, "require_login_key", self.login),
+            mock.patch.object(yo.LIMA, "stop", self.stop),
+            mock.patch.object(yo.LIMA, "grow_disk"),
+            mock.patch.object(yo.agent, "luks_passphrase", self.passphrase),
+            mock.patch.object(yo.vm, "root_usage_before_grow"),
+            mock.patch.object(yo.vm, "vm_up"),
+            mock.patch.object(yo.vm, "grow_mapping_and_filesystem"),
+            mock.patch.object(yo.ui, "err"),
+        ):
+            yo.grow_running_disk(100, 200)
+
+    def test_a_fatal_gap_refuses_the_grow_before_the_stop_and_the_prompt(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.grow([yo.lima.GAP_SSH_OVER_VSOCK])
+        self.assertIn("overVsock", caught.exception.message)
+        self.stop.assert_not_called()
+        self.passphrase.assert_not_called()
+
+    def test_a_login_key_that_is_not_on_offer_refuses_before_the_stop(self):
+        with self.assertRaisesRegex(yo.YoError, "1Password is locked"):
+            self.grow([], login_failure=yo.YoError("1Password is locked"))
+        self.stop.assert_not_called()
+        self.passphrase.assert_not_called()
+
+    def test_a_box_that_passes_is_stopped_after_the_key_check_and_the_prompt(self):
+        self.grow([])
+        self.login.assert_called_once_with()
+        self.passphrase.assert_called_once_with()
+        self.stop.assert_called_once_with()
+
+
 class TestHerdrMachineId(unittest.TestCase):
     def test_empty_listing_has_no_machine(self):
         self.assertIsNone(yo.herdr_machine_id("[]"))

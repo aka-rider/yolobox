@@ -3925,7 +3925,14 @@ class TestDiskGrowResizesTheMapping(FakeHome):
     vda2_listing = (0, "199.8G\n", "")
 
     def disk_grow(
-        self, fstype="crypto_LUKS\n", size="200", df_k=GROWN, vda2_bytes=FULL_VDA2
+        self,
+        fstype="crypto_LUKS\n",
+        size="200",
+        df_k=GROWN,
+        vda2_bytes=FULL_VDA2,
+        # The filesystem's size from its superblock: short of the mapping by
+        # default, so a rerun at the ceiling has something to finish.
+        filesystem_bytes=FULL_VDA2 - 1024**3,
     ):
         os.makedirs(os.path.join(self.home, ".lima"))
         calls = []
@@ -3956,6 +3963,11 @@ class TestDiskGrowResizesTheMapping(FakeHome):
                 stdout = next(df_k)
             elif argv[:3] == ["lsblk", "-bdno", "SIZE"]:
                 stdout = "%s\n" % vda2_bytes
+            elif argv[:2] == ["sudo", "dumpe2fs"]:
+                stdout = (
+                    "Block count:              %d\nBlock size:               1\n"
+                    % (filesystem_bytes)
+                )
             elif argv[:2] == ["lsblk", "-no"]:
                 code, stdout, stderr = self.vda2_listing
                 return mock.Mock(returncode=code, stdout=stdout, stderr=stderr)
@@ -3999,9 +4011,11 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         self,
     ):
         self.disk_grow()
-        self.assertEqual(self.order[0], "passphrase")
-        self.assertEqual(self.order[1], "stop")
-        self.assertEqual(self.order[2], {"passphrase": b"p" * 64})
+        # The first vm_up brings the box up without a passphrase of its own.
+        self.assertEqual(
+            self.order,
+            [{"run_services": False}, "passphrase", "stop", {"passphrase": b"p" * 64}],
+        )
 
     def test_asking_for_the_current_ceiling_finishes_a_failed_grow_without_editing_lima(
         self,
@@ -4014,15 +4028,18 @@ class TestDiskGrowResizesTheMapping(FakeHome):
             b"p" * 64,
         )
         self.assertIn(resize, calls)
-        self.assertEqual(self.order, ["passphrase", {"passphrase": b"p" * 64}])
+        # The passphrase is asked for once the box is up and the root is read
+        # as short: a rerun that has nothing to finish costs no prompt.
+        self.assertEqual(self.order, [{"run_services": True}, "passphrase"])
         self.assertEqual([c for c in self.limactl if c[:2] != ["limactl", "list"]], [])
 
     def test_a_finished_grow_that_has_nothing_left_to_grow_is_not_an_error(self):
         # The previous run grew the root and failed afterwards: asking for the
         # same ceiling again changes nothing, and that is the right answer.
         same = self.UNGROWN
-        self.disk_grow(size="100", df_k=same)
+        self.disk_grow(size="100", df_k=same, filesystem_bytes=self.FULL_VDA2)
         self.assertTrue(any("nothing left to grow" in line for line in self.out))
+        self.assertNotIn("passphrase", self.order)
 
     def test_a_finished_grow_whose_partition_never_grew_is_not_nothing_left(self):
         # growpart failed at the previous boot: the ceiling is edited, vda2 is
@@ -4079,7 +4096,8 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         with self.assertRaises(yo.YoError) as caught:
             self.disk_grow(fstype="ext4\n")
         self.assertIn("yo bootstrap", caught.exception.message)
-        self.assertEqual(self.order, [])
+        # The box was brought up to be read; nothing was derived or stopped.
+        self.assertEqual(self.order, [{"run_services": False}])
 
 
 class TestUpGrowsTheDiskOfAStoppedBox(FakeHome):
