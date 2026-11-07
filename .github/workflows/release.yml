@@ -7,16 +7,66 @@ on:
 permissions:
   contents: read
 
+# One group for every release, not one per tag: two releases published close
+# together both stamp .version and move a tag on main, and must not interleave.
 concurrency:
-  group: release-${{ github.event.release.tag_name }}
+  group: release
 
 jobs:
   verify:
     uses: ./.github/workflows/verify.yml
 
+  # The formula is built and tested on a Mac from the same tree the release
+  # will archive, before anything irreversible: a formula that does not
+  # install, or a yo that still reports `dev`, stops the tag from moving.
+  # The tarball is the job's own `git archive` of main, served over file://,
+  # because the release's tarball does not exist yet; its contents are the
+  # same tree minus the .version stamp, and the version brew splices comes
+  # from the file name, as it does from the release URL.
+  brew:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Refuse a tag that is not vMAJOR.MINOR.PATCH
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::tag '${TAG}' is not vMAJOR.MINOR.PATCH; refusing to build a formula from it"
+              exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Install the formula from a local tarball and run its test
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          tarball="$RUNNER_TEMP/yolobox-${version}.tar.gz"
+          git archive --format=tar.gz --prefix="yolobox-${version}/" -o "$tarball" HEAD
+          sha="$(shasum -a 256 "$tarball" | cut -d' ' -f1)"
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no sha256 for $tarball"; exit 1; }
+          # A local tap, because brew installs a formula by name from a tap,
+          # not from a file path.
+          brew tap-new --no-git local/yolobox
+          formula="$(brew --repository local/yolobox)/Formula/yolobox.rb"
+          sed -e "s#@URL@#file://${tarball}#" -e "s#@SHA256@#${sha}#" homebrew/yolobox.rb > "$formula"
+          if grep -q '@[A-Z0-9_]*@' "$formula"; then
+              echo "::error::the rendered formula still contains an unreplaced @HOLE@"
+              exit 1
+          fi
+          brew install --build-from-source local/yolobox/yolobox
+          brew test local/yolobox/yolobox
+          test "$(yo --version)" = "yolobox ${version}"
+
   release:
-    needs: verify
+    needs: [verify, brew]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     env:
@@ -38,9 +88,13 @@ jobs:
       - name: Refuse before anything irreversible happens
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Read through the environment, never spliced into the script: an
+          # expression inside `run:` is text substitution, which is how a
+          # workflow injection starts.
+          REPO_PRIVATE: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event.repository.private }}" = "true" ]; then
+          if [ "$REPO_PRIVATE" = "true" ]; then
               echo "::error::repository is private — every yo bootstrap fetches the flake ref anonymously and would break"
               exit 1
           fi
@@ -49,7 +103,7 @@ jobs:
               exit 1
           fi
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -64,11 +118,16 @@ jobs:
           # moved. A dry-run push is the only probe that exercises the token's own
           # write grant: the REST permissions field reports the token owner's role,
           # which a fine-grained PAT does not share. The branch name is unique to
-          # this run, so nothing is created. The checkout above persisted its own
-          # GITHUB_TOKEN header; -c clears it, or git would authenticate with that
-          # header instead of the token in the URL.
-          if ! git -c http.https://github.com/.extraheader= push --dry-run \
-              "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/aka-rider/homebrew-tap.git" \
+          # this run, so nothing is created. The token travels as an extra
+          # header through git's environment config, never in the URL, where
+          # it would sit in argv and in any error git prints. The checkout
+          # above persisted its own GITHUB_TOKEN header in .git/config; the
+          # empty value first resets that list, or git would send both.
+          header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$HOMEBREW_TAP_TOKEN" | base64 -w0)"
+          if ! env GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0= \
+              GIT_CONFIG_KEY_1=http.https://github.com/.extraheader "GIT_CONFIG_VALUE_1=$header" \
+              git push --dry-run https://github.com/aka-rider/homebrew-tap.git \
               "HEAD:refs/heads/preflight-probe-${GITHUB_RUN_ID}"; then
               echo "::error::HOMEBREW_TAP_TOKEN cannot push to aka-rider/homebrew-tap (git push --dry-run was refused, see above); refusing before the tag moves"
               exit 1
@@ -101,7 +160,10 @@ jobs:
         run: |
           set -euo pipefail
           # The diff guard makes a re-run a no-op instead of a "nothing to
-          # commit" failure. [skip ci] because ci.yml fires on push to main.
+          # commit" failure. A push with GITHUB_TOKEN never triggers a workflow,
+          # so [skip ci] changes nothing here; it is the subject the tip-of-main
+          # guard above recognises, and the tap's commit carries it because
+          # that push uses a PAT, which does trigger the tap's own workflows.
           printf '%s\n' "${TAG#v}" > .version
           if ! git diff --quiet -- .version; then
               git config user.name "github-actions[bot]"
@@ -126,30 +188,40 @@ jobs:
           version="${TAG#v}"
           tarball="yolobox-${version}.tar.gz"
           git archive --format=tar.gz --prefix="yolobox-${version}/" -o "$tarball" HEAD
+          # Checked before it is written: a sha256sum that printed nothing
+          # would otherwise land an empty hash in the formula.
+          sha="$(sha256sum "$tarball" | cut -d' ' -f1)"
+          if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::sha256sum of ${tarball} gave '${sha}', not 64 hex digits"
+              exit 1
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "sha256=$(sha256sum "$tarball" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${sha}" >> "$GITHUB_OUTPUT"
 
       - name: Upload the tarball to the published release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARBALL: ${{ steps.build.outputs.tarball }}
         run: |
           set -euo pipefail
           # upload, not create — a human already published the release.
           # --clobber keeps a re-run idempotent.
-          gh release upload "$TAG" "yolobox-${TAG#v}.tar.gz" --clobber
+          gh release upload "$TAG" "$TARBALL" --clobber
 
   bump-tap:
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.release.tag_name }}
           persist-credentials: false
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: true
           repository: aka-rider/homebrew-tap

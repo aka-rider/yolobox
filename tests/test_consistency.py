@@ -2320,14 +2320,14 @@ class TestEveryUserUnitIsTheAgents(unittest.TestCase):
 
 class TestOperatorNamePatternHasOneSpelling(unittest.TestCase):
     """The operator's name reaches sshd config, tmpfiles rules and shell
-    scripts, so nix/base.nix asserts its shape; the libvirt driver refuses
-    the same names on the host before it writes cidata (docs/accounts.md)."""
+    scripts, so nix/base.nix asserts its shape; yo refuses the same names on
+    the host, for both drivers, before it writes cidata (docs/accounts.md)."""
 
-    def test_base_nix_and_the_libvirt_driver_accept_the_same_names(self):
+    def test_base_nix_and_yo_accept_the_same_names(self):
         (pattern,) = re.findall(
             r'builtins\.match "([^"]+)" username', nix_code(REPO / "nix" / "base.nix")
         )
-        self.assertEqual(pattern, yo.libvirt.OPERATOR_ACCOUNT_RE.pattern)
+        self.assertEqual(pattern, yo.config.OPERATOR_ACCOUNT_RE.pattern)
 
 
 class TestProcMountOptionsHaveOneSpelling(unittest.TestCase):
@@ -2423,3 +2423,54 @@ class TestYoSourceRevLiteral(unittest.TestCase):
         self.assertNotIn(
             "YO_SOURCE_REV", (REPO / "homebrew" / "yolobox.rb").read_text()
         )
+
+
+class TestLibvirtCheckNamesWhatYoNames(unittest.TestCase):
+    """tests/box-libvirt-check.sh takes a machine name and judges it with two
+    bash regexes before it touches a domain; yo judges the same name with
+    cli.INSTANCE_NAME_RE and config.HOSTNAME_LABEL_RE. A name one accepts and
+    the other refuses would make the check run against a domain yo never
+    defines, or refuse one it did."""
+
+    SCRIPT = REPO / "tests" / "box-libvirt-check.sh"
+
+    def bash_regex(self, subject: str) -> str:
+        (pattern,) = re.findall(
+            r"\[\[ %s =~ \^(.+?)\$ \]\]" % re.escape(subject), self.SCRIPT.read_text()
+        )
+        return pattern
+
+    def test_the_name_regex_is_yos(self):
+        # bash ERE has no (?:...): the non-capturing group is a plain group there.
+        expected = yo.cli.INSTANCE_NAME_RE.pattern.replace("(?:", "(")
+        self.assertEqual(self.bash_regex("${NAME}"), expected)
+
+    def test_the_hostname_regex_is_yos(self):
+        self.assertEqual(
+            self.bash_regex('"yolobox-${NAME,,}"'), yo.config.HOSTNAME_LABEL_RE.pattern
+        )
+
+
+class TestPinnedActionsNameTheirFullTag(unittest.TestCase):
+    """Every action in the workflows is pinned to a commit SHA, and the comment
+    beside it is the tag the SHA was resolved from (release.md, "Pinned
+    actions"). A bare major (`# v7`) names a tag the owner moves, so the next
+    person resolving it cannot tell which release the SHA is; the full X.Y.Z
+    can be checked against the action's releases."""
+
+    WORKFLOWS = sorted((REPO / ".github" / "workflows").glob("*.yml"))
+    USES = re.compile(r"^\s*(?:- )?uses: (\S+)(.*)$", re.M)
+    PINNED = re.compile(r"^(?P<action>[^@\s]+)@(?P<sha>[0-9a-f]{40})$")
+    TAG = re.compile(r"^ # v\d+\.\d+\.\d+$")
+
+    def test_every_action_is_a_sha_with_its_full_tag(self):
+        seen = 0
+        for path in self.WORKFLOWS:
+            for action, rest in self.USES.findall(path.read_text()):
+                if action.startswith("./"):
+                    continue
+                seen += 1
+                with self.subTest(workflow=path.name, action=action):
+                    self.assertRegex(action, self.PINNED)
+                    self.assertRegex(rest, self.TAG)
+        self.assertGreater(seen, 0)

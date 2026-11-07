@@ -31,8 +31,10 @@ brew install aka-rider/tap/yolobox
 ### Nix
 
 ```bash
-nix run github:aka-rider/yolobox/<version>
+nix run github:aka-rider/yolobox/v<version> -- bootstrap
 ```
+
+Run a release, not the repo's tip: an unpinned `nix run github:aka-rider/yolobox` builds `main` but reports and bootstraps the last release in `.version`, so the box lags the `yo` that runs it (see `yo.md`, "bootstrap --version"). To run `main` on purpose, add `--version main`, so the box builds the same tree.
 
 ### Init the VM
 

@@ -39,6 +39,8 @@ Determinism is the assumption everything rests on, and 1Password does not docume
 
 The agent serves only the vaults named in `~/.config/1Password/ssh/agent.toml`, one `[[ssh-keys]]` entry with a `vault = "..."` line per vault. An item created in any other vault is invisible to `ssh-add -L` until it is moved into a served one. If the `yolobox-disk` item sits in an unserved vault, `yo` reports it as missing (see Recognising failures).
 
+Keep `yolobox-disk` in a vault of its own, named in `agent.toml` with `item = "yolobox-disk"`, and keep your git and cloud keys in vaults that entry does not cover: every key the agent lists is a key the box's agent sessions can ask to sign, because the forward relays the agent socket whole and `yo` cannot narrow it (see [docs/ssh.md](ssh.md#1password-reaches-the-agent)). If one vault must hold all of them, use a separate 1Password account for the box.
+
 ### Secrets that still live on disk
 
 The rule that nothing sensitive is written to disk has three exceptions, and each is a vendor's own storage that this repo does not control:

@@ -146,9 +146,9 @@ def preflight(size: Size) -> Preflight:
 
 def vm_up(
     run_services: bool = True,
-    passphrase: Optional[bytes] = None,
+    passphrase: Optional[agent.Passphrase] = None,
     size: Size = NO_SIZE,
-) -> Optional[bytes]:
+) -> Optional[agent.Passphrase]:
     status, size, resize = preflight(size)
     if status != RUNNING:
         # Derived before anything changes, so a missing 1Password key leaves the
