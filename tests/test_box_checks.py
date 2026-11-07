@@ -42,7 +42,19 @@ exec "$@"
 """
 
 # The real tools the agent-side helpers run with PATH set to the fake bin.
-REAL_TOOLS = ("env", "bash", "mktemp", "rm", "kill", "mkdir", "touch", "cat", "grep")
+REAL_TOOLS = (
+    "env",
+    "bash",
+    "mktemp",
+    "rm",
+    "kill",
+    "mkdir",
+    "touch",
+    "cat",
+    "grep",
+    "mv",
+    "ln",
+)
 
 OPERATOR = "op"
 ALLOWUSERS = "not allowed because not listed in AllowUsers"
@@ -276,6 +288,163 @@ class BoxCheck(unittest.TestCase):
         self.assert_fail(
             self.run_check("check_accounts_locked"), "agent is in groups 'users wheel'"
         )
+
+    def test_the_groups_a_box_adds_pass_in_any_order(self):
+        self.accounts(groups="users dialout video")
+        result = self.run_check(
+            "check_accounts_locked", env={"EXTRA_AGENT_GROUPS": "video dialout"}
+        )
+        self.assert_ok(
+            result, "ok: agent is uid 1000 in the groups: dialout users video"
+        )
+
+    # -- the 1Password proxy, sshd, tailscale, containers --------------
+
+    def proxy(self, protect_system="strict", private_network="yes", keys_rc=0):
+        self.fake(
+            "systemctl",
+            "#!/bin/sh\n"
+            'printf "ProtectSystem=%s\\nProtectHome=yes\\nPrivateNetwork=%s\\nRestrictAddressFamilies=AF_UNIX\\n"\n'
+            % (protect_system, private_network),
+        )
+        self.fake("ssh-add", "#!/bin/sh\nexit %d\n" % keys_rc)
+
+    def test_a_confined_proxy_the_agent_still_reaches_passes(self):
+        self.proxy(keys_rc=1)
+        self.assert_ok(
+            self.run_check("check_proxy_confined"),
+            "ok: yolobox-op-agent.service is confined",
+        )
+
+    def test_a_proxy_with_a_network_fails(self):
+        self.proxy(private_network="no")
+        self.assert_fail(
+            self.run_check("check_proxy_confined"),
+            "yolobox-op-agent.service has PrivateNetwork=no, want yes",
+        )
+
+    def test_a_dead_socket_behind_the_proxy_fails(self):
+        self.proxy(keys_rc=2)
+        self.assert_fail(self.run_check("check_proxy_confined"), "ssh-add -L through")
+
+    def test_sshd_settings_are_read_from_sshd_t(self):
+        self.fake(
+            "sshd",
+            '#!/bin/sh\nprintf "permitrootlogin %s\\nsubsystem sftp internal-sftp\\n"\n'
+            % "no",
+        )
+        self.assert_ok(
+            self.run_check("check_sshd_settings"), "ok: sshd runs internal-sftp"
+        )
+        self.fake(
+            "sshd",
+            '#!/bin/sh\nprintf "permitrootlogin prohibit-password\\nsubsystem sftp internal-sftp\\n"\n',
+        )
+        self.assert_fail(
+            self.run_check("check_sshd_settings"), "sshd -T lacks 'permitrootlogin no'"
+        )
+
+    def test_the_tailscale_pin_is_compared_only_when_given(self):
+        self.fake(
+            "tailscale", '#!/bin/sh\nprintf "1.104.4\\n  go version: go1.25\\n"\n'
+        )
+        result = self.run_check("check_tailscale_version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SKIP: tailscale's version was NOT compared", result.stderr)
+        result = self.run_check(
+            "check_tailscale_version", env={"TAILSCALE_VERSION": "1.104.4"}
+        )
+        self.assert_ok(result, "ok: tailscale is the pinned 1.104.4")
+        result = self.run_check(
+            "check_tailscale_version", env={"TAILSCALE_VERSION": "1.104.5"}
+        )
+        self.assert_fail(result, "tailscale is 1.104.4, the pin says 1.104.5")
+
+    def podman(self, gateway_rc):
+        # nc's last two words are the host and port.
+        self.fake(
+            "podman",
+            "#!/bin/sh\n"
+            "for a; do host=$port; port=$a; done\n"
+            "case $host in 192.168.5.2) exit %d ;; *) exit 0 ;; esac\n" % gateway_rc,
+        )
+
+    def test_a_container_refused_the_gateway_passes(self):
+        self.podman(gateway_rc=1)
+        self.assert_ok(
+            self.run_check("check_container_egress"),
+            "ok: a rootless container on --network=host cannot reach 192.168.5.2:22",
+        )
+
+    def test_a_container_that_reaches_the_gateway_fails(self):
+        self.podman(gateway_rc=0)
+        self.assert_fail(
+            self.run_check("check_container_egress"),
+            "a rootless container connected to 192.168.5.2:22",
+        )
+
+    # -- link kinds -----------------------------------------------------
+
+    def link_tools(self, refusal):
+        # unshare runs the command after its options; ip refuses every kind
+        # but the bridge; lsmod lists nothing.
+        self.fake("unshare", '#!/bin/sh\nshift\nexec "$@"\n')
+        self.fake(
+            "ip",
+            "#!/bin/sh\n"
+            "for a; do case $prev in type) kind=$a ;; esac; prev=$a; done\n"
+            'case $kind in bridge) exit 0 ;; *) printf "%s\\n" >&2; exit 2 ;; esac\n'
+            % refusal,
+        )
+        self.fake("lsmod", "#!/bin/sh\nexit 0\n")
+
+    def test_link_kinds_the_kernel_refuses_pass(self):
+        self.link_tools("RTNETLINK answers: Operation not supported")
+        self.assert_ok(
+            self.run_check("check_link_kinds"), "ok: the agent cannot add a ipvlan link"
+        )
+
+    def test_a_link_kind_refused_for_its_options_fails(self):
+        self.link_tools('Error: argument "id" is required.')
+        self.assert_fail(
+            self.run_check("check_link_kinds"),
+            "ip link add type vxlan failed, but not with the kernel refusing the kind",
+        )
+
+    # -- tmpfiles and the agent's symlink -------------------------------
+
+    def tmpfiles(self, refuses):
+        # The first run (the symlink in place) answers `refuses`; the second
+        # run, after the restore, passes.
+        self.fake(
+            "systemd-tmpfiles",
+            "#!/bin/sh\n"
+            'if [ -L "$HOME/.config/zed" ]; then %s; fi\nexit 0\n'
+            % (
+                'printf "Detected unsafe path transition %s/.config/zed\\n" "$HOME" >&2; exit 65'
+                if refuses
+                else "exit 0"
+            ),
+        )
+
+    def test_a_refused_symlink_passes_and_the_directory_is_restored(self):
+        self.tmpfiles(refuses=True)
+        zed = self.home / ".config" / "zed"
+        zed.mkdir(parents=True)
+        (zed / "settings.json").write_text("{}")
+        result = self.run_check("stage_helpers; check_tmpfiles_refuses_agent_symlink")
+        self.assert_ok(result, "ok: systemd-tmpfiles refuses the agent's symlink")
+        self.assertTrue(zed.is_dir() and not zed.is_symlink())
+        self.assertEqual((zed / "settings.json").read_text(), "{}")
+        self.assertFalse((self.home / ".config" / "zed.bak").exists())
+
+    def test_tmpfiles_that_follows_the_symlink_fails_and_still_restores(self):
+        self.tmpfiles(refuses=False)
+        result = self.run_check(
+            "stage_helpers; trap cleanup EXIT; check_tmpfiles_refuses_agent_symlink"
+        )
+        self.assert_fail(result, "systemd-tmpfiles --create succeeded")
+        self.assertFalse((self.home / ".config" / "zed").exists())
 
     # -- the operator's login ------------------------------------------
 

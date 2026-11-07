@@ -12,18 +12,25 @@
 #   comma-separated, in any order (dumpcap=cap_net_raw,cap_setpcap). A bare
 #   name means the wrapper carries none. A name of the allowlist is refused,
 #   as the rebuild refuses it.
+# EXTRA_AGENT_GROUPS: space-separated groups a box's local.nix adds the agent
+#   to, beside users.
+# TAILSCALE_VERSION: the version nix/pkgs/tailscale.nix pins; unset, the
+#   box's tailscale is not compared (SKIP).
 # ONLY=hardening | ONLY=compat: run just one half. Unset runs both. The
 #   compat half ("nothing the agent needs broke") is the one to iterate on
 #   against a box that is not hardened yet.
 #
 # The hardening half proves the box holds against the agent: sysctls, kernel
-# parameters, blocked modules, io_uring, the wrapper set and each wrapper's
-# privilege, no setuid su, sudo closed to the agent, root and the agent locked,
-# no forwarding, the gateway's ssh port closed, the operator refused to the
-# agent's forwarded 1Password agent (SKIP, and nothing tested, when that agent
-# authorizes no key of the box's), and the agent's own authorized_keys
-# ignored. Its probes run as the agent WITHOUT the agent's login shell, since
-# the agent edits that shell's rc files and PATH.
+# parameters, blocked modules (sockets and link kinds), io_uring, the
+# wrapper set and each wrapper's privilege, no setuid su, sudo closed to the
+# agent, root and the agent locked, the agent's groups, the 1Password proxy
+# confined, sshd's settings, the tailscale pin, no forwarding, the gateway's
+# ssh port closed to the agent and to its containers, the operator refused
+# to the agent's forwarded 1Password agent (SKIP, and nothing tested, when
+# that agent authorizes no key of the box's), the agent's own
+# authorized_keys ignored, and tmpfiles refusing a symlink of the agent's
+# into /etc. Its probes run as the agent WITHOUT the agent's login shell,
+# since the agent edits that shell's rc files and PATH.
 #
 # The compat half proves nothing the agent needs broke: net-check, the kept
 # qdisc, podman, chromium, a nix build, strace -p, the harness binaries, the
@@ -62,6 +69,7 @@ NET_CREATED=""
 PROBE_OUT=""
 WRAPPER_CAPS=""
 PLANTED_KEY_DIR=""
+ZED_STAMP_DIR=""
 EXTRA_NAMES=()
 
 fail() {
@@ -119,6 +127,9 @@ cleanup() {
     if [ -n "${PLANTED_KEY_DIR}" ]; then
         unplant_agent_key || warn "cleanup: could not remove the planted key from ${AGENT_HOME}/.ssh/authorized_keys"
     fi
+    if [ -n "${ZED_STAMP_DIR}" ]; then
+        restore_zed || warn "cleanup: ${AGENT_HOME}/.config/zed is NOT restored; move ${AGENT_HOME}/.config/zed.bak back by hand"
+    fi
     if [ -n "${WORK}" ]; then
         rm -rf "${WORK}"
     fi
@@ -171,6 +182,7 @@ check_sysctls() {
         net.core.bpf_jit_harden=2 \
         kernel.io_uring_disabled=2 \
         dev.tty.ldisc_autoload=0 \
+        dev.tty.legacy_tiocsti=0 \
         fs.protected_fifos=2 \
         fs.protected_regular=2 \
         fs.suid_dumpable=0 \
@@ -316,6 +328,8 @@ unplant)
 esac
 EOF
 
+    stage_zed_swap
+
     # The name is unique per run, so the build is never a cache hit.
     cat >"${WORK}/build.nix" <<EOF
 derivation {
@@ -376,8 +390,53 @@ check_modules() {
     check_socket_refused bluetooth bluetooth 31 1 3
     # AF_INET=2, SOCK_STREAM=1, IPPROTO_SCTP=132
     check_socket_refused sctp sctp 2 1 132
+    # AF_PPPOX=24, SOCK_STREAM=1, PX_PROTO_PPTP=2
+    check_socket_refused pptp pptp 24 1 2
+    # AF_MCTP=45, SOCK_DGRAM=2
+    check_socket_refused mctp mctp 45 2 0
+    # AF_NETLINK=16, SOCK_RAW=3, NETLINK_ISCSI=8 and NETLINK_XFRM=6
+    check_socket_refused iscsi scsi_transport_iscsi 16 3 8
+    check_socket_refused xfrm xfrm_user 16 3 6
+    # AF_INET=2, SOCK_DGRAM=2, IPPROTO_L2TP=115
+    check_socket_refused l2tp_ip l2tp_core 2 2 115
     check_modprobe_routed bluetooth
     ok "explicit modprobe of bluetooth is routed to bin/false"
+}
+
+# `ip link add ... type KIND` in the agent's own namespace asks the kernel for
+# the module rtnl-link-KIND, before the kernel looks at the kind's options.
+# The blocked kinds must be refused as unsupported, with their module not
+# loaded; the positive control is a bridge, which stays, and must attach.
+# `kind|module|options`, one per word.
+check_link_kinds() {
+    local entry kind module options out loaded
+    as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/ip" link add b0 type bridge ||
+        fail "the agent could not add a bridge in its own namespace, so a refused link kind would prove nothing"
+    ok "the agent can add a bridge in its own namespace"
+    for entry in \
+        "vxlan|vxlan|id 1 dstport 4789" \
+        "geneve|geneve|id 1 remote 192.0.2.1" \
+        "bareudp|bareudp|dstport 6635 ethertype ipv4" \
+        "gtp|gtp|role sgsn" \
+        "hsr|hsr|slave1 lo slave2 lo" \
+        "macsec|macsec|link lo" \
+        "bond|bonding|" \
+        "team|team|" \
+        "ipvlan|ipvlan|link lo mode l2"; do
+        IFS='|' read -r kind module options <<<"${entry}"
+        # ${options} is split on purpose: it is ip's own word list.
+        # shellcheck disable=SC2086
+        if out=$(as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/ip" link add l0 type "${kind}" ${options} 2>&1); then
+            fail "the agent added a ${kind} link in its own namespace (${module} autoloads)"
+        fi
+        case ${out} in
+        *"Operation not supported"* | *"Unknown device type"*) ;;
+        *) fail "ip link add type ${kind} failed, but not with the kernel refusing the kind: ${out}" ;;
+        esac
+        loaded=$(lsmod | awk -v m="${module}" '$1 == m { print $1 }')
+        [ -z "${loaded}" ] || fail "${module} is loaded in the kernel after the ${kind} refusal"
+        ok "the agent cannot add a ${kind} link (${out}), ${module} not loaded"
+    done
 }
 
 # The agent is root of its own user and network namespace and can attach
@@ -509,7 +568,7 @@ check_sudo_refuses_agent() {
 # agent out of every supplementary group (systemd-journal would show it the
 # operator's sudo lines).
 check_accounts_locked() {
-    local account entry field groups
+    local account entry field groups want
     for account in root "${AGENT_USER}"; do
         entry=$(sudo -n getent shadow "${account}") || fail "no shadow entry for ${account}"
         field=${entry#*:}
@@ -520,10 +579,130 @@ check_accounts_locked() {
         esac
     done
     ok "root and ${AGENT_USER} have locked passwords"
-    groups=$(id -Gn "${AGENT_USER}") || fail "id -Gn ${AGENT_USER} failed"
-    [ "${groups}" = users ] || fail "${AGENT_USER} is in groups '${groups}', want users alone"
+    groups=$(id -Gn "${AGENT_USER}" | tr ' ' '\n' | LC_ALL=C sort -u | paste -sd' ' -) || fail "id -Gn ${AGENT_USER} failed"
+    want=$(tr ' ' '\n' <<<"users ${EXTRA_AGENT_GROUPS:-}" | grep . | LC_ALL=C sort -u | paste -sd' ' -)
+    [ "${groups}" = "${want}" ] || fail "${AGENT_USER} is in groups '${groups}', want '${want}' (users plus EXTRA_AGENT_GROUPS)"
     [ "$(id -u "${AGENT_USER}")" = "${AGENT_UID}" ] || fail "${AGENT_USER} is not uid ${AGENT_UID}"
-    ok "${AGENT_USER} is uid ${AGENT_UID} in the group users alone"
+    ok "${AGENT_USER} is uid ${AGENT_UID} in the groups: ${want}"
+}
+
+# The forwarded 1Password socket reaches the agent through a proxy unit
+# (nix/base.nix, docs/ssh.md) that must hold nothing but the two sockets: no
+# writable system, no homes, no network, unix sockets only. The positive
+# control is that the agent still reaches the agent behind it: ssh-add -L
+# exits 0 with keys, 1 with none, and 2 when the socket is dead.
+check_proxy_confined() {
+    local unit=yolobox-op-agent.service props want got keys status=0
+    props=$(systemctl show -p ProtectSystem,ProtectHome,PrivateNetwork,RestrictAddressFamilies "${unit}") ||
+        fail "could not read the confinement of ${unit}"
+    for want in ProtectSystem=strict ProtectHome=yes PrivateNetwork=yes RestrictAddressFamilies=AF_UNIX; do
+        got=$(sed -n "s/^${want%%=*}=//p" <<<"${props}")
+        [ "${got}" = "${want#*=}" ] || fail "${unit} has ${want%%=*}=${got}, want ${want#*=}"
+    done
+    keys=$(as_agent_bare "SSH_AUTH_SOCK=${AGENT_AUTH_SOCK}" "${SYSBIN}/ssh-add" -L 2>&1) || status=$?
+    [ "${status}" -le 1 ] || fail "ssh-add -L through the confined ${unit} exited ${status}: ${keys}"
+    ok "${unit} is confined (strict, no homes, no network, AF_UNIX) and the agent still reaches the forwarded ssh agent"
+}
+
+# sshd's effective settings: sftp by the in-process server (no sftp-server
+# binary to run), and no root login at all.
+check_sshd_settings() {
+    local config setting
+    config=$(sudo -n sshd -T) || fail "sshd -T failed"
+    for setting in "subsystem sftp internal-sftp" "permitrootlogin no"; do
+        grep -qx -- "${setting}" <<<"${config}" || fail "sshd -T lacks '${setting}'"
+    done
+    ok "sshd runs internal-sftp and permits no root login"
+}
+
+# The box runs the tailscale nix/pkgs/tailscale.nix pins. The pin's version
+# comes in TAILSCALE_VERSION (the e2e driver reads it from the checkout);
+# unset, nothing is compared.
+check_tailscale_version() {
+    local got
+    if [ -z "${TAILSCALE_VERSION:-}" ]; then
+        echo "SKIP: tailscale's version was NOT compared: TAILSCALE_VERSION is unset" >&2
+        return
+    fi
+    got=$(tailscale version | head -n 1) || fail "tailscale version failed"
+    [ "${got}" = "${TAILSCALE_VERSION}" ] || fail "tailscale is ${got}, the pin says ${TAILSCALE_VERSION}"
+    ok "tailscale is the pinned ${TAILSCALE_VERSION}"
+}
+
+# podman as the agent, with the runtime directory rootless podman needs.
+agent_podman() {
+    as_agent_bare "XDG_RUNTIME_DIR=/run/user/${AGENT_UID}" "${SYSBIN}/podman" "$@"
+}
+
+# A rootless container's traffic is the agent's, so the egress table must
+# refuse it the gateway's ssh port, through pasta and on the host network
+# alike. The positive control is the same nc reaching the internet.
+check_container_egress() {
+    local network out
+    agent_podman run --rm docker.io/library/busybox nc -z -w 3 github.com 443 ||
+        fail "a container cannot reach github.com:443, so a refused gateway would prove nothing"
+    ok "a rootless container reaches github.com:443"
+    for network in "" --network=host; do
+        # ${network} is one option or nothing; an empty word would be an image name.
+        # shellcheck disable=SC2086
+        if out=$(agent_podman run --rm ${network} docker.io/library/busybox nc -z -w 3 "${GATEWAY_ADDR}" 22 2>&1); then
+            fail "a rootless container${network:+ on ${network}} connected to ${GATEWAY_ADDR}:22"
+        fi
+        ok "a rootless container${network:+ on ${network}} cannot reach ${GATEWAY_ADDR}:22 (${out})"
+    done
+}
+
+# Puts the agent's ~/.config/zed aside and points the name at /etc, or
+# restores it. Run as the agent; STAMPDIR records whether the directory
+# existed, so a box that never had one gets none back.
+stage_zed_swap() {
+    cat >"${WORK}/zed-swap.sh" <<'EOF'
+set -eu
+stampdir=$1 action=$2
+zed=~/.config/zed
+case ${action} in
+swap)
+    mkdir -p ~/.config
+    if [ -e "${zed}" ] || [ -L "${zed}" ]; then mv "${zed}" "${zed}.bak"; touch "${stampdir}/had-zed"; fi
+    ln -s /etc "${zed}"
+    ;;
+restore)
+    rm "${zed}"
+    if [ -e "${stampdir}/had-zed" ]; then mv "${zed}.bak" "${zed}"; fi
+    ;;
+esac
+EOF
+}
+
+restore_zed() {
+    as_agent_bare "${SYSBIN}/bash" "${WORK}/zed-swap.sh" "${ZED_STAMP_DIR}" restore || return 1
+    as_agent_bare "${SYSBIN}/rm" -rf "${ZED_STAMP_DIR}" || return 1
+    ZED_STAMP_DIR=""
+}
+
+# The tmpfiles rules that link files into the agent's home (nix/lib/
+# home-tmpfiles.nix) run as root. With ~/.config/zed pointed at /etc by the
+# agent, systemd-tmpfiles must refuse the path (an unsafe transition from
+# the agent's home into root's directory) rather than write
+# /etc/settings.json. The positive control is the same run passing once the
+# directory is back.
+check_tmpfiles_refuses_agent_symlink() {
+    local out status=0
+    ZED_STAMP_DIR=$(as_agent_bare "${SYSBIN}/mktemp" -d /tmp/hk-zed.XXXXXX) ||
+        fail "could not create a directory as the agent"
+    as_agent_bare "${SYSBIN}/bash" "${WORK}/zed-swap.sh" "${ZED_STAMP_DIR}" swap ||
+        fail "could not point ${AGENT_HOME}/.config/zed at /etc as the agent"
+    out=$(sudo -n systemd-tmpfiles --create 2>&1) || status=$?
+    [ "${status}" -ne 0 ] || fail "systemd-tmpfiles --create succeeded with ${AGENT_HOME}/.config/zed pointing at /etc"
+    case ${out} in
+    *"unsafe path transition"*) ;;
+    *) fail "systemd-tmpfiles --create failed (exit ${status}), but not on the unsafe path transition: ${out}" ;;
+    esac
+    [ ! -e /etc/settings.json ] || fail "/etc/settings.json exists: the agent's symlink steered a root-run rule into /etc"
+    restore_zed || fail "could not restore ${AGENT_HOME}/.config/zed"
+    out=$(sudo -n systemd-tmpfiles --create 2>&1) ||
+        fail "systemd-tmpfiles --create fails with ${AGENT_HOME}/.config/zed restored: ${out}"
+    ok "systemd-tmpfiles refuses the agent's symlink into /etc and passes once the directory is back"
 }
 
 # The gateway is the host's own loopback, so a connection to its port 22 would
@@ -660,16 +839,22 @@ hardening_checks() {
     check_ip_forward
     check_cmdline
     check_modules
+    check_link_kinds
     check_net_sched
     check_io_uring
     check_wrappers
     check_no_su
     check_sudo_refuses_agent
     check_accounts_locked
+    check_proxy_confined
+    check_sshd_settings
+    check_tailscale_version
     check_gateway_ssh_closed
+    check_container_egress
     check_operator_login_refused "$(id -un)"
     check_gateway_spoof_dropped
     check_agent_authorized_keys_ignored
+    check_tmpfiles_refuses_agent_symlink
 }
 
 # ------------------------------------------------------------ nothing broke
