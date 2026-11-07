@@ -1232,8 +1232,9 @@ class TestEgressTierChainNames(unittest.TestCase):
     wrong tier, or none."""
 
     CHAIN_HEADER = re.compile(r"\bchain (\w+) \{")
-    # postrouting is the tunnel variant's second chain, not a tier.
-    NOT_A_TIER = {"postrouting"}
+    # postrouting and the forward chains are not tiers: yo status reads only
+    # the output chain's name.
+    NOT_A_TIER = {"postrouting", "forward", "forward_recovery"}
 
     def status_names(self):
         names = set()

@@ -182,7 +182,7 @@ Three open problems sit outside this module's reach, so they get pointers and no
 
 - The port-mirror squat (see `TODO.md`). Lima mirrors guest TCP ports 1024-49151 onto the host, so an agent can bind a port before a host tool does. The fix is a change to `lima/yolobox.yaml`, which lima reads only when it creates an instance.
 - `AF_VSOCK` from the guest to the host. The egress table does not see it, and today nothing listens host-side. See [nix/egress.md](egress.md#residuals).
-- The `198.18.0.0/15` fake-IP range, which the egress table deliberately does not block. See [nix/egress.md](egress.md#residuals).
+- The `198.18.0.0/15` fake-IP range, when the operator opts in with `lanAllow` to keep a box behind such a proxy online; the egress table blocks it by default. See [nix/egress.md](egress.md#a-fake-ip-proxy-on-the-host).
 
 ## Running the acceptance test
 

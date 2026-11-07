@@ -37,7 +37,7 @@ Recognise the two by those patterns, and on a macOS host run `scutil --nc list` 
 
 ### A fake-IP proxy on the host
 
-A fake-IP proxy on the host answers every name with an address in `198.18.0.0/15` and proxies the connection itself. The guest's DNS goes through the host's resolver, so the box gets those addresses too and reaches the internet through the proxy. This works: the [egress table](../nix/egress.md) does not block `198.18.0.0/15`.
+A fake-IP proxy on the host answers every name with an address in `198.18.0.0/15` and proxies the connection itself. The guest's DNS goes through the host's resolver, so the box gets those addresses too, and through the proxy it would reach any LAN host, and the host itself, by name. That is why the [egress table](../nix/egress.md#a-fake-ip-proxy-on-the-host) blocks `198.18.0.0/15`: such a box has no internet until its operator opts in with `yolobox.network.lanAllow = [ "198.18.0.0/15" ]` in `local.nix`.
 
 ## The DNS sinkhole
 

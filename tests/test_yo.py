@@ -1769,7 +1769,9 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
                 self.assertNotIn("\x1b", message)
                 if stderr:
                     self.assertIn(
-                        yo.ui.quoted_line("find: '/home/agent/proj/lock?ed': Permission denied"),
+                        yo.ui.quoted_line(
+                            "find: '/home/agent/proj/lock?ed': Permission denied"
+                        ),
                         message,
                     )
                 else:
