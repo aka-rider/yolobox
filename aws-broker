@@ -262,6 +262,7 @@ def unlink_bound(sockets):
 
 def exit_cleanly(why, sockets, status):
     log(f"{why}; shutting down")
+    kill_running_mints()
     unlink_bound(sockets)
     os._exit(status)
 
@@ -303,13 +304,69 @@ def seconds_to_expiry(expiration):
     return (parse_expiration(expiration) - datetime.now(timezone.utc)).total_seconds()
 
 
+# The mints in flight, so that a broker that is stopped can end them: a
+# replaced broker os._exits, and the `aws` it left running, with whatever
+# that spawned (a credential_process, an SSO browser helper), would run on.
+running_mints = set()
+running_mints_lock = threading.Lock()
+
+
+def kill_process_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def kill_running_mints():
+    with running_mints_lock:
+        mints = list(running_mints)
+    for proc in mints:
+        kill_process_group(proc)
+
+
+# `aws` in its own session, so that a timeout ends its whole process group:
+# killing `aws` alone, as subprocess.run's timeout does, leaves a
+# credential_process it spawned running, with the pipes it inherited open.
+# Raises TimeoutExpired after MINT_TIMEOUT_SECONDS, like run().
+def run_aws(argv):
+    proc = subprocess.Popen(
+        argv,
+        # Bytes, decoded by the caller: text=True would raise on a byte that is
+        # not UTF-8 and skip the throttle's timestamp in _remint_locked.
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        # The CLI may prompt (an SSO login, a device code). Stdin is
+        # the launcher's, so it must never be read.
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    with running_mints_lock:
+        running_mints.add(proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=MINT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            kill_process_group(proc)
+            # Reap `aws` and drop the pipes without draining them: a grandchild
+            # that escaped the group could hold them open for ever.
+            proc.wait()
+            proc.stdout.close()
+            proc.stderr.close()
+            raise
+    finally:
+        with running_mints_lock:
+            running_mints.discard(proc)
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
 # Runs the host's full credential resolution for the profile (including any
 # credential_process) and returns the
 # process-format JSON, or (None, <one-line error>) on any failure. Never
 # raises: every caller turns a failure into ERROR=/500 output instead.
 def export_credentials(profile):
     try:
-        proc = subprocess.run(
+        proc = run_aws(
             [
                 "aws",
                 "configure",
@@ -318,14 +375,7 @@ def export_credentials(profile):
                 profile,
                 "--format",
                 "process",
-            ],
-            # Bytes, decoded below: text=True would raise on a byte that is not
-            # UTF-8 and skip the throttle's timestamp in _remint_locked.
-            capture_output=True,
-            # The CLI may prompt (an SSO login, a device code). Stdin is
-            # the launcher's, so it must never be read.
-            stdin=subprocess.DEVNULL,
-            timeout=MINT_TIMEOUT_SECONDS,
+            ]
         )
     except subprocess.TimeoutExpired:
         return (

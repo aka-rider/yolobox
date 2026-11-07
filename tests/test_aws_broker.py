@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -69,7 +70,7 @@ def process_json(**overrides):
 
 
 def aws_result(stdout="", stderr="", returncode=0):
-    """What `aws` printed, as the bytes subprocess.run hands back; text is UTF-8."""
+    """What `aws` printed, as the bytes run_aws hands back; text is UTF-8."""
     return subprocess.CompletedProcess(
         [],
         returncode,
@@ -267,7 +268,7 @@ class TestParseExpiration(unittest.TestCase):
 
 class TestExportCredentials(unittest.TestCase):
     def run_export(self, result):
-        with mock.patch.object(broker.subprocess, "run", return_value=result):
+        with mock.patch.object(broker, "run_aws", return_value=result):
             return broker.export_credentials("dev")
 
     def test_good_output_returns_the_four_fields(self):
@@ -295,11 +296,8 @@ class TestExportCredentials(unittest.TestCase):
     def test_a_hung_cli_is_killed_after_the_mint_timeout_and_the_message_says_so(self):
         timed_out = subprocess.TimeoutExpired("aws", 7)
         with mock.patch.object(broker, "MINT_TIMEOUT_SECONDS", 7):
-            with mock.patch.object(
-                broker.subprocess, "run", side_effect=timed_out
-            ) as run:
+            with mock.patch.object(broker, "run_aws", side_effect=timed_out):
                 creds, err = broker.export_credentials("dev")
-        self.assertEqual(run.call_args.kwargs["timeout"], 7)
         self.assertIsNone(creds)
         self.assertIn("timed out after 7s", err)
 
@@ -388,11 +386,62 @@ class TestExportCredentials(unittest.TestCase):
         self.assertNotIn("12345", err)
 
 
+# A stand-in for `aws` that hangs, with a grandchild that holds the FIFO named
+# by $MINT_FIFO open: a reader of the FIFO sees EOF only once the grandchild
+# is dead.
+HUNG_AWS_WITH_GRANDCHILD = """#!/bin/sh
+sh -c 'exec 3>"$MINT_FIFO"; echo started >&3; exec sleep 600' &
+exec sleep 600
+"""
+
+
+class MintGrandchild(unittest.TestCase):
+    """A fake aws on PATH whose grandchild reports through a FIFO."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        fake = Path(self.tmp, "aws")
+        fake.write_text(HUNG_AWS_WITH_GRANDCHILD)
+        fake.chmod(0o755)
+        self.fifo = os.path.join(self.tmp, "fifo")
+        os.mkfifo(self.fifo)
+        self.env = {"PATH": self.tmp + ":" + os.environ["PATH"], "MINT_FIFO": self.fifo}
+
+    def grandchild_started(self):
+        """Block until the grandchild opened the FIFO; keep the read end."""
+        self.reader = os.open(self.fifo, os.O_RDONLY)
+        self.addCleanup(os.close, self.reader)
+        self.assertEqual(os.read(self.reader, 8), b"started\n")
+
+    def assert_grandchild_dead(self):
+        ready, _, _ = select.select([self.reader], [], [], 10)
+        self.assertEqual(ready, [self.reader], "the grandchild still holds the FIFO")
+        self.assertEqual(os.read(self.reader, 8), b"")
+
+
+class TestMintTimeoutEndsTheWholeProcessGroup(MintGrandchild):
+    def test_the_grandchild_of_a_timed_out_mint_is_dead_too(self):
+        # The grandchild reaches the FIFO milliseconds after `aws` starts; the
+        # timeout is the feature's own, long enough for it to get there.
+        started = threading.Thread(target=self.grandchild_started, daemon=True)
+        started.start()
+        with mock.patch.dict(os.environ, self.env):
+            with mock.patch.object(broker, "MINT_TIMEOUT_SECONDS", 2):
+                creds, err = broker.export_credentials("dev")
+        started.join(10)
+        self.assertFalse(started.is_alive(), "the grandchild never opened the FIFO")
+        self.assertIsNone(creds)
+        self.assertIn("timed out", err)
+        self.assert_grandchild_dead()
+        self.assertEqual(broker.running_mints, set())
+
+
 class TestMintOutputThatIsNotUtf8(unittest.TestCase):
     def test_a_failure_with_non_utf8_output_is_an_error_not_an_exception(self):
         with mock.patch.object(
-            broker.subprocess,
-            "run",
+            broker,
+            "run_aws",
             return_value=aws_result(returncode=255, stderr=b"bad \xff\xfe byte"),
         ):
             creds, err = broker.export_credentials("dev")
@@ -400,9 +449,7 @@ class TestMintOutputThatIsNotUtf8(unittest.TestCase):
         self.assertIn("bad \ufffd\ufffd byte", err)
 
     def test_a_success_with_non_utf8_output_is_an_error_not_an_exception(self):
-        with mock.patch.object(
-            broker.subprocess, "run", return_value=aws_result(b"\xff\xfe")
-        ):
+        with mock.patch.object(broker, "run_aws", return_value=aws_result(b"\xff\xfe")):
             creds, err = broker.export_credentials("dev")
         self.assertIsNone(creds)
         self.assertIn("unparseable", err)
@@ -411,8 +458,8 @@ class TestMintOutputThatIsNotUtf8(unittest.TestCase):
         state = broker.State("dev", 3600.0, broker.EventLog())
         with mock.patch.object(broker, "log"):
             with mock.patch.object(
-                broker.subprocess,
-                "run",
+                broker,
+                "run_aws",
                 return_value=aws_result(returncode=255, stderr=b"\xff"),
             ) as run:
                 self.assertIsNone(state.get())
@@ -668,6 +715,36 @@ class TestSigterm(SocketDirCase):
         self.assertEqual(broker_proc.wait(30), 0, broker_proc.stderr.read())
         self.assertFalse(os.path.lexists(self.sock))
         self.assertFalse(os.path.lexists(self.ctl))
+
+
+@unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+class TestStoppedBrokerEndsItsMints(MintGrandchild, SocketDirCase):
+    def setUp(self):
+        MintGrandchild.setUp(self)
+        SocketDirCase.setUp(self)
+
+    def test_sigterm_ends_a_mint_in_flight_and_its_grandchild(self):
+        broker_proc = subprocess.Popen(
+            [sys.executable, BROKER_PATH, "--socket", self.sock]
+            + ["--control-socket", self.ctl, "--watch-pid", str(os.getpid())]
+            + ["--allow", "dev"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, **self.env},
+        )
+        self.addCleanup(broker_proc.stderr.close)
+        self.addCleanup(broker_proc.stdout.close)
+        self.addCleanup(broker_proc.kill)
+        self.assertEqual(broker_proc.stdout.readline(), "READY\n")
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.connect(self.sock)
+        client.sendall(b"GET /creds/dev HTTP/1.0\r\n\r\n")
+        self.grandchild_started()
+        broker_proc.terminate()
+        self.assertEqual(broker_proc.wait(30), 0, broker_proc.stderr.read())
+        self.assert_grandchild_dead()
 
 
 # The head of every script below: load the broker file as a module to wrap one
@@ -955,11 +1032,9 @@ class ServedBroker(SocketDirCase):
         """Mock the aws CLI: one result forever, or each result in turn. Returns
         the mock, whose calls are the mints."""
         if len(results) == 1:
-            patch = mock.patch.object(broker.subprocess, "run", return_value=results[0])
+            patch = mock.patch.object(broker, "run_aws", return_value=results[0])
         else:
-            patch = mock.patch.object(
-                broker.subprocess, "run", side_effect=list(results)
-            )
+            patch = mock.patch.object(broker, "run_aws", side_effect=list(results))
         run = patch.start()
         self.addCleanup(patch.stop)
         return run
