@@ -49,12 +49,18 @@ def release_triple(version: str) -> Optional[Tuple[int, int, int]]:
     return major, minor, patch
 
 
-def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
+def version_drift(
+    host: str, guest: Optional[str], built_from: Optional[str]
+) -> Optional[str]:
     """What to do about a box built by another release than this yo, or None.
 
     A box built by a newer release is not rebuilt by this yo: `yo bootstrap`
     would build the older release over it. Versions that are not X.Y.Z cannot be
     ordered, so a box that differs from this yo is advised the rebuild.
+    `built_from` is the ref the box was bootstrapped from with --version
+    (state.remembered_flake_ref()), or None: the rebuild advised then names
+    that ref, because a plain `yo bootstrap` would move the box to this yo's
+    release and forget the ref.
     """
     if guest is None or host == "dev" or host == guest:
         return None
@@ -70,10 +76,20 @@ def version_drift(host: str, guest: Optional[str]) -> Optional[str]:
             "(%s would build %s over it)"
             % (guest, host, state.yo_cmd("bootstrap"), host)
         )
-    return "yo: this host's yo is %s but the box was built by %s — rebuild it: %s" % (
-        host,
-        guest,
-        state.yo_cmd("bootstrap"),
+    if built_from is None:
+        return (
+            "yo: this host's yo is %s but the box was built by %s — rebuild it: %s"
+            % (host, guest, state.yo_cmd("bootstrap"))
+        )
+    return (
+        "yo: this host's yo is %s but the box was built by %s from %s — rebuild it "
+        "from that ref: %s"
+        % (
+            host,
+            guest,
+            built_from,
+            state.yo_cmd("bootstrap", "--version", shlex.quote(built_from)),
+        )
     )
 
 
@@ -359,7 +375,7 @@ def locked_rev(ref: str) -> str:
 
 
 def helper_skew(what: str) -> str:
-    drift = version_drift(config.YO_VERSION, built_by())
+    drift = version_drift(config.YO_VERSION, built_by(), state.remembered_flake_ref())
     if drift:
         return "%s.\n    %s" % (what, drift[len("yo: ") :])
     return "%s.\n    rebuild it: %s" % (what, rebuild_hint())

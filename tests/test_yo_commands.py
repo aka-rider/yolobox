@@ -2422,6 +2422,8 @@ class StatusRunner:
             ),
             mock.patch.object(yo.LIMA, "running_keepalive_pid", keepalive),
             mock.patch.object(yo.LIMA, "show_status", return_value=listing_failure),
+            # The real $HOME may remember a ref; the scripted box was built plain.
+            mock.patch.object(yo.state, "remembered_flake_ref", return_value=None),
             mock.patch.object(yo.ui, "out", side_effect=fake_out),
             mock.patch.object(yo.ui, "err"),
             mock.patch.object(yo.guest, "guest_helper", helper),

@@ -408,7 +408,9 @@ def status_guest_services(report: Report) -> None:
         "yolobox: host yo %s, box built by %s"
         % (config.YO_VERSION, guest_version or unknown_note)
     )
-    drift = release.version_drift(config.YO_VERSION, guest_version)
+    drift = release.version_drift(
+        config.YO_VERSION, guest_version, state.remembered_flake_ref()
+    )
     if drift:
         report.warn(drift)
 

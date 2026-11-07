@@ -154,35 +154,48 @@ class TestPickProject(FakeHome):
 
 class TestVersionDrift(unittest.TestCase):
     def test_equal_versions_report_no_drift(self):
-        self.assertIsNone(yo.version_drift("1.2.3", "1.2.3"))
+        self.assertIsNone(yo.version_drift("1.2.3", "1.2.3", None))
 
     def test_unknown_guest_reports_no_drift(self):
-        self.assertIsNone(yo.version_drift("1.2.3", None))
+        self.assertIsNone(yo.version_drift("1.2.3", None, None))
 
     def test_different_versions_name_both_and_suggest_bootstrap(self):
-        message = yo.version_drift("1.2.3", "1.1.0")
+        message = yo.version_drift("1.2.3", "1.1.0", None)
         self.assertIsNotNone(message)
         self.assertIn("1.2.3", message)
         self.assertIn("1.1.0", message)
         self.assertIn("yo bootstrap", message)
 
     def test_dev_host_reports_no_drift(self):
-        self.assertIsNone(yo.version_drift("dev", "1.1.0"))
+        self.assertIsNone(yo.version_drift("dev", "1.1.0", None))
 
     def test_a_box_built_by_a_newer_release_is_never_advised_a_downgrade(self):
-        message = yo.version_drift("1.2.3", "1.3.0")
+        message = yo.version_drift("1.2.3", "1.3.0", None)
         self.assertIn("upgrade yo", message)
         self.assertNotIn("rebuild it", message)
 
     def test_versions_compare_as_numbers_not_as_text(self):
         # "1.9.0" > "1.10.0" as text.
-        self.assertIn("rebuild it", yo.version_drift("1.10.0", "1.9.0"))
-        self.assertIn("upgrade yo", yo.version_drift("1.9.0", "1.10.0"))
+        self.assertIn("rebuild it", yo.version_drift("1.10.0", "1.9.0", None))
+        self.assertIn("upgrade yo", yo.version_drift("1.9.0", "1.10.0", None))
+
+    def test_a_box_on_its_own_ref_is_rebuilt_from_that_ref_not_moved(self):
+        message = yo.version_drift("1.2.3", "1.1.0", "github:you/yolobox/x")
+        self.assertEqual(
+            message,
+            "yo: this host's yo is 1.2.3 but the box was built by 1.1.0 from "
+            "github:you/yolobox/x — rebuild it from that ref: "
+            "yo bootstrap --version github:you/yolobox/x",
+        )
+        for guest in ("1.1.0", "1.3.0", "dev", "1.2.3"):
+            with self.subTest(guest=guest):
+                drift = yo.version_drift("1.2.3", guest, "github:you/yolobox/x") or ""
+                self.assertNotIn("rebuild it: yo bootstrap", drift)
 
     def test_a_version_that_cannot_be_ordered_is_advised_the_rebuild(self):
         for guest in ("dev", "1.3", "1.3.0-rc1", "١.٣.٠"):
             with self.subTest(guest=guest):
-                self.assertIn("rebuild it", yo.version_drift("1.2.3", guest))
+                self.assertIn("rebuild it", yo.version_drift("1.2.3", guest, None))
 
 
 if __name__ == "__main__":

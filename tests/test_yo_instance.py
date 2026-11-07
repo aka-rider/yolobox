@@ -993,7 +993,9 @@ class TestRemediesNameTheMachine(FakeHome):
     def test_another_machine_is_named_in_the_remedies(self):
         with as_instance("box2"), mock.patch.object(yo.config, "YO_VERSION", A_RELEASE):
             self.assertEqual(yo.yo_cmd("up"), "yo -m box2 up")
-            self.assertIn("yo -m box2 bootstrap", yo.version_drift(A_RELEASE, "0.9.0"))
+            self.assertIn(
+                "yo -m box2 bootstrap", yo.version_drift(A_RELEASE, "0.9.0", None)
+            )
             self.assertTrue(yo.rebuild_hint().startswith("yo -m box2 ssh "))
 
     def test_the_enter_refusal_names_the_machine(self):
