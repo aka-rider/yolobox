@@ -761,8 +761,13 @@ printf 'reply %s %s [%s]\\n' "$1" "$2" "$body" >> "$FAKE_REPLY_LOG"
             # them all.
             start_new_session=True,
         )
-        self.proc.stdin.write(stdin.encode())
-        self.proc.stdin.close()
+        try:
+            self.proc.stdin.write(stdin.encode())
+            self.proc.stdin.close()
+        except BrokenPipeError:
+            # A helper that refuses to start exits before reading its stdin;
+            # what it said, and its exit code, are what the test then reads.
+            pass
         # communicate() flushes a non-None stdin, which is closed now.
         self.proc.stdin = None
 
