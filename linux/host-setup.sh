@@ -81,6 +81,15 @@ dnf install -y libvirt-daemon-kvm libvirt-client edk2-ovmf passt passt-selinux x
 # version gate and the network step. virtnetworkd is started only so the
 # `default` network can be switched off.
 step "(d) libvirt daemons"
+# The host table is tied to virtqemud (RequiredBy=, step g), and the passt hook
+# is read by it. The monolithic libvirtd would start domains past both, so a
+# host that still runs or enables it is refused, not silently switched over
+# under its running domains.
+for unit in libvirtd.service libvirtd.socket; do
+  if systemctl is-enabled --quiet "$unit" || systemctl is-active --quiet "$unit"; then
+    die "the monolithic $unit is enabled or active; yolobox gates its host table and passt hook on virtqemud, which libvirtd would bypass. Switch the host to the modular daemons first (stop every domain, then: systemctl disable --now libvirtd.service libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket) and run this again"
+  fi
+done
 systemctl enable --now virtqemud.socket virtstoraged.socket virtnetworkd.socket
 
 # The daemon's version counts, not the client's: the daemon starts passt. A daemon
