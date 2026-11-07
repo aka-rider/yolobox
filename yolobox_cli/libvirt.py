@@ -29,6 +29,7 @@ from typing import (
 from . import (
     agent,
     aws,
+    config,
     driver,
     libvirt_host,
     proc,
@@ -40,7 +41,6 @@ from . import (
     unlock,
 )
 from .config import (
-    AGENT_USER,
     FILE_MODE_PRIVATE,
     FILE_MODE_READABLE,
     GIB,
@@ -64,7 +64,9 @@ from .ui import YoError
 # and virsh by name at call time.
 # The 1Password item whose public key is the operator's login, in cidata.
 OPERATOR_KEY_ITEM = "yolobox-operator"
-OPERATOR_ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]*")
+# The check itself lives in config.py, where cli.main() runs it for both drivers.
+OPERATOR_ACCOUNT_RE = config.OPERATOR_ACCOUNT_RE
+operator_account = config.operator_account
 # A box's memory and disk when `yo up` is given no --memory or --disk
 # (domain_size); lima/yolobox.yaml has the same. Its CPUs are default_cpus()
 # in driver.py, which vm_up fills into the size.
@@ -179,19 +181,9 @@ def domain_xml(
     )
 
 
-def operator_account(username: str) -> str:
-    """The guest account the cidata creates for the operator, checked."""
-    if not OPERATOR_ACCOUNT_RE.fullmatch(username):
-        raise YoError(
-            "the host account name %r cannot name the operator's account in the "
-            "box: it must match %s" % (username, OPERATOR_ACCOUNT_RE.pattern)
-        )
-    if username == AGENT_USER:
-        raise YoError(
-            "the host account is named %r, which is the box's agent account; "
-            "the operator needs a different name" % AGENT_USER
-        )
-    return username
+# The check itself lives in config.py, where cli.main() runs it for both drivers.
+OPERATOR_ACCOUNT_RE = config.OPERATOR_ACCOUNT_RE
+operator_account = config.operator_account
 
 
 def public_key_line(blob: bytes) -> str:

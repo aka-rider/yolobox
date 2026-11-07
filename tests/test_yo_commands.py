@@ -523,6 +523,28 @@ class TestMainPreflight(unittest.TestCase):
                             yo.main(["bootstrap", "--version", version])
                 self.assertEqual(caught.exception.code, 2)
 
+    def test_a_host_account_the_box_cannot_name_is_refused_before_the_preflight(
+        self,
+    ):
+        for username, said in (
+            ("Bob", "the host account name 'Bob' cannot name"),
+            ("agent", "which is the box's agent account"),
+            ("", "the host account name '' cannot name"),
+            ("bob\n", "cannot name"),
+        ):
+            with self.subTest(username=username):
+                with (
+                    mock.patch.object(yo.release, "host_user", return_value=username),
+                    mock.patch.object(
+                        yo.proc,
+                        "require_tool",
+                        side_effect=AssertionError("preflight ran"),
+                    ),
+                ):
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.main(["status"])
+                self.assertIn(said, caught.exception.message)
+
     def test_known_command_runs_the_preflight_before_the_command(self):
         def raise_reached(args):
             raise Reached()

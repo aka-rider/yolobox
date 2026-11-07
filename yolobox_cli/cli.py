@@ -474,6 +474,10 @@ def main(argv: Sequence[str]) -> int:
         problem = args.usage_problem(args)
         if problem is not None:
             parser.error(problem)
+        # Refused here, before any tool runs: the name reaches the box's cidata
+        # and its sshd config, and nix/base.nix would refuse it only at the
+        # rebuild, after the box was created.
+        config.operator_account(release.host_user())
         state.driver().require_tool()
         if args.logs_in:
             state.driver().require_login_key()

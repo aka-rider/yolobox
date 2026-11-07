@@ -6,6 +6,8 @@ import re
 import sys
 from pathlib import Path
 
+from .ui import YoError
+
 
 # Rewritten at build time: nix substituteInPlace, Homebrew inreplace.
 YO_VERSION = "dev"
@@ -18,6 +20,11 @@ HOSTNAME_LABEL_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 # The operator's uid inside the guest on every host: lima-init's cidata
 # account, declared in nix/base.nix and checked by yolobox-guest rebuild.
 OPERATOR_GUEST_UID = 501
+# The shape of the operator's account name, which reaches sshd config, tmpfiles
+# rules and shell scripts in the box. nix/base.nix asserts the same pattern at
+# eval time (tests/test_consistency.py keeps the two equal); operator_account()
+# refuses the name on the host first, in cli.main(), for both drivers.
+OPERATOR_ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]*")
 # The word the box's stage-2 sshd appends to its SSH banner (VersionAddendum in
 # nix/base.nix). The initrd's sshd has none, so yo tells the two apart without
 # logging in, and never offers stage 2 a user it rejects (nix/base.md).
@@ -29,6 +36,23 @@ SSH_CONFIG_INCLUDE_LINE = (
     "Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config"
 )
 AGENT_USER = "agent"
+
+
+def operator_account(username: str) -> str:
+    """The guest account the box creates for the operator, checked."""
+    if not OPERATOR_ACCOUNT_RE.fullmatch(username):
+        raise YoError(
+            "the host account name %r cannot name the operator's account in the "
+            "box: it must match %s" % (username, OPERATOR_ACCOUNT_RE.pattern)
+        )
+    if username == AGENT_USER:
+        raise YoError(
+            "the host account is named %r, which is the box's agent account; "
+            "the operator needs a different name" % AGENT_USER
+        )
+    return username
+
+
 AGENT_HOME = "/home/agent"
 HELPER = "yolobox-guest"
 HELPER_NO_SUBCOMMAND = 64
