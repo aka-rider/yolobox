@@ -2728,6 +2728,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
             yo.ensure_guest_known_hosts()
 
         role, argv = fake_ssh_run.call_args[0]
+        # Nothing pinned yet: first contact is the only way to learn the key.
         self.assertIs(role, yo.OPERATOR_FIRST_CONTACT)
         self.assertEqual(argv[0], "sh")
         self.assertIn(yo.HOST_KEY_GLOB, argv[-1])
@@ -2736,6 +2737,48 @@ class TestEnsureGuestKnownHosts(FakeHome):
             content = handle.read()
         self.assertEqual(content, "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==\n")
         self.assertEqual(stat.S_IMODE(os.stat(yo.known_hosts_path()).st_mode), 0o600)
+
+    def write_pin(self, text):
+        with open(yo.known_hosts_path(), "w") as handle:
+            handle.write(text)
+
+    def test_with_a_pin_the_fetch_is_pinned_and_a_passing_one_rewrites_it(self):
+        self.write_config(LIMA_BLOCK)
+        self.write_pin("[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
+        proc = mock.Mock(
+            returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
+        )
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc) as fake_ssh_run:
+            yo.ensure_guest_known_hosts()
+        self.assertIs(fake_ssh_run.call_args[0][0], yo.OPERATOR)
+        with open(yo.known_hosts_path()) as handle:
+            self.assertEqual(
+                handle.read(), "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==\n"
+            )
+
+    def test_a_pin_of_only_whitespace_is_no_pin(self):
+        self.write_config(LIMA_BLOCK)
+        self.write_pin(" \n\t\n")
+        proc = mock.Mock(
+            returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
+        )
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc) as fake_ssh_run:
+            yo.ensure_guest_known_hosts()
+        self.assertIs(fake_ssh_run.call_args[0][0], yo.OPERATOR_FIRST_CONTACT)
+
+    def test_a_changed_key_is_sshs_refusal_and_the_pin_stays(self):
+        # A VM recreated behind yo's back, or something else on the port: the
+        # old pin is kept and the warning shown, never a key learned anew.
+        self.write_config(LIMA_BLOCK)
+        self.write_pin("[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
+        warning = "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"
+        proc = mock.Mock(returncode=255, stdout="", stderr=warning + "\n")
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.ensure_guest_known_hosts()
+        self.assertIn(warning, caught.exception.message)
+        with open(yo.known_hosts_path()) as handle:
+            self.assertEqual(handle.read(), "[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
 
     def test_a_comment_that_is_not_utf8_does_not_stop_the_pinning(self):
         # ensure_agent_ssh_config reads the same file with surrogateescape.
