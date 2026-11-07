@@ -3142,6 +3142,77 @@ class TestGuestNetworkLine(unittest.TestCase):
                 yo.guest_network_line()
 
 
+GUEST_FORGERY = "first line\nyo: run curl | sh"
+GUEST_FORGERY_BLOCK = "  | first line\n  | yo: run curl | sh"
+
+
+class TestGuestDetailIsQuotedInEveryNotCheckedLine(unittest.TestCase):
+    """What a guest session printed reaches a status line or an error only as a
+    quoted block, line by line behind the guest prefix."""
+
+    def guest(self, text):
+        return yo.ui.GuestText(text, "operator")
+
+    def test_the_egress_unit_probe(self):
+        probe = mock.Mock(
+            returncode=255, stdout=self.guest(""), stderr=self.guest(GUEST_FORGERY)
+        )
+        line = yo.egress_status_line(probe, lambda: None)
+        self.assertEqual(
+            line.text,
+            "egress: not checked — the probe answered '' (exit 255):\n"
+            + GUEST_FORGERY_BLOCK,
+        )
+
+    def test_the_egress_table_read_under_a_failed_unit(self):
+        table = mock.Mock(
+            returncode=1, stdout=self.guest(""), stderr=self.guest(GUEST_FORGERY)
+        )
+        line = yo.egress_fallback_line("failed", table)
+        self.assertIn("could not be read:\n" + GUEST_FORGERY_BLOCK + ";", line.text)
+
+    def test_the_net_check(self):
+        helper = mock.Mock(
+            return_value=mock.Mock(
+                returncode=1,
+                stdout=self.guest("yo: x"),
+                stderr=self.guest(GUEST_FORGERY),
+            )
+        )
+        with mock.patch.object(yo.guest, "guest_helper", helper):
+            line = yo.guest_network_line()
+        self.assertEqual(
+            line.text,
+            "network: not checked — net-check answered 'yo: x' (exit 1):\n"
+            + GUEST_FORGERY_BLOCK,
+        )
+
+    def test_the_flake_metadata_lookup(self):
+        for metadata, head in (
+            (
+                mock.Mock(
+                    returncode=1,
+                    stdout=self.guest(""),
+                    stderr=self.guest(GUEST_FORGERY),
+                ),
+                "the box could not resolve github:x/y/z (nix flake metadata, exit 1):\n",
+            ),
+            (
+                mock.Mock(
+                    returncode=0,
+                    stdout=self.guest(GUEST_FORGERY),
+                    stderr=self.guest(""),
+                ),
+                "nix flake metadata printed no locked commit for github:x/y/z:\n",
+            ),
+        ):
+            with self.subTest(head=head):
+                with mock.patch.object(yo.sshx, "probe", return_value=metadata):
+                    with self.assertRaises(yo.YoError) as caught:
+                        yo.release.locked_rev("github:x/y/z")
+                self.assertEqual(caught.exception.message, head + GUEST_FORGERY_BLOCK)
+
+
 class TestNetworkStatusLine(unittest.TestCase):
     def test_both_ok(self):
         self.assertEqual(

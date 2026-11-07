@@ -53,6 +53,23 @@ TAILSCALE_PROBE = (
 ) % shlex.quote("NO_TAILSCALE")
 
 
+def answered(what: str, completed: subprocess.CompletedProcess) -> str:
+    """`WHAT answered 'STDOUT' (exit N)`, then its stderr, for a probe that did
+    not answer the question asked. The stdout is one escaped line (ui.shown);
+    the stderr of a guest session a quoted block, a host tool's as it is."""
+    stderr = completed.stderr
+    if isinstance(stderr, ui.GuestText):
+        said = ui.quoted_block(stderr)
+    else:
+        said = stderr.strip()
+    return "%s answered %r (exit %d)%s" % (
+        what,
+        ui.shown(completed.stdout.strip()),
+        completed.returncode,
+        proc.said_suffix(said) if said else "",
+    )
+
+
 def guest_field(text: str, key: str) -> str:
     fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     return fields.get(key, "")
@@ -241,7 +258,7 @@ def egress_fallback_line(
     elif tier is EgressTier.UNREADABLE:
         what = (
             "the egress rules failed to load (%s) and the live table could not be "
-            "read: %s" % (unit, table.stderr.strip() or "no message")
+            "read%s" % (unit, proc.what_it_said(table))
         )
     else:
         what = (
@@ -279,15 +296,7 @@ def egress_status_line(
             True,
         )
     if load_state != "loaded" or not active_state:
-        stderr = probe.stderr.strip()
-        return StatusLine(
-            "egress: not checked — the probe answered %r (exit %d)%s"
-            % (
-                probe.stdout.strip(),
-                probe.returncode,
-                ": " + stderr if stderr else "",
-            )
-        )
+        return StatusLine("egress: not checked — %s" % answered("the probe", probe))
     if active_state == "active":
         return egress_active_line(read_table())
     return egress_fallback_line(active_state, read_table())
@@ -378,14 +387,8 @@ def guest_network_line() -> StatusLine:
         return StatusLine("network: not checked — %s" % e.message)
     check = parse_net_check(completed.stdout)
     if check is None:
-        stderr = completed.stderr.strip()
         return StatusLine(
-            "network: not checked — net-check answered %r (exit %d)%s"
-            % (
-                completed.stdout.strip(),
-                completed.returncode,
-                ": " + stderr if stderr else "",
-            )
+            "network: not checked — %s" % answered("net-check", completed)
         )
     return network_status_line(check)
 

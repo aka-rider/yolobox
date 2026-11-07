@@ -10,7 +10,7 @@ import re
 import shlex
 from typing import List, Optional, Tuple
 
-from . import config, sshx, state, ui
+from . import config, proc, sshx, state, ui
 from .ui import YoError
 
 
@@ -359,15 +359,15 @@ def locked_rev(ref: str) -> str:
     )
     if completed.returncode != 0:
         raise YoError(
-            "the box could not resolve %s (nix flake metadata, exit %d): %s"
-            % (ref, completed.returncode, completed.stderr.strip() or "no output")
+            "the box could not resolve %s (nix flake metadata, exit %d)%s"
+            % (ref, completed.returncode, proc.what_it_said(completed))
         )
     try:
         rev = json.loads(completed.stdout)["locked"]["rev"]
     except (ValueError, KeyError, TypeError):
         raise YoError(
-            "nix flake metadata printed no locked commit for %s: %s"
-            % (ref, completed.stdout.strip()[:200] or "no output")
+            "nix flake metadata printed no locked commit for %s%s"
+            % (ref, proc.what_it_said(completed))
         )
     if not isinstance(rev, str) or not COMMIT_RE.fullmatch(rev):
         raise YoError("nix flake metadata locked %s at %r, not a commit" % (ref, rev))
