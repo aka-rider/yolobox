@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import io
 import os
 import shlex
@@ -11,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, Optional, Sequence
 
 from . import ui
 from .ui import RunTimeout, YoError
@@ -93,6 +94,18 @@ def require_tool(name: str, hint: str) -> str:
     return path
 
 
+# A guest session's captured channel holds at most this many bytes: the agent owns
+# what a session prints, and an unbounded read would let `yes` fill the host's
+# memory. Past it the session is killed and the overflow is a YoError.
+GUEST_CAPTURE_LIMIT = 1 << 20
+# A streamed guest line is read in pieces of at most this many bytes; a longer
+# line continues as the next piece, each shown behind the guest prefix.
+GUEST_LINE_LIMIT = 64 * 1024
+# How much of a streamed session's stderr is kept for the caller: the last lines,
+# where a helper's own "unknown subcommand" marker is.
+STREAMED_STDERR_TAIL_LINES = 200
+
+
 def run(
     argv: Sequence[str],
     *,
@@ -104,7 +117,12 @@ def run(
     binary: bool = False,
     filtered: bool = False,
     timeout: Optional[float] = None,
+    guest: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
+    """Run `argv` to completion. `guest` names the account whose ssh session this
+    is ("operator", or the agent's name), and None means a host tool: a guest
+    session's captured channels are capped at GUEST_CAPTURE_LIMIT bytes and come
+    back as ui.GuestText, which out() and err() refuse until quoted."""
     if filtered:
         unsupported = [
             name
@@ -123,9 +141,17 @@ def run(
             raise ValueError(
                 "run(filtered=True) cannot honour %s" % ", ".join(unsupported)
             )
+        if guest is None:
+            raise ValueError("run(filtered=True) streams a guest session: name it")
+    if guest is not None and timeout is not None:
+        raise ValueError("run(guest=...) caps the session's output and has no timeout")
     try:
         if filtered:
-            completed = run_filtered(argv)
+            completed = run_filtered(argv, guest)
+        elif capture and guest is not None:
+            completed = run_capped(
+                argv, stdin=stdin, env=env, merge_stderr=merge_stderr, guest=guest
+            )
         else:
             completed = subprocess.run(
                 list(argv),
@@ -143,16 +169,12 @@ def run(
         raise RunTimeout(
             "%s did not finish within %d s" % (shlex.join(argv), timeout or 0)
         )
-    if capture:
+    if capture and not filtered:
         completed.stdout = completed.stdout or b""
         if not binary:
-            completed.stdout = completed.stdout.decode("utf-8", "replace").replace(
-                "\r", ""
-            )
+            completed.stdout = decoded(completed.stdout, guest)
         if completed.stderr is not None:
-            completed.stderr = completed.stderr.decode("utf-8", "replace").replace(
-                "\r", ""
-            )
+            completed.stderr = decoded(completed.stderr, guest)
     if check and completed.returncode != 0:
         raise YoError(
             failed_message(
@@ -164,30 +186,106 @@ def run(
     return completed
 
 
+def decoded(raw: bytes, guest: Optional[str]) -> str:
+    text = raw.decode("utf-8", "replace").replace("\r", "")
+    return text if guest is None else ui.GuestText(text, guest)
+
+
+def run_capped(
+    argv: Sequence[str],
+    *,
+    stdin: Optional[bytes],
+    env: Optional[Dict[str, str]],
+    merge_stderr: bool,
+    guest: str,
+) -> subprocess.CompletedProcess:
+    """subprocess.run for a guest session that reads at most GUEST_CAPTURE_LIMIT
+    bytes per channel. A channel that overflows kills the session, and the
+    overflow is a YoError naming the account and the channel."""
+    captured: Dict[str, bytes] = {}
+
+    def read(name: str, source: io.BufferedReader, child: subprocess.Popen) -> None:
+        captured[name] = source.read(GUEST_CAPTURE_LIMIT + 1)
+        if len(captured[name]) > GUEST_CAPTURE_LIMIT:
+            child.kill()
+
+    with subprocess.Popen(
+        list(argv),
+        stdin=subprocess.PIPE if stdin is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+        env=env,
+    ) as child:
+        sources = {"stdout": child.stdout}
+        if not merge_stderr:
+            sources["stderr"] = child.stderr
+        readers = [
+            threading.Thread(target=read, args=(name, source, child))
+            for name, source in sources.items()
+        ]
+        for reader in readers:
+            reader.start()
+        if stdin is not None:
+            try:
+                child.stdin.write(stdin)
+            except BrokenPipeError:
+                pass  # the session ended first; its exit code and stderr say why
+            child.stdin.close()
+        for reader in readers:
+            reader.join()
+    for name, data in captured.items():
+        if len(data) > GUEST_CAPTURE_LIMIT:
+            raise YoError(
+                "the %s's session printed more than %d bytes on %s, so it was "
+                "killed: %s" % (guest, GUEST_CAPTURE_LIMIT, name, shlex.join(argv))
+            )
+    return subprocess.CompletedProcess(
+        list(argv), child.returncode, captured["stdout"], captured.get("stderr")
+    )
+
+
 def failed_message(what: str, code: int, said: Optional[str], where: str = "") -> str:
     """The one spelling of a failed command: `WHAT failed[ WHERE] (exit N)`, then what
-    it said. `said` is None when its output went to the terminal, so nothing follows;
-    an empty one is said to be empty rather than ending the message on a bare colon."""
-    if said is None:
-        suffix = ""
-    elif said:
-        suffix = ": " + said
-    else:
-        suffix = " with no output"
+    it said (said_suffix). `said` is None when its output went to the terminal, so
+    nothing follows."""
     return "%s failed%s (exit %d)%s" % (
         what,
         " " + where if where else "",
         code,
-        suffix,
+        "" if said is None else said_suffix(said),
     )
 
 
+def said_suffix(said: str) -> str:
+    """How a message ends in what a process said: `: SAID` on the same line, a
+    quoted block (a guest session's words) on the lines after a colon, and an empty
+    one said to be empty rather than ending the message on a bare colon."""
+    if said.startswith(ui.GUEST_LINE_PREFIX):
+        return ":\n" + said
+    if said:
+        return ": " + said
+    return " with no output"
+
+
+def what_it_said(completed: subprocess.CompletedProcess) -> str:
+    """said_suffix of failure_detail: for a message that ends in what a failed
+    process said."""
+    return said_suffix(failure_detail(completed))
+
+
 def failure_detail(completed: subprocess.CompletedProcess) -> str:
-    """What a failed process said: its stderr, else its stdout (bytes from a binary run included)."""
+    """What a failed process said, for a message: its stderr, else its stdout (bytes
+    from a binary run included). A guest session's words come back as a quoted
+    block (ui.quoted_block), a host tool's as they are, stripped."""
     stdout = completed.stdout
     if isinstance(stdout, bytes):
         stdout = stdout.decode("utf-8", "replace")
-    return (completed.stderr or stdout or "").strip()
+    said = completed.stderr or stdout or ""
+    if isinstance(completed.stderr, ui.GuestText) or isinstance(
+        completed.stdout, ui.GuestText
+    ):
+        return ui.quoted_block(said)
+    return said.strip()
 
 
 def spawn(argv: Sequence[str], **popen_kwargs: Any) -> subprocess.Popen:
@@ -198,21 +296,39 @@ def spawn(argv: Sequence[str], **popen_kwargs: Any) -> subprocess.Popen:
         raise YoError("%s not found on PATH" % argv[0])
 
 
-def run_filtered(argv: Sequence[str]) -> subprocess.CompletedProcess:
-    # Streams the output live, line by line, through out() and err(), so guest
-    # text (a project path, a Makefile's recipe) is filtered like any other.
-    def pump(source: io.BufferedReader, sink: Callable[[str], None]) -> None:
-        for raw in iter(source.readline, b""):
-            sink(raw.decode("utf-8", "replace").rstrip("\n"))
+def run_filtered(argv: Sequence[str], guest: str) -> subprocess.CompletedProcess:
+    """Stream the guest session's output live, each line behind ui.GUEST_LINE_PREFIX
+    through out() and err(), so a project path or a Makefile recipe it prints is
+    filtered like any other guest text and can never pass for a line of yo's own.
+    A line longer than GUEST_LINE_LIMIT bytes continues as the next. The last
+    STREAMED_STDERR_TAIL_LINES lines of stderr come back as the result's stderr,
+    for a caller that reads a marker in them."""
+    stderr_tail: Deque[str] = collections.deque(maxlen=STREAMED_STDERR_TAIL_LINES)
+
+    def pump(
+        source: io.BufferedReader,
+        sink: Callable[[str], None],
+        keep: Optional[Deque[str]],
+    ) -> None:
+        for raw in iter(lambda: source.readline(GUEST_LINE_LIMIT), b""):
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if keep is not None:
+                keep.append(line)
+            sink(ui.quoted_line(line))
 
     with subprocess.Popen(
         list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE
     ) as child:
-        errors = threading.Thread(target=pump, args=(child.stderr, ui.err))
+        errors = threading.Thread(target=pump, args=(child.stderr, ui.err, stderr_tail))
         errors.start()
-        pump(child.stdout, ui.out)
+        pump(child.stdout, ui.out, None)
         errors.join()
-    return subprocess.CompletedProcess(list(argv), child.returncode)
+    return subprocess.CompletedProcess(
+        list(argv),
+        child.returncode,
+        None,
+        ui.GuestText("\n".join(stderr_tail), guest),
+    )
 
 
 def exec_process(argv: Sequence[str], env: Optional[Dict[str, str]] = None) -> None:

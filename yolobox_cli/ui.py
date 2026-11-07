@@ -19,11 +19,58 @@ class RunTimeout(YoError):
     """A command `run()` gave up on after its timeout."""
 
 
+class GuestText(str):
+    """What a guest process printed on one channel, tagged with the account whose
+    ssh session printed it (`role`: "operator" or the agent's name).
+
+    out() and err() refuse one, so a guest line that reads `yo: ...` never reaches
+    the terminal as yo's own: a message turns it into display text first, with
+    shown() (one escaped line) or quoted_block() (every line prefixed). Slicing,
+    stripping and splitting keep the tag, so a trimmed copy is refused too; text
+    built from it with `%` or `+` is the caller's own, and the caller's duty.
+    """
+
+    role: str
+
+    def __new__(cls, text: str, role: str) -> "GuestText":
+        tagged = str.__new__(cls, text)
+        tagged.role = role
+        return tagged
+
+    def __getitem__(self, key):  # type: ignore[no-untyped-def]
+        return GuestText(str.__getitem__(self, key), self.role)
+
+    def strip(self, chars: Optional[str] = None) -> "GuestText":
+        return GuestText(str.strip(self, chars), self.role)
+
+    def lstrip(self, chars: Optional[str] = None) -> "GuestText":
+        return GuestText(str.lstrip(self, chars), self.role)
+
+    def rstrip(self, chars: Optional[str] = None) -> "GuestText":
+        return GuestText(str.rstrip(self, chars), self.role)
+
+    def split(self, sep: Optional[str] = None, maxsplit: int = -1) -> List["GuestText"]:  # type: ignore[override]
+        return [GuestText(part, self.role) for part in str.split(self, sep, maxsplit)]
+
+    def splitlines(self, keepends: bool = False) -> List["GuestText"]:  # type: ignore[override]
+        return [GuestText(line, self.role) for line in str.splitlines(self, keepends)]
+
+
+def refuse_guest_text(line: str) -> None:
+    if isinstance(line, GuestText):
+        raise TypeError(
+            "text the %s's session printed reached the terminal unquoted: pass it "
+            "through ui.shown() or ui.quoted_block() first" % line.role
+        )
+
+
 def out(line: str = "") -> None:
+    refuse_guest_text(line)
     print(common.sanitize(line), flush=True)
 
 
 def err(line: str = "") -> None:
+    refuse_guest_text(line)
     print(common.sanitize(line), file=sys.stderr, flush=True)
 
 
@@ -37,8 +84,33 @@ def shown(text: str) -> str:
     replace control characters, but only as an unreadable "?".
     """
     if text.isprintable():
-        return text
+        return str(text)
     return repr(text)[1:-1]
+
+
+# Every line a guest printed is shown behind this, so a reader (and a test) tells
+# the box's words from yo's: no guest line can start a `yo:` or `FAIL:` line.
+GUEST_LINE_PREFIX = "  | "
+QUOTED_BLOCK_MAX_LINES = 40
+QUOTED_BLOCK_MAX_CHARS = 4096
+
+
+def quoted_line(line: str) -> str:
+    """One line a guest printed (no newline in it), behind GUEST_LINE_PREFIX."""
+    return GUEST_LINE_PREFIX + common.sanitize(str(line))
+
+
+def quoted_block(text: str) -> str:
+    """`text`, what a guest printed, as lines a message can carry: each prefixed with
+    GUEST_LINE_PREFIX, control bytes replaced, cut after QUOTED_BLOCK_MAX_LINES lines
+    or QUOTED_BLOCK_MAX_CHARS characters with a line that says what the whole held.
+    Empty text (or only whitespace) is an empty block, so `or "no output"` works."""
+    clean = common.sanitize(str(text)).strip()
+    lines = clean.splitlines()
+    block = "\n".join(lines[:QUOTED_BLOCK_MAX_LINES])[:QUOTED_BLOCK_MAX_CHARS]
+    if len(block) < len(clean):
+        block += "\n[cut: %d lines, %d characters in all]" % (len(lines), len(clean))
+    return "\n".join(quoted_line(line) for line in block.splitlines())
 
 
 def os_error_reason(failure: OSError) -> str:

@@ -42,12 +42,8 @@ def ensure_guest_known_hosts() -> None:
     if completed.returncode != 0:
         raise YoError(
             "could not fetch the guest's ssh host keys (%s) to pin them for the %r ssh "
-            "alias: %s"
-            % (
-                HOST_KEY_GLOB,
-                state.box.herdr_alias,
-                proc.failure_detail(completed),
-            )
+            "alias%s"
+            % (HOST_KEY_GLOB, state.box.herdr_alias, proc.what_it_said(completed))
         )
 
     lines = sshconfig.known_hosts_lines(host_block, completed.stdout)
@@ -85,28 +81,27 @@ def guest_helper(
         kwargs["capture"] = False
         kwargs["filtered"] = True
     completed = sshx.probe(role, [HELPER, sub, *args], **kwargs)
-    if completed.returncode not in (127, HELPER_NO_SUBCOMMAND):
-        return completed
-    # A streamed run has no captured stderr to match the marker against, so the
-    # two skews are told apart by asking the box directly instead.
-    if stream:
-        helper_missing = sshx.probe(role, ["command", "-v", HELPER]).returncode != 0
-        no_subcommand = completed.returncode == HELPER_NO_SUBCOMMAND
-    else:
-        stderr = completed.stderr or ""
-        helper_missing = completed.returncode == 127 and "not found" in stderr
-        no_subcommand = (
-            completed.returncode == HELPER_NO_SUBCOMMAND and HELPER_MARKER in stderr
+    # The exit code alone is never read as skew: a subcommand's own child can
+    # exit 127 or 64 too. Both skews need their stderr marker, which a streamed
+    # run also keeps (run_filtered returns stderr's tail).
+    stderr = completed.stderr or ""
+    if completed.returncode == 127 and "not found" in stderr:
+        raise helper_skew_error(role, 127, "the box has no %s" % HELPER)
+    if completed.returncode == HELPER_NO_SUBCOMMAND and HELPER_MARKER in stderr:
+        raise helper_skew_error(
+            role,
+            HELPER_NO_SUBCOMMAND,
+            "the box's %s has no '%s' subcommand" % (HELPER, sub),
         )
-    if helper_missing:
-        raise helper_skew_error("the box has no %s" % HELPER)
-    if no_subcommand:
-        raise helper_skew_error("the box's %s has no '%s' subcommand" % (HELPER, sub))
     return completed
 
 
-def helper_skew_error(what: str) -> YoError:
-    return YoError(release.helper_skew(what))
+def helper_skew_error(role: SshRole, code: int, what: str) -> YoError:
+    """`what` is what the exit code and marker mean on an honest box; the message
+    says whose session said so, since the agent's own session can say anything."""
+    return YoError(
+        release.helper_skew("%s (the %s's session exited %d)" % (what, role.name, code))
+    )
 
 
 def agent_paths(sub: str, args: Sequence[str] = (), *, check: bool = True) -> List[str]:
@@ -116,7 +111,7 @@ def agent_paths(sub: str, args: Sequence[str] = (), *, check: bool = True) -> Li
             guest_helper_check(completed, sub)
         else:
             if completed.stderr:
-                ui.err(completed.stderr.rstrip("\n"))
+                ui.err(ui.quoted_block(completed.stderr))
             ui.err(
                 "yo: the project walk could not read every directory under %s (find exit %d)."
                 % (AGENT_HOME, completed.returncode)
@@ -165,8 +160,8 @@ def guest_root_usage() -> RootUsage:
     completed = sshx.ssh_run(OPERATOR, ROOT_USAGE_PROBE)
     if completed.returncode != 0:
         raise YoError(
-            "cannot read the VM's root usage from df (exit %d): %s"
-            % (completed.returncode, proc.failure_detail(completed))
+            "cannot read the VM's root usage from df (exit %d)%s"
+            % (completed.returncode, proc.what_it_said(completed))
         )
     lines = completed.stdout.splitlines()
     if len(lines) != ROOT_USAGE_LINES:
@@ -180,5 +175,10 @@ def guest_root_usage() -> RootUsage:
     if total is None or used is None:
         raise YoError(
             "cannot read the VM's root usage from df: no sizes in %r" % kib_line
+        )
+    if total == 0:
+        raise YoError(
+            "cannot read the VM's root usage from df: it reports a total of 0 KiB in %r"
+            % kib_line
         )
     return RootUsage(human_line, total, used)

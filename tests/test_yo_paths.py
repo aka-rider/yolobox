@@ -26,7 +26,8 @@ class TestAgentPathsWalkFailures(unittest.TestCase):
         proc = mock.Mock(returncode=255, stdout=b"", stderr="ssh: connect refused\n")
         with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
             with self.assertRaisesRegex(
-                yo.Unreachable, "cannot reach yolobox as agent — is it up\\? yo status"
+                yo.Unreachable,
+                "cannot reach yolobox as agent .*— is it up\\? yo status",
             ) as caught:
                 yo.agent_paths("projects", check=False)
         self.assertNotIn("find exit", caught.exception.message)
@@ -42,7 +43,7 @@ class TestAgentPathsWalkFailures(unittest.TestCase):
                 result = yo.agent_paths("projects", check=False)
         self.assertEqual(result, ["/a"])
         shown = [call.args[0] for call in fake_err.call_args_list]
-        self.assertIn("find: '/x': Permission denied", shown)
+        self.assertIn("  | find: '/x': Permission denied", shown)
 
 
 class TestPickProject(FakeHome):

@@ -282,12 +282,28 @@ def pinned_ref(ref: str, rev: str) -> str:
     return "%s/%s" % (ref.rsplit("/", 1)[0], rev)
 
 
+VERSION_STAMP = "/etc/yolobox/version"
+# What cat says of a path that does not exist; any other failure is not "absent".
+NO_SUCH_FILE = "No such file or directory"
+# How much of a stamp that is not a version is quoted back.
+STAMP_SHOWN_CHARS = 60
+
+
 def built_by() -> Optional[str]:
-    """The yolobox version the box was built by; None for a box that predates the file."""
-    return (
-        sshx.probe(sshx.OPERATOR, ["cat", "/etc/yolobox/version"]).stdout.strip()
-        or None
-    )
+    """The yolobox version the box was built by; None for a box that predates the
+    stamp. A stamp that reads neither X.Y.Z nor dev is shown escaped, so the
+    drift advice can quote it without taking it for a version."""
+    completed = sshx.probe(sshx.OPERATOR, ["cat", VERSION_STAMP])
+    if completed.returncode != 0:
+        if NO_SUCH_FILE in completed.stderr:
+            return None
+        raise sshx.box_failure("cat %s" % VERSION_STAMP, completed)
+    version = completed.stdout.strip()
+    if not version:
+        return None
+    if version == "dev" or VERSION_TRIPLE_RE.fullmatch(version):
+        return str(version)
+    return ui.shown(version[:STAMP_SHOWN_CHARS])
 
 
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")

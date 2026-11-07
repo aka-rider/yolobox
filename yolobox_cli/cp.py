@@ -410,14 +410,14 @@ def list_guest(
     done = sshx.ssh_run(AGENT, ["find", "-H"] + list(starts) + list(tests), binary=True)
     if done.returncode != 0:
         # find's stderr names what it could not read (an unreadable directory
-        # under /tmp); it is guest text, so it is shown as one escaped line.
-        # Its stdout is the listing, never the reason.
+        # under /tmp); it is guest text, so it is shown as a quoted block.
+        # Its stdout is the listing, never the reason, so only stderr is quoted.
         raise YoError(
-            "cannot list %s in the guest (find exited %d): %s"
+            "cannot list %s in the guest (find exited %d)%s"
             % (
                 ", ".join(starts),
                 done.returncode,
-                ui.shown(done.stderr.strip()) or "it said nothing",
+                proc.said_suffix(ui.quoted_block(done.stderr)),
             )
         )
     entries: Dict[str, GuestEntry] = {}

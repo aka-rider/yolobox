@@ -478,13 +478,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     rev = release.locked_rev(ref)
     report.ok("building %s at %s" % (ref, rev))
     rebuild_argv = release.nixos_rebuild_argv("boot", release.host_user(), ref, rev)
-    rebuild = sshx.ssh_run(
-        OPERATOR,
-        rebuild_argv,
-        mux=True,
-        capture=False,
-        inherit_stdin=True,
-    )
+    # Streamed, so every line nix prints shows behind the guest prefix like a gc
+    # tier's; the session has no tty either way, and the exit code is read as is.
+    rebuild = sshx.ssh_run(OPERATOR, rebuild_argv, mux=True, filtered=True)
     if rebuild.returncode == release.REBUILD_BUSY_EXIT:
         raise YoError(release.rebuild_busy_message())
     if rebuild.returncode != 0:

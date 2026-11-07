@@ -1739,7 +1739,7 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
                     )
                 self.assertIn(repr(malformed), caught.exception.message)
 
-    def test_a_find_that_failed_names_what_it_could_not_read_on_one_line(self):
+    def test_a_find_that_failed_quotes_what_it_could_not_read(self):
         # find exits 1 when a directory under a source is unreadable, and its
         # stderr names it; the copy is refused with that name, escaped.
         os.makedirs("dest")
@@ -1752,7 +1752,7 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
             done = guest.ssh_run(role, argv, **kwargs)
             if argv[0] == "find":
                 done.returncode = 1
-                done.stderr = said["stderr"]
+                done.stderr = yo.ui.GuestText(said["stderr"], role.name)
             return done
 
         for stderr in ("find: '/home/agent/proj/lock\x1bed': Permission denied\n", ""):
@@ -1766,12 +1766,15 @@ class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
                     yo.cmd_cp(yo.build_parser().parse_args(["cp", ":~/proj", "dest/"]))
                 message = caught.exception.message
                 self.assertIn("find exited 1", message)
-                self.assertNotIn("\n", message)
                 self.assertNotIn("\x1b", message)
                 if stderr:
-                    self.assertIn("proj/lock\\x1bed': Permission denied", message)
+                    self.assertIn(
+                        yo.ui.quoted_line("find: '/home/agent/proj/lock?ed': Permission denied"),
+                        message,
+                    )
                 else:
-                    self.assertIn("it said nothing", message)
+                    self.assertNotIn("\n", message)
+                    self.assertIn("with no output", message)
         self.assertEqual(self.scp_sources, [])
 
     def test_the_largest_mode_and_mtime_a_filesystem_holds_are_accepted(self):
@@ -3573,8 +3576,8 @@ class TestDisableAwsBrokerFailsLoudly(FakeHome):
             ),
             mock.patch.object(yo.sshconfig, "ensure_agent_ssh_config"),
             mock.patch.object(
-                yo.subprocess,
-                "run",
+                yo.proc,
+                "run_capped",
                 return_value=subprocess.CompletedProcess([], returncode, b"", stderr),
             ),
         ):
@@ -3582,7 +3585,7 @@ class TestDisableAwsBrokerFailsLoudly(FakeHome):
 
     def test_a_guest_config_that_cannot_be_removed_is_an_error_not_a_note(self):
         with self.assertRaisesRegex(
-            yo.aws.BrokerDisableError, "rm -f .*aws-config.*Permission denied"
+            yo.aws.BrokerDisableError, r"rm -f .*aws-config.*\n  \| Permission denied"
         ):
             self.disable_with_ssh_exit(1, b"Permission denied")
 
@@ -3727,6 +3730,11 @@ class TestLimaDestroy(FakeHome):
         self.lines = []
         for patcher in (
             mock.patch.object(yo.subprocess, "run", side_effect=self.subprocess_run),
+            mock.patch.object(
+                yo.proc,
+                "run_capped",
+                side_effect=lambda argv, **kw: self.subprocess_run(argv),
+            ),
             mock.patch.object(yo.shutil, "which", return_value=None),
             mock.patch.object(yo.ui, "out", side_effect=self.lines.append),
         ):
@@ -4542,7 +4550,7 @@ class TestTailscaleStatusLine(unittest.TestCase):
     def test_unparseable_output_surfaces_stderr(self):
         line = yo.tailscale_status_line("", "failed to connect to local tailscaled")
         self.assertIn(
-            "status unreadable: failed to connect to local tailscaled", line.text
+            "status unreadable:\n  | failed to connect to local tailscaled", line.text
         )
         self.assertTrue(line.warning)
 
@@ -4550,7 +4558,7 @@ class TestTailscaleStatusLine(unittest.TestCase):
         for payload in ("null", "[]"):
             with self.subTest(payload=payload):
                 line = yo.tailscale_status_line(payload + "\n", "")
-                self.assertIn("status unreadable: " + payload, line.text)
+                self.assertIn("status unreadable:\n  | " + payload, line.text)
                 self.assertTrue(line.warning)
 
     def test_silent_failure_says_no_output(self):
