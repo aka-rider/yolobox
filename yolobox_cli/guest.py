@@ -176,4 +176,9 @@ def guest_root_usage() -> RootUsage:
         raise YoError(
             "cannot read the VM's root usage from df: no sizes in %r" % kib_line
         )
+    if total == 0:
+        raise YoError(
+            "cannot read the VM's root usage from df: it reports a total of 0 KiB in %r"
+            % kib_line
+        )
     return RootUsage(human_line, total, used)

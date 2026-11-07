@@ -3,6 +3,7 @@ quoted before it reaches the terminal. Nothing here skips: a Python with a
 working `subprocess` is all it needs."""
 
 import io
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -207,6 +208,54 @@ class TestUnreachableNamesTheSessionThatExited255(unittest.TestCase):
         failure = yo.sshx.unreachable(yo.OPERATOR)
         self.assertNotIn("\n", failure.message)
         self.assertIn("the operator's ssh session exited 255", failure.message)
+
+
+class TestRootUsageRefusesAnEmptyDisk(unittest.TestCase):
+    def test_a_total_of_zero_is_an_error_not_a_division(self):
+        answer = subprocess.CompletedProcess(
+            [], 0, "h\nline\nh\n/dev/root 0 0 0 0% /\n", ""
+        )
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=answer):
+            with self.assertRaisesRegex(yo.YoError, "a total of 0 KiB"):
+                yo.guest.guest_root_usage()
+
+
+class TestBuiltByReadsTheStamp(unittest.TestCase):
+    def built_by(self, returncode, stdout="", stderr=""):
+        answer = subprocess.CompletedProcess(
+            [],
+            returncode,
+            yo.ui.GuestText(stdout, "operator"),
+            yo.ui.GuestText(stderr, "operator"),
+        )
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=answer):
+            return yo.release.built_by()
+
+    def test_a_version_or_dev_comes_back_as_it_is(self):
+        for stamp in ("1.9.3", "dev"):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(self.built_by(0, stamp + "\n"), stamp)
+
+    def test_a_missing_or_empty_stamp_is_none(self):
+        self.assertIsNone(
+            self.built_by(
+                1,
+                "",
+                "cat: %s: %s\n" % (yo.release.VERSION_STAMP, yo.release.NO_SUCH_FILE),
+            )
+        )
+        self.assertIsNone(self.built_by(0, "\n"))
+
+    def test_any_other_failure_to_read_it_is_an_error(self):
+        with self.assertRaisesRegex(
+            yo.YoError,
+            "cat /etc/yolobox/version failed on the box \\(exit 1\\):\n  \\| cat: .*Permission denied",
+        ):
+            self.built_by(1, "", "cat: /etc/yolobox/version: Permission denied\n")
+
+    def test_a_stamp_that_is_not_a_version_is_quoted_escaped_and_cut(self):
+        self.assertEqual(self.built_by(0, "1.2\nyo: x"), "1.2\\nyo: x")
+        self.assertEqual(len(self.built_by(0, "v" * 500)), yo.release.STAMP_SHOWN_CHARS)
 
 
 if __name__ == "__main__":
