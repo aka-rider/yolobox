@@ -32,10 +32,25 @@ GETENT_KEY_NOT_FOUND = 2
 
 OPERATOR = SshRole(None, False)
 AGENT = SshRole(AGENT_USER, True)
-# Only for fetching the guest's host keys to pin them (ensure_guest_known_hosts):
-# the pin cannot be checked against itself, and after a VM recreated behind
-# yo's back the old pin would refuse the very connection that replaces it.
+# Only for the first fetch of the guest's host keys (host_key_fetch_role):
+# with nothing pinned yet there is nothing to check a key against.
 OPERATOR_FIRST_CONTACT = SshRole(None, False, pins_host_key=False)
+
+
+def host_key_fetch_role() -> SshRole:
+    """The role ensure_guest_known_hosts fetches the guest's host keys with.
+
+    First contact only while nothing is pinned: a fresh instance, or a file
+    emptied by hand. Once a pin exists the fetch is pinned too, so a key that
+    changed under a kept known_hosts (a VM recreated behind yo's back, or
+    something else holding the port) is ssh's own REMOTE HOST IDENTIFICATION
+    HAS CHANGED refusal, never learned anew and then trusted with the agent
+    forward. The way out of a stale pin is to delete the file (docs/ssh.md).
+    """
+    pin = proc.read_text_file(state.known_hosts_path(), errors="surrogateescape")
+    if pin is None or not pin.strip():
+        return OPERATOR_FIRST_CONTACT
+    return OPERATOR
 
 
 def ssh_options(role: SshRole, mux: bool = False) -> List[str]:
@@ -45,11 +60,11 @@ def ssh_options(role: SshRole, mux: bool = False) -> List[str]:
     if not role.pins_host_key:
         argv += FIRST_CONTACT_OPTS
     if role.user is not None:
-        argv += ["-o", "User=%s" % role.user]
+        argv += sshconfig.ssh_opt("User", role.user)
     if not mux:
-        argv += ["-o", "ControlPath=none"]
+        argv += sshconfig.ssh_opt("ControlPath", "none")
     elif role.own_control_path:
-        argv += ["-o", "ControlPath=%s" % state.agent_control_path()]
+        argv += sshconfig.ssh_opt("ControlPath", state.agent_control_path())
     return argv
 
 
@@ -98,7 +113,7 @@ def agent_master_removals() -> List[Removal]:
 
 
 def forward_agent_opts() -> List[str]:
-    return ["-o", 'ForwardAgent="%s"' % state.driver().op_sock()]
+    return sshconfig.ssh_opt("ForwardAgent", state.driver().op_sock())
 
 
 def ssh_run(
@@ -193,8 +208,14 @@ def account_status() -> Tuple[AccountStatus, str]:
     agent_probe = ssh_run(AGENT, ["true"])
     if agent_probe.returncode == 0:
         return AccountStatus.AGENT, ""
-    if ssh_run(OPERATOR, ["true"]).returncode != 0:
-        return AccountStatus.UNREACHABLE, ui.quoted_block(agent_probe.stderr)
+    # The operator's probe is judged on its own: ssh's 255 is the box out of
+    # reach, with what that session said; `true` failing there is a box that
+    # answers but is broken (an rc file that exits), not one that is away.
+    operator_probe = ssh_run(OPERATOR, ["true"])
+    if operator_probe.returncode == SSH_UNREACHABLE:
+        return AccountStatus.UNREACHABLE, ui.quoted_block(operator_probe.stderr)
+    if operator_probe.returncode != 0:
+        raise box_failure("ssh %s true" % state.box.vm_host, operator_probe)
     lookup = ssh_run(OPERATOR, ["getent", "passwd", AGENT_USER])
     if lookup.returncode == SSH_UNREACHABLE:
         return AccountStatus.UNREACHABLE, ui.quoted_block(lookup.stderr)

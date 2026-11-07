@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, ContextManager, List, Optional, Tuple
 
 from . import aws, guest, proc, sshx, state, ui
 from .config import (
@@ -104,8 +104,11 @@ def ensure_herdr_machine(ssh_config_includes_the_vm: bool) -> None:
     )
     if added.returncode != 0:
         raise YoError(
-            "herdr machine add %s failed: %s"
-            % (state.box.herdr_alias, (added.stderr or added.stdout).strip())
+            proc.failed_message(
+                "herdr machine add %s" % state.box.herdr_alias,
+                added.returncode,
+                proc.failure_detail(added),
+            )
         )
 
 
@@ -167,13 +170,23 @@ def forward_is_up(forward: ReverseForward) -> bool:
     return forward.alive(sshx.ssh_run(AGENT, list(forward.probe)))
 
 
+def heal_lock() -> ContextManager[None]:
+    """This machine's lock around a heal: two yo processes healing one forward
+    would cancel and re-issue it under each other, and one of them would then
+    probe a forward the other had just torn down."""
+    return state.host_state_lock("%s.forwards.lock" % state.box.name, wait=True)
+
+
 def heal_reverse_forward(forward: ReverseForward) -> bool:
-    if forward_is_up(forward):
-        return True
-    proc.run(forward_control_cmd("cancel", forward), check=False)
-    sshx.ssh_run(OPERATOR, ["rm", "-f", forward.guest_path], mux=True, check=True)
-    proc.run(forward_control_cmd("forward", forward), check=True)
-    return forward_is_up(forward)
+    with heal_lock():
+        # sshx.probe: an agent that cannot log in at all (ssh's 255) is not a
+        # dead forward, and tearing a live forward down would not cure it.
+        if forward.alive(sshx.probe(AGENT, list(forward.probe))):
+            return True
+        proc.run(forward_control_cmd("cancel", forward), check=False)
+        sshx.ssh_run(OPERATOR, ["rm", "-f", forward.guest_path], mux=True, check=True)
+        proc.run(forward_control_cmd("forward", forward), check=True)
+        return forward.alive(sshx.probe(AGENT, list(forward.probe)))
 
 
 def heal_forward_collecting_errors(forward: ReverseForward, errors: List[str]) -> None:
@@ -212,10 +225,29 @@ def units_missing_note() -> str:
     )
 
 
+def account_problem(status: AccountStatus, detail: str) -> str:
+    """Why the forwards cannot be healed: the agent account they serve is not
+    there, or cannot log in. Healing anyway would read its failed login as a
+    dead forward and tear a live one down."""
+    if status is AccountStatus.OPERATOR_ONLY:
+        return (
+            "%s has no agent account to forward anything to (it predates the "
+            "operator/agent split); rebuild it: %s"
+            % (state.box.name, state.destroy_then_bootstrap_command())
+        )
+    return (
+        "the agent account's login on %s fails, so its forwards were not checked "
+        "(its shell startup files are the usual cause; inspect them as the "
+        "operator: %s):\n%s" % (state.box.name, state.yo_cmd("ssh"), detail)
+    )
+
+
 def vm_services() -> None:
-    status, _ = sshx.account_status()
+    status, detail = sshx.account_status()
     if status is AccountStatus.UNREACHABLE:
         raise sshx.unreachable(OPERATOR)
+    if status is not AccountStatus.AGENT:
+        raise YoError(account_problem(status, detail))
     if not guest.vm_units_present():
         ui.err("yo: %s" % units_missing_note())
         return

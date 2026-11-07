@@ -105,11 +105,21 @@ def plan_resize(status: str, asked: Size) -> Optional[Resize]:
     return Resize(current, wanted)
 
 
-def vm_up(
-    run_services: bool = True,
-    passphrase: Optional[bytes] = None,
-    size: Size = NO_SIZE,
-) -> Optional[bytes]:
+class Preflight(NamedTuple):
+    """What preflight() found: the box's status, the size a creation gets, and
+    the change a resize makes (None for none)."""
+
+    status: Optional[str]
+    size: Size
+    resize: Optional[Resize]
+
+
+def preflight(size: Size) -> Preflight:
+    """Every check before the box is touched, in one place for a start, an
+    unlock and the stop of a disk grow: the instance's config gaps, the asked
+    size against the box as it is, and the login key. Nothing after it is
+    refused for a reason that was knowable before, so no stop, ceiling edit or
+    1Password prompt is spent on a box that was going to be refused."""
     gaps = state.driver().config_gaps()
     if state.driver().fatal_gaps(gaps):
         raise YoError(state.driver().config_gap_message(gaps))
@@ -127,11 +137,19 @@ def vm_up(
     else:
         # The one place for both drivers, and before the passphrase is asked for.
         resize = plan_resize(status, size)
-    # The one check for every start and unlock: up, both of bootstrap's and
-    # disk-grow's. A cached passphrase needs no 1Password, but the logins that
-    # follow do, and a 1Password that quit or locked since would otherwise
-    # surface as a refused key (docs/linux-host.md#the-operators-key).
+    # A cached passphrase needs no 1Password, but the logins that follow do,
+    # and a 1Password that quit or locked since would otherwise surface as a
+    # refused key (docs/linux-host.md#the-operators-key).
     state.driver().require_login_key()
+    return Preflight(status, size, resize)
+
+
+def vm_up(
+    run_services: bool = True,
+    passphrase: Optional[bytes] = None,
+    size: Size = NO_SIZE,
+) -> Optional[bytes]:
+    status, size, resize = preflight(size)
     if status != RUNNING:
         # Derived before anything changes, so a missing 1Password key leaves the
         # box as it was.
@@ -229,6 +247,7 @@ def asked_size(args: argparse.Namespace) -> Size:
     return Size(args.memory, args.disk, args.cpus)
 
 
+@agent.clearing_passphrases
 def cmd_up(args: argparse.Namespace) -> None:
     size = asked_size(args)
     passphrase = vm_up(size=size)
@@ -441,6 +460,7 @@ def cmd_destroy(args: argparse.Namespace) -> None:
         )
 
 
+@agent.clearing_passphrases
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     report = Report()
     ref = args.version if args.version is not None else release.flake_ref(None)
@@ -620,6 +640,9 @@ def grow_running_disk(
     (grow_to_asked_disk). The caller has checked that the guest can grow
     (require_growable_guest), while the ceiling was still untouched.
     """
+    # The same checks as a start, before the stop: a config gap or a dead
+    # 1Password would otherwise be found by the restart, with the box stopped.
+    preflight(NO_SIZE)
     # Derived before the VM stops, so a missing 1Password key leaves the box running.
     passphrase = passphrase or agent.luks_passphrase()
     # Before the ceiling is edited, the one step that cannot be repeated.
@@ -661,15 +684,19 @@ def grow_to_asked_disk(wanted_gib: int, passphrase: Optional[bytes]) -> None:
 
     A box vm_up just created already has it. A box whose ceiling is already
     `wanted_gib` may have had a grow interrupted after the ceiling moved, so
-    its mapping and filesystem are checked and finished as `yo disk-grow` does.
-    vm_up refused a smaller disk and a running box before this.
+    its mapping and filesystem are checked and finished as `yo disk-grow` does,
+    and the passphrase is asked for only when one of them is short. A smaller
+    disk was refused before this, by preflight() or cmd_disk_grow.
     """
     current_gib = state.driver().current_size().disk_gib
-    if wanted_gib < current_gib:
-        return
     if wanted_gib == current_gib:
         if root_has_room_to_grow(wanted_gib):
             finish_previous_grow(wanted_gib, passphrase or agent.luks_passphrase())
+        else:
+            ui.out(
+                "the root already fills the %dGiB ceiling; nothing left to grow"
+                % wanted_gib
+            )
         return
     try:
         require_growable_guest()
@@ -741,6 +768,7 @@ def finish_previous_grow(ceiling_gib: int, passphrase: bytes) -> None:
     )
 
 
+@agent.clearing_passphrases
 def cmd_disk_grow(args: argparse.Namespace) -> None:
     wanted = args.size
 
@@ -757,14 +785,13 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
             "%s: %s already has a %dGiB ceiling; finishing a previous grow"
             % (state.driver().name, state.box.name, current_gib)
         )
-        # Derived first: the box may be stopped or waiting in its initrd.
-        passphrase = agent.luks_passphrase()
-        vm_up(passphrase=passphrase)
-        finish_previous_grow(wanted, passphrase)
-        return
-
-    require_growable_guest()
-    grow_running_disk(current_gib, wanted)
+    # The box up first, on both paths: the reads that decide what to grow need
+    # its guest, and vm_up's preflight judges the box before anything is spent
+    # on it. A box that is up and unlocked costs no passphrase here; the grow
+    # of a bigger disk derives it before the stop, and heals the services on
+    # the restart.
+    passphrase = vm_up(run_services=wanted == current_gib)
+    grow_to_asked_disk(wanted, passphrase)
 
 
 def guest_device_bytes(device: str) -> int:

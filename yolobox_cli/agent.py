@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import os
 import socket
 import struct
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, TypeVar
 
 from . import state, ui
 from .config import LUKS_KEY_ITEM
@@ -26,6 +27,7 @@ AGENT_REPLY_TIMEOUT = 300
 # Larger than any reply the agent protocol has a reason to send here.
 AGENT_MAX_REPLY_BYTES = 1 << 20
 ED25519_SIGNATURE_LENGTH = 64
+ED25519_KEY_LENGTH = 32
 SSH_AGENT_REQUEST_IDENTITIES = 11
 SSH_AGENT_IDENTITIES_ANSWER = 12
 SSH_AGENT_SIGN_REQUEST = 13
@@ -81,6 +83,108 @@ def key_type(blob: bytes) -> str:
     return kind.decode("utf-8", "replace")
 
 
+def ed25519_public_key(blob: bytes) -> bytes:
+    """The 32 raw key bytes of an ssh-ed25519 public key blob."""
+    _, pos = read_ssh_string(blob, 0)
+    key, _ = read_ssh_string(blob, pos)
+    if len(key) != ED25519_KEY_LENGTH:
+        raise YoError(
+            "the %s key's public half is %d bytes, not %d"
+            % (LUKS_KEY_ITEM, len(key), ED25519_KEY_LENGTH)
+        )
+    return key
+
+
+# RFC 8032 Ed25519, verification only, in the stdlib: the signature the agent
+# returns becomes the one LUKS keyslot, so before it does, it is checked
+# against the listed key's public half. Points are extended coordinates
+# (X, Y, Z, T) with x = X/Z, y = Y/Z, xy = T/Z.
+ED25519_P = 2**255 - 19
+ED25519_ORDER = 2**252 + 27742317777372353535851937790883648493
+ED25519_D = (-121665 * pow(121666, -1, ED25519_P)) % ED25519_P
+Point = Tuple[int, int, int, int]
+
+
+def ed25519_decode_point(encoded: bytes) -> Optional[Point]:
+    """The point a 32-byte little-endian y with the sign of x in its top bit
+    names, or None when no point on the curve has that encoding."""
+    y = int.from_bytes(encoded, "little")
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    if y >= ED25519_P:
+        return None
+    y2 = y * y % ED25519_P
+    u = (y2 - 1) % ED25519_P
+    v = (ED25519_D * y2 + 1) % ED25519_P
+    x = u * pow(v, 3, ED25519_P) % ED25519_P
+    x = x * pow(u * pow(v, 7, ED25519_P), (ED25519_P - 5) // 8, ED25519_P)
+    x %= ED25519_P
+    vx2 = v * x * x % ED25519_P
+    if vx2 == (-u) % ED25519_P:
+        x = x * pow(2, (ED25519_P - 1) // 4, ED25519_P) % ED25519_P
+    elif vx2 != u:
+        return None
+    if x == 0 and sign == 1:
+        return None
+    if x & 1 != sign:
+        x = ED25519_P - x
+    return (x, y, 1, x * y % ED25519_P)
+
+
+def ed25519_point_add(p: Point, q: Point) -> Point:
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % ED25519_P
+    b = (y1 + x1) * (y2 + x2) % ED25519_P
+    c = 2 * t1 * t2 * ED25519_D % ED25519_P
+    d = 2 * z1 * z2 % ED25519_P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % ED25519_P, g * h % ED25519_P, f * g % ED25519_P, e * h % ED25519_P)
+
+
+def ed25519_point_mul(scalar: int, point: Point) -> Point:
+    result: Point = (0, 1, 1, 0)
+    while scalar:
+        if scalar & 1:
+            result = ed25519_point_add(result, point)
+        point = ed25519_point_add(point, point)
+        scalar >>= 1
+    return result
+
+
+def ed25519_points_equal(p: Point, q: Point) -> bool:
+    x1, y1, z1, _ = p
+    x2, y2, z2, _ = q
+    return (x1 * z2 - x2 * z1) % ED25519_P == 0 and (y1 * z2 - y2 * z1) % ED25519_P == 0
+
+
+# The base point: y = 4/5, x the even root (RFC 8032, section 5.1).
+ED25519_BASE = ed25519_decode_point(
+    (4 * pow(5, -1, ED25519_P) % ED25519_P).to_bytes(32, "little")
+)
+assert ED25519_BASE is not None
+
+
+def ed25519_verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
+    """Whether `signature` (64 bytes) is `public_key`'s Ed25519 signature over
+    `message`, as RFC 8032 section 5.1.7 checks it."""
+    if len(public_key) != ED25519_KEY_LENGTH:
+        return False
+    if len(signature) != ED25519_SIGNATURE_LENGTH:
+        return False
+    a = ed25519_decode_point(public_key)
+    r = ed25519_decode_point(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or r is None or s >= ED25519_ORDER:
+        return False
+    digest = hashlib.sha512(signature[:32] + public_key + message).digest()
+    k = int.from_bytes(digest, "little") % ED25519_ORDER
+    return ed25519_points_equal(
+        ed25519_point_mul(s, ED25519_BASE),
+        ed25519_point_add(r, ed25519_point_mul(k, a)),
+    )
+
+
 def derive_luks_passphrase(raw_signature: bytes) -> bytes:
     return (
         hmac.new(raw_signature, LUKS_KDF_INFO, hashlib.sha256)
@@ -133,7 +237,11 @@ def recv_exact(conn: socket.socket, count: int) -> bytes:
 def read_agent_reply(conn: socket.socket) -> bytes:
     (length,) = struct.unpack(">I", recv_exact(conn, 4))
     if length == 0 or length > AGENT_MAX_REPLY_BYTES:
-        raise OSError("implausible reply length %d" % length)
+        # A protocol violation, not a socket that failed: named as the agent's.
+        raise YoError(
+            "the ssh agent announced a reply of %d bytes, which no agent message "
+            "has" % length
+        )
     return recv_exact(conn, length)
 
 
@@ -216,7 +324,36 @@ def ssh_agent_sign(sock_path: str, blob: bytes, data: bytes) -> bytes:
     return parse_agent_signature(reply[1:])
 
 
-def luks_passphrase() -> bytes:
+# The passphrase lives as a mutable bytearray so that the command that derived
+# it can zero it when it ends; a bytes object would stay in memory until the
+# allocator reused it. Every derivation is kept here until forget_passphrases().
+Passphrase = bytearray
+live_passphrases: List[bytearray] = []
+
+Command = TypeVar("Command", bound=Callable[..., None])
+
+
+def forget_passphrases() -> None:
+    for passphrase in live_passphrases:
+        passphrase[:] = bytes(len(passphrase))
+    live_passphrases.clear()
+
+
+def clearing_passphrases(command: Command) -> Command:
+    """The command boundary: every passphrase derived while `command` runs is
+    zeroed when it returns or raises."""
+
+    @functools.wraps(command)
+    def run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        try:
+            return command(*args, **kwargs)
+        finally:
+            forget_passphrases()
+
+    return run  # type: ignore[return-value]
+
+
+def luks_passphrase() -> Passphrase:
     sock_path = state.driver().op_sock()
     if not os.path.exists(sock_path):
         raise YoError(
@@ -228,4 +365,16 @@ def luks_passphrase() -> bytes:
         "yo: 1Password: approve the %s key (Touch ID) to unlock %s's disk"
         % (LUKS_KEY_ITEM, state.box.name)
     )
-    return derive_luks_passphrase(ssh_agent_sign(sock_path, blob, LUKS_SIGN_DATA))
+    signature = ssh_agent_sign(sock_path, blob, LUKS_SIGN_DATA)
+    # The signature is the disk's only keyslot: one the listed key did not
+    # make (an agent that signed with another key, or mangled the reply)
+    # would encrypt a fresh disk under a passphrase nothing can derive again.
+    if not ed25519_verify(ed25519_public_key(blob), LUKS_SIGN_DATA, signature):
+        raise YoError(
+            "the signature the ssh agent returned is not the %s key's over the "
+            "fixed data; the agent signed with another key or corrupted the "
+            "reply, and the disk passphrase is not derived from it" % LUKS_KEY_ITEM
+        )
+    passphrase = bytearray(derive_luks_passphrase(signature))
+    live_passphrases.append(passphrase)
+    return passphrase

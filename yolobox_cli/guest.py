@@ -13,7 +13,7 @@ from .config import (
     HELPER_NO_SUBCOMMAND,
     PROXY_SOCKET_UNITS,
 )
-from .sshx import AGENT, OPERATOR, OPERATOR_FIRST_CONTACT, SshRole
+from .sshx import AGENT, OPERATOR, SshRole
 from .ui import YoError
 
 
@@ -26,9 +26,10 @@ def ensure_guest_known_hosts() -> None:
     # The herdr_alias_block's UserKnownHostsFile has to be pre-populated with
     # the guest's real key: herdr passes -o StrictHostKeyChecking=yes on the
     # command line for every saved machine, which overrides anything weaker
-    # this alias sets, so "no known key yet" can never pass. Fetching it over
-    # the operator's own ssh (already trusted via lima's own config, not this
-    # alias) is what breaks that chicken-and-egg.
+    # this alias sets, so "no known key yet" can never pass. The fetch is
+    # first contact only while nothing is pinned; with a pin it is pinned
+    # itself (sshx.host_key_fetch_role), so a changed key is refused, never
+    # learned anew, and the file is rewritten only after a fetch that passed.
     current = proc.read_text_file(state.ssh_cfg(), errors="surrogateescape")
     if current is None:
         return
@@ -37,7 +38,9 @@ def ensure_guest_known_hosts() -> None:
         return
 
     completed = sshx.ssh_run(
-        OPERATOR_FIRST_CONTACT, ["sh", "-c", "cat %s" % HOST_KEY_GLOB], check=False
+        sshx.host_key_fetch_role(),
+        ["sh", "-c", "cat %s" % HOST_KEY_GLOB],
+        check=False,
     )
     if completed.returncode != 0:
         raise YoError(

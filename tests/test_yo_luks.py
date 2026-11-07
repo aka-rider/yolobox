@@ -10,10 +10,35 @@ from unittest import mock
 
 from test_yo import FakeHome, initrd_probe, yo
 
-ED25519_BLOB = yo.ssh_string(b"ssh-ed25519") + yo.ssh_string(b"\x01" * 32)
+# A real Ed25519 key's public half and its signature over LUKS_SIGN_DATA,
+# made once with a reference implementation: luks_passphrase verifies the
+# signature against the listed key before it becomes the disk's passphrase.
+ED25519_PUBLIC_KEY = bytes.fromhex(
+    "ca44a299cb4e18752db50ab77c88d5f5b3808a1181e0b38f8a3b0be3af83a179"
+)
+ED25519_BLOB = yo.ssh_string(b"ssh-ed25519") + yo.ssh_string(ED25519_PUBLIC_KEY)
 OTHER_BLOB = yo.ssh_string(b"ssh-ed25519") + yo.ssh_string(b"\x02" * 32)
 RSA_BLOB = yo.ssh_string(b"ssh-rsa") + yo.ssh_string(b"\x03" * 8)
-RAW_SIGNATURE = bytes(range(64))
+RAW_SIGNATURE = bytes.fromhex(
+    "b2151d9e50e6688a8d851470161db5bcf57255d3e6256eb6a60626f6608cb1b2"
+    "4ab53c39aa938262134010564f993b552d37d3ffe3f8f3367575d559c64f9200"
+)
+
+# RFC 8032, section 7.1, TEST 1 and TEST 2: public key, message, signature.
+RFC_8032_VECTORS = (
+    (
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "",
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+        "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+    ),
+    (
+        "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "72",
+        "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+        "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+    ),
+)
 
 
 def identities_answer(pairs):
@@ -85,6 +110,52 @@ class TestParseAgentMessages(unittest.TestCase):
             yo.YoError, "the ssh agent sent a truncated message"
         ):
             yo.parse_agent_signature(b"")
+
+
+class TestEd25519Verify(unittest.TestCase):
+    def test_the_rfc_8032_vectors_verify(self):
+        for public_key, message, signature in RFC_8032_VECTORS:
+            with self.subTest(public_key=public_key):
+                self.assertTrue(
+                    yo.ed25519_verify(
+                        bytes.fromhex(public_key),
+                        bytes.fromhex(message),
+                        bytes.fromhex(signature),
+                    )
+                )
+
+    def test_a_signature_over_other_data_or_by_another_key_is_refused(self):
+        public_key, message, signature = (bytes.fromhex(v) for v in RFC_8032_VECTORS[1])
+        self.assertFalse(yo.ed25519_verify(public_key, b"", signature))
+        self.assertFalse(yo.ed25519_verify(public_key, message + b"\0", signature))
+        other_key = bytes.fromhex(RFC_8032_VECTORS[0][0])
+        self.assertFalse(yo.ed25519_verify(other_key, message, signature))
+
+    def test_every_single_bit_flip_in_the_signature_is_refused(self):
+        public_key, message, signature = (bytes.fromhex(v) for v in RFC_8032_VECTORS[1])
+        for byte in (0, 31, 32, 63):
+            for bit in (0, 7):
+                flipped = bytearray(signature)
+                flipped[byte] ^= 1 << bit
+                with self.subTest(byte=byte, bit=bit):
+                    self.assertFalse(yo.ed25519_verify(public_key, message, flipped))
+
+    def test_malformed_inputs_are_refused_not_errors(self):
+        public_key, message, signature = (bytes.fromhex(v) for v in RFC_8032_VECTORS[1])
+        s_at_the_order = signature[:32] + yo.ED25519_ORDER.to_bytes(32, "little")
+        for key, sig in (
+            (b"", signature),
+            (public_key[:-1], signature),
+            (b"\xff" * 32, signature),  # not a point: y past the field
+            (public_key, b""),
+            (public_key, signature[:-1]),
+            (public_key, signature + b"\0"),
+            (public_key, b"\xff" * 32 + signature[32:]),  # R past the field
+            (public_key, s_at_the_order),
+            (public_key, bytes(64)),
+        ):
+            with self.subTest(key=key.hex(), sig=sig.hex()):
+                self.assertFalse(yo.ed25519_verify(key, message, sig))
 
 
 class TestPickLuksKey(unittest.TestCase):
@@ -200,20 +271,52 @@ class TestSshAgentClient(FakeAgent):
         self.assertIn("run the same yo command again", caught.exception.message)
         self.assertNotIn("yo up", caught.exception.message)
 
-    def test_luks_passphrase_signs_with_the_titled_key(self):
+    def luks_passphrase(self):
         with (
             mock.patch.object(yo.box.driver, "op_sock", return_value=self.sock_path),
             mock.patch.object(yo.ui, "err") as fake_err,
         ):
             passphrase = yo.luks_passphrase()
-        self.assertEqual(passphrase, yo.derive_luks_passphrase(RAW_SIGNATURE))
         self.assertIn("Touch ID", fake_err.call_args[0][0])
+        return passphrase
+
+    def test_luks_passphrase_signs_with_the_titled_key(self):
+        self.assertEqual(
+            self.luks_passphrase(), yo.derive_luks_passphrase(RAW_SIGNATURE)
+        )
+
+    def test_a_signature_the_listed_key_did_not_make_never_becomes_a_passphrase(
+        self,
+    ):
+        # The signature is the disk's only keyslot: one from another key would
+        # encrypt the disk under a passphrase nothing can derive again.
+        self.raw_reply = yo.ssh_string(
+            signature_answer(b"ssh-ed25519", bytes(reversed(RAW_SIGNATURE)))
+        )
+        with mock.patch.object(yo.agent, "ssh_agent_identities") as listing:
+            listing.return_value = [(ED25519_BLOB, "yolobox-disk")]
+            with self.assertRaises(yo.YoError) as caught:
+                self.luks_passphrase()
+        self.assertIn("not the yolobox-disk key's", caught.exception.message)
+
+    def test_the_passphrase_is_zeroed_when_the_command_ends(self):
+        held = []
+
+        @yo.agent.clearing_passphrases
+        def command():
+            held.append(self.luks_passphrase())
+            raise yo.YoError("stopped half-way")
+
+        with self.assertRaises(yo.YoError):
+            command()
+        self.assertEqual(held[0], bytearray(64))
+        self.assertEqual(yo.agent.live_passphrases, [])
 
 
 class TestSshAgentClientFailures(FakeAgent):
     def test_an_empty_reply_is_refused(self):
         self.raw_reply = struct.pack(">I", 0)
-        with self.assertRaisesRegex(yo.YoError, "1Password's SSH agent at"):
+        with self.assertRaisesRegex(yo.YoError, "reply of 0 bytes"):
             yo.ssh_agent_identities(self.sock_path)
 
     def test_a_connection_closed_mid_reply_is_refused(self):
@@ -520,7 +623,7 @@ class TestInitrdState(FakeHome):
 
     def test_an_ssh_that_failed_in_silence_still_gives_a_cause(self):
         reading = self.reading_after(subprocess.CompletedProcess([], 255, "", ""))
-        self.assertIn("no message", reading.cause)
+        self.assertIn("with no output", reading.cause)
 
     def test_output_no_state_matches_is_unknown_and_quoted(self):
         reading = self.reading_after(subprocess.CompletedProcess([], 0, "lizard\n", ""))
@@ -536,19 +639,19 @@ class TestInitrdSshArgv(FakeHome):
 
     def test_takes_host_port_and_key_from_limas_block(self):
         self.write_ssh_config(
-            'Host lima-yolobox\n  Hostname 127.0.0.2\n  Port 61234\n  IdentityFile "/k/user"\n'
+            'Host lima-yolobox\n  Hostname localhost\n  Port 61234\n  IdentityFile "/k/user"\n'
         )
-        argv = yo.initrd_ssh_argv("true")
-        self.assertEqual(argv[-2:], ["127.0.0.2", "true"])
+        argv = yo.initrd_ssh_argv("true", yo.initrd_endpoint())
+        self.assertEqual(argv[-2:], ["localhost", "true"])
         self.assertIn("Port=61234", argv)
         self.assertEqual(argv[argv.index("-i") + 1], "/k/user")
 
     def test_offers_every_key_of_limas_block_in_order(self):
         self.write_ssh_config(
-            'Host lima-yolobox\n  Hostname 127.0.0.2\n  Port 61234\n  IdentityFile "/k/user"\n'
+            'Host lima-yolobox\n  Hostname localhost\n  Port 61234\n  IdentityFile "/k/user"\n'
             '  IdentityFile "/k/second"\n  Port 1\n'
         )
-        argv = yo.initrd_ssh_argv("true")
+        argv = yo.initrd_ssh_argv("true", yo.initrd_endpoint())
         self.assertEqual(
             [argv[i + 1] for i, arg in enumerate(argv) if arg == "-i"],
             ["/k/user", "/k/second"],
@@ -556,7 +659,7 @@ class TestInitrdSshArgv(FakeHome):
         self.assertIn("Port=61234", argv)
 
     def test_falls_back_to_limas_defaults_without_the_file(self):
-        argv = yo.initrd_ssh_argv("true")
+        argv = yo.initrd_ssh_argv("true", yo.initrd_endpoint())
         self.assertEqual(argv[-2:], ["127.0.0.1", "true"])
         self.assertIn("Port=%d" % yo.SSH_LOCAL_PORT, argv)
         self.assertEqual(
@@ -564,21 +667,40 @@ class TestInitrdSshArgv(FakeHome):
         )
 
     def test_logs_in_as_root_unless_told_otherwise(self):
-        self.assertIn("User=root", yo.initrd_ssh_argv("true"))
-        self.assertIn("User=someone", yo.initrd_ssh_argv("true", user="someone"))
+        self.assertIn("User=root", yo.initrd_ssh_argv("true", yo.initrd_endpoint()))
+        self.assertIn(
+            "User=someone",
+            yo.initrd_ssh_argv("true", yo.initrd_endpoint(), user="someone"),
+        )
 
     def test_pins_nothing_and_never_reads_a_config_file(self):
-        argv = yo.initrd_ssh_argv("true")
+        argv = yo.initrd_ssh_argv("true", yo.initrd_endpoint())
         self.assertEqual(argv[argv.index("-F") + 1], "/dev/null")
         self.assertNotIn(yo.ssh_cfg(), argv)
         for index in range(0, len(yo.FIRST_CONTACT_OPTS), 2):
             self.assertIn(yo.FIRST_CONTACT_OPTS[index + 1], argv)
         self.assertIn("BatchMode=yes", argv)
 
+    def test_a_host_that_is_not_this_one_is_refused_naming_the_file(self):
+        # The owner check and Lima's mirror both assume the port is local, so
+        # a block that sends the passphrase elsewhere is refused, not obeyed.
+        os.makedirs(yo.instance_dir())
+        for hostname in ("192.168.5.15", "box.example", "127.0.0.1.1", "lizard"):
+            with self.subTest(hostname=hostname):
+                with open(yo.ssh_cfg(), "w") as handle:
+                    handle.write(
+                        "Host lima-yolobox\n  Hostname %s\n  Port 61234\n"
+                        '  IdentityFile "/k/user"\n' % hostname
+                    )
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.initrd_endpoint()
+                self.assertIn(yo.ssh_cfg(), caught.exception.message)
+                self.assertIn("not a loopback address", caught.exception.message)
+
     def test_an_unreadable_config_is_an_error_not_a_fallback(self):
         os.makedirs(yo.ssh_cfg())
         with self.assertRaisesRegex(yo.YoError, "cannot read"):
-            yo.initrd_ssh_argv("true")
+            yo.initrd_ssh_argv("true", yo.initrd_endpoint())
 
 
 if __name__ == "__main__":

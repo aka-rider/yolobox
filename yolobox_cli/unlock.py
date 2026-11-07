@@ -93,9 +93,23 @@ def classify_initrd_attempt(returncode: int, stderr: str) -> SshOutcome:
     return SshOutcome.ERROR
 
 
-def probe_sshd(user: str) -> Tuple[SshOutcome, str]:
+# Whose session the initrd's text is, for ui.GuestText: root's there is the
+# unlock login, and nothing else on the box answers as root.
+INITRD_SESSION = "initrd root"
+
+
+def session_of(user: str) -> str:
+    """Whose words an unpinned probe as `user` brings back, for ui.GuestText."""
+    return INITRD_SESSION if user == "root" else "operator"
+
+
+def probe_sshd(endpoint: sshconfig.InitrdEndpoint, user: str) -> Tuple[SshOutcome, str]:
     """One `true` over the unpinned initrd channel as `user`, and ssh's stderr."""
-    completed = proc.run(sshconfig.initrd_ssh_argv("true", user=user), stdin=b"")
+    completed = proc.run(
+        sshconfig.initrd_ssh_argv("true", endpoint, user=user),
+        stdin=b"",
+        guest=session_of(user),
+    )
     if completed.returncode == 0:
         return SshOutcome.ANSWERED, completed.stderr
     return (
@@ -104,12 +118,38 @@ def probe_sshd(user: str) -> Tuple[SshOutcome, str]:
     )
 
 
-def sshd_answers(user: str) -> SshOutcome:
-    return probe_sshd(user)[0]
+def sshd_answers(endpoint: sshconfig.InitrdEndpoint, user: str) -> SshOutcome:
+    return probe_sshd(endpoint, user)[0]
 
 
-def stage2_up() -> bool:
-    return sshd_answers(release.host_user()) is SshOutcome.ANSWERED
+def stage2_up(endpoint: sshconfig.InitrdEndpoint) -> bool:
+    return sshd_answers(endpoint, release.host_user()) is SshOutcome.ANSWERED
+
+
+class Endpoint(enum.Enum):
+    """Which sshd the box's port offers, read from its banner before any login.
+
+    The one classifier every login as root, and every passphrase, is gated on:
+    both go only to an INITRD. Root is an invalid user on stage 2, which
+    OpenSSH penalises per source address, and every host connection shares the
+    gateway's (nix/base.md); a passphrase sent to stage 2 is a secret handed
+    to the wrong sshd.
+    """
+
+    NONE = "none"  # no banner came: nothing listens, or nothing answered in time
+    STAGE2 = "stage2"  # the banner carries the mark (VersionAddendum, nix/base.nix)
+    # A banner without the mark: the initrd's, or a stage 2 built before the
+    # mark, which only an operator login tells apart.
+    INITRD = "initrd"
+
+
+def endpoint_kind(endpoint: sshconfig.InitrdEndpoint) -> Endpoint:
+    banner = ssh_banner(endpoint)
+    if not banner:
+        return Endpoint.NONE
+    if STAGE2_SSH_BANNER_MARK in banner.split():
+        return Endpoint.STAGE2
+    return Endpoint.INITRD
 
 
 class BootStage(enum.Enum):
@@ -126,10 +166,10 @@ class BootStage(enum.Enum):
     UNKNOWN = "unknown"
 
 
-def ssh_banner() -> str:
+def ssh_banner(endpoint: sshconfig.InitrdEndpoint) -> str:
     """The identification line the sshd on the box's port sends before any
     login; "" when nothing answers. Reading it authenticates as nobody."""
-    host, port, _ = sshconfig.initrd_endpoint()
+    host, port, _ = endpoint
     timeout = sshconfig.SSH_CONNECT_TIMEOUT_SECONDS
     deadline = time.monotonic() + timeout
     banner = b""
@@ -153,21 +193,23 @@ def ssh_banner() -> str:
 
 
 def boot_stage() -> BootStage:
-    # The one place that tells the two sshds apart. Ask for stage 2 first: a
-    # caller must never run a pinned ssh against the initrd, whose per-boot host
-    # key differs from the pin and makes ssh print REMOTE HOST IDENTIFICATION
-    # HAS CHANGED. Both probes go through initrd_ssh_argv(), which pins nothing.
-    if stage2_up():
-        return BootStage.STAGE2
-    # Stage 2 answered and refused the operator. Logging in there as root
-    # would be an invalid user, which OpenSSH penalises per source address, and
-    # every host connection shares the gateway's (nix/base.md).
-    banner = ssh_banner()
-    if STAGE2_SSH_BANNER_MARK in banner.split():
+    # The one place that tells the two sshds apart, and it reads the banner
+    # before it logs in anywhere: a port that sends none gets no login at all,
+    # and root is offered only off a banner without the mark (Endpoint). Both
+    # probes go through initrd_ssh_argv(), which pins nothing: a pinned ssh
+    # against the initrd's per-boot host key would print REMOTE HOST
+    # IDENTIFICATION HAS CHANGED.
+    endpoint = sshconfig.initrd_endpoint()
+    kind = endpoint_kind(endpoint)
+    if kind is Endpoint.NONE:
         return BootStage.NONE
-    if sshd_answers("root") is SshOutcome.ANSWERED:
+    if stage2_up(endpoint):
+        return BootStage.STAGE2
+    if kind is Endpoint.STAGE2:
+        return BootStage.NONE
+    if sshd_answers(endpoint, "root") is SshOutcome.ANSWERED:
         return BootStage.INITRD
-    return BootStage.UNKNOWN if banner else BootStage.NONE
+    return BootStage.UNKNOWN
 
 
 class InitrdState(enum.Enum):
@@ -292,25 +334,25 @@ def classify_initrd_probe(output: str) -> InitrdState:
 
 
 def initrd_state() -> InitrdReading:
-    completed = proc.run(sshconfig.initrd_ssh_argv(INITRD_PROBE_COMMAND), stdin=b"")
+    completed = proc.run(
+        sshconfig.initrd_ssh_argv(INITRD_PROBE_COMMAND, sshconfig.initrd_endpoint()),
+        stdin=b"",
+        guest=INITRD_SESSION,
+    )
     if completed.returncode != 0:
         return InitrdReading(
             InitrdState.UNKNOWN,
-            "the probe's ssh exited %d: %s"
-            % (completed.returncode, completed.stderr.strip() or "no message"),
+            "the probe's ssh exited %d%s"
+            % (completed.returncode, proc.what_it_said(completed)),
         )
     verdict = classify_initrd_probe(completed.stdout)
     if verdict is InitrdState.UNKNOWN:
         return InitrdReading(
             verdict,
-            "the probe printed %r, which no known initrd state matches"
-            % completed.stdout.strip(),
+            "the probe printed what no known initrd state matches:\n%s"
+            % ui.quoted_block(completed.stdout),
         )
     return InitrdReading(verdict, "")
-
-
-# Whose session the initrd helper's text is, for ui.GuestText.
-INITRD_SESSION = "initrd root"
 
 
 @dataclass(frozen=True)
@@ -339,9 +381,11 @@ def run_initrd_helper(passphrase: bytes) -> HelperRun:
 
         migrated = False
         streamed = False
-        state.driver().verify_initrd_listener(sshconfig.initrd_endpoint().port)
+        # Read once: the listener that is checked is the one ssh then dials.
+        endpoint = sshconfig.initrd_endpoint()
+        state.driver().verify_initrd_listener(endpoint.port)
         helper = proc.spawn(
-            sshconfig.initrd_ssh_argv(INITRD_UNLOCK_HELPER),
+            sshconfig.initrd_ssh_argv(INITRD_UNLOCK_HELPER, endpoint),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -400,7 +444,9 @@ def judge_helper_run(attempt: HelperRun) -> Verdict:
 
 def initrd_root_ssh_command(remote_command: str) -> str:
     """The command yo itself would run, for a printed remedy to paste."""
-    return shlex.join(sshconfig.initrd_ssh_argv(remote_command))
+    return shlex.join(
+        sshconfig.initrd_ssh_argv(remote_command, sshconfig.initrd_endpoint())
+    )
 
 
 def helper_failure_message(attempt: HelperRun) -> str:
@@ -412,8 +458,10 @@ def helper_failure_message(attempt: HelperRun) -> str:
         )
     if code == HELPER_EXIT_MIGRATION_FAILED:
         return (
-            "encrypting the disk failed in the initrd; the box is still in its initrd "
-            "with the plaintext intact. Inspect it as root: %s\n%s"
+            "the in-place encryption failed in the initrd; the box is still in its "
+            "initrd, and the last journal line below says what the disk holds now "
+            "(still plaintext, partly encrypted, or encrypted but not finalized). "
+            "Inspect it as root: %s\n%s"
             % (initrd_root_ssh_command("journalctl -u yolobox-luks-migrate"), stderr)
         )
     if code == HELPER_EXIT_ROOT_MOUNT_FAILED:
@@ -471,9 +519,9 @@ def vm_lost_error(status: Optional[str], waiting_for: str) -> YoError:
 def initrd_timeout_error(key_was_refused: bool) -> YoError:
     if key_was_refused:
         return YoError(
-            "the sshd on 127.0.0.1:%d refused %s's key for root and for %s — if %s "
-            "is in its initrd, reading the key from cidata failed; see "
-            "docs/disk-encryption.md#recognising-failures"
+            "the sshd on 127.0.0.1:%d refused %s's key (root in an initrd, %s on a "
+            "stage 2) — if %s is in its initrd, reading the key from cidata failed; "
+            "see docs/disk-encryption.md#recognising-failures"
             % (
                 state.driver().ssh_port(),
                 state.driver().name,
@@ -505,27 +553,49 @@ def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -
         "yo: waiting for %s's initrd to ask for its disk passphrase" % state.box.name
     )
     while True:
-        attempt = run_initrd_helper(passphrase)
-        migrated_any = migrated_any or attempt.migrated
-        verdict = judge_helper_run(attempt)
-        if verdict in (Verdict.UNLOCKED, Verdict.DROPPED):
-            for line in attempt.stderr.splitlines():
-                ui.err(ui.quoted_line(line))
-        if verdict is Verdict.UNLOCKED:
-            return migrated_any
-        if verdict is Verdict.FAILED:
-            raise YoError(helper_failure_message(attempt))
-        if verdict is Verdict.DROPPED:
-            # Switch-root, or a migration that outlived the connection. A fresh
-            # budget, since the old one may have expired while the session streamed.
-            session_ran = True
-            deadline = time.monotonic() + INITRD_WAIT_SECONDS
-        if verdict in (Verdict.DROPPED, Verdict.REFUSED) and stage2_up():
-            return migrated_any
-        if verdict is Verdict.REFUSED:
-            # A fresh instance's first plain boot writes the operator's key
-            # moments after its sshd starts, so a refusal is retried.
-            refused_since = refused_since or time.monotonic()
+        # The banner decides what this round may do (Endpoint): the helper,
+        # with the passphrase on its stdin as root, runs only against an sshd
+        # without the stage-2 mark. A marked one is asked for the operator and
+        # nothing else, so after a switch-root the new stage 2 never sees root.
+        endpoint = sshconfig.initrd_endpoint()
+        kind = endpoint_kind(endpoint)
+        # An unmarked sshd is asked for the operator first only once a session
+        # ran: switch-root may have landed in a stage 2 built before the mark.
+        operator_asked = kind is Endpoint.STAGE2 or (
+            kind is Endpoint.INITRD and session_ran
+        )
+        if operator_asked:
+            outcome = sshd_answers(endpoint, release.host_user())
+            if outcome is SshOutcome.ANSWERED:
+                return migrated_any
+            if outcome is SshOutcome.REFUSED:
+                # A fresh instance's first plain boot writes the operator's key
+                # moments after its sshd starts, so a refusal is retried.
+                refused_since = refused_since or time.monotonic()
+        if kind is Endpoint.INITRD:
+            attempt = run_initrd_helper(passphrase)
+            migrated_any = migrated_any or attempt.migrated
+            verdict = judge_helper_run(attempt)
+            if verdict in (Verdict.UNLOCKED, Verdict.DROPPED):
+                for line in attempt.stderr.splitlines():
+                    ui.err(ui.quoted_line(line))
+            if verdict is Verdict.UNLOCKED:
+                return migrated_any
+            if verdict is Verdict.FAILED:
+                raise YoError(helper_failure_message(attempt))
+            if verdict is Verdict.DROPPED:
+                # Switch-root, or a migration that outlived the connection. A
+                # fresh budget, since the old one may have expired while the
+                # session streamed.
+                session_ran = True
+                deadline = time.monotonic() + INITRD_WAIT_SECONDS
+            if verdict is Verdict.REFUSED:
+                # Root refused by an unmarked sshd: an initrd without its keys,
+                # or a stage 2 built before the mark, which may admit the
+                # operator by now, or moments from now.
+                if not operator_asked and stage2_up(endpoint):
+                    return migrated_any
+                refused_since = refused_since or time.monotonic()
 
         starter_alive = starter is not None and starter.poll() is None
         if starter is not None and not starter_alive and not session_ran:
@@ -539,7 +609,7 @@ def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -
                     )
                 )
             # Lima's own ssh worked, so this was a plain boot: stage 2 is up.
-            if stage2_up():
+            if stage2_up(endpoint):
                 return migrated_any
         deadline = deadline_after(
             deadline,
@@ -554,9 +624,10 @@ def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -
 
 def wait_for_operator() -> None:
     deadline = time.monotonic() + OPERATOR_WAIT_SECONDS
+    endpoint = sshconfig.initrd_endpoint()
     while True:
         # Bounded by ssh's ConnectTimeout and ServerAliveInterval.
-        outcome, stderr = probe_sshd(release.host_user())
+        outcome, stderr = probe_sshd(endpoint, release.host_user())
         if outcome is SshOutcome.ANSWERED:
             return
         # First the VM: one that went away or paused (the host's OOM killer, a
@@ -568,8 +639,8 @@ def wait_for_operator() -> None:
             # Of no shape a boot explains: ssh failed in a way yo has no name
             # for, or it logged in and `true` failed.
             raise YoError(
-                "ssh to %s as the operator failed: %s"
-                % (state.box.name, stderr.strip() or "no message")
+                "ssh to %s as the operator failed%s"
+                % (state.box.name, proc.said_suffix(ui.quoted_block(stderr)))
             )
         # Nothing listening yet, or a refused key, is retried: a fresh box
         # writes the operator's key moments after its sshd starts.

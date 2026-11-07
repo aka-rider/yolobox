@@ -2611,12 +2611,83 @@ class TestHostKeyPinning(FakeHome):
         self.assert_pinned(self.effective(["ssh", "-F", user_config]))
 
     @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_herdrs_alias_keeps_loopback_verification_against_a_later_host_star(self):
+        # herdr reaches the alias through ~/.ssh/config, where the operator's
+        # own `Host *` may switch verification off for 127.0.0.1.
+        lima = os.path.join(self.home, ".lima", "yolobox")
+        os.makedirs(lima, exist_ok=True)
+        with open(os.path.join(lima, "ssh.config"), "w") as handle:
+            handle.write(LIMA_BLOCK + "  NoHostAuthenticationForLocalhost yes\n")
+        yo.ensure_agent_ssh_config()
+        user_config = os.path.join(self.home, ".ssh", "config")
+        os.makedirs(os.path.dirname(user_config))
+        with open(user_config, "w") as handle:
+            handle.write(
+                "Include %s\nHost *\n  NoHostAuthenticationForLocalhost yes\n"
+                % yo.ssh_cfg()
+            )
+        proc = subprocess.run(
+            ["ssh", "-F", user_config, "-G", yo.box.herdr_alias],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("nohostauthenticationforlocalhost no", proc.stdout.splitlines())
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
     def test_first_contact_overrides_all_three_pinned_keywords(self):
         self.write_lima_config()
         effective = self.effective(["ssh"] + yo.ssh_options(yo.OPERATOR_FIRST_CONTACT))
         self.assertEqual(effective["stricthostkeychecking"], "false")
         self.assertEqual(effective["userknownhostsfile"], "/dev/null")
         self.assertEqual(effective["nohostauthenticationforlocalhost"], "yes")
+
+
+class TestSshOptionValuesSurviveAHomeWithASpace(FakeHome):
+    """Every -o value goes through ssh_opt(): ssh reads the argument as a
+    config line, so an unquoted path with a blank is cut there and ssh exits
+    255, which reads as a box that cannot be reached."""
+
+    def write_lima_config(self):
+        lima = os.path.join(yo.home(), ".lima", "yolobox")
+        os.makedirs(lima, exist_ok=True)
+        with open(os.path.join(lima, "ssh.config"), "w") as handle:
+            handle.write(LIMA_ALIAS_BLOCK)
+
+    def effective(self, argv):
+        completed = subprocess.run(
+            list(argv) + ["-G", yo.box.vm_host],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return dict(line.split(" ", 1) for line in completed.stdout.splitlines())
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_the_agents_control_path_and_the_forwarded_socket_reach_ssh_whole(self):
+        home = os.path.join(self.home, "h o m e")
+        os.makedirs(home)
+        with with_home(home):
+            self.write_lima_config()
+            with mock.patch.object(yo.ui, "err"):
+                argv = ["ssh"] + yo.ssh_options(yo.AGENT, mux=True)
+                argv += yo.sshx.forward_agent_opts()
+            effective = self.effective(argv)
+            self.assertEqual(effective["controlpath"], yo.state.agent_control_path())
+            self.assertEqual(effective["forwardagent"], yo.state.driver().op_sock())
+
+    def test_a_value_with_a_double_quote_is_refused_not_mangled(self):
+        for value in ('"', 'a"b', '"a b"'):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(yo.YoError, "double quote"):
+                    yo.ssh_opt("ControlPath", value)
+
+    def test_a_plain_value_is_not_quoted_and_a_blank_one_is(self):
+        self.assertEqual(yo.ssh_opt("User", "agent"), ["-o", "User=agent"])
+        self.assertEqual(yo.ssh_opt("User", ""), ["-o", "User="])
+        self.assertEqual(
+            yo.ssh_opt("ControlPath", "/a b/c\td"), ["-o", 'ControlPath="/a b/c\td"']
+        )
 
 
 class TestEnsureGuestKnownHosts(FakeHome):
@@ -2658,6 +2729,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
             yo.ensure_guest_known_hosts()
 
         role, argv = fake_ssh_run.call_args[0]
+        # Nothing pinned yet: first contact is the only way to learn the key.
         self.assertIs(role, yo.OPERATOR_FIRST_CONTACT)
         self.assertEqual(argv[0], "sh")
         self.assertIn(yo.HOST_KEY_GLOB, argv[-1])
@@ -2666,6 +2738,48 @@ class TestEnsureGuestKnownHosts(FakeHome):
             content = handle.read()
         self.assertEqual(content, "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==\n")
         self.assertEqual(stat.S_IMODE(os.stat(yo.known_hosts_path()).st_mode), 0o600)
+
+    def write_pin(self, text):
+        with open(yo.known_hosts_path(), "w") as handle:
+            handle.write(text)
+
+    def test_with_a_pin_the_fetch_is_pinned_and_a_passing_one_rewrites_it(self):
+        self.write_config(LIMA_BLOCK)
+        self.write_pin("[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
+        proc = mock.Mock(
+            returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
+        )
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc) as fake_ssh_run:
+            yo.ensure_guest_known_hosts()
+        self.assertIs(fake_ssh_run.call_args[0][0], yo.OPERATOR)
+        with open(yo.known_hosts_path()) as handle:
+            self.assertEqual(
+                handle.read(), "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==\n"
+            )
+
+    def test_a_pin_of_only_whitespace_is_no_pin(self):
+        self.write_config(LIMA_BLOCK)
+        self.write_pin(" \n\t\n")
+        proc = mock.Mock(
+            returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
+        )
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc) as fake_ssh_run:
+            yo.ensure_guest_known_hosts()
+        self.assertIs(fake_ssh_run.call_args[0][0], yo.OPERATOR_FIRST_CONTACT)
+
+    def test_a_changed_key_is_sshs_refusal_and_the_pin_stays(self):
+        # A VM recreated behind yo's back, or something else on the port: the
+        # old pin is kept and the warning shown, never a key learned anew.
+        self.write_config(LIMA_BLOCK)
+        self.write_pin("[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
+        warning = "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"
+        proc = mock.Mock(returncode=255, stdout="", stderr=warning + "\n")
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
+            with self.assertRaises(yo.YoError) as caught:
+                yo.ensure_guest_known_hosts()
+        self.assertIn(warning, caught.exception.message)
+        with open(yo.known_hosts_path()) as handle:
+            self.assertEqual(handle.read(), "[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
 
     def test_a_comment_that_is_not_utf8_does_not_stop_the_pinning(self):
         # ensure_agent_ssh_config reads the same file with surrogateescape.
@@ -4564,6 +4678,9 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
         with (
             mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
             mock.patch.object(yo.lima, "lima_instance_info", return_value=running),
+            mock.patch.object(
+                yo.unlock, "endpoint_kind", return_value=yo.Endpoint.STAGE2
+            ),
             mock.patch.object(yo.unlock, "stage2_up", return_value=True),
             mock.patch.object(yo.sshconfig, "ensure_agent_ssh_config"),
             mock.patch.object(yo.guest, "ensure_guest_known_hosts"),
@@ -4582,6 +4699,49 @@ class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
     def test_no_gaps_prints_nothing_about_lima_config(self):
         fake_err, _ = self.vm_up_on_a_running_box([])
         fake_err.assert_not_called()
+
+
+class TestADiskGrowIsJudgedBeforeItsStop(FakeHome):
+    """grow_running_disk stops the box to edit the ceiling, so what would refuse
+    the restart (a fatal config gap, a dead 1Password) is checked before the
+    stop, as vm_up checks it before a start."""
+
+    def grow(self, gaps, login_failure=None):
+        self.login = mock.Mock(side_effect=login_failure)
+        self.stop = mock.Mock()
+        self.passphrase = mock.Mock(return_value=b"p" * 64)
+        with (
+            mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
+            mock.patch.object(yo.LIMA, "vm_status", return_value="Running"),
+            mock.patch.object(yo.LIMA, "require_login_key", self.login),
+            mock.patch.object(yo.LIMA, "stop", self.stop),
+            mock.patch.object(yo.LIMA, "grow_disk"),
+            mock.patch.object(yo.agent, "luks_passphrase", self.passphrase),
+            mock.patch.object(yo.vm, "root_usage_before_grow"),
+            mock.patch.object(yo.vm, "vm_up"),
+            mock.patch.object(yo.vm, "grow_mapping_and_filesystem"),
+            mock.patch.object(yo.ui, "err"),
+        ):
+            yo.grow_running_disk(100, 200)
+
+    def test_a_fatal_gap_refuses_the_grow_before_the_stop_and_the_prompt(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.grow([yo.lima.GAP_SSH_OVER_VSOCK])
+        self.assertIn("overVsock", caught.exception.message)
+        self.stop.assert_not_called()
+        self.passphrase.assert_not_called()
+
+    def test_a_login_key_that_is_not_on_offer_refuses_before_the_stop(self):
+        with self.assertRaisesRegex(yo.YoError, "1Password is locked"):
+            self.grow([], login_failure=yo.YoError("1Password is locked"))
+        self.stop.assert_not_called()
+        self.passphrase.assert_not_called()
+
+    def test_a_box_that_passes_is_stopped_after_the_key_check_and_the_prompt(self):
+        self.grow([])
+        self.login.assert_called_once_with()
+        self.passphrase.assert_called_once_with()
+        self.stop.assert_called_once_with()
 
 
 class TestHerdrMachineId(unittest.TestCase):
@@ -4957,9 +5117,11 @@ class TestStatusWithVmDown(unittest.TestCase):
             mock.patch.object(yo.LIMA, "config_gaps", lambda: []),
             mock.patch.object(yo.LIMA, "config_notes", lambda: []),
             mock.patch.object(
-                yo.unlock, "sshd_answers", lambda user: yo.SshOutcome.NOT_LISTENING
+                yo.unlock,
+                "sshd_answers",
+                lambda endpoint, user: yo.SshOutcome.NOT_LISTENING,
             ),
-            mock.patch.object(yo.unlock, "ssh_banner", lambda: ""),
+            mock.patch.object(yo.unlock, "ssh_banner", lambda endpoint: ""),
             mock.patch.object(yo.shutil, "which", lambda name: None),
         ):
             with self.assertRaises(yo.YoError) as caught:
@@ -5016,7 +5178,7 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
         port = self.serve(banner)
         asked = []
 
-        def answers(user):
+        def answers(endpoint, user):
             asked.append(user)
             return operator if user != "root" else root
 
@@ -5039,7 +5201,6 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
         for banner in (
             "SSH-2.0-OpenSSH_10.6\r\n",
             "SSH-2.0-OpenSSH_10.6 %s-old\r\n" % yo.STAGE2_SSH_BANNER_MARK,
-            "",
         ):
             with self.subTest(banner=banner):
                 self.assertEqual(
@@ -5053,22 +5214,84 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
             (yo.BootStage.UNKNOWN, ["op", "root"]),
         )
 
-    def test_no_banner_and_no_login_is_nothing_answering(self):
+    def test_an_empty_banner_offers_no_login_at_all(self):
+        # Nothing listening, or an sshd that sent nothing in time: whoever it
+        # is, it was not shown root, whatever a login would have answered.
         for banner in (None, ""):
             with self.subTest(banner=banner):
-                self.assertEqual(
-                    self.boot_stage(banner, root=yo.SshOutcome.NOT_LISTENING),
-                    (yo.BootStage.NONE, ["op", "root"]),
-                )
+                self.assertEqual(self.boot_stage(banner), (yo.BootStage.NONE, []))
 
-    def test_a_port_nothing_listens_on_is_asked_for_root_too(self):
-        self.assertEqual(self.boot_stage(None), (yo.BootStage.INITRD, ["op", "root"]))
-
-    def test_a_stage2_that_admits_the_operator_is_stage2_without_a_banner_read(self):
+    def test_a_stage2_that_admits_the_operator_is_stage2_off_an_unmarked_banner(self):
+        # Built before the mark: the operator's login is what tells it apart.
         self.assertEqual(
-            self.boot_stage(None, operator=yo.SshOutcome.ANSWERED),
+            self.boot_stage(
+                "SSH-2.0-OpenSSH_10.6\r\n", operator=yo.SshOutcome.ANSWERED
+            ),
             (yo.BootStage.STAGE2, ["op"]),
         )
+
+
+class TestUnlockDiskSendsThePassphraseOnlyToAnUnmarkedSshd(unittest.TestCase):
+    """The passphrase goes to root over an unpinned channel, so the banner is
+    read before every helper run: a marked stage 2, the one switch-root lands
+    in, is asked for the operator and nothing else."""
+
+    DROPPED = yo.HelperRun(yo.SSH_UNREACHABLE, "", False, True)
+
+    def run_unlock(self, kinds, operator_answers, helper_runs):
+        kinds = iter(kinds)
+        operator_answers = iter(operator_answers)
+        helper_runs = iter(helper_runs)
+        helper_calls = []
+        driver = mock.Mock()
+        driver.vm_status.return_value = yo.driver.RUNNING
+
+        def helper(passphrase):
+            helper_calls.append(passphrase)
+            return next(helper_runs)
+
+        with (
+            mock.patch.object(yo.sshconfig, "initrd_endpoint", return_value=None),
+            mock.patch.object(yo.unlock, "endpoint_kind", lambda endpoint: next(kinds)),
+            mock.patch.object(
+                yo.unlock,
+                "sshd_answers",
+                lambda endpoint, user: next(operator_answers),
+            ),
+            mock.patch.object(yo.unlock, "run_initrd_helper", helper),
+            mock.patch.object(yo.state, "driver", return_value=driver),
+            mock.patch.object(yo.state, "box", mock.Mock(name="box")),
+            mock.patch.object(yo.ui, "err"),
+            mock.patch.object(yo.time, "sleep"),
+        ):
+            yo.unlock_disk(b"secret")
+        return helper_calls
+
+    def test_after_the_session_dropped_a_marked_stage2_never_sees_the_helper(self):
+        helper_calls = self.run_unlock(
+            kinds=[yo.Endpoint.INITRD, yo.Endpoint.NONE] + [yo.Endpoint.STAGE2] * 2,
+            # The new stage 2 refuses the operator once (its key not written
+            # yet): that round gets no helper either, only the next probe.
+            operator_answers=[yo.SshOutcome.REFUSED, yo.SshOutcome.ANSWERED],
+            helper_runs=[self.DROPPED],
+        )
+        self.assertEqual(helper_calls, [b"secret"])
+
+    def test_a_marked_stage2_that_refuses_the_operator_is_retried_without_root(self):
+        helper_calls = self.run_unlock(
+            kinds=[yo.Endpoint.STAGE2, yo.Endpoint.STAGE2],
+            operator_answers=[yo.SshOutcome.REFUSED, yo.SshOutcome.ANSWERED],
+            helper_runs=[],
+        )
+        self.assertEqual(helper_calls, [])
+
+    def test_nothing_listening_gets_no_helper_and_no_login(self):
+        helper_calls = self.run_unlock(
+            kinds=[yo.Endpoint.NONE, yo.Endpoint.STAGE2],
+            operator_answers=[yo.SshOutcome.ANSWERED],
+            helper_runs=[],
+        )
+        self.assertEqual(helper_calls, [])
 
 
 class TestLimaStopHangOffersTheKillOnlyPastTheInitrd(unittest.TestCase):
@@ -5187,7 +5410,7 @@ class TestSshBannerReadsTheWholeLine(unittest.TestCase):
             "create_connection",
             lambda address, timeout: self.Client(client, received),
         ):
-            return yo.unlock.ssh_banner()
+            return yo.unlock.ssh_banner(yo.sshconfig.InitrdEndpoint("127.0.0.1", 1, ()))
 
     def test_a_line_sent_in_two_segments_is_read_whole(self):
         mark = yo.STAGE2_SSH_BANNER_MARK.encode()
