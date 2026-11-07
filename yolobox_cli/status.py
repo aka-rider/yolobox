@@ -134,10 +134,24 @@ EGRESS_PRIVATE_V4 = "10.0.0.0/8"
 EGRESS_PRIVATE_V6 = "fc00::/7"
 
 
+def rule_words(line: str) -> List[str]:
+    """An nft rule as words: set braces and commas dropped, so an address and a
+    verdict are matched as whole words, never as substrings of another word or
+    of a comment."""
+    return line.replace("{", " ").replace("}", " ").replace(",", " ").split()
+
+
+def rejects(line: str, family: str, network: str) -> bool:
+    words = rule_words(line)
+    return words[:2] == [family, "daddr"] and network in words and "reject" in words
+
+
 def egress_table_holds(listing: str) -> bool:
     # Structural invariants only. lanAllow and tunnelInterfaces boxes add
     # accepts and a postrouting chain, so comparing rule content would raise
-    # a false alarm on exactly those boxes.
+    # a false alarm on exactly those boxes. This catches a table that was
+    # flushed, emptied or replaced by accident; a root that forges one that
+    # passes has already won, so adversaries are not the subject (yo.md).
     lines = [line.strip() for line in listing.splitlines()]
     has_output_hook = any(
         line.startswith("type filter hook output") for line in lines
@@ -149,14 +163,8 @@ def egress_table_holds(listing: str) -> bool:
         and '"tailscale0"' in line
         for line in lines
     )
-    rejects_v4 = any(
-        "ip daddr" in line and EGRESS_PRIVATE_V4 in line and "reject" in line
-        for line in lines
-    )
-    rejects_v6 = any(
-        "ip6 daddr" in line and EGRESS_PRIVATE_V6 in line and "reject" in line
-        for line in lines
-    )
+    rejects_v4 = any(rejects(line, "ip", EGRESS_PRIVATE_V4) for line in lines)
+    rejects_v6 = any(rejects(line, "ip6", EGRESS_PRIVATE_V6) for line in lines)
     return has_output_hook and has_local_accept and rejects_v4 and rejects_v6
 
 

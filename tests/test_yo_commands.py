@@ -3213,6 +3213,22 @@ class TestGuestDetailIsQuotedInEveryNotCheckedLine(unittest.TestCase):
                 self.assertEqual(caught.exception.message, head + GUEST_FORGERY_BLOCK)
 
 
+class TestEgressTableHoldsMatchesWholeWords(unittest.TestCase):
+    def test_a_comment_or_a_longer_address_is_not_the_reject_rule(self):
+        holding = (FIXTURES / "egress.nft").read_text()
+        self.assertTrue(yo.egress_table_holds(holding))
+        for wrong in (
+            (
+                "counter reject with icmpx type admin-prohibited",
+                'counter accept comment "reject"',
+            ),
+            ("10.0.0.0/8,", "110.0.0.0/8,"),
+            ("fc00::/7,", "2fc00::/7,"),
+        ):
+            with self.subTest(wrong=wrong):
+                self.assertFalse(yo.egress_table_holds(holding.replace(*wrong)))
+
+
 class TestNetworkStatusLine(unittest.TestCase):
     def test_both_ok(self):
         self.assertEqual(
