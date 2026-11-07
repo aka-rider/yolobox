@@ -26,12 +26,12 @@
 # agent, root and the agent locked, the agent's groups, /proc hiding every
 # other account's pids from the agent, the 1Password proxy
 # confined, sshd's settings, the tailscale pin, no forwarding, the gateway's
-# ssh port closed to the agent and to its containers, the operator refused
-# to the agent's forwarded 1Password agent (SKIP, and nothing tested, when
-# that agent authorizes no key of the box's), the agent's own
-# authorized_keys ignored, and tmpfiles refusing a symlink of the agent's
-# into /etc. Its probes run as the agent WITHOUT the agent's login shell,
-# since the agent edits that shell's rc files and PATH.
+# ssh port closed to the agent and to its containers, both accounts refused
+# off the gateway to the agent's forwarded 1Password agent (SKIP, and
+# nothing tested, when that agent lists no key), the agent's own
+# authorized_keys ignored by sshd's configuration, and tmpfiles refusing a
+# symlink of the agent's into /etc. Its probes run as the agent WITHOUT the
+# agent's login shell, since the agent edits that shell's rc files and PATH.
 #
 # The compat half proves nothing the agent needs broke: net-check, the kept
 # qdisc, podman, chromium, a nix build, strace -p, the harness binaries, the
@@ -63,6 +63,8 @@ readonly GATEWAY_ADDR=192.168.5.2
 readonly GUEST_ADDR=192.168.5.15
 # What sshd logs when AllowUsers refuses a name (openssh auth.c allowed_user).
 readonly ALLOWUSERS_REFUSAL="not allowed because not listed in AllowUsers"
+# The root-run command sshd reads the agent's keys from (nix/base.nix).
+readonly AGENT_KEYS_COMMAND=/etc/ssh/agent-authorized-keys
 # /proc's mount options: nixpkgs' three defaults, then the two
 # nix/hardening.nix procOptions adds; gid=1 is wheel, the one group that sees
 # every pid.
@@ -74,7 +76,6 @@ SLEEPER_PID=""
 NET_CREATED=""
 PROBE_OUT=""
 WRAPPER_CAPS=""
-PLANTED_KEY_DIR=""
 ZED_STAMP_DIR=""
 EXTRA_NAMES=()
 
@@ -129,9 +130,6 @@ cleanup() {
     if [ -n "${NET_CREATED}" ]; then
         as_agent podman network rm -f "${HK_NET}" >/dev/null ||
             warn "cleanup: could not remove podman network ${HK_NET}"
-    fi
-    if [ -n "${PLANTED_KEY_DIR}" ]; then
-        unplant_agent_key || warn "cleanup: could not remove the planted key from ${AGENT_HOME}/.ssh/authorized_keys"
     fi
     if [ -n "${ZED_STAMP_DIR}" ]; then
         restore_zed || warn "cleanup: ${AGENT_HOME}/.config/zed is NOT restored; move ${AGENT_HOME}/.config/zed.bak back by hand"
@@ -308,31 +306,6 @@ cat "${WORK}/fifo" </dev/null >/dev/null 2>&1 &
 echo \$!
 EOF
     chmod 755 "${WORK}/sleeper.sh"
-
-    # Plants a key of the agent's own in its ~/.ssh/authorized_keys, or takes
-    # it out again. Run as the agent: KEYDIR is the agent's directory, MARKER
-    # the key's comment. A file that was there stays, minus the planted line.
-    cat >"${WORK}/plant-key.sh" <<'EOF'
-set -eu
-keydir=$1 action=$2 marker=$3
-file=~/.ssh/authorized_keys
-case ${action} in
-plant)
-    if [ -e "${file}" ]; then touch "${keydir}/had-authorized-keys"; fi
-    mkdir -p -m 700 ~/.ssh
-    ssh-keygen -q -t ed25519 -N '' -C "${marker}" -f "${keydir}/key"
-    cat "${keydir}/key.pub" >>"${file}"
-    ;;
-unplant)
-    if [ -e "${keydir}/had-authorized-keys" ]; then
-        grep -v -F "${marker}" "${file}" >"${keydir}/kept" || true
-        cat "${keydir}/kept" >"${file}"
-    else
-        rm -f "${file}"
-    fi
-    ;;
-esac
-EOF
 
     stage_zed_swap
 
@@ -771,63 +744,56 @@ sshd_journal_since() {
     sudo -n journalctl -u sshd.service --after-cursor="$1" -q -o cat
 }
 
-# On a Linux host the operator's key is served by the host's 1Password agent,
-# which the agent account reaches through its forwarded socket. So on every box
-# sshd must refuse the operator from every address but the gateway's, and the
-# firewall must stop the agent claiming that address over loopback.
+# Both accounts log in only from the gateway (nix/base.nix AllowUsers), the
+# one address the agent cannot claim off enp0s1. On a Linux host the agent's
+# forwarded 1Password agent serves the operator's key, which is also the key
+# the agent account is authorized with, so from inside the box that key must
+# open nothing: neither account, at loopback or at the guest's own address.
 #
 # A Permission denied alone proves nothing: ssh fails the same way when the
-# forwarded agent offers no key the box authorizes. So the positive control
-# comes first: the same forwarded agent must log the agent account in, whose
-# authorized keys are the operator's (nix/base.nix AuthorizedKeysCommand). When
-# that is refused, the operator probes print a SKIP and test nothing. When it
-# works, each operator probe must be refused, and sshd's journal must say it
-# was AllowUsers that refused (an authorized key with any other outcome is a
-# FAIL). An agent that cannot be reached at all is a FAIL.
+# forwarded agent offers no key the box authorizes, and nothing the box admits
+# is reachable from inside it, so there is no login to use as a positive
+# control. The proof is sshd's own journal: each probe must be refused, and
+# sshd must have logged that AllowUsers refused that name from that address.
+# openssh judges AllowUsers before any key, so any other outcome is a FAIL.
+# The probes carry the forwarded key so that the refusal is of the key that
+# opens the box from the host; with no key forwarded they print a SKIP. An
+# agent that cannot be reached at all is a FAIL.
 #
 # sshd penalises an address that fails authentication (PerSourcePenalties,
 # enforced once the address accumulates 15 s, 5 s per failure), and only the
-# gateway is exempt. So each address below takes at most two failures per run,
-# this check's one and check_agent_authorized_keys_ignored's; a penalised
-# address shows as a connection closed before authentication, not a refusal.
+# gateway is exempt. So each address below takes exactly two failures per
+# run, one per account; a penalised address shows as a connection closed
+# before authentication, not a refusal.
 # $1 is the operator's account name.
-check_operator_login_refused() {
-    local operator=$1 addr out keys keys_status=0 control_status=0 cursor journal
+check_logins_refused_off_gateway() {
+    local operator=$1 user addr out keys keys_status=0 cursor journal
     # ssh-add -L exits 1 when the agent lists no identity and 2 when it cannot
     # reach the agent; only the first is a SKIP.
     keys=$(as_agent_bare "SSH_AUTH_SOCK=${AGENT_AUTH_SOCK}" "${SYSBIN}/ssh-add" -L 2>&1) || keys_status=$?
     case ${keys_status} in
     0) ;;
     1)
-        echo "SKIP: sshd's refusal of ${operator} was NOT tested: the agent's forwarded ssh agent lists no key (ssh-add -L: ${keys}). Connect with an ssh agent forwarded and run this again" >&2
+        echo "SKIP: sshd's refusal of ${operator} and ${AGENT_USER} off the gateway was NOT tested: the agent's forwarded ssh agent lists no key (ssh-add -L: ${keys}). Connect with an ssh agent forwarded and run this again" >&2
         return
         ;;
     *) fail "ssh-add -L exited ${keys_status}: the agent's ssh agent socket is unreachable (${keys})" ;;
     esac
-    out=$(agent_ssh "${AGENT_USER}@127.0.0.1" true 2>&1) || control_status=$?
-    if [ "${control_status}" -ne 0 ]; then
-        case ${out} in
-        *"Permission denied"*)
-            echo "SKIP: sshd's refusal of ${operator} was NOT tested: the agent's forwarded ssh agent lists keys, but none logs the agent account in, so a refusal of ${operator} would prove nothing (${out}). Forward the operator's key and run this again" >&2
-            return
-            ;;
-        *) fail "the agent could not log in as itself at 127.0.0.1 with its forwarded agent (exit ${control_status}): ${out}" ;;
-        esac
-    fi
-    ok "the forwarded agent logs ${AGENT_USER} in at 127.0.0.1, so a refusal of ${operator} with it is sshd's doing"
     cursor=$(sshd_journal_cursor)
-    for addr in 127.0.0.1 "${GUEST_ADDR}"; do
-        if out=$(agent_ssh "${operator}@${addr}" true 2>&1); then
-            fail "the agent logged in as ${operator} at ${addr} with its forwarded agent"
-        fi
-        case ${out} in
-        *"Permission denied"*) ;;
-        *) fail "ssh as ${operator} at ${addr} failed, but not with Permission denied (a penalised address closes the connection instead): ${out}" ;;
-        esac
-        journal=$(sshd_journal_since "${cursor}")
-        grep -qF "User ${operator} from ${addr} ${ALLOWUSERS_REFUSAL}" <<<"${journal}" ||
-            fail "sshd refused ${operator} at ${addr}, but its journal does not say AllowUsers did: ${journal}"
-        ok "sshd refuses ${operator} at ${addr} because of AllowUsers"
+    for user in "${operator}" "${AGENT_USER}"; do
+        for addr in 127.0.0.1 "${GUEST_ADDR}"; do
+            if out=$(agent_ssh "${user}@${addr}" true 2>&1); then
+                fail "the agent logged in as ${user} at ${addr} with its forwarded agent"
+            fi
+            case ${out} in
+            *"Permission denied"*) ;;
+            *) fail "ssh as ${user} at ${addr} failed, but not with Permission denied (a penalised address closes the connection instead): ${out}" ;;
+            esac
+            journal=$(sshd_journal_since "${cursor}")
+            grep -qF "User ${user} from ${addr} ${ALLOWUSERS_REFUSAL}" <<<"${journal}" ||
+                fail "sshd refused ${user} at ${addr}, but its journal does not say AllowUsers did: ${journal}"
+            ok "sshd refuses ${user} at ${addr} because of AllowUsers"
+        done
     done
 }
 
@@ -840,32 +806,25 @@ check_gateway_spoof_dropped() {
     ok "nixos-fw drops packets claiming ${GATEWAY_ADDR} on any interface but enp0s1"
 }
 
-unplant_agent_key() {
-    as_agent_bare "${SYSBIN}/bash" "${WORK}/plant-key.sh" "${PLANTED_KEY_DIR}" unplant "hk-check-$$" || return 1
-    as_agent_bare "${SYSBIN}/rm" -rf "${PLANTED_KEY_DIR}" || return 1
-    PLANTED_KEY_DIR=""
-}
-
 # ~agent/.ssh/authorized_keys is the agent's to write, so sshd must not read
-# it (nix/base.nix: AuthorizedKeysFile none for the agent). The agent plants a
-# key of its own there and must still be refused with it; the control that
-# sshd takes a key at all is check_operator_login_refused's agent login.
+# it: nix/base.nix gives the agent AuthorizedKeysFile none and a root-run
+# AuthorizedKeysCommand that reads the operator's root-owned file. No login
+# from inside the box gets as far as a key, since AllowUsers refuses every
+# address the agent can come from first (check_logins_refused_off_gateway),
+# so a planted key that is refused would prove nothing. The proof is sshd's
+# effective configuration for the agent arriving from the gateway (sshd -T
+# -C), and the command being root's and writable by nobody else.
 check_agent_authorized_keys_ignored() {
-    local out status=0
-    PLANTED_KEY_DIR=$(as_agent_bare "${SYSBIN}/mktemp" -d /tmp/hk-agent-key.XXXXXX) ||
-        fail "could not create a directory as the agent"
-    as_agent_bare "${SYSBIN}/bash" "${WORK}/plant-key.sh" "${PLANTED_KEY_DIR}" plant "hk-check-$$" ||
-        fail "could not plant a key in ${AGENT_HOME}/.ssh/authorized_keys as the agent"
-    out=$(as_agent_bare "${SYSBIN}/ssh" -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o IdentitiesOnly=yes \
-        -o IdentityAgent=none -i "${PLANTED_KEY_DIR}/key" "${AGENT_USER}@127.0.0.1" true 2>&1) || status=$?
-    [ "${status}" -ne 0 ] || fail "the agent logged in with a key it wrote to its own authorized_keys"
-    case ${out} in
-    *"Permission denied"*) ;;
-    *) fail "ssh with the planted key failed, but not with Permission denied: ${out}" ;;
-    esac
-    unplant_agent_key || fail "could not remove the planted key from ${AGENT_HOME}/.ssh/authorized_keys"
-    ok "a key the agent writes to its own authorized_keys does not log it in"
+    local config setting owner_mode
+    config=$(sudo -n sshd -T -C "user=${AGENT_USER},addr=${GATEWAY_ADDR},host=${GATEWAY_ADDR}") ||
+        fail "sshd -T -C for ${AGENT_USER} from ${GATEWAY_ADDR} failed"
+    for setting in "authorizedkeysfile none" "authorizedkeyscommand ${AGENT_KEYS_COMMAND}" "authorizedkeyscommanduser root"; do
+        grep -qx -- "${setting}" <<<"${config}" ||
+            fail "sshd -T for ${AGENT_USER} from ${GATEWAY_ADDR} lacks '${setting}': $(grep '^authorizedkeys' <<<"${config}")"
+    done
+    owner_mode=$(stat -c '%U %a' "${AGENT_KEYS_COMMAND}") || fail "cannot stat ${AGENT_KEYS_COMMAND}"
+    [ "${owner_mode}" = "root 555" ] || fail "${AGENT_KEYS_COMMAND} is ${owner_mode}, want root 555"
+    ok "sshd reads the agent's keys from root's ${AGENT_KEYS_COMMAND} and from no authorized_keys file"
 }
 
 hardening_checks() {
@@ -886,7 +845,7 @@ hardening_checks() {
     check_tailscale_version
     check_gateway_ssh_closed
     check_container_egress
-    check_operator_login_refused "$(id -un)"
+    check_logins_refused_off_gateway "$(id -un)"
     check_gateway_spoof_dropped
     check_agent_authorized_keys_ignored
     check_tmpfiles_refuses_agent_symlink
