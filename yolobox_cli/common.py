@@ -25,16 +25,6 @@ def sanitize(text: str) -> str:
     return CONTROL_BYTES_RE.sub("?", text)
 
 
-def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 class PidExitWatch(NamedTuple):
     wait: Callable[[Optional[float]], bool]
     close: Callable[[], None]
