@@ -534,7 +534,8 @@ def config_lines(gaps_and_notes: Tuple[List[str], List[str]]) -> List[StatusLine
 
 def aws_lines(vm_reachable: bool) -> List[StatusLine]:
     disabled = StatusLine(
-        "aws: disabled (no 'aws' CLI or no SSO profiles in ~/.aws/config)"
+        "aws: disabled (no 'aws' CLI or no SSO profiles in %s)"
+        % state.tilde(aws.aws_config_path())
     )
     if shutil.which("aws") is None:
         return [disabled]

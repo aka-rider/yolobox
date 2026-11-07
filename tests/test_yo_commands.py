@@ -2533,6 +2533,20 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         self.assertIsNotNone(self.raised)
         self.assertEqual(self.raised.code, 1)
 
+    def test_the_disabled_line_names_the_config_file_aws_reads(self):
+        for configured, named in (
+            ("", "~/.aws/config"),
+            ("/etc/aws.ini", "/etc/aws.ini"),
+            ("~/work/aws", "~/work/aws"),
+        ):
+            with self.subTest(configured=configured):
+                with mock.patch.dict(os.environ, {"AWS_CONFIG_FILE": configured}):
+                    outs = self.run_status(aws_which=None)
+                self.assertIn(
+                    "aws: disabled (no 'aws' CLI or no SSO profiles in %s)" % named,
+                    outs,
+                )
+
     def test_a_healthy_broker_names_whose_pid_it_watches(self):
         outs = self.run_status(
             aws_which="/usr/local/bin/aws",
