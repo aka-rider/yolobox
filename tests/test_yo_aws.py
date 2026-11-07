@@ -6,6 +6,10 @@ No tool's absence skips these tests.
 
 import fcntl
 import os
+import shutil
+import stat
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -153,6 +157,98 @@ class TestEnsureAwsBrokerIsOneStep(FakeHome):
         ):
             self.assertFalse(yo.ensure_aws_broker())
         self.assertEqual(self.held_during, {"disable": False})
+
+
+class TestPushConfigCommand(unittest.TestCase):
+    """The guest-side command that installs the rendered AWS config: the whole
+    text or nothing, atomically, with no temp file left on any failure."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.config = os.path.join(self.tmp, "cfg", "aws-config")
+
+    def push(self, text, failing=()):
+        """Run the command under sh with stdin at EOF, the shape of a dropped
+        ssh; `failing` names commands replaced by ones that exit 1."""
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        for name in failing:
+            fake = os.path.join(bindir, name)
+            with open(fake, "w") as handle:
+                handle.write("#!/bin/sh\nexit 1\n")
+            os.chmod(fake, 0o755)
+        return subprocess.run(
+            yo.aws.push_config_argv(self.config, text),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env={**os.environ, "PATH": bindir + ":" + os.environ["PATH"]},
+        )
+
+    def leftovers(self):
+        return sorted(os.listdir(os.path.dirname(self.config)))
+
+    def test_the_text_is_installed_verbatim_whatever_it_holds(self):
+        for text in ["", "a\n", '[profile x]\nregion = %s\n\'"$tmp" \\ \u00e9\n']:
+            with self.subTest(text=text):
+                done = self.push(text)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                with open(self.config) as handle:
+                    self.assertEqual(handle.read(), text)
+                self.assertEqual(self.leftovers(), ["aws-config"])
+
+    def test_a_failed_install_leaves_no_temp_file_and_no_config(self):
+        done = self.push("[profile x]\n", failing=["mv"])
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_failed_install_keeps_the_previous_config(self):
+        self.assertEqual(self.push("old\n").returncode, 0)
+        self.assertNotEqual(self.push("new\n", failing=["mv"]).returncode, 0)
+        with open(self.config) as handle:
+            self.assertEqual(handle.read(), "old\n")
+        self.assertEqual(self.leftovers(), ["aws-config"])
+
+
+class TestBrokerLogGenerations(FakeHome):
+    """A restart keeps the previous broker's log as broker.log.1."""
+
+    def start(self):
+        proc = mock.Mock()
+        proc.stdout.fileno.return_value = 0
+        with (
+            mock.patch.object(yo.subprocess, "Popen", return_value=proc),
+            mock.patch.object(
+                yo.aws,
+                "read_handshake",
+                return_value=yo.aws.Handshake(["READY"], False),
+            ),
+        ):
+            yo.start_aws_broker(555, ["work"])
+
+    def log(self, suffix=""):
+        return os.path.join(yo.state_dir(), "aws-broker", "broker.log" + suffix)
+
+    def test_a_first_start_makes_no_previous_generation(self):
+        self.start()
+        self.assertTrue(os.path.exists(self.log()))
+        self.assertFalse(os.path.exists(self.log(".1")))
+
+    def test_the_previous_log_is_kept_one_generation_and_stays_private(self):
+        os.makedirs(os.path.dirname(self.log()))
+        for run in ["first", "second", "third"]:
+            with open(self.log(), "w") as handle:
+                handle.write(run)
+            os.chmod(self.log(), 0o600)
+            self.start()
+        with open(self.log(".1")) as handle:
+            self.assertEqual(handle.read(), "third")
+        self.assertEqual(os.path.getsize(self.log()), 0)
+        self.assertEqual(stat.S_IMODE(os.stat(self.log(".1")).st_mode), 0o600)
+        self.assertEqual(
+            sorted(os.listdir(os.path.dirname(self.log()))),
+            ["broker.log", "broker.log.1"],
+        )
 
 
 if __name__ == "__main__":
