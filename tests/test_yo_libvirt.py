@@ -3935,20 +3935,6 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         )
         self.assertNotIn("as the operator failed", message)
 
-    def test_an_ssh_failure_of_no_known_shape_after_the_unlock_is_surfaced(self):
-        self.host.helper = lambda: (["unlocked"], 0, "")
-        self.host.sshd = lambda argv: (255, "Bad configuration option: lizard")
-        message = self.up()
-        self.assertIn("ssh to box as the operator failed", message)
-        self.assertIn("lizard", message)
-
-    def test_a_login_whose_command_fails_after_the_unlock_is_surfaced(self):
-        self.host.helper = lambda: (["unlocked"], 0, "")
-        self.host.sshd = lambda argv: (1, "/run/current-system/sw/bin/true: lizard")
-        message = self.up()
-        self.assertIn("ssh to box as the operator failed", message)
-        self.assertIn("true: lizard", message)
-
     def test_virsh_speaks_the_c_locale_whatever_the_users_locale(self):
         with mock.patch.dict(
             os.environ, {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}

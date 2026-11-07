@@ -626,6 +626,17 @@ def unlock_disk(passphrase: bytes, starter: Optional[subprocess.Popen] = None) -
 
 
 def wait_for_operator() -> None:
+    """Wait for stage 2's sshd to accept the operator, up to OPERATOR_WAIT_SECONDS.
+
+    Every outcome but ANSWERED is retried until the deadline. A fresh box writes
+    the operator's key moments after its sshd starts (a refused key), and its
+    first boot starts sshd late: `mkswap` writes the 16 GiB swapfile before it,
+    27 s after switch-root on a 4 GiB box. In that window one probe came back
+    as RAN, and another as ERROR with nothing said, and a wait that raised on
+    either ended a `yo bootstrap` that would have succeeded three seconds later
+    (docs/linux-host.md#the-first-boot-answers-late). Only the VM going away
+    ends the wait early.
+    """
     deadline = time.monotonic() + OPERATOR_WAIT_SECONDS
     endpoint = sshconfig.initrd_endpoint()
     while True:
@@ -638,18 +649,16 @@ def wait_for_operator() -> None:
         status = state.driver().vm_status()
         if status != RUNNING:
             raise vm_lost_error(status, "its sshd to accept the operator")
-        if outcome in (SshOutcome.ERROR, SshOutcome.RAN):
-            # Of no shape a boot explains: ssh failed in a way yo has no name
-            # for, or it logged in and `true` failed.
-            raise YoError(
-                "ssh to %s as the operator failed%s"
-                % (state.box.name, proc.said_suffix(ui.quoted_block(stderr)))
-            )
-        # Nothing listening yet, or a refused key, is retried: a fresh box
-        # writes the operator's key moments after its sshd starts.
         if time.monotonic() > deadline:
             raise YoError(
-                "the disk is unlocked but %s is not reachable as the operator — %s"
-                % (state.box.name, state.yo_cmd("status"))
+                "the disk is unlocked but %s is not reachable as the operator after "
+                "%d s (the last ssh attempt: %s%s) — %s"
+                % (
+                    state.box.name,
+                    OPERATOR_WAIT_SECONDS,
+                    outcome.value,
+                    proc.said_suffix(ui.quoted_block(stderr)),
+                    state.yo_cmd("status"),
+                )
             )
         time.sleep(OPERATOR_POLL_SECONDS)

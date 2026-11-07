@@ -12,6 +12,7 @@ import fcntl
 import http.server
 import importlib.util
 import io
+import itertools
 import json
 import os
 import select
@@ -5245,6 +5246,91 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
             ),
             (yo.BootStage.STAGE2, ["op"]),
         )
+
+
+class TestWaitForOperatorRetriesEveryShapeUntilTheDeadline(unittest.TestCase):
+    """A first boot's sshd listens late (mkswap writes the swapfile first), and
+    in that window a probe came back once as RAN and once as ERROR: both are
+    retried, like a refused key or a closed port, until the deadline."""
+
+    def wait(self, outcomes, status=yo.driver.RUNNING):
+        outcomes = iter(outcomes)
+        clock = [0.0]
+        sleeps = []
+        driver = mock.Mock()
+        driver.vm_status.return_value = status
+        driver.vm_lost_hint.return_value = "hint"
+        box = mock.Mock()
+        box.name = "e2e1"
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+            if len(sleeps) > 2000:
+                raise AssertionError("yo is polling forever")
+
+        def probe(endpoint, user):
+            outcome = next(outcomes)
+            return outcome, "ssh said %s" % outcome.value
+
+        with (
+            mock.patch.object(yo.sshconfig, "initrd_endpoint", return_value=None),
+            mock.patch.object(yo.release, "host_user", return_value="op"),
+            mock.patch.object(yo.unlock, "probe_sshd", probe),
+            mock.patch.object(yo.state, "driver", return_value=driver),
+            mock.patch.object(yo.state, "box", box),
+            mock.patch.object(yo.state, "yo_cmd", lambda *a: "yo -m e2e1 status"),
+            mock.patch.object(yo.time, "sleep", sleep),
+            mock.patch.object(yo.time, "monotonic", lambda: clock[0]),
+        ):
+            yo.unlock.wait_for_operator()
+        return sleeps
+
+    def test_every_failed_shape_is_retried_until_the_operator_answers(self):
+        sleeps = self.wait(
+            [
+                yo.SshOutcome.RAN,
+                yo.SshOutcome.ERROR,
+                yo.SshOutcome.NOT_LISTENING,
+                yo.SshOutcome.REFUSED,
+                yo.SshOutcome.ANSWERED,
+            ]
+        )
+        self.assertEqual(sleeps, [yo.OPERATOR_POLL_SECONDS] * 4)
+
+    def test_a_shape_that_never_changes_is_an_error_at_the_deadline_quoting_it(self):
+        for outcome in (yo.SshOutcome.ERROR, yo.SshOutcome.RAN):
+            with self.subTest(outcome=outcome.value):
+                with self.assertRaises(yo.YoError) as caught:
+                    self.wait(itertools.repeat(outcome))
+                message = caught.exception.message
+                self.assertIn(
+                    "e2e1 is not reachable as the operator after %d s (the last ssh "
+                    "attempt: %s:" % (yo.OPERATOR_WAIT_SECONDS, outcome.value),
+                    message,
+                )
+                self.assertIn("ssh said %s" % outcome.value, message)
+                self.assertIn("yo -m e2e1 status", message)
+
+    def test_the_wait_lasts_the_deadline_and_no_longer(self):
+        probes = []
+
+        def counting():
+            while True:
+                probes.append(1)
+                yield yo.SshOutcome.ERROR
+
+        with self.assertRaises(yo.YoError):
+            self.wait(counting())
+        waited = (len(probes) - 1) * yo.OPERATOR_POLL_SECONDS
+        self.assertGreater(waited, yo.OPERATOR_WAIT_SECONDS)
+        self.assertLessEqual(
+            waited, yo.OPERATOR_WAIT_SECONDS + yo.OPERATOR_POLL_SECONDS
+        )
+
+    def test_a_domain_that_went_away_ends_the_wait_at_once(self):
+        with self.assertRaisesRegex(yo.YoError, "e2e1 is shut off, not Running"):
+            self.wait(itertools.repeat(yo.SshOutcome.ERROR), status="shut off")
 
 
 class TestUnlockDiskSendsThePassphraseOnlyToAnUnmarkedSshd(unittest.TestCase):
