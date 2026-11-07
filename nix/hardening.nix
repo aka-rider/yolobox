@@ -72,9 +72,13 @@ let
   # The one spelling of a capability list that both sides are compared in:
   # unique, byte-sorted, comma separated. "" has no names and stays "".
   sortedCaps = names: lib.concatStringsSep "," (lib.sort lib.lessThan (lib.unique names));
-  expectedWrappers = keptWrappers // lib.mapAttrs
+  # keptWrappers is merged last: an extraWrappers entry under a kept name is
+  # refused by the `shadowed` assertion below, and it must not replace the
+  # kept entry first, or `want` would throw on the missing `source` before
+  # that assertion's message is shown.
+  expectedWrappers = lib.mapAttrs
     (_: caps: if caps == "" then setuidRoot else capRoot (sortedCaps (lib.splitString "," caps)))
-    cfg.extraWrappers;
+    cfg.extraWrappers // keptWrappers;
 
   enabledWrappers = lib.filterAttrs (_: w: w.enable) config.security.wrappers;
   enabledNames = lib.attrNames enabledWrappers;
