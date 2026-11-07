@@ -415,6 +415,6 @@ jobs:
           }
           toplevel 'users.groups.wireshark = {}; users.users.agent.extraGroups = [ "wireshark" ]; yolobox.hardening.extraAgentGroups = [ "wireshark" ];' > /dev/null
           refused 'users.groups.wireshark = {}; users.users.agent.extraGroups = [ "wireshark" ];' 'supplementary groups (wireshark) differ'
-          refused 'users.groups.wireshark = {}; users.groups.wireshark.members = [ "agent" ];' 'supplementary groups (wireshark) differ'
+          refused 'users.groups.wireshark.members = [ "agent" ];' 'supplementary groups (wireshark) differ'
           refused 'yolobox.hardening.extraAgentGroups = [ "wireshark" ];' 'differ from yolobox.hardening.extraAgentGroups (wireshark)'
           refused 'users.users.agent.extraGroups = [ "wheel" ]; yolobox.hardening.extraAgentGroups = [ "wheel" ];' 'The agent is in wheel'
