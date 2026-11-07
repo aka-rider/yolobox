@@ -163,9 +163,12 @@ feed() {
   local name=$1 child rc=0
   shift
   (
+    # The trap is set before the fork: a TERM in the gap would otherwise end
+    # the subshell alone and leave the writer holding the fifo.
+    child=
+    trap 'kill "$child" 2>/dev/null; exit' TERM
     "$@" &
     child=$!
-    trap 'kill "$child" 2>/dev/null; exit' TERM
     wait "$child" || rc=$?
     echo "writer-exited ${name} ${rc}"
   ) > "$fifo" 2>&1 &
