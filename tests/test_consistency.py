@@ -208,6 +208,24 @@ class TestHostLoopbackMirroring(unittest.TestCase):
                 )
                 self.assertLess(denied, range_rule)
 
+    def test_a_listener_in_the_macos_ephemeral_range_is_never_mirrored(self):
+        # Login tools that take an ephemeral port (Claude Code, whose old fixed
+        # port was 54545) must not need a deny-list entry: lima's first matching
+        # TCP rule for such a port is an ignore, so a guest listener there never
+        # reaches the host's 127.0.0.1.
+        for port in (49152, 54545, 65535):
+            with self.subTest(port=port):
+                self.assertTrue(self.first_tcp_rule_for(port).get("ignore"))
+
+    def first_tcp_rule_for(self, port):
+        for rule in self.rules():
+            if "guestSocket" in rule or rule.get("proto") != "tcp":
+                continue
+            first, last = rule.get("guestPortRange", [1, 65535])
+            if first <= port <= last:
+                return rule
+        self.fail("no tcp rule matches port %d" % port)
+
     def test_no_forward_rule_publishes_beyond_the_hosts_loopback(self):
         for rule in self.rules():
             with self.subTest(rule=rule):

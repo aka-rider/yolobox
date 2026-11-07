@@ -51,7 +51,8 @@ MIN_SSH_LOCAL_PORT = MIRRORED_TCP_PORTS[1] + 1
 # Fixed OAuth callback ports inside MIRRORED_TCP_PORTS that are never mirrored:
 # Codex CLI 1455-1457, Databricks 8020, gcloud 8085, Firebase 9005, kubelogin 18000.
 # (kubelogin's 8000 stays mirrored on purpose: it is also the Django and
-# http.server default.)
+# http.server default.) Claude Code needs no entry: its login listens on an
+# ephemeral port, above the mirror (lima/yolobox.md).
 OAUTH_CALLBACK_PORT_RANGES = [
     [1455, 1457],
     [8020, 8020],
