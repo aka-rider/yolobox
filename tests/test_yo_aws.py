@@ -10,10 +10,21 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import types
 import unittest
 from unittest import mock
 
+from test_aws_broker import broker
 from test_yo import FakeHome, healthy, yo
+
+
+def broker_health(pid, watch_pid, allow):
+    """A healthy broker whose /health body is what the broker's own handler
+    answers, so a key the broker renames fails here, not on a Mac."""
+    handler = types.SimpleNamespace(watch_pid=watch_pid, states=dict.fromkeys(allow))
+    with mock.patch.object(broker.os, "getpid", return_value=pid):
+        return healthy(broker.HealthHandler.health(handler))
+
 
 SSO_PROFILE = "[profile %s]\nsso_start_url = https://example.awsapps.com/start\nregion = us-east-1\n"
 
@@ -108,7 +119,7 @@ class TestEnsureAwsBrokerIsOneStep(FakeHome):
     def test_the_allowlist_the_pid_and_the_push_are_read_and_done_under_the_lock(
         self,
     ):
-        stale = healthy({"pid": 111, "watch_pid": 999, "allow": ["work"]})
+        stale = broker_health(pid=111, watch_pid=999, allow=["work"])
         with (
             mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
             mock.patch.object(
@@ -137,7 +148,7 @@ class TestEnsureAwsBrokerIsOneStep(FakeHome):
             mock.patch.object(
                 yo.aws,
                 "aws_broker_health",
-                return_value=healthy({"pid": 111, "watch_pid": 999, "allow": []}),
+                return_value=broker_health(pid=111, watch_pid=999, allow=[]),
             ),
             mock.patch.object(yo.aws, "kill_stale_broker"),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=self.seen("rm")),

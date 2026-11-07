@@ -1631,7 +1631,12 @@ class TestControlSocket(ServedBroker):
         self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
         status, body = self.get("/health", sock=self.ctl)
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["pid"], os.getpid())
+        # The contract yo reads (aws.py): exactly these keys, the allow list as
+        # given, the watched pid as given, the broker's own pid.
+        self.assertEqual(
+            json.loads(body),
+            {"allow": sorted(self.allow), "pid": os.getpid(), "watch_pid": 4242},
+        )
 
     def test_credentials_are_never_served_on_it(self):
         run = self.aws(aws_result(process_json()))
