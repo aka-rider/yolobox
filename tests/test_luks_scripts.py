@@ -10,6 +10,7 @@ did it.
 Tools whose absence skips tests: gawk (the two tests of lima's key program).
 """
 
+import contextlib
 import os
 import select
 import shutil
@@ -586,8 +587,15 @@ printf 'reply %s %s [%s]\\n' "$1" "$2" "$body" >> "$FAKE_REPLY_LOG"
             # them all.
             start_new_session=True,
         )
-        self.proc.stdin.write(stdin.encode())
-        self.proc.stdin.close()
+        # A helper that refuses before it reads its passphrase can have exited
+        # already, and the pipe's read end with it: the write, or the flush
+        # in close(), then raises EPIPE. finish() judges the exit code and
+        # stderr, so that is not a failure here. close() releases the pipe
+        # even when its flush raised.
+        with contextlib.suppress(BrokenPipeError):
+            self.proc.stdin.write(stdin.encode())
+        with contextlib.suppress(BrokenPipeError):
+            self.proc.stdin.close()
         # communicate() flushes a non-None stdin, which is closed now.
         self.proc.stdin = None
 
