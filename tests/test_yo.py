@@ -2879,8 +2879,17 @@ class TestBoxSizeFlags(unittest.TestCase):
     def test_the_smallest_box_and_a_larger_one_are_accepted(self):
         for command in ("up", "bootstrap"):
             with self.subTest(command=command):
-                smallest = self.parse(command, "--memory", "8", "--disk", "40")
-                self.assertEqual((smallest.memory, smallest.disk), (8, 40))
+                smallest = self.parse(
+                    command,
+                    "--memory",
+                    str(yo.MIN_MEMORY_GIB),
+                    "--disk",
+                    str(yo.MIN_DISK_GIB),
+                )
+                self.assertEqual(
+                    (smallest.memory, smallest.disk),
+                    (yo.MIN_MEMORY_GIB, yo.MIN_DISK_GIB),
+                )
                 larger = self.parse(command, "--memory", "24", "--disk", "250")
                 self.assertEqual((larger.memory, larger.disk), (24, 250))
 
@@ -2903,11 +2912,18 @@ class TestBoxSizeFlags(unittest.TestCase):
                     )
 
     def test_a_box_below_the_floor_is_refused_saying_why(self):
-        memory = self.parse_error("up", "--memory", "7")
-        self.assertIn("--memory must be at least 8 GiB, got 7", memory)
+        under = yo.MIN_MEMORY_GIB - 1
+        memory = self.parse_error("up", "--memory", str(under))
+        self.assertIn(
+            "--memory must be at least %d GiB, got %d" % (yo.MIN_MEMORY_GIB, under),
+            memory,
+        )
         self.assertIn("OOM-killed", memory)
-        disk = self.parse_error("bootstrap", "--disk", "39")
-        self.assertIn("--disk must be at least 40 GiB, got 39", disk)
+        under = yo.MIN_DISK_GIB - 1
+        disk = self.parse_error("bootstrap", "--disk", str(under))
+        self.assertIn(
+            "--disk must be at least %d GiB, got %d" % (yo.MIN_DISK_GIB, under), disk
+        )
         self.assertIn("swapfile", disk)
 
     def test_an_abbreviated_flag_is_not_the_flag(self):

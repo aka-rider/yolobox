@@ -1966,16 +1966,19 @@ class TestStatusAndGaps(LibvirtCase):
             self.refusal(memory_gib=8)
 
     def test_a_host_with_no_room_for_the_smallest_box_says_so(self):
-        self.host_memory((self.box.HOST_MEMORY_RESERVE_GIB + 7) << 20)
-        refusal = self.refusal(memory_gib=8)
+        floor = self.box.MIN_MEMORY_GIB
+        under = floor - 1
+        self.host_memory((self.box.HOST_MEMORY_RESERVE_GIB + under) << 20)
+        refusal = self.refusal(memory_gib=floor)
         self.assertIn("other active domains may take 0.0 GiB (none)", refusal)
         self.assertIn(
-            "leaves 7.0 GiB for this box — that is under the 8 GiB a box needs",
+            "leaves %d.0 GiB for this box — that is under the %d GiB a box needs"
+            % (under, floor),
             refusal,
         )
         self.assertNotIn("at most", refusal)
-        self.host.foreign_domain("win", 8 << 20)
-        refusal = self.refusal(memory_gib=8)
+        self.host.foreign_domain("win", under << 20)
+        refusal = self.refusal(memory_gib=floor)
         self.assertIn("leaves 0.0 GiB for this box — stop another domain", refusal)
 
     def test_a_dominfo_without_a_max_memory_in_kib_is_an_error(self):

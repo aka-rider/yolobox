@@ -95,9 +95,15 @@ GIB = 1024 * MIB
 
 # The smallest box `yo up --memory/--disk` creates, and why
 # (yo.md#several-machines). The reasons are printed with a refused flag.
-MIN_MEMORY_GIB = 8
+# The memory floor is a guess, never measured: it was 8 only because that was
+# the first default. The default stays 16 (LIBVIRT_MEMORY_GIB in libvirt.py,
+# lima/yolobox.yaml on a Mac). A box this small leans on its swapfile, 16 GiB
+# by default (nix/swap.nix), for `nixos-rebuild`'s evaluation. TODO.md carries
+# the live check.
+MIN_MEMORY_GIB = 2
 MIN_MEMORY_WHY = (
-    "the box builds its own system, and with less the nix evaluator is OOM-killed"
+    "the box builds its own system, and with less the nix evaluator is OOM-killed "
+    "even with its swapfile"
 )
 MIN_DISK_GIB = 40
 MIN_DISK_WHY = (
