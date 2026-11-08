@@ -2,17 +2,9 @@
 
 from __future__ import annotations
 
+import enum
 import os
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    List,
-    NamedTuple,
-    Optional,
-    Protocol,
-    Sequence,
-    Tuple,
-)
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional, Protocol, Tuple
 
 from .config import GIB
 from .ui import YoError
@@ -67,27 +59,44 @@ class BoxSize(NamedTuple):
     disk_gib: int
     cpus: int
 
-    def changes_to(self, wanted: "BoxSize") -> "Size":
-        """What `wanted` changes of this size, as the flags that ask for it."""
-        return Size(
-            wanted.memory_gib if wanted.memory_gib != self.memory_gib else None,
-            wanted.disk_gib if wanted.disk_gib != self.disk_gib else None,
-            wanted.cpus if wanted.cpus != self.cpus else None,
+
+def size_flags(
+    memory_gib: Optional[int], disk_gib: Optional[int], cpus: Optional[int]
+) -> List[str]:
+    """The flags that ask for a size, spelled the same by yo and limactl; None: not asked."""
+    asked = (("--memory", memory_gib), ("--disk", disk_gib), ("--cpus", cpus))
+    return [
+        word
+        for flag, value in asked
+        if value is not None
+        for word in (flag, str(value))
+    ]
+
+
+class NewBox(NamedTuple):
+    """The size of a box start() creates: --memory and --disk as asked (None:
+    the driver's default) and the CPU count, always decided (default_cpus)."""
+
+    memory_gib: Optional[int]
+    disk_gib: Optional[int]
+    cpus: int
+
+    def fill(self, memory_gib: int, disk_gib: int) -> BoxSize:
+        """This size, with the driver's defaults for what was not asked."""
+        return BoxSize(
+            memory_gib if self.memory_gib is None else self.memory_gib,
+            disk_gib if self.disk_gib is None else self.disk_gib,
+            self.cpus,
         )
 
-    def describe(self) -> str:
-        return "%d GiB of memory, %d CPUs and a %d GiB disk" % (
-            self.memory_gib,
-            self.cpus,
-            self.disk_gib,
-        )
+    def flags(self) -> List[str]:
+        return size_flags(self.memory_gib, self.disk_gib, self.cpus)
 
 
 class Size(NamedTuple):
     """What `--memory`, `--disk` and `--cpus` asked of a box, in GiB and CPUs; None: not asked.
 
-    A box that does not exist is created at it; one that exists and is stopped
-    is resized to it (vm_up decides which).
+    A box that does not exist is created at it; one that exists is refused them.
     """
 
     memory_gib: Optional[int]
@@ -99,31 +108,13 @@ class Size(NamedTuple):
         """Whether any flag was given."""
         return any(value is not None for value in self)
 
-    def for_creation(self) -> "Size":
+    def for_creation(self) -> NewBox:
         """This size with the default CPU count when --cpus was not asked."""
-        return self if self.cpus is not None else self._replace(cpus=default_cpus())
-
-    def fill(self, base: BoxSize) -> BoxSize:
-        """This size, with `base` for everything that was not asked."""
-        return BoxSize(
-            base.memory_gib if self.memory_gib is None else self.memory_gib,
-            base.disk_gib if self.disk_gib is None else self.disk_gib,
-            base.cpus if self.cpus is None else self.cpus,
-        )
+        cpus = self.cpus if self.cpus is not None else default_cpus()
+        return NewBox(self.memory_gib, self.disk_gib, cpus)
 
     def flags(self) -> List[str]:
-        """The flags that ask for this size, spelled the same by yo and limactl."""
-        asked = (
-            ("--memory", self.memory_gib),
-            ("--disk", self.disk_gib),
-            ("--cpus", self.cpus),
-        )
-        return [
-            word
-            for flag, value in asked
-            if value is not None
-            for word in (flag, str(value))
-        ]
+        return size_flags(self.memory_gib, self.disk_gib, self.cpus)
 
 
 NO_SIZE = Size(None, None, None)
@@ -153,8 +144,40 @@ class Removal(NamedTuple):
     remove: Callable[[], None]
 
 
-# The status of a VM that is up, in Lima's word, which every driver reports.
-RUNNING = "Running"
+class VmState(enum.Enum):
+    """Whether the VM holds its memory: up, off, or something in between that
+    only the host tool's own word (VmStatus.word) describes."""
+
+    RUNNING = "running"
+    OFF = "off"
+    OTHER = "other"
+
+
+class VmStatus(NamedTuple):
+    state: VmState
+    word: str  # the host tool's own word, for messages ("Broken", "paused")
+
+
+class SshFacts(NamedTuple):
+    """How ssh reaches the box's sshd on this host's loopback as the operator:
+    what yo writes into the instance's ssh.config, and what the initrd probes
+    dial before that file exists."""
+
+    port: int
+    user: str
+    identity_file: str
+    identity_agent: str  # "none" when the identity is a plain key file
+
+
+class DriverHints(NamedTuple):
+    """The prose a driver lends to shared messages. `{name}` is the machine,
+    `{vm_name}` the driver's name for it, `{dir}` its instance directory
+    (state.hint fills them in)."""
+
+    keepalive_name: str  # whose pid keepalive_pid() is ("host agent", "ssh master")
+    login_fix: str  # what the operator fixes when the box refuses yo's login
+    force_stop_command: str  # a hard power-off, to paste
+    where_to_look: str  # what the host can show of a boot that went wrong
 
 
 class Driver(Protocol):
@@ -162,83 +185,44 @@ class Driver(Protocol):
 
     main() picks one with driver_for() and set_box(), and nothing else asks
     which OS it runs on. Methods read the machine from box.name, like the rest
-    of yo. Statuses use Lima's words: "Running" when the VM is up. Methods that
-    return a command line or a message build a printed remedy.
+    of yo.
     """
 
     name: str  # what messages call the driver ("lima: ...")
-    keepalive_name: str  # whose pid keepalive_pid() is ("host agent", "ssh master")
     instances_dir: str  # instance directories, relative to $HOME
-    start_command: str  # the background process unlock_disk watches
-    off_status: str  # what vm_status() says of a VM that is stopped
-
-    @property
-    def initrd_identity(self) -> str: ...  # $HOME-relative key of pre-unlock probes
+    hints: DriverHints
 
     def require_tool(self) -> None: ...  # YoError when the host lacks the tool
     def op_sock(self) -> str: ...  # the host's 1Password agent socket
-    def initrd_identity_agent(self) -> str: ...  # "none", or an agent socket
-    # YoError naming the agent when the key the box's logins use is not on offer.
-    # vm_up runs it before any start or unlock, main() for the other commands
-    # that must log in, so a dead agent is never misread as an unreachable box;
-    # `yo status` reports it as a line, `yo down` only when it cannot tell an
-    # initrd from stage 2, and ensure_master only to open a master.
-    def require_login_key(self) -> None: ...
-    # What the operator fixes when the box refuses yo's login, for a message.
-    def login_fix(self) -> str: ...
-    # What a person can do about BootStage.UNKNOWN once the login is right.
-    def unknown_next_step(self) -> str: ...
-    def ssh_port(self) -> int: ...  # loopback port reaching sshd, initrd included
+    def ssh_facts(self) -> SshFacts: ...  # YoError when the instance does not exist
     def forward_port(self, guest_port: int) -> int: ...  # the host port forwarded
-    def keepalive_pid(self) -> Optional[int]: ...  # pid the AWS broker lives with
-    # The same pid, read without starting anything: a box with no master or
-    # agent yet answers None. `yo status` reports and never repairs (YoError when
-    # it cannot be read).
-    def running_keepalive_pid(self) -> Optional[int]: ...
-    def keepalive_pid_error(self) -> str: ...  # why keepalive_pid() was empty
-    def vm_status(self) -> Optional[str]: ...  # None: no such instance
+    # The pid the AWS broker lives with, read without starting anything: a box
+    # with no master or agent yet answers None.
+    def keepalive_pid(self) -> Optional[int]: ...
+    def vm_status(self) -> Optional[VmStatus]: ...  # None: no such instance
     # Why start() will not create the instance, at that size.
     def creation_refusal(self, size: Size) -> Optional[str]: ...
-    # The size of the instance that exists, read from the host (YoError when it
-    # cannot be read).
-    def current_size(self) -> BoxSize: ...
-    # Why the stopped instance cannot take `wanted`, or None. Read-only, so vm_up
-    # can run it before the passphrase.
-    def resize_refusal(self, current: BoxSize, wanted: BoxSize) -> Optional[str]: ...
-    # Set the stopped instance's memory and CPUs, taking effect at its next start.
-    def resize(self, memory_gib: int, cpus: int) -> None: ...
-    def config_gaps(self) -> List[str]: ...  # how the instance breaks guarantees
-    # What yo cannot verify about the instance, each a full sentence: no gap, so
-    # `yo status` shows it without failing and `yo up` does not repeat it.
-    def config_notes(self) -> List[str]: ...
-    # Those of `gaps` vm_up refuses to start with; it only warns about the rest.
-    def fatal_gaps(self, gaps: Sequence[str]) -> List[str]: ...
-    def config_gap_message(self, gaps: Sequence[str]) -> str: ...  # with the fixes
-    def host_gaps(self) -> List[str]: ...  # what the host breaks, each with its fix
+    # The disk ceiling of the instance that exists, in whole GiB, read from the
+    # host (YoError when it cannot be read).
+    def disk_gib(self) -> int: ...
     def verify_initrd_listener(self, port: int) -> None: ...  # YoError: not the VM's
-    # Start, unlock, operator's ssh. `size` is for a start that creates the
-    # instance; vm_up passes NO_SIZE for one that exists.
-    def start(self, passphrase: agent.Passphrase, size: Size) -> None: ...
+    # Start, unlock, operator's ssh. `new_box` is the size of the instance
+    # this start creates; None: the instance exists.
+    def start(
+        self, passphrase: agent.Passphrase, new_box: Optional[NewBox]
+    ) -> None: ...
     def stop(self) -> None: ...  # YoError when it will not stop
     def force_stop(self) -> None: ...  # a hard power-off, for an initrd box
-    def force_stop_command(self) -> str: ...  # what force_stop() does, to paste
-    def stop_command(self) -> str: ...
-    def stop_failed(self, detail: str) -> str: ...  # first line of the abort
-    def stop_recovery(self) -> List[str]: ...  # how to stop what stop() could not
     # What of this machine the driver holds and `yo destroy` removes, in the order
     # to remove it. Only what exists is listed, so a machine with nothing left
     # gives [].
     def removals(self) -> List[Removal]: ...
-    def list_command(self) -> str: ...  # shows the instance's state
-    # Where to look when the initrd's sshd never answered, from what the host
-    # can actually show of the boot.
-    def initrd_unseen_hint(self) -> str: ...
-    # Why a VM that yo waits for is in `status`, not Running (None: it no longer
-    # exists), and the way back.
-    def vm_lost_hint(self, status: Optional[str]) -> str: ...
     # The driver's view, head of `yo status`. A warning line when it could not
     # show it, which the report keeps and the rest of the report follows.
     def show_status(self) -> Optional[str]: ...
     def disk_image(self) -> Optional[Tuple[str, int]]: ...  # label and host KiB
     # Raise the disk's ceiling. The VM must be off, and it stays off.
-    def grow_disk(self, current_gib: int, wanted_gib: int) -> None: ...
+    def grow_disk(self, wanted_gib: int) -> None: ...
+    # The one remedy for a box that must be made anew, to paste: destroy it,
+    # then bootstrap it at `size` (and whatever creation needs between the two).
+    def recreate_command(self, size: Size) -> str: ...

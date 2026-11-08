@@ -6,21 +6,23 @@ import base64
 import contextlib
 import errno
 import hashlib
+import json
 import os
 import re
-import shutil
 import socket
 import string
 import subprocess
 import tempfile
 import urllib.error
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from typing import (
     Callable,
     Dict,
     Iterator,
     List,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -29,12 +31,13 @@ from typing import (
 from . import (
     agent,
     aws,
+    common,
     config,
     driver,
+    forwards,
     libvirt_host,
     proc,
     release,
-    sshconfig,
     sshx,
     state,
     ui,
@@ -49,19 +52,33 @@ from .config import (
     MIN_DISK_GIB,
     MIN_MEMORY_GIB,
     OPERATOR_GUEST_UID,
+    OPERATOR_HOME_SUFFIX,
     SCRIPT_DIR,
 )
-from .driver import RUNNING, BoxSize, Removal, Size, StopRefused
-from .libvirt_host import GUEST_SSH_PORT, LIBVIRT_POOL, LIBVIRT_URI, VM_USER
+from .driver import (
+    BoxSize,
+    DriverHints,
+    NO_SIZE,
+    NewBox,
+    Removal,
+    Size,
+    SshFacts,
+    StopRefused,
+    VmState,
+    VmStatus,
+)
+from .libvirt_host import LIBVIRT_POOL, LIBVIRT_URI, VM_USER
 from .sshx import OPERATOR
 from .ui import YoError
 
 
 # The libvirt driver: Linux hosts. One KVM domain per machine on the system
 # connection, with passt for the network and an SELinux/DAC label from the host
-# layer (see linux/host-setup.md). The host's preflight and the domain XML policy
-# are in libvirt_host.py. Pure helpers first, then the driver, which calls them
-# and virsh by name at call time.
+# layer. The domain is always what libvirt/domain.xml makes: a stopped domain
+# is defined again from the template on every start, filled in from the facts
+# the instance directory keeps (DomainFacts). The host's preflight is in
+# libvirt_host.py. Pure helpers first, then the driver, which calls them and
+# virsh by name at call time.
 # The 1Password item whose public key is the operator's login, in cidata.
 OPERATOR_KEY_ITEM = "yolobox-operator"
 # A box's memory and disk when `yo up` is given no --memory or --disk
@@ -77,8 +94,8 @@ LIBVIRT_STOP_TIMEOUT = 300
 # What `virsh event --timeout` prints, then exits 1, when no more events came.
 EVENT_TIMEOUT_LINE = "event loop timed out"
 # virsh domstate words. A guest is up in two of them ("blocked" is a running
-# guest idling on I/O), and both read as RUNNING. "in shutdown" is a guest
-# still going down, and the only other word a stop waits through.
+# guest idling on I/O), and both read as VmState.RUNNING. "in shutdown" is a
+# guest still going down, and the only other word a stop waits through.
 STATE_OFF = "shut off"
 STATE_SHUTTING_DOWN = "in shutdown"
 RUNNING_STATES = ("running", "blocked")
@@ -93,8 +110,9 @@ STATE_REMEDIES = {
     "pmsuspended": ("wake", "dompmwakeup"),
 }
 PORT_LOCK_NAME = ".port.lock"
-# In the instance directory: held over ensure_master's check, drop and reopen.
-MASTER_LOCK_NAME = "master.lock"
+# In the instance directory: what the template is filled in with, kept so every
+# start defines the same domain (libvirt refuses a new uuid under a known name).
+DOMAIN_FACTS_NAME = "domain.json"
 
 SEED_NAME = "nixos-lima-v0.2.2-x86_64.qcow2"
 SEED_URL = (
@@ -110,7 +128,44 @@ CIDATA_FILES = ("user-data", "meta-data", "lima.env", "etc_environment")
 MASTER_PID_RE = re.compile(r"Master running \(pid=(\d+)\)")
 SIZE_LINE_RE = re.compile(r"^(Capacity|Allocation):\s+(\d+) bytes\s*$", re.M)
 MAX_MEMORY_LINE_RE = re.compile(r"^Max memory:\s+(\d+) KiB\s*$", re.M)
-CPUS_LINE_RE = re.compile(r"^CPU\(s\):\s+(\d+)\s*$", re.M)
+
+
+class DomainFacts(NamedTuple):
+    """What a machine's domain is defined with, besides the template."""
+
+    uuid: str
+    ssh_port: int
+    memory_gib: int
+    cpus: int
+
+
+def read_domain_facts(directory: str) -> Optional[DomainFacts]:
+    """The facts kept in `directory`, None when there are none."""
+    path = os.path.join(directory, DOMAIN_FACTS_NAME)
+    text = proc.read_text_file(path)
+    if text is None:
+        return None
+    try:
+        facts = DomainFacts(**json.loads(text))
+    except (ValueError, TypeError) as failure:
+        raise YoError("%s is not a domain record: %s" % (path, failure))
+    if not (
+        isinstance(facts.uuid, str)
+        and all(
+            isinstance(field, int) and not isinstance(field, bool)
+            for field in (facts.ssh_port, facts.memory_gib, facts.cpus)
+        )
+    ):
+        raise YoError("%s is not a domain record: %r" % (path, text))
+    return facts
+
+
+def write_domain_facts(directory: str, facts: DomainFacts) -> None:
+    proc.atomic_write(
+        os.path.join(directory, DOMAIN_FACTS_NAME),
+        json.dumps(facts._asdict(), indent=2) + "\n",
+        FILE_MODE_READABLE,
+    )
 
 
 def domain_name() -> str:
@@ -151,30 +206,24 @@ def lowest_free_port(
     )
 
 
-def domain_size(size: Size) -> BoxSize:
-    """The size of a box yo creates: what was asked, else the defaults.
-
-    `size` is the one vm_up decided (Size.for_creation), which also holds the
-    default CPU count, so there is no second default here.
-    """
-    if size.cpus is None:
-        raise YoError("a box is created with the CPU count vm_up decides; got none")
-    return size.fill(BoxSize(LIBVIRT_MEMORY_GIB, LIBVIRT_DISK_GIB, size.cpus))
+def domain_size(new_box: NewBox) -> BoxSize:
+    """The size of a box yo creates: what was asked, else the defaults. The CPU
+    count is the one vm_up decided, so there is no second default here."""
+    return new_box.fill(LIBVIRT_MEMORY_GIB, LIBVIRT_DISK_GIB)
 
 
-def domain_xml(
-    instance: str, ssh_port: int, uid: int, gid: int, memory_gib: int, cpus: int
-) -> str:
+def domain_xml(instance: str, facts: DomainFacts, uid: int, gid: int) -> str:
     template = string.Template(
         (SCRIPT_DIR / "libvirt" / "domain.xml").read_text(encoding="utf-8")
     )
     return template.substitute(
         name=instance,
-        ssh_port=ssh_port,
+        uuid=facts.uuid,
+        ssh_port=facts.ssh_port,
         uid=uid,
         gid=gid,
-        memory_gib=memory_gib,
-        cpus=cpus,
+        memory_gib=facts.memory_gib,
+        cpus=facts.cpus,
     )
 
 
@@ -187,7 +236,10 @@ def public_key_line(blob: bytes) -> str:
 
 
 def cidata_files(username: str, public_key: str, instance: str) -> Dict[str, str]:
-    """The files of the cidata ISO lima-init and the initrd read, by name."""
+    """The files of the cidata ISO, by name. The seed image is nixos-lima's, and
+    its lima-init creates the operator from these LIMA_CIDATA_* variables and
+    takes lima's instance name as its hostname; the initrd reads the key out of
+    user-data. That is why a libvirt guest is told it is lima's."""
     account = config.operator_account(username)
     return {
         "user-data": (
@@ -204,44 +256,19 @@ def cidata_files(username: str, public_key: str, instance: str) -> Dict[str, str
         "lima.env": (
             "LIMA_CIDATA_USER=%s\n"
             "LIMA_CIDATA_UID=%d\n"
-            "LIMA_CIDATA_HOME=/home/%s.guest\n"
+            "LIMA_CIDATA_HOME=/home/%s%s\n"
             "LIMA_CIDATA_IID=yolobox-%s\n"
-            % (account, OPERATOR_GUEST_UID, account, instance)
+            % (account, OPERATOR_GUEST_UID, account, OPERATOR_HOME_SUFFIX, instance)
         ),
         "etc_environment": "",
     }
 
 
-def libvirt_ssh_config(
-    host: str, port: int, user: str, identity_agent: str, instance_dir: str
-) -> str:
-    """The instance's ssh.config, in the shape lima writes for its own."""
-    return "\n".join(
-        [
-            "Host %s" % host,
-            "  Hostname %s" % LOOPBACK,
-            "  Port %d" % port,
-            "  User %s" % user,
-            '  IdentityAgent "%s"' % identity_agent,
-            '  IdentityFile "%s"' % os.path.join(instance_dir, "operator.pub"),
-            "  IdentitiesOnly yes",
-            "  BatchMode yes",
-            "  PreferredAuthentications publickey",
-            "  PasswordAuthentication no",
-            "  KbdInteractiveAuthentication no",
-            "  GSSAPIAuthentication no",
-            "  AddKeysToAgent no",
-            "  ForwardAgent no",
-            "  Compression no",
-            "  ControlMaster auto",
-            '  ControlPath "%s"' % os.path.join(instance_dir, "ssh.sock"),
-            "  ControlPersist yes",
-            "  StrictHostKeyChecking no",
-            "  UserKnownHostsFile /dev/null",
-            "  NoHostAuthenticationForLocalhost yes",
-            "",
-        ]
-    )
+def file_size(path: str) -> int:
+    try:
+        return os.stat(path).st_size
+    except OSError as failure:
+        raise YoError("cannot stat %s: %s" % (path, ui.os_error_reason(failure)))
 
 
 def file_sha512(path: str) -> str:
@@ -272,20 +299,19 @@ def download_seed(path: str) -> None:
     except (urllib.error.URLError, OSError) as failure:
         raise YoError("cannot download %s: %s" % (SEED_URL, failure))
     finally:
-        if os.path.exists(part):
-            os.unlink(part)
+        proc.remove_file(part)
 
 
 def ensure_seed() -> str:
     """The pinned seed image, downloaded once and verified on every use."""
     cache = os.path.join(state.home(), ".cache", "yolobox")
-    os.makedirs(cache, exist_ok=True)
+    proc.private_dir(cache)
     path = os.path.join(cache, SEED_NAME)
     if os.path.exists(path):
         if file_sha512(path) == SEED_SHA512:
             return path
         ui.err("yo: %s fails its sha512 check; downloading it again" % path)
-        os.unlink(path)
+        proc.remove_file(path)
     ui.err("yo: downloading the seed image %s" % SEED_URL)
     download_seed(path)
     return path
@@ -312,13 +338,7 @@ def raise_unless_undefined(
     """Raise `failed`, the failure of `virsh SUBCOMMAND NAME`, unless that domain is no
     longer defined, which means it was undefined after it was listed."""
     if name in domain_names():
-        raise YoError(
-            proc.failed_message(
-                "virsh %s %s" % (subcommand, name),
-                failed.returncode,
-                proc.failure_detail(failed),
-            )
-        )
+        proc.checked(failed, "virsh %s %s" % (subcommand, name))
 
 
 def active_domains_memory() -> Dict[str, int]:
@@ -401,17 +421,6 @@ def state_hint(domain_state: str) -> Optional[str]:
     )
 
 
-def redefine_command() -> str:
-    """Remove the domain's definition and keep its disk volume, for a printed
-    remedy: the next `yo up` defines it again from the template and adopts the
-    volume."""
-    return "%s && virsh -c %s undefine --nvram %s" % (
-        state.yo_cmd("down"),
-        LIBVIRT_URI,
-        domain_name(),
-    )
-
-
 def virsh_removal(what: str, *args: str) -> Removal:
     def remove() -> None:
         libvirt_host.virsh(*args)
@@ -444,62 +453,40 @@ def volume_names() -> List[str]:
     return [row.split()[0] for row in rows[separators[0] + 1 :] if row.strip()]
 
 
-def host_firmware() -> libvirt_host.HostFirmware:
-    """The emulator and the firmware loaders libvirt runs the template's
-    machine with, the one canonical answer a defined domain may carry."""
-    return libvirt_host.parse_domcapabilities(
-        libvirt_host.virsh(
-            "domcapabilities",
-            "--virttype",
-            "kvm",
-            "--arch",
-            "x86_64",
-            "--machine",
-            "q35",
-        ).stdout
-    )
-
-
 class LibvirtDriver:
     """Linux: one libvirt domain per machine, on the system connection."""
 
     name = "libvirt"
-    keepalive_name = "ssh master"
     instances_dir = ".local/state/yolobox/instances"
-    start_command = "virsh start"
-    off_status = STATE_OFF
-
-    @property
-    def initrd_identity(self) -> str:
-        return "%s/%s/operator.pub" % (self.instances_dir, state.box.name)
-
-    def initrd_identity_agent(self) -> str:
-        return self.op_sock()
-
-    def login_fix(self) -> str:
-        return "1Password running and unlocked, its prompt approved"
-
-    def unknown_next_step(self) -> str:
-        # No console helps: `virsh console` shows nothing from before it
-        # attaches, and the initrd writes to tty0, which a domain without
-        # graphics shows nowhere.
-        return (
-            "Without a working login yo cannot see inside it, and it does not "
-            "force it off: nothing else tells an idle initrd from one encrypting "
-            "its disk"
-        )
-
-    def require_login_key(self) -> None:
-        # Both accounts log in with the operator's key (the agent account's
-        # AuthorizedKeysCommand serves the operator's keys), and so does root
-        # in the initrd.
-        self.operator_key()
+    hints = DriverHints(
+        keepalive_name="ssh master",
+        login_fix="1Password running and unlocked, its prompt approved",
+        force_stop_command="virsh -c %s destroy {vm_name}" % LIBVIRT_URI,
+        # `virsh console` keeps no history and the initrd writes to tty0, which
+        # no graphics show, so the domain's state is what the host can show.
+        where_to_look="`virsh -c %s domstate --reason {vm_name}` says why (a guest "
+        "that went off by itself was possibly killed by the host's OOM killer: "
+        "check `journalctl -k -g oom`); a domain that runs while nothing answers "
+        "never brought its initrd sshd up, which a missing or unreadable cidata "
+        "disk ({vm_name}-cidata.iso) causes; then run this command again" % LIBVIRT_URI,
+    )
 
     def require_tool(self) -> None:
         libvirt_host.check_libvirt_host()
 
     def op_sock(self) -> str:
         return os.path.join(state.home(), ".1password/agent.sock")
+
+    def ssh_facts(self) -> SshFacts:
+        # Both accounts log in with the operator's key (the agent account's
+        # AuthorizedKeysCommand serves the operator's keys), and so does root
+        # in the initrd; 1Password's agent holds it, the file is its public half.
+        return SshFacts(
+            self.ssh_port(),
+            release.host_user(),
+            os.path.join(state.instance_dir(), "operator.pub"),
+            self.op_sock(),
+        )
 
     def domain_exists(self) -> bool:
         """Whether this machine's domain is defined. A domain of that name that
@@ -539,15 +526,23 @@ class LibvirtDriver:
 
     def ssh_port(self) -> int:
         self.require_domain()
-        port = libvirt_host.parse_domain(
-            libvirt_host.virsh("dumpxml", domain_name()).stdout
-        ).ssh_port
-        if port is None:
+        return self.domain_facts().ssh_port
+
+    def domain_facts(self) -> DomainFacts:
+        """The facts the existing domain was defined with. Without them the
+        domain cannot be defined again, so it is only good for a destroy."""
+        facts = read_domain_facts(state.instance_dir())
+        if facts is None:
             raise YoError(
-                "domain %s forwards no host port to guest port %d"
-                % (domain_name(), GUEST_SSH_PORT)
+                "domain %s exists but %s holds no record of its uuid, port and "
+                "size, so yo cannot define it again — %s"
+                % (
+                    domain_name(),
+                    os.path.join(state.instance_dir(), DOMAIN_FACTS_NAME),
+                    self.recreate_command(NO_SIZE),
+                )
             )
-        return port
+        return facts
 
     def allocate_host_port(self) -> int:
         # Every domain's forwards count, not only the boxes': a shut-off domain
@@ -569,22 +564,11 @@ class LibvirtDriver:
         one of the two forwards would fail or, worse, land on the other's port.
         """
         directory = os.path.join(state.home(), self.instances_dir)
-        os.makedirs(directory, exist_ok=True)
-        with state.held_flock(os.path.join(directory, PORT_LOCK_NAME), wait=True):
-            yield
-
-    @contextlib.contextmanager
-    def master_lock(self) -> Iterator[None]:
-        """Hold this machine's lock over checking, dropping and opening its
-        operator master, so one yo never drops a master another just opened."""
-        proc.private_dir(state.instance_dir())
-        with state.held_flock(
-            os.path.join(state.instance_dir(), MASTER_LOCK_NAME), wait=True
-        ):
+        with common.held_flock(os.path.join(directory, PORT_LOCK_NAME), wait=True):
             yield
 
     def forward_port(self, guest_port: int) -> int:
-        self.ensure_master()
+        forwards.ensure_session()
         with self.port_lock():
             host_port = self.allocate_host_port()
             proc.run(
@@ -601,64 +585,22 @@ class LibvirtDriver:
             )
         return host_port
 
-    def close_master(self) -> None:
-        """Quit the operator's master, under the lock that orders it against
-        ensure_master, so none opens in between."""
-        with self.master_lock():
-            sshx.stop_master(
-                OPERATOR,
-                "%s's ssh master is still running after `ssh -O exit`" % state.box.name,
-            )
-
-    def ensure_master(self) -> None:
-        """Open the operator's multiplexed ssh connection, if it is not open.
-
-        Only opening one logs in, so only then must the login key be on offer:
-        a live master serves `yo port` and the forwards without 1Password.
-        `-O check` proves only that the master process answers, so a session
-        through it proves the connection; a master that fails it is dropped.
-
-        master.lock orders only the yo processes that run this. Any other mux
-        ssh (ControlMaster auto, as every `mux=True` session is) can still open
-        a master without it. `-O exit` stops whatever master holds the control
-        socket when it runs, so one window is left: the dead master quits on its
-        own after the failed session, and another yo's mux ssh opens a new one,
-        both before this exit. While the dead master still holds the socket, a
-        mux ssh joins it rather than replacing it, so the window is that gap
-        alone; the other yo's session then fails, and its command reports it."""
-        with self.master_lock():
-            if sshx.master_alive(OPERATOR):
-                if sshx.ssh_run(OPERATOR, ["true"], mux=True).returncode == 0:
-                    return
-                sshx.stop_master(
-                    OPERATOR,
-                    "%s's ssh master answers but carries no session, and "
-                    "`ssh -O exit` did not stop it" % state.box.name,
-                )
-            self.require_login_key()
-            sshx.ssh_run(OPERATOR, ["true"], mux=True, check=True)
-
     def keepalive_pid(self) -> Optional[int]:
-        self.ensure_master()
-        return self.running_keepalive_pid()
-
-    def running_keepalive_pid(self) -> Optional[int]:
         check = proc.run(
             sshx.ssh_argv(OPERATOR, "-O", "check", state.box.vm_host, mux=True)
         )
         found = MASTER_PID_RE.search(check.stderr + check.stdout)
         return aws.checked_pid(int(found.group(1))) if found else None
 
-    def keepalive_pid_error(self) -> str:
-        return state.not_up_hint(
-            "cannot read the pid of %s's ssh master (ssh -O check)" % state.box.name
-        )
-
-    def vm_status(self) -> Optional[str]:
+    def vm_status(self) -> Optional[VmStatus]:
         if not self.domain_exists():
             return None
         domain_state = self.domain_state()
-        return RUNNING if domain_state in RUNNING_STATES else domain_state
+        if domain_state in RUNNING_STATES:
+            return VmStatus(VmState.RUNNING, domain_state)
+        if domain_state == STATE_OFF:
+            return VmStatus(VmState.OFF, domain_state)
+        return VmStatus(VmState.OTHER, domain_state)
 
     def domain_state(self) -> str:
         """virsh's own word for the state: "running", "in shutdown", "shut off"..."""
@@ -701,71 +643,9 @@ class LibvirtDriver:
             % (disk_volume(), capacity / GIB, size.disk_gib, way)
         )
 
-    def current_size(self) -> BoxSize:
-        info = libvirt_host.virsh("dominfo", domain_name()).stdout
-        memory = MAX_MEMORY_LINE_RE.search(info)
-        cpus = CPUS_LINE_RE.search(info)
-        if memory is None or cpus is None:
-            raise YoError(
-                "virsh dominfo %s printed no Max memory in KiB and CPU(s): %s"
-                % (domain_name(), info.strip())
-            )
-        return BoxSize(
-            driver.exact_gib(int(memory.group(1)) * KIB, "memory"),
-            driver.exact_gib(self.volume_sizes()["Capacity"], "disk"),
-            int(cpus.group(1)),
-        )
-
-    def resize_refusal(self, current: BoxSize, wanted: BoxSize) -> Optional[str]:
-        # Only more memory is judged by the host's room: a box that keeps its
-        # memory, or asks for less, fits no worse than the `yo up` without a
-        # flag that would start it at its current size unjudged.
-        if wanted.memory_gib <= current.memory_gib:
-            return None
-        return self.memory_fit_refusal(wanted.memory_gib)
-
-    def resize(self, memory_gib: int, cpus: int) -> None:
-        # --config edits the stopped domain's definition, which the next start
-        # reads. The maximum goes first and the current value follows it: the
-        # template sets both alike, and a current above the maximum is refused.
-        name = domain_name()
-        libvirt_host.virsh("setmaxmem", name, "%dG" % memory_gib, "--config")
-        libvirt_host.virsh("setmem", name, "%dG" % memory_gib, "--config")
-        libvirt_host.virsh("setvcpus", name, str(cpus), "--config", "--maximum")
-        libvirt_host.virsh("setvcpus", name, str(cpus), "--config")
-
-    def fatal_gaps(self, gaps: Sequence[str]) -> List[str]:
-        # A domain that is not what the template made may hold a path to the host.
-        return list(gaps)
-
-    def host_gaps(self) -> List[str]:
-        gap = libvirt_host.passt_dir_gap()
-        return [gap] if gap else []
-
-    def config_gaps(self) -> List[str]:
-        if not self.domain_exists():
-            return []
-        uid, gid = libvirt_host.vm_account()
-        return libvirt_host.domain_gaps(
-            libvirt_host.parse_domain(
-                libvirt_host.virsh("dumpxml", domain_name()).stdout
-            ),
-            state.box.name,
-            uid,
-            gid,
-            host_firmware(),
-        )
-
-    def config_notes(self) -> List[str]:
-        return []
-
-    def config_gap_message(self, gaps: Sequence[str]) -> str:
-        return (
-            "domain %s breaks the box's guarantees (%s) — remove its definition, "
-            "keeping the disk volume: %s, then run %s to define it again from "
-            "libvirt/domain.xml"
-            % (domain_name(), ", ".join(gaps), redefine_command(), state.yo_cmd("up"))
-        )
+    def disk_gib(self) -> int:
+        self.require_domain()
+        return driver.exact_gib(self.volume_sizes()["Capacity"], "disk")
 
     def verify_initrd_listener(self, port: int) -> None:
         # No listener at all is fine: ssh finds nothing and the passphrase goes
@@ -868,7 +748,7 @@ class LibvirtDriver:
             )
             libvirt_host.virsh("vol-delete", "--pool", LIBVIRT_POOL, disk_volume())
         seed = ensure_seed()
-        self.create_volume(disk_volume(), os.stat(seed).st_size, "qcow2", seed)
+        self.create_volume(disk_volume(), file_size(seed), "qcow2", seed)
         libvirt_host.virsh(
             "vol-resize", "--pool", LIBVIRT_POOL, disk_volume(), "%dG" % disk_gib
         )
@@ -877,8 +757,9 @@ class LibvirtDriver:
         """Make the pool's cidata volume carry `files`; rebuilt only on change.
 
         The staged copy in the instance dir is the cache key: what the volume
-        was last built from. It is replaced only after the upload succeeded, so
-        a failed rebuild leaves the old key and the next run tries again.
+        was last built from. It is rewritten only after the upload succeeded,
+        so a failed rebuild, or a rewrite cut short, leaves a key that does not
+        match and the next run builds again.
         """
         staging = os.path.join(state.instance_dir(), "cidata")
         staged: Dict[str, str] = {}
@@ -891,89 +772,88 @@ class LibvirtDriver:
             staged[name] = text
         if staged == files and self.volume_exists(cidata_volume()):
             return
-        building = staging + ".new"
-        iso = os.path.join(state.instance_dir(), "cidata.iso")
-        if os.path.exists(building):
-            shutil.rmtree(building)
+        # The new ISO's tree and the ISO itself, side by side: xorriso packs
+        # the tree, so the ISO cannot be written inside it.
+        work = staging + ".new"
+        tree = os.path.join(work, "tree")
+        iso = os.path.join(work, "cidata.iso")
+        proc.delete_tree(work)
         try:
-            proc.private_dir(building)
+            proc.private_dir(tree)
             for name, text in files.items():
-                proc.atomic_write(
-                    os.path.join(building, name), text, FILE_MODE_READABLE
-                )
+                proc.atomic_write(os.path.join(tree, name), text, FILE_MODE_READABLE)
             proc.run(
                 ["xorriso", "-as", "mkisofs", "-V", "cidata", "-J", "-R", "-o", iso]
-                + [building],
+                + [tree],
                 check=True,
             )
             if self.volume_exists(cidata_volume()):
                 libvirt_host.virsh(
                     "vol-delete", "--pool", LIBVIRT_POOL, cidata_volume()
                 )
-            self.create_volume(cidata_volume(), os.stat(iso).st_size, "raw", iso)
-            if os.path.exists(staging):
-                shutil.rmtree(staging)
-            os.rename(building, staging)
+            self.create_volume(cidata_volume(), file_size(iso), "raw", iso)
+            proc.delete_tree(staging)
+            proc.private_dir(staging)
+            for name, text in files.items():
+                proc.atomic_write(os.path.join(staging, name), text, FILE_MODE_READABLE)
         finally:
-            if os.path.exists(iso):
-                os.unlink(iso)
-            if os.path.exists(building):
-                shutil.rmtree(building)
+            proc.delete_tree(work)
 
-    def write_ssh_config(self, port: int) -> None:
-        wanted = libvirt_ssh_config(
-            state.box.vm_host,
-            port,
-            release.host_user(),
-            self.op_sock(),
-            state.instance_dir(),
-        )
-        current = proc.read_text_file(
-            state.ssh_cfg(), missing="", errors="surrogateescape"
-        )
-        if sshconfig.lima_part_of(current) != wanted:
-            proc.atomic_write(state.ssh_cfg(), wanted, FILE_MODE_PRIVATE)
-
-    def create_domain(self, memory_gib: int, cpus: int) -> int:
-        """Define the domain on the lowest free host port; return that port."""
-        uid, gid = libvirt_host.vm_account()
+    def create_domain(self, memory_gib: int, cpus: int) -> DomainFacts:
+        """Record and define the domain on the lowest free host port."""
         with self.port_lock():
-            port = self.allocate_host_port()
-            path = os.path.join(state.instance_dir(), "domain.xml")
-            proc.atomic_write(
-                path,
-                domain_xml(state.box.name, port, uid, gid, memory_gib, cpus),
-                FILE_MODE_READABLE,
+            facts = DomainFacts(
+                str(uuid.uuid4()), self.allocate_host_port(), memory_gib, cpus
             )
-            libvirt_host.virsh("define", path)
-        return port
+            write_domain_facts(state.instance_dir(), facts)
+            self.define_domain(facts)
+        return facts
 
-    def start(self, passphrase: bytes, size: Size) -> None:
-        existing = self.domain_exists()
+    def define_domain(self, facts: DomainFacts) -> None:
+        """`virsh define` the template filled in with `facts`: a new domain, or
+        the stopped one again, which libvirt accepts under the same uuid."""
+        uid, gid = libvirt_host.vm_account()
+        path = os.path.join(state.instance_dir(), "domain.xml")
+        proc.atomic_write(
+            path, domain_xml(state.box.name, facts, uid, gid), FILE_MODE_READABLE
+        )
+        try:
+            proc.checked(
+                libvirt_host.virsh("define", path, check=False),
+                "virsh define %s" % path,
+            )
+        except YoError as refused:
+            raise YoError("%s — %s" % (refused.message, self.recreate_command(NO_SIZE)))
+
+    def recreate_command(self, size: Size) -> str:
+        return state.recreate_chain(flags=size.flags())
+
+    def start(self, passphrase: bytes, new_box: Optional[NewBox]) -> None:
         public_key = public_key_line(self.operator_key())
         files = cidata_files(release.host_user(), public_key, state.box.name)
-        os.makedirs(os.path.dirname(state.instance_dir()), exist_ok=True)
         proc.private_dir(state.instance_dir())
         # 0600 though it is public: when the agent is gone, ssh tries the
         # IdentityFile as a private key and warns UNPROTECTED PRIVATE KEY FILE
-        # on any other mode, which misnames the failure (docs/linux-host.md).
+        # on any other mode, which misnames the failure.
         proc.atomic_write(
             os.path.join(state.instance_dir(), "operator.pub"),
             public_key + "\n",
             FILE_MODE_PRIVATE,
         )
-        created = None if existing else domain_size(size)
+        created = None if new_box is None else domain_size(new_box)
         if created is not None:
             self.ensure_disk_volume(created.disk_gib)
         self.sync_cidata(files)
         # The port is chosen last: the volume upload above is slow, and the port
         # lock is held from choosing until the domain claims the port.
-        port = (
-            self.ssh_port()
-            if created is None
-            else self.create_domain(created.memory_gib, created.cpus)
-        )
-        self.write_ssh_config(port)
+        if created is not None:
+            facts = self.create_domain(created.memory_gib, created.cpus)
+        else:
+            facts = self.domain_facts()
+            # A stopped domain is always what this yo's template makes; a
+            # domain that is up keeps the definition it runs.
+            if self.domain_state() == STATE_OFF:
+                self.define_domain(facts)
         # Only a start needs passt to bind its socket, so only a start is
         # refused for the directory's ACL; down, ssh and status work without it.
         gap = libvirt_host.passt_dir_gap()
@@ -989,8 +869,8 @@ class LibvirtDriver:
         """`virsh start`, tried once more when passt could not bind its socket.
 
         Another passt domain starting between yo's ACL check and this start
-        recomputes the directory's mask (docs/linux-host.md, "The passt socket
-        directory"); the hook restores it at that domain's `started begin`. So
+        recomputes the directory's mask; the hook restores it at that domain's
+        `started begin`. So
         the ACL is read again: short, and the start is refused with the remedy;
         restored, and the start is tried once more, whose failure is final.
         """
@@ -998,13 +878,7 @@ class LibvirtDriver:
         if started.returncode == 0:
             return
         if PASST_BIND_DENIED not in (started.stderr or ""):
-            raise YoError(
-                proc.failed_message(
-                    "virsh start %s" % domain_name(),
-                    started.returncode,
-                    proc.failure_detail(started),
-                )
-            )
+            proc.checked(started, "virsh start %s" % domain_name())
         gap = libvirt_host.passt_dir_gap()
         if gap is not None:
             raise YoError(gap)
@@ -1065,15 +939,12 @@ class LibvirtDriver:
         self.force_stop()
         libvirt_host.virsh("undefine", "--nvram", domain_name())
 
-    def force_stop_command(self) -> str:
-        return "virsh -c %s destroy %s" % (LIBVIRT_URI, domain_name())
-
     def require_stoppable(self, domain_state: str) -> None:
         """Raise YoError for a state in which a guest shutdown will never finish.
 
         `yo down` reaches this without knowing whether the box is in its initrd,
-        maybe encrypting its disk, so it names no forced stop: only
-        initrd_state() can prove one safe (vm.initrd_down_refusal)."""
+        maybe encrypting its disk, so it names no forced stop: only a pending
+        passphrase ask proves one safe (vm.cmd_down)."""
         if domain_state in STATES_STOPPING:
             return
         cause = ""
@@ -1126,20 +997,11 @@ class LibvirtDriver:
             )
         return YoError(proc.failed_message("virsh event", code, stderr.strip()))
 
-    def stop_command(self) -> str:
-        return state.yo_cmd("down")
-
-    def stop_failed(self, detail: str) -> str:
-        return "the domain did not stop: %s" % detail
-
-    def stop_recovery(self) -> List[str]:
-        # Only bootstrap prints this, right after nixos-rebuild ran over ssh:
-        # the box is in stage 2, so a power-off cuts no encryption.
-        return [
-            "It runs stage 2 (nixos-rebuild just ran in it), so a hard power-off",
-            "cuts no disk encryption: %s" % self.force_stop_command(),
-            "then start it again with: %s" % state.yo_cmd("up"),
-        ]
+    def close_master(self) -> None:
+        sshx.stop_master(
+            OPERATOR,
+            "%s's ssh master is still running after `ssh -O exit`" % state.box.name,
+        )
 
     def removals(self) -> List[Removal]:
         steps: List[Removal] = []
@@ -1172,45 +1034,6 @@ class LibvirtDriver:
             steps.append(state.tree_removal(state.instance_dir()))
         return steps
 
-    def list_command(self) -> str:
-        return "virsh -c %s list --all" % LIBVIRT_URI
-
-    def initrd_unseen_hint(self) -> str:
-        # Nothing shows what the initrd printed: `virsh console` keeps no
-        # history, and the initrd writes to tty0, which no graphics show.
-        return (
-            "check that the domain runs (`virsh -c %s domstate %s`) and see %s; if "
-            "it runs and nothing answers, its initrd sshd did not come up, which "
-            "a missing or unreadable cidata disk causes (%s)"
-            % (
-                LIBVIRT_URI,
-                domain_name(),
-                state.yo_cmd("status"),
-                cidata_volume(),
-            )
-        )
-
-    def vm_lost_hint(self, status: Optional[str]) -> str:
-        if status is None:
-            return (
-                "domain %s no longer exists: %s defines it again from the template "
-                "and adopts the disk volume" % (domain_name(), state.yo_cmd("up"))
-            )
-        reason = "`virsh -c %s domstate --reason %s`" % (LIBVIRT_URI, domain_name())
-        why = "%s says why" % reason
-        if status == STATE_OFF:
-            return (
-                "%s. A guest that goes off by itself was possibly killed by the "
-                "host's OOM killer: check `journalctl -k -g oom`. If it was, free "
-                "memory on the host or give the box less, keeping its disk: %s, "
-                "then %s; then run this command again"
-                % (why, redefine_command(), state.yo_cmd("up", "--memory", "N"))
-            )
-        hint = state_hint(status)
-        if hint is not None:
-            return "%s; %s, then run this command again" % (why, hint)
-        return "check why with %s, then run this command again" % reason
-
     def show_status(self) -> Optional[str]:
         shown = libvirt_host.virsh("dominfo", domain_name(), check=False, capture=False)
         if shown.returncode == 0:
@@ -1237,7 +1060,7 @@ class LibvirtDriver:
         allocation = self.volume_sizes()["Allocation"]
         return "pool %s volume %s" % (LIBVIRT_POOL, disk_volume()), allocation // KIB
 
-    def grow_disk(self, current_gib: int, wanted_gib: int) -> None:
+    def grow_disk(self, wanted_gib: int) -> None:
         # qemu holds the image of a running domain open, so only a stopped one
         # is resized.
         domain_state = self.domain_state()
@@ -1246,10 +1069,7 @@ class LibvirtDriver:
                 "%s is %s, and a disk is grown only while the domain is shut off"
                 % (state.box.name, domain_state)
             )
-        ui.out(
-            "libvirt: raising %s from %dGiB to %dGiB"
-            % (state.box.name, current_gib, wanted_gib)
-        )
+        ui.out("libvirt: raising %s's disk to %dGiB" % (state.box.name, wanted_gib))
         libvirt_host.virsh(
             "vol-resize", "--pool", LIBVIRT_POOL, disk_volume(), "%dG" % wanted_gib
         )

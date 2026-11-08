@@ -1,5 +1,6 @@
 <domain type='kvm'>
   <name>yolobox-$name</name>
+  <uuid>$uuid</uuid>
   <metadata>
     <yolobox:instance xmlns:yolobox='https://github.com/aka-rider/yolobox'>$name</yolobox:instance>
   </metadata>

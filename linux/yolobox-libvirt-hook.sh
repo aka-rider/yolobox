@@ -7,7 +7,7 @@
 # libvirt recomputes the directory's ACL mask whenever it starts another passt
 # domain, and the entry is only as wide as the mask. So the fixed setfacl below
 # runs before a yolobox domain starts, and after any domain starts or is
-# released (linux/host-setup.md, "The passt ACL hook").
+# released.
 #
 # libvirt calls this as `HOOK <domain> <operation> <sub-operation> <extra>`,
 # with the domain XML on stdin. The XML is only searched for the yolobox

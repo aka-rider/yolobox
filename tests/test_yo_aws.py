@@ -1,5 +1,5 @@
-"""yo's side of the AWS broker: which config it allow-lists from, and what it
-does under its broker lock.
+"""yo's side of the AWS broker: which config it allow-lists from, how the guest
+config is installed, and the broker log's generations.
 
 No tool's absence skips these tests.
 """
@@ -10,20 +10,19 @@ import shutil
 import stat
 import subprocess
 import tempfile
-import types
 import unittest
 from unittest import mock
 
-from test_aws_broker import broker
-from test_yo import FakeHome, healthy, yo
+from test_yo import (
+    FakeHome,
+    fake_bin,
+    yo,
+    refuse_tcp_to_the_host,
+)
 
 
-def broker_health(pid, watch_pid, allow):
-    """A healthy broker whose /health body is what the broker's own handler
-    answers, so a key the broker renames fails here, not on a Mac."""
-    handler = types.SimpleNamespace(watch_pid=watch_pid, states=dict.fromkeys(allow))
-    with mock.patch.object(broker.os, "getpid", return_value=pid):
-        return healthy(broker.HealthHandler.health(handler))
+def setUpModule():
+    refuse_tcp_to_the_host()
 
 
 SSO_PROFILE = "[profile %s]\nsso_start_url = https://example.awsapps.com/start\nregion = us-east-1\n"
@@ -86,10 +85,10 @@ class TestAllowlistConfigFile(FakeHome):
 
 
 class TestEnsureAwsBrokerIsOneStep(FakeHome):
-    """Everything ensure_aws_broker reads and writes happens under its lock, so
-    two yos cannot interleave: one reading the pid or the allowlist before the
-    other restarted the broker would replace a good broker or push a guest
-    config that names other profiles than the broker serves."""
+    """Everything ensure_aws_broker reads and does happens under yo's broker
+    lock, so two yos cannot interleave: one reading the pid or the allowlist
+    before the other restarted the broker would replace a good broker or push a
+    guest config that names other profiles than the broker serves."""
 
     def setUp(self):
         super().setUp()
@@ -106,20 +105,20 @@ class TestEnsureAwsBrokerIsOneStep(FakeHome):
         except BlockingIOError:
             return True
         finally:
-            os.close(fd)
+            os.close(fd)  # drops the lock when this probe got it
         return False
 
     def seen(self, step, result=None):
+        """A stand-in for `step` that records whether the lock is held when it runs."""
+
         def record(*args, **kwargs):
             self.held_during[step] = self.lock_is_held()
             return result
 
         return record
 
-    def test_the_allowlist_the_pid_and_the_push_are_read_and_done_under_the_lock(
-        self,
-    ):
-        stale = broker_health(pid=111, watch_pid=999, allow=["work"])
+    def test_every_read_and_every_change_happens_under_the_lock(self):
+        stale = {"pid": 111, "watch_pid": 999, "allow": ["work"]}
         with (
             mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
             mock.patch.object(
@@ -131,43 +130,48 @@ class TestEnsureAwsBrokerIsOneStep(FakeHome):
                 yo.box.driver, "keepalive_pid", side_effect=self.seen("pid", 555)
             ),
             mock.patch.object(yo.aws, "aws_broker_health", return_value=stale),
-            mock.patch.object(yo.aws, "kill_stale_broker"),
-            mock.patch.object(yo.aws, "start_aws_broker"),
+            mock.patch.object(yo.aws, "stop_broker", side_effect=self.seen("stop")),
+            mock.patch.object(
+                yo.aws, "start_aws_broker", side_effect=self.seen("start")
+            ),
             mock.patch.object(
                 yo.aws, "push_aws_guest_files", side_effect=self.seen("push")
             ),
         ):
             self.assertTrue(yo.ensure_aws_broker())
         self.assertEqual(
-            self.held_during, {"allowlist": True, "pid": True, "push": True}
+            self.held_during,
+            {"allowlist": True, "pid": True, "stop": True, "start": True, "push": True},
         )
         self.assertFalse(self.lock_is_held())
 
-    def test_disabling_removes_the_guest_config_under_the_same_lock(self):
-        with (
-            mock.patch.object(
-                yo.aws,
-                "aws_broker_health",
-                return_value=broker_health(pid=111, watch_pid=999, allow=[]),
-            ),
-            mock.patch.object(yo.aws, "kill_stale_broker"),
-            mock.patch.object(yo.sshx, "ssh_run", side_effect=self.seen("rm")),
-        ):
-            yo.disable_aws_broker()
-        self.assertEqual(self.held_during, {"rm": True})
-        self.assertFalse(self.lock_is_held())
-
-    def test_an_empty_allowlist_releases_the_lock_before_disabling(self):
+    def test_disabling_for_an_empty_allowlist_happens_under_the_lock(self):
         with (
             mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
             mock.patch.object(yo.aws, "aws_allowlist", return_value=[]),
             mock.patch.object(
-                yo.aws, "disable_aws_broker", side_effect=self.seen("disable")
+                yo.aws,
+                "aws_broker_health",
+                return_value={"pid": 111, "watch_pid": 999, "allow": []},
             ),
+            mock.patch.object(yo.aws, "stop_broker", side_effect=self.seen("stop")),
+            mock.patch.object(yo.sshx, "ssh_run", side_effect=self.seen("rm")),
             mock.patch.object(yo.ui, "err"),
         ):
             self.assertFalse(yo.ensure_aws_broker())
-        self.assertEqual(self.held_during, {"disable": False})
+        self.assertEqual(self.held_during, {"stop": True, "rm": True})
+        self.assertFalse(self.lock_is_held())
+
+    def test_a_failing_step_releases_the_lock(self):
+        with (
+            mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
+            mock.patch.object(
+                yo.aws, "aws_allowlist", side_effect=yo.YoError("unreadable")
+            ),
+        ):
+            with self.assertRaises(yo.YoError):
+                yo.ensure_aws_broker()
+        self.assertFalse(self.lock_is_held())
 
 
 class TestPushConfigCommand(unittest.TestCase):
@@ -182,25 +186,19 @@ class TestPushConfigCommand(unittest.TestCase):
     def push(self, text, failing=()):
         """Run the command under sh with stdin at EOF, the shape of a dropped
         ssh; `failing` names commands replaced by ones that exit 1."""
-        bindir = os.path.join(self.tmp, "bin")
-        os.makedirs(bindir, exist_ok=True)
-        for name in failing:
-            fake = os.path.join(bindir, name)
-            with open(fake, "w") as handle:
-                handle.write("#!/bin/sh\nexit 1\n")
-            os.chmod(fake, 0o755)
+        _, path = fake_bin(self, {name: "#!/bin/sh\nexit 1\n" for name in failing})
         return subprocess.run(
             yo.aws.push_config_argv(self.config, text),
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            env={**os.environ, "PATH": bindir + ":" + os.environ["PATH"]},
+            env={**os.environ, "PATH": path},
         )
 
     def leftovers(self):
         return sorted(os.listdir(os.path.dirname(self.config)))
 
     def test_the_text_is_installed_verbatim_whatever_it_holds(self):
-        for text in ["", "a\n", '[profile x]\nregion = %s\n\'"$tmp" \\ \u00e9\n']:
+        for text in ["", "a\n", '[profile x]\nregion = %s\n\'"$tmp" \\ é\n']:
             with self.subTest(text=text):
                 done = self.push(text)
                 self.assertEqual(done.returncode, 0, done.stderr)

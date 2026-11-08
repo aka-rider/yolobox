@@ -1,0 +1,42 @@
+# The guest's egress table: the host and every private network are off limits,
+# except Lima's gateway (gvproxy's NAT to the host's own loopback) for DNS.
+# One atomic transaction: `table`, `delete table` and `table {..}` in one file,
+# so a reload swaps the rules with no instant at which the table is missing.
+#
+# The table judges destinations, not interfaces: every chain of the output hook
+# sees the interface of the route taken before the hook, and a DNAT that
+# reroutes does not update it, so oifname cannot say where a packet leaves.
+# Priority -20 runs after mangle (-150) and dstnat (-100), so the destination
+# judged here is the final one.
+#
+# 198.18.0.0/15: a fake-IP proxy's range, a relay to the LAN by name.
+# 64:ff9b:1::/48: local-use NAT64, a relay to the private v4 ranges.
+# Keep the two sets equal to linux/yolobox-host.nft's.
+define private_ip = { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }
+define private_ip6 = { fc00::/7, fe80::/10, ff00::/8, 64:ff9b:1::/48 }
+
+table inet yolobox-egress
+delete table inet yolobox-egress
+table inet yolobox-egress {
+  chain output {
+    type filter hook output priority -20; policy accept;
+    oifname { "lo", "tailscale0" } accept
+    ct direction reply accept
+    udp sport 68 udp dport 67 ip daddr { 255.255.255.255, 192.168.5.2 } accept
+    ip daddr 192.168.5.2 udp dport 53 accept
+    ip daddr 192.168.5.2 tcp dport 53 accept
+    icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+    # MLD reports go to link-local groups; ff02::/16 stops the accept passing one off the link.
+    icmpv6 type { mld-listener-report, mld2-listener-report } ip6 daddr ff02::/16 accept
+    ip daddr $private_ip limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
+    ip daddr $private_ip counter reject with icmpx type admin-prohibited
+    ip6 daddr $private_ip6 limit rate 6/minute burst 3 packets log prefix "yolobox-egress: blocked: " level warn
+    ip6 daddr $private_ip6 counter reject with icmpx type admin-prohibited
+  }
+  # The output hook sees only what the box itself sends; a routed packet takes
+  # the forward hook instead, so this chain drops it: the box routes for nobody.
+  chain forward {
+    type filter hook forward priority -20; policy drop;
+    limit rate 6/minute burst 3 packets log prefix "yolobox-egress: forward: " level warn
+  }
+}

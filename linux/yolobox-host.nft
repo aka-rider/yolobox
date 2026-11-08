@@ -11,11 +11,10 @@
 # the rule, and `!=` would not match it either, so those host packets would
 # fall through to the rejects. In `vm`, the host's loopback (where passt maps
 # the guest's gateway) is reachable on DNS only, and the private and
-# link-local ranges that nix/egress.nix blocks inside the guest are rejected
-# here too. Keep the two address sets equal to that file.
+# link-local ranges that nix/egress/yolobox-egress.nft blocks inside the guest
+# are rejected here too. Keep the two address sets equal to that file.
 # The table is defined, deleted and defined again in one file, so a reload
 # replaces it atomically and a failed load leaves the old table in place.
-# See linux/host-setup.md.
 
 table inet yolobox-host {}
 delete table inet yolobox-host

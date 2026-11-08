@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Optional, Sequence
 
-from . import guest, state, ui
+from . import guest, proc, state, ui
 from .config import AGENT_HOME
 from .sshx import AGENT
 from .ui import YoError
@@ -71,8 +71,8 @@ def dir_for_cwd() -> str:
     # Checked before it is sent: the helper is asked only for a path under the
     # guest home, with no newline a forged answer could hide behind.
     desired = guest_path(desired)
-    reported = guest.guest_helper_check(
-        guest.guest_helper(AGENT, "landing-dir", [desired]), "landing-dir"
+    reported = proc.checked(
+        guest.guest_helper(AGENT, "landing-dir", [desired]), "landing-dir", "on the box"
     ).stdout.strip("\n")
     landing = guest_path(reported)
     if landing != desired:

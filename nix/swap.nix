@@ -2,7 +2,7 @@
 let
   cfg = config.yolobox.swapSizeMiB;
   # What /var must keep after the swapfile grows: a full root disk breaks name
-  # resolution first and everything else after (docs/disk.md).
+  # resolution first (dhcpcd cannot write resolv.conf) and everything else after.
   reserveMiB = 1024;
   # NixOS's mkswap-var-swapfile unit recreates the file whenever its size
   # differs from `cfg`, on every boot, so an oversize value would fill the
@@ -15,7 +15,7 @@ let
     avail=$(${pkgs.coreutils}/bin/df --output=avail --block-size=1M /var | ${pkgs.coreutils}/bin/tail -n 1)
     need=$(( ${toString cfg} - current + ${toString reserveMiB} ))
     if [ "$current" -ne ${toString cfg} ] && [ "$avail" -lt "$need" ]; then
-      echo "refusing to grow /var/swapfile to ${toString cfg} MiB: /var has $avail MiB free, the growth needs $need MiB with a ${toString reserveMiB} MiB reserve; lower yolobox.swapSizeMiB in /etc/yolobox/local.nix (nix/base.md, Memory pressure)" >&2
+      echo "refusing to grow /var/swapfile to ${toString cfg} MiB: /var has $avail MiB free, the growth needs $need MiB with a ${toString reserveMiB} MiB reserve; lower yolobox.swapSizeMiB in /etc/yolobox/local.nix" >&2
       exit 1
     fi
   '';
@@ -27,8 +27,9 @@ in
     description = ''
       Size of /var/swapfile in MiB; 0 means no swap. A box on a small disk
       sets it in /etc/yolobox/local.nix, because the swapfile is allocated
-      in full on the root disk. Why the default is 16 GiB: nix/base.md,
-      "Memory pressure".
+      in full on the root disk. The default is 16 GiB so that reclaim has
+      somewhere to go before the kernel's OOM killer takes a user
+      manager and every rootless container with it.
     '';
   };
 

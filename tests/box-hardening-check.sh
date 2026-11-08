@@ -1,74 +1,45 @@
 #!/usr/bin/env bash
-# Acceptance check for the box-hardening change (nix/hardening.nix). Runs
-# INSIDE a yolobox guest, as the operator (the account with passwordless
-# sudo). The host driver tests/box-hardening-e2e.sh pipes it over `yo ssh`;
-# a person inside the box can run it directly.
+# Acceptance check for the box hardening (nix/hardening.nix). Runs INSIDE a
+# yolobox guest, as the operator (the account with passwordless sudo). The
+# host driver tests/box-hardening-e2e.sh pipes it over `yo ssh`; a person
+# inside the box can run it directly.
 #
-#   EXTRA_WRAPPERS="<wrapper>[=<caps>] ..." tests/box-hardening-check.sh
-#
-# EXTRA_WRAPPERS: space-separated setuid/capability wrappers a box adds
-#   through yolobox.hardening.extraWrappers in its /etc/yolobox/local.nix.
-#   Each is a name, or name=caps with the capability names getcap shows,
-#   comma-separated, in any order (dumpcap=cap_net_raw,cap_setpcap). A bare
-#   name means the wrapper carries none. A name of the allowlist is refused,
-#   as the rebuild refuses it.
-# EXTRA_AGENT_GROUPS: space-separated groups a box's local.nix adds the agent
-#   to, beside users.
-# TAILSCALE_VERSION: the version nix/pkgs/tailscale.nix pins; unset, the
-#   box's tailscale is not compared (SKIP).
-# ONLY=hardening | ONLY=compat: run just one half. Unset runs both. The
-#   compat half ("nothing the agent needs broke") is the one to iterate on
-#   against a box that is not hardened yet.
+# The expected values (the wrapper set and each wrapper's capabilities, the
+# agent's account and groups, the sysctls, the kernel parameters, /proc's
+# mount options) come from the box itself: nix/hardening.nix renders them
+# into /etc/yolobox/facts.sh from the same values it asserts on at eval time.
 #
 # The hardening half proves the box holds against the agent: sysctls, kernel
 # parameters, blocked modules (sockets and link kinds), io_uring, the
 # wrapper set and each wrapper's privilege, no setuid su, sudo closed to the
 # agent, root and the agent locked, the agent's groups, /proc hiding every
-# other account's pids from the agent, the 1Password proxy
-# confined, sshd's settings, the tailscale pin, no forwarding, the gateway's
-# ssh port closed to the agent and to its containers, both accounts refused
-# off the gateway to the agent's forwarded 1Password agent (SKIP, and
-# nothing tested, when that agent lists no key), the agent's own
-# authorized_keys ignored by sshd's configuration, and tmpfiles refusing a
-# symlink of the agent's into /etc. Its probes run as the agent WITHOUT the
-# agent's login shell, since the agent edits that shell's rc files and PATH.
+# other account's pids from the agent, the 1Password proxy confined, sshd's
+# settings, no forwarding, the gateway's ssh port closed to the agent and to
+# its containers, both accounts refused off the gateway to the agent's
+# forwarded 1Password agent (SKIP, and nothing tested, when that agent lists
+# no key), the agent's own authorized_keys ignored by sshd's configuration,
+# and tmpfiles refusing a symlink of the agent's into /etc. Its probes run as
+# the agent WITHOUT the agent's login shell, since the agent edits that
+# shell's rc files and PATH.
 #
-# The compat half proves nothing the agent needs broke: net-check, the kept
-# qdisc, podman, chromium, a nix build, strace -p, the harness binaries, the
-# herdr server's oom_score_adj, the agent's user manager, logind and the
-# system bus answering the agent, rosetta on an aarch64 guest, the host OS stamp
-# absent, the Lima guest agent running exactly when Lima's cidata ships it,
-# `yolobox-guest rebuild` present, github.com's host key pinned.
+# The compat half proves nothing the agent needs broke: the kept qdisc,
+# podman, chromium, a nix build, strace -p, the harness binaries, the herdr
+# server's oom_score_adj, the agent's user manager, logind and the system bus
+# answering the agent, rosetta on an aarch64 guest, the Lima guest agent
+# running exactly when Lima's cidata ships it, `yolobox-guest rebuild` present.
 #
 # It stops at the first broken property and names it. There is no python in
-# the box, so socket probes use perl and JSON uses jq.
+# the box, so socket probes use perl.
 set -Eeuo pipefail
 # No globbing: the unquoted word lists below (wrapper names) must stay literal.
 set -f
 
-# Wrappers a hardened box keeps (nix/hardening.nix keptWrappers). Anything else in
-# /run/wrappers/bin is an unexpected setuid/capability binary.
-readonly WRAPPER_ALLOWLIST="sudo sudoedit unix_chkpwd newuidmap newgidmap"
+readonly FACTS=/etc/yolobox/facts.sh
 readonly WRAPPERS=/run/wrappers/bin
 readonly SYSBIN=/run/current-system/sw/bin
-# The agent account (flake.nix agentUser, nix/base.nix) and the forwarded
-# 1Password agent it reaches (nix/lib/agent-env.nix SSH_AUTH_SOCK).
-readonly AGENT_USER=agent
-readonly AGENT_UID=1000
-readonly AGENT_AUTH_SOCK=/run/yolobox/op-agent.sock
 readonly HK_NET=hk-test
-# The addresses of the box's own network (nix/egress.nix, libvirt/domain.xml):
-# the gateway is the host's loopback, the guest's address is enp0s1's.
-readonly GATEWAY_ADDR=192.168.5.2
-readonly GUEST_ADDR=192.168.5.15
 # What sshd logs when AllowUsers refuses a name (openssh auth.c allowed_user).
 readonly ALLOWUSERS_REFUSAL="not allowed because not listed in AllowUsers"
-# The root-run command sshd reads the agent's keys from (nix/base.nix).
-readonly AGENT_KEYS_COMMAND=/etc/ssh/agent-authorized-keys
-# /proc's mount options: nixpkgs' three defaults, then the two
-# nix/hardening.nix procOptions adds; gid=1 is wheel, the one group that sees
-# every pid.
-readonly PROC_OPTIONS="nosuid noexec nodev hidepid=invisible gid=1"
 
 WORK=""
 AGENT_HOME=""
@@ -77,7 +48,6 @@ NET_CREATED=""
 PROBE_OUT=""
 WRAPPER_CAPS=""
 ZED_STAMP_DIR=""
-EXTRA_NAMES=()
 
 fail() {
     echo "FAIL: $*" >&2
@@ -108,7 +78,7 @@ trap 'echo "FAIL: unexpected error at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 # except `$`. So callers pass plain words only; anything with quotes or `$`
 # lives in a file under $WORK and is passed by path.
 as_agent() {
-    sudo -n -iu "${AGENT_USER}" env "XDG_RUNTIME_DIR=/run/user/${AGENT_UID}" "$@"
+    sudo -n -iu "${YOLOBOX_AGENT_USER}" env "XDG_RUNTIME_DIR=/run/user/${YOLOBOX_AGENT_UID}" "$@"
 }
 
 # Run a command as the agent with nothing of the agent's own in the way. The
@@ -118,7 +88,7 @@ as_agent() {
 # callers name every binary by its ${SYSBIN} path. Arguments reach the command
 # verbatim, so quotes and `$` are fine here.
 as_agent_bare() {
-    sudo -n -u "${AGENT_USER}" "${SYSBIN}/env" -i "PATH=${SYSBIN}" "HOME=${AGENT_HOME}" "$@"
+    sudo -n -u "${YOLOBOX_AGENT_USER}" "${SYSBIN}/env" -i "PATH=${SYSBIN}" "HOME=${AGENT_HOME}" "$@"
 }
 
 cleanup() {
@@ -140,71 +110,27 @@ cleanup() {
     exit "${status}"
 }
 
-# EXTRA_WRAPPERS, checked once: each word is a name, or name=caps, and no
-# name is on the allowlist (the rebuild refuses that too: the table already
-# fixes the privilege of those). Leaves the names in EXTRA_NAMES.
-parse_extra_wrappers() {
-    local extra name
-    for extra in ${EXTRA_WRAPPERS:-}; do
-        name=${extra%%=*}
-        case ${extra} in
-        *[!A-Za-z0-9._,=-]* | =* | *=) fail "EXTRA_WRAPPERS entry '${extra}' is not name or name=cap_a,cap_b" ;;
-        esac
-        case " ${WRAPPER_ALLOWLIST} " in
-        *" ${name} "*) fail "EXTRA_WRAPPERS names ${name}, which is on the allowlist; the rebuild refuses that too" ;;
-        esac
-        EXTRA_NAMES+=("${name}")
+# The facts the box renders from facts.json and nix/hardening.nix: KEY=value
+# lines, one per expected value. A missing file or key is a broken box, not a
+# value to default.
+load_facts() {
+    local key
+    [ -r "${FACTS}" ] || fail "${FACTS} is missing or unreadable: the box renders it from facts.json"
+    # shellcheck disable=SC1090
+    . "${FACTS}"
+    for key in YOLOBOX_AGENT_USER YOLOBOX_AGENT_UID YOLOBOX_AGENT_GROUPS YOLOBOX_WRAPPERS \
+        YOLOBOX_SYSCTLS YOLOBOX_KERNEL_PARAMS YOLOBOX_PROC_OPTIONS YOLOBOX_AGENT_AUTH_SOCK \
+        YOLOBOX_GATEWAY YOLOBOX_GUEST_ADDR YOLOBOX_GUEST_NIC YOLOBOX_AGENT_KEYS_COMMAND YOLOBOX_OP_AGENT_PROXY_UNIT; do
+        [ -n "${!key:-}" ] || fail "${FACTS} does not set ${key}"
     done
-}
-
-# The capabilities EXTRA_WRAPPERS states for a wrapper, sorted; "" when it
-# states none or does not name the wrapper.
-extra_caps_of() {
-    local name=$1 extra
-    for extra in ${EXTRA_WRAPPERS:-}; do
-        case ${extra} in
-        "${name}="*)
-            sorted_caps <<<"${extra#*=}"
-            return
-            ;;
-        esac
-    done
-    echo ""
 }
 
 # ---------------------------------------------------------------- hardening
 
+# Every sysctl nix/hardening.nix sets reads back its value.
 check_sysctls() {
     local pair name want got
-    # The sysctls nix/hardening.nix sets, plus kexec_load_disabled (from
-    # security.protectKernelImage) and ptrace_scope, which must stay 0 (a
-    # CONSTITUTION rule). The port floor is nix/hardening.nix's mkForce
-    # statement: nixos-lima's 0 would let the agent bind port 22.
-    for pair in \
-        kernel.kptr_restrict=2 \
-        kernel.unprivileged_bpf_disabled=1 \
-        net.core.bpf_jit_harden=2 \
-        kernel.io_uring_disabled=2 \
-        dev.tty.ldisc_autoload=0 \
-        dev.tty.legacy_tiocsti=0 \
-        fs.protected_fifos=2 \
-        fs.protected_regular=2 \
-        fs.suid_dumpable=0 \
-        kernel.kexec_load_disabled=1 \
-        kernel.yama.ptrace_scope=0 \
-        net.ipv4.conf.all.accept_redirects=0 \
-        net.ipv4.conf.default.accept_redirects=0 \
-        net.ipv4.conf.all.secure_redirects=0 \
-        net.ipv4.conf.default.secure_redirects=0 \
-        net.ipv4.conf.all.send_redirects=0 \
-        net.ipv4.conf.default.send_redirects=0 \
-        net.ipv4.conf.all.accept_source_route=0 \
-        net.ipv4.conf.default.accept_source_route=0 \
-        net.ipv6.conf.all.accept_redirects=0 \
-        net.ipv6.conf.default.accept_redirects=0 \
-        net.ipv6.conf.all.accept_source_route=0 \
-        net.ipv6.conf.default.accept_source_route=0 \
-        net.ipv4.ip_unprivileged_port_start=1024; do
+    for pair in ${YOLOBOX_SYSCTLS}; do
         name=${pair%%=*}
         want=${pair#*=}
         got=$(sudo -n sysctl -n "${name}") || fail "sysctl ${name} is unreadable"
@@ -222,12 +148,11 @@ check_ip_forward() {
     ok "net.ipv4.ip_forward is 0"
 }
 
+# Every parameter the box's boot.kernelParams names is on the command line.
 check_cmdline() {
     local cmdline param
     cmdline=$(cat /proc/cmdline)
-    # The first three are boot.kernelParams in nix/hardening.nix (a consistency
-    # test compares them); nohibernate comes from security.protectKernelImage.
-    for param in slab_nomerge page_alloc.shuffle=1 debugfs=off nohibernate; do
+    for param in ${YOLOBOX_KERNEL_PARAMS}; do
         grep -qxF -- "${param}" <<<"${cmdline// /$'\n'}" ||
             fail "kernel parameter ${param} is missing from /proc/cmdline: ${cmdline}"
         ok "kernel parameter ${param} is on the command line"
@@ -476,32 +401,40 @@ read_wrapper_caps() {
     WRAPPER_CAPS=$(sorted_caps <<<"${BASH_REMATCH[2]}")
 }
 
+# The capability names YOLOBOX_WRAPPERS states for a wrapper (name=caps words,
+# "" for a setuid-root one), sorted.
+expected_caps_of() {
+    local name=$1 word
+    for word in ${YOLOBOX_WRAPPERS}; do
+        case ${word} in
+        "${name}="*)
+            sorted_caps <<<"${word#*=}"
+            return
+            ;;
+        esac
+    done
+    fail "YOLOBOX_WRAPPERS names no ${name}"
+}
+
 check_wrappers() {
-    local allowlist have want name path caps expected_caps stat owner group mode
-    read -ra allowlist <<<"${WRAPPER_ALLOWLIST}"
+    local have want name path caps expected_caps stat owner group mode
     # The trailing slash: /run/wrappers/bin is a symlink to the generation's
     # directory, and find does not follow its start point without it.
     have=$(find "${WRAPPERS}/" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
     [ -n "${have}" ] || fail "found no wrappers under ${WRAPPERS}, so the wrapper set cannot be checked"
-    want=$(printf '%s\n' "${allowlist[@]}" "${EXTRA_NAMES[@]}" | LC_ALL=C sort -u)
-    [ "${have}" = "${want}" ] || fail "${WRAPPERS} differs from the allowlist (< unexpected, > missing)
+    want=$(for name in ${YOLOBOX_WRAPPERS}; do echo "${name%%=*}"; done | LC_ALL=C sort -u)
+    [ "${have}" = "${want}" ] || fail "${WRAPPERS} differs from the kept set (< unexpected, > missing)
 $(diff <(printf '%s\n' "${have}") <(printf '%s\n' "${want}") || true)"
     ok "wrapper set is exactly: ${want//$'\n'/ }"
 
-    # Each wrapper's privilege, as nix/hardening.nix states it: root's, never
-    # setgid, setuid exactly when it carries no capability, and sudo's pair
+    # Each wrapper's privilege: root's, never setgid, setuid exactly when it
+    # carries no capability, the capabilities the box states, and sudo's pair
     # closed to anyone outside wheel (security.sudo.execWheelOnly).
     for name in ${have}; do
         path="${WRAPPERS}/${name}"
         read_wrapper_caps "${path}"
         caps=${WRAPPER_CAPS}
-        case ${name} in
-        # nixpkgs grants cap_setpcap beside the one the name suggests
-        # (getcap: "newuidmap cap_setuid,cap_setpcap=ep").
-        newuidmap) expected_caps=cap_setpcap,cap_setuid ;;
-        newgidmap) expected_caps=cap_setgid,cap_setpcap ;;
-        *) expected_caps=$(extra_caps_of "${name}") ;;
-        esac
+        expected_caps=$(expected_caps_of "${name}")
         [ "${caps}" = "${expected_caps}" ] ||
             fail "wrapper ${name} has capabilities '${caps}', want '${expected_caps}'"
         stat=$(stat -c '%U %G %a' "${path}") || fail "cannot stat ${path}"
@@ -550,12 +483,12 @@ check_sudo_refuses_agent() {
     ok "the agent cannot run sudo (${out})"
 }
 
-# nix/base.nix locks root and the agent on every activation, and keeps the
-# agent out of every supplementary group (systemd-journal would show it the
+# nix/base.nix locks root and the agent on every activation, and the agent
+# holds exactly the groups the box states (systemd-journal would show it the
 # operator's sudo lines).
 check_accounts_locked() {
     local account entry field groups want
-    for account in root "${AGENT_USER}"; do
+    for account in root "${YOLOBOX_AGENT_USER}"; do
         entry=$(sudo -n getent shadow "${account}") || fail "no shadow entry for ${account}"
         field=${entry#*:}
         field=${field%%:*}
@@ -564,27 +497,27 @@ check_accounts_locked() {
         *) fail "the password of ${account} is not locked (shadow field '${field}')" ;;
         esac
     done
-    ok "root and ${AGENT_USER} have locked passwords"
-    groups=$(id -Gn "${AGENT_USER}" | tr ' ' '\n' | LC_ALL=C sort -u | paste -sd' ' -) || fail "id -Gn ${AGENT_USER} failed"
-    want=$(tr ' ' '\n' <<<"users ${EXTRA_AGENT_GROUPS:-}" | grep . | LC_ALL=C sort -u | paste -sd' ' -)
-    [ "${groups}" = "${want}" ] || fail "${AGENT_USER} is in groups '${groups}', want '${want}' (users plus EXTRA_AGENT_GROUPS)"
-    [ "$(id -u "${AGENT_USER}")" = "${AGENT_UID}" ] || fail "${AGENT_USER} is not uid ${AGENT_UID}"
-    ok "${AGENT_USER} is uid ${AGENT_UID} in the groups: ${want}"
+    ok "root and ${YOLOBOX_AGENT_USER} have locked passwords"
+    groups=$(id -Gn "${YOLOBOX_AGENT_USER}" | tr ' ' '\n' | LC_ALL=C sort -u | paste -sd' ' -) || fail "id -Gn ${YOLOBOX_AGENT_USER} failed"
+    want=$(tr ' ' '\n' <<<"${YOLOBOX_AGENT_GROUPS}" | LC_ALL=C sort -u | paste -sd' ' -)
+    [ "${groups}" = "${want}" ] || fail "${YOLOBOX_AGENT_USER} is in groups '${groups}', want '${want}'"
+    [ "$(id -u "${YOLOBOX_AGENT_USER}")" = "${YOLOBOX_AGENT_UID}" ] || fail "${YOLOBOX_AGENT_USER} is not uid ${YOLOBOX_AGENT_UID}"
+    ok "${YOLOBOX_AGENT_USER} is uid ${YOLOBOX_AGENT_UID} in the groups: ${want}"
 }
 
-# /proc is mounted with hidepid (nix/hardening.nix procOptions), so the agent
-# sees no pid but its own: not root's, not the operator's. The mount is read
-# back whole first, because a lost nosuid or gid= is as much a regression as
-# a lost hidepid. Then the agent is made to look: at pid 1, at this operator
-# shell, and at the whole table through ps.
+# /proc is mounted with hidepid, so the agent sees no pid but its own: not
+# root's, not the operator's. The mount is read back whole first, because a
+# lost nosuid or gid= is as much a regression as a lost hidepid. Then the
+# agent is made to look: at pid 1, at this operator shell, and at the whole
+# table through ps.
 check_hidepid() {
     local options opt pid out users
     options=$(findmnt -no OPTIONS /proc) || fail "findmnt -no OPTIONS /proc failed: the mount cannot be read back"
     [ -n "${options}" ] || fail "findmnt printed no options for /proc"
-    for opt in ${PROC_OPTIONS}; do
+    for opt in ${YOLOBOX_PROC_OPTIONS}; do
         grep -qxF -- "${opt}" <<<"${options//,/$'\n'}" || fail "/proc is mounted without ${opt}: ${options}"
     done
-    ok "/proc is mounted with ${PROC_OPTIONS// /,}"
+    ok "/proc is mounted with ${YOLOBOX_PROC_OPTIONS// /,}"
     for pid in 1 $$; do
         if out=$(as_agent_bare "${SYSBIN}/ls" "/proc/${pid}" 2>&1); then
             fail "the agent listed /proc/${pid} (${out//$'\n'/ })"
@@ -596,24 +529,24 @@ check_hidepid() {
     done
     users=$(as_agent_bare "${SYSBIN}/ps" -eo user= | awk '{ print $1 }' | LC_ALL=C sort -u | paste -sd' ' -) ||
         fail "ps -eo user failed as the agent"
-    [ "${users}" = "${AGENT_USER}" ] || fail "ps as the agent lists the processes of '${users}', want ${AGENT_USER} alone"
-    ok "the agent sees neither /proc/1 nor /proc/$$ (the operator's shell), and ps shows it ${AGENT_USER}'s processes alone"
+    [ "${users}" = "${YOLOBOX_AGENT_USER}" ] || fail "ps as the agent lists the processes of '${users}', want ${YOLOBOX_AGENT_USER} alone"
+    ok "the agent sees neither /proc/1 nor /proc/$$ (the operator's shell), and ps shows it ${YOLOBOX_AGENT_USER}'s processes alone"
 }
 
 # The forwarded 1Password socket reaches the agent through a proxy unit
-# (nix/base.nix, docs/ssh.md) that must hold nothing but the two sockets: no
+# (nix/base.nix) that must hold nothing but the two sockets: no
 # writable system, no homes, no network, unix sockets only. The positive
 # control is that the agent still reaches the agent behind it: ssh-add -L
 # exits 0 with keys, 1 with none, and 2 when the socket is dead.
 check_proxy_confined() {
-    local unit=yolobox-op-agent.service props want got keys status=0
+    local unit=${YOLOBOX_OP_AGENT_PROXY_UNIT}.service props want got keys status=0
     props=$(systemctl show -p ProtectSystem,ProtectHome,PrivateNetwork,RestrictAddressFamilies "${unit}") ||
         fail "could not read the confinement of ${unit}"
     for want in ProtectSystem=strict ProtectHome=yes PrivateNetwork=yes RestrictAddressFamilies=AF_UNIX; do
         got=$(sed -n "s/^${want%%=*}=//p" <<<"${props}")
         [ "${got}" = "${want#*=}" ] || fail "${unit} has ${want%%=*}=${got}, want ${want#*=}"
     done
-    keys=$(as_agent_bare "SSH_AUTH_SOCK=${AGENT_AUTH_SOCK}" "${SYSBIN}/ssh-add" -L 2>&1) || status=$?
+    keys=$(as_agent_bare "SSH_AUTH_SOCK=${YOLOBOX_AGENT_AUTH_SOCK}" "${SYSBIN}/ssh-add" -L 2>&1) || status=$?
     [ "${status}" -le 1 ] || fail "ssh-add -L through the confined ${unit} exited ${status}: ${keys}"
     ok "${unit} is confined (strict, no homes, no network, AF_UNIX) and the agent still reaches the forwarded ssh agent"
 }
@@ -631,23 +564,9 @@ check_sshd_settings() {
     ok "sshd runs internal-sftp and permits no root login"
 }
 
-# The box runs the tailscale nix/pkgs/tailscale.nix pins. The pin's version
-# comes in TAILSCALE_VERSION (the e2e driver reads it from the checkout);
-# unset, nothing is compared.
-check_tailscale_version() {
-    local got
-    if [ -z "${TAILSCALE_VERSION:-}" ]; then
-        echo "SKIP: tailscale's version was NOT compared: TAILSCALE_VERSION is unset" >&2
-        return
-    fi
-    got=$(tailscale version | head -n 1) || fail "tailscale version failed"
-    [ "${got}" = "${TAILSCALE_VERSION}" ] || fail "tailscale is ${got}, the pin says ${TAILSCALE_VERSION}"
-    ok "tailscale is the pinned ${TAILSCALE_VERSION}"
-}
-
 # podman as the agent, with the runtime directory rootless podman needs.
 agent_podman() {
-    as_agent_bare "XDG_RUNTIME_DIR=/run/user/${AGENT_UID}" "${SYSBIN}/podman" "$@"
+    as_agent_bare "XDG_RUNTIME_DIR=/run/user/${YOLOBOX_AGENT_UID}" "${SYSBIN}/podman" "$@"
 }
 
 # A rootless container's traffic is the agent's, so the egress table must
@@ -661,10 +580,10 @@ check_container_egress() {
     for network in "" --network=host; do
         # ${network} is one option or nothing; an empty word would be an image name.
         # shellcheck disable=SC2086
-        if out=$(agent_podman run --rm ${network} docker.io/library/busybox nc -z -w 3 "${GATEWAY_ADDR}" 22 2>&1); then
-            fail "a rootless container${network:+ on ${network}} connected to ${GATEWAY_ADDR}:22"
+        if out=$(agent_podman run --rm ${network} docker.io/library/busybox nc -z -w 3 "${YOLOBOX_GATEWAY}" 22 2>&1); then
+            fail "a rootless container${network:+ on ${network}} connected to ${YOLOBOX_GATEWAY}:22"
         fi
-        ok "a rootless container${network:+ on ${network}} cannot reach ${GATEWAY_ADDR}:22 (${out})"
+        ok "a rootless container${network:+ on ${network}} cannot reach ${YOLOBOX_GATEWAY}:22 (${out})"
     done
 }
 
@@ -696,8 +615,8 @@ restore_zed() {
     ZED_STAMP_DIR=""
 }
 
-# The tmpfiles rules that link files into the agent's home (nix/lib/
-# home-tmpfiles.nix) run as root. With ~/.config/zed pointed at /etc by the
+# The tmpfiles rules that link files into the agent's home run as root. With
+# ~/.config/zed pointed at /etc by the
 # agent, systemd-tmpfiles must refuse the path (an unsafe transition from
 # the agent's home into root's directory) rather than write
 # /etc/settings.json. The positive control is the same run passing once the
@@ -724,15 +643,15 @@ check_tmpfiles_refuses_agent_symlink() {
 # The gateway is the host's own loopback, so a connection to its port 22 would
 # reach the host's sshd. The egress table must refuse it for the agent.
 check_gateway_ssh_closed() {
-    agent_probe "the agent connected to ${GATEWAY_ADDR}:22, the host's loopback" \
-        "${WORK}/tcp.pl" "${GATEWAY_ADDR}" 22
-    ok "the agent cannot reach ${GATEWAY_ADDR}:22 (${PROBE_OUT})"
+    agent_probe "the agent connected to ${YOLOBOX_GATEWAY}:22, the host's loopback" \
+        "${WORK}/tcp.pl" "${YOLOBOX_GATEWAY}" 22
+    ok "the agent cannot reach ${YOLOBOX_GATEWAY}:22 (${PROBE_OUT})"
 }
 
 # ssh as the agent, with the forwarded agent and nothing of the agent's own:
 # no ~/.ssh/config, no known hosts. The target's identity is not the question.
 agent_ssh() {
-    as_agent_bare "SSH_AUTH_SOCK=${AGENT_AUTH_SOCK}" "${SYSBIN}/ssh" -F /dev/null \
+    as_agent_bare "SSH_AUTH_SOCK=${YOLOBOX_AGENT_AUTH_SOCK}" "${SYSBIN}/ssh" -F /dev/null \
         -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=5 "$@"
 }
@@ -779,18 +698,18 @@ check_logins_refused_off_gateway() {
     local operator=$1 user addr out keys keys_status=0 cursor journal
     # ssh-add -L exits 1 when the agent lists no identity and 2 when it cannot
     # reach the agent; only the first is a SKIP.
-    keys=$(as_agent_bare "SSH_AUTH_SOCK=${AGENT_AUTH_SOCK}" "${SYSBIN}/ssh-add" -L 2>&1) || keys_status=$?
+    keys=$(as_agent_bare "SSH_AUTH_SOCK=${YOLOBOX_AGENT_AUTH_SOCK}" "${SYSBIN}/ssh-add" -L 2>&1) || keys_status=$?
     case ${keys_status} in
     0) ;;
     1)
-        echo "SKIP: sshd's refusal of ${operator} and ${AGENT_USER} off the gateway was NOT tested: the agent's forwarded ssh agent lists no key (ssh-add -L: ${keys}). Connect with an ssh agent forwarded and run this again" >&2
+        echo "SKIP: sshd's refusal of ${operator} and ${YOLOBOX_AGENT_USER} off the gateway was NOT tested: the agent's forwarded ssh agent lists no key (ssh-add -L: ${keys}). Connect with an ssh agent forwarded and run this again" >&2
         return
         ;;
     *) fail "ssh-add -L exited ${keys_status}: the agent's ssh agent socket is unreachable (${keys})" ;;
     esac
     cursor=$(sshd_journal_cursor)
-    for user in "${operator}" "${AGENT_USER}"; do
-        for addr in 127.0.0.1 "${GUEST_ADDR}"; do
+    for user in "${operator}" "${YOLOBOX_AGENT_USER}"; do
+        for addr in 127.0.0.1 "${YOLOBOX_GUEST_ADDR}"; do
             if out=$(agent_ssh "${user}@${addr}" true 2>&1); then
                 fail "the agent logged in as ${user} at ${addr} with its forwarded agent"
             fi
@@ -810,9 +729,9 @@ check_logins_refused_off_gateway() {
 # address over loopback. -C matches the rule by meaning; `iptables -S` prints
 # its options in another order than the one the unit adds them in.
 check_gateway_spoof_dropped() {
-    sudo -n iptables -C nixos-fw ! -i enp0s1 -s "${GATEWAY_ADDR}" -j DROP ||
-        fail "nixos-fw has no rule dropping ${GATEWAY_ADDR} off enp0s1: $(sudo -n iptables -S nixos-fw)"
-    ok "nixos-fw drops packets claiming ${GATEWAY_ADDR} on any interface but enp0s1"
+    sudo -n iptables -C nixos-fw ! -i "${YOLOBOX_GUEST_NIC}" -s "${YOLOBOX_GATEWAY}" -j DROP ||
+        fail "nixos-fw has no rule dropping ${YOLOBOX_GATEWAY} off ${YOLOBOX_GUEST_NIC}: $(sudo -n iptables -S nixos-fw)"
+    ok "nixos-fw drops packets claiming ${YOLOBOX_GATEWAY} on any interface but ${YOLOBOX_GUEST_NIC}"
 }
 
 # ~agent/.ssh/authorized_keys is the agent's to write, so sshd must not read
@@ -825,15 +744,15 @@ check_gateway_spoof_dropped() {
 # -C), and the command being root's and writable by nobody else.
 check_agent_authorized_keys_ignored() {
     local config setting owner_mode
-    config=$(sudo -n sshd -T -C "user=${AGENT_USER},addr=${GATEWAY_ADDR},host=${GATEWAY_ADDR}") ||
-        fail "sshd -T -C for ${AGENT_USER} from ${GATEWAY_ADDR} failed"
-    for setting in "authorizedkeysfile none" "authorizedkeyscommand ${AGENT_KEYS_COMMAND}" "authorizedkeyscommanduser root"; do
+    config=$(sudo -n sshd -T -C "user=${YOLOBOX_AGENT_USER},addr=${YOLOBOX_GATEWAY},host=${YOLOBOX_GATEWAY}") ||
+        fail "sshd -T -C for ${YOLOBOX_AGENT_USER} from ${YOLOBOX_GATEWAY} failed"
+    for setting in "authorizedkeysfile none" "authorizedkeyscommand ${YOLOBOX_AGENT_KEYS_COMMAND}" "authorizedkeyscommanduser root"; do
         grep -qix -- "${setting}" <<<"${config}" ||
-            fail "sshd -T for ${AGENT_USER} from ${GATEWAY_ADDR} lacks '${setting}': $(grep -i '^authorizedkeys' <<<"${config}")"
+            fail "sshd -T for ${YOLOBOX_AGENT_USER} from ${YOLOBOX_GATEWAY} lacks '${setting}': $(grep -i '^authorizedkeys' <<<"${config}")"
     done
-    owner_mode=$(stat -c '%U %a' "${AGENT_KEYS_COMMAND}") || fail "cannot stat ${AGENT_KEYS_COMMAND}"
-    [ "${owner_mode}" = "root 555" ] || fail "${AGENT_KEYS_COMMAND} is ${owner_mode}, want root 555"
-    ok "sshd reads the agent's keys from root's ${AGENT_KEYS_COMMAND} and from no authorized_keys file"
+    owner_mode=$(stat -c '%U %a' "${YOLOBOX_AGENT_KEYS_COMMAND}") || fail "cannot stat ${YOLOBOX_AGENT_KEYS_COMMAND}"
+    [ "${owner_mode}" = "root 555" ] || fail "${YOLOBOX_AGENT_KEYS_COMMAND} is ${owner_mode}, want root 555"
+    ok "sshd reads the agent's keys from root's ${YOLOBOX_AGENT_KEYS_COMMAND} and from no authorized_keys file"
 }
 
 hardening_checks() {
@@ -851,7 +770,6 @@ hardening_checks() {
     check_hidepid
     check_proxy_confined
     check_sshd_settings
-    check_tailscale_version
     check_gateway_ssh_closed
     check_container_egress
     check_logins_refused_off_gateway "$(id -un)"
@@ -862,24 +780,8 @@ hardening_checks() {
 
 # ------------------------------------------------------------ nothing broke
 
-check_net() {
-    local out
-    out=$(yolobox-guest net-check) || fail "yolobox-guest net-check exited nonzero: ${out}"
-    grep -qx 'egress=ok' <<<"${out}" || fail "net-check: want egress=ok, got: ${out}"
-    ok "net-check: egress=ok"
-}
-
-# The guest gates each host difference on the fact it needs, so nothing tells
-# it which OS runs it (nix/base.md, "No host OS in the guest"). A box built
-# before that carried the stamp; a rebuild removes it.
-check_no_host_os_stamp() {
-    [ ! -e /etc/yolobox/host-os ] ||
-        fail "/etc/yolobox/host-os exists: the box was built by a flake that told it its host OS"
-    ok "the box holds no host OS stamp"
-}
-
 # nixos-lima links /etc/environment into root's 0700 cidata mount, which every
-# user manager then fails to read (nix/base.md, "/etc/environment").
+# user manager then fails to read.
 check_etc_environment() {
     if [ -L /etc/environment ] || [ -e /etc/environment ]; then
         cat /etc/environment >/dev/null ||
@@ -890,7 +792,7 @@ check_etc_environment() {
 
 # The initrd mounts cidata, and mount creates /run/mount, which outlives
 # switch-root. A 0700 one denies every user manager its mount watch
-# (docs/disk-encryption.md, "The initrd network").
+# ("Failed to acquire watch file descriptor" in every user manager's log).
 check_run_mount() {
     local mode
     mode=$(stat -c %a /run/mount) || fail "cannot stat /run/mount"
@@ -928,24 +830,6 @@ check_guestagent() {
         fail "the cidata has no guest agent, but ${unit} has ConditionResult=${result}, not no"
     [ "${state}" != failed ] || fail "the cidata has no guest agent, and ${unit} failed"
     ok "${unit} is skipped: the cidata has no guest agent binary"
-}
-
-# The agent's first `git clone git@github.com:...` must not stop at a
-# trust-on-first-use prompt: /etc/ssh/ssh_known_hosts pins github.com
-# (nix/base.md). An empty user known_hosts leaves only that file to vouch.
-check_github_host_keys() {
-    local out status=0
-    ssh-keygen -F github.com -f /etc/ssh/ssh_known_hosts >/dev/null ||
-        fail "/etc/ssh/ssh_known_hosts has no github.com key"
-    out=$(as_agent ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
-        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -T git@github.com 2>&1) || status=$?
-    case ${out} in
-    *"Host key verification failed"*)
-        fail "the agent does not trust github.com's host key from /etc/ssh/ssh_known_hosts: ${out}" ;;
-    *"successfully authenticated"* | *"Permission denied"*) ;;
-    *) fail "ssh to github.com as the agent ended neither in auth nor a refusal (exit ${status}): ${out}" ;;
-    esac
-    ok "the agent trusts github.com's host key without a prompt"
 }
 
 # The in-box rebuild chokepoint exists and refuses a call without an action.
@@ -1034,9 +918,9 @@ check_strace() {
 # The network flag and the user manager are started first for the same reason:
 # each start blocks until its unit is up, and is a no-op when it already is.
 await_harness_install() {
-    sudo -n systemctl start yolobox-network-ready.service "user@${AGENT_UID}.service" ||
+    sudo -n systemctl start yolobox-network-ready.service "user@${YOLOBOX_AGENT_UID}.service" ||
         fail "the network flag or the agent's user manager did not start"
-    sudo -n systemctl --user -M "${AGENT_USER}@" start yolobox-harness-install.service ||
+    sudo -n systemctl --user -M "${YOLOBOX_AGENT_USER}@" start yolobox-harness-install.service ||
         fail "yolobox-harness-install failed; see: journalctl --user -u yolobox-harness-install"
     ok "yolobox-harness-install finished"
 }
@@ -1050,14 +934,14 @@ check_vendors() {
     done
 }
 
-# user@.service has OOMScoreAdjust=-500 (nix/base.md, "Memory pressure"), which
+# user@.service has OOMScoreAdjust=-500, which
 # every process under the agent's user manager inherits unless its unit sets
 # its own. The herdr server and the panes it forks are the heavy, restartable
 # part of a session, so a -500 there would make them the last thing the kernel
 # kills, behind the manager that holds them. nix/herd-server.nix sets 0.
 check_herdr_server_oom_score() {
     local unit=herdr-server.service pid score
-    pid=$(sudo -n systemctl --user -M "${AGENT_USER}@" show -p MainPID --value "${unit}") ||
+    pid=$(sudo -n systemctl --user -M "${YOLOBOX_AGENT_USER}@" show -p MainPID --value "${unit}") ||
         fail "could not read the main pid of the agent's ${unit}"
     [ "${pid}" -gt 0 ] || fail "the agent's ${unit} is not running"
     score=$(sudo -n cat "/proc/${pid}/oom_score_adj") ||
@@ -1075,8 +959,8 @@ check_agent_session_services() {
     local state
     state=$(as_agent systemctl --user is-active herdr-server) ||
         fail "herdr-server is ${state:-unknown} under the agent's user manager"
-    as_agent loginctl --no-pager user-status "${AGENT_USER}" >/dev/null ||
-        fail "loginctl user-status ${AGENT_USER} failed as the agent: logind no longer tracks the agent"
+    as_agent loginctl --no-pager user-status "${YOLOBOX_AGENT_USER}" >/dev/null ||
+        fail "loginctl user-status ${YOLOBOX_AGENT_USER} failed as the agent: logind no longer tracks the agent"
     as_agent busctl --no-pager status >/dev/null ||
         fail "busctl status failed as the agent: the system bus does not answer it"
     ok "the agent's user manager, logind and the system bus answer the agent"
@@ -1095,7 +979,6 @@ check_rosetta() {
 }
 
 compat_checks() {
-    check_net
     check_default_qdisc
     check_podman
     check_chromium
@@ -1109,34 +992,22 @@ compat_checks() {
     if [ "$(uname -m)" = aarch64 ]; then
         check_rosetta
     fi
-    check_no_host_os_stamp
     check_etc_environment
     check_run_mount
     check_guestagent
     check_rebuild_helper
-    check_github_host_keys
 }
 
 main() {
-    [ "$(id -u)" -ne "${AGENT_UID}" ] || fail "run this as the operator, not the agent"
+    load_facts
+    [ "$(id -u)" -ne "${YOLOBOX_AGENT_UID}" ] || fail "run this as the operator, not the agent"
     sudo -n true || fail "passwordless sudo is required (run as the operator)"
-    AGENT_HOME=$(getent passwd "${AGENT_USER}" | cut -d: -f6)
-    [ -n "${AGENT_HOME}" ] || fail "no account ${AGENT_USER} in passwd"
-    case ${ONLY:-both} in
-    both | hardening | compat) ;;
-    *) fail "ONLY must be hardening, compat or unset, got '${ONLY}'" ;;
-    esac
-    parse_extra_wrappers
+    AGENT_HOME=$(getent passwd "${YOLOBOX_AGENT_USER}" | cut -d: -f6)
+    [ -n "${AGENT_HOME}" ] || fail "no account ${YOLOBOX_AGENT_USER} in passwd"
     trap cleanup EXIT
     stage_helpers
-    case ${ONLY:-both} in
-    both)
-        hardening_checks
-        compat_checks
-        ;;
-    hardening) hardening_checks ;;
-    compat) compat_checks ;;
-    esac
+    hardening_checks
+    compat_checks
     echo "box-hardening-check: all checks passed"
 }
 

@@ -1,16 +1,14 @@
 """Behaviour of nix/display/yolobox-screen-record.sh, run for real under bash.
 
-Nix builds the script with writeShellApplication, which prepends
-`set -o errexit -o nounset -o pipefail` and puts ffmpeg on PATH. Here bash
-gets the same three options and PATH holds a fake `ffmpeg` ahead of the system
-tools. Like the real one, it writes a progress block to its `-progress pipe:N`
+It runs under shell_harness.ShellCase with a fake `ffmpeg` ahead of the
+system tools. Like the real one, it writes a progress block to its `-progress pipe:N`
 once it records and then idles until SIGINT, or it fails first, as $FAKE_FFMPEG
 tells it. The pid file lives in a scratch HOME.
 
 The tests read /proc/<pid>/stat and the kernel's boot_id, which only Linux
 has, and wait for the recorder's wrapper on a pidfd (`os.pidfd_open`); the
 script is for the guest, so they skip elsewhere. Tools whose absence skips
-tests: util-linux `flock` and `waitpid` (2.40 or newer).
+tests: util-linux `flock`.
 """
 
 import ctypes
@@ -20,21 +18,12 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
-import time
 import unittest
 from pathlib import Path
 
-SCRIPT = (
-    Path(__file__).resolve().parent.parent
-    / "nix"
-    / "display"
-    / "yolobox-screen-record.sh"
-)
+from shell_harness import BASH, REPO, ShellCase
 
-BASH = ["bash", "-o", "errexit", "-o", "nounset", "-o", "pipefail"]
-
-PR_SET_CHILD_SUBREAPER = 36
+SCRIPT = REPO / "nix" / "display" / "yolobox-screen-record.sh"
 
 # Python, not sh: a background job of a non-interactive shell starts with SIGINT
 # ignored, and an ignored signal cannot be trapped in sh. Real ffmpeg installs
@@ -66,8 +55,25 @@ if mode == "crash":
 signal.pause()
 """ % (sys.executable,)
 
+# util-linux waitpid's `--exited --timeout SECONDS PID`, on a pidfd: exit 0
+# when PID has exited (or is gone), 3 when the timeout expires.
+FAKE_WAITPID = """#!%s
+import os
+import select
+import sys
+
+timeout = float(sys.argv[sys.argv.index("--timeout") + 1])
+try:
+    fd = os.pidfd_open(int(sys.argv[-1]))
+except ProcessLookupError:
+    sys.exit(0)
+sys.exit(0 if select.select([fd], [], [], timeout)[0] else 3)
+""" % (sys.executable,)
+
 # Answers like util-linux waitpid when its --timeout expires.
 FAKE_WAITPID_TIMES_OUT = "#!/bin/sh\nexit 3\n"
+
+PR_SET_CHILD_SUBREAPER = 36
 
 
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
@@ -82,43 +88,29 @@ def starttime_of(pid):
 @unittest.skipUnless(BOOT_ID.exists(), "needs /proc/<pid>/stat and boot_id")
 @unittest.skipUnless(hasattr(os, "pidfd_open"), "needs os.pidfd_open")
 @unittest.skipUnless(shutil.which("flock"), "needs util-linux flock")
-class TestScreenRecord(unittest.TestCase):
+class TestScreenRecord(ShellCase):
+    timeout = 30
+
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name).resolve()
+        super().setUp()
         self.home = self.tmp / "home"
         self.home.mkdir()
         self.artifacts = self.tmp / "artifacts"
-        self.bin_dir = self.tmp / "bin"
-        self.bin_dir.mkdir()
         self.fake("ffmpeg", FAKE_FFMPEG)
+        self.fake("waitpid", FAKE_WAITPID)
+        self.fake("date", "#!/bin/sh\necho 20260101-000000\n")
         self.pid_file = self.home / ".local" / "state" / "yolobox" / "screen-record.pid"
         self.control = self.tmp / "control"
-        self.env = {
-            "PATH": os.pathsep.join(
-                [str(self.bin_dir), os.environ.get("PATH", "/usr/bin:/bin")]
-            ),
-            "HOME": str(self.home),
-            "YOLOBOX_ARTIFACTS": str(self.artifacts),
-            "DISPLAY": ":0",
-            "FAKE_FFMPEG": "record",
-            "FAKE_FFMPEG_CONTROL": str(self.control),
-        }
-
-    def fake(self, name, text):
-        tool = self.bin_dir / name
-        tool.write_text(text)
-        tool.chmod(0o755)
+        self.env.update(
+            HOME=str(self.home),
+            YOLOBOX_ARTIFACTS=str(self.artifacts),
+            DISPLAY=":0",
+            FAKE_FFMPEG="record",
+            FAKE_FFMPEG_CONTROL=str(self.control),
+        )
 
     def run_script(self, *args):
-        return subprocess.run(
-            [*BASH, str(SCRIPT), *args],
-            capture_output=True,
-            text=True,
-            env=self.env,
-            timeout=30,
-        )
+        return self.run_bash(SCRIPT, *args)
 
     def assert_start_reports_the_failure(self, started):
         self.assertEqual(started.returncode, 1, started.stderr)
@@ -192,7 +184,6 @@ class TestScreenRecord(unittest.TestCase):
         self.assertEqual(libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0), 0)
         self.addCleanup(libc.prctl, PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0)
 
-    @unittest.skipUnless(shutil.which("waitpid"), "needs util-linux waitpid")
     def test_stop_ends_the_recording_it_started_and_prints_the_file(self):
         self.adopt_orphans()
         self.addCleanup(self.kill_recorder)
@@ -210,7 +201,6 @@ class TestScreenRecord(unittest.TestCase):
             "stop returned before the recorder's wrapper exited",
         )
 
-    @unittest.skipUnless(shutil.which("waitpid"), "needs util-linux waitpid")
     def test_stop_fails_when_ffmpeg_logged_an_error_and_still_prints_the_file(self):
         self.addCleanup(self.kill_recorder)
         self.env["FAKE_FFMPEG"] = "noisy"
@@ -223,7 +213,6 @@ class TestScreenRecord(unittest.TestCase):
         self.assertIn("x11grab: lost the display", stopped.stderr)
         self.assertFalse(self.pid_file.exists())
 
-    @unittest.skipUnless(shutil.which("waitpid"), "needs util-linux waitpid")
     def test_stop_reports_a_recording_that_died_on_its_own_with_its_status(self):
         os.mkfifo(self.control)
         self.env["FAKE_FFMPEG"] = "crash"
@@ -233,12 +222,8 @@ class TestScreenRecord(unittest.TestCase):
         with open(self.control, "w") as control:
             control.write("die\n")
         status_file = self.pid_file.with_name("screen-record.status")
-        # The wrapper writes the status once it has reaped ffmpeg, then exits;
-        # it is nobody's child here, so waitpid is how to wait for it.
-        subprocess.run(
-            ["waitpid", "--exited", "--timeout", "20", self.pid_file_field("wrapper")],
-            check=True,
-        )
+        # The wrapper writes the status once it has reaped ffmpeg, then exits.
+        self.await_exit(int(self.pid_file_field("wrapper")))
         self.assertEqual(status_file.read_text(), "3\n")
         stopped = self.run_script("stop")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
@@ -263,21 +248,18 @@ class TestScreenRecord(unittest.TestCase):
     def test_a_recording_started_in_the_same_second_as_another_gets_its_own_name(
         self,
     ):
+        """`date` always says 20260101-000000, so the names taken are the same
+        whatever the clock does: a video, and a log whose video is gone."""
         self.addCleanup(self.kill_recorder)
         self.artifacts.mkdir()
-        now = int(time.time())
-        taken = [
-            self.artifacts
-            / time.strftime("screen-%Y%m%d-%H%M%S.mp4", time.localtime(now + delta))
-            for delta in (0, 1, 2)
-        ]
-        for path in taken:
-            path.write_text("")
+        (self.artifacts / "screen-20260101-000000.mp4").write_text("")
+        (self.artifacts / "screen-20260101-000000-2.log").write_text("")
         started = self.run_script("start")
         self.assertEqual(started.returncode, 0, started.stderr)
-        out = Path(started.stdout.strip())
-        self.assertNotIn(out, taken)
-        self.assertRegex(out.name, r"^screen-\d{8}-\d{6}-2\.mp4$")
+        self.assertEqual(
+            Path(started.stdout.strip()),
+            self.artifacts / "screen-20260101-000000-3.mp4",
+        )
 
     def test_start_reports_an_ffmpeg_that_fails_at_once_and_records_nothing(self):
         self.env["FAKE_FFMPEG"] = "fail"
@@ -295,9 +277,14 @@ class TestScreenRecord(unittest.TestCase):
             env=self.env,
         )
         self.addCleanup(start.kill)
-        # Opening a fifo for writing waits for its reader: the fake is running.
-        with open(self.control, "w") as control:
-            control.write("fail\n")
+        # Opening a fifo for writing waits for its reader, the running fake: a
+        # shell does it, so a script that died early leaves nothing to hang on
+        # but a process to kill.
+        writer = subprocess.Popen(
+            ["sh", "-c", 'echo fail > "$1"', "sh", str(self.control)]
+        )
+        self.addCleanup(writer.wait)
+        self.addCleanup(writer.kill)
         stdout, stderr = start.communicate(timeout=30)
         self.assert_start_reports_the_failure(
             subprocess.CompletedProcess(start.args, start.returncode, stdout, stderr)

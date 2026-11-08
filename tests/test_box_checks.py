@@ -1,29 +1,32 @@
-"""tests/box-hardening-check.sh's checks, run for real under bash with fakes.
+"""tests/box-hardening-check.sh refuses what it must, run for real under bash.
 
 The script's `main` call is cut off and its functions sourced, with the box
-paths it names (/run/wrappers/bin, /run/current-system/sw/bin, the cidata
-binary, its /tmp scratch directories) pointed at a scratch directory. A fake
-`sudo` drops sudo's own options and runs the command, so "as the agent" runs
-as the test's own account; the fakes for getcap, stat, systemctl, journalctl,
-ssh, ssh-add, sshd, getent, id, strace, findmnt, ls, ps, loginctl and busctl answer
-what each test bakes in. Only the checks that judge a tool's answer are
-covered: the ones that need a kernel (sysctls, modules, io_uring) are the
-live box's.
+paths it names (/run/wrappers/bin, /run/current-system/sw/bin, the facts
+file, the cidata binary, its /tmp scratch directories) pointed at a scratch
+directory. A fake `sudo` drops sudo's own options and runs the command, so
+"as the agent" runs as the test's own account; the fakes for getcap, stat,
+systemctl, journalctl, ssh, ssh-add, sshd, getent, id, strace, findmnt, ls
+and ps answer what each test bakes in. Each check family gets one run
+on a box that meets it, and then the answers that must not pass: a tool
+answer that is wrong, or a malformed input. That the checks pass on a real
+hardened box is the live run's to prove.
 
-Tools whose absence skips tests: GNU find (`-printf`).
+Tools whose absence skips the module: GNU find (`-printf`) and GNU stat (`-c`).
 """
 
 import os
+import shlex
 import shutil
 import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "tests" / "box-hardening-check.sh"
+from shell_harness import REPO, ShellCase, facts_sh, is_gnu
+
+SCRIPT = REPO / "tests" / "box-hardening-check.sh"
 
 # The script's constants and literals the harness points into the scratch
 # directory, each expected exactly once.
+FACTS_LINE = "readonly FACTS=/etc/yolobox/facts.sh"
 WRAPPERS_LINE = "readonly WRAPPERS=/run/wrappers/bin"
 SYSBIN_LINE = "readonly SYSBIN=/run/current-system/sw/bin"
 CIDATA_BINARY = "/mnt/lima-cidata/lima-guestagent"
@@ -40,6 +43,15 @@ while [ $# -gt 0 ]; do
 done
 exec "$@"
 """
+
+# What nix/hardening.nix adds to /etc/yolobox/facts.sh beside facts.json's.
+FACTS = {
+    "YOLOBOX_AGENT_GROUPS": "users",
+    "YOLOBOX_WRAPPERS": "newgidmap=cap_setgid,cap_setpcap newuidmap=cap_setpcap,cap_setuid sudo= sudoedit= unix_chkpwd=",
+    "YOLOBOX_SYSCTLS": "kernel.kptr_restrict=2",
+    "YOLOBOX_KERNEL_PARAMS": "slab_nomerge",
+    "YOLOBOX_PROC_OPTIONS": "nosuid noexec nodev hidepid=invisible gid=1",
+}
 
 # The real tools the agent-side helpers run with PATH set to the fake bin.
 REAL_TOOLS = (
@@ -58,25 +70,15 @@ OPERATOR = "op"
 ALLOWUSERS = "not allowed because not listed in AllowUsers"
 
 
-def gnu_find():
-    try:
-        out = subprocess.run(
-            ["find", "--version"], capture_output=True, text=True, timeout=20
-        ).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return "GNU" in out
-
-
-class BoxCheck(unittest.TestCase):
+class BoxCheck(ShellCase):
     """The harness: the script's functions, fakes on PATH, a snippet to run."""
 
+    timeout = 60
+
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name).resolve()
-        self.bin = self.tmp / "bin"
-        self.bin.mkdir()
+        if not (is_gnu("find") and is_gnu("stat")):
+            self.skipTest("needs GNU find and stat")
+        super().setUp()
         # A symlink, as /run/wrappers/bin is on the box (to the generation's
         # directory): find does not follow a start point without a trailing slash.
         (self.tmp / "wrappers.real").mkdir()
@@ -84,24 +86,29 @@ class BoxCheck(unittest.TestCase):
         self.wrappers.symlink_to(self.tmp / "wrappers.real")
         self.home = self.tmp / "home"
         self.home.mkdir()
+        self.facts = self.tmp / "facts.sh"
+        self.write_facts(FACTS)
         self.fake("sudo", FAKE_SUDO)
         for tool in REAL_TOOLS:
             real = shutil.which(tool)
-            self.assertIsNotNone(real, tool)
-            (self.bin / tool).symlink_to(real)
+            if real is None:
+                self.skipTest("needs %s" % tool)
+            (self.bin_dir / tool).symlink_to(real)
         self.real_stat = shutil.which("stat")
-        self.assertIsNotNone(self.real_stat)
 
-    def fake(self, name, body):
-        path = self.bin / name
-        path.write_text(body)
-        path.chmod(0o755)
+    def write_facts(self, facts):
+        """The box's facts file: facts.json's, then `facts`, hardening.nix's."""
+        self.facts.write_text(
+            facts_sh()
+            + "".join("%s=%s\n" % (key, shlex.quote(v)) for key, v in facts.items())
+        )
 
     def functions(self):
         text = SCRIPT.read_text()
         for old, new in (
+            (FACTS_LINE, "readonly FACTS=%s" % self.facts),
             (WRAPPERS_LINE, "readonly WRAPPERS=%s" % self.wrappers),
-            (SYSBIN_LINE, "readonly SYSBIN=%s" % self.bin),
+            (SYSBIN_LINE, "readonly SYSBIN=%s" % self.bin_dir),
             (CIDATA_BINARY, str(self.tmp / "lima-guestagent")),
             (WORK_TEMPLATE, str(self.tmp / "hk-check.XXXXXX")),
             (MAIN_CALL, ""),
@@ -111,7 +118,11 @@ class BoxCheck(unittest.TestCase):
         return text
 
     def run_check(self, snippet, env=None):
-        program = "%s\nAGENT_HOME=%s\n%s\n" % (self.functions(), self.home, snippet)
+        program = "%s\nload_facts\nAGENT_HOME=%s\n%s\n" % (
+            self.functions(),
+            self.home,
+            snippet,
+        )
         return subprocess.run(
             ["bash", "-c", program],
             capture_output=True,
@@ -124,19 +135,29 @@ class BoxCheck(unittest.TestCase):
         """The fake bin first on PATH, the scratch home; `overrides` win."""
         env = dict(
             os.environ,
-            PATH=os.pathsep.join([str(self.bin), os.environ.get("PATH", "")]),
+            PATH=self.env["PATH"],
             HOME=str(self.home),
         )
         env.update(overrides)
         return env
 
-    def assert_ok(self, result, text):
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(text, result.stdout)
-
     def assert_fail(self, result, text):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("FAIL: " + text, result.stderr)
+
+    # -- the facts file --------------------------------------------------
+
+    def test_a_missing_facts_file_fails(self):
+        self.facts.unlink()
+        self.assert_fail(self.run_check("true"), "%s is missing" % self.facts)
+
+    def test_a_facts_file_without_a_key_fails(self):
+        for key in FACTS:
+            with self.subTest(key=key):
+                self.write_facts({k: v for k, v in FACTS.items() if k != key})
+                self.assert_fail(
+                    self.run_check("true"), "%s does not set %s" % (self.facts, key)
+                )
 
     # -- the wrapper set -----------------------------------------------
 
@@ -178,89 +199,53 @@ class BoxCheck(unittest.TestCase):
             + ' -c %a "$3")"\n',
         )
 
-    def test_the_kept_wrappers_pass(self):
-        self.box_wrappers()
-        result = self.run_check("parse_extra_wrappers; check_wrappers")
-        self.assert_ok(result, "ok: every wrapper is root's")
-
     def test_a_capability_text_without_names_fails(self):
-        # "=ep" grants every capability; the old check read it as none.
+        # "=ep" grants every capability; a check that read it as none would pass.
         self.box_wrappers(caps={"unix_chkpwd": " =ep"})
-        result = self.run_check("parse_extra_wrappers; check_wrappers")
+        result = self.run_check("check_wrappers")
         self.assert_fail(result, "getcap %s/unix_chkpwd printed" % self.wrappers)
 
-    def test_the_older_getcap_form_is_read(self):
-        self.box_wrappers(caps={"newuidmap": " = cap_setuid,cap_setpcap+ep"})
-        result = self.run_check("parse_extra_wrappers; check_wrappers")
-        self.assert_ok(result, "ok: every wrapper is root's")
+    def test_other_capabilities_than_the_box_states_fail(self):
+        self.box_wrappers(
+            caps={"newuidmap": " cap_setuid,cap_setpcap,cap_sys_admin=ep"}
+        )
+        result = self.run_check("check_wrappers")
+        self.assert_fail(result, "wrapper newuidmap has capabilities")
 
     def test_a_capability_wrapper_that_is_also_setuid_fails(self):
         self.box_wrappers()
         (self.wrappers / "newuidmap").chmod(0o4511)
-        result = self.run_check("parse_extra_wrappers; check_wrappers")
+        result = self.run_check("check_wrappers")
         self.assert_fail(result, "wrapper newuidmap is setuid on top")
 
     def test_a_setgid_wrapper_fails(self):
         self.box_wrappers()
         (self.wrappers / "unix_chkpwd").chmod(0o6511)
-        result = self.run_check("parse_extra_wrappers; check_wrappers")
+        result = self.run_check("check_wrappers")
         self.assert_fail(result, "wrapper unix_chkpwd is setgid")
 
     def test_a_sudo_executable_by_others_fails(self):
         self.box_wrappers()
         (self.wrappers / "sudo").chmod(0o4511)
-        result = self.run_check("parse_extra_wrappers; check_wrappers")
+        result = self.run_check("check_wrappers")
         self.assert_fail(result, "sudo is mode 4511")
 
     def test_a_wrapper_not_owned_by_root_fails(self):
         self.box_wrappers(owner="nobody")
-        result = self.run_check("parse_extra_wrappers; check_wrappers")
+        result = self.run_check("check_wrappers")
         self.assert_fail(result, "wrapper newgidmap is owned by nobody")
-
-    def test_an_extra_wrapper_with_its_capabilities_passes_in_any_order(self):
-        self.box_wrappers(caps={"dumpcap": " cap_net_admin,cap_net_raw=ep"})
-        self.wrapper("dumpcap", 0o511)
-        result = self.run_check(
-            "parse_extra_wrappers; check_wrappers",
-            env={"EXTRA_WRAPPERS": "dumpcap=cap_net_raw,cap_net_admin"},
-        )
-        self.assert_ok(result, "ok: wrapper set is exactly: dumpcap newgidmap")
 
     def test_an_unexpected_wrapper_fails(self):
         self.box_wrappers()
         self.wrapper("su", 0o4511)
-        result = self.run_check("parse_extra_wrappers; check_wrappers")
-        self.assert_fail(result, "%s differs from the allowlist" % self.wrappers)
+        result = self.run_check("check_wrappers")
+        self.assert_fail(result, "%s differs from the kept set" % self.wrappers)
 
     def test_a_wrapper_directory_with_nothing_in_it_fails_closed(self):
-        result = self.run_check("parse_extra_wrappers; check_wrappers")
+        result = self.run_check("check_wrappers")
         self.assert_fail(result, "found no wrappers under %s" % self.wrappers)
 
-    def test_an_extra_wrapper_on_the_allowlist_is_refused(self):
-        result = self.run_check(
-            "parse_extra_wrappers", env={"EXTRA_WRAPPERS": "dumpcap sudo"}
-        )
-        self.assert_fail(result, "EXTRA_WRAPPERS names sudo")
-
-    def test_a_malformed_extra_wrapper_is_refused(self):
-        for entry in ("=cap_net_raw", "dumpcap=", "dump;cap"):
-            with self.subTest(entry=entry):
-                result = self.run_check(
-                    "parse_extra_wrappers", env={"EXTRA_WRAPPERS": entry}
-                )
-                self.assert_fail(result, "EXTRA_WRAPPERS entry")
-
     # -- sudo and the accounts -----------------------------------------
-
-    def test_sudo_that_refuses_the_agent_passes(self):
-        self.fake("sudo", FAKE_SUDO)
-        (self.wrappers / "sudo").write_text(
-            '#!/bin/sh\nprintf "sudo: unable to execute: Permission denied\\n" >&2\nexit 1\n'
-        )
-        (self.wrappers / "sudo").chmod(0o755)
-        self.assert_ok(
-            self.run_check("check_sudo_refuses_agent"), "ok: the agent cannot run sudo"
-        )
 
     def test_sudo_that_runs_for_the_agent_fails(self):
         (self.wrappers / "sudo").write_text("#!/bin/sh\nexit 0\n")
@@ -281,10 +266,6 @@ class BoxCheck(unittest.TestCase):
             % groups,
         )
 
-    def test_locked_accounts_pass(self):
-        self.accounts(root="!", agent="*")
-        self.assert_ok(self.run_check("check_accounts_locked"), "ok: agent is uid 1000")
-
     def test_a_password_hash_on_root_fails(self):
         self.accounts(root="$6$salt$hash")
         self.assert_fail(
@@ -292,19 +273,10 @@ class BoxCheck(unittest.TestCase):
             "the password of root is not locked",
         )
 
-    def test_a_supplementary_group_on_the_agent_fails(self):
+    def test_a_group_the_box_does_not_state_fails(self):
         self.accounts(groups="users wheel")
         self.assert_fail(
             self.run_check("check_accounts_locked"), "agent is in groups 'users wheel'"
-        )
-
-    def test_the_groups_a_box_adds_pass_in_any_order(self):
-        self.accounts(groups="users dialout video")
-        result = self.run_check(
-            "check_accounts_locked", env={"EXTRA_AGENT_GROUPS": "video dialout"}
-        )
-        self.assert_ok(
-            result, "ok: agent is uid 1000 in the groups: dialout users video"
         )
 
     # -- /proc hidepid --------------------------------------------------
@@ -326,18 +298,12 @@ class BoxCheck(unittest.TestCase):
             "#!/bin/sh\n" + "".join('printf "%-8s\\n"\n' % u for u in ps_users),
         )
 
-    def test_a_proc_the_agent_cannot_see_into_passes(self):
-        self.proc()
-        self.assert_ok(
-            self.run_check("check_hidepid"), "ok: the agent sees neither /proc/1 nor"
-        )
-
     def test_a_missing_findmnt_fails(self):
         # PATH holds the fake bin alone, so no findmnt of the host's steps in.
         self.proc()
-        (self.bin / "findmnt").unlink()
+        (self.bin_dir / "findmnt").unlink()
         self.assert_fail(
-            self.run_check("check_hidepid", env={"PATH": str(self.bin)}),
+            self.run_check("check_hidepid", env={"PATH": str(self.bin_dir)}),
             "findmnt -no OPTIONS /proc failed",
         )
 
@@ -395,13 +361,6 @@ class BoxCheck(unittest.TestCase):
         self.fake("loginctl", "#!/bin/sh\nexit %d\n" % loginctl_rc)
         self.fake("busctl", "#!/bin/sh\nexit %d\n" % busctl_rc)
 
-    def test_services_that_answer_the_agent_pass(self):
-        self.session_services()
-        self.assert_ok(
-            self.run_check("check_agent_session_services"),
-            "ok: the agent's user manager, logind and the system bus answer the agent",
-        )
-
     def test_a_herdr_server_that_is_not_active_fails(self):
         self.session_services(herdr="failed")
         self.assert_fail(
@@ -423,7 +382,7 @@ class BoxCheck(unittest.TestCase):
             "busctl status failed as the agent",
         )
 
-    # -- the 1Password proxy, sshd, tailscale, containers --------------
+    # -- the 1Password proxy, sshd, containers ---------------------------
 
     def proxy(self, protect_system="strict", private_network="yes", keys_rc=0):
         self.fake(
@@ -433,13 +392,6 @@ class BoxCheck(unittest.TestCase):
             % (protect_system, private_network),
         )
         self.fake("ssh-add", "#!/bin/sh\nexit %d\n" % keys_rc)
-
-    def test_a_confined_proxy_the_agent_still_reaches_passes(self):
-        self.proxy(keys_rc=1)
-        self.assert_ok(
-            self.run_check("check_proxy_confined"),
-            "ok: yolobox-op-agent.service is confined",
-        )
 
     def test_a_proxy_with_a_network_fails(self):
         self.proxy(private_network="no")
@@ -452,15 +404,7 @@ class BoxCheck(unittest.TestCase):
         self.proxy(keys_rc=2)
         self.assert_fail(self.run_check("check_proxy_confined"), "ssh-add -L through")
 
-    def test_sshd_settings_are_read_from_sshd_t(self):
-        self.fake(
-            "sshd",
-            '#!/bin/sh\nprintf "PermitRootLogin %s\\nSubsystem sftp internal-sftp\\n"\n'
-            % "no",
-        )
-        self.assert_ok(
-            self.run_check("check_sshd_settings"), "ok: sshd runs internal-sftp"
-        )
+    def test_sshd_that_permits_root_login_fails(self):
         self.fake(
             "sshd",
             '#!/bin/sh\nprintf "PermitRootLogin prohibit-password\\nSubsystem sftp internal-sftp\\n"\n',
@@ -469,22 +413,6 @@ class BoxCheck(unittest.TestCase):
             self.run_check("check_sshd_settings"), "sshd -T lacks 'permitrootlogin no'"
         )
 
-    def test_the_tailscale_pin_is_compared_only_when_given(self):
-        self.fake(
-            "tailscale", '#!/bin/sh\nprintf "1.104.4\\n  go version: go1.25\\n"\n'
-        )
-        result = self.run_check("check_tailscale_version")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("SKIP: tailscale's version was NOT compared", result.stderr)
-        result = self.run_check(
-            "check_tailscale_version", env={"TAILSCALE_VERSION": "1.104.4"}
-        )
-        self.assert_ok(result, "ok: tailscale is the pinned 1.104.4")
-        result = self.run_check(
-            "check_tailscale_version", env={"TAILSCALE_VERSION": "1.104.5"}
-        )
-        self.assert_fail(result, "tailscale is 1.104.4, the pin says 1.104.5")
-
     def podman(self, gateway_rc):
         # nc's last two words are the host and port.
         self.fake(
@@ -492,13 +420,6 @@ class BoxCheck(unittest.TestCase):
             "#!/bin/sh\n"
             "for a; do host=$port; port=$a; done\n"
             "case $host in 192.168.5.2) exit %d ;; *) exit 0 ;; esac\n" % gateway_rc,
-        )
-
-    def test_a_container_refused_the_gateway_passes(self):
-        self.podman(gateway_rc=1)
-        self.assert_ok(
-            self.run_check("check_container_egress"),
-            "ok: a rootless container on --network=host cannot reach 192.168.5.2:22",
         )
 
     def test_a_container_that_reaches_the_gateway_fails(self):
@@ -530,12 +451,6 @@ class BoxCheck(unittest.TestCase):
         )
         self.fake("lsmod", "#!/bin/sh\nexit 0\n")
 
-    def test_link_kinds_the_kernel_refuses_pass(self):
-        self.link_tools("RTNETLINK answers: Operation not supported")
-        self.assert_ok(
-            self.run_check("check_link_kinds"), "ok: the agent cannot add a ipvlan link"
-        )
-
     def test_a_link_kind_refused_for_its_options_fails(self):
         self.link_tools('Error: argument "id" is required.')
         self.assert_fail(
@@ -545,33 +460,8 @@ class BoxCheck(unittest.TestCase):
 
     # -- tmpfiles and the agent's symlink -------------------------------
 
-    def tmpfiles(self, refuses):
-        # The first run (the symlink in place) answers `refuses`; the second
-        # run, after the restore, passes.
-        self.fake(
-            "systemd-tmpfiles",
-            "#!/bin/sh\n"
-            'if [ -L "$HOME/.config/zed" ]; then %s; fi\nexit 0\n'
-            % (
-                'printf "Detected unsafe path transition %s/.config/zed\\n" "$HOME" >&2; exit 65'
-                if refuses
-                else "exit 0"
-            ),
-        )
-
-    def test_a_refused_symlink_passes_and_the_directory_is_restored(self):
-        self.tmpfiles(refuses=True)
-        zed = self.home / ".config" / "zed"
-        zed.mkdir(parents=True)
-        (zed / "settings.json").write_text("{}")
-        result = self.run_check("stage_helpers; check_tmpfiles_refuses_agent_symlink")
-        self.assert_ok(result, "ok: systemd-tmpfiles refuses the agent's symlink")
-        self.assertTrue(zed.is_dir() and not zed.is_symlink())
-        self.assertEqual((zed / "settings.json").read_text(), "{}")
-        self.assertFalse((self.home / ".config" / "zed.bak").exists())
-
     def test_tmpfiles_that_follows_the_symlink_fails_and_still_restores(self):
-        self.tmpfiles(refuses=False)
+        self.fake("systemd-tmpfiles", "#!/bin/sh\nexit 0\n")
         result = self.run_check(
             "stage_helpers; trap cleanup EXIT; check_tmpfiles_refuses_agent_symlink"
         )
@@ -623,15 +513,6 @@ class BoxCheck(unittest.TestCase):
             if (user, addr) != but
         ]
 
-    def test_an_allowusers_refusal_of_each_account_and_address_passes(self):
-        self.ssh_fakes()
-        self.journal(self.refusals())
-        result = self.run_check("check_logins_refused_off_gateway %s" % OPERATOR)
-        for user, addr in self.PROBED:
-            self.assert_ok(
-                result, "ok: sshd refuses %s at %s because of AllowUsers" % (user, addr)
-            )
-
     def test_a_refusal_the_journal_does_not_explain_fails(self):
         for user, addr in self.PROBED:
             with self.subTest(user=user, addr=addr):
@@ -669,14 +550,6 @@ class BoxCheck(unittest.TestCase):
             result, "ssh as op at 127.0.0.1 failed, but not with Permission denied"
         )
 
-    def test_a_forwarded_agent_without_a_key_is_a_skip(self):
-        self.ssh_fakes(keys_rc=1)
-        self.journal(self.refusals())
-        result = self.run_check("check_logins_refused_off_gateway %s" % OPERATOR)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("SKIP: sshd's refusal of op and agent", result.stderr)
-        self.assertNotIn("ok: sshd refuses", result.stdout)
-
     def test_an_unreachable_ssh_agent_fails(self):
         self.ssh_fakes(keys_rc=2)
         result = self.run_check("check_logins_refused_off_gateway %s" % OPERATOR)
@@ -699,13 +572,6 @@ class BoxCheck(unittest.TestCase):
             % (keys_file, command, command_user),
         )
         self.fake("stat", '#!/bin/sh\nprintf "%s\\n"\n' % owner_mode)
-
-    def test_no_keys_file_and_a_root_run_command_pass(self):
-        self.agent_sshd_config()
-        self.assert_ok(
-            self.run_check("check_agent_authorized_keys_ignored"),
-            "ok: sshd reads the agent's keys from root's /etc/ssh/agent-authorized-keys",
-        )
 
     def test_sshd_that_reads_the_agents_authorized_keys_fails(self):
         self.agent_sshd_config(keys_file=".ssh/authorized_keys")
@@ -748,12 +614,6 @@ class BoxCheck(unittest.TestCase):
             "esac\n" % (load, active, result, timestamp),
         )
 
-    def test_a_skipped_unit_on_a_box_without_the_binary_passes(self):
-        self.unit()
-        self.assert_ok(
-            self.run_check("check_guestagent"), "ok: lima-guestagent.service is skipped"
-        )
-
     def test_a_missing_unit_fails(self):
         # systemctl show prints inactive and ConditionResult=no for any name.
         self.unit(load="not-found", timestamp="")
@@ -768,13 +628,6 @@ class BoxCheck(unittest.TestCase):
             "the cidata has no guest agent, but systemd never evaluated the condition",
         )
 
-    def test_an_active_unit_where_the_binary_exists_passes(self):
-        (self.tmp / "lima-guestagent").touch()
-        self.unit(active="active")
-        self.assert_ok(
-            self.run_check("check_guestagent"), "ok: lima-guestagent.service is active"
-        )
-
     def test_an_inactive_unit_where_the_binary_exists_fails(self):
         (self.tmp / "lima-guestagent").touch()
         self.unit()
@@ -784,21 +637,6 @@ class BoxCheck(unittest.TestCase):
         )
 
     # -- strace -p ------------------------------------------------------
-
-    def test_an_attached_strace_that_follows_the_exit_passes(self):
-        # A real strace prints the exit line once the target is gone; the
-        # fake prints both at once, and the check still has to let the target
-        # go (the fifo) before it reads on, or the cat it started would hang.
-        self.fake(
-            "strace",
-            "#!/bin/sh\n"
-            'printf "strace: Process %s attached\\n" "$2" >&2\n'
-            'printf "+++ exited with 0 +++\\n" >&2\n',
-        )
-        result = self.run_check(
-            "stage_helpers; export WORK; trap cleanup EXIT; check_strace"
-        )
-        self.assert_ok(result, "ok: strace -p attaches")
 
     def test_a_refused_attach_fails(self):
         self.fake(
@@ -810,9 +648,97 @@ class BoxCheck(unittest.TestCase):
         )
         self.assert_fail(result, "strace -p on an agent process did not attach")
 
+    # -- a box that meets each check -----------------------------------
 
-if not gnu_find():
-    BoxCheck = unittest.skip("needs GNU find")(BoxCheck)  # noqa: F811
+    def assert_passes(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("FAIL", result.stderr)
+        self.assertIn("ok: ", result.stdout)
+
+    def test_the_wrapper_set_passes_on_a_box_that_keeps_exactly_it(self):
+        self.box_wrappers()
+        self.assert_passes(self.run_check("check_wrappers"))
+
+    def test_sudo_that_refuses_the_agent_passes(self):
+        (self.wrappers / "sudo").write_text(
+            "#!/bin/sh\necho 'sudo: Permission denied' >&2\nexit 1\n"
+        )
+        (self.wrappers / "sudo").chmod(0o755)
+        self.assert_passes(self.run_check("check_sudo_refuses_agent"))
+
+    def test_locked_accounts_in_the_stated_groups_pass(self):
+        self.accounts()
+        self.assert_passes(self.run_check("check_accounts_locked"))
+
+    def test_a_proc_that_hides_other_pids_from_the_agent_passes(self):
+        self.proc()
+        self.assert_passes(self.run_check("check_hidepid"))
+
+    def test_session_services_that_answer_the_agent_pass(self):
+        self.session_services()
+        self.assert_passes(self.run_check("check_agent_session_services"))
+
+    def test_a_confined_proxy_with_a_live_socket_passes(self):
+        self.proxy()
+        self.assert_passes(self.run_check("check_proxy_confined"))
+
+    def test_sshd_with_internal_sftp_and_no_root_login_passes(self):
+        self.fake(
+            "sshd",
+            '#!/bin/sh\nprintf "PermitRootLogin no\\nSubsystem sftp internal-sftp\\n"\n',
+        )
+        self.assert_passes(self.run_check("check_sshd_settings"))
+
+    def test_a_container_that_cannot_reach_the_gateway_passes(self):
+        self.podman(gateway_rc=1)
+        self.assert_passes(self.run_check("check_container_egress"))
+
+    def test_link_kinds_the_kernel_refuses_pass(self):
+        self.link_tools("RTNETLINK answers: Operation not supported")
+        self.assert_passes(self.run_check("check_link_kinds"))
+
+    def test_logins_off_the_gateway_that_sshd_refuses_pass(self):
+        self.ssh_fakes()
+        self.journal(self.refusals())
+        self.assert_passes(
+            self.run_check("check_logins_refused_off_gateway %s" % OPERATOR)
+        )
+
+    def test_the_agents_keys_read_from_roots_command_only_pass(self):
+        self.agent_sshd_config()
+        self.assert_passes(self.run_check("check_agent_authorized_keys_ignored"))
+
+    def test_a_guest_agent_skipped_where_the_cidata_has_none_passes(self):
+        self.unit()
+        self.assert_passes(self.run_check("check_guestagent"))
+
+    def test_tmpfiles_that_refuses_the_symlink_and_then_runs_clean_passes(self):
+        self.fake(
+            "systemd-tmpfiles",
+            "#!/bin/sh\n"
+            'if [ -e "$0.ran" ]; then exit 0; fi\n'
+            'touch "$0.ran"\n'
+            "echo 'Detected unsafe path transition' >&2\n"
+            "exit 1\n",
+        )
+        self.assert_passes(
+            self.run_check(
+                "stage_helpers; trap cleanup EXIT; check_tmpfiles_refuses_agent_symlink"
+            )
+        )
+
+    def test_strace_that_attaches_and_follows_the_target_passes(self):
+        self.fake(
+            "strace",
+            "#!/bin/sh\n"
+            'echo "strace: Process $2 attached"\n'
+            'echo "+++ exited with 0 +++"\n',
+        )
+        self.assert_passes(
+            self.run_check(
+                "stage_helpers; export WORK; trap cleanup EXIT; check_strace"
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -7,16 +7,16 @@ import functools
 import os
 import re
 import signal
-from typing import Callable, Optional, Sequence
+from typing import Callable, Sequence
 
 from . import (
     config,
     cp,
     driver,
+    forwards,
     proc,
     release,
     session,
-    sshx,
     state,
     status,
     ui,
@@ -130,31 +130,30 @@ def box_cpus(value: str) -> int:
 
 
 def add_size_arguments(parser: argparse.ArgumentParser) -> None:
-    """--memory, --disk and --cpus, for the commands that create or resize a box."""
+    """--memory, --disk and --cpus, for the commands that create a box."""
     parser.add_argument(
         "--memory",
         metavar="GiB",
         type=box_gib("--memory", MIN_MEMORY_GIB, MIN_MEMORY_WHY),
         default=None,
-        help="the box's memory (at least %d). Creates the box at this size, or "
-        "resizes a stopped one; a box that is not stopped is refused" % MIN_MEMORY_GIB,
+        help="the memory of the box this command creates (at least %d); a box "
+        "that exists is refused the flag" % MIN_MEMORY_GIB,
     )
     parser.add_argument(
         "--disk",
         metavar="GiB",
         type=box_gib("--disk", MIN_DISK_GIB, MIN_DISK_WHY),
         default=None,
-        help="the box's disk (at least %d), applied like --memory. A disk only "
-        "grows. The box is started, then stopped and started a second time to "
-        "grow its disk, and its encrypted root and filesystem are grown into it "
-        "(the same steps as disk-grow)" % MIN_DISK_GIB,
+        help="the disk of the box this command creates (at least %d); an existing "
+        "box's disk grows with disk-grow" % MIN_DISK_GIB,
     )
     parser.add_argument(
         "--cpus",
         metavar="N",
         type=box_cpus,
         default=None,
-        help="the box's CPU count, from 1 to one less than the host's, applied like --memory",
+        help="the CPU count of the box this command creates, from 1 to one less "
+        "than the host's",
     )
 
 
@@ -188,13 +187,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="machine to drive (default: %s); accepted before or after "
         "the command" % DEFAULT_INSTANCE,
     )
-    # logs_in: the command cannot work without logging in to the box, so main()
-    # checks the login key is on offer first (Driver.require_login_key).
-    # usage_problem: a refusal that needs the chosen machine (its remedy names
-    # -m), which a `type=` callable cannot give because it runs while parsing.
-    parser.set_defaults(
-        needs_driver=True, heals=False, logs_in=True, usage_problem=no_usage_problem
-    )
+    # session: the command talks to the guest, so main() first brings up the
+    # operator's ssh master and the reverse forwards it carries, and says so
+    # when it cannot.
+    parser.set_defaults(needs_driver=True, session=False)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, help_text: str, description: str) -> argparse.ArgumentParser:
@@ -222,20 +218,15 @@ def build_parser() -> argparse.ArgumentParser:
         "Start the VM and unlock its encrypted disk. When the box has to be started\n"
         "or unlocked, asks 1Password (Touch ID) for the yolobox-disk key; a box that\n"
         "is already up needs no prompt. Safe to run again.\n"
-        "--memory, --disk and --cpus create a missing box at that size, or resize a\n"
-        "stopped one: memory and CPUs before it starts, a bigger disk after (the\n"
-        "box is stopped and started a second time to grow it; a disk only grows).\n"
-        "A box that is not stopped is refused, before anything is asked or changed:\n"
-        "yo down first, or yo disk-grow to grow only the disk of a running box.\n"
-        "A flag equal to the box's current size changes nothing.",
+        "--memory, --disk and --cpus size the box this command creates; a box that\n"
+        "exists is refused them (yo destroy && yo up to resize it, yo disk-grow to\n"
+        "grow its disk).",
     )
     add_size_arguments(up)
-    # vm_up checks the login key itself, before any start or unlock.
-    up.set_defaults(func=vm.cmd_up, logs_in=False)
+    up.set_defaults(func=vm.cmd_up)
 
     down = add("down", "Stop the VM.", "Stop the VM.")
-    # Stopping needs no login: a box yo cannot log in to is stopped all the same.
-    down.set_defaults(func=vm.cmd_down, logs_in=False)
+    down.set_defaults(func=vm.cmd_down)
 
     destroy = add(
         "destroy",
@@ -252,8 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="delete instead of only listing what would be deleted",
     )
-    # Deleting needs no login: a box yo cannot log in to is deleted all the same.
-    destroy.set_defaults(func=vm.cmd_destroy, logs_in=False)
+    destroy.set_defaults(func=vm.cmd_destroy)
 
     status_parser = add(
         "status",
@@ -263,8 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
         "check found something wrong (an unreachable VM, an unencrypted disk,\n"
         "egress rules not in force, a dead forward or broker, version drift).",
     )
-    # status reports a missing login key as one of its lines.
-    status_parser.set_defaults(func=status.cmd_status, logs_in=False)
+    status_parser.set_defaults(func=status.cmd_status)
 
     bootstrap = add(
         "bootstrap",
@@ -289,10 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(github:you/yolobox/x); default: this yo's own release",
     )
     add_size_arguments(bootstrap)
-    # Its first step is vm_up, which checks the login key, as its reboot's does.
-    bootstrap.set_defaults(
-        func=vm.cmd_bootstrap, logs_in=False, usage_problem=release.old_release_problem
-    )
+    bootstrap.set_defaults(func=vm.cmd_bootstrap)
 
     gc = add(
         "gc",
@@ -332,12 +318,10 @@ def build_parser() -> argparse.ArgumentParser:
         "disk-grow",
         "Raise the VM's disk ceiling.",
         "Raise the VM's disk ceiling (grow-only; the backing file is sparse, so\n"
-        "a large ceiling costs nothing until used). Stops and restarts the VM.\n"
-        "Refuses unless the VM already runs a generation with boot.growPartition.\n"
-        "Needs the disk passphrase (1Password, Touch ID) to grow the LUKS mapping.\n"
-        "If a grow failed after the ceiling was raised, repeat the same size: the\n"
-        "ceiling edit is skipped and only the mapping and filesystem are grown.\n"
-        "yo up --disk GiB does the same for a stopped box.",
+        "a large ceiling costs nothing until used), then grow the encrypted root\n"
+        "and its filesystem into it. Stops and restarts the VM when the ceiling\n"
+        "moves. Needs the disk passphrase (1Password, Touch ID). Safe to repeat:\n"
+        "at the ceiling it only grows what is still short.",
     )
     disk_grow.add_argument(
         "size", type=functools.partial(whole_gib, "disk-grow size"), metavar="GiB"
@@ -351,20 +335,20 @@ def build_parser() -> argparse.ArgumentParser:
         "sudo), or run one command there.",
     )
     ssh.add_argument("ssh_cmd", nargs=argparse.REMAINDER, metavar="cmd...")
-    ssh.set_defaults(func=session.cmd_ssh, heals=True)
+    ssh.set_defaults(func=session.cmd_ssh, session=True)
 
     enter = add(
         "enter",
         "Shell in the VM as the agent account.",
         "Shell in the VM as the unprivileged agent account, landing in the guest\n"
         "twin of the current project. 1Password and the AWS credentials broker\n"
-        "are wired into the VM permanently (yo up heals both), not per session;\n"
+        "ride the operator's ssh master, which this command opens if it is not up;\n"
         "set AWS_PROFILE in the shell to pick an allow-listed profile. Inside a\n"
         "herdr pane, prints a note that an agent started here is invisible to\n"
         "herdr — run agents in a workspace on the yolobox herdr machine instead.",
     )
     enter.add_argument("project", nargs="?")
-    enter.set_defaults(func=session.cmd_enter, heals=True)
+    enter.set_defaults(func=session.cmd_enter, session=True)
 
     cp_parser = add(
         "cp",
@@ -379,7 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
         "destination must be on the other side.",
     )
     cp_parser.add_argument("paths", nargs="+", metavar="path")
-    cp_parser.set_defaults(func=cp.cmd_cp, heals=True)
+    cp_parser.set_defaults(func=cp.cmd_cp, session=True)
 
     code = add(
         "code",
@@ -390,7 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
         "ms-vscode-remote.remote-ssh extension." % include_line,
     )
     code.add_argument("project", nargs="?")
-    code.set_defaults(func=session.cmd_code, heals=True)
+    code.set_defaults(func=session.cmd_code, session=True)
 
     zed = add(
         "zed",
@@ -400,7 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
         "~/.ssh/config (yo zed offers to add it otherwise)." % include_line,
     )
     zed.add_argument("project", nargs="?")
-    zed.set_defaults(func=session.cmd_zed, heals=True)
+    zed.set_defaults(func=session.cmd_zed, session=True)
 
     port = add(
         "port",
@@ -413,9 +397,7 @@ def build_parser() -> argparse.ArgumentParser:
         "command exits 64 there.",
     )
     port.add_argument("guest_port", type=guest_port_number, metavar="GUEST_PORT")
-    # port rides the operator's master; ensure_master checks the key only when
-    # it has to open one.
-    port.set_defaults(func=session.cmd_port, logs_in=False)
+    port.set_defaults(func=session.cmd_port)
 
     aws_check = add(
         "aws-check",
@@ -443,45 +425,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def no_usage_problem(args: argparse.Namespace) -> Optional[str]:
-    return None
-
-
-def heal_before_command() -> None:
-    """Re-establish the box's forwards before a command that talks to the guest.
-
-    An unreachable box stops the command with the "is it up?" hint. Any other
-    failure is printed and the command runs anyway, because `yo ssh` is the way
-    into a box whose broker or forwards are broken.
-    """
-    try:
-        vm.heal_services()
-    except sshx.Unreachable:
-        raise
-    except YoError as failure:
-        ui.err(
-            "yo: healing the box's forwards failed, going on: %s"
-            % (failure.message or "unknown error")
-        )
-
-
 def main(argv: Sequence[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.needs_driver:
         state.set_box(driver_for(config.HOST_PLATFORM), args.machine)
-        problem = args.usage_problem(args)
-        if problem is not None:
-            parser.error(problem)
         # Refused here, before any tool runs: the name reaches the box's cidata
         # and its sshd config, and nix/base.nix would refuse it only at the
         # rebuild, after the box was created.
         config.operator_account(release.host_user())
         state.driver().require_tool()
-        if args.logs_in:
-            state.driver().require_login_key()
-        if args.heals:
-            heal_before_command()
+        if args.session:
+            # A session reaches the box without its forwards too: `yo ssh` is
+            # the way into a box whose forwards are broken.
+            try:
+                forwards.ensure_session()
+            except YoError as failure:
+                ui.err(
+                    "yo: the 1Password and AWS forwards are not up, so this session "
+                    "runs without them: %s" % failure.message
+                )
     args.func(args)
     return 0
 

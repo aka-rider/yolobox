@@ -1,16 +1,19 @@
-{ config, lib, pkgs, agentUser, ... }:
+{ config, lib, pkgs, yolobox, ... }:
 let
-  homeDir = config.users.users.${agentUser}.home;
-  homeTmpfiles = import ./lib/home-tmpfiles.nix;
+  inherit (yolobox) agentHomeTmpfiles agentUnit display;
 
-  waitForX = pkgs.writeShellScript "wait-for-x" ''
-    for _ in $(seq 1 150); do
-      [ -S /tmp/.X11-unix/X0 ] && exit 0
-      sleep 0.2
-    done
-    echo "yolobox: X socket /tmp/.X11-unix/X0 did not appear within 30s" >&2
-    exit 1
-  '';
+  # Type=notify: openbox starts after Xvfb accepts connections.
+  xvfb = pkgs.writeShellApplication {
+    name = "yolobox-xvfb";
+    runtimeInputs = [ pkgs.xvfb config.systemd.package ];
+    runtimeEnv = {
+      YOLOBOX_XVFB_DISPLAY = display;
+      # -xkbdir works around nixpkgs#3441 ("cannot find xkbcomp" keymap
+      # failure) by pointing Xvfb straight at the store's xkb data.
+      YOLOBOX_XVFB_XKBDIR = "${pkgs.xkeyboard_config}/etc/X11/xkb";
+    };
+    text = builtins.readFile ./display/yolobox-xvfb.sh;
+  };
 
   screenRecord = pkgs.writeShellApplication {
     name = "yolobox-screen-record";
@@ -26,55 +29,40 @@ in
   # User units of the agent, not system units running as it: a system
   # unit's log goes to the system journal, which is readable only through
   # the `systemd-journal` group, and that journal also holds the operator's
-  # sudo command lines. Same shape as nix/herd-server.nix. DISPLAY=:0 comes
-  # from nix/lib/agent-env.nix, the agent's environment, not from the box.
-  systemd.user.services.xvfb = {
-    description = "Virtual X display :0";
-    unitConfig = {
-      ConditionUser = agentUser;
-      # The display must come back however often it dies: systemd's default
-      # five starts in ten seconds would leave the box without a display
-      # until the next boot.
-      StartLimitIntervalSec = 0;
-    };
+  # sudo command lines. DISPLAY is in the agent's environment (agentEnv);
+  # openbox, a unit of its own, sets it below.
+  systemd.user.services.xvfb = agentUnit {
+    description = "Virtual X display ${display}";
+    # The display must come back however often it dies: systemd's default
+    # five starts in ten seconds would leave the box without a display
+    # until the next boot.
+    unitConfig.StartLimitIntervalSec = 0;
     wantedBy = [ "default.target" ];
     serviceConfig = {
+      Type = "notify";
+      # The ready signal comes from a child of the service's main process.
+      NotifyAccess = "all";
       Restart = "always";
       # A pause between restarts, so a crash loop does not spin the CPU.
       RestartSec = 2;
-      # -xkbdir works around nixpkgs#3441 ("cannot find xkbcomp" keymap
-      # failure) by pointing Xvfb straight at the store's xkb data.
-      # -nolisten tcp keeps the display off the network. There is no -auth,
-      # so any local uid can still connect over the unix socket (verified:
-      # the operator and root can); that is no boundary, the display is the
-      # agent's own.
-      ExecStart = "${pkgs.xvfb}/bin/Xvfb :0 -screen 0 1920x1080x24 -nolisten tcp -xkbdir ${pkgs.xkeyboard_config}/etc/X11/xkb";
+      ExecStart = lib.getExe xvfb;
     };
   };
 
-  systemd.user.services.openbox = {
+  systemd.user.services.openbox = agentUnit {
     description = "openbox on the virtual display";
-    unitConfig.ConditionUser = agentUser;
     wantedBy = [ "default.target" ];
     after = [ "xvfb.service" ];
     requires = [ "xvfb.service" ];
-    environment.DISPLAY = ":0";
+    environment.DISPLAY = display;
     serviceConfig = {
       Restart = "always";
-      # Xvfb's socket lags its own service start; without this wait,
-      # openbox crash-loops fast enough to trip systemd's start-limit
-      # (5 restarts/10s) and fail the unit permanently instead of settling
-      # once Xvfb catches up.
-      ExecStartPre = "${waitForX}";
       ExecStart = "${pkgs.openbox}/bin/openbox";
     };
   };
 
-  systemd.tmpfiles.rules = homeTmpfiles {
-    home = homeDir;
-    user = agentUser;
+  systemd.tmpfiles.rules = agentHomeTmpfiles {
     dirs = [ "artifacts" ];
-    links = [ ];
   };
 
   # Playwright's own browser downloads do not run on NixOS, so a Playwright
@@ -92,6 +80,7 @@ in
   # --disable-xlib/--disable-libxcb*, so x11grab doesn't exist in it.
   environment.systemPackages = [ pkgs.chromium pkgs.xdotool pkgs.maim pkgs.ffmpeg-full screenRecord ];
   # Reachable by name, so CI can build the package on its own: its check
-  # phase (shellcheck) runs only in a build (nix/display.md).
+  # phase (shellcheck) runs only in a build.
   system.build.yoloboxScreenRecord = screenRecord;
+  system.build.yoloboxXvfb = xvfb;
 }

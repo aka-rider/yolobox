@@ -6,14 +6,9 @@
 # its server through `lspWrapper`, which runs it under `devbox run` when the
 # project has a devbox.json. There is no direnv: nothing loads a project's
 # environment on its own, so the server's launch command carries it.
-#
-# nix/lib/basedpyright.nix is the shared constant every render here builds from.
-{ config, pkgs, agentUser, ... }:
+{ pkgs, yolobox, ... }:
 let
-  homeDir = config.users.users.${agentUser}.home;
-  homeTmpfiles = import ./lib/home-tmpfiles.nix;
-
-  basedpyrightLsp = import ./lib/basedpyright.nix;
+  inherit (yolobox) agentHomeTmpfiles;
 
   # `lspWrapper <server> <args...>`: devbox supplies the server when the
   # working directory is inside a devbox project, found by walking up from
@@ -34,14 +29,14 @@ let
     devbox install -c "$dir" >&2
     exec devbox run -c "$dir" -q -- "$@"
   '';
-  basedpyrightArgv = [ basedpyrightLsp.command ] ++ basedpyrightLsp.args;
+  basedpyrightArgv = [ "basedpyright-langserver" "--stdio" ];
 in
 {
   # Zed runs the server named here instead of looking for a bare binary. A
   # server-side setting: the Mac's Zed settings are never consulted for
   # remote projects.
   environment.etc."yolobox/lsp/zed-settings.json".text = builtins.toJSON {
-    # The box has no direnv and CONSTITUTION says nothing auto-loads project
+    # The box has no direnv, and nothing auto-loads project
     # shell code; disabling the loader makes that true whatever is on PATH.
     load_direnv = "disabled";
     lsp.basedpyright.binary = {
@@ -54,9 +49,7 @@ in
   # servers are the user's dotfiles concern. The flake ships no pi LSP extension
   # of its own, because a second one would register another `lsp_diagnostics`
   # tool, and pi refuses to start on a tool-name conflict.
-  systemd.tmpfiles.rules = homeTmpfiles {
-    home = homeDir;
-    user = agentUser;
+  systemd.tmpfiles.rules = agentHomeTmpfiles {
     dirs = [ ".config" ".config/zed" ];
     links = [
       { path = ".config/zed/settings.json"; argument = "/etc/yolobox/lsp/zed-settings.json"; }

@@ -1,29 +1,26 @@
 """Behaviour of nix/guest/yolobox-guest.sh, run for real under bash.
 
-Nix builds the script with writeShellApplication, which prepends
-`set -o errexit -o nounset -o pipefail` and puts `runtimeInputs` on PATH. Here
-bash gets the same three options, and PATH holds a scratch directory with a
-fake `curl` ahead of the system tools (and, per class, fake `dig`, `stat`,
-`sudo` and `id`). Only subcommands that need nothing but
-what macOS and Linux share are exercised, except `gc-user --deep`, which runs
-only where GNU find's `-printf` exists (CI, the guest): the other subcommands
-(`projects`, `gc-machine`) use it or sudo too.
+The script runs under shell_harness.ShellCase with a fake `curl` ahead of
+the system tools (and, per class, fake `dig`, `stat`, `systemctl`,
+`tailscale`, `lsblk`, `df`, `sudo` and `id`), and sources a facts file
+rendered from facts.json as the box renders its /etc/yolobox/facts.sh. Only
+subcommands that need nothing but what macOS and Linux share are exercised,
+except `gc-user --deep`, which runs only where GNU find's `-printf` exists
+(CI, the guest): the other subcommands (`projects`, `gc-machine`) use it or
+sudo too.
 
 Tools whose absence skips tests: GNU find (the `gc-user` classes), flock (the
 rebuild lock).
 """
 
 import fcntl
-import os
 import shutil
 import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
-GUEST_SCRIPT = (
-    Path(__file__).resolve().parent.parent / "nix" / "guest" / "yolobox-guest.sh"
-)
+from shell_harness import FACTS, REPO, ShellCase, facts_sh, is_gnu, render_fact
+
+GUEST_SCRIPT = REPO / "nix" / "guest" / "yolobox-guest.sh"
 
 FAKE_CURL = """#!/bin/sh
 printf '%s\\n' "$@" > "$FAKE_CURL_ARGV"
@@ -31,57 +28,36 @@ printf '%s' "$FAKE_CURL_BODY"
 exit "$FAKE_CURL_RC"
 """
 
-BROKER_SOCK = "/run/yolobox/aws-broker.sock"
+BROKER_SOCK = FACTS["agent_aws_broker_sock"]
 
 
-class GuestScript(unittest.TestCase):
+class GuestScript(ShellCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name).resolve()
+        super().setUp()
         self.home = self.tmp / "home"
         self.home.mkdir()
-        bin_dir = self.tmp / "bin"
-        bin_dir.mkdir()
-        curl = bin_dir / "curl"
-        curl.write_text(FAKE_CURL)
-        curl.chmod(0o755)
+        self.fake("curl", FAKE_CURL)
         self.curl_argv = self.tmp / "curl-argv"
-        self.env = {
-            # The ambient PATH stays after the fakes: the script needs mktemp,
-            # find and the rest, and on NixOS they are not in /usr/bin.
-            "PATH": os.pathsep.join(
-                [str(bin_dir), os.environ.get("PATH", "/usr/bin:/bin")]
-            ),
-            "HOME": str(self.home),
-            "YOLOBOX_AWS_BROKER_SOCK": BROKER_SOCK,
-            "FAKE_CURL_ARGV": str(self.curl_argv),
-            "FAKE_CURL_BODY": "",
-            "FAKE_CURL_RC": "0",
-        }
+        self.facts = self.tmp / "facts.sh"
+        self.write_facts()
+        self.env.update(
+            HOME=str(self.home),
+            YOLOBOX_FACTS=str(self.facts),
+            FAKE_CURL_ARGV=str(self.curl_argv),
+            FAKE_CURL_BODY="",
+            FAKE_CURL_RC="0",
+        )
+
+    def write_facts(self, **overrides):
+        """The box's facts file, with `overrides` over facts.json."""
+        self.facts.write_text(facts_sh(**overrides))
 
     def run_script(self, *args, curl_rc=0, curl_body="", extra_env=None):
-        env = dict(self.env, FAKE_CURL_RC=str(curl_rc), FAKE_CURL_BODY=curl_body)
+        env = dict(FAKE_CURL_RC=str(curl_rc), FAKE_CURL_BODY=curl_body)
         env.update(extra_env or {})
-        return subprocess.run(
-            [
-                "bash",
-                "-o",
-                "errexit",
-                "-o",
-                "nounset",
-                "-o",
-                "pipefail",
-                str(GUEST_SCRIPT),
-                *args,
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            # A subcommand that loops forever (landing-dir on a relative path
-            # once did) must fail the test, not hang the suite.
-            timeout=20,
-        )
+        # A subcommand that loops forever (landing-dir on a relative path
+        # once did) must fail the test, not hang the suite: the timeout.
+        return self.run_bash(GUEST_SCRIPT, *args, env=env)
 
     def curl_was_called(self):
         return self.curl_argv.exists()
@@ -180,7 +156,7 @@ class TestEverySubcommandRefusesExtraArguments(GuestScript):
             ("aws-creds",),
             ("aws-creds", "p", "extra"),
             ("aws-check", "extra"),
-            ("net-check", "extra"),
+            ("status", "extra"),
             ("rebuild",),
             ("rebuild", "switch", "extra"),
         ):
@@ -201,9 +177,7 @@ echo "arn:aws:sts::1:assumed-role/r/$AWS_PROFILE"
 
 class TestAwsCheck(GuestScript):
     def check(self, config):
-        aws = self.tmp / "bin" / "aws"
-        aws.write_text(FAKE_AWS)
-        aws.chmod(0o755)
+        self.fake("aws", FAKE_AWS)
         path = self.tmp / "aws-config"
         path.write_text(config)
         return self.run_script("aws-check", extra_env={"AWS_CONFIG_FILE": str(path)})
@@ -222,19 +196,25 @@ class TestAwsCheck(GuestScript):
         self.assertIn("no profile sections", result.stderr)
 
 
+class TestFactsRendering(unittest.TestCase):
+    def test_lists_and_maps_become_words_and_a_shape_nix_cannot_render_is_refused(self):
+        self.assertEqual(render_fact("k", ["a", "b"]), "a b")
+        self.assertEqual(
+            render_fact("k", {"target": "Cargo.toml", ".next": "p"}),
+            ".next:p target:Cargo.toml",
+        )
+        self.assertEqual(render_fact("k", 75), "75")
+        for value in (None, True, 1.5, [1], {"a": 1}, [["a"]]):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, "no YOLOBOX_K rendering"):
+                    render_fact("k", value)
+
+
 class TestUnknownSubcommand(GuestScript):
     def test_an_unknown_subcommand_exits_64_with_the_marker_yo_looks_for(self):
         result = self.run_script("bogus")
         self.assertEqual(result.returncode, 64)
         self.assertIn("unknown subcommand 'bogus'", result.stderr)
-
-
-def has_gnu_find():
-    try:
-        probe = subprocess.run(["find", "--version"], capture_output=True, text=True)
-    except OSError:
-        return False
-    return probe.returncode == 0 and "GNU" in probe.stdout
 
 
 # Every fake appends "<name> <cwd> <argv>" to $FAKE_LOG, so a test can tell
@@ -306,14 +286,12 @@ fi
 CLEAN_MAKEFILE = "all:\n\ttrue\nclean:\n\trm -rf out\n"
 
 
-@unittest.skipUnless(has_gnu_find(), "gc-user needs GNU find's -printf")
+@unittest.skipUnless(is_gnu("find"), "gc-user needs GNU find's -printf")
 class TestGcUserGoCaches(GuestScript):
     def setUp(self):
         super().setUp()
-        bin_dir = self.tmp / "bin"
         for name in ("podman", "npm"):
-            (bin_dir / name).write_text("#!/bin/sh\n")
-            (bin_dir / name).chmod(0o755)
+            self.fake(name, "#!/bin/sh\n")
         self.log = self.tmp / "log"
 
     def module_cache(self, gopath):
@@ -369,11 +347,10 @@ class TestGcUserGoCaches(GuestScript):
         self.assertFalse(cache.exists())
 
 
-@unittest.skipUnless(has_gnu_find(), "gc-user --deep needs GNU find's -printf")
+@unittest.skipUnless(is_gnu("find"), "gc-user --deep needs GNU find's -printf")
 class TestGcUserDeep(GuestScript):
     def setUp(self):
         super().setUp()
-        bin_dir = self.tmp / "bin"
         for name, body in (
             ("podman", FAKE_NOOP),
             ("npm", FAKE_NOOP),
@@ -382,14 +359,13 @@ class TestGcUserDeep(GuestScript):
             ("make", FAKE_MAKE),
             ("go", FAKE_NOOP),
         ):
-            (bin_dir / name).write_text(body)
-            (bin_dir / name).chmod(0o755)
+            self.fake(name, body)
         self.log = self.tmp / "log"
         sh_dir = self.tmp / "sh-only"
         sh_dir.mkdir()
         (sh_dir / "sh").symlink_to(shutil.which("sh"))
         self.env.update(
-            FAKE_LOG=str(self.log), FAKE_BIN=str(bin_dir), FAKE_SH_DIR=str(sh_dir)
+            FAKE_LOG=str(self.log), FAKE_BIN=str(self.bin_dir), FAKE_SH_DIR=str(sh_dir)
         )
 
     def project(self, name, files, ignore=""):
@@ -499,6 +475,13 @@ class TestGcUserDeep(GuestScript):
         self.assertFalse((web / ".next").exists())
         self.assertTrue((bare / ".next").exists())
         self.assertIn("kept %s/.next: no package.json beside it" % bare, result.stdout)
+
+    def test_the_manifests_a_name_needs_are_the_facts(self):
+        self.write_facts(build_output_manifests={"target": "Cargo.toml"})
+        bare = self.project("bare", {".next/cache": "x"}, ignore=".next\n")
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((bare / ".next").exists())
 
     def test_a_makefile_with_a_clean_rule_gets_make_clean_in_its_root(self):
         root = self.project("p", {"Makefile": CLEAN_MAKEFILE})
@@ -694,24 +677,78 @@ DNS_REPLY = ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n"
 DNS_SERVFAIL = ";; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 1\n"
 
 
-class TestNetCheckSkipsTheGatewayProbeOnlyWhenTheBoxBlocksIt(GuestScript):
+# `systemctl show -p ActiveState --value UNIT` answers the file FAKE_UNITS/UNIT.
+FAKE_SYSTEMCTL = """#!/bin/sh
+for unit; do :; done
+cat "$FAKE_UNITS/$unit" 2>/dev/null || true
+"""
+
+# Each of these answers from one environment variable: its stdout, and
+# FAKE_<TOOL>_RC its exit code.
+
+FAKE_TAILSCALE = """#!/bin/sh
+printf '%s' "$FAKE_TAILSCALE_OUT"
+exit "$FAKE_TAILSCALE_RC"
+"""
+
+FAKE_LSBLK = """#!/bin/sh
+printf '%s' "$FAKE_LSBLK_OUT"
+exit "$FAKE_LSBLK_RC"
+"""
+
+# `df -h /` and `df -P /` both print a header and one data line.
+FAKE_DF = """#!/bin/sh
+case "$1" in
+-h) printf 'Filesystem Size Used Avail Use%% Mounted on\n%s\n' "$FAKE_DF_H" ;;
+-P) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n%s\n' "$FAKE_DF_P" ;;
+esac
+exit "$FAKE_DF_RC"
+"""
+
+TAILSCALE_JSON = '{"Version": "1.90.0", "BackendState": "%s", "Peer": {}}'
+DF_H = "/dev/mapper/root 59G 10G 46G 18% /"
+DF_P = "/dev/mapper/root 61000000 10000000 51000000 18% /"
+
+
+class TestStatusBlock(GuestScript):
+    """`yolobox-guest status` prints one KEY=value line per fact yo shows, in one
+    round trip, and a probe that fails leaves its key empty instead of failing
+    the block."""
+
     def setUp(self):
         super().setUp()
-        bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
-        dig = bin_dir / "dig"
-        dig.write_text(FAKE_DIG)
-        dig.chmod(0o755)
-        stat = bin_dir / "stat"
-        stat.write_text(FAKE_STAT)
-        stat.chmod(0o755)
+        for name, body in (
+            ("dig", FAKE_DIG),
+            ("stat", FAKE_STAT),
+            ("systemctl", FAKE_SYSTEMCTL),
+            ("tailscale", FAKE_TAILSCALE),
+            ("lsblk", FAKE_LSBLK),
+            ("df", FAKE_DF),
+        ):
+            self.fake(name, body)
         self.dig_argv = self.tmp / "dig-argv"
-        self.blocked = self.tmp / "gateway-blocked"
+        self.stamps = self.tmp / "stamps"
+        self.stamps.mkdir()
+        (self.stamps / "version").write_text("2.0.0\n")
+        (self.stamps / "flake-ref").write_text("github:x/y/abc?narHash=sha256-h\n")
+        self.units = self.tmp / "units"
+        self.units.mkdir()
+        for unit in (
+            "yolobox-egress",
+            "yolobox-op-agent.socket",
+            "yolobox-aws-broker.socket",
+        ):
+            self.set_unit(unit, "active")
         self.env.update(
             FAKE_DIG_ARGV=str(self.dig_argv),
-            YOLOBOX_GATEWAY_BLOCKED=str(self.blocked),
+            FAKE_UNITS=str(self.units),
+            YOLOBOX_STAMPS=str(self.stamps),
         )
 
-    def net_check(
+    def set_unit(self, unit, state):
+        (self.units / unit).write_text(state + "\n")
+
+    def status(
         self,
         *args,
         curl_rc=0,
@@ -719,79 +756,128 @@ class TestNetCheckSkipsTheGatewayProbeOnlyWhenTheBoxBlocksIt(GuestScript):
         dig_rc=0,
         stat_out="1000000 4096",
         stat_rc=0,
+        tailscale_out=TAILSCALE_JSON % "Running",
+        tailscale_rc=0,
+        lsblk_out="crypto_LUKS\n",
+        lsblk_rc=0,
+        df_h=DF_H,
+        df_p=DF_P,
+        df_rc=0,
     ):
-        return self.run_script(
-            "net-check",
-            *args,
-            curl_rc=curl_rc,
-            extra_env={
-                "FAKE_DIG_OUT": dig_out,
-                "FAKE_DIG_RC": str(dig_rc),
-                "FAKE_STAT_OUT": stat_out,
-                "FAKE_STAT_RC": str(stat_rc),
+        env = {
+            "FAKE_DIG_OUT": dig_out,
+            "FAKE_DIG_RC": str(dig_rc),
+            "FAKE_STAT_OUT": stat_out,
+            "FAKE_STAT_RC": str(stat_rc),
+            "FAKE_TAILSCALE_OUT": tailscale_out,
+            "FAKE_TAILSCALE_RC": str(tailscale_rc),
+            "FAKE_LSBLK_OUT": lsblk_out,
+            "FAKE_LSBLK_RC": str(lsblk_rc),
+            "FAKE_DF_H": df_h,
+            "FAKE_DF_P": df_p,
+            "FAKE_DF_RC": str(df_rc),
+        }
+        return self.run_script("status", *args, curl_rc=curl_rc, extra_env=env)
+
+    def fields(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return dict(line.split("=", 1) for line in result.stdout.splitlines())
+
+    def test_a_healthy_box_reports_every_key(self):
+        result = self.status()
+        self.assertEqual(
+            self.fields(result),
+            {
+                "version": "2.0.0",
+                "flake_ref": "github:x/y/abc?narHash=sha256-h",
+                "egress": "active",
+                "yolobox-op-agent.socket": "active",
+                "yolobox-aws-broker.socket": "active",
+                "tailscale": "Running",
+                "fstype": "crypto_LUKS",
+                "rootfs": DF_H,
+                "rootfs_full": "no",
+                "rootdisk": "ok",
+                "internet": "ok",
+                "gateway_dns": "ok",
             },
         )
-
-    def test_without_the_marker_the_gateway_is_asked_for_the_root_name_servers(self):
-        result = self.net_check()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=ok\nrootdisk=ok\n")
         argv = self.dig_argv.read_text().split("\n")
         self.assertEqual(argv[-4:-1], ["@192.168.5.2", ".", "NS"])
 
+    def test_a_unit_state_is_reported_as_systemctl_says_it(self):
+        self.set_unit("yolobox-egress", "failed")
+        self.set_unit("yolobox-op-agent.socket", "inactive")
+        fields = self.fields(self.status())
+        self.assertEqual(fields["egress"], "failed")
+        self.assertEqual(fields["yolobox-op-agent.socket"], "inactive")
+        self.assertEqual(fields["yolobox-aws-broker.socket"], "active")
+
+    def test_a_logged_out_tailscale_still_reports_its_backend_state(self):
+        # `tailscale status` exits 1 while logged out, JSON and all.
+        fields = self.fields(
+            self.status(tailscale_out=TAILSCALE_JSON % "NeedsLogin", tailscale_rc=1)
+        )
+        self.assertEqual(fields["tailscale"], "NeedsLogin")
+
+    def test_a_probe_that_fails_or_answers_nonsense_leaves_its_key_empty(self):
+        for name, broken in (
+            ("version", dict()),
+            ("tailscale", dict(tailscale_out="", tailscale_rc=1)),
+            ("tailscale", dict(tailscale_out="null", tailscale_rc=0)),
+            ("fstype", dict(lsblk_out="", lsblk_rc=32)),
+            ("rootfs", dict(df_h="", df_rc=1)),
+            ("rootfs_full", dict(df_p="/dev/x 1 1 1 lizard /")),
+            ("rootfs_full", dict(df_p="/dev/x 1 1 1 \u00b2% /")),
+            ("rootdisk", dict(stat_out="", stat_rc=1)),
+            ("rootdisk", dict(stat_out="lizard 4096")),
+            ("rootdisk", dict(stat_out="-1")),
+        ):
+            with self.subTest(name=name, broken=broken):
+                if name == "version":
+                    (self.stamps / "version").unlink()
+                fields = self.fields(self.status(**broken))
+                self.assertEqual(fields[name], "")
+                self.assertEqual(len(fields), 12)
+
+    def test_a_value_is_cut_at_its_first_newline_so_it_cannot_forge_a_key(self):
+        (self.stamps / "version").write_text("2.0.0\ninternet=ok\n")
+        fields = self.fields(self.status(curl_rc=6))
+        self.assertEqual(fields["version"], "2.0.0")
+        self.assertEqual(fields["internet"], "dead")
+
+    def test_the_root_filesystem_is_full_at_90_percent_and_not_below(self):
+        for pct, word in ((89, "no"), (90, "yes"), (100, "yes")):
+            with self.subTest(pct=pct):
+                fields = self.fields(
+                    self.status(df_p="/dev/x 100 %d %d %d%% /" % (pct, 100 - pct, pct))
+                )
+                self.assertEqual(fields["rootfs_full"], word)
+
     def test_a_dns_error_reply_still_proves_the_gateway_answers(self):
-        result = self.net_check(dig_out=DNS_SERVFAIL, dig_rc=0)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=ok\nrootdisk=ok\n")
+        fields = self.fields(self.status(dig_out=DNS_SERVFAIL, dig_rc=0))
+        self.assertEqual(fields["gateway_dns"], "ok")
 
-    def test_a_gateway_that_sends_no_reply_is_reported_dead(self):
-        result = self.net_check(dig_out=";; no servers could be reached\n", dig_rc=9)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=dead\nrootdisk=ok\n")
-
-    def test_dig_exiting_zero_without_a_reply_is_still_dead(self):
+    def test_a_gateway_that_sends_no_reply_is_dead_whatever_dig_exits(self):
         # bind9 #3235 and #3615: exit 0 on an ICMP unreachable.
-        result = self.net_check(dig_out=";; Connection refused\n", dig_rc=0)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=dead\nrootdisk=ok\n")
+        for out, rc in (
+            (";; no servers could be reached\n", 9),
+            (";; Connection refused\n", 0),
+        ):
+            with self.subTest(out=out, rc=rc):
+                fields = self.fields(self.status(dig_out=out, dig_rc=rc))
+                self.assertEqual(fields["gateway_dns"], "dead")
 
-    def test_egress_that_fails_is_reported_dead_whatever_the_gateway_does(self):
-        result = self.net_check(curl_rc=6)
-        self.assertEqual(result.stdout, "egress=dead\ngateway=ok\nrootdisk=ok\n")
+    def test_egress_that_fails_is_dead_whatever_the_gateway_does(self):
+        fields = self.fields(self.status(curl_rc=6))
+        self.assertEqual((fields["internet"], fields["gateway_dns"]), ("dead", "ok"))
 
-    def test_a_box_with_the_marker_skips_the_gateway_probe_without_running_it(self):
-        self.blocked.write_text("")
-        result = self.net_check()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "egress=ok\ngateway=skipped\nrootdisk=ok\n")
-        self.assertEqual(result.stderr, "")
-        self.assertFalse(self.dig_argv.exists())
-
-    def test_a_root_disk_with_no_space_left_for_root_is_named_full(self):
-        # The DNS failure a full disk causes (dhcpcd cannot write resolv.conf)
-        # leaves the gateway answering and egress dead: the shape of a VPN.
-        result = self.net_check(curl_rc=6, stat_out="0 4096")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "egress=dead\ngateway=ok\nrootdisk=full\n")
-
-    def test_the_root_disk_is_full_just_below_64_mib_free_and_not_at_64(self):
+    def test_the_root_disk_is_full_just_below_64_mib_free_for_root_and_not_at_64(self):
         blocks_64_mib = 64 * 1024 * 1024 // 4096
         for blocks, word in ((blocks_64_mib - 1, "full"), (blocks_64_mib, "ok")):
             with self.subTest(blocks=blocks):
-                result = self.net_check(stat_out="%d 4096" % blocks)
-                self.assertIn("rootdisk=%s\n" % word, result.stdout)
-
-    def test_a_stat_that_fails_or_answers_nonsense_is_an_error_not_a_pass(self):
-        for out, rc in (("", 1), ("", 0), ("lizard 4096", 0), ("-1", 0)):
-            with self.subTest(out=out, rc=rc):
-                result = self.net_check(stat_out=out, stat_rc=rc)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(result.stdout, "")
-
-    def test_an_argument_is_a_usage_error(self):
-        for arg in ("8080", "", "lizard"):
-            with self.subTest(arg=arg):
-                result = self.net_check(arg)
-                self.assertEqual(result.returncode, 2)
-                self.assertEqual(result.stdout, "")
-                self.assertIn("usage: net-check", result.stderr)
+                fields = self.fields(self.status(stat_out="%d 4096" % blocks))
+                self.assertEqual(fields["rootdisk"], word)
 
 
 FAKE_SUDO = """#!/bin/sh
@@ -806,10 +892,7 @@ class TestGcMachineNeedsSudo(GuestScript):
 
     def setUp(self):
         super().setUp()
-        bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
-        sudo = bin_dir / "sudo"
-        sudo.write_text(FAKE_SUDO)
-        sudo.chmod(0o755)
+        self.fake("sudo", FAKE_SUDO)
         self.sudo_argv = self.tmp / "sudo-argv"
         self.env.update(FAKE_SUDO_ARGV=str(self.sudo_argv))
 
@@ -844,44 +927,38 @@ case "$*" in
 esac
 """
 
-REF = "github:aka-rider/yolobox/v1.9.1"
+# What yo bootstrap stamps into /etc/yolobox/flake-ref: the exact tree it built.
 REV = "0123456789abcdef0123456789abcdef01234567"
 NAR = "sha256-" + "A" * 43 + "="
-# What a rebuild builds on a box yo bootstrap stamped: the commit and its hash.
 PINNED = "github:aka-rider/yolobox/%s?narHash=%s" % (REV, NAR)
+
+# `uname -n` answers FAKE_HOSTNAME.
+FAKE_UNAME = """#!/bin/sh
+[ "$*" = -n ] || { echo "fake uname: unexpected $*" >&2; exit 99; }
+printf '%s\\n' "$FAKE_HOSTNAME"
+"""
 
 
 class RebuildCase(GuestScript):
     def setUp(self):
         super().setUp()
-        bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
-        for name, text in (("sudo", FAKE_SUDO), ("id", FAKE_ID)):
-            tool = bin_dir / name
-            tool.write_text(text)
-            tool.chmod(0o755)
+        for name, text in (("sudo", FAKE_SUDO), ("id", FAKE_ID), ("uname", FAKE_UNAME)):
+            self.fake(name, text)
         self.stamps = self.tmp / "stamps"
         self.stamps.mkdir()
-        self.state = self.tmp / "state"
-        self.state.mkdir()
         self.sudo_argv = self.tmp / "sudo-argv"
         self.env.update(
             YOLOBOX_STAMPS=str(self.stamps),
-            YOLOBOX_STATE_DIR=str(self.state),
             FAKE_SUDO_ARGV=str(self.sudo_argv),
             FAKE_USER="alice",
+            FAKE_HOSTNAME="yolobox-e2e",
         )
-        self.stamp("flake-ref", REF + "\n")
-        self.stamp("hostname", "yolobox-e2e\n")
-        self.state_stamp("flake-rev", REV + "\n")
-        self.state_stamp("flake-narhash", NAR + "\n")
+        self.stamp(PINNED + "\n")
 
-    def stamp(self, name, text):
-        (self.stamps / name).write_bytes(text.encode())
+    def stamp(self, text):
+        (self.stamps / "flake-ref").write_bytes(text.encode())
 
-    def state_stamp(self, name, text):
-        (self.state / name).write_bytes(text.encode())
-
-    def rebuild(self, *args, uid=501, sudo_rc=0):
+    def rebuild(self, *args, uid=FACTS["operator_uid"], sudo_rc=0):
         return self.run_script(
             "rebuild",
             *args,
@@ -899,90 +976,6 @@ class RebuildCase(GuestScript):
 
 
 class TestRebuild(RebuildCase):
-    def test_switch_and_boot_rebuild_from_the_stamps_as_the_operator(self):
-        for action in ("switch", "boot"):
-            with self.subTest(action=action):
-                result = self.rebuild(action)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(
-                    self.sudo_argv_list(),
-                    [
-                        "env",
-                        "YOLOBOX_USERNAME=alice",
-                        "YOLOBOX_HOSTNAME=yolobox-e2e",
-                        "YOLOBOX_FLAKE_REF=" + REF,
-                        "flock",
-                        "-n",
-                        "-E",
-                        "75",
-                        "/run/yolobox-rebuild.lock",
-                        "nixos-rebuild",
-                        action,
-                        "--impure",
-                        "--refresh",
-                        "--flake",
-                        PINNED + "#yolobox",
-                    ],
-                )
-                self.assertNotIn("no commit stamp", result.stderr)
-
-    def test_a_box_no_yo_stamped_builds_the_ref_by_name_and_says_so(self):
-        # Built by a yo older than the stamps: it follows the ref, as before,
-        # with one line that says the next bootstrap pins it. A hash without
-        # a commit is what an interrupted bootstrap leaves, and counts the same.
-        for present in ((), ("flake-narhash",)):
-            with self.subTest(present=present):
-                for name in ("flake-rev", "flake-narhash"):
-                    (self.state / name).unlink(missing_ok=True)
-                for name in present:
-                    self.state_stamp(name, NAR + "\n")
-                result = self.rebuild("switch")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.sudo_argv_list()[-1], REF + "#yolobox")
-                self.assertIn("no commit stamp in %s" % self.state, result.stderr)
-                self.assertIn("yo bootstrap pins it", result.stderr)
-
-    def test_a_commit_stamp_that_is_not_one_commit_is_refused_naming_the_file(self):
-        for text in (
-            "",
-            "\n",
-            REV + "\n" + REV + "\n",
-            "main\n",
-            REV[:-1] + "\n",
-            REV + "0\n",
-            REV.upper() + "\n",
-            REV + "?narHash=x\n",
-            "-" + REV[1:] + "\n",
-        ):
-            with self.subTest(text=text[:40]):
-                self.state_stamp("flake-rev", text)
-                self.assert_refused(
-                    self.rebuild("switch"), 1, str(self.state / "flake-rev")
-                )
-
-    def test_a_hash_stamp_that_is_not_one_sri_sha256_is_refused_naming_the_file(
-        self,
-    ):
-        path = self.state / "flake-narhash"
-        for text in (
-            None,
-            "",
-            "\n",
-            NAR + "\n" + NAR + "\n",
-            "sha256-" + "A" * 42 + "=\n",
-            "sha256-" + "A" * 44 + "\n",
-            "sha512-" + "A" * 43 + "=\n",
-            NAR.replace("A", "#", 1) + "\n",
-            NAR + "#evil\n",
-            NAR + " \n",
-        ):
-            with self.subTest(text=text if text is None else text[:40]):
-                if text is None:
-                    path.unlink()
-                else:
-                    self.state_stamp("flake-narhash", text)
-                self.assert_refused(self.rebuild("switch"), 1, str(path))
-
     def test_anything_but_one_switch_or_boot_is_a_usage_error(self):
         for args in (
             (),
@@ -997,60 +990,37 @@ class TestRebuild(RebuildCase):
                 self.assert_refused(self.rebuild(*args), 2, "usage: rebuild")
 
     def test_root_and_the_agent_are_refused(self):
-        for uid in (0, 1000):
+        for uid in (0, FACTS["agent_uid"]):
             with self.subTest(uid=uid):
                 self.assert_refused(
                     self.rebuild("switch", uid=uid), 2, "run as the operator"
                 )
 
-    def test_a_flake_ref_that_is_not_one_github_ref_is_refused_naming_the_file(self):
-        for text in (
-            "",
-            "\n",
-            REF + "\n" + REF + "\n",
-            "path:/x\n",
-            "github:x/y\n",
-            "github:x/y/z#evil\n",
-            "github:x/y/-z\n",
-            REF + " \n",
-            "x" * 4096 + "\n",
-        ):
+    def test_a_stamp_that_is_not_one_non_empty_line_is_refused_naming_the_file(self):
+        for text in ("", "\n", "\n\n", PINNED + "\n" + PINNED + "\n", PINNED + "\n\n"):
             with self.subTest(text=text[:40]):
-                self.stamp("flake-ref", text)
+                self.stamp(text)
                 self.assert_refused(
                     self.rebuild("switch"), 1, str(self.stamps / "flake-ref")
                 )
 
-    def test_a_missing_flake_ref_is_refused_naming_the_file(self):
+    def test_a_stamp_that_is_not_a_github_ref_is_refused_naming_the_file(self):
+        for text in ("git+https://elsewhere/x\n", "/srv/tree\n", "GITHUB:x/y\n", "x\n"):
+            with self.subTest(text=text):
+                self.stamp(text)
+                self.assert_refused(
+                    self.rebuild("switch"), 1, "not a github: flake ref"
+                )
+
+    def test_a_missing_stamp_is_refused_naming_the_file(self):
         (self.stamps / "flake-ref").unlink()
         self.assert_refused(self.rebuild("switch"), 1, str(self.stamps / "flake-ref"))
 
-    def test_a_hostname_that_is_not_one_lowercase_dns_label_is_refused(self):
-        path = self.stamps / "hostname"
-        for text in ("Yolobox", "-box", "box-", "a_b", "a b", "a.b", "x" * 64):
-            with self.subTest(text=text):
-                self.stamp("hostname", text + "\n")
-                self.assert_refused(self.rebuild("switch"), 1, str(path))
-
-    def test_a_missing_or_empty_hostname_is_refused_naming_the_file(self):
-        path = self.stamps / "hostname"
-        for text in ("", "\n", None):
-            with self.subTest(text=text):
-                if text is None:
-                    path.unlink()
-                else:
-                    self.stamp("hostname", text)
-                self.assert_refused(self.rebuild("switch"), 1, str(path))
-
     def test_a_stamp_without_a_trailing_newline_is_read_whole(self):
-        self.stamp("flake-ref", REF)
-        self.stamp("hostname", "yolobox-e2e")
-        self.state_stamp("flake-rev", REV)
-        self.state_stamp("flake-narhash", NAR)
+        self.stamp(PINNED)
         result = self.rebuild("switch")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("YOLOBOX_FLAKE_REF=" + REF, self.sudo_argv_list())
-        self.assertIn("YOLOBOX_HOSTNAME=yolobox-e2e", self.sudo_argv_list())
+        self.assertIn("YOLOBOX_FLAKE_REF=" + PINNED, self.sudo_argv_list())
         self.assertEqual(self.sudo_argv_list()[-1], PINNED + "#yolobox")
 
     def test_the_exit_code_of_the_rebuild_is_the_helpers(self):
@@ -1074,33 +1044,28 @@ class TestRebuildLock(RebuildCase):
 
     def setUp(self):
         super().setUp()
-        bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
-        for name, text in (
-            ("sudo", RUNNING_SUDO),
-            ("nixos-rebuild", RECORDING_REBUILD),
-        ):
-            tool = bin_dir / name
-            tool.write_text(text)
-            tool.chmod(0o755)
+        self.fake("sudo", RUNNING_SUDO)
+        self.fake("nixos-rebuild", RECORDING_REBUILD)
         self.lock = self.tmp / "rebuild.lock"
         self.ran = self.tmp / "rebuild-ran"
-        self.env.update(
-            YOLOBOX_REBUILD_LOCK=str(self.lock), FAKE_REBUILD_RAN=str(self.ran)
-        )
+        self.write_facts(rebuild_lock=str(self.lock))
+        self.env.update(FAKE_REBUILD_RAN=str(self.ran))
 
-    def test_a_free_lock_lets_the_rebuild_run_with_its_variables(self):
-        result = self.rebuild("boot")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.ran.read_text(),
-            "boot --impure --refresh --flake %s#yolobox\n" % PINNED
-            + "alice yolobox-e2e %s\n" % REF,
-        )
+    def test_switch_and_boot_rebuild_the_stamped_tree_for_this_host_and_user(self):
+        for action in ("switch", "boot"):
+            with self.subTest(action=action):
+                result = self.rebuild(action)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.ran.read_text(),
+                    "%s --impure --flake %s#yolobox\n" % (action, PINNED)
+                    + "alice yolobox-e2e %s\n" % PINNED,
+                )
 
     def test_a_held_lock_refuses_the_rebuild_at_once_and_says_why(self):
         with open(self.lock, "w") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX)
             result = self.rebuild("boot")
-        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual(result.returncode, FACTS["rebuild_busy_exit"], result.stderr)
         self.assertIn("another rebuild is running", result.stderr)
         self.assertFalse(self.ran.exists(), "nixos-rebuild ran under a held lock")

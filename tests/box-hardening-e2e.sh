@@ -3,21 +3,11 @@
 # Runs on the HOST against a throwaway, already bootstrapped lima instance,
 # never against a box you use: step 5 reboots it.
 #
-#   tests/box-hardening-e2e.sh <instance> [EXTRA_WRAPPERS...]
+#   tests/box-hardening-e2e.sh <instance>
 #
 # <instance>        lima instance name, as for `yo -m <instance>`. The default
 #                   machine (`yolobox`) is the one a person works in, so it is
 #                   refused unless FORCE=1 is set.
-# EXTRA_WRAPPERS    names (or name=caps) of the setuid wrappers the instance's own
-#                   /etc/yolobox/local.nix adds via
-#                   yolobox.hardening.extraWrappers (e.g. a VPN client's split-tunnel helper).
-# ONLY              passed through to the guest script (hardening or compat);
-#                   unset runs both halves.
-# EXTRA_AGENT_GROUPS
-#                   passed through: the groups the instance's local.nix adds
-#                   the agent to. The tailscale pin's version is read from
-#                   this checkout (nix/pkgs/tailscale.nix) and passed as
-#                   TAILSCALE_VERSION; with no pin file, none is compared.
 # YO                the yo to drive the box with; the default is this
 #                   checkout's, so the test never runs another install's.
 #
@@ -35,61 +25,23 @@
 # mapfile, no ${var,,}, and no array expansions that can be empty.
 set -euo pipefail
 
-if [ "$#" -lt 1 ]; then
-    echo "usage: $0 <instance> [EXTRA_WRAPPERS...]" >&2
+if [ "$#" -ne 1 ]; then
+    echo "usage: $0 <instance>" >&2
     exit 64
 fi
 inst=$1
-shift
-extra_wrappers="$*"
-only=${ONLY:-}
-agent_groups=${EXTRA_AGENT_GROUPS:-}
 
 here=$(cd "$(dirname "$0")" && pwd)
 check_script="${here}/box-hardening-check.sh"
 yo=${YO:-"${here}/../yo"}
-tailscale_pin="${here}/../nix/pkgs/tailscale.nix"
 [ -f "${check_script}" ] || { echo "FAIL: ${check_script} is missing" >&2; exit 1; }
 [ -x "${yo}" ] || { echo "FAIL: ${yo} is not an executable yo" >&2; exit 1; }
-tailscale_version=""
-if [ -f "${tailscale_pin}" ]; then
-    tailscale_version=$(sed -n 's/^  version = "\([0-9.]*\)";$/\1/p' "${tailscale_pin}")
-    [ -n "${tailscale_version}" ] || { echo "FAIL: ${tailscale_pin} has no version line" >&2; exit 1; }
-fi
 
 # The default machine is never a throwaway (yolobox_cli/config.py DEFAULT_INSTANCE).
 if [ "${inst}" = yolobox ] && [ "${FORCE:-}" != 1 ]; then
     echo "FAIL: '${inst}' is the default machine, which this test reboots; use a throwaway instance, or FORCE=1" >&2
     exit 64
 fi
-
-# The names, the groups and ONLY travel inside single-quoted words of the
-# remote command line, so they must not be able to close the quote. `=` and
-# `,` are in because the documented form is name=caps
-# (dumpcap=cap_net_raw,cap_setpcap).
-for name in "$@"; do
-    case ${name} in
-    *[!A-Za-z0-9._,=-]* | '')
-        echo "FAIL: '${name}' is not a plausible wrapper name" >&2
-        exit 64
-        ;;
-    esac
-done
-for name in ${agent_groups}; do
-    case ${name} in
-    *[!A-Za-z0-9._-]*)
-        echo "FAIL: '${name}' is not a plausible group name" >&2
-        exit 64
-        ;;
-    esac
-done
-case ${only} in
-'' | hardening | compat) ;;
-*)
-    echo "FAIL: ONLY must be hardening, compat or unset, got '${only}'" >&2
-    exit 64
-    ;;
-esac
 
 step=""
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/box-hardening-e2e.XXXXXX")
@@ -121,7 +73,7 @@ begin() {
 # The check script reads from stdin via `bash -s`, so it needs no copy in the
 # guest. yo passes the one word to ssh, which hands it to the operator's shell.
 guest_check() {
-    "${yo}" -m "${inst}" ssh "EXTRA_WRAPPERS='${extra_wrappers}' EXTRA_AGENT_GROUPS='${agent_groups}' TAILSCALE_VERSION='${tailscale_version}' ONLY='${only}' bash -s" <"${check_script}"
+    "${yo}" -m "${inst}" ssh "bash -s" <"${check_script}"
 }
 
 # The kernel's boot id: a new one per boot, so a `yo down; yo up` that left
@@ -139,8 +91,8 @@ check_status() {
         return 1
     }
     printf '%s\n' "${out}"
-    grep -qx 'egress: host and LAN blocked' <<<"${out}" ||
-        { echo "status has no 'egress: host and LAN blocked' line" >&2; return 1; }
+    grep -qx 'egress: active' <<<"${out}" ||
+        { echo "status has no 'egress: active' line" >&2; return 1; }
     grep -q '^network: ok' <<<"${out}" ||
         { echo "status has no 'network: ok' line" >&2; return 1; }
 }

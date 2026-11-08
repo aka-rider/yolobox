@@ -10,7 +10,7 @@ class Yolobox < Formula
   depends_on "lima"
 
   def install
-    libexec.install "yo", "aws-broker"
+    libexec.install "yo", "aws-broker", "facts.json"
     # macOS runs the Lima driver; the libvirt driver's modules and the Linux host
     # files stay out.
     (libexec/"yolobox_cli").install Dir["yolobox_cli/*.py"] - ["yolobox_cli/libvirt.py", "yolobox_cli/libvirt_host.py"]

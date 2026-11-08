@@ -1,15 +1,15 @@
-"""Reverse forwards into the guest, the herdr machine and the per-command healing of both."""
+"""Reverse forwards into the guest, the operator's ssh master that carries them, and the herdr machine."""
 
 from __future__ import annotations
 
 import json
-import os
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Callable, ContextManager, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
-from . import aws, guest, proc, sshx, state, ui
+from . import aws, proc, sshx, state, ui
 from .config import (
     AGENT_AWS_BROKER_SOCK,
     AWS_BROKER_GUEST_SOCK,
@@ -17,7 +17,7 @@ from .config import (
     SSH_CONFIG_INCLUDE_LINE,
 )
 from .driver import Removal
-from .sshx import AGENT, OPERATOR, AccountStatus
+from .sshx import AGENT, OPERATOR
 from .ui import YoError
 
 
@@ -92,24 +92,9 @@ def ensure_herdr_machine(ssh_config_includes_the_vm: bool) -> None:
         )
         ui.err("        %s" % SSH_CONFIG_INCLUDE_LINE)
         return
-    added = proc.run(
-        [
-            herdr,
-            "machine",
-            "add",
-            state.box.herdr_alias,
-            "--label",
-            state.box.herdr_alias,
-        ]
-    )
-    if added.returncode != 0:
-        raise YoError(
-            proc.failed_message(
-                "herdr machine add %s" % state.box.herdr_alias,
-                added.returncode,
-                proc.failure_detail(added),
-            )
-        )
+    alias = state.box.herdr_alias
+    argv = [herdr, "machine", "add", alias, "--label", alias]
+    proc.checked(proc.run(argv), shlex.join(argv))
 
 
 def op_probe_alive(completed: subprocess.CompletedProcess) -> bool:
@@ -124,6 +109,10 @@ def aws_broker_probe_alive(completed: subprocess.CompletedProcess) -> bool:
     return completed.returncode == 0
 
 
+# How long the broker probe waits for an answer through the forward.
+BROKER_PROBE_SECONDS = 5
+
+
 @dataclass(frozen=True)
 class ReverseForward:
     name: str
@@ -133,13 +122,8 @@ class ReverseForward:
     alive: Callable[[subprocess.CompletedProcess], bool]
 
 
-# `ssh-add -l` with SIGPIPE ignored, which exec keeps. The agent-side socket
-# unit accepts every connection, and right after a boot its proxy finds no
-# forward behind it and closes the connection at once; ssh-add's request then
-# races that close, and a write after it is EPIPE. Ignored, EPIPE is ssh-add's
-# own exit 1 (a dead forward); by default it is death by SIGPIPE, which ssh
-# reports as 255, the code of a box out of reach (docs/ssh.md#healing-reverse-
-# forwards).
+# `ssh-add -l` with SIGPIPE ignored, so a dead forward is ssh-add's own exit 1,
+# never a death by SIGPIPE that ssh would report as 255.
 OP_PROBE = ("sh", "-c", "trap '' PIPE; exec ssh-add -l")
 
 
@@ -158,7 +142,15 @@ def aws_broker_forward() -> ReverseForward:
         "aws-broker",
         AWS_BROKER_GUEST_SOCK,
         aws.aws_broker_sock(),
-        ("curl", "-sS", "--unix-socket", AGENT_AWS_BROKER_SOCK, "http://broker/health"),
+        (
+            "curl",
+            "-sS",
+            "--max-time",
+            str(BROKER_PROBE_SECONDS),
+            "--unix-socket",
+            AGENT_AWS_BROKER_SOCK,
+            "http://broker/health",
+        ),
         aws_broker_probe_alive,
     )
 
@@ -176,123 +168,31 @@ def forward_control_cmd(action: str, forward: ReverseForward) -> List[str]:
 
 
 def forward_is_up(forward: ReverseForward) -> bool:
-    """Whether the agent can use the forward: the one probe of it, here and in `yo status`."""
+    """Whether the agent can use the forward: the one probe of it, for `yo status`."""
     return forward.alive(sshx.ssh_run(AGENT, list(forward.probe)))
 
 
-def heal_lock() -> ContextManager[None]:
-    """This machine's lock around a heal: two yo processes healing one forward
-    would cancel and re-issue it under each other, and one of them would then
-    probe a forward the other had just torn down."""
-    return state.host_state_lock("%s.forwards.lock" % state.box.name, wait=True)
-
-
-def heal_reverse_forward(forward: ReverseForward) -> bool:
-    with heal_lock():
-        # sshx.probe: an agent that cannot log in at all (ssh's 255 with its
-        # reason) is not a dead forward, and tearing a live forward down would
-        # not cure it. A probe that died on the box (255, nothing said) is one.
-        if forward.alive(sshx.probe(AGENT, list(forward.probe))):
-            return True
-        # The operator's master, opened on purpose: `-O` control commands need
-        # a live one and open none, and after a boot there is none yet.
-        sshx.ssh_run(OPERATOR, ["true"], mux=True, check=True)
-        proc.run(forward_control_cmd("cancel", forward), check=False)
-        sshx.ssh_run(OPERATOR, ["rm", "-f", forward.guest_path], mux=True, check=True)
+def ensure_session() -> None:
+    """The operator's ssh master, carrying both reverse forwards: left alone
+    when it answers `-O check`, opened otherwise. Nothing is probed or judged:
+    a master that answers is taken as whole, and `yo up` is the repair."""
+    if sshx.master_alive(OPERATOR):
+        return
+    forwards = [one_password_forward(), aws_broker_forward()]
+    # The first mux session opens the master (ControlMaster auto; ssh unlinks
+    # the socket a dead master left) and clears the guest sockets a previous
+    # master left behind, which a forward cannot bind over.
+    cleanup = ["rm", "-f", *(forward.guest_path for forward in forwards)]
+    proc.checked(
+        sshx.probe(OPERATOR, cleanup, mux=True), shlex.join(cleanup), "on the box"
+    )
+    for forward in forwards:
         proc.run(forward_control_cmd("forward", forward), check=True)
-        return forward.alive(sshx.probe(AGENT, list(forward.probe)))
 
 
-def heal_forward_collecting_errors(forward: ReverseForward, errors: List[str]) -> None:
-    try:
-        healed = heal_reverse_forward(forward)
-    except YoError as failure:
-        errors.append(
-            "the %s forward into the VM failed while healing it: %s"
-            % (forward.name, failure.message or "unknown error")
-        )
-        return
-    if not healed:
-        errors.append(
-            "the %s forward into the VM is still dead after re-issuing it"
-            % forward.name
-        )
-
-
-def ensure_forwards(aws_enabled: bool) -> List[str]:
-    errors: List[str] = []
-    if not os.path.exists(state.driver().op_sock()):
-        ui.err(
-            "yo: 1Password not running on this host (no socket at %s) — skipping its VM forward"
-            % state.driver().op_sock()
-        )
-    else:
-        heal_forward_collecting_errors(one_password_forward(), errors)
-    if aws_enabled:
-        heal_forward_collecting_errors(aws_broker_forward(), errors)
-    return errors
-
-
-def units_missing_note() -> str:
-    return "box predates the 1Password/AWS forwards; run `%s`" % state.yo_cmd(
-        "bootstrap"
-    )
-
-
-class AgentMissing(YoError):
-    """The box has no agent account at all (AccountStatus.OPERATOR_ONLY). Its
-    message is the destroy remedy; vm.heal_services tells the seed image, which
-    has the operator only too, apart first."""
-
-
-def account_problem(status: AccountStatus, detail: str) -> YoError:
-    """Why the forwards cannot be healed: the agent account they serve is not
-    there, or cannot log in. Healing anyway would read its failed login as a
-    dead forward and tear a live one down."""
-    if status is AccountStatus.OPERATOR_ONLY:
-        return AgentMissing(
-            "%s has no agent account to forward anything to (it predates the "
-            "operator/agent split); rebuild it: %s"
-            % (state.box.name, state.destroy_then_bootstrap_command())
-        )
-    return YoError(
-        "the agent account's login on %s fails, so its forwards were not checked "
-        "(its shell startup files are the usual cause; inspect them as the "
-        "operator: %s):\n%s" % (state.box.name, state.yo_cmd("ssh"), detail)
-    )
-
-
-def vm_services() -> None:
-    status, detail = sshx.account_status()
-    if status is AccountStatus.UNREACHABLE:
-        raise sshx.unreachable(OPERATOR)
-    if status is not AccountStatus.AGENT:
-        raise account_problem(status, detail)
-    if not guest.vm_units_present():
-        ui.err("yo: %s" % units_missing_note())
-        return
-
-    errors: List[str] = []
-    disable_failure: Optional[str] = None
-    aws_enabled = False
-    try:
-        aws_enabled = aws.ensure_aws_broker()
-    except aws.BrokerDisableError as failure:
-        disable_failure = failure.message or "aws-broker could not be disabled"
-    except YoError as failure:
-        errors.append(failure.message or "aws-broker failed")
-
-    errors += ensure_forwards(aws_enabled)
-
-    # Only the errors a fresh ssh master may cure get its remedy.
-    reports: List[str] = []
-    if errors:
-        reports.append(
-            "; ".join(errors)
-            + " — recreate the master: %s && %s"
-            % (state.driver().stop_command(), state.yo_cmd("up"))
-        )
-    if disable_failure is not None:
-        reports.append(disable_failure)
-    if reports:
-        raise YoError("\n".join(reports))
+def vm_services() -> bool:
+    """The box's host-side services, whole: the master with its forwards, and
+    the AWS broker serving today's allowlist (or stopped). True when the guest
+    has AWS. They serve the agent, whose login the caller has checked."""
+    ensure_session()
+    return aws.ensure_aws_broker()

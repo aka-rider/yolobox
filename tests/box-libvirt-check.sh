@@ -10,10 +10,10 @@
 # What it checks, in order, and stops at the first broken property:
 #   (a) libvirt's SELinux label of the domain: svirt_t, a category pair, enforcing
 #   (b) QEMU and passt run as yolobox-vm, in svirt_t and passt_t, with that pair
-#   (c) the live domain XML holds nothing but what libvirt/domain.xml makes,
-#       judged by yo's own rule (yolobox_cli/libvirt_host.py domain_gaps): the
-#       allowed elements and devices, both seclabels, the yolobox metadata,
-#       every portForward bound to 127.0.0.1, one passt interface
+#   (c) the live domain XML is the box's own (the yolobox metadata), holds no
+#       device that reaches the host (graphics, vsock, filesystem, channel,
+#       hostdev, tpm), one passt interface, both seclabels relabelling, and
+#       every portForward bound to 127.0.0.1
 #   (d) with the guest's own egress table deleted, so that only the host layer
 #       (linux/yolobox-host.nft) is left, the guest cannot reach the host, the
 #       LAN or a peer box, over TCP and UDP, on IPv4 and on IPv6 (the gateway
@@ -50,28 +50,19 @@
 #                   IPv6 default route, so the probe to the host's global
 #                   IPv6 address did not run
 #   RESIDUAL tailnet-host-ssh
-#                   the box reached the host's sshd over the tailnet. This is
-#                   the known residual in docs/linux-host.md, so it does not
-#                   change the exit status.
+#                   the box reached the host's sshd over the tailnet. A host
+#                   sshd listening on 0.0.0.0 is reachable from a box on the
+#                   same tailnet by design, so it does not change the exit status.
 set -Eeuo pipefail
 # Without this a command substitution runs with errexit off, so `peers=$(f)`
 # would carry on past a failing step inside f.
 shopt -s inherit_errexit
 
 readonly URI=qemu:///system
-readonly VM_ACCOUNT=yolobox-vm
-readonly GATEWAY_ADDR=192.168.5.2
-# nix/egress.nix: the unit that loads the guest table, and the table itself.
-readonly EGRESS_UNIT=yolobox-egress
-readonly EGRESS_TABLE="inet yolobox-egress"
 # The positive control for the probes: a host on the internet the host layer
 # lets the guest reach, and its port.
 readonly INTERNET_HOST=github.com
 readonly INTERNET_PORT=443
-# The checkout this script runs from: yo's own domain rule is imported from it.
-REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-readonly REPO_ROOT
-
 fail() {
     echo "FAIL: $*" >&2
     exit 1
@@ -86,17 +77,15 @@ if [ "$#" -ne 1 ]; then
     exit 64
 fi
 NAME=$1
-# yo's rule for a name (yolobox_cli/cli.py INSTANCE_NAME_RE and instance_name):
-# Lima's identifier shape, not Lima's own `lima-` prefix, and `yolobox-<name>`
-# lowercased must be one DNS label (yolobox_cli/config.py HOSTNAME_LABEL_RE).
-[[ ${NAME} =~ ^[A-Za-z0-9]+([._-][A-Za-z0-9]+)*$ ]] && [[ ${NAME} != lima-* ]] &&
-    [[ "yolobox-${NAME,,}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] ||
-    fail "'${NAME}' is not an instance name yo accepts (letters, digits and dashes, at most 55 of them)"
 DOMAIN="yolobox-${NAME}"
 SSH_CONFIG="${HOME}/.local/state/yolobox/instances/${NAME}/ssh.config"
 SSH_HOST="lima-${NAME}"
 [ -f "${SSH_CONFIG}" ] || fail "${SSH_CONFIG} is missing: run yo -m ${NAME} up first"
 
+YOLOBOX_GATEWAY=""
+YOLOBOX_VM_USER=""
+YOLOBOX_EGRESS_UNIT=""
+EGRESS_TABLE=""
 TABLE_DELETED=""
 CANARY_PID=""
 CANARY_PORT=""
@@ -116,10 +105,26 @@ guest() {
     ssh -F "${SSH_CONFIG}" "${SSH_HOST}" "$@" </dev/null
 }
 
-# Restarting the unit reloads recovery and then the full rules, so the table
-# is the real one again, whatever state it was left in.
+# The facts the box renders from facts.json into /etc/yolobox/facts.sh: the
+# gateway, the VM account and the egress unit, whose table carries its name.
+# The guest sources the file and prints one value per line; the host only
+# reads them, it never runs what the guest says.
+load_box_facts() {
+    local values
+    # shellcheck disable=SC2016 # expanded by the guest's shell
+    values=$(guest '. /etc/yolobox/facts.sh && printf "%s\n" "$YOLOBOX_GATEWAY" "$YOLOBOX_VM_USER" "$YOLOBOX_EGRESS_UNIT"') ||
+        fail "the box has no /etc/yolobox/facts.sh: run yo -m ${NAME} bootstrap first"
+    { read -r YOLOBOX_GATEWAY && read -r YOLOBOX_VM_USER && read -r YOLOBOX_EGRESS_UNIT; } <<<"${values}" ||
+        fail "the box's /etc/yolobox/facts.sh lacks the gateway, the VM account or the egress unit"
+    [ -n "${YOLOBOX_GATEWAY}" ] && [ -n "${YOLOBOX_VM_USER}" ] && [ -n "${YOLOBOX_EGRESS_UNIT}" ] ||
+        fail "the box's /etc/yolobox/facts.sh lacks the gateway, the VM account or the egress unit"
+    EGRESS_TABLE="inet ${YOLOBOX_EGRESS_UNIT}"
+}
+
+# Restarting the unit reloads the rules, so the table is the real one again,
+# whatever state it was left in.
 restore_egress_table() {
-    guest "sudo systemctl restart ${EGRESS_UNIT}" || return 1
+    guest "sudo systemctl restart ${YOLOBOX_EGRESS_UNIT}" || return 1
     guest "sudo nft list table ${EGRESS_TABLE} >/dev/null" || return 1
     TABLE_DELETED=""
 }
@@ -133,7 +138,7 @@ cleanup() {
         kill "${CANARY_PID}" || echo "WARN: could not stop the canary listener ${CANARY_PID}" >&2
     fi
     if [ -n "${TABLE_DELETED}" ] && ! restore_egress_table; then
-        echo "FAIL: the guest egress table is NOT restored. Run: yo -m ${NAME} ssh sudo systemctl restart ${EGRESS_UNIT}" >&2
+        echo "FAIL: the guest egress table is NOT restored. Run: yo -m ${NAME} ssh sudo systemctl restart ${YOLOBOX_EGRESS_UNIT}" >&2
         status=1
     fi
     exit "${status}"
@@ -259,7 +264,7 @@ while True:
 # Prints the guest's IPv6 default gateway, scoped when it is link-local (a
 # connect to fe80:: needs the interface), or nothing when the guest has no
 # IPv6 default route. passt answers for its gateway address of each family and
-# maps it to the host's loopback, so this is the IPv6 twin of ${GATEWAY_ADDR}.
+# maps it to the host's loopback, so this is the IPv6 twin of ${YOLOBOX_GATEWAY}.
 guest_v6_gateway() {
     local routes via
     routes=$(guest "ip -6 route show default") || fail "could not list the guest's IPv6 routes"
@@ -326,36 +331,53 @@ count_confined() {
 
 check_process_confinement() {
     local uid procs qemu passt
-    uid=$(id -u "${VM_ACCOUNT}") || fail "the account ${VM_ACCOUNT} does not exist: run linux/host-setup.sh"
+    uid=$(id -u "${YOLOBOX_VM_USER}") || fail "the account ${YOLOBOX_VM_USER} does not exist: run linux/host-setup.sh"
     procs=$(ps -eo euid=,label=,comm=) || fail "ps could not list processes with their labels"
     qemu=$(count_confined qemu-system svirt_t "${uid}" "${procs}")
     passt=$(count_confined passt passt_t "${uid}" "${procs}")
     [ "${qemu}" -eq 1 ] ||
-        fail "want exactly one qemu process as ${VM_ACCOUNT} in svirt_t:s0:${CATEGORIES}, found ${qemu}"
+        fail "want exactly one qemu process as ${YOLOBOX_VM_USER} in svirt_t:s0:${CATEGORIES}, found ${qemu}"
     [ "${passt}" -ge 1 ] ||
-        fail "no passt process as ${VM_ACCOUNT} in passt_t:s0:${CATEGORIES}"
-    ok "qemu runs as ${VM_ACCOUNT} in svirt_t and ${passt} passt in passt_t, all in s0:${CATEGORIES}"
+        fail "no passt process as ${YOLOBOX_VM_USER} in passt_t:s0:${CATEGORIES}"
+    ok "qemu runs as ${YOLOBOX_VM_USER} in svirt_t and ${passt} passt in passt_t, all in s0:${CATEGORIES}"
 }
 
 # ------------------------------------------------------------------- (c)
 
-# What yo would say about a domain's XML, read on stdin: three lines,
-# `instance=<marker or ->`, `ssh_port=<host port or ->` and `gaps=<names>`
-# (domain_gaps, space separated, empty for a domain the template made). $1 is
-# the instance name the metadata must carry. python runs isolated (-I) and
-# imports yo's package from this checkout, so the rule has one spelling, and
-# asks the host's domcapabilities for the emulator and loaders the way yo does
-# (libvirt.host_firmware), on the same qemu:///system connection.
+# What a domain's XML, read on stdin, says of itself: `instance=<marker or ->`,
+# `ssh_port=<host port forwarded to 22, or ->` and `gaps=<what breaks the box's
+# confinement, space separated, empty for a domain libvirt/domain.xml makes>`.
+# python runs isolated (-I) and reads the XML with the stdlib alone.
 domain_report() {
     python3 -I -c '
 import sys
-sys.path.insert(0, sys.argv[1])
-from yolobox_cli import libvirt, libvirt_host
-info = libvirt_host.parse_domain(sys.stdin.read())
-print("instance=%s" % (info.instance if info.instance is not None else "-"))
-print("ssh_port=%s" % (info.ssh_port if info.ssh_port is not None else "-"))
-print("gaps=%s" % " ".join(libvirt_host.domain_gaps(info, sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), libvirt.host_firmware())))
-' "${REPO_ROOT}" "$1" "$(id -u "${VM_ACCOUNT}")" "$(id -g "${VM_ACCOUNT}")"
+import xml.etree.ElementTree as ET
+root = ET.fromstring(sys.stdin.read())
+marker = root.find("metadata/{https://github.com/aka-rider/yolobox}instance")
+print("instance=%s" % ((marker.text or "").strip() if marker is not None else "-"))
+ranges = [r for r in root.findall("devices/interface/portForward/range") if r.get("to") == "22"]
+print("ssh_port=%s" % (ranges[0].get("start") if ranges else "-"))
+gaps = []
+devices = root.find("devices")
+for tag in ("graphics", "vsock", "filesystem", "channel", "hostdev", "tpm"):
+    if devices is not None and devices.find(tag) is not None:
+        gaps.append("device:" + tag)
+backends = [
+    (i.get("type"), i.find("backend").get("type") if i.find("backend") is not None else None)
+    for i in root.findall("devices/interface")
+]
+if backends != [("user", "passt")]:
+    gaps.append("interface")
+for forward in root.findall("devices/interface/portForward"):
+    if forward.get("address") != "127.0.0.1":
+        gaps.append("portForward.address")
+labels = {(l.get("type"), l.get("model")): l.get("relabel") for l in root.findall("seclabel")}
+if labels.get(("dynamic", "selinux")) != "yes":
+    gaps.append("seclabel.selinux")
+if labels.get(("static", "dac")) != "yes":
+    gaps.append("seclabel.dac")
+print("gaps=%s" % " ".join(gaps))
+'
 }
 
 # One line of a domain_report.
@@ -366,14 +388,14 @@ report_field() {
 check_domain_xml() {
     local xml report gaps instance
     xml=$(virsh_system dumpxml "${DOMAIN}") || fail "virsh dumpxml ${DOMAIN} failed"
-    report=$(domain_report "${NAME}" <<<"${xml}") || fail "yo's domain rule could not read the XML of ${DOMAIN}"
+    report=$(domain_report <<<"${xml}") || fail "could not read the XML of ${DOMAIN}"
     gaps=$(report_field "${report}" gaps)
-    [ -z "${gaps}" ] || fail "${DOMAIN} differs from what libvirt/domain.xml makes: ${gaps}"
+    [ -z "${gaps}" ] || fail "${DOMAIN} breaks the box's confinement: ${gaps}"
     instance=$(report_field "${report}" instance)
     [ "${instance}" = "${NAME}" ] || fail "${DOMAIN} carries the metadata of '${instance}', not ${NAME}"
     SSH_PORT=$(report_field "${report}" ssh_port)
     [[ ${SSH_PORT} =~ ^[0-9]+$ ]] || fail "no forward to guest port 22 in the XML of ${DOMAIN}"
-    ok "${DOMAIN} is what libvirt/domain.xml makes (no gaps), forwards 127.0.0.1:${SSH_PORT} and carries the metadata"
+    ok "${DOMAIN} holds no device that reaches the host, one passt interface, both seclabels, forwards 127.0.0.1:${SSH_PORT} and carries the metadata"
 }
 
 # ------------------------------------------------------------------- (d)
@@ -389,7 +411,7 @@ running_peers() {
         xml=$(virsh_system dumpxml "${other}") || fail "virsh dumpxml ${other} failed"
         # `|| return 1` as well: the substitution here sits in a list that
         # errexit ignores, so inherit_errexit alone would not stop it.
-        report=$(domain_report "${other#yolobox-}" <<<"${xml}") || return 1
+        report=$(domain_report <<<"${xml}") || return 1
         if [ "$(report_field "${report}" instance)" != - ]; then
             port=$(report_field "${report}" ssh_port)
             [[ ${port} =~ ^[0-9]+$ ]] || fail "no forward to guest port 22 in the XML of ${other}"
@@ -406,7 +428,7 @@ check_peers() {
             continue
         fi
         seen=1
-        expect_blocked "the ssh port of the running box ${peer_name}" "${GATEWAY_ADDR}" "${peer_port}"
+        expect_blocked "the ssh port of the running box ${peer_name}" "${YOLOBOX_GATEWAY}" "${peer_port}"
     done <<<"${peers}"
     if [ -z "${seen}" ]; then
         echo "SKIP peer"
@@ -460,7 +482,7 @@ check_v6_gateway() {
 }
 
 # The host's own global IPv6 address is delivered over loopback, which the
-# host table rejects (docs/linux-host.md, "IPv6").
+# host table rejects.
 check_v6_host() {
     local dev6 host_ip6=""
     read -r _ dev6 <<<"$(lan_default_route -6)"
@@ -505,9 +527,9 @@ check_host_layer_alone() {
     ok "the guest connects to ${INTERNET_HOST}:${INTERNET_PORT}"
 
     start_canary
-    expect_blocked "the gateway, the host's loopback, ssh" "${GATEWAY_ADDR}" 22
-    expect_blocked "the gateway, a listener of the host" "${GATEWAY_ADDR}" "${CANARY_PORT}"
-    expect_udp_blocked "the gateway, a listener of the host" "${GATEWAY_ADDR}" "${CANARY_PORT}"
+    expect_blocked "the gateway, the host's loopback, ssh" "${YOLOBOX_GATEWAY}" 22
+    expect_blocked "the gateway, a listener of the host" "${YOLOBOX_GATEWAY}" "${CANARY_PORT}"
+    expect_udp_blocked "the gateway, a listener of the host" "${YOLOBOX_GATEWAY}" "${CANARY_PORT}"
     check_v6_gateway
     expect_blocked "the host's primary address, ssh" "${host_ip}" 22
     expect_blocked "the host's primary address, a listener of the host" "${host_ip}" "${CANARY_PORT}"
@@ -520,9 +542,9 @@ check_host_layer_alone() {
     guest "curl -sSI --max-time 20 https://github.com >/dev/null" ||
         fail "the guest cannot fetch https://github.com with the host layer alone"
     ok "the guest reaches https://github.com"
-    answer=$(guest "dig +short +time=5 +tries=1 @${GATEWAY_ADDR} github.com") ||
-        fail "dig @${GATEWAY_ADDR} github.com failed in the guest"
-    [ -n "${answer}" ] || fail "dig @${GATEWAY_ADDR} github.com answered nothing"
+    answer=$(guest "dig +short +time=5 +tries=1 @${YOLOBOX_GATEWAY} github.com") ||
+        fail "dig @${YOLOBOX_GATEWAY} github.com failed in the guest"
+    [ -n "${answer}" ] || fail "dig @${YOLOBOX_GATEWAY} github.com answered nothing"
     ok "the gateway answers DNS (UDP to the gateway's port 53 is the one host port the guest may use)"
 
     restore_egress_table || fail "could not restore the guest egress table"
@@ -546,6 +568,7 @@ main() {
     state=$(virsh_system domstate "${DOMAIN}") || fail "no domain ${DOMAIN}: is the box created?"
     [ "${state}" = running ] || fail "${DOMAIN} is ${state}, not running"
     guest true || fail "cannot ssh to ${SSH_HOST} with ${SSH_CONFIG}"
+    load_box_facts
     check_domain_label
     check_process_confinement
     check_domain_xml

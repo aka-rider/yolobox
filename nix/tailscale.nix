@@ -7,13 +7,11 @@
 
   services.tailscale = {
     enable = true;
-    # nixos-unstable lags tailscale's releases; see nix/pkgs/tailscale.md.
-    package = pkgs.callPackage ./pkgs/tailscale.nix { };
     # 0: tailscaled picks a free UDP port at each start. A fixed port collides
     # on a Linux host, where passt binds it for the guest and the host's own
-    # tailscaled may hold it. See nix/tailscale.md.
+    # tailscaled may hold it: passt keeps the guest's source port.
     port = 0;
-    # false: true would open its UDP port on enp0s1 as well (CONSTITUTION).
+    # false: true would open its UDP port on enp0s1 as well.
     openFirewall = false;
     # TS_NO_LOGS_NO_SUPPORT=true: no log uploads to log.tailscale.com, and with
     # them no Tailscale support for this node.
@@ -23,18 +21,15 @@
     # its own (its default puts "-A INPUT -j ts-input" ahead of nixos-fw).
     # --accept-dns=false: MagicDNS must not take over the guest's resolver.
     # --exit-node-allow-lan-access: keeps 192.168.5.0/24 (Lima's ssh replies) out
-    # of tailscale's table 52 once an exit node is selected. Verified live;
-    # see nix/tailscale.md. egress.nix still rejects the private ranges,
-    # except the networks in lanAllow.
+    # of tailscale's table 52 once an exit node is selected, so `yo ssh`
+    # survives one. The egress table still rejects the private ranges.
     extraSetFlags = [ "--accept-dns=false" "--ssh=false" "--netfilter-mode=off" "--exit-node-allow-lan-access" "--hostname=${config.networking.hostName}" ];
   };
 
-  # tailscaled makes its socket 0666 itself, so the directory mode is what keeps
-  # the agent, which is not in wheel, off it. The operator is in wheel and keeps
-  # `tailscale status` working. The chgrp must be ExecStartPost: systemd re-applies
-  # the unit's owner (root:root) to /run/tailscale for every command it spawns, so
-  # a chgrp in ExecStartPre is undone by the next gate and by ExecStart. A restart
-  # re-runs the whole sequence, ExecStartPost included. See nix/tailscale.md.
+  # tailscaled's socket is 0666, so a 0750 wheel-group directory keeps the agent
+  # off it, and the operator, in wheel, keeps `tailscale status`. The chgrp is an
+  # ExecStartPost because systemd re-applies root:root to /run/tailscale for
+  # every earlier command.
   systemd.services.tailscaled.serviceConfig.RuntimeDirectoryMode = "0750";
   systemd.services.tailscaled.serviceConfig.ExecStartPost = [ "+${pkgs.coreutils}/bin/chgrp wheel /run/tailscale" ];
 
@@ -47,7 +42,7 @@
   # is every few seconds for as long as the path stays relayed, and the box
   # sits behind lima's NAT, so it often does. The line carries nothing that
   # `tailscale status` does not, and tailscaled has no switch for it. The
-  # direct-path lines and "now using" stay. See nix/tailscale.md.
+  # direct-path lines and "now using" stay.
   systemd.services.tailscaled.serviceConfig.LogFilterPatterns =
     "~magicsock: new contact: peer=[^ ]+ usec=[0-9]+ cached=[a-z]+ via=derp";
 

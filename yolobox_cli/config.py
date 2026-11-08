@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import re
 import sys
-from pathlib import Path
 
+from . import common
 from .ui import YoError
+
+# Where yo is installed, and the facts shipped beside it (common reads both).
+SCRIPT_DIR = common.SCRIPT_DIR
+FACTS = common.FACTS
 
 
 # Rewritten at build time: nix substituteInPlace, Homebrew inreplace.
@@ -17,30 +21,30 @@ YO_VERSION = "dev"
 # release tag instead (release.own_release_ref).
 YO_SOURCE_REV = "dev"
 
-DEFAULT_INSTANCE = "yolobox"
-# One DNS label (RFC 1123, lowercase). flake.nix matches the same pattern against
-# YOLOBOX_HOSTNAME; tests/test_consistency.py keeps the two equal. fullmatch only.
-HOSTNAME_LABEL_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+DEFAULT_INSTANCE = FACTS["default_instance"]
+# One DNS label (RFC 1123, lowercase); the flake matches the same pattern against
+# YOLOBOX_HOSTNAME. fullmatch only.
+HOSTNAME_LABEL_RE = re.compile(FACTS["hostname_label_re"])
 
-# The operator's uid inside the guest on every host: lima-init's cidata
-# account, declared in nix/base.nix and checked by yolobox-guest rebuild.
-OPERATOR_GUEST_UID = 501
+# The operator's uid inside the guest on every host: lima-init's cidata account.
+OPERATOR_GUEST_UID = FACTS["operator_uid"]
+# What the operator's guest home adds to the account name: /home/<name>.guest.
+OPERATOR_HOME_SUFFIX = FACTS["operator_home_suffix"]
 # The shape of the operator's account name, which reaches sshd config, tmpfiles
-# rules and shell scripts in the box. nix/base.nix asserts the same pattern at
-# eval time (tests/test_consistency.py keeps the two equal); operator_account()
-# refuses the name on the host first, in cli.main(), for both drivers.
-OPERATOR_ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]*")
-# The word the box's stage-2 sshd appends to its SSH banner (VersionAddendum in
-# nix/base.nix). The initrd's sshd has none, so yo tells the two apart without
-# logging in, and never offers stage 2 a user it rejects (nix/base.md).
-STAGE2_SSH_BANNER_MARK = "yolobox-stage2"
+# rules and shell scripts in the box; the box asserts the same pattern at eval
+# time, and operator_account() refuses the name on the host first.
+OPERATOR_ACCOUNT_RE = re.compile(FACTS["operator_account_re"])
+# The word the box's stage-2 sshd appends to its SSH banner. The initrd's sshd
+# has none, so yo tells the two apart without logging in, and never offers
+# stage 2 a user it rejects.
+STAGE2_SSH_BANNER_MARK = FACTS["stage2_ssh_banner_mark"]
 # The one ~/.ssh/config line that reaches every machine on both hosts: libvirt's
 # instance files and Lima's. An Include applies only to the Host or Match block
 # it follows, so it belongs above the first one (ssh_config_reaches_box()).
 SSH_CONFIG_INCLUDE_LINE = (
     "Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config"
 )
-AGENT_USER = "agent"
+AGENT_USER = FACTS["agent_user"]
 
 
 def operator_account(username: str) -> str:
@@ -58,32 +62,38 @@ def operator_account(username: str) -> str:
     return username
 
 
-AGENT_HOME = "/home/agent"
+AGENT_HOME = FACTS["agent_home"]
 HELPER = "yolobox-guest"
-HELPER_NO_SUBCOMMAND = 64
-# EX_USAGE (sysexits.h): the command cannot do what was asked on this host.
-USAGE_EXIT = 64
+# EX_USAGE (sysexits.h): the command cannot do what was asked on this host, and
+# what the guest script answers an unknown subcommand with.
+USAGE_EXIT = FACTS["usage_exit"]
 SSH_UNREACHABLE = 255
 
-OP_GUEST_SOCK = "/run/yolobox-op/agent.sock"
-AWS_BROKER_GUEST_SOCK = "/run/yolobox-op/aws-broker.sock"
-AGENT_AWS_BROKER_SOCK = "/run/yolobox/aws-broker.sock"
+OP_GUEST_SOCK = FACTS["op_guest_sock"]
+AWS_BROKER_GUEST_SOCK = FACTS["aws_broker_guest_sock"]
+AGENT_AWS_BROKER_SOCK = FACTS["agent_aws_broker_sock"]
+# Where lima's hostagent listens on the Mac for the default instance.
+SSH_LOCAL_PORT = FACTS["ssh_local_port"]
+# The unit that loads the guest's egress table.
+EGRESS_UNIT = FACTS["egress_unit"]
 
-# The encrypted root. The passphrase is derived from a 1Password-held key (see
-# luks_passphrase) and never stored.
-LUKS_DEVICE = "/dev/vda2"
+# The encrypted root: the partition and the name it is opened under. The
+# passphrase is derived from a 1Password-held key (luks_passphrase) and never stored.
+LUKS_DEVICE = FACTS["luks_device"]
+LUKS_MAPPER = FACTS["luks_mapper"]
 
 # Title of the Ed25519 "SSH Key" item in 1Password that unlocks the disk.
 LUKS_KEY_ITEM = "yolobox-disk"
 
-PROXY_SOCKET_UNITS = ("yolobox-op-agent.socket", "yolobox-aws-broker.socket")
+PROXY_SOCKET_UNITS = (
+    FACTS["op_agent_proxy_unit"] + ".socket",
+    FACTS["aws_broker_proxy_unit"] + ".socket",
+)
 
 
 # The host OS as sys.platform spells it: the one place yo asks. main() turns it
 # into a driver with driver_for(), and nothing else looks at the host OS.
 HOST_PLATFORM = sys.platform
-
-SCRIPT_DIR = Path(__file__).resolve().parent.parent
 
 LOOPBACK = "127.0.0.1"
 
@@ -93,16 +103,9 @@ KIB = 1024
 MIB = 1024 * KIB
 GIB = 1024 * MIB
 
-# The smallest box `yo up --memory/--disk` creates, and why
-# (yo.md#several-machines). The reasons are printed with a refused flag.
-# The memory floor is measured, on a libvirt box: the first `yo bootstrap`
-# runs on the seed image, which has no swap until stage 2 makes the 16 GiB
-# swapfile (nix/swap.nix), and its nix needs about 1.4 GB resident. At 2 GiB
-# the guest's OOM killer ended nix after 166 s (`Out of memory: Killed process
-# (nix) ... anon-rss:1364620kB`, PSI full avg10 12.44 before it); at 4 GiB the
-# bootstrap took 184 s with a 1.78 GB peak. The default stays 16
-# (LIBVIRT_MEMORY_GIB in libvirt.py, lima/yolobox.yaml on a Mac), and a box
-# this small leans on the swapfile for every later `nixos-rebuild`.
+# The smallest box `yo up --memory/--disk` creates, and why. The reasons are
+# printed with a refused flag. The memory floor is measured: the first
+# bootstrap's nix peaks at 1.78 GB, before the box has a swapfile.
 MIN_MEMORY_GIB = 4
 MIN_MEMORY_WHY = (
     "the box builds its own system, and with less the nix evaluator is OOM-killed "

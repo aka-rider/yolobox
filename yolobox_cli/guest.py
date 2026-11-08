@@ -1,42 +1,27 @@
-"""Calling yolobox-guest and the guest's accounts, host keys and units."""
+"""Calling yolobox-guest, and the guest's host keys and root usage."""
 
 from __future__ import annotations
 
 import subprocess
 from typing import List, NamedTuple, Optional, Sequence
 
-from . import proc, release, sshconfig, sshx, state, ui
-from .config import (
-    AGENT_HOME,
-    FILE_MODE_PRIVATE,
-    HELPER,
-    HELPER_NO_SUBCOMMAND,
-    PROXY_SOCKET_UNITS,
-)
+from . import proc, sshconfig, sshx, state, ui
+from .config import AGENT_HOME, FILE_MODE_PRIVATE, HELPER
 from .sshx import AGENT, OPERATOR, SshRole
 from .ui import YoError
 
-
-HELPER_MARKER = "unknown subcommand"
 
 HOST_KEY_GLOB = "/etc/ssh/ssh_host_*_key.pub"
 
 
 def ensure_guest_known_hosts() -> None:
-    # The herdr_alias_block's UserKnownHostsFile has to be pre-populated with
-    # the guest's real key: herdr passes -o StrictHostKeyChecking=yes on the
+    # The herdr alias's UserKnownHostsFile has to be pre-populated with the
+    # guest's real key: herdr passes -o StrictHostKeyChecking=yes on the
     # command line for every saved machine, which overrides anything weaker
     # this alias sets, so "no known key yet" can never pass. The fetch is
     # first contact only while nothing is pinned; with a pin it is pinned
     # itself (sshx.host_key_fetch_role), so a changed key is refused, never
     # learned anew, and the file is rewritten only after a fetch that passed.
-    current = proc.read_text_file(state.ssh_cfg(), errors="surrogateescape")
-    if current is None:
-        return
-    host_block = sshconfig.parse_ssh_host_block(current, state.box.vm_host)
-    if host_block is None:
-        return
-
     completed = sshx.ssh_run(
         sshx.host_key_fetch_role(),
         ["sh", "-c", "cat %s" % HOST_KEY_GLOB],
@@ -49,7 +34,9 @@ def ensure_guest_known_hosts() -> None:
             % (HOST_KEY_GLOB, state.box.herdr_alias, proc.what_it_said(completed))
         )
 
-    lines = sshconfig.known_hosts_lines(host_block, completed.stdout)
+    lines = sshconfig.known_hosts_lines(
+        state.driver().ssh_facts().port, completed.stdout
+    )
     if not lines:
         raise YoError(
             "the guest reported no parseable ssh host keys at %s" % HOST_KEY_GLOB
@@ -60,18 +47,6 @@ def ensure_guest_known_hosts() -> None:
     )
 
 
-def guest_helper_check(
-    completed: subprocess.CompletedProcess, what: str
-) -> subprocess.CompletedProcess:
-    if completed.returncode != 0:
-        raise YoError(
-            proc.failed_message(
-                what, completed.returncode, proc.failure_detail(completed)
-            )
-        )
-    return completed
-
-
 def guest_helper(
     role: SshRole,
     sub: str,
@@ -80,38 +55,18 @@ def guest_helper(
     stream: bool = False,
     **kwargs,
 ) -> subprocess.CompletedProcess:
+    """`yolobox-guest SUB ARGS` as `role`; the exit code is the caller's to read."""
     if stream:
         kwargs["capture"] = False
         kwargs["filtered"] = True
-    completed = sshx.probe(role, [HELPER, sub, *args], **kwargs)
-    # The exit code alone is never read as skew: a subcommand's own child can
-    # exit 127 or 64 too. Both skews need their stderr marker, which a streamed
-    # run also keeps (run_filtered returns stderr's tail).
-    stderr = completed.stderr or ""
-    if completed.returncode == 127 and "not found" in stderr:
-        raise helper_skew_error(role, 127, "the box has no %s" % HELPER)
-    if completed.returncode == HELPER_NO_SUBCOMMAND and HELPER_MARKER in stderr:
-        raise helper_skew_error(
-            role,
-            HELPER_NO_SUBCOMMAND,
-            "the box's %s has no '%s' subcommand" % (HELPER, sub),
-        )
-    return completed
-
-
-def helper_skew_error(role: SshRole, code: int, what: str) -> YoError:
-    """`what` is what the exit code and marker mean on an honest box; the message
-    says whose session said so, since the agent's own session can say anything."""
-    return YoError(
-        release.helper_skew("%s (the %s's session exited %d)" % (what, role.name, code))
-    )
+    return sshx.probe(role, [HELPER, sub, *args], **kwargs)
 
 
 def agent_paths(sub: str, args: Sequence[str] = (), *, check: bool = True) -> List[str]:
     completed = guest_helper(AGENT, sub, args, binary=True)
     if completed.returncode != 0:
         if check:
-            guest_helper_check(completed, sub)
+            proc.checked(completed, "%s %s" % (HELPER, sub), "on the box")
         else:
             if completed.stderr:
                 ui.err(ui.quoted_block(completed.stderr))
@@ -125,13 +80,6 @@ def agent_paths(sub: str, args: Sequence[str] = (), *, check: bool = True) -> Li
             )
     decoded = completed.stdout.decode("utf-8", "replace")
     return [entry for entry in decoded.split("\0") if entry]
-
-
-def vm_units_present() -> bool:
-    return (
-        sshx.probe(OPERATOR, ["systemctl", "cat", PROXY_SOCKET_UNITS[0]]).returncode
-        == 0
-    )
 
 
 class RootUsage(NamedTuple):

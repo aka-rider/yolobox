@@ -79,6 +79,20 @@ def aws_result(stdout="", stderr="", returncode=0):
     )
 
 
+def broker_argv(sock, ctl, watch_pid=None):
+    return [
+        sys.executable,
+        BROKER_PATH,
+        *["--socket", sock, "--control-socket", ctl],
+        *["--watch-pid", str(watch_pid or os.getpid()), "--allow", "dev"],
+        *["--log", broker_log_path(sock)],
+    ]
+
+
+def broker_log_path(sock):
+    return os.path.join(os.path.dirname(sock), "broker.log")
+
+
 class TestProfileNamePattern(unittest.TestCase):
     def test_accepts_ordinary_names(self):
         for name in ["dev", "A", "0", "prod-eu_1.2", "a.b"]:
@@ -131,78 +145,10 @@ class TestSanitize(unittest.TestCase):
                 self.assertEqual(broker.sanitize(char), expected)
 
 
-class TestEventLog(unittest.TestCase):
-    """What a kind of event costs in broker.log: one line per window, then a count."""
-
-    def setUp(self):
-        patch = mock.patch.object(broker, "log")
-        self.log = patch.start()
-        self.addCleanup(patch.stop)
-        self.clock = mock.patch.object(broker.time, "monotonic", return_value=1000.0)
-        self.now = self.clock.start()
-        self.addCleanup(self.clock.stop)
-        self.events = broker.EventLog(window=60)
-
-    def lines(self):
-        return [call.args[0] for call in self.log.call_args_list]
-
-    def test_the_first_event_of_a_kind_is_written_with_its_detail(self):
-        self.events.note("answered 404", "GET /nope HTTP/1.0")
-        self.events.note("deadline passed")
-        self.assertEqual(
-            self.lines(), ["answered 404: GET /nope HTTP/1.0", "deadline passed"]
-        )
-
-    def test_repeats_inside_the_window_cost_nothing_until_it_closes(self):
-        for n in range(1000):
-            self.events.note("answered 404", f"GET /nope{n} HTTP/1.0")
-            self.events.note("answered 403", f"GET /creds/x{n} HTTP/1.0")
-        self.assertEqual(len(self.lines()), 2)
-        self.events.close_window()
-        self.assertEqual(len(self.lines()), 3)
-        self.assertIn("999 x answered 404", self.lines()[-1])
-        self.assertIn("999 x answered 403", self.lines()[-1])
-
-    def test_closing_an_empty_or_unrepeated_window_writes_nothing(self):
-        self.events.close_window()
-        self.events.note("once")
-        self.events.close_window()
-        self.assertEqual(self.lines(), ["once"])
-
-    def test_the_window_closes_at_the_first_event_after_it_passed(self):
-        self.events.note("answered 404", "first")
-        self.events.note("answered 404", "second")
-        self.now.return_value = 1059.9
-        self.events.note("answered 404", "third")
-        self.assertEqual(self.lines(), ["answered 404: first"])
-        self.now.return_value = 1060.0
-        self.events.note("answered 404", "fourth")
-        self.assertEqual(
-            self.lines(),
-            [
-                "answered 404: first",
-                "in the last 60s, also: 2 x answered 404",
-                "answered 404: fourth",
-            ],
-        )
-
-    def test_a_zero_window_writes_every_event(self):
-        events = broker.EventLog(window=0)
-        for _ in range(3):
-            events.note("answered 404", "x")
-        self.assertEqual(self.lines(), ["answered 404: x"] * 3)
-
-    def test_detail_is_clipped_so_a_request_head_cannot_fill_a_line(self):
-        self.events.note("answered 404", "x" * (broker.LOGGED_DETAIL_MAX + 100))
-        (line,) = self.lines()
-        self.assertLess(len(line), broker.LOGGED_DETAIL_MAX + 50)
-        self.assertIn("(100 more)", line)
-
-
 class TestParseArgs(unittest.TestCase):
     def parse(self, *allow):
         argv = ["aws-broker", "--socket", "/x", "--control-socket", "/y"]
-        argv += ["--watch-pid", "1", "--allow", *allow]
+        argv += ["--watch-pid", "1", "--log", "/z", "--allow", *allow]
         out = io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
             try:
@@ -300,12 +246,6 @@ class TestExportCredentials(unittest.TestCase):
                 creds, err = broker.export_credentials("dev")
         self.assertIsNone(creds)
         self.assertIn("timed out after 7s", err)
-
-    def test_a_mint_and_a_lock_wait_fit_in_the_request_deadline(self):
-        self.assertLess(
-            broker.PROFILE_LOCK_TIMEOUT_SECONDS + broker.MINT_TIMEOUT_SECONDS,
-            broker.REQUEST_DEADLINE_SECONDS,
-        )
 
     def test_the_cli_never_gets_the_brokers_stdin(self):
         with tempfile.TemporaryDirectory() as bindir:
@@ -422,19 +362,23 @@ class MintGrandchild(unittest.TestCase):
 
 class TestMintTimeoutEndsTheWholeProcessGroup(MintGrandchild):
     def test_the_grandchild_of_a_timed_out_mint_is_dead_too(self):
-        # The grandchild reaches the FIFO milliseconds after `aws` starts; the
-        # timeout is the feature's own, long enough for it to get there.
-        started = threading.Thread(target=self.grandchild_started, daemon=True)
-        started.start()
+        real_communicate = subprocess.Popen.communicate
+
+        def communicate_once_the_grandchild_runs(proc, *args, **kwargs):
+            # The clock is consulted only after the grandchild reported in, so
+            # no wait for it is raced against the mint timeout.
+            self.grandchild_started()
+            return real_communicate(proc, *args, **{**kwargs, "timeout": 0})
+
         with mock.patch.dict(os.environ, self.env):
-            with mock.patch.object(broker, "MINT_TIMEOUT_SECONDS", 2):
+            with mock.patch.object(
+                subprocess.Popen, "communicate", communicate_once_the_grandchild_runs
+            ):
                 creds, err = broker.export_credentials("dev")
-        started.join(10)
-        self.assertFalse(started.is_alive(), "the grandchild never opened the FIFO")
         self.assertIsNone(creds)
         self.assertIn("timed out", err)
         self.assert_grandchild_dead()
-        self.assertEqual(broker.running_mints, set())
+        self.assertIsNone(broker.mint_in_flight)
 
 
 class TestMintOutputThatIsNotUtf8(unittest.TestCase):
@@ -446,7 +390,7 @@ class TestMintOutputThatIsNotUtf8(unittest.TestCase):
         ):
             creds, err = broker.export_credentials("dev")
         self.assertIsNone(creds)
-        self.assertIn("bad \ufffd\ufffd byte", err)
+        self.assertIn("bad �� byte", err)
 
     def test_a_success_with_non_utf8_output_is_an_error_not_an_exception(self):
         with mock.patch.object(broker, "run_aws", return_value=aws_result(b"\xff\xfe")):
@@ -455,15 +399,18 @@ class TestMintOutputThatIsNotUtf8(unittest.TestCase):
         self.assertIn("unparseable", err)
 
     def test_the_remint_throttle_still_counts_a_mint_that_printed_non_utf8(self):
-        state = broker.State("dev", 3600.0, broker.EventLog())
-        with mock.patch.object(broker, "log"):
-            with mock.patch.object(
+        cache = broker.ProfileCache("dev")
+        with (
+            mock.patch.object(broker, "log"),
+            mock.patch.object(broker, "MIN_REMINT_INTERVAL_SECONDS", 3600.0),
+            mock.patch.object(
                 broker,
                 "run_aws",
                 return_value=aws_result(returncode=255, stderr=b"\xff"),
-            ) as run:
-                self.assertIsNone(state.get())
-                self.assertIsNone(state.get())
+            ) as run,
+        ):
+            self.assertIsNone(cache.get())
+            self.assertIsNone(cache.get())
         self.assertEqual(run.call_count, 1)
 
 
@@ -488,6 +435,34 @@ class SocketDirCase(unittest.TestCase):
         self.assertTrue(out.getvalue().startswith("ERROR="))
         return out.getvalue()
 
+    def spawn_broker(self, argv, **popen_kwargs):
+        """A broker process whose pipes and life end with the test."""
+        child = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **popen_kwargs,
+        )
+        self.addCleanup(child.stderr.close)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child
+
+    def script_argv(self, script):
+        """Run `script` (LOAD_BROKER ... RUN_BROKER) on this test's sockets."""
+        return [
+            *[sys.executable, "-c", script, BROKER_PATH, self.sock],
+            *[str(os.getpid()), broker_log_path(self.sock)],
+        ]
+
+    def start_broker(self, **popen_kwargs):
+        """A broker on this test's sockets, running and READY."""
+        child = self.spawn_broker(broker_argv(self.sock, self.ctl), **popen_kwargs)
+        self.assertEqual(child.stdout.readline(), "READY\n", child.stderr)
+        return child
+
 
 class TestReclaimSocketPath(SocketDirCase):
     def test_missing_path_is_fine(self):
@@ -510,7 +485,7 @@ class TestReclaimSocketPath(SocketDirCase):
 
     def test_refuses_a_symlink_to_a_live_socket(self):
         real = os.path.join(self.dir, "real.sock")
-        server, _ = broker.bind_guest_server(real, {}, 1, broker.EventLog())
+        server, _ = broker.bind_guest_server(real, {}, 1)
         self.addCleanup(server.server_close)
         os.symlink(real, self.sock)
         out = self.fails(broker.reclaim_socket_path, self.sock)
@@ -518,14 +493,14 @@ class TestReclaimSocketPath(SocketDirCase):
         self.assertTrue(os.path.islink(self.sock))
 
     def test_removes_a_stale_socket(self):
-        server, _ = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
+        server, _ = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()  # closed but the file remains: stale
         self.assertTrue(os.path.exists(self.sock))
         broker.reclaim_socket_path(self.sock)
         self.assertFalse(os.path.exists(self.sock))
 
     def test_refuses_a_live_socket(self):
-        server, _ = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
+        server, _ = broker.bind_guest_server(self.sock, {}, 1)
         self.addCleanup(server.server_close)
         self.fails(broker.reclaim_socket_path, self.sock)
         self.assertTrue(os.path.exists(self.sock))
@@ -533,13 +508,13 @@ class TestReclaimSocketPath(SocketDirCase):
 
 class TestUnlinkIfSameIdentity(SocketDirCase):
     def test_removes_the_file_with_that_identity(self):
-        server, identity = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
+        server, identity = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()
         broker.unlink_if_same_identity(self.sock, identity)
         self.assertFalse(os.path.lexists(self.sock))
 
     def test_leaves_a_newer_file_alone(self):
-        server, identity = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
+        server, identity = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()
         # Made while the old socket still exists, then renamed over it: Linux
         # hands a freed inode number straight to the next file, which would
@@ -554,7 +529,7 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
         self.assertIn("not the socket this broker bound", log.call_args.args[0])
 
     def test_a_path_that_cannot_be_inspected_is_logged_not_ignored(self):
-        server, identity = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
+        server, identity = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()
         with mock.patch.object(broker.os, "lstat", side_effect=PermissionError("no")):
             with mock.patch.object(broker, "log") as log:
@@ -564,7 +539,7 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
         self.assertTrue(os.path.lexists(self.sock))
 
     def test_a_failing_unlink_is_logged_not_ignored(self):
-        server, identity = broker.bind_guest_server(self.sock, {}, 1, broker.EventLog())
+        server, identity = broker.bind_guest_server(self.sock, {}, 1)
         server.server_close()
         with mock.patch.object(broker.os, "unlink", side_effect=PermissionError("no")):
             with mock.patch.object(broker, "log") as log:
@@ -574,7 +549,7 @@ class TestUnlinkIfSameIdentity(SocketDirCase):
 
     def test_does_not_follow_a_symlink_to_the_identity(self):
         real = os.path.join(self.dir, "real.sock")
-        server, identity = broker.bind_guest_server(real, {}, 1, broker.EventLog())
+        server, identity = broker.bind_guest_server(real, {}, 1)
         server.server_close()
         os.symlink(real, self.sock)
         with mock.patch.object(broker, "log") as log:
@@ -656,7 +631,7 @@ class TestWatchedPidExit(unittest.TestCase):
         ):
             with self.assertRaises(Exited):
                 gone = broker.BoundSocket("/no/such/socket", (0, 0))
-                broker.wait_for_pid_exit(7, [gone], broker.EventLog(), wait_for_exit)
+                broker.wait_for_pid_exit(7, [gone], wait_for_exit)
         exit_.assert_called_once_with(status)
         return "\n".join(str(call.args[0]) for call in log.call_args_list)
 
@@ -675,7 +650,7 @@ class TestWatchedPidExit(unittest.TestCase):
 class TestMain(SocketDirCase):
     def test_a_watch_that_cannot_be_set_up_leaves_no_socket_behind(self):
         argv = ["aws-broker", "--socket", self.sock, "--control-socket", self.ctl]
-        argv += ["--watch-pid", str(os.getpid())]
+        argv += ["--watch-pid", str(os.getpid()), "--log", broker_log_path(self.sock)]
         out = io.StringIO()
         with mock.patch.object(sys, "argv", [*argv, "--allow", "dev"]):
             with mock.patch.object(broker, "pid_exit_watch", side_effect=OSError("no")):
@@ -690,6 +665,7 @@ class TestMain(SocketDirCase):
         gone.wait()
         argv = ["aws-broker", "--socket", self.sock, "--control-socket", self.ctl]
         argv += ["--watch-pid", str(gone.pid), "--allow", "dev"]
+        argv += ["--log", broker_log_path(self.sock)]
         out = io.StringIO()
         with mock.patch.object(sys, "argv", argv):
             with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
@@ -700,70 +676,45 @@ class TestMain(SocketDirCase):
         self.assertFalse(os.path.lexists(self.sock))
         self.assertFalse(os.path.lexists(self.ctl))
 
+    def test_a_socket_lock_that_cannot_be_taken_is_a_handshake_error(self):
+        os.mkdir(self.sock + ".lock")
+        self.addCleanup(os.rmdir, self.sock + ".lock")
+        done = subprocess.run(
+            broker_argv(self.sock, self.ctl), capture_output=True, text=True, timeout=30
+        )
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertTrue(done.stdout.startswith("ERROR=cannot lock"), done.stdout)
+        self.assertFalse(os.path.lexists(self.sock))
+
 
 @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
 class TestSigterm(SocketDirCase):
-    def test_sigterm_removes_the_socket_and_exits_cleanly(self):
-        broker_proc = subprocess.Popen(
-            [
-                sys.executable,
-                BROKER_PATH,
-                "--socket",
-                self.sock,
-                "--control-socket",
-                self.ctl,
-                "--watch-pid",
-                str(os.getpid()),
-                "--allow",
-                "dev",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self.addCleanup(broker_proc.stderr.close)
-        self.addCleanup(broker_proc.stdout.close)
-        self.addCleanup(broker_proc.kill)
-        self.assertEqual(broker_proc.stdout.readline(), "READY\n")
+    def test_sigterm_removes_both_sockets_and_exits_cleanly(self):
+        child = self.start_broker()
         self.assertTrue(os.path.exists(self.sock))
         self.assertTrue(os.path.exists(self.ctl))
-        broker_proc.terminate()
-        self.assertEqual(broker_proc.wait(30), 0, broker_proc.stderr.read())
+        child.terminate()
+        self.assertEqual(child.wait(30), 0, child.stderr.read())
         self.assertFalse(os.path.lexists(self.sock))
         self.assertFalse(os.path.lexists(self.ctl))
 
-    def test_sigterm_writes_the_count_of_the_window_still_open(self):
-        # A flood inside one window is counted, and the count line is written
-        # only when the window closes. A broker stopped before that would lose
-        # it, so the exit path closes the window first.
-        broker_proc = subprocess.Popen(
-            [sys.executable, BROKER_PATH, "--socket", self.sock]
-            + ["--control-socket", self.ctl, "--watch-pid", str(os.getpid())]
-            + ["--allow", "dev"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+
+@unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+class TestSecondBroker(SocketDirCase):
+    def test_a_second_broker_on_a_live_socket_fails_and_leaves_the_first_serving(
+        self,
+    ):
+        first = self.start_broker()
+        done = subprocess.run(
+            broker_argv(self.sock, self.ctl), capture_output=True, text=True, timeout=30
         )
-        self.addCleanup(broker_proc.stderr.close)
-        self.addCleanup(broker_proc.stdout.close)
-        self.addCleanup(broker_proc.kill)
-        self.assertEqual(broker_proc.stdout.readline(), "READY\n")
-        flood = 5
-        for _ in range(flood):
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.settimeout(5)
-                client.connect(self.sock)
-                client.sendall(b"GET /nope HTTP/1.0\r\n\r\n")
-                while client.recv(4096):
-                    pass  # the answer is logged before it is written
-        broker_proc.terminate()
-        status = broker_proc.wait(30)
-        logged = broker_proc.stderr.read()
-        self.assertEqual(status, 0, logged)
-        self.assertIn(f"also: {flood - 1} x answered 404", logged)
-        self.assertLess(
-            logged.index("answered 404"), logged.index("SIGTERM; shutting down")
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(
+            done.stdout, "ERROR=another aws-broker is already serving %s\n" % self.sock
         )
+        self.assertIsNone(first.poll())
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.connect(self.sock)
 
 
 @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
@@ -773,39 +724,33 @@ class TestStoppedBrokerEndsItsMints(MintGrandchild, SocketDirCase):
         SocketDirCase.setUp(self)
 
     def test_sigterm_ends_a_mint_in_flight_and_its_grandchild(self):
-        broker_proc = subprocess.Popen(
-            [sys.executable, BROKER_PATH, "--socket", self.sock]
-            + ["--control-socket", self.ctl, "--watch-pid", str(os.getpid())]
-            + ["--allow", "dev"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={**os.environ, **self.env},
-        )
-        self.addCleanup(broker_proc.stderr.close)
-        self.addCleanup(broker_proc.stdout.close)
-        self.addCleanup(broker_proc.kill)
-        self.assertEqual(broker_proc.stdout.readline(), "READY\n")
+        child = self.start_broker(env={**os.environ, **self.env})
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(client.close)
         client.connect(self.sock)
         client.sendall(b"GET /creds/dev HTTP/1.0\r\n\r\n")
         self.grandchild_started()
-        broker_proc.terminate()
-        self.assertEqual(broker_proc.wait(30), 0, broker_proc.stderr.read())
+        child.terminate()
+        self.assertEqual(child.wait(30), 0, child.stderr.read())
         self.assert_grandchild_dead()
 
 
-# The head of every script below: load the broker file as a module to wrap one
-# step of main(), then run main() itself.
+# The broker file loaded as a module, a patch of it, then main(). A script's
+# arguments: the broker file, the guest socket, the watched pid, the log.
 LOAD_BROKER = """
 import importlib.machinery, importlib.util, os, signal, sys
 loader = importlib.machinery.SourceFileLoader("aws_broker", sys.argv[1])
 broker = importlib.util.module_from_spec(importlib.util.spec_from_loader("aws_broker", loader))
 loader.exec_module(broker)
 """
+RUN_BROKER = """
+sys.argv = ["aws-broker", "--socket", sys.argv[2], "--control-socket", sys.argv[2] + ".ctl",
+            "--watch-pid", sys.argv[3], "--allow", "dev", "--log", sys.argv[4]]
+broker.main()
+"""
 
-WINDOW_SCRIPT = (
+# SIGTERM lands right after the bind.
+SIGTERM_AFTER_BIND_SCRIPT = (
     LOAD_BROKER
     + """
 real_bind = broker.bind_servers
@@ -816,35 +761,28 @@ def bind_then_sigterm(*args, **kwargs):
     return bound
 
 broker.bind_servers = bind_then_sigterm
-sys.argv = ["aws-broker", "--socket", sys.argv[2], "--control-socket", sys.argv[2] + ".ctl",
-            "--watch-pid", sys.argv[3], "--allow", "dev"]
-broker.main()
 """
+    + RUN_BROKER
 )
 
+# SIGTERM lands inside the log's write, on the thread that holds its lock.
+SIGTERM_IN_LOG_WRITE_SCRIPT = (
+    LOAD_BROKER
+    + """
+real_fstat, fired = os.fstat, []
 
-@unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
-class TestSigtermDuringBind(SocketDirCase):
-    def test_a_sigterm_right_after_the_bind_still_removes_the_socket(self):
-        done = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                WINDOW_SCRIPT,
-                BROKER_PATH,
-                self.sock,
-                str(os.getpid()),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertFalse(os.path.lexists(self.sock))
-        self.assertIn("SIGTERM; shutting down", done.stderr)
+def fstat_then_sigterm(fd):
+    if fd == 2 and not fired:  # CappedLog.write, under its lock
+        fired.append(True)
+        os.kill(os.getpid(), signal.SIGTERM)
+    return real_fstat(fd)
 
+os.fstat = fstat_then_sigterm
+"""
+    + RUN_BROKER
+)
 
-# A broker that stops between its reclaim and its bind until stdin says go.
+# Stops between the reclaim and the bind until stdin says go.
 PAUSE_SCRIPT = (
     LOAD_BROKER
     + """
@@ -856,34 +794,59 @@ def bind_after_go(*args, **kwargs):
     return real_bind(*args, **kwargs)
 
 broker.bind_servers = bind_after_go
-sys.argv = ["aws-broker", "--socket", sys.argv[2], "--control-socket", sys.argv[2] + ".ctl",
-            "--watch-pid", sys.argv[3], "--allow", "dev"]
-broker.main()
 """
+    + RUN_BROKER
 )
 
-# A broker that says when it is about to take the socket lock and when it starts
-# to reclaim the socket, so a test can order it against another broker.
+# Says when it is about to take the socket lock and when it starts to reclaim
+# the socket, so a test can order it against another broker.
 ANNOUNCE_SCRIPT = (
     LOAD_BROKER
     + """
-real_lock, real_reclaim = broker.held_socket_lock, broker.reclaim_socket_path
+real_lock, real_reclaim = broker.held_flock, broker.reclaim_socket_path
 
-def announce_lock(path):
+def announce_lock(path, wait):
     print("ATTEMPT", flush=True)
-    return real_lock(path)
+    return real_lock(path, wait)
 
 def announce_reclaim(path):
     print("RECLAIMING", flush=True)
     return real_reclaim(path)
 
-broker.held_socket_lock = announce_lock
+broker.held_flock = announce_lock
 broker.reclaim_socket_path = announce_reclaim
-sys.argv = ["aws-broker", "--socket", sys.argv[2], "--control-socket", sys.argv[2] + ".ctl",
-            "--watch-pid", sys.argv[3], "--allow", "dev"]
-broker.main()
 """
+    + RUN_BROKER
 )
+
+
+@unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+class TestSigtermDuringBind(SocketDirCase):
+    def test_a_sigterm_right_after_the_bind_still_removes_the_socket(self):
+        done = subprocess.run(
+            self.script_argv(SIGTERM_AFTER_BIND_SCRIPT),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(os.path.lexists(self.sock))
+        with open(broker_log_path(self.sock)) as log:
+            self.assertIn("SIGTERM; shutting down", log.read())
+
+
+@unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+class TestSigtermDuringALogWrite(SocketDirCase):
+    def test_a_sigterm_inside_the_log_write_still_ends_the_broker(self):
+        child = self.spawn_broker(self.script_argv(SIGTERM_IN_LOG_WRITE_SCRIPT))
+        self.assertEqual(child.stdout.readline(), "READY\n", child.stderr)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.connect(self.sock)
+            c.sendall(b"GET /health HTTP/1.0\r\n\r\n")  # its log line takes the lock
+        # A handler that logged would wait for the lock its own thread holds.
+        self.assertEqual(child.wait(30), 0)
+        self.assertFalse(os.path.lexists(self.sock))
+        self.assertFalse(os.path.lexists(self.ctl))
 
 
 @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
@@ -901,32 +864,9 @@ class TestSocketLock(SocketDirCase):
             os.close(fd)  # drops the lock when this probe got it
         return False
 
-    def spawn(self, argv, **pipes):
-        child = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **pipes
-        )
-        for stream in (child.stdin, child.stdout, child.stderr):
-            if stream is not None:
-                self.addCleanup(stream.close)
-        self.addCleanup(child.wait)
-        self.addCleanup(child.kill)
-        return child
-
-    def start_paused_broker(self):
-        return self.spawn(
-            [sys.executable, "-c", PAUSE_SCRIPT, BROKER_PATH, self.sock]
-            + [str(os.getpid())],
-            stdin=subprocess.PIPE,
-        )
-
-    def start_announcing_broker(self):
-        return self.spawn(
-            [sys.executable, "-c", ANNOUNCE_SCRIPT, BROKER_PATH, self.sock]
-            + [str(os.getpid())]
-        )
-
     def test_the_lock_is_held_from_reclaim_through_bind_and_free_after(self):
-        child = self.start_paused_broker()
+        child = self.spawn_broker(self.script_argv(PAUSE_SCRIPT), stdin=subprocess.PIPE)
+        self.addCleanup(child.stdin.close)
         self.assertEqual(child.stdout.readline(), "IN_WINDOW\n")
         self.assertTrue(self.lock_is_held())
         child.stdin.write("go\n")
@@ -937,12 +877,13 @@ class TestSocketLock(SocketDirCase):
     def test_a_second_broker_cannot_reclaim_the_socket_the_first_is_about_to_bind(
         self,
     ):
-        first = self.start_paused_broker()
+        first = self.spawn_broker(self.script_argv(PAUSE_SCRIPT), stdin=subprocess.PIPE)
+        self.addCleanup(first.stdin.close)
         self.assertEqual(first.stdout.readline(), "IN_WINDOW\n")
         # The first holds the lock between its reclaim and its bind, with no
         # socket on disk yet. Without the lock the second would reclaim nothing,
         # bind first, and make the first fail; with it, the second waits.
-        second = self.start_announcing_broker()
+        second = self.spawn_broker(self.script_argv(ANNOUNCE_SCRIPT))
         self.assertEqual(second.stdout.readline(), "ATTEMPT\n")
         first.stdin.write("go\n")
         first.stdin.flush()
@@ -954,30 +895,12 @@ class TestSocketLock(SocketDirCase):
         )
         self.assertEqual(second.wait(30), 1)
 
-    def test_a_lock_file_that_cannot_be_opened_is_a_handshake_error(self):
-        os.mkdir(self.sock + ".lock")
-        self.addCleanup(os.rmdir, self.sock + ".lock")
-        # A subprocess with a timeout: a broker that ignored the lock file would
-        # serve forever instead of failing.
-        done = subprocess.run(
-            [sys.executable, BROKER_PATH, "--socket", self.sock]
-            + ["--control-socket", self.ctl]
-            + ["--watch-pid", str(os.getpid()), "--allow", "dev"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        self.assertEqual(done.returncode, 1, done.stderr)
-        self.assertTrue(done.stdout.startswith("ERROR=cannot open lock file"))
-
 
 class TestBindServer(SocketDirCase):
     def test_socket_is_mode_0600_and_umask_is_restored(self):
         before = os.umask(0o022)
         try:
-            server, identity = broker.bind_guest_server(
-                self.sock, {}, 1, broker.EventLog()
-            )
+            server, identity = broker.bind_guest_server(self.sock, {}, 1)
             self.addCleanup(server.server_close)
             self.assertEqual(os.umask(0o022), 0o022)
         finally:
@@ -989,38 +912,26 @@ class TestBindServer(SocketDirCase):
 
     def test_bind_failure_is_a_handshake_error(self):
         missing = os.path.join(self.dir, "no-such-dir", "s.sock")
-        out = self.fails(broker.bind_server, missing, {}, 1, broker.EventLog())
+        out = self.fails(broker.bind_server, missing, broker.HealthHandler)
         self.assertIn("cannot bind", out)
 
 
 class ServedBroker(SocketDirCase):
     allow = ("dev", "prod")
-    max_concurrent = broker.MAX_CONCURRENT_REQUESTS
-    max_connections = broker.MAX_CONNECTIONS
     min_remint_interval = 0.0
 
     def setUp(self):
         super().setUp()
-        log_patch = mock.patch.object(broker, "log")
-        self.log = log_patch.start()
-        self.addCleanup(log_patch.stop)
-        # A window no test outlives: what a test logs is the first line of each
-        # kind, and the count line when it calls close_window itself.
-        self.events = broker.EventLog(window=3600)
-        self.states = {
-            p: broker.State(p, self.min_remint_interval, self.events)
-            for p in self.allow
-        }
-        self.serve(
-            broker.bind_guest_server(
-                self.sock,
-                self.states,
-                4242,
-                self.events,
-                max_concurrent=self.max_concurrent,
-                max_connections=self.max_connections,
-            )[0]
-        )
+        for name, value in [
+            ("log", mock.Mock()),
+            ("MIN_REMINT_INTERVAL_SECONDS", self.min_remint_interval),
+        ]:
+            patch = mock.patch.object(broker, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.log = broker.log
+        self.caches = {p: broker.ProfileCache(p) for p in self.allow}
+        self.serve(broker.bind_guest_server(self.sock, self.caches, 4242)[0])
 
     def serve(self, server):
         """Serve on a thread until the test ends."""
@@ -1074,6 +985,20 @@ class ServedBroker(SocketDirCase):
         run = patch.start()
         self.addCleanup(patch.stop)
         return run
+
+    def hung_mint(self):
+        """Mints block until the returned `release` is set; `in_mint` says one started."""
+        in_mint = threading.Event()
+        release = threading.Event()
+
+        def mint(*args, **kwargs):
+            in_mint.set()
+            self.assertTrue(release.wait(10))
+            return aws_result(process_json())
+
+        self.aws(aws_result(process_json())).side_effect = mint
+        self.addCleanup(release.set)
+        return in_mint, release
 
     def served_token(self, profile="dev"):
         """The SessionToken served for the profile, or the status when it is not 200."""
@@ -1165,21 +1090,19 @@ class TestServedRequests(ServedBroker):
 
     def test_unexpected_exception_is_a_clean_500_and_logged(self):
         boom = RuntimeError("secret detail /Users/user/x")
-        with mock.patch.object(broker.State, "get", side_effect=boom):
-            status, body = self.get("/creds/dev")
-        self.assertEqual(status, 500)
-        self.assertNotIn("secret detail", body)
-        self.assertNotIn("/Users/user", body)
-        self.assertIn("aws sso login --profile dev", body)
-        self.assertIn("RuntimeError", self.logged())
-
-    def test_unexpected_exception_off_creds_path_is_still_a_500(self):
-        with mock.patch.object(
-            broker.HealthHandler, "_route", side_effect=ValueError("x")
-        ):
-            status, body = self.get("/health")
-        self.assertEqual(status, 500)
-        self.assertIn("broker.log", body)
+        for path in ["/creds/dev", "/health"]:
+            with self.subTest(path=path):
+                with (
+                    mock.patch.object(broker.ProfileCache, "get", side_effect=boom),
+                    mock.patch.object(broker.GuestHandler, "health", side_effect=boom),
+                ):
+                    status, body = self.get(path)
+                self.assertEqual(status, 500)
+                self.assertNotIn("secret detail", body)
+                self.assertNotIn("/Users/user", body)
+                self.assertIn("broker.log", body)
+                self.assertIn("RuntimeError", self.logged())
+                self.assertEqual(self.get("/nope")[0], 404)
 
     def test_control_bytes_in_a_guest_path_never_reach_the_log(self):
         self.log.side_effect = REAL_LOG
@@ -1193,7 +1116,7 @@ class TestServedRequests(ServedBroker):
         self.log.side_effect = REAL_LOG
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
             with mock.patch.object(
-                broker.GuestHandler, "_creds_route", side_effect=ValueError("x")
+                broker.GuestHandler, "route", side_effect=ValueError("x")
             ):
                 status, _ = self.get("/creds/a\x1b[31m")
         self.assertEqual(status, 500)
@@ -1201,10 +1124,29 @@ class TestServedRequests(ServedBroker):
         self.assertNotIn("\x1b", stderr.getvalue())
 
     def test_a_long_request_path_is_clipped_in_the_log(self):
-        path = "/" + "x" * (broker.MAX_REQUEST_HEAD_BYTES // 2)
+        path = "/" + "x" * 4000
         self.assertEqual(self.get(path)[0], 404)
         self.assertNotIn(path, self.logged())
         self.assertIn("more)", self.logged())
+
+    def test_a_flood_of_requests_leaves_the_log_and_its_backup_under_the_cap(self):
+        self.log.side_effect = REAL_LOG
+        path = broker_log_path(self.sock)
+        saved_fd = os.dup(2)
+        self.addCleanup(os.close, saved_fd)
+        self.addCleanup(os.dup2, saved_fd, 2)
+        cap = 4096
+        with (
+            mock.patch.object(broker, "LOG_MAX_BYTES", cap),
+            mock.patch.object(sys, "stderr", broker.CappedLog(path)),
+        ):
+            for n in range(200):
+                self.assertEqual(self.get("/nope-%d" % n)[0], 404)
+        for name in (path, path + ".1"):
+            self.assertLessEqual(os.path.getsize(name), cap, name)
+            self.assertEqual(stat.S_IMODE(os.stat(name).st_mode), 0o600, name)
+        with open(path) as handle:
+            self.assertIn("/nope-199 ", handle.read())
 
     def test_secrets_never_reach_the_log(self):
         self.aws(aws_result(process_json()))
@@ -1212,70 +1154,21 @@ class TestServedRequests(ServedBroker):
         for secret in ["s3cr3t-value", "token-value", "AKIAEXAMPLE"]:
             self.assertNotIn(secret, self.logged())
 
-
-class TestLogCostOfAGuest(ServedBroker):
-    """Whatever the guest sends, broker.log grows by a bounded, secret-free amount."""
-
-    flood = 50
-
-    def close_early(self, release):
-        """A /creds/ request whose client hangs up before the answer is written."""
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
-            c.connect(self.sock)
-            c.sendall(b"GET /creds/dev HTTP/1.0\r\n\r\n")
-            self.assertTrue(release.wait(10))
-        # The handler writes only once the client has closed, so the write fails.
-
     def test_a_client_that_hangs_up_early_costs_one_line_and_no_traceback(self):
-        in_mint = threading.Event()
-        closed = threading.Event()
-
-        def mint_once_the_client_is_gone(*args, **kwargs):
-            in_mint.set()
-            self.assertTrue(closed.wait(10))
-            return aws_result(process_json())
-
-        run = self.aws(aws_result(process_json()))
-        run.side_effect = mint_once_the_client_is_gone
-        # The handler's thread logs the failed write after the mint; the server
-        # answers other connections meanwhile, so the line is waited for.
+        in_mint, release = self.hung_mint()
         failed_write_logged = threading.Event()
         self.log.side_effect = lambda line: (
             failed_write_logged.set() if "client connection failed" in line else None
         )
-        self.close_early(in_mint)
-        closed.set()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.connect(self.sock)
+            c.sendall(b"GET /creds/dev HTTP/1.0\r\n\r\n")
+            self.assertTrue(in_mint.wait(10))
+        release.set()  # the answer is written to a closed connection
         self.assertTrue(failed_write_logged.wait(10))
         self.assertEqual(self.get("/health")[0], 200)
         self.assertNotIn("Traceback", self.logged())
         self.assertEqual(self.logged().count("client connection failed"), 1)
-
-    def test_a_flood_of_refused_requests_costs_one_line_per_kind_then_a_count(self):
-        for _ in range(self.flood):
-            self.assertEqual(self.get("/nope")[0], 404)
-            self.assertEqual(self.get("/creds/other")[0], 403)
-            self.assertEqual(
-                self.exchange(b"BREW / HTTP/1.0\r\n\r\n")[:12], b"HTTP/1.0 501"
-            )
-        self.assertEqual(self.log.call_count, 3)
-        self.events.close_window()
-        self.assertEqual(self.log.call_count, 4)
-        for kind in ["answered 404", "answered 403", "answered 501"]:
-            self.assertIn(f"{self.flood - 1} x {kind}", self.logged())
-
-    def test_a_flood_of_requests_that_crash_the_handler_costs_one_traceback(self):
-        with mock.patch.object(
-            broker.GuestHandler, "_creds_route", side_effect=ValueError("x")
-        ):
-            for _ in range(self.flood):
-                self.assertEqual(self.get("/creds/dev")[0], 500)
-        self.assertEqual(self.logged().count("Traceback"), 1)
-
-    def test_a_flood_of_requests_for_a_profile_that_cannot_mint_costs_one_detail(self):
-        self.aws(aws_result(returncode=255, stderr="SSO session expired"))
-        for _ in range(self.flood):
-            self.assertEqual(self.get("/creds/dev")[0], 500)
-        self.assertEqual(self.logged().count("SSO session expired"), 1)
 
 
 def minted(token, seconds):
@@ -1333,81 +1226,6 @@ class TestCredentialCache(ServedBroker):
         self.assertEqual(profiles, ["dev", "prod"])
 
 
-class TestRefreshInsideTheWindow(ServedBroker):
-    """A cache inside the re-mint window is still valid: one request refreshes
-    it, and the others are served the cache instead of waiting for the lock."""
-
-    def hung_refresh(self):
-        """The second mint blocks until `release`; `in_mint` says it started."""
-        in_mint = threading.Event()
-        release = threading.Event()
-        first = [minted("first", 300)]
-
-        def mint(*args, **kwargs):
-            if first:
-                return first.pop()
-            in_mint.set()
-            self.assertTrue(release.wait(10))
-            return minted("second", 3600)
-
-        self.aws(minted("unused", 3600)).side_effect = mint
-        self.addCleanup(release.set)
-        return in_mint, release
-
-    def test_the_cache_is_served_while_another_request_refreshes_it(self):
-        in_mint, release = self.hung_refresh()
-        self.assertEqual(self.served_token(), "first")
-        refresher = threading.Thread(target=self.served_token)
-        refresher.start()
-        self.addCleanup(refresher.join)
-        self.assertTrue(in_mint.wait(10))
-        with mock.patch.object(broker, "PROFILE_LOCK_TIMEOUT_SECONDS", 0.2):
-            self.assertEqual(self.served_token(), "first")
-        release.set()
-        refresher.join(10)
-        self.assertEqual(self.served_token(), "second")
-
-    def test_a_refresh_in_progress_is_not_started_twice(self):
-        in_mint, release = self.hung_refresh()
-        self.assertEqual(self.served_token(), "first")
-        refresher = threading.Thread(target=self.served_token)
-        refresher.start()
-        self.addCleanup(refresher.join)
-        self.assertTrue(in_mint.wait(10))
-        for _ in range(3):
-            self.assertEqual(self.served_token(), "first")
-        release.set()
-        refresher.join(10)
-        self.assertEqual(self.served_token(), "second")
-        self.assertEqual(self.states["dev"].events, self.events)
-
-    def test_a_request_with_nothing_cached_still_waits_for_the_mint(self):
-        in_mint = threading.Event()
-        release = threading.Event()
-
-        def first_mint(*args, **kwargs):
-            in_mint.set()
-            self.assertTrue(release.wait(10))
-            return minted("shared", 3600)
-
-        run = self.aws(minted("unused", 3600))
-        run.side_effect = first_mint
-        self.addCleanup(release.set)
-        waiters = []
-        threads = [
-            threading.Thread(target=lambda: waiters.append(self.served_token()))
-            for _ in range(3)
-        ]
-        for thread in threads:
-            thread.start()
-        self.assertTrue(in_mint.wait(10))
-        release.set()
-        for thread in threads:
-            thread.join(10)
-        self.assertEqual(waiters, ["shared"] * 3)
-        self.assertEqual(run.call_count, 1)
-
-
 class TestRemintThrottle(ServedBroker):
     min_remint_interval = 3600.0
 
@@ -1421,45 +1239,6 @@ class TestRemintThrottle(ServedBroker):
         run = self.aws(aws_result(returncode=255, stderr="boom"), minted("ok", 3600))
         self.assertEqual(self.served_token(), 500)
         self.assertEqual(self.served_token(), 500)
-        self.assertEqual(run.call_count, 1)
-
-
-class TestConcurrentClients(ServedBroker):
-    clients = 8
-
-    def test_clients_arriving_together_share_one_mint(self):
-        # The first mint waits until every client is inside State.get, so the
-        # other seven are queued on the profile lock when it finishes.
-        arrived = 0
-        arrivals = threading.Lock()
-        all_arrived = threading.Event()
-        real_get = broker.State.get
-
-        def counted_get(state):
-            nonlocal arrived
-            with arrivals:
-                arrived += 1
-                if arrived == self.clients:
-                    all_arrived.set()
-            return real_get(state)
-
-        def mint(*args, **kwargs):
-            all_arrived.wait(10)
-            return minted("shared", 3600)
-
-        run = self.aws(minted("unused", 3600))
-        run.side_effect = mint
-        results = []
-        with mock.patch.object(broker.State, "get", counted_get):
-            threads = [
-                threading.Thread(target=lambda: results.append(self.served_token()))
-                for _ in range(self.clients)
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(20)
-        self.assertEqual(results, ["shared"] * self.clients)
         self.assertEqual(run.call_count, 1)
 
 
@@ -1483,291 +1262,38 @@ class TestMalformedRequests(ServedBroker):
 
 
 class TestRequestHeadCap(ServedBroker):
+    """The request line and headers together may be MAX_REQUEST_HEAD_BYTES; a
+    client that sends more is closed unanswered."""
+
     cap = broker.MAX_REQUEST_HEAD_BYTES
-    # http.server answers 414 to a request line longer than this; the cap must
-    # close such a line unanswered too, not leave it to the stdlib.
-    stdlib_line_limit = 64 * 1024
 
-    def assert_still_serving(self):
+    def request_of(self, size):
+        """A GET /health whose request line and headers are `size` bytes."""
+        filler = size - len(b"GET /health HTTP/1.0\r\nX: \r\n\r\n")
+        return b"GET /health HTTP/1.0\r\nX: " + b"a" * filler + b"\r\n\r\n"
+
+    def test_a_head_of_exactly_the_cap_is_served(self):
+        answer = self.exchange(self.request_of(self.cap))
+        self.assertRegex(answer, rb"^HTTP/1\.[01] 200 ")
+
+    def test_one_line_a_byte_over_the_cap_is_closed_unanswered(self):
+        self.assertEqual(self.exchange(self.request_of(self.cap + 1)), b"")
+        self.assertIn(f"over {self.cap} bytes", self.logged())
         self.assertEqual(self.get("/health")[0], 200)
-
-    def test_a_request_head_of_exactly_the_cap_is_served(self):
-        frame = b"GET / HTTP/1.0\r\n\r\n"
-        padding = b"a" * (self.cap - len(frame))
-        answer = self.exchange(b"GET /" + padding + b" HTTP/1.0\r\n\r\n")
-        self.assertRegex(answer, rb"^HTTP/1\.[01] 404 ")
-
-    def test_a_request_line_over_the_cap_is_closed_unanswered(self):
-        for length in [self.cap, self.stdlib_line_limit + 1]:
-            with self.subTest(length=length):
-                answer = self.exchange(b"GET /" + b"a" * length + b" HTTP/1.0\r\n\r\n")
-                self.assertEqual(answer, b"")
-                self.assert_still_serving()
-
-    def test_one_header_over_the_cap_is_closed_unanswered(self):
-        answer = self.exchange(
-            b"GET /health HTTP/1.0\r\nX: " + b"a" * self.cap + b"\r\n\r\n"
-        )
-        self.assertEqual(answer, b"")
-        self.assert_still_serving()
 
     def test_many_small_headers_over_the_cap_together_are_closed_unanswered(self):
-        headers = b"".join(b"X-%03d: %s\r\n" % (n, b"a" * 100) for n in range(90))
+        headers = b"".join(b"X-%d: %s\r\n" % (n, b"a" * 90) for n in range(90))
         self.assertGreater(len(headers), self.cap)
-        answer = self.exchange(b"GET /health HTTP/1.0\r\n" + headers + b"\r\n")
-        self.assertEqual(answer, b"")
-        self.assert_still_serving()
-
-    def test_the_refusal_is_logged_without_a_traceback(self):
-        self.exchange(b"GET /" + b"a" * self.cap + b" HTTP/1.0\r\n\r\n")
-        self.assertIn("request head over", self.logged())
-        self.assertNotIn("Traceback", self.logged())
-
-
-class TestSingleSlot(ServedBroker):
-    max_concurrent = 1
-
-    def test_slot_is_released_after_each_request(self):
-        self.aws(aws_result(process_json()))
-        for _ in range(3):
-            self.assertEqual(self.get("/creds/dev")[0], 200)
-
-    def test_slot_is_released_after_a_failed_request(self):
-        self.aws(aws_result(process_json()))
-        with mock.patch.object(
-            broker.GuestHandler, "_creds_route", side_effect=ValueError("x")
-        ):
-            self.assertEqual(self.get("/creds/dev")[0], 500)
-        self.assertEqual(self.get("/creds/dev")[0], 200)
-
-    def test_health_is_answered_while_the_only_slot_is_held(self):
-        in_mint = threading.Event()
-        release = threading.Event()
-
-        def hung_mint(*args, **kwargs):
-            in_mint.set()
-            release.wait(10)
-            return aws_result(process_json())
-
-        run = self.aws(aws_result(process_json()))
-        run.side_effect = hung_mint
-        holder = threading.Thread(target=lambda: self.get("/creds/dev"))
-        holder.start()
-        self.addCleanup(holder.join)
-        self.addCleanup(release.set)
-        self.assertTrue(in_mint.wait(10))
-        status, body = self.get("/health")
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), {"ok": True})
-        self.assertEqual(self.get("/creds/prod")[0], 503)
-
-
-class TestNoSlotFree(ServedBroker):
-    max_concurrent = 0
-
-    def test_a_creds_request_is_turned_away_with_503(self):
-        status, body = self.get("/creds/dev")
-        self.assertEqual(status, 503)
-        self.assertIn("busy", body)
-        self.assertIn("503", self.logged())
-
-    def test_health_is_never_busy(self):
+        self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n" + headers), b"")
         self.assertEqual(self.get("/health")[0], 200)
 
 
-class HeldConnection:
-    """A client that connects and then says nothing, so its handler stays blocked in a read."""
-
-    def __init__(self, path):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(5)
-        self.sock.connect(path)
-
-    def close(self):
-        self.sock.close()
-
-
-class TestConnectionBound(ServedBroker):
-    max_connections = 1
+class TestStalledClient(ServedBroker):
+    """The head's time budget is patched to a few milliseconds; a client that
+    stops sending is dropped and the next one is served."""
 
     def setUp(self):
-        super().setUp()
-        # Set once a connection's thread has finished, slot released.
-        self.finished = threading.Event()
-        real = broker.UnixHTTPServer.process_request_thread
-
-        def finishing(server, request, client_address):
-            real(server, request, client_address)
-            self.finished.set()
-
-        patch = mock.patch.object(
-            broker.UnixHTTPServer, "process_request_thread", finishing
-        )
-        patch.start()
-        self.addCleanup(patch.stop)
-
-    def hold(self):
-        held = HeldConnection(self.sock)
-        self.addCleanup(held.close)
-        return held
-
-    def test_a_connection_over_the_bound_is_closed_at_once_and_unanswered(self):
-        self.hold()  # accepted first: the kernel queues connections in order
-        self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
-        self.assertFalse(self.finished.is_set())
-
-    def test_the_slot_comes_back_when_the_connection_ends(self):
-        held = self.hold()
-        self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
-        held.close()
-        self.assertTrue(self.finished.wait(10))
-        self.assertEqual(self.get("/health")[0], 200)
-
-    def test_the_slot_comes_back_when_the_handler_crashes(self):
-        boom = RuntimeError("boom")
-        with mock.patch.object(
-            broker.HealthHandler, "handle_one_request", side_effect=boom
-        ):
-            self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
-            self.assertTrue(self.finished.wait(10))
-        self.assertEqual(self.get("/health")[0], 200)
-
-    def test_the_slot_comes_back_when_no_thread_can_be_started(self):
-        with mock.patch.object(
-            broker.threading.Thread, "start", side_effect=RuntimeError("no threads")
-        ):
-            self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
-        self.assertEqual(self.get("/health")[0], 200)
-
-
-class TestConnectionBoundLogging(ServedBroker):
-    max_connections = 0
-
-    def test_a_run_of_refused_connections_is_logged_once(self):
-        for _ in range(3):
-            self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
-        self.assertEqual(self.logged().count("too many open connections"), 1)
-
-
-class TestControlSocket(ServedBroker):
-    # The guest socket takes no connection at all: the flood the control socket
-    # must not be subject to.
-    max_connections = 0
-
-    def setUp(self):
-        super().setUp()
-        self.serve(
-            broker.bind_control_server(self.ctl, self.states, 4242, self.events)[0]
-        )
-
-    def test_health_is_answered_while_the_guest_socket_refuses_every_connection(self):
-        self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
-        status, body = self.get("/health", sock=self.ctl)
-        self.assertEqual(status, 200)
-        # The contract yo reads (aws.py): exactly these keys, the allow list as
-        # given, the watched pid as given, the broker's own pid.
-        self.assertEqual(
-            json.loads(body),
-            {"allow": sorted(self.allow), "pid": os.getpid(), "watch_pid": 4242},
-        )
-
-    def test_credentials_are_never_served_on_it(self):
-        run = self.aws(aws_result(process_json()))
-        self.assertEqual(self.get("/creds/dev", sock=self.ctl)[0], 404)
-        run.assert_not_called()
-
-
-class TestBindServers(SocketDirCase):
-    def test_both_sockets_are_bound_and_both_identities_recorded(self):
-        bound = broker.bind_servers(self.sock, self.ctl, {}, 1, broker.EventLog())
-        self.addCleanup(bound.guest.server_close)
-        self.addCleanup(bound.control.server_close)
-        self.assertEqual([b.path for b in bound.sockets], [self.sock, self.ctl])
-        for path, identity in bound.sockets:
-            st = os.lstat(path)
-            self.assertEqual(identity, (st.st_dev, st.st_ino))
-            self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
-
-    def test_a_control_socket_that_cannot_be_bound_leaves_no_guest_socket(self):
-        missing = os.path.join(self.dir, "no-such-dir", "c.sock")
-        out = self.fails(
-            broker.bind_servers, self.sock, missing, {}, 1, broker.EventLog()
-        )
-        self.assertIn("cannot bind", out)
-        self.assertFalse(os.path.lexists(self.sock))
-
-    def test_unlinking_the_bound_sockets_removes_both(self):
-        bound = broker.bind_servers(self.sock, self.ctl, {}, 1, broker.EventLog())
-        bound.guest.server_close()
-        bound.control.server_close()
-        broker.unlink_bound(bound.sockets)
-        self.assertFalse(os.path.lexists(self.sock))
-        self.assertFalse(os.path.lexists(self.ctl))
-
-
-class TestControlSocketReclaim(SocketDirCase):
-    def broker_args(self):
-        return [
-            *["--socket", self.sock, "--control-socket", self.ctl],
-            *["--watch-pid", str(os.getpid()), "--allow", "dev"],
-        ]
-
-    def test_a_live_control_socket_stops_a_second_broker_and_leaves_no_guest_socket(
-        self,
-    ):
-        live, _ = broker.bind_guest_server(self.ctl, {}, 1, broker.EventLog())
-        self.addCleanup(live.server_close)
-        done = subprocess.run(
-            [sys.executable, BROKER_PATH, *self.broker_args()],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        self.assertEqual(done.returncode, 1, done.stderr)
-        self.assertEqual(
-            done.stdout,
-            "ERROR=another aws-broker is already serving %s\n" % self.ctl,
-        )
-        self.assertFalse(os.path.lexists(self.sock))
-
-    @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
-    def test_a_stale_control_socket_is_replaced(self):
-        stale, _ = broker.bind_guest_server(self.ctl, {}, 1, broker.EventLog())
-        stale.server_close()  # closed but the file remains
-        child = subprocess.Popen(
-            [sys.executable, BROKER_PATH, *self.broker_args()],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self.addCleanup(child.stderr.close)
-        self.addCleanup(child.stdout.close)
-        self.addCleanup(child.wait)
-        self.addCleanup(child.kill)
-        self.assertEqual(child.stdout.readline(), "READY\n")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-            probe.connect(self.ctl)
-
-
-class TestHandlerCrash(ServedBroker):
-    def test_a_traceback_from_a_crashed_handler_is_sanitized_like_every_log_line(self):
-        self.log.side_effect = REAL_LOG
-        boom = RuntimeError("guest said \x1b[31m")
-        with contextlib.redirect_stderr(io.StringIO()) as stderr:
-            with mock.patch.object(
-                broker.HealthHandler, "handle_one_request", side_effect=boom
-            ):
-                self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
-        self.assertIn("RuntimeError: guest said ?[31m", stderr.getvalue())
-        self.assertNotIn("\x1b", stderr.getvalue())
-
-
-class TestDeadline(ServedBroker):
-    """The deadline is patched to a few milliseconds; each client then blocks on
-    its own recv, which returns when the broker shuts the connection down."""
-
-    def setUp(self):
-        patch = mock.patch.object(broker, "REQUEST_DEADLINE_SECONDS", 0.05)
+        patch = mock.patch.object(broker, "REQUEST_HEAD_SECONDS", 0.05)
         patch.start()
         self.addCleanup(patch.stop)
         super().setUp()
@@ -1781,48 +1307,140 @@ class TestDeadline(ServedBroker):
         ]:
             with self.subTest(sent=sent):
                 self.assertEqual(self.exchange(sent), b"")
-
-    def test_a_cut_off_client_does_not_stop_the_broker(self):
-        self.exchange(b"GET /hea")
         self.assertEqual(self.get("/health")[0], 200)
+        self.assertNotIn("Traceback", self.logged())
 
 
-class TestDeadlineTimerFiringLate(ServedBroker):
-    """The timer is replaced by one the test fires by hand, after the request."""
+class TestTricklingClient(ServedBroker):
+    """A client that sends a byte whenever the socket would time out is not
+    stalled by any per-recv measure; the head's total time still ends it."""
 
-    def test_a_timer_firing_after_the_request_finished_does_nothing(self):
-        timers = []
+    def setUp(self):
+        patch = mock.patch.object(broker, "REQUEST_HEAD_SECONDS", 0.3)
+        patch.start()
+        self.addCleanup(patch.stop)
+        super().setUp()
 
-        class HandTimer:
-            daemon = False
+    def test_a_trickler_cannot_starve_the_next_client_beyond_the_deadline(self):
+        first_byte_sent = threading.Event()
+        cut_off = threading.Event()
 
-            def __init__(self, interval, function):
-                timers.append(function)
+        def trickle():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.connect(self.sock)
+                try:
+                    while True:
+                        c.sendall(b"a")
+                        first_byte_sent.set()
+                        # Readable means the broker closed (or answered): stop.
+                        if select.select([c], [], [], 0.01)[0]:
+                            break
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            cut_off.set()
 
-            def start(self):
-                pass
+        trickler = threading.Thread(target=trickle, daemon=True)
+        trickler.start()
+        self.assertTrue(first_byte_sent.wait(10))
+        self.assertEqual(self.get("/health")[0], 200)
+        self.assertTrue(cut_off.wait(10))
+        self.assertIn("not complete", self.logged())
 
-            def cancel(self):
-                pass
 
-        with mock.patch.object(broker.threading, "Timer", HandTimer):
+class TestControlSocket(ServedBroker):
+    def setUp(self):
+        super().setUp()
+        self.serve(broker.bind_control_server(self.ctl, self.caches, 4242)[0])
+
+    def test_health_is_the_contract_yo_reads(self):
+        status, body = self.get("/health", sock=self.ctl)
+        self.assertEqual(status, 200)
+        # Exactly these keys: the allow list as given, the watched pid as
+        # given, the broker's own pid.
+        self.assertEqual(
+            json.loads(body),
+            {"allow": sorted(self.allow), "pid": os.getpid(), "watch_pid": 4242},
+        )
+
+    def test_credentials_are_never_served_on_it(self):
+        run = self.aws(aws_result(process_json()))
+        self.assertEqual(self.get("/creds/dev", sock=self.ctl)[0], 404)
+        run.assert_not_called()
+
+    def test_health_is_answered_while_the_guest_socket_is_inside_a_mint(self):
+        in_mint, release = self.hung_mint()
+        guest = threading.Thread(target=self.get, args=("/creds/dev",))
+        guest.start()
+        self.addCleanup(guest.join)
+        self.addCleanup(release.set)  # before the join, which waits for the mint
+        self.assertTrue(in_mint.wait(10))
+        self.assertEqual(self.get("/health", sock=self.ctl)[0], 200)
+        release.set()
+
+
+class TestBindServers(SocketDirCase):
+    def test_both_sockets_are_bound_and_both_identities_recorded(self):
+        bound = broker.bind_servers(self.sock, self.ctl, {}, 1)
+        self.addCleanup(bound.guest.server_close)
+        self.addCleanup(bound.control.server_close)
+        self.assertEqual([b.path for b in bound.sockets], [self.sock, self.ctl])
+        for path, identity in bound.sockets:
+            st = os.lstat(path)
+            self.assertEqual(identity, (st.st_dev, st.st_ino))
+            self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
+
+    def test_a_control_socket_that_cannot_be_bound_leaves_no_guest_socket(self):
+        missing = os.path.join(self.dir, "no-such-dir", "c.sock")
+        out = self.fails(broker.bind_servers, self.sock, missing, {}, 1)
+        self.assertIn("cannot bind", out)
+        self.assertFalse(os.path.lexists(self.sock))
+
+    def test_unlinking_the_bound_sockets_removes_both(self):
+        bound = broker.bind_servers(self.sock, self.ctl, {}, 1)
+        bound.guest.server_close()
+        bound.control.server_close()
+        broker.unlink_bound(bound.sockets)
+        self.assertFalse(os.path.lexists(self.sock))
+        self.assertFalse(os.path.lexists(self.ctl))
+
+
+class TestControlSocketReclaim(SocketDirCase):
+    def test_a_live_control_socket_stops_a_second_broker_and_leaves_no_guest_socket(
+        self,
+    ):
+        live, _ = broker.bind_guest_server(self.ctl, {}, 1)
+        self.addCleanup(live.server_close)
+        done = subprocess.run(
+            broker_argv(self.sock, self.ctl), capture_output=True, text=True, timeout=30
+        )
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(
+            done.stdout,
+            "ERROR=another aws-broker is already serving %s\n" % self.ctl,
+        )
+        self.assertFalse(os.path.lexists(self.sock))
+
+    @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
+    def test_a_stale_control_socket_is_replaced(self):
+        stale, _ = broker.bind_guest_server(self.ctl, {}, 1)
+        stale.server_close()  # closed but the file remains
+        self.start_broker()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.connect(self.ctl)
+
+
+class TestHandlerCrash(ServedBroker):
+    def test_a_traceback_from_a_crashed_handler_is_sanitized_like_every_log_line(self):
+        self.log.side_effect = REAL_LOG
+        boom = RuntimeError("guest said \x1b[31m")
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with mock.patch.object(
+                broker.HealthHandler, "handle_one_request", side_effect=boom
+            ):
+                self.assertEqual(self.exchange(b"GET /health HTTP/1.0\r\n\r\n"), b"")
             self.assertEqual(self.get("/health")[0], 200)
-        (fire,) = timers
-        fire()
-        self.assertNotIn("deadline", self.logged())
-        self.assertNotIn("closing the connection failed", self.logged())
-
-
-class TestProfileLockTimeout(ServedBroker):
-    def test_a_profile_whose_lock_is_held_answers_503_and_others_still_serve(self):
-        self.aws(aws_result(process_json()))
-        self.states["dev"].lock.acquire()
-        self.addCleanup(self.states["dev"].lock.release)
-        with mock.patch.object(broker, "PROFILE_LOCK_TIMEOUT_SECONDS", 0.05):
-            status, body = self.get("/creds/dev")
-            self.assertEqual(self.get("/creds/prod")[0], 200)
-        self.assertEqual(status, 503)
-        self.assertIn("busy", body)
+        self.assertIn("RuntimeError: guest said ?[31m", stderr.getvalue())
+        self.assertNotIn("\x1b", stderr.getvalue())
 
 
 if __name__ == "__main__":

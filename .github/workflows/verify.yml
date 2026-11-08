@@ -34,12 +34,20 @@ jobs:
           "$RUNNER_TEMP/shellcheck/bin/pip" install shellcheck-py==0.11.0.1
           echo "$RUNNER_TEMP/shellcheck/bin" >> "$GITHUB_PATH"
 
-      # No -S: the box builds two of these scripts with writeShellApplication,
+      # No -S: the box builds most of these scripts with writeShellApplication,
       # whose check phase runs shellcheck at its default severity, so a finding
-      # below `warning` that passes here fails the box build at `yo bootstrap`
-      # (nix/display.md, "Shellcheck at the build's severity").
+      # below `warning` that passes here fails the box build at `yo bootstrap`.
       - name: Shellcheck every tracked shell script
-        run: shellcheck nix/guest/yolobox-guest.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-migrate.sh nix/display/yolobox-screen-record.sh nix/egress/yolobox-egress-load-tiers.sh nix/egress/yolobox-egress-failed.sh tests/render-tunnel-egress.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh
+        run: shellcheck nix/guest/yolobox-guest.sh nix/harnesses/claude.sh nix/harnesses/yolobox-claude-launcher-keep.sh nix/harnesses/yolobox-claude-versions.sh nix/harnesses/yolobox-harness-install.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-encrypt.sh nix/display/yolobox-screen-record.sh nix/display/yolobox-xvfb.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh
+
+      # nix cannot check the rule file (nft needs netlink, which the build
+      # sandbox forbids), and a file that fails to load leaves the box with no
+      # network: dhcpcd requires the egress unit.
+      - name: Check the egress rules parse
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nftables
+          sudo nft --check --file nix/egress/yolobox-egress.nft
 
   # yo is stdlib Python, so the only axis is the Python version: 3.9 is the
   # floor yo promises, the newest 3.x catches the other direction. One runner,
@@ -75,9 +83,7 @@ jobs:
   # Two boxes are evaluated and every check below runs on each: the x86_64
   # guest (a Linux host's, or an Intel Mac's) and the aarch64 guest (an
   # Apple-silicon Mac's). The guest is never told its host OS, so the CPU is
-  # the only axis a box varies on (nix/base.md, "No host OS in the guest").
-  # The rule files are builtins.toFile, so they print without a builder on
-  # either system.
+  # the only axis a box varies on.
   eval:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -116,21 +122,16 @@ jobs:
           .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
 
       # The ref is stamped into /etc/yolobox/flake-ref, and a rebuild without it
-      # would delete the stamp, so the flake must refuse when it is unset, and
-      # when it is not github:OWNER/REPO/REF. Each refusal must name the
-      # variable, or it failed for some other reason. `! cmd` never fails a
-      # `bash -e` step, hence the explicit exits.
-      - name: Check the flake refuses a missing or non-github flake ref
+      # would delete the stamp, so the flake must refuse when it is unset. The
+      # refusal must name the variable, or it failed for some other reason.
+      # `! cmd` never fails a `bash -e` step, hence the explicit exit.
+      - name: Check the flake refuses a missing flake ref
         run: |
           attr=.#nixosConfigurations.yolobox.config.networking.hostName
           if env -u YOLOBOX_FLAKE_REF $NIX_EVAL --raw "$attr" 2> unset.err; then
             echo "evaluated with YOLOBOX_FLAKE_REF unset"; exit 1
           fi
           grep -F 'YOLOBOX_FLAKE_REF is' unset.err
-          if env YOLOBOX_FLAKE_REF=path:/x $NIX_EVAL --raw "$attr" 2> path.err; then
-            echo "evaluated with YOLOBOX_FLAKE_REF=path:/x"; exit 1
-          fi
-          grep -F 'YOLOBOX_FLAKE_REF is' path.err
 
       # The operator account must not collide with the agent's or with root.
       # The refusal must name the variable, or it failed for some other reason.
@@ -149,7 +150,7 @@ jobs:
 
       # The package is what `nix run github:aka-rider/yolobox/v<version>` runs,
       # and its one patch stamps .version over `YO_VERSION = "dev"` with
-      # --replace-fail (yo.md, "YO_VERSION"). Building it proves the patch
+      # --replace-fail. Building it proves the patch
       # still matches, and the version it reports is .version's. Only the
       # x86_64 leg can run the binary it built.
       - name: Build yo and check the version it reports
@@ -158,33 +159,28 @@ jobs:
           nix build .#yolobox
           ./result/bin/yo --version | grep -Fx "yolobox $(cat .version)"
 
-      # The guest script and the screen recorder are writeShellApplication
-      # packages, whose check phase runs shellcheck at its default severity
-      # inside the build. An evaluation never runs that phase, so only a build
-      # proves the box's own shellcheck passes; the lint job above runs the
-      # repo's pinned shellcheck at the same severity, and this step holds
-      # nixpkgs' shellcheck to the same verdict. Only the x86_64 leg can
-      # build (nix/display.md, "Shellcheck at the build's severity").
-      - name: Build the two shellchecked script packages
+      # Every script the box exposes as a system.build attribute (the guest
+      # script, the display scripts, the harness scripts) is a
+      # writeShellApplication package, whose check phase runs shellcheck at its
+      # default severity inside the build. An evaluation never runs that phase,
+      # so only a build proves the box's own shellcheck passes; the lint job
+      # above runs the repo's pinned shellcheck at the same severity, and this
+      # step holds nixpkgs' shellcheck to the same verdict. Only the x86_64 leg
+      # can build.
+      - name: Build the shellchecked script packages
         if: matrix.system == 'x86_64-linux'
         run: |
           nix build --impure --no-link \
             .#nixosConfigurations.yolobox.config.system.build.yoloboxGuestScript \
-            .#nixosConfigurations.yolobox.config.system.build.yoloboxScreenRecord
-
-      # A yo older than the flake still passes YOLOBOX_HOST_OS. The box must
-      # be the same derivation whatever it says, or unset (nix/base.md).
-      - name: Check the box ignores YOLOBOX_HOST_OS
-        run: |
-          attr=.#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
-          unset_drv="$(env -u YOLOBOX_HOST_OS $NIX_EVAL --raw "$attr")"
-          for value in darwin linux lizard; do
-            test "$(env YOLOBOX_HOST_OS="$value" $NIX_EVAL --raw "$attr")" = "$unset_drv" ||
-              { echo "YOLOBOX_HOST_OS=$value changed the box"; exit 1; }
-          done
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxScreenRecord \
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxXvfb \
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxClaudeVersions \
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxClaudeLauncher \
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxClaudeLauncherKeep \
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxHarnessInstall
 
       # The guest trusts github.com through these pinned keys, so each must
-      # be the key GitHub publishes (nix/base.md, "github.com host keys").
+      # be the key GitHub publishes.
       - name: Check the github.com host keys have the published fingerprints
         run: |
           $NIX_EVAL --json .#nixosConfigurations.yolobox.config.programs.ssh.knownHosts \
@@ -198,22 +194,9 @@ jobs:
             | sort > published
           diff -u published fingerprints
 
-      # A commit that changes only docs must not change the box's system: a new
-      # generation costs every box a reboot (and a 1Password approval) at its
-      # next bootstrap. A commit stamp in /etc did exactly that, so yo
-      # resolves the commit at bootstrap instead (docs/distribution.md).
-      - name: Check a docs-only change keeps the box's generation
-        run: |
-          attr=.#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
-          before="$($NIX_EVAL --raw "$attr")"
-          echo "docs-only probe line" >> README.md
-          after="$($NIX_EVAL --raw "$attr")"
-          git checkout -- README.md
-          test "$before" = "$after" || { echo "a README change moved the system"; exit 1; }
-
       # vz cannot emulate, so only an Apple-silicon Mac's guest has a rosetta
       # share to mount, and only that host runs an aarch64 guest; on any other
-      # box it would wait on a mount that never comes (nix/base.md).
+      # box it would wait on a mount that never comes.
       - name: Check Rosetta is on exactly for the aarch64 guest
         run: |
           expected=false
@@ -233,17 +216,10 @@ jobs:
           test "$($NIX_EVAL --raw "$unit.unitConfig.ConditionPathExists")" = "$binary"
           $NIX_EVAL --raw "$unit.script" | grep -F "$binary daemon"
 
-      # The agent holds a forwarded 1Password agent, which on a Linux host
-      # serves the operator's key, so every box admits the operator only from
-      # the gateway and drops that address off enp0s1 (nix/base.md). The
-      # literals restate base.nix on purpose: this step only proves the two
-      # rules are not conditional, i.e. present on both legs. What they do is
-      # tests/box-hardening-check.sh's check_operator_login_refused.
-      # yo tells stage 2's sshd from the initrd's by the banner word alone
-      # (yolobox_cli/unlock.py), so stage 2 must render it and the initrd's
-      # sshd, which copies a few of stage 2's settings, must not. The gateway
-      # is exempt from per-source penalties (nix/base.md, "sshd penalties").
-      # tests/test_consistency.py keeps the word equal to yo's constant.
+      # yo tells stage 2's sshd from the initrd's by the banner word alone, so
+      # stage 2 must render it and the initrd's sshd, which copies a few of
+      # stage 2's settings, must not. The gateway is exempt from per-source
+      # penalties: every host connection comes from it.
       - name: Check the stage-2 banner mark and the gateway's penalty exemption
         run: |
           box=.#nixosConfigurations.yolobox.config
@@ -255,6 +231,11 @@ jobs:
             echo "the initrd's sshd carries the stage-2 banner mark"; exit 1
           fi
 
+      # The agent holds a forwarded 1Password agent, which on a Linux host
+      # serves the operator's key, so every box admits the operator only from
+      # the gateway and drops that address off enp0s1. The literals restate
+      # base.nix on purpose: this step only proves the two rules are not
+      # conditional, i.e. present on both legs.
       - name: Check the operator rules are on every box
         run: |
           box=.#nixosConfigurations.yolobox.config
@@ -264,7 +245,7 @@ jobs:
 
       # containersConf.settings is freeform toml, so a misspelled key
       # evaluates fine and silently sends container output back to the
-      # journal (nix/podman.md).
+      # journal.
       - name: Check container logs stay out of the journal
         run: |
           settings=.#nixosConfigurations.yolobox.config.virtualisation.containers.containersConf.settings
@@ -272,16 +253,14 @@ jobs:
           test "$($NIX_EVAL --raw "$settings.engine.events_logger")" = file
 
       # The module list and the sysctls are plain strings in the config, so a
-      # dropped line would still evaluate. Pin the two that matter most
-      # (nix/hardening.md).
+      # dropped line would still evaluate. Pin the two that matter most.
       - name: Check the hardening settings are present
         run: |
           set -o pipefail
           box=.#nixosConfigurations.yolobox.config
           test "$($NIX_EVAL --json "$box.boot.kernel.sysctl.\"kernel.io_uring_disabled\"")" = 2
           $NIX_EVAL --json "$box.boot.extraModprobeConfig" | grep -F 'install bluetooth '
-          # The net/sched modules stay blocked and the default qdisc does not
-          # (nix/hardening.md).
+          # The net/sched modules stay blocked and the default qdisc does not.
           for module in cls_u32 act_gact sch_netem; do
             $NIX_EVAL --json "$box.boot.extraModprobeConfig" | grep -F "install $module "
           done
@@ -294,7 +273,7 @@ jobs:
           fi
 
       # The kernel has no unprivileged_userns_clone, and systemd-sysctl warned
-      # about the key on every boot (nix/base.md). A null value in the
+      # about the key on every boot. A null value in the
       # attribute set is how it is removed, so read the rendered file.
       - name: Check no sysctl key the kernel lacks is rendered
         run: |
@@ -305,7 +284,7 @@ jobs:
           if grep -F unprivileged_userns_clone sysctl.conf; then exit 1; fi
 
       # yolobox.swapSizeMiB is how a box's local.nix sizes the swapfile
-      # without mkForce (nix/base.md).
+      # without mkForce.
       - name: Check the swap size is an option
         run: |
           size() {
@@ -322,7 +301,7 @@ jobs:
           test "$(size 4096)" = '[4096]'
           test "$(size 0)" = '[]'
           # The growth guard sits on the unit nixpkgs names for the file, and
-          # 0 removes the old file (nix/base.md).
+          # 0 removes the old file.
           test "$($NIX_EVAL --json --apply 'units: units."mkswap-var-swapfile".serviceConfig ? ExecStartPre' .#nixosConfigurations.yolobox.config.systemd.services)" = true
           $NIX_EVAL --json --expr "
             let
@@ -331,132 +310,3 @@ jobs:
               };
             in box.config.systemd.tmpfiles.rules
           " | grep -F '"r /var/swapfile"'
-
-      # nix cannot check the egress rule files (nft needs netlink, which the
-      # build sandbox forbids), and a rule file that fails to load leaves the
-      # box in recovery mode with no network. `nft --check` parses and validates
-      # each against the runner's kernel without changing any rules.
-      - name: Check the egress rules parse
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes nftables
-          for rules in egressRules egressRecoveryRules egressLastResortRules; do
-            file="$($NIX_EVAL --raw ".#nixosConfigurations.yolobox.config.system.build.$rules")"
-            sudo nft --check --file "$file"
-          done
-          sudo nft --check --file "$(tests/render-tunnel-egress.sh --system "$GUEST_SYSTEM")"
-
-      # The rendered files are what the kernel runs, so the egress tests read
-      # them, not the Nix. The host has no nix, so the unit tests run on copies
-      # in tests/fixtures; this step runs the same checker on the fresh render
-      # and diffs the copies against it, so a fixture cannot drift. A diff
-      # failure means: copy the fresh render over the fixture (nix/egress.md).
-      - name: Check the egress rules close the host
-        run: |
-          rules="$($NIX_EVAL --raw .#nixosConfigurations.yolobox.config.system.build.egressRules)"
-          recovery="$($NIX_EVAL --raw .#nixosConfigurations.yolobox.config.system.build.egressRecoveryRules)"
-          lastresort="$($NIX_EVAL --raw .#nixosConfigurations.yolobox.config.system.build.egressLastResortRules)"
-          tunnel="$(tests/render-tunnel-egress.sh --system "$GUEST_SYSTEM")"
-          python3 tests/egress_rules.py "$rules" "$recovery" "$lastresort" "$tunnel"
-          diff -u tests/fixtures/egress.nft "$rules"
-          diff -u tests/fixtures/egress-recovery.nft "$recovery"
-          diff -u tests/fixtures/egress-lastresort.nft "$lastresort"
-          diff -u tests/fixtures/egress-tunnel.nft "$tunnel"
-
-      # lanAllow goes into the rule files as text, so a bad entry must fail the
-      # evaluation: nft would reject it at load and drop the box into recovery
-      # mode. The assertions run on a configuration extended with one entry.
-      - name: Check lanAllow rejects what nft would reject
-        run: |
-          check() {
-            $NIX_EVAL --raw --expr "
-              let
-                box = (builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
-                  modules = [ { yolobox.network.lanAllow = [ \"$1\" ]; } ];
-                };
-              in
-              if builtins.all (a: a.assertion) box.config.assertions then \"accepted\" else \"rejected\"
-            "
-          }
-          for entry in 300.1.1.1/8 10.0.0.0/33 lizard fd00::/129 ::::/64 010.0.0.0/8 192.168.1.20/24 fd00::1/64 fd00::1:0/96 1.0.0.0/7; do
-            test "$(check "$entry")" = rejected || { echo "not rejected: $entry"; exit 1; }
-          done
-          for entry in 192.168.1.20/32 fd00:1::/64 fd00::1/128 255.255.255.255/32 0.0.0.0/0 ::/0 2001:db8:0:0:0:0:0:8000/113; do
-            test "$(check "$entry")" = accepted || { echo "not accepted: $entry"; exit 1; }
-          done
-
-      # The wrapper assertions fire only when the system is evaluated, so each
-      # case evaluates the toplevel of a configuration extended with one module.
-      # The refusal must name the offender, or it failed for some other reason,
-      # and the control proves the same wrapper evaluates without the forbidden
-      # capability. The extra wrapper is named after the binary it wraps,
-      # because an extra wrapper's source must carry its name. `! cmd` never
-      # fails a `bash -e` step, hence the explicit exits.
-      - name: Check the wrapper allowlist refuses what it must
-        run: |
-          toplevel() {
-            $NIX_EVAL --raw --expr "
-              let
-                box = (builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
-                  modules = [ ({ pkgs, lib, ... }: { $1 }) ];
-                };
-              in box.config.system.build.toplevel.drvPath
-            "
-          }
-          refused() {
-            if toplevel "$1" 2> wrappers.err; then
-              echo "evaluated: $1"; exit 1
-            fi
-            grep -F -- "$2" wrappers.err
-          }
-          # $1 the capabilities, $2 the group (root when omitted), $3 the
-          # binary (sleep when omitted). The group is an argument because Nix
-          # refuses a second sleep.group in the same set.
-          wrapper() {
-            echo "security.wrappers.sleep = { source = \"\${pkgs.coreutils}/bin/${3:-sleep}\"; owner = \"root\"; group = \"${2:-root}\"; capabilities = \"$1+ep\"; };"
-          }
-          toplevel "$(wrapper cap_net_raw) yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap\";" > /dev/null
-          refused "$(wrapper cap_net_raw,cap_sys_admin) yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap,cap_sys_admin\";" 'sleep: cap_net_raw,cap_sys_admin+ep'
-          # Each capability that reaches root in one step is refused on its
-          # own, and cap_setuid everywhere but on the two id-map helpers.
-          for cap in cap_sys_module cap_sys_rawio cap_setfcap cap_fowner cap_chown cap_bpf cap_sys_boot cap_mknod cap_setuid cap_setgid; do
-            refused "$(wrapper $cap) yolobox.hardening.extraWrappers.sleep = \"$cap,cap_setpcap\";" "sleep: $cap+ep"
-          done
-          refused 'yolobox.hardening.extraWrappers.sudo = "";' 'names kept wrappers (sudo)'
-          # group and permissions are privilege too: a mode with an s makes a
-          # capability wrapper setuid, and sudo is wheel-only.
-          toplevel "$(wrapper cap_net_raw wireshark) security.wrappers.sleep.permissions = \"u+rx,g+x\"; yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap\";" > /dev/null
-          refused "$(wrapper cap_net_raw) security.wrappers.sleep.permissions = \"u+rxs,g+x,o+x\"; yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap\";" 'sleep: have'
-          refused 'security.wrappers.sudo.group = lib.mkForce "root";' 'sudo: have'
-          refused 'security.wrappers.sudo.permissions = lib.mkForce "u+rx,g+x,o+x";' 'sudo: have'
-          # The source is privilege too: a kept name pointed at a shell is a
-          # setuid shell, and an extra wrapper must wrap a binary of its name.
-          refused 'security.wrappers.unix_chkpwd.source = lib.mkForce "${pkgs.bash}/bin/bash";' 'unix_chkpwd: have'
-          refused "$(wrapper cap_net_raw root true) yolobox.hardening.extraWrappers.sleep = \"cap_net_raw,cap_setpcap\";" 'sleep: source'
-
-      # The agent is in no supplementary group unless the box's local.nix says
-      # so twice, and in wheel never (nix/hardening.md, "The agent's groups").
-      # Membership counts from either side: extraGroups on the account, or
-      # members on the group.
-      - name: Check the agent's groups are asserted
-        run: |
-          toplevel() {
-            $NIX_EVAL --raw --expr "
-              let
-                box = (builtins.getFlake (toString ./.)).nixosConfigurations.yolobox.extendModules {
-                  modules = [ ({ pkgs, lib, ... }: { $1 }) ];
-                };
-              in box.config.system.build.toplevel.drvPath
-            "
-          }
-          refused() {
-            if toplevel "$1" 2> groups.err; then
-              echo "evaluated: $1"; exit 1
-            fi
-            grep -F -- "$2" groups.err
-          }
-          toplevel 'users.groups.wireshark = {}; users.users.agent.extraGroups = [ "wireshark" ]; yolobox.hardening.extraAgentGroups = [ "wireshark" ];' > /dev/null
-          refused 'users.groups.wireshark = {}; users.users.agent.extraGroups = [ "wireshark" ];' 'supplementary groups (wireshark) differ'
-          refused 'users.groups.wireshark.members = [ "agent" ];' 'supplementary groups (wireshark) differ'
-          refused 'yolobox.hardening.extraAgentGroups = [ "wireshark" ];' 'differ from yolobox.hardening.extraAgentGroups (wireshark)'
-          refused 'users.users.agent.extraGroups = [ "wheel" ]; yolobox.hardening.extraAgentGroups = [ "wheel" ];' 'The agent is in wheel'

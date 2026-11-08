@@ -26,11 +26,25 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
-from test_yo import ACCEPT_TIMEOUT_SECONDS, FakeHome, load_yo, unload_yo
+from test_yo import (
+    ACCEPT_TIMEOUT_SECONDS,
+    NOT_LISTENING,
+    FakeHelper,
+    FakeHome,
+    load_yo,
+    unload_yo,
+    refuse_tcp_to_the_host,
+)
+
+
+def setUpModule():
+    refuse_tcp_to_the_host()
+
 
 REPO = Path(__file__).resolve().parent.parent
 # LibvirtCase.setUp patches `which` on the stdlib module itself, which yo shares,
@@ -63,38 +77,11 @@ READS = frozenset(
         "dumpxml",
         "domstate",
         "dominfo",
-        "domcapabilities",
         "vol-list",
         "vol-info",
     }
 )
-# What `virsh domcapabilities` says of the host's q35 kvm machine, cut to the
-# two things the domain policy reads from it.
-EMULATOR = "/usr/bin/qemu-system-x86_64"
-LOADER = "/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2"
-DOMCAPABILITIES_XML = """\
-<domainCapabilities>
-  <path>%s</path>
-  <domain>kvm</domain>
-  <machine>pc-q35-11.1</machine>
-  <arch>x86_64</arch>
-  <os supported='yes'>
-    <loader supported='yes'>
-      <value>/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.qcow2</value>
-      <value>%s</value>
-      <value>/usr/share/edk2/ovmf/OVMF_CODE.fd</value>
-      <enum name='type'>
-        <value>rom</value>
-        <value>pflash</value>
-      </enum>
-    </loader>
-  </os>
-</domainCapabilities>
-""" % (EMULATOR, LOADER)
-# The virsh subcommands that edit a domain's definition.
-WRITES = frozenset({"setmaxmem", "setmem", "setvcpus"})
 # What ssh prints when nothing listens behind the box's port: a domain that is off.
-SSH_REFUSED = (255, "ssh: connect to host 127.0.0.1 port 61000: Connection refused")
 
 
 def getfacl_listing(entry="rwx", mask="rwx", comment=True):
@@ -168,8 +155,6 @@ class FakeHost:
         self.watchers = []
         self.max_memory_kib = {}  # domain -> the Max memory `virsh dominfo` prints
         self.cpus = {}  # domain -> the CPU(s) `virsh dominfo` prints, default 8
-        self.max_cpus = {}  # domain -> its maximum vCPUs, default 8
-        self.memory_kib = {}  # domain -> its current memory (`setmem`), default max
         self.dominfo = {}  # domain -> what `virsh dominfo` prints instead
         # Runs as `virsh dominfo NAME` starts, given NAME: another tool acting.
         self.before_dominfo = lambda name: None
@@ -231,7 +216,7 @@ class FakeHost:
             else:
                 result = completed(returncode=0 if self.master_running else 255)
                 self.master_running &= self.master_survives_exit
-        elif argv[0] == "ssh" and argv[-1] == "true":
+        elif argv[0] == "ssh" and "-O" not in argv:
             # A session without ControlPath=none rides the master when one runs;
             # any other one logs in to the box's sshd, and a mux one that does
             # becomes the master.
@@ -281,34 +266,6 @@ class FakeHost:
         self.watchers.append(watcher)
         return watcher
 
-    def set_definition(self, sub, args):
-        """setmaxmem, setmem and setvcpus on the definition of a domain, as libvirt
-        refuses them: only with --config on a shut-off domain, and a current
-        value never above its maximum."""
-        name, value = args[0], args[1]
-        assert "--config" in args, "a live change to a domain that is shut off"
-        if self.states[name] != "shut off":
-            return completed(returncode=1, stderr="error: domain is running")
-        if sub == "setvcpus":
-            if "--maximum" in args:
-                self.max_cpus[name] = int(value)
-                self.cpus[name] = min(self.cpus.get(name, DOMAIN_CPUS), int(value))
-            elif int(value) > self.max_cpus.get(name, DOMAIN_CPUS):
-                return completed(returncode=1, stderr="error: too many vCPUs")
-            else:
-                self.cpus[name] = int(value)
-            return completed()
-        kib = int(re.fullmatch(r"(\d+)G", value).group(1)) << 20
-        if sub == "setmaxmem":
-            current = self.memory_kib.get(name, self.max_memory_kib[name])
-            self.max_memory_kib[name] = kib
-            self.memory_kib[name] = min(current, kib)
-        elif kib > self.max_memory_kib[name]:
-            return completed(returncode=1, stderr="error: memory above the maximum")
-        else:
-            self.memory_kib[name] = kib
-        return completed()
-
     def virsh(self, sub, args):
         if sub in self.interrupted:
             raise self.interrupted[sub]
@@ -355,8 +312,6 @@ class FakeHost:
                     self.cpus.get(args[0], DOMAIN_CPUS),
                 )
             )
-        if sub in ("setmaxmem", "setmem", "setvcpus"):
-            return self.set_definition(sub, args)
         if sub == "dumpxml":
             self.before_dumpxml(args[0])
             if args[0] not in self.domains:
@@ -365,15 +320,30 @@ class FakeHost:
                     stderr="error: failed to get domain '%s'\n" % args[0],
                 )
             return completed(self.domains[args[0]])
-        if sub == "domcapabilities":
-            return completed(DOMCAPABILITIES_XML)
         if sub == "domstate":
             return completed(self.states[args[0]] + "\n")
         if sub == "define":
             xml = Path(args[0]).read_text()
-            name = ET.fromstring(xml).findtext("name")
+            root = ET.fromstring(xml)
+            name = root.findtext("name")
+            # libvirt keeps a name to its uuid: a definition under a known name
+            # must carry that domain's uuid, and only replaces it while it is off.
+            if name in self.domains:
+                known = ET.fromstring(self.domains[name]).findtext("uuid")
+                if known != root.findtext("uuid"):
+                    return completed(
+                        returncode=1,
+                        stderr="error: operation failed: domain '%s' already "
+                        "exists with uuid %s" % (name, known),
+                    )
+                if self.states[name] != "shut off":
+                    return completed()
             self.domains[name] = xml
             self.states[name] = "shut off"
+            memory = root.find("memory")
+            assert memory.get("unit") == "GiB", memory.get("unit")
+            self.max_memory_kib[name] = int(memory.text) << 20
+            self.cpus[name] = int(root.findtext("vcpu"))
             return completed()
         if sub == "start":
             self.states[args[0]] = "running"
@@ -405,45 +375,30 @@ class FakeHost:
             )
         return completed()
 
-    def tagged_domain(self, name, port, address="127.0.0.1"):
-        xml = self.box.domain_xml(
-            name,
-            port,
-            VM_UID,
-            VM_GID,
-            self.box.LIBVIRT_MEMORY_GIB,
-            DOMAIN_CPUS,
+    def tagged_domain(self, name, port, memory_gib=None, cpus=DOMAIN_CPUS):
+        """A domain yo defined for the instance `name`, running, with the
+        record yo keeps of it in that instance's directory."""
+        facts = self.box.DomainFacts(
+            str(uuid.uuid4()), port, memory_gib or self.box.LIBVIRT_MEMORY_GIB, cpus
         )
-        self.domains["yolobox-" + name] = xml.replace(
-            "address='127.0.0.1'", "address='%s'" % address
+        directory = os.path.join(
+            self.box.state.home(), self.box.box.driver.instances_dir, name
+        )
+        os.makedirs(directory, exist_ok=True)
+        self.box.write_domain_facts(directory, facts)
+        self.domains["yolobox-" + name] = self.box.domain_xml(
+            name, facts, VM_UID, VM_GID
         )
         self.states["yolobox-" + name] = "running"
-        self.max_memory_kib["yolobox-" + name] = self.box.LIBVIRT_MEMORY_GIB << 20
+        self.max_memory_kib["yolobox-" + name] = facts.memory_gib << 20
+        self.cpus["yolobox-" + name] = cpus
+        return facts
 
     def foreign_domain(self, name, memory_kib, domain_state="running"):
         """A domain of another tool, which yo only lists and asks for its memory."""
         self.domains[name] = "<domain type='kvm'><name>%s</name></domain>" % name
         self.states[name] = domain_state
         self.max_memory_kib[name] = memory_kib
-
-
-class FakeHelper:
-    """The initrd helper's ssh session: scripted stdout lines, exit code, stderr."""
-
-    def __init__(self, lines, code, stderr):
-        self.stdin = io.BytesIO()
-        self.stdout = io.BytesIO("".join(line + "\n" for line in lines).encode())
-        self.stderr = io.BytesIO(stderr.encode())
-        self.code = code
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def wait(self):
-        return self.code
 
 
 def fake_which(name):
@@ -523,6 +478,14 @@ class LibvirtCase(FakeHome):
             "MemTotal:       %d kB\nMemFree:         1048576 kB\n" % kib
         )
 
+    def vm_word(self):
+        """virsh's own word for the domain's state, None for no domain."""
+        status = self.driver.vm_status()
+        return status.word if status is not None else None
+
+    def force_stop_command(self):
+        return self.box.state.hint(self.driver.hints.force_stop_command)
+
     def lock_held(self, path=None):
         """Whether another process would have to wait for the lock at `path`,
         the host-wide port lock by default."""
@@ -539,494 +502,34 @@ class LibvirtCase(FakeHome):
         return False
 
 
-# `virsh dumpxml` of a running domain, as libvirt 12.8 prints one: what the
-# template produces plus what libvirt adds when it defines it (uuid, the
-# resolved firmware, emulator, controllers, ps2 input, audio, watchdog,
-# addresses) and when it runs it (the id, pty paths, aliases, labels). Its DAC
-# label is the vm account's.
-LIBVIRT_STORED_DOMAIN = """\
-<domain type='kvm' id='10'>
-  <name>yolobox-yolobox</name>
-  <uuid>49e37216-8dc2-432f-9e39-7aca92c26024</uuid>
-  <metadata>
-    <yolobox:instance xmlns:yolobox="https://github.com/aka-rider/yolobox">yolobox</yolobox:instance>
-  </metadata>
-  <memory unit='KiB'>MEMORY_KIB</memory>
-  <currentMemory unit='KiB'>MEMORY_KIB</currentMemory>
-  <vcpu placement='static'>8</vcpu>
-  <resource>
-    <partition>/machine</partition>
-  </resource>
-  <os firmware='efi'>
-    <type arch='x86_64' machine='pc-q35-11.1'>hvm</type>
-    <firmware>
-      <feature enabled='no' name='enrolled-keys'/>
-      <feature enabled='no' name='secure-boot'/>
-    </firmware>
-    <loader readonly='yes' type='pflash' format='qcow2'>/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2</loader>
-    <nvram template='/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2' templateFormat='qcow2' format='qcow2'>/var/lib/libvirt/qemu/nvram/yolobox-yolobox_VARS.qcow2</nvram>
-    <boot dev='hd'/>
-  </os>
-  <features>
-    <acpi/>
-    <apic/>
-  </features>
-  <cpu mode='host-passthrough' check='none' migratable='on'/>
-  <clock offset='utc'/>
-  <on_poweroff>destroy</on_poweroff>
-  <on_reboot>restart</on_reboot>
-  <on_crash>destroy</on_crash>
-  <devices>
-    <emulator>/usr/bin/qemu-system-x86_64</emulator>
-    <disk type='volume' device='disk'>
-      <driver name='qemu' type='qcow2' discard='unmap' detect_zeroes='unmap'/>
-      <source pool='default' volume='yolobox-yolobox.qcow2' index='2'/>
-      <backingStore/>
-      <target dev='vda' bus='virtio'/>
-      <alias name='virtio-disk0'/>
-      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
-    </disk>
-    <disk type='volume' device='cdrom'>
-      <driver name='qemu' type='raw'/>
-      <source pool='default' volume='yolobox-yolobox-cidata.iso' index='1'/>
-      <backingStore/>
-      <target dev='sda' bus='sata'/>
-      <readonly/>
-      <alias name='sata0-0-0'/>
-      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
-    </disk>
-    <controller type='usb' index='0' model='none'/>
-    <controller type='sata' index='0'>
-      <alias name='ide'/>
-      <address type='pci' domain='0x0000' bus='0x00' slot='0x1f' function='0x2'/>
-    </controller>
-    <controller type='pci' index='0' model='pcie-root'>
-      <alias name='pcie.0'/>
-    </controller>
-    <controller type='pci' index='1' model='pcie-root-port'>
-      <model name='pcie-root-port'/>
-      <target chassis='1' port='0x10'/>
-      <alias name='pci.1'/>
-      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0' multifunction='on'/>
-    </controller>
-    <controller type='pci' index='2' model='pcie-root-port'>
-      <model name='pcie-root-port'/>
-      <target chassis='2' port='0x11'/>
-      <alias name='pci.2'/>
-      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x1'/>
-    </controller>
-    <controller type='pci' index='3' model='pcie-root-port'>
-      <model name='pcie-root-port'/>
-      <target chassis='3' port='0x12'/>
-      <alias name='pci.3'/>
-      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x2'/>
-    </controller>
-    <interface type='user'>
-      <mac address='52:54:00:fe:e5:f7'/>
-      <ip address='192.168.5.15' family='ipv4' prefix='24'/>
-      <route family='ipv4' gateway='192.168.5.2'/>
-      <portForward proto='tcp' address='127.0.0.1'>
-        <range start='61000' to='22'/>
-      </portForward>
-      <model type='virtio'/>
-      <backend type='passt'/>
-      <mtu size='65520'/>
-      <alias name='net0'/>
-      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x0'/>
-    </interface>
-    <serial type='pty'>
-      <source path='/dev/pts/3'/>
-      <target type='isa-serial' port='0'>
-        <model name='isa-serial'/>
-      </target>
-      <alias name='serial0'/>
-    </serial>
-    <console type='pty' tty='/dev/pts/3'>
-      <source path='/dev/pts/3'/>
-      <target type='serial' port='0'/>
-      <alias name='serial0'/>
-    </console>
-    <input type='mouse' bus='ps2'>
-      <alias name='input0'/>
-    </input>
-    <input type='keyboard' bus='ps2'>
-      <alias name='input1'/>
-    </input>
-    <audio id='1' type='none'/>
-    <video>
-      <model type='none'/>
-      <alias name='video0'/>
-    </video>
-    <watchdog model='itco' action='reset'>
-      <alias name='watchdog0'/>
-    </watchdog>
-    <memballoon model='none'/>
-    <rng model='virtio'>
-      <backend model='random'>/dev/urandom</backend>
-      <alias name='rng0'/>
-      <address type='pci' domain='0x0000' bus='0x02' slot='0x00' function='0x0'/>
-    </rng>
-  </devices>
-  <seclabel type='dynamic' model='selinux' relabel='yes'>
-    <label>system_u:system_r:svirt_t:s0:c865,c946</label>
-    <imagelabel>system_u:object_r:svirt_image_t:s0:c865,c946</imagelabel>
-  </seclabel>
-  <seclabel type='static' model='dac' relabel='yes'>
-    <label>+955:+953</label>
-    <imagelabel>+955:+953</imagelabel>
-  </seclabel>
-</domain>
-"""
-
-
 class TestDomainTemplate(LibvirtCase):
-    def render(self, name="box", port=FIRST_PORT):
-        return self.box.domain_xml(
-            name,
-            port,
-            VM_UID,
-            VM_GID,
-            self.box.LIBVIRT_MEMORY_GIB,
-            DOMAIN_CPUS,
-        )
+    """What libvirt/domain.xml gives every box: the guarantees the box's
+    confinement rests on are properties of the template, which every start of
+    a stopped domain defines again."""
 
-    def devices(self, xml):
-        return [child.tag for child in ET.fromstring(xml).find("devices")]
+    def render(self, name="box", port=FIRST_PORT, memory_gib=16, cpus=DOMAIN_CPUS):
+        facts = self.box.DomainFacts("a-uuid", port, memory_gib, cpus)
+        return self.box.domain_xml(name, facts, VM_UID, VM_GID)
 
-    def gaps(self, info, instance="box"):
-        return self.box.domain_gaps(info, instance, VM_UID, VM_GID, self.firmware())
+    def test_the_facts_fill_the_template(self):
+        root = ET.fromstring(self.render(port=61234, memory_gib=24, cpus=3))
+        self.assertEqual(root.findtext("uuid"), "a-uuid")
+        self.assertEqual(root.find("memory").get("unit"), "GiB")
+        self.assertEqual(root.findtext("memory"), "24")
+        self.assertEqual(root.findtext("vcpu"), "3")
+        forward = root.find("devices/interface/portForward")
+        self.assertEqual(forward.get("address"), "127.0.0.1")
+        self.assertEqual(forward.get("proto"), "tcp")
+        self.assertEqual(forward.find("range").get("start"), "61234")
+        self.assertEqual(forward.find("range").get("to"), "22")
 
-    def firmware(self):
-        return self.box.HostFirmware(EMULATOR, frozenset({LOADER}))
-
-    def with_device(self, element):
-        return self.render().replace("<video>", element + "<video>")
-
-    def with_rng(self, element):
-        return re.sub(r"<rng .*?</rng>", element, self.render(), flags=re.S)
-
-    def assert_gaps(self, xml, *gaps):
-        found = self.gaps(self.box.parse_domain(xml))
-        self.assertEqual(found, list(gaps))
-        for gap in gaps:
-            self.assertIn(gap, self.driver.config_gap_message(found))
-
-    def test_every_device_tag_the_template_lacks_is_a_gap_named_in_the_message(self):
-        broken = {
-            "graphics": "<graphics type='vnc'/>",
-            "vsock": "<vsock model='virtio'/>",
-            "filesystem": "<filesystem type='mount'/>",
-            "channel": "<channel type='pty'/>",
-            "hostdev": "<hostdev/>",
-            "tpm": "<tpm model='tpm-crb'/>",
-            "shmem": "<shmem name='x'/>",
-            "redirdev": "<redirdev bus='usb' type='spicevmc'/>",
-            "smartcard": "<smartcard mode='passthrough' type='tcp'/>",
-            "parallel": "<parallel type='pty'/>",
-            "iommu": "<iommu model='intel'/>",
-            "panic": "<panic model='isa'/>",
-        }
-        for tag, element in broken.items():
-            with self.subTest(tag=tag):
-                self.assert_gaps(self.with_device(element), "element:devices/" + tag)
-
-    def test_a_device_of_the_templates_tag_with_another_type_is_a_gap(self):
-        broken = {
-            "value:devices/input@type=passthrough": "<input type='passthrough' bus='ps2'/>",
-            "value:devices/input@type=evdev": "<input type='evdev' bus='ps2'/>",
-            "value:devices/controller@type=virtio-serial": (
-                "<controller type='virtio-serial'/>"
-            ),
-            "value:devices/audio@type=pulseaudio": "<audio id='1' type='pulseaudio'/>",
-        }
-        for gap, element in broken.items():
-            with self.subTest(gap=gap):
-                self.assert_gaps(self.with_device(element), gap)
-        base = self.render()
-        changed = {
-            "value:devices/serial@type=tcp": base.replace(
-                "<serial type='pty'>", "<serial type='tcp'>"
-            ),
-            "value:devices/console@type=unix": base.replace(
-                "<console type='pty'>", "<console type='unix'>"
-            ),
-            "value:devices/memballoon@model=virtio": base.replace(
-                "<memballoon model='none'/>", "<memballoon model='virtio'/>"
-            ),
-        }
-        for gap, xml in changed.items():
-            with self.subTest(gap=gap):
-                self.assert_gaps(xml, gap)
-
-    def test_a_second_serial_or_console_is_a_gap(self):
-        for tag in ("serial", "console"):
-            with self.subTest(tag=tag):
-                self.assert_gaps(
-                    self.with_device("<%s type='pty'/>" % tag),
-                    "repeated:devices/" + tag,
-                )
-
-    def test_a_disk_that_is_not_a_pool_volume_of_this_box_is_a_gap(self):
-        base = self.render()
-        broken = {
-            "value:devices/disk@type=file": base.replace(
-                "<disk type='volume' device='disk'>", "<disk type='file' device='disk'>"
-            ),
-            "value:devices/disk@device=lun": base.replace(
-                "<disk type='volume' device='disk'>",
-                "<disk type='volume' device='lun'>",
-            ),
-            "value:devices/disk/source@pool=homes": base.replace(
-                "pool='default' volume='yolobox-box.qcow2'",
-                "pool='homes' volume='yolobox-box.qcow2'",
-            ),
-            "value:devices/disk/source@volume=other.qcow2": base.replace(
-                "volume='yolobox-box.qcow2'", "volume='other.qcow2'"
-            ),
-            "attribute:devices/disk/source@file": base.replace(
-                "volume='yolobox-box.qcow2'",
-                "volume='yolobox-box.qcow2' file='/etc/shadow'",
-            ),
-            "element:devices/disk/source/seclabel": base.replace(
-                "volume='yolobox-box.qcow2'/>",
-                "volume='yolobox-box.qcow2'><seclabel model='dac' relabel='no'/></source>",
-            ),
-            "element:devices/disk/seclabel": base.replace(
-                "<target dev='vda' bus='virtio'/>",
-                "<target dev='vda' bus='virtio'/><seclabel model='selinux' relabel='no'/>",
-            ),
-            "element:devices/disk/shareable": base.replace(
-                "<target dev='vda' bus='virtio'/>",
-                "<target dev='vda' bus='virtio'/><shareable/>",
-            ),
-            "value:devices/disk/driver@discard=ignore": base.replace(
-                "discard='unmap'", "discard='ignore'"
-            ),
-            "attribute:devices/disk/driver@cache": base.replace(
-                "<driver name='qemu' type='raw'/>",
-                "<driver name='qemu' type='raw' cache='unsafe'/>",
-            ),
-        }
-        for gap, xml in broken.items():
-            with self.subTest(gap=gap):
-                self.assert_gaps(xml, gap)
-
-    def test_a_backing_store_is_a_gap_in_each_of_its_parts(self):
-        # libvirt stores an empty <backingStore/>; one with a file is a host path.
-        xml = self.render().replace(
-            "<target dev='vda' bus='virtio'/>",
-            "<backingStore type='file'><source file='/home/op/base.qcow2'/>"
-            "</backingStore><target dev='vda' bus='virtio'/>",
-        )
-        self.assert_gaps(
-            xml,
-            "attribute:devices/disk/backingStore@type",
-            "element:devices/disk/backingStore/source",
-        )
-
-    def test_a_boot_from_a_host_file_or_another_firmware_is_a_gap(self):
-        base = self.render()
-        broken = {
-            "element:os/kernel": "<kernel>/home/op/vmlinuz</kernel>",
-            "element:os/initrd": "<initrd>/home/op/initrd.img</initrd>",
-            "element:os/cmdline": "<cmdline>init=/bin/sh</cmdline>",
-            "element:os/dtb": "<dtb>/home/op/x.dtb</dtb>",
-            "element:os/smbios": "<smbios mode='host'/>",
-            "element:os/acpi": "<acpi><table type='slic'>/home/op/slic.dat</table></acpi>",
-            "text:os/loader=/home/op/evil.fd": (
-                "<loader readonly='yes' type='pflash'>/home/op/evil.fd</loader>"
-            ),
-            "value:os/loader@readonly=no": (
-                "<loader readonly='no' type='pflash'>%s</loader>" % LOADER
-            ),
-            "text:os/nvram=/home/op/vars.fd": (
-                "<nvram template='/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2'>"
-                "/home/op/vars.fd</nvram>"
-            ),
-            "value:os/nvram@template=/home/op/vars.fd": (
-                "<nvram template='/home/op/vars.fd'>"
-                "/var/lib/libvirt/qemu/nvram/yolobox-box_VARS.qcow2</nvram>"
-            ),
-            # A prefix under /usr/share/ that walks back out of it.
-            "value:os/nvram@template=/usr/share/../../../etc/shadow": (
-                "<nvram template='/usr/share/../../../etc/shadow'>"
-                "/var/lib/libvirt/qemu/nvram/yolobox-box_VARS.qcow2</nvram>"
-            ),
-            "value:os/nvram@template=/usr/share/edk2/./OVMF_VARS_4M.qcow2": (
-                "<nvram template='/usr/share/edk2/./OVMF_VARS_4M.qcow2'>"
-                "/var/lib/libvirt/qemu/nvram/yolobox-box_VARS.qcow2</nvram>"
-            ),
-            "value:os/nvram@template=/usr/share/": (
-                "<nvram template='/usr/share/'>"
-                "/var/lib/libvirt/qemu/nvram/yolobox-box_VARS.qcow2</nvram>"
-            ),
-            "text:os/nvram=/var/lib/libvirt/qemu/nvram/other_VARS.qcow2": (
-                "<nvram template='/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2'>"
-                "/var/lib/libvirt/qemu/nvram/other_VARS.qcow2</nvram>"
-            ),
-        }
-        for gap, element in broken.items():
-            with self.subTest(gap=gap):
-                self.assert_gaps(
-                    base.replace("<boot dev='hd'/>", element + "<boot dev='hd'/>"), gap
-                )
-        self.assert_gaps(
-            base.replace(
-                "enabled='no' name='secure-boot'", "enabled='yes' name='secure-boot'"
-            ),
-            "value:os/firmware/feature@enabled=yes",
-        )
-
-    def test_an_emulator_other_than_the_hosts_is_a_gap(self):
-        xml = self.render().replace(
-            "<devices>", "<devices><emulator>/home/op/qemu-wrapper</emulator>"
-        )
-        self.assert_gaps(xml, "text:devices/emulator=/home/op/qemu-wrapper")
-
-    def test_an_interface_that_reaches_a_host_file_or_a_second_port_is_a_gap(self):
-        base = self.render()
-        broken = {
-            "element:devices/interface/rom": base.replace(
-                "<mtu size='65520'/>",
-                "<mtu size='65520'/><rom file='/home/op/rom.bin'/>",
-            ),
-            "attribute:devices/interface/backend@logFile": base.replace(
-                "<backend type='passt'/>",
-                "<backend type='passt' logFile='/etc/shadow'/>",
-            ),
-            "attribute:devices/interface/backend@upstream": base.replace(
-                "<backend type='passt'/>", "<backend type='passt' upstream='eth0'/>"
-            ),
-            "element:devices/interface/source": base.replace(
-                "<backend type='passt'/>",
-                "<backend type='passt'/><source dev='/dev/net/tun'/>",
-            ),
-            "repeated:devices/interface/portForward/range": base.replace(
-                "<range start='61000' to='22'/>",
-                "<range start='61000' to='22'/><range start='61001' to='22'/>",
-            ),
-            "attribute:devices/interface/portForward/range@end": base.replace(
-                "<range start='61000' to='22'/>",
-                "<range start='61000' end='61100' to='22'/>",
-            ),
-            "value:devices/interface/portForward/range@to=80": base.replace(
-                "<range start='61000' to='22'/>", "<range start='61000' to='80'/>"
-            ),
-            "repeated:devices/interface/portForward": base.replace(
-                "</portForward>",
-                "</portForward><portForward proto='tcp' address='127.0.0.1'>"
-                "<range start='61001' to='22'/></portForward>",
-            ),
-            "value:devices/interface/ip@address=192.168.5.16": base.replace(
-                "address='192.168.5.15'", "address='192.168.5.16'"
-            ),
-            "value:devices/interface/route@gateway=192.168.5.1": base.replace(
-                "gateway='192.168.5.2'", "gateway='192.168.5.1'"
-            ),
-        }
-        for gap, xml in broken.items():
-            with self.subTest(gap=gap):
-                self.assert_gaps(xml, gap)
-
-    def test_a_serial_log_a_base_label_or_a_qemu_argument_is_a_gap(self):
-        base = self.render()
-        qemu = "http://libvirt.org/schemas/domain/qemu/1.0"
-        broken = {
-            "element:devices/serial/log": base.replace(
-                "<serial type='pty'>",
-                "<serial type='pty'><log file='/home/op/serial.log'/>",
-            ),
-            "element:seclabel/baselabel": base.replace(
-                "<seclabel type='dynamic' model='selinux' relabel='yes'/>",
-                "<seclabel type='dynamic' model='selinux' relabel='yes'>"
-                "<baselabel>system_u:system_r:unconfined_t:s0</baselabel></seclabel>",
-            ),
-            "text:seclabel/label=system_u:system_r:unconfined_t:s0:c1,c2": base.replace(
-                "<seclabel type='dynamic' model='selinux' relabel='yes'/>",
-                "<seclabel type='dynamic' model='selinux' relabel='yes'>"
-                "<label>system_u:system_r:unconfined_t:s0:c1,c2</label></seclabel>",
-            ),
-            "element:qemu:commandline": base.replace(
-                "<domain type='kvm'>", "<domain type='kvm' xmlns:qemu='%s'>" % qemu
-            ).replace("</domain>", "<qemu:commandline/></domain>"),
-            "element:sysinfo": base.replace(
-                "</domain>", "<sysinfo type='smbios'/></domain>"
-            ),
-            "element:launchSecurity": base.replace(
-                "</domain>", "<launchSecurity type='sev'/></domain>"
-            ),
-            "element:{urn:other}extra": base.replace(
-                "</domain>", "<x:extra xmlns:x='urn:other'/></domain>"
-            ),
-            "element:metadata/{urn:other}note": base.replace(
-                "</metadata>", "<x:note xmlns:x='urn:other'/></metadata>"
-            ),
-        }
-        for gap, xml in broken.items():
-            with self.subTest(gap=gap):
-                self.assert_gaps(xml, gap)
-
-    def test_an_rng_that_reads_anything_but_the_hosts_entropy_devices_is_a_gap(self):
-        broken = {
-            "value:devices/rng/backend@model=egd": (
-                "<rng model='virtio'><backend model='egd'>/dev/urandom</backend></rng>"
-            ),
-            "missing:devices/rng/backend": "<rng model='virtio'/>",
-            "text:devices/rng/backend=/home/op/secret": (
-                "<rng model='virtio'>"
-                "<backend model='random'>/home/op/secret</backend></rng>"
-            ),
-        }
-        for gap, element in broken.items():
-            with self.subTest(gap=gap):
-                self.assert_gaps(self.with_rng(element), gap)
-        self.assert_gaps(
-            self.with_rng(
-                "<rng model='virtio'><backend model='egd' type='unix'>"
-                "<source mode='connect' path='/run/host.sock'/></backend></rng>"
-            ),
-            "value:devices/rng/backend@model=egd",
-            "attribute:devices/rng/backend@type",
-            "text:devices/rng/backend=",
-            "element:devices/rng/backend/source",
-        )
-
-    def test_a_device_that_is_there_twice_is_one_gap(self):
-        xml = self.with_device("<shmem name='a'/><shmem name='b'/>")
-        self.assert_gaps(xml, "element:devices/shmem")
-
-    def test_a_domain_as_libvirt_runs_it_has_no_gap(self):
-        xml = LIBVIRT_STORED_DOMAIN.replace(
-            "+955:+953", "+%d:+%d" % (VM_UID, VM_GID)
-        ).replace("MEMORY_KIB", str(self.box.LIBVIRT_MEMORY_GIB << 20))
-        self.assertEqual(self.gaps(self.box.parse_domain(xml), "yolobox"), [])
-
-    def test_both_host_entropy_devices_are_no_gap(self):
-        for path in ("/dev/urandom", "/dev/random"):
-            with self.subTest(path=path):
-                xml = self.with_rng(
-                    "<rng model='virtio'><backend model='random'>%s</backend></rng>"
-                    % path
-                )
-                self.assertEqual(self.gaps(self.box.parse_domain(xml)), [])
-
-    def test_the_hosts_firmware_is_read_from_domcapabilities(self):
-        firmware = self.box.parse_domcapabilities(DOMCAPABILITIES_XML)
-        self.assertEqual(firmware.emulator, EMULATOR)
-        self.assertIn(LOADER, firmware.loaders)
-        for text in (
-            "",
-            "<domainCapabilities/>",
-            "<domainCapabilities><path>/usr/bin/qemu</path></domainCapabilities>",
-            "<x",
-        ):
-            with self.subTest(text=text):
-                with self.assertRaises(self.box.YoError):
-                    self.box.parse_domcapabilities(text)
-
-    def test_a_rendered_domain_has_no_config_gap(self):
-        info = self.box.parse_domain(self.render())
-        self.assertEqual(self.gaps(info), [])
+    def test_no_device_reaches_the_host(self):
+        root = ET.fromstring(self.render())
+        devices = {child.tag for child in root.find("devices")}
+        for tag in ("graphics", "vsock", "filesystem", "channel", "hostdev", "tpm"):
+            self.assertNotIn(tag, devices)
+        interfaces = root.findall("devices/interface")
+        self.assertEqual([i.get("type") for i in interfaces], ["user"])
 
     def test_both_seclabels_are_there_and_the_dac_one_relabels_to_the_vm_account(self):
         root = ET.fromstring(self.render())
@@ -1035,17 +538,10 @@ class TestDomainTemplate(LibvirtCase):
             for label in root.findall("seclabel")
         }
         self.assertEqual(set(labels), {("dynamic", "selinux"), ("static", "dac")})
+        for label in labels.values():
+            self.assertEqual(label.get("relabel"), "yes")
         dac = labels[("static", "dac")]
-        self.assertEqual(dac.get("relabel"), "yes")
         self.assertEqual(dac.findtext("label"), "+%d:+%d" % (VM_UID, VM_GID))
-
-    def test_the_ssh_forward_binds_loopback_only(self):
-        root = ET.fromstring(self.render(port=61234))
-        forward = root.find("devices/interface/portForward")
-        self.assertEqual(forward.get("address"), "127.0.0.1")
-        self.assertEqual(forward.get("proto"), "tcp")
-        self.assertEqual(forward.find("range").get("start"), "61234")
-        self.assertEqual(forward.find("range").get("to"), "22")
 
     def test_the_network_mirrors_limas(self):
         root = ET.fromstring(self.render())
@@ -1081,98 +577,11 @@ class TestDomainTemplate(LibvirtCase):
         self.assertEqual(root.find("os").get("firmware"), "efi")
         self.assertEqual(root.find("os/firmware/feature").get("enabled"), "no")
 
-    def test_every_guarantee_the_template_gives_is_noticed_when_it_goes_missing(self):
-        base = self.render()
-        broken = {
-            "element:devices/graphics": base.replace(
-                "<video>", "<graphics type='vnc'/><video>"
-            ),
-            "element:devices/channel": base.replace(
-                "<video>", "<channel type='pty'/><video>"
-            ),
-            "element:devices/hostdev": base.replace("<video>", "<hostdev/><video>"),
-            "seclabel.selinux": base.replace(
-                "<seclabel type='dynamic' model='selinux' relabel='yes'/>", ""
-            ),
-            "seclabel.dac": base.replace(
-                "type='static' model='dac'", "type='dynamic' model='dac'"
-            ),
-            "metadata": re.sub(r"<yolobox:instance.*?</yolobox:instance>", "", base),
-            "portForward.address": base.replace(" address='127.0.0.1'>", ">"),
-        }
-        for gap, xml in broken.items():
-            with self.subTest(gap=gap):
-                self.assertEqual(self.gaps(self.box.parse_domain(xml)), [gap])
-
-    def test_a_forward_off_loopback_is_the_address_gap_and_a_value_gap(self):
-        xml = self.render().replace("address='127.0.0.1'", "address='0.0.0.0'")
-        self.assert_gaps(
-            xml,
-            "value:devices/interface/portForward@address=0.0.0.0",
-            "portForward.address",
-        )
-
-    def test_a_dac_label_that_is_not_the_vm_account_is_a_gap(self):
-        base = self.render()
-        for label in ("+0:+0", "+990:+0", "+0:+989", "990:989", ""):
-            with self.subTest(label=label):
-                xml = base.replace(
-                    "<label>+%d:+%d</label>" % (VM_UID, VM_GID),
-                    "<label>%s</label>" % label,
-                )
-                self.assertIn("seclabel.dac", self.gaps(self.box.parse_domain(xml)))
-
-    def test_a_seclabel_that_does_not_relabel_is_a_gap(self):
-        base = self.render()
-        for model, gap in (("dac", "seclabel.dac"), ("selinux", "seclabel.selinux")):
-            with self.subTest(model=model):
-                xml = base.replace(
-                    "model='%s' relabel='yes'" % model,
-                    "model='%s' relabel='no'" % model,
-                )
-                self.assertEqual(self.gaps(self.box.parse_domain(xml)), [gap])
-
-    def test_a_second_dac_seclabel_is_a_gap(self):
-        xml = self.render().replace(
-            "</domain>", "<seclabel type='static' model='dac' relabel='yes'/></domain>"
-        )
-        self.assertEqual(self.gaps(self.box.parse_domain(xml)), ["seclabel.dac"])
-
-    def test_the_dac_label_is_judged_against_the_account_asked_for(self):
-        info = self.box.parse_domain(self.render())
-        self.assertEqual(
-            self.box.domain_gaps(info, "box", VM_UID + 1, VM_GID, self.firmware()),
-            ["seclabel.dac"],
-        )
-
-    def test_a_network_that_is_not_one_passt_interface_is_a_gap(self):
-        base = self.render()
-        extra = "<interface type='user'><backend type='passt'/></interface><serial"
-        broken = {
-            "bridge": base.replace(
-                "<interface type='user'>", "<interface type='bridge'>"
-            ),
-            "slirp": base.replace(
-                "<backend type='passt'/>", "<backend type='default'/>"
-            ),
-            "no backend": base.replace("<backend type='passt'/>", ""),
-            "a second interface": base.replace("<serial", extra, 1),
-            "no interface": re.sub(r"<interface.*</interface>", "", base, flags=re.S),
-        }
-        for name, xml in broken.items():
-            with self.subTest(name=name):
-                gaps = self.gaps(self.box.parse_domain(xml))
-                self.assertIn("interface", gaps)
-
-    def test_a_domain_of_another_instance_is_a_metadata_gap(self):
-        xml = self.render().replace(
-            ">box</yolobox:instance>", ">other</yolobox:instance>"
-        )
-        self.assert_gaps(xml, "metadata")
-
-    def test_unparseable_xml_is_an_error_not_an_empty_domain(self):
+    def test_unparseable_xml_from_virsh_is_an_error_not_a_missing_domain(self):
+        self.host.domains["yolobox-box"] = "<domain"
+        self.host.states["yolobox-box"] = "running"
         with self.assertRaisesRegex(self.box.YoError, "unparseable XML"):
-            self.box.parse_domain("<domain")
+            self.driver.vm_status()
 
 
 class TestHostPortWindow(LibvirtCase):
@@ -1262,12 +671,7 @@ class TestPortAllocation(LibvirtCase):
         self.host.tagged_domain("first", FIRST_PORT)
         self.host.tagged_domain("second", FIRST_PORT + 1)
         untagged = self.box.domain_xml(
-            "x",
-            FIRST_PORT + 2,
-            VM_UID,
-            VM_GID,
-            self.box.LIBVIRT_MEMORY_GIB,
-            DOMAIN_CPUS,
+            "x", self.box.DomainFacts("u", FIRST_PORT + 2, 16, 2), VM_UID, VM_GID
         )
         self.host.domains["plain"] = re.sub(
             r"<metadata>.*</metadata>", "", untagged, flags=re.S
@@ -1299,7 +703,8 @@ class TestPortAllocation(LibvirtCase):
         self.host.tagged_domain("first", FIRST_PORT)
         self.host.fail["dumpxml"] = "error: internal error: lizard"
         with self.assertRaisesRegex(
-            self.box.YoError, r"virsh dumpxml yolobox-first failed \(exit 1\): .*lizard"
+            self.box.YoError,
+            r"virsh dumpxml yolobox-first failed \(exit 1\): .*lizard",
         ):
             self.driver.allocate_host_port()
 
@@ -1317,17 +722,6 @@ class TestPortAllocation(LibvirtCase):
         ):
             self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 1)
 
-    def test_the_same_xml_in_this_machines_domain_is_an_error_not_a_skip(self):
-        self.host.domains["yolobox-box"] = self.FOREIGN.replace(
-            "<devices>",
-            "<metadata><yolobox:instance xmlns:yolobox='%s'>box</yolobox:instance>"
-            "</metadata><devices>" % self.box.DOMAIN_NS,
-        )
-        self.host.states["yolobox-box"] = "running"
-        with self.assertRaises(self.box.YoError) as caught:
-            self.driver.ssh_port()
-        self.assertIn("no numeric start", caught.exception.message)
-
     def test_the_driver_skips_a_port_bound_on_the_host(self):
         with mock.patch.object(
             self.box.libvirt,
@@ -1336,9 +730,40 @@ class TestPortAllocation(LibvirtCase):
         ):
             self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 1)
 
-    def test_the_ssh_port_is_read_back_from_the_domain(self):
+    def test_the_ssh_port_is_the_one_recorded_at_creation(self):
         self.host.tagged_domain("box", 61234)
         self.assertEqual(self.driver.ssh_port(), 61234)
+
+    def test_a_domain_without_its_record_is_only_good_for_a_destroy(self):
+        self.host.tagged_domain("box", 61234)
+        os.unlink(os.path.join(self.box.instance_dir(), "domain.json"))
+        with self.assertRaises(self.box.YoError) as caught:
+            self.driver.ssh_port()
+        self.assertIn("holds no record", caught.exception.message)
+        self.assertIn(
+            "yo -m box destroy --yes && yo -m box bootstrap", caught.exception.message
+        )
+
+    def test_a_record_that_is_not_one_is_an_error_naming_the_file(self):
+        self.host.tagged_domain("box", 61234)
+        record = os.path.join(self.box.instance_dir(), "domain.json")
+        whole = '{"uuid": "u", "ssh_port": 1, "memory_gib": 1, "cpus": 1'
+        for text in (
+            "lizard",
+            "{}",
+            "[]",
+            whole.replace('"u"', "1") + "}",
+            whole.replace('"ssh_port": 1', '"ssh_port": "1"') + "}",
+            whole.replace('"ssh_port": 1', '"ssh_port": true') + "}",
+            whole.replace('"ssh_port": 1', '"ssh_port": 1.5') + "}",
+            whole + ', "x": 1}',
+        ):
+            with self.subTest(text=text):
+                Path(record).write_text(text)
+                with self.assertRaisesRegex(
+                    self.box.YoError, "domain.json is not a domain record"
+                ):
+                    self.driver.ssh_port()
 
     def test_the_ssh_port_of_a_missing_domain_says_to_create_it(self):
         with self.assertRaises(self.box.YoError) as caught:
@@ -1592,76 +1017,53 @@ class TestCidata(LibvirtCase):
 
 
 class TestSshConfig(LibvirtCase):
-    def config(self):
-        return self.box.libvirt_ssh_config(
-            "lima-box", 61234, OPERATOR, "/h/.1password/agent.sock", "/h/state/box"
+    """The ssh facts a libvirt box is reached with, and the file written from them."""
+
+    def test_the_facts_name_the_domains_port_the_public_key_and_the_agent(self):
+        self.host.tagged_domain("box", 61234)
+        facts = self.driver.ssh_facts()
+        self.assertEqual(
+            facts,
+            self.box.SshFacts(
+                61234,
+                OPERATOR,
+                os.path.join(self.box.instance_dir(), "operator.pub"),
+                self.driver.op_sock(),
+            ),
         )
 
-    def test_the_block_is_the_shape_yos_parser_reads(self):
-        values = self.box.parse_ssh_host_block(self.config(), "lima-box")
-        self.assertEqual(values.hostname, "127.0.0.1")
-        self.assertEqual(values.port, "61234")
-        self.assertEqual(values.identity_files, ("/h/state/box/operator.pub",))
-        self.assertEqual(values.identity_agent, "/h/.1password/agent.sock")
-
-    def test_it_uses_the_agent_alone_and_never_forwards_it(self):
-        text = self.config()
-        for line in (
-            "IdentitiesOnly yes",
-            "ForwardAgent no",
-            "ControlMaster auto",
-            'ControlPath "/h/state/box/ssh.sock"',
-            "ControlPersist yes",
-            "BatchMode yes",
-        ):
-            self.assertIn("  " + line + "\n", text)
-
-    def test_the_herdr_alias_carries_the_agent_socket(self):
-        values = self.box.parse_ssh_host_block(self.config(), "lima-box")
-        alias = self.box.herdr_alias_block(values)
-        self.assertIn('IdentityAgent "/h/.1password/agent.sock"', alias)
-
-    def test_a_block_without_an_agent_gives_an_alias_without_one(self):
-        text = 'Host lima-box\n  Hostname 127.0.0.1\n  Port 1\n  IdentityFile "/k"\n'
-        values = self.box.parse_ssh_host_block(text, "lima-box")
-        self.assertNotIn("IdentityAgent", self.box.herdr_alias_block(values))
-
-    def test_the_file_is_rewritten_only_when_the_block_changed(self):
-        os.makedirs(self.box.instance_dir())
-        self.driver.write_ssh_config(61234)
-        owned = self.box.AGENT_SSH_CONFIG_MARKER + "\nowned block\n\n"
+    def test_the_written_file_carries_the_agent_for_both_names(self):
+        self.host.tagged_domain("box", 61234)
+        self.box.sshconfig.write_ssh_config()
         with open(self.box.ssh_cfg()) as handle:
-            written = handle.read()
-        with open(self.box.ssh_cfg(), "w") as handle:
-            handle.write(owned + written)
-        self.driver.write_ssh_config(61234)
-        with open(self.box.ssh_cfg()) as handle:
-            self.assertEqual(handle.read(), owned + written)
-        self.driver.write_ssh_config(61235)
-        with open(self.box.ssh_cfg()) as handle:
-            self.assertIn("Port 61235", handle.read())
+            text = handle.read()
+        self.assertEqual(
+            text.count('  IdentityAgent "%s"\n' % self.driver.op_sock()), 2
+        )
+        self.assertEqual(text.count("  Port 61234\n"), 2)
+        self.assertIn("Host lima-box\n", text)
+        self.assertIn("Host box\n", text)
 
     def test_the_initrd_probe_uses_the_agent_and_the_public_key(self):
-        os.makedirs(self.box.instance_dir())
-        self.driver.write_ssh_config(61234)
-        argv = self.box.initrd_ssh_argv("true", self.box.initrd_endpoint())
+        self.host.tagged_domain("box", 61234)
+        argv = self.box.initrd_ssh_argv("true", self.driver.ssh_facts())
         self.assertIn("IdentityAgent=%s" % self.driver.op_sock(), argv)
         self.assertEqual(
             argv[argv.index("-i") + 1],
             os.path.join(self.box.instance_dir(), "operator.pub"),
         )
         self.assertIn("IdentitiesOnly=yes", argv)
+        self.assertIn("Port=61234", argv)
 
-    def test_the_initrd_probe_before_the_config_exists_names_the_public_key(self):
-        with mock.patch.object(self.driver, "ssh_port", return_value=61234):
-            argv = self.box.initrd_ssh_argv("true", self.box.initrd_endpoint())
-        self.assertTrue(argv[argv.index("-i") + 1].endswith("/box/operator.pub"))
+    def test_without_a_domain_there_are_no_facts_and_the_remedy_is_yo_up(self):
+        with self.assertRaisesRegex(self.box.YoError, "does not exist.*yo -m box up"):
+            self.driver.ssh_facts()
 
     def test_lima_keeps_its_private_key_and_no_agent(self):
         mac = load_yo("yo_mac_initrd")
         self.addCleanup(unload_yo, "yo_mac_initrd")
         with mock.patch.object(mac.box.driver, "ssh_port", return_value=60022):
-            argv = mac.initrd_ssh_argv("true", mac.initrd_endpoint())
+            argv = mac.initrd_ssh_argv("true", mac.box.driver.ssh_facts())
         self.assertIn("IdentityAgent=none", argv)
         self.assertTrue(argv[argv.index("-i") + 1].endswith(".lima/_config/user"))
 
@@ -1792,23 +1194,6 @@ class TestPasstDirectory(LibvirtCase):
             with self.subTest(comment=comment):
                 self.assertIsNone(self.gap(acl=getfacl_listing(comment=comment)))
 
-    def host_gaps(self, acl):
-        with (
-            mock.patch.object(
-                self.box.shutil, "which", return_value="/usr/bin/getfacl"
-            ),
-            mock.patch.object(
-                self.box.proc, "run", lambda argv, **kwargs: completed(acl)
-            ),
-        ):
-            return self.box.LIBVIRT.host_gaps()
-
-    def test_the_driver_reports_a_narrowed_mask_as_its_one_host_gap(self):
-        self.assertEqual(self.host_gaps(getfacl_listing()), [])
-        gaps = self.host_gaps(getfacl_listing(mask="r-x"))
-        self.assertEqual(len(gaps), 1)
-        self.assertIn("sudo setfacl -m u:yolobox-vm:rwx", gaps[0])
-
     def assertPasstGap(self, fragment, **kwargs):
         message = self.gap(**kwargs)
         self.assertIn(fragment, message)
@@ -1857,21 +1242,27 @@ class TestPasstDirectory(LibvirtCase):
             self.gap(getfacl=False)
 
 
-class TestStatusAndGaps(LibvirtCase):
-    def test_a_domain_that_is_not_defined_has_no_status_and_no_gaps(self):
+class TestStatusAndSize(LibvirtCase):
+    def test_a_domain_that_is_not_defined_has_no_status(self):
         self.assertIsNone(self.driver.vm_status())
-        self.assertEqual(self.driver.config_gaps(), [])
 
     def test_running_and_blocked_are_running_and_other_states_keep_their_words(self):
         # "blocked" is a running guest idling on I/O; the same word set keeps
         # a stop waiting through it (require_stoppable).
         self.host.tagged_domain("box", FIRST_PORT)
-        self.assertEqual(self.driver.vm_status(), "Running")
-        self.host.states["yolobox-box"] = "blocked"
-        self.assertEqual(self.driver.vm_status(), "Running")
+        for word, state in (
+            ("running", self.box.VmState.RUNNING),
+            ("blocked", self.box.VmState.RUNNING),
+            ("shut off", self.box.VmState.OFF),
+            ("paused", self.box.VmState.OTHER),
+            ("in shutdown", self.box.VmState.OTHER),
+        ):
+            with self.subTest(word=word):
+                self.host.states["yolobox-box"] = word
+                self.assertEqual(
+                    self.driver.vm_status(), self.box.VmStatus(state, word)
+                )
         self.driver.require_stoppable("blocked")
-        self.host.states["yolobox-box"] = "shut off"
-        self.assertEqual(self.driver.vm_status(), "shut off")
 
     def test_a_dominfo_that_worked_is_left_to_the_terminal(self):
         self.host.tagged_domain("box", FIRST_PORT)
@@ -1889,17 +1280,6 @@ class TestStatusAndGaps(LibvirtCase):
     def test_another_instances_domain_is_not_this_one(self):
         self.host.tagged_domain("other", FIRST_PORT)
         self.assertIsNone(self.driver.vm_status())
-
-    def test_a_live_domain_with_a_device_the_box_never_has_is_a_gap(self):
-        self.host.tagged_domain("box", FIRST_PORT)
-        self.host.domains["yolobox-box"] = self.host.domains["yolobox-box"].replace(
-            "<video>", "<tpm model='tpm-crb'/><video>"
-        )
-        self.assertEqual(self.driver.config_gaps(), ["element:devices/tpm"])
-        self.assertIn(
-            "undefine --nvram yolobox-box",
-            self.driver.config_gap_message(["element:devices/tpm"]),
-        )
 
     def refusal(self, memory_gib=None, disk_gib=None):
         return self.driver.creation_refusal(self.box.Size(memory_gib, disk_gib))
@@ -2050,32 +1430,19 @@ class TestStatusAndGaps(LibvirtCase):
         self.assertIn("yolobox-box.qcow2", label)
         self.assertEqual(kib, 2 * 1024 * 1024)
 
-    def test_the_size_is_what_dominfo_and_the_volume_report(self):
-        self.host.tagged_domain("box", FIRST_PORT)
+    def test_the_disk_is_what_the_volume_reports(self):
+        self.host.tagged_domain("box", FIRST_PORT, memory_gib=24, cpus=6)
         self.host.states["yolobox-box"] = "shut off"
         self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
         self.host.capacity["yolobox-box.qcow2"] = 120 << 30
-        self.host.cpus["yolobox-box"] = 6
-        self.assertEqual(self.driver.current_size(), self.box.BoxSize(16, 120, 6))
-
-    def test_memory_that_is_not_whole_gib_is_an_error(self):
-        self.host.tagged_domain("box", FIRST_PORT)
-        self.host.max_memory_kib["yolobox-box"] = 12 * (1 << 20) + 1
-        with self.assertRaisesRegex(self.box.YoError, "not a whole number of GiB"):
-            self.driver.current_size()
+        self.assertEqual(self.driver.disk_gib(), 120)
 
     def test_a_disk_that_is_not_whole_gib_is_an_error_not_a_rounded_one(self):
         self.host.tagged_domain("box", FIRST_PORT)
         self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
         self.host.capacity["yolobox-box.qcow2"] = (100 << 30) + 512
         with self.assertRaisesRegex(self.box.YoError, "disk is .* not a whole number"):
-            self.driver.current_size()
-
-    def test_a_dominfo_without_cpus_is_an_error(self):
-        self.host.tagged_domain("box", FIRST_PORT)
-        self.host.dominfo["yolobox-box"] = "Max memory:     16777216 KiB\n"
-        with self.assertRaisesRegex(self.box.YoError, "printed no Max memory"):
-            self.driver.current_size()
+            self.driver.disk_gib()
 
     def test_a_shut_off_domain_gets_its_volume_resized_and_a_running_one_does_not(self):
         self.host.tagged_domain("box", FIRST_PORT)
@@ -2086,27 +1453,16 @@ class TestStatusAndGaps(LibvirtCase):
                 self.box.YoError, "only while the domain is shut off"
             ),
         ):
-            self.driver.grow_disk(100, 200)
+            self.driver.grow_disk(200)
         self.assertEqual(self.host.calls_of("vol-resize"), [])
         self.host.states["yolobox-box"] = "shut off"
         with mock.patch.object(self.box.ui, "out"):
-            self.driver.grow_disk(100, 200)
+            self.driver.grow_disk(200)
         self.assertEqual(
             self.host.calls_of("vol-resize")[0][3:],
             ["vol-resize", "--pool", "default", "yolobox-box.qcow2", "200G"],
         )
         self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 200 << 30)
-
-    def test_the_nix_commands_name_the_machine_and_never_the_host_os(self):
-        env = self.box.nix_env("alice", "github:x/y/z")
-        self.assertEqual(
-            env,
-            [
-                "YOLOBOX_USERNAME=alice",
-                "YOLOBOX_HOSTNAME=yolobox-box",
-                "YOLOBOX_FLAKE_REF=github:x/y/z",
-            ],
-        )
 
 
 class TestOwnDomain(LibvirtCase):
@@ -2131,7 +1487,6 @@ class TestOwnDomain(LibvirtCase):
                     self.driver.ssh_port,
                     self.driver.stop,
                     self.driver.removals,
-                    self.driver.config_gaps,
                 ):
                     with self.assertRaises(self.box.YoError) as caught:
                         look()
@@ -2164,16 +1519,11 @@ class TestKeepalive(LibvirtCase):
     def test_a_pid_that_would_hit_init_is_not_a_pid(self):
         self.assertIsNone(self.pid("Master running (pid=1)\n"))
 
-    def test_reading_the_pid_for_status_opens_no_master(self):
+    def test_reading_the_pid_opens_no_master(self):
         self.host.master_running = False
-        self.assertIsNone(self.driver.running_keepalive_pid())
+        self.assertIsNone(self.driver.keepalive_pid())
         self.assertFalse(self.host.master_running)
-        self.assertEqual([call for call in self.host.calls if call[-1] == "true"], [])
-
-    def test_reading_the_pid_for_status_reads_a_running_master(self):
-        self.host.master_running = True
-        self.host.master_output = "Master running (pid=4242)\r\n"
-        self.assertEqual(self.driver.running_keepalive_pid(), 4242)
+        self.assertEqual([call for call in self.host.calls if "-O" not in call], [])
 
 
 class FakeEventStream:
@@ -2269,17 +1619,17 @@ class TestStop(LibvirtCase):
         )
         order = [sub for sub in self.host.subcommands() if sub in ("event", "shutdown")]
         self.assertEqual(order, ["event", "shutdown"])
-        self.assertEqual(self.driver.vm_status(), "shut off")
+        self.assertEqual(self.vm_word(), "shut off")
 
     def test_events_that_are_not_the_stop_are_waited_past_by_the_same_watcher(self):
         self.stop(["in shutdown", "running", "shut off"])
         self.assertEqual(len(self.host.watchers), 1)
-        self.assertEqual(self.driver.vm_status(), "shut off")
+        self.assertEqual(self.vm_word(), "shut off")
 
     def test_a_stop_that_lands_before_any_event_is_seen_does_not_wait_for_one(self):
         self.host.shutdown_state = "shut off"
         self.stop()
-        self.assertEqual(self.driver.vm_status(), "shut off")
+        self.assertEqual(self.vm_word(), "shut off")
 
     def test_the_watcher_is_ended_once_the_guest_is_off(self):
         self.stop(["shut off"])
@@ -2302,12 +1652,12 @@ class TestStop(LibvirtCase):
         self.assertIn("yo -m box status shows its state", message)
         self.assertNotIn("ssh answers", message)
         self.assertNotIn("destroy", message)
-        self.assertEqual(self.driver.vm_status(), "in shutdown")
+        self.assertEqual(self.vm_word(), "in shutdown")
 
     def test_a_domain_that_went_off_as_the_event_stream_ended_is_stopped(self):
         self.host.off_at_eof = True
         self.stop(["in shutdown"], "timeout")
-        self.assertEqual(self.driver.vm_status(), "shut off")
+        self.assertEqual(self.vm_word(), "shut off")
 
     def test_a_virsh_that_fails_is_an_error_with_its_message(self):
         with self.assertRaisesRegex(
@@ -2389,13 +1739,13 @@ class TestStop(LibvirtCase):
                 self.box.cmd_bootstrap(args)
         text = " ".join(errors)
         self.assertIn(
-            "the domain did not stop: domain yolobox-box is 'paused', so it will "
+            "the box did not stop: domain yolobox-box is 'paused', so it will "
             "not shut down by itself. A domain pauses when its disk image cannot "
             "grow because the host's disk is full",
             text,
         )
         self.assertIn("domblkerror yolobox-box", text)
-        self.assertIn(self.driver.force_stop_command(), text)
+        self.assertIn(self.force_stop_command(), text)
         self.assertIn("It runs stage 2", text)
         self.assertNotIn("Do not force it off", text)
 
@@ -2406,9 +1756,7 @@ class TestStop(LibvirtCase):
                 with self.assertRaises(self.box.YoError) as caught:
                     self.driver.stop()
                 self.assertNotIn("destroy", caught.exception.message)
-                self.assertNotIn(
-                    self.driver.force_stop_command(), caught.exception.message
-                )
+                self.assertNotIn(self.force_stop_command(), caught.exception.message)
 
     def test_a_state_yo_cannot_leave_does_not_send_the_user_back_to_down(self):
         # `yo down` would meet the same refusal, so the message names what
@@ -2494,13 +1842,13 @@ class TestDown(LibvirtCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def down(self, stage, initrd=None):
-        initrd = initrd or self.box.unlock.InitrdState.WAITING_FOR_PASSPHRASE
-        reading = self.box.unlock.InitrdReading(initrd, "")
+    def down(self, stage, ask_pending=True):
         self.host.event_script = (["shut off"], "hang")
         with (
             mock.patch.object(self.box.unlock, "boot_stage", return_value=stage),
-            mock.patch.object(self.box.unlock, "initrd_state", return_value=reading),
+            mock.patch.object(
+                self.box.unlock, "initrd_ask_pending", return_value=ask_pending
+            ),
         ):
             self.box.cmd_down(None)
 
@@ -2511,7 +1859,7 @@ class TestDown(LibvirtCase):
         self.assertEqual(self.host.calls_of("destroy")[0][4:], ["yolobox-box"])
         self.assertEqual(self.host.watchers, [])
         self.assertNotIn("shutdown", self.host.subcommands())
-        self.assertEqual(self.driver.vm_status(), "shut off")
+        self.assertEqual(self.vm_word(), "shut off")
 
     def test_a_box_that_is_up_or_unanswering_is_asked_to_shut_down(self):
         for stage in (self.box.BootStage.STAGE2, self.box.BootStage.NONE):
@@ -2522,28 +1870,19 @@ class TestDown(LibvirtCase):
                 self.assertIn("shutdown", self.host.subcommands())
                 self.assertEqual(self.host.calls_of("destroy"), [])
 
-    def test_a_box_not_provably_idle_in_its_initrd_is_neither_destroyed_nor_asked_to_shut_down(
+    def test_a_box_with_no_ask_pending_in_its_initrd_is_neither_destroyed_nor_asked_to_shut_down(
         self,
     ):
-        states = self.box.unlock.InitrdState
-        for initrd in set(states) - {states.WAITING_FOR_PASSPHRASE}:
-            with self.subTest(initrd=initrd):
-                with self.assertRaisesRegex(self.box.YoError, "Not stopping it"):
-                    self.down(self.box.BootStage.INITRD, initrd)
-                self.assertEqual(self.host.calls_of("destroy"), [])
-                self.assertNotIn("shutdown", self.host.subcommands())
-
-    def test_the_refusal_prints_the_destroy_command_unless_the_box_is_encrypting(self):
-        states = self.box.unlock.InitrdState
-        destroy = "virsh -c qemu:///system destroy yolobox-box"
-        for initrd in set(states) - {states.WAITING_FOR_PASSPHRASE}:
-            with self.subTest(initrd=initrd):
-                with self.assertRaises(self.box.YoError) as caught:
-                    self.down(self.box.BootStage.INITRD, initrd)
-                self.assertEqual(
-                    destroy in caught.exception.message,
-                    initrd is not states.MIGRATING,
-                )
+        with self.assertRaises(self.box.YoError) as caught:
+            self.down(self.box.BootStage.INITRD, ask_pending=False)
+        self.assertIn("not stopping it", caught.exception.message)
+        self.assertIn("may be encrypting its disk", caught.exception.message)
+        # Never a dead end: the operator who knows nothing encrypts has the command.
+        self.assertIn(
+            "virsh -c qemu:///system destroy yolobox-box", caught.exception.message
+        )
+        self.assertEqual(self.host.calls_of("destroy"), [])
+        self.assertNotIn("shutdown", self.host.subcommands())
 
     def test_a_domain_already_off_is_not_destroyed(self):
         self.host.states["yolobox-box"] = "shut off"
@@ -2581,11 +1920,7 @@ class TestDestroy(LibvirtCase):
             {"id": "m-8", "label": "ops", "target": "other"},
         ]
         self.instance_dir = Path(self.box.state.instance_dir())
-        self.instance_dir.mkdir(parents=True)
         (self.instance_dir / "operator.pub").write_text(PUBLIC_KEY)
-        self.flake_ref = Path(self.box.state.flake_ref_file())
-        self.flake_ref.parent.mkdir(parents=True, exist_ok=True)
-        self.flake_ref.write_text("main\n")
         self.lock_file = Path(self.box.state.state_dir()) / "box.unlock.lock"
         self.lines = []
         for patcher in (
@@ -2607,7 +1942,6 @@ class TestDestroy(LibvirtCase):
         self.host.master_running = False
         self.host.agent_master_running = False
         shutil.rmtree(self.instance_dir)
-        self.flake_ref.unlink()
         self.host.calls.clear()
 
     def assert_the_other_machine_is_untouched(self):
@@ -2632,7 +1966,6 @@ class TestDestroy(LibvirtCase):
             self.destroy(yes=True)
         self.assertNotIn("yolobox-box", self.host.domains)
         self.assertFalse(self.instance_dir.exists())
-        self.assertFalse(self.flake_ref.exists())
         self.assertFalse(self.host.master_running)
         self.assertFalse(self.host.agent_master_running)
         self.assert_the_other_machine_is_untouched()
@@ -2704,7 +2037,6 @@ class TestDestroy(LibvirtCase):
             {"yolobox-box.qcow2", "yolobox-box-cidata.iso", "yolobox-other.qcow2"},
         )
         self.assertTrue(self.instance_dir.exists())
-        self.assertTrue(self.flake_ref.exists())
         self.assertTrue(self.host.master_running)
         self.assertTrue(self.host.agent_master_running)
         self.assertEqual([m["id"] for m in self.host.herdr_machines], ["m-7", "m-8"])
@@ -2718,7 +2050,6 @@ class TestDestroy(LibvirtCase):
             "delete volume yolobox-box-cidata.iso",
             "delete directory " + self.TILDE_INSTANCE_DIR,
             "delete the herdr machine box",
-            "delete file ~/.local/state/yolobox/box.flake-ref",
         ):
             with self.subTest(piece=piece):
                 self.assertIn(piece, listing)
@@ -2748,24 +2079,10 @@ class TestDestroy(LibvirtCase):
     def test_pieces_that_are_gone_are_skipped_and_the_rest_removed(self):
         del self.host.volumes["yolobox-box-cidata.iso"]
         self.host.herdr_machines.pop(0)
-        self.flake_ref.unlink()
         self.destroy(yes=True)
         self.assertEqual(self.mutations().count("vol-delete"), 1)
         self.assertNotIn("yolobox-box", self.host.domains)
         self.assertFalse(self.instance_dir.exists())
-
-    def test_the_operators_master_quits_under_the_lock_that_orders_ensure_master(self):
-        master_lock = os.path.join(self.instance_dir, self.box.MASTER_LOCK_NAME)
-        held_while_quitting = []
-
-        def watch_the_exit(argv, **kwargs):
-            if argv[0] == "ssh" and "exit" in argv and "User=agent" not in argv:
-                held_while_quitting.append(self.lock_held(master_lock))
-            return self.host.run(argv, **kwargs)
-
-        with mock.patch.object(self.box.proc, "run", side_effect=watch_the_exit):
-            self.destroy(yes=True)
-        self.assertEqual(held_while_quitting, [True])
 
     def test_a_master_that_survives_its_exit_stops_the_run(self):
         self.host.master_survives_exit = True
@@ -2781,7 +2098,6 @@ class TestDestroy(LibvirtCase):
         self.assertIn("yolobox-box", self.host.domains)
         self.assertEqual(self.host.calls_of("vol-delete"), [])
         self.assertTrue(self.instance_dir.exists())
-        self.assertTrue(self.flake_ref.exists())
 
     def test_a_failing_herdr_removal_is_raised(self):
         self.host.herdr_remove_fails = True
@@ -2789,7 +2105,6 @@ class TestDestroy(LibvirtCase):
             self.box.YoError, "machine remove m-7 failed.*no such machine"
         ):
             self.destroy(yes=True)
-        self.assertTrue(self.flake_ref.exists())
 
     def test_a_box_another_yo_is_unlocking_is_not_destroyed(self):
         with self.box.state.unlock_lock(wait=True):
@@ -2806,23 +2121,11 @@ class TestDestroy(LibvirtCase):
             self.destroy(yes=False)
         self.assertIn("yo -m box destroy --yes", self.lines[-1])
 
-    def test_the_hint_that_deletes_and_rebuilds_names_the_remembered_ref(self):
-        self.flake_ref.write_text("github:aka-rider/yolobox/v1.2.3\n")
-        self.assertEqual(
-            self.box.state.destroy_then_bootstrap_command(),
-            "yo -m box destroy --yes && "
-            "yo -m box bootstrap --version github:aka-rider/yolobox/v1.2.3",
-        )
-        self.flake_ref.unlink()
-        self.assertEqual(
-            self.box.state.destroy_then_bootstrap_command(),
-            "yo -m box destroy --yes && yo -m box bootstrap",
-        )
-
 
 class TestADeadAgent(LibvirtCase):
     """1Password's agent is gone. What needs no login still works, through
-    main() and the real boot_stage; what must log in says so before any ssh."""
+    main() and the real boot_stage; a start names the agent before anything
+    is created, and a session reports what ssh said."""
 
     DEAD = "1Password's SSH agent at %s is not running (or locked)"
     REFUSED = "Connection closed by authenticating user op 127.0.0.1 port 1 [preauth]"
@@ -2860,7 +2163,7 @@ class TestADeadAgent(LibvirtCase):
         self.host.event_script = (["shut off"], "hang")
         self.box.main(["-m", "box", "down"])
         self.assertIn("shutdown", self.host.subcommands())
-        self.assertEqual(self.driver.vm_status(), "shut off")
+        self.assertEqual(self.vm_word(), "shut off")
         self.assertFalse(
             [argv for argv in self.ssh_calls() if argv[-1] != "true"],
             "down ran more than the boot-stage probes",
@@ -2868,7 +2171,7 @@ class TestADeadAgent(LibvirtCase):
 
     def test_destroy_deletes_the_box_it_cannot_log_in_to(self):
         instance_dir = Path(self.box.state.instance_dir())
-        instance_dir.mkdir(parents=True)
+        instance_dir.mkdir(parents=True, exist_ok=True)
         with mock.patch.object(self.box.shutil, "which", return_value=None):
             self.box.main(["-m", "box", "destroy", "--yes"])
         self.assertNotIn("yolobox-box", self.host.domains)
@@ -2887,9 +2190,9 @@ class TestADeadAgent(LibvirtCase):
         self.assertIn("undefine domain yolobox-box", "\n".join(self.lines))
         self.assertIn("yo -m box destroy --yes", self.lines[-1])
 
-    def test_down_refuses_an_sshd_it_cannot_identify_and_names_the_agent(self):
+    def test_down_refuses_an_sshd_it_cannot_identify_and_names_the_login(self):
         # An unmarked banner and both logins refused: an initrd, maybe encrypting
-        # the disk, or an older stage 2. Neither stop is safe on an initrd.
+        # the disk, or a stage 2. Neither stop is safe on an initrd.
         self.host.states["yolobox-box"] = "running"
         with mock.patch.object(
             self.box.unlock, "ssh_banner", return_value="SSH-2.0-OpenSSH_10.6"
@@ -2898,66 +2201,49 @@ class TestADeadAgent(LibvirtCase):
                 self.box.main(["-m", "box", "down"])
         message = caught.exception.message
         self.assertTrue(message.startswith("not stopping it: "), message)
-        self.assertIn("Found: " + self.dead(), message)
+        self.assertIn(self.driver.hints.login_fix, message)
         # The passphrase may have gone in earlier this boot: no force offered.
-        self.assertNotIn(self.driver.force_stop_command(), message)
+        self.assertNotIn(self.force_stop_command(), message)
         self.assertNotIn("shutdown", self.host.subcommands())
         self.assertNotIn("destroy", self.host.subcommands())
-        self.assertEqual(self.driver.vm_status(), "Running")
+        self.assertEqual(self.vm_word(), "running")
 
-    def test_status_on_an_unidentified_sshd_offers_no_force_without_the_key(self):
-        # The passphrase may have gone in before 1Password died: fix it first.
-        with mock.patch.object(
-            self.box.unlock, "ssh_banner", return_value="SSH-2.0-OpenSSH_10.6"
-        ):
-            with self.assertRaises(self.box.YoError):
-                self.box.main(["-m", "box", "status"])
-        (vm_line,) = [line for line in self.lines if line.startswith("vm: ")]
-        self.assertIn("Found: " + self.dead(), vm_line)
-        self.assertNotIn(self.driver.force_stop_command(), vm_line)
-
-    def test_a_reboot_with_a_cached_passphrase_still_names_the_agent(self):
+    def test_a_start_with_a_cached_passphrase_names_the_agent_before_anything(self):
         # bootstrap's second vm_up: the box stopped, the passphrase in hand.
-        for domain_state in ("shut off", "running"):
-            with self.subTest(domain_state=domain_state):
-                self.host.calls.clear()
-                self.host.states["yolobox-box"] = domain_state
-                with self.assertRaises(self.box.YoError) as caught:
-                    self.box.vm_up(run_services=False, passphrase=b"cached")
-                self.assertTrue(
-                    caught.exception.message.startswith(self.dead()),
-                    caught.exception.message,
-                )
-                self.assertNotIn("start", self.host.subcommands())
-                self.assertEqual(self.ssh_calls(), [])
+        self.host.states["yolobox-box"] = "shut off"
+        with self.assertRaises(self.box.YoError) as caught:
+            self.box.vm_up(run_services=False, passphrase=b"cached")
+        self.assertTrue(
+            caught.exception.message.startswith(self.dead()), caught.exception.message
+        )
+        self.assertNotIn("start", self.host.subcommands())
+        self.assertEqual(self.ssh_calls(), [])
 
-    def test_status_names_the_agent_then_reports_the_rest(self):
+    def test_status_reports_the_box_unreachable_and_the_rest(self):
         with self.assertRaises(self.box.YoError) as caught:
             self.box.main(["-m", "box", "status"])
         self.assertEqual(caught.exception.code, 1)
-        self.assertTrue(
-            self.lines[0].startswith("login: " + self.dead()), self.lines[0]
-        )
         self.assertEqual(
-            self.lines[1:3],
-            [
-                "vm: unreachable — is it up? start it with: yo -m box up",
-                "libvirt: reverse forwards ok",
-            ],
+            self.lines[0], "vm: unreachable — is it up? start it with: yo -m box up"
         )
-        self.assertTrue(self.lines[3].startswith("aws: "), self.lines)
+        self.assertTrue(
+            any(line.startswith("aws: ") for line in self.lines), self.lines
+        )
 
-    def test_a_command_that_logs_in_names_the_agent_before_any_ssh(self):
-        for argv in (["ssh"], ["enter"], ["gc"], ["aws-check"], ["code"]):
-            with self.subTest(argv=argv):
-                self.host.calls.clear()
-                with self.assertRaises(self.box.YoError) as caught:
-                    self.box.main(["-m", "box"] + argv)
-                self.assertTrue(
-                    caught.exception.message.startswith(self.dead()),
-                    caught.exception.message,
-                )
-                self.assertEqual(self.ssh_calls(), [])
+    def test_yo_ssh_still_reaches_the_box_and_says_why_the_forwards_are_down(self):
+        self.host.master_running = False
+        errors = []
+        with (
+            mock.patch.object(self.box.proc, "exec_process") as exec_ssh,
+            mock.patch.object(self.box.ui, "err", errors.append),
+        ):
+            self.box.main(["-m", "box", "ssh"])
+        (warning,) = errors
+        self.assertIn("the 1Password and AWS forwards are not up", warning)
+        self.assertIn(self.REFUSED, warning)
+        self.assertEqual(self.host.forwarded, [])
+        (argv,), _ = exec_ssh.call_args
+        self.assertEqual(argv[0], "ssh")
 
     def test_port_rides_a_live_master_without_the_agent(self):
         self.box.main(["-m", "box", "port", "5173"])
@@ -2969,23 +2255,12 @@ class TestADeadAgent(LibvirtCase):
             self.host.forwarded[0],
         )
 
-    def test_a_master_whose_connection_died_is_dropped_and_names_the_agent(self):
-        self.host.master_session = (255, "Connection to lima-box closed")
-        with self.assertRaises(self.box.YoError) as caught:
-            self.box.main(["-m", "box", "port", "5173"])
-        self.assertTrue(
-            caught.exception.message.startswith(self.dead()), caught.exception.message
-        )
-        self.assertEqual(self.host.forwarded, [])
-
-    def test_port_without_a_master_names_the_agent_and_logs_in_nowhere(self):
+    def test_port_without_a_master_reports_what_ssh_said(self):
         self.host.master_running = False
-        with self.assertRaises(self.box.YoError) as caught:
+        with self.assertRaises(self.box.Unreachable) as caught:
             self.box.main(["-m", "box", "port", "5173"])
-        self.assertTrue(
-            caught.exception.message.startswith(self.dead()), caught.exception.message
-        )
-        self.assertEqual([argv for argv in self.ssh_calls() if "-O" not in argv], [])
+        self.assertIn(self.REFUSED, caught.exception.message)
+        self.assertEqual(self.host.forwarded, [])
 
 
 class TestAnInitrdThatNeverAnswersPointsAtWhatTheHostShows(LibvirtCase):
@@ -2995,8 +2270,7 @@ class TestAnInitrdThatNeverAnswersPointsAtWhatTheHostShows(LibvirtCase):
         self.host.tagged_domain("box", FIRST_PORT)
         text = self.box.unlock.initrd_timeout_error(False).message
         self.assertIn("never offered its initrd sshd", text)
-        self.assertIn("virsh -c qemu:///system domstate yolobox-box", text)
-        self.assertIn("yo -m box status", text)
+        self.assertIn("virsh -c qemu:///system domstate --reason yolobox-box", text)
         self.assertIn("yolobox-box-cidata.iso", text)
         self.assertNotIn("console", text)
 
@@ -3022,31 +2296,23 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
         # Fix the login and run again; never a force (the initrd may be
         # encrypting), never "see yo status", which would only refuse again.
         self.assertIn("Fix the login", text)
-        # No console can be followed here (virsh console has no history and
-        # the initrd writes to tty0), so the text says yo cannot see inside.
-        self.assertIn("Without a working login yo cannot see inside it", text)
-        self.assertIn("does not force it off", text)
+        self.assertIn("run the command again", text)
         self.assertNotIn("console", text)
-        self.assertNotIn(self.driver.force_stop_command(), text)
+        self.assertNotIn(self.force_stop_command(), text)
         self.assertNotIn("destroy", text)
         self.assertNotIn("yo -m box status", text)
-        self.assertIn(self.driver.login_fix(), text)
+        self.assertIn(self.driver.hints.login_fix, text)
 
-    def test_no_unknown_text_in_any_login_state_names_a_force(self):
+    def test_the_unknown_text_names_no_force(self):
         # A listed key may not sign, and root's probe may only have timed out:
         # the initrd may be encrypting whatever the login state says.
-        for login in (None, "", "lizard", self.box.vm.login_problem()):
-            with self.subTest(login=login):
-                self.assert_names_the_way_out(
-                    self.box.unknown_stage_message(login, self.box.vm.RERUN)
-                )
+        self.assert_names_the_way_out(self.box.unlock.unknown_stage_message())
 
     def test_down_refuses_names_the_way_out_and_stops_nothing(self):
         with self.assertRaises(self.box.YoError) as caught:
             self.box.cmd_down(None)
         self.assertIn("not stopping it: an sshd answers", caught.exception.message)
         self.assert_names_the_way_out(caught.exception.message)
-        self.assertIn("then %s:" % self.box.vm.RERUN, caught.exception.message)
         self.assertNotIn("shutdown", self.host.subcommands())
         self.assertNotIn("destroy", self.host.subcommands())
 
@@ -3072,11 +2338,8 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
         self.assertIn("an sshd answers", vm_lines[0])
         self.assert_names_the_way_out(vm_lines[0])
         self.assertNotIn("start it with", vm_lines[0])
-        # status stops nothing, so it names the commands that do.
-        self.assertIn("then run yo -m box down or yo -m box up:", vm_lines[0])
-        self.assertNotIn(self.box.vm.RERUN, vm_lines[0])
-        # Only the unpinned boot-stage probes ran; account_status's pinned ones,
-        # which read the ssh.config and its known_hosts, did not.
+        # Only the unpinned boot-stage probes ran; the pinned agent probe, which
+        # reads the ssh.config and its known_hosts, did not.
         pinned = [
             argv
             for argv in self.host.calls
@@ -3085,9 +2348,9 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
         self.assertEqual(pinned, [])
 
 
-class TestEnsureMaster(LibvirtCase):
-    """With the key on offer, a master that answers -O check but whose
-    connection died is replaced; a healthy one is ridden as it is."""
+class TestEnsureSession(LibvirtCase):
+    """`yo port` rides the operator's master: one that answers -O check is
+    taken as it is, and without one a login opens it and carries the forwards."""
 
     def setUp(self):
         super().setUp()
@@ -3107,67 +2370,128 @@ class TestEnsureMaster(LibvirtCase):
         (line,) = lines
         return line
 
-    def assert_forwarded(self, printed):
+    def reverse_forwards(self):
+        return [
+            argv[argv.index("-R") + 1] for argv in self.host.forwarded if "-R" in argv
+        ]
+
+    def test_a_master_that_answers_carries_the_port_and_is_not_touched(self):
+        printed = self.port()
         host_port = printed.split(":")[1]
         self.assertEqual(len(self.host.forwarded), 1)
         self.assertIn("127.0.0.1:%s:127.0.0.1:5173" % host_port, self.host.forwarded[0])
+        self.assertEqual([argv for argv in self.host.calls if "exit" in argv], [])
 
-    def test_a_healthy_master_carries_the_forward(self):
-        self.assert_forwarded(self.port())
-
-    def test_a_master_whose_connection_died_is_replaced_and_carries_the_forward(self):
+    def test_a_master_whose_connection_died_is_not_judged_and_the_forward_reports_it(
+        self,
+    ):
+        # -O check answers, so nothing is torn down: the forward fails with
+        # ssh's own words, and `yo up` is the repair.
         self.host.master_session = (255, "Connection to lima-box closed")
-        self.assert_forwarded(self.port())
+        with self.assertRaisesRegex(self.box.YoError, "mux_client_forward"):
+            self.port()
+        self.assertEqual([argv for argv in self.host.calls if "exit" in argv], [])
 
-    def test_with_no_master_a_login_opens_one_that_carries_the_forward(self):
+    def test_with_no_master_a_login_opens_one_with_both_reverse_forwards(self):
         self.host.master_running = False
-        self.assert_forwarded(self.port())
+        printed = self.port()
+        host_port = printed.split(":")[1]
+        self.assertTrue(self.host.master_running)
+        self.assertEqual(
+            self.reverse_forwards(),
+            [
+                "%s:%s" % (self.box.OP_GUEST_SOCK, self.driver.op_sock()),
+                "%s:%s"
+                % (self.box.AWS_BROKER_GUEST_SOCK, self.box.aws.aws_broker_sock()),
+            ],
+        )
+        self.assertIn(
+            "127.0.0.1:%s:127.0.0.1:5173" % host_port, self.host.forwarded[-1]
+        )
+        opener = [
+            argv
+            for argv in self.host.calls
+            if argv[0] == "ssh" and "-O" not in argv and "ControlPath=none" not in argv
+        ]
+        self.assertEqual(len(opener), 1)
+        self.assertIn(self.box.OP_GUEST_SOCK, opener[0][-1])
 
-    def test_the_master_is_dropped_and_reopened_under_its_lock(self):
-        # Another yo taking the lock in between could otherwise lose its master.
-        self.host.master_session = (255, "Connection to lima-box closed")
-        lock = os.path.join(self.box.instance_dir(), self.box.MASTER_LOCK_NAME)
-        held = []
-        run = self.host.run
 
-        def spy(argv, **kwargs):
-            if argv[:1] == ["ssh"] and ("exit" in argv or argv[-1] == "true"):
-                held.append(self.lock_held(lock))
-            return run(argv, **kwargs)
+class TestDefinition(LibvirtCase):
+    """A stopped domain is defined again from libvirt/domain.xml on every start,
+    with the uuid, port and size recorded for it; one that is up is left as it
+    runs."""
 
-        with mock.patch.object(self.box.proc, "run", spy):
-            self.driver.ensure_master()
-        self.assertEqual(len(held), 3, "round trip, exit and reopen")
-        self.assertTrue(all(held), held)
-        self.assertFalse(self.lock_held(lock))
-
-
-class TestVmUpWithAGap(LibvirtCase):
-    def test_a_domain_that_is_not_what_the_template_made_is_never_started(self):
-        self.host.tagged_domain("box", FIRST_PORT)
+    def setUp(self):
+        super().setUp()
+        self.facts = self.host.tagged_domain("box", FIRST_PORT)
         self.host.states["yolobox-box"] = "shut off"
-        self.host.domains["yolobox-box"] = self.host.domains["yolobox-box"].replace(
+        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+        self.tampered = self.host.domains["yolobox-box"].replace(
             "<video>", "<tpm model='tpm-crb'/><video>"
         )
-        with mock.patch.object(self.box.agent, "luks_passphrase") as passphrase:
-            with self.assertRaises(self.box.YoError) as caught:
-                self.box.vm_up()
-        self.assertIn("element:devices/tpm", caught.exception.message)
-        self.assertIn("undefine --nvram yolobox-box", caught.exception.message)
-        passphrase.assert_not_called()
-        self.assertNotIn("start", self.host.subcommands())
+        self.host.domains["yolobox-box"] = self.tampered
+        for patcher in (
+            mock.patch.object(
+                self.box.shutil, "which", return_value="/usr/bin/getfacl"
+            ),
+            mock.patch.object(self.driver, "operator_key", return_value=KEY_BLOB),
+            mock.patch.object(self.box.unlock, "unlock_disk"),
+            mock.patch.object(self.box.unlock, "wait_for_operator"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
-    def test_a_domain_with_a_foreign_dac_label_is_refused_too(self):
-        self.host.tagged_domain("box", FIRST_PORT)
-        self.host.domains["yolobox-box"] = self.host.domains["yolobox-box"].replace(
-            "+%d:+%d" % (VM_UID, VM_GID), "+0:+0"
+    def start(self):
+        self.driver.start(b"pass", None)
+
+    def test_a_stopped_domain_is_defined_again_from_the_template_on_up(self):
+        self.start()
+        subs = self.host.subcommands()
+        self.assertLess(subs.index("define"), subs.index("start"))
+        self.assertEqual(
+            self.host.domains["yolobox-box"],
+            self.box.domain_xml("box", self.facts, VM_UID, VM_GID),
+        )
+        self.assertNotIn("tpm", self.host.domains["yolobox-box"])
+        self.assertEqual(self.driver.ssh_port(), FIRST_PORT)
+        self.assertEqual(self.host.states["yolobox-box"], "running")
+
+    def test_a_domain_that_is_up_is_left_as_it_runs(self):
+        for domain_state in ("running", "paused"):
+            with self.subTest(domain_state=domain_state):
+                self.host.states["yolobox-box"] = domain_state
+                self.host.calls.clear()
+                self.start()
+                self.assertNotIn("define", self.host.subcommands())
+                self.assertEqual(self.host.domains["yolobox-box"], self.tampered)
+
+    def test_without_its_record_the_domain_is_not_started(self):
+        os.unlink(os.path.join(self.box.instance_dir(), "domain.json"))
+        with self.assertRaises(self.box.YoError) as caught:
+            self.start()
+        self.assertIn(
+            "yo -m box destroy --yes && yo -m box bootstrap", caught.exception.message
+        )
+        self.assertNotIn("start", self.host.subcommands())
+        self.assertNotIn("define", self.host.subcommands())
+
+    def test_a_definition_libvirt_refuses_is_quoted_with_the_way_out(self):
+        self.box.write_domain_facts(
+            self.box.instance_dir(), self.facts._replace(uuid="another")
         )
         with self.assertRaises(self.box.YoError) as caught:
-            self.box.vm_up()
-        self.assertIn("seclabel.dac", caught.exception.message)
+            self.start()
+        self.assertIn(
+            "already exists with uuid %s" % self.facts.uuid, caught.exception.message
+        )
+        self.assertIn(
+            "yo -m box destroy --yes && yo -m box bootstrap", caught.exception.message
+        )
+        self.assertNotIn("start", self.host.subcommands())
 
 
-class TestVmUpResizes(LibvirtCase):
+class TestVmUpRefusesSizeFlagsOnAnExistingBox(LibvirtCase):
     """`yo up --memory/--disk/--cpus` on a box whose domain exists."""
 
     def setUp(self):
@@ -3176,7 +2500,6 @@ class TestVmUpResizes(LibvirtCase):
         self.host.states["yolobox-box"] = "shut off"
         self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
         self.host.capacity["yolobox-box.qcow2"] = 100 << 30
-        self.order = []
 
     def vm_up(self, size):
         """Run vm_up; return the error it raised (or None) and its stubs."""
@@ -3186,15 +2509,11 @@ class TestVmUpResizes(LibvirtCase):
             for target, name in (
                 (self.box.agent, "luks_passphrase"),
                 (self.driver, "start"),
-                (self.box.sshconfig, "ensure_agent_ssh_config"),
+                (self.box.sshconfig, "write_ssh_config"),
                 (self.box.guest, "ensure_guest_known_hosts"),
                 (self.box.forwards, "vm_services"),
             ):
                 stubs[name] = stack.enter_context(mock.patch.object(target, name))
-            for name in ("luks_passphrase", "start"):
-                stubs[name].side_effect = lambda *a, _n=name, **k: (
-                    self.order.append((_n, len(self.host.calls))) or mock.DEFAULT
-                )
             try:
                 self.box.vm_up(size=size)
             except self.box.YoError as failure:
@@ -3204,120 +2523,33 @@ class TestVmUpResizes(LibvirtCase):
     def writes(self):
         return [sub for sub in self.host.subcommands() if sub not in READS]
 
-    def assert_nothing_asked_or_changed(self, stubs):
-        stubs["luks_passphrase"].assert_not_called()
-        stubs["start"].assert_not_called()
-        self.assertEqual(self.writes(), [])
+    def test_any_size_flag_is_refused_before_anything_whatever_the_domain_does(self):
+        for domain_state in ("shut off", "running", "paused"):
+            for size in (
+                self.box.Size(24, None, 2),
+                self.box.Size(None, 250, None),
+                self.box.Size(16, 100, DOMAIN_CPUS),
+            ):
+                with self.subTest(domain_state=domain_state, size=size):
+                    self.host.states["yolobox-box"] = domain_state
+                    error, stubs = self.vm_up(size)
+                    self.assertIn("box exists", error.message)
+                    self.assertIn("applies only when a box is created", error.message)
+                    self.assertIn(
+                        "yo -m box destroy --yes && yo -m box bootstrap", error.message
+                    )
+                    self.assertIn("yo -m box disk-grow <GiB>", error.message)
+                    stubs["luks_passphrase"].assert_not_called()
+                    stubs["start"].assert_not_called()
+                    self.assertEqual(self.writes(), [])
+                    self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 100 << 30)
 
-    def test_memory_and_cpus_are_set_in_the_definition_after_the_passphrase(self):
-        error, stubs = self.vm_up(self.box.Size(24, None, 2))
+    def test_a_box_asked_for_nothing_is_started_as_it_is(self):
+        error, stubs = self.vm_up(self.box.NO_SIZE)
         self.assertIsNone(error)
-        self.assertEqual(
-            [call[3:] for call in self.host.calls if call[3:4] and call[3] in WRITES],
-            [
-                ["setmaxmem", "yolobox-box", "24G", "--config"],
-                ["setmem", "yolobox-box", "24G", "--config"],
-                ["setvcpus", "yolobox-box", "2", "--config", "--maximum"],
-                ["setvcpus", "yolobox-box", "2", "--config"],
-            ],
-        )
-        self.assertEqual(self.driver.current_size(), self.box.BoxSize(24, 100, 2))
-        self.assertEqual(self.host.memory_kib["yolobox-box"], 24 << 20)
         stubs["start"].assert_called_once_with(
-            stubs["luks_passphrase"].return_value, self.box.NO_SIZE
+            stubs["luks_passphrase"].return_value, None
         )
-        passphrase_at = dict(self.order)["luks_passphrase"]
-        self.assertTrue(
-            all(
-                call[3] not in WRITES
-                for call in self.host.calls[:passphrase_at]
-                if call[3:4]
-            ),
-            "the box was changed before the passphrase was derived",
-        )
-
-    def test_less_memory_and_fewer_cpus_are_set_too(self):
-        error, _ = self.vm_up(self.box.Size(8, None, 2))
-        self.assertIsNone(error)
-        self.assertEqual(self.driver.current_size(), self.box.BoxSize(8, 100, 2))
-        self.assertEqual(self.host.memory_kib["yolobox-box"], 8 << 20)
-
-    def test_a_bigger_disk_is_left_to_the_grow_after_the_start(self):
-        # The volume is resized by grow_to_asked_disk, once the booted guest is
-        # known to be able to grow (TestUpGrowsTheDiskOfAStoppedBox).
-        error, stubs = self.vm_up(self.box.Size(None, 250, None))
-        self.assertIsNone(error)
-        self.assertEqual(self.writes(), [])
-        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 100 << 30)
-        stubs["start"].assert_called_once_with(
-            stubs["luks_passphrase"].return_value, self.box.NO_SIZE
-        )
-
-    def test_the_size_the_box_already_has_changes_nothing(self):
-        error, stubs = self.vm_up(self.box.Size(16, 100, DOMAIN_CPUS))
-        self.assertIsNone(error)
-        self.assertEqual(self.writes(), [])
-        stubs["start"].assert_called_once_with(
-            stubs["luks_passphrase"].return_value, self.box.NO_SIZE
-        )
-
-    def test_a_start_without_a_size_never_reads_the_size(self):
-        error, _ = self.vm_up(self.box.NO_SIZE)
-        self.assertIsNone(error)
-        self.assertEqual(self.host.calls_of("dominfo"), [])
-        self.assertEqual(self.writes(), [])
-
-    def test_a_change_to_a_box_that_is_not_shut_off_is_refused_before_anything(self):
-        for domain_state in ("running", "paused", "in shutdown"):
-            with self.subTest(domain_state=domain_state):
-                self.host.states["yolobox-box"] = domain_state
-                error, stubs = self.vm_up(self.box.Size(24, None, None))
-                shown = "Running" if domain_state == "running" else domain_state
-                self.assertIn(
-                    "box is %s with 16 GiB of memory, %d CPUs and a 100 GiB disk"
-                    % (shown, DOMAIN_CPUS),
-                    error.message,
-                )
-                self.assertIn("--memory 24 would change that", error.message)
-                self.assertIn("yo -m box down, then run this command", error.message)
-                self.assert_nothing_asked_or_changed(stubs)
-
-    def test_a_smaller_disk_is_refused_before_anything_and_not_by_deleting_the_box(
-        self,
-    ):
-        error, stubs = self.vm_up(self.box.Size(24, 50, None))
-        self.assertIn("box's disk is 100 GiB", error.message)
-        self.assertIn("neither lima nor libvirt can shrink a disk", error.message)
-        self.assertNotIn("destroy", error.message)
-        self.assert_nothing_asked_or_changed(stubs)
-
-    def test_more_memory_than_the_host_has_room_for_is_refused_before_anything(self):
-        self.host.foreign_domain("win", 6 << 20)
-        error, stubs = self.vm_up(self.box.Size(HOST_MEMORY_GIB - 4 - 6 + 1, None, 2))
-        self.assertIn("does not fit on this host", error.message)
-        self.assert_nothing_asked_or_changed(stubs)
-
-    def test_cpus_alone_are_not_judged_by_the_hosts_memory(self):
-        self.host_memory(8 << 20)
-        error, _ = self.vm_up(self.box.Size(None, None, 2))
-        self.assertIsNone(error)
-        self.assertEqual(self.driver.current_size().cpus, 2)
-
-    def test_less_memory_is_never_refused_by_a_full_host(self):
-        # A plain `yo up` would start the box at its 16 GiB unjudged, so a
-        # shrink to 8 cannot fit worse than that.
-        self.host_memory(8 << 20)
-        error, _ = self.vm_up(self.box.Size(8, None, None))
-        self.assertIsNone(error)
-        self.assertEqual(self.driver.current_size().memory_gib, 8)
-        error, _ = self.vm_up(self.box.Size(9, None, None))
-        self.assertIn("does not fit on this host", error.message)
-
-    def test_a_virsh_that_refuses_a_setting_stops_before_the_start(self):
-        self.host.fail["setvcpus"] = "error: too many vCPUs"
-        error, stubs = self.vm_up(self.box.Size(None, None, 2))
-        self.assertIn("too many vCPUs", error.message)
-        stubs["start"].assert_not_called()
 
 
 class TestVmUpCreatesAtTheAskedSize(LibvirtCase):
@@ -3336,15 +2568,9 @@ class TestVmUpCreatesAtTheAskedSize(LibvirtCase):
 
     def test_all_three_flags_reach_the_creation(self):
         with (
-            mock.patch.object(self.box.sshconfig, "ensure_agent_ssh_config"),
+            mock.patch.object(self.box.sshconfig, "write_ssh_config"),
             mock.patch.object(self.box.guest, "ensure_guest_known_hosts"),
             mock.patch.object(self.box.forwards, "vm_services"),
-            # A box just created runs the stock image, whose root is not encrypted.
-            mock.patch.object(self.box.vm, "luks_device_fstype", return_value="ext4"),
-            # The box start() would have created, at the size it was asked.
-            mock.patch.object(
-                self.driver, "current_size", return_value=self.box.BoxSize(24, 250, 3)
-            ),
         ):
             error, passphrase, start = self.up(
                 16, "--memory", "24", "--disk", "250", "--cpus", "3"
@@ -3352,7 +2578,7 @@ class TestVmUpCreatesAtTheAskedSize(LibvirtCase):
         self.assertIsNone(error)
         self.assertEqual(self.host.calls_of("vol-resize"), [])
         start.assert_called_once_with(
-            passphrase.return_value, self.box.Size(24, 250, 3)
+            passphrase.return_value, self.box.NewBox(24, 250, 3)
         )
 
     def test_a_host_that_cannot_give_a_default_creates_nothing(self):
@@ -3441,9 +2667,9 @@ class TestInitrdListener(LibvirtCase):
 
 
 class TestStart(LibvirtCase):
-    def start(self, memory_gib=None, disk_gib=None, cpus=None, size=None):
-        """driver.start() of the flags as vm_up decides a creation size from them,
-        or of `size` as it is."""
+    def start(self, memory_gib=None, disk_gib=None, cpus=None, existing=False):
+        """driver.start() of the flags as vm_up decides a creation size from
+        them, or of an existing domain."""
         seed = Path(self.home) / "seed.qcow2"
         seed.write_bytes(b"Q" * 4096)
         with (
@@ -3458,9 +2684,12 @@ class TestStart(LibvirtCase):
                 self.box.libvirt, "loopback_port_bound", return_value=False
             ),
         ):
-            if size is None:
-                size = self.box.Size(memory_gib, disk_gib, cpus).for_creation()
-            self.driver.start(b"pass", size)
+            new_box = (
+                None
+                if existing
+                else self.box.Size(memory_gib, disk_gib, cpus).for_creation()
+            )
+            self.driver.start(b"pass", new_box)
         return unlock
 
     def test_a_new_instance_gets_its_volumes_then_its_domain_then_starts(self):
@@ -3523,14 +2752,9 @@ class TestStart(LibvirtCase):
         for host in (1, None):
             with self.subTest(host=host):
                 with mock.patch.object(self.box.os, "cpu_count", return_value=host):
-                    unlock = self.start(size=self.box.NO_SIZE)
+                    unlock = self.start(existing=True)
                 unlock.assert_called_once_with(b"pass")
-                self.assertEqual(self.host.calls_of("define"), [])
                 self.assertNotIn("yolobox-box.qcow2", self.host.volumes)
-
-    def test_creating_without_the_cpus_vm_up_decides_is_an_error(self):
-        with self.assertRaisesRegex(self.box.YoError, "CPU count vm_up decides"):
-            self.start(size=self.box.NO_SIZE)
 
     def test_a_box_is_created_with_the_cpus_asked_for(self):
         self.start(cpus=3)
@@ -3585,7 +2809,9 @@ class TestStart(LibvirtCase):
 
     def test_a_start_that_fails_for_any_other_reason_is_not_retried(self):
         self.host.fail_once["start"] = "error: internal error: lizard"
-        with self.assertRaisesRegex(self.box.YoError, r"virsh start .*lizard"):
+        with self.assertRaisesRegex(
+            self.box.YoError, r"virsh start .*failed \(exit 1\): .*lizard"
+        ):
             self.start()
         self.assertEqual(len(self.host.calls_of("start")), 1)
 
@@ -3622,11 +2848,12 @@ class TestStart(LibvirtCase):
             if call[0] == "virsh":
                 self.assertEqual(call[1:3], ["-c", "qemu:///system"])
 
-    def test_the_domain_forwards_the_port_ssh_config_names(self):
+    def test_the_domain_forwards_the_port_the_ssh_facts_name(self):
         self.start()
-        self.assertEqual(self.driver.ssh_port(), FIRST_PORT)
-        with open(self.box.ssh_cfg()) as handle:
-            self.assertIn("  Port %d\n" % FIRST_PORT, handle.read())
+        self.assertEqual(self.driver.ssh_facts().port, FIRST_PORT)
+        self.assertIn(
+            "<range start='%d' to='22'/>" % FIRST_PORT, self.host.domains["yolobox-box"]
+        )
 
     def test_the_iso_is_built_under_the_cidata_label_and_the_files_are_staged_after(
         self,
@@ -3641,7 +2868,7 @@ class TestStart(LibvirtCase):
         self.assertFalse(os.path.exists(built_from))
         self.assertEqual(
             sorted(os.listdir(self.box.instance_dir())),
-            ["cidata", "domain.xml", "operator.pub", "ssh.config"],
+            ["cidata", "domain.json", "domain.xml", "operator.pub"],
         )
         staged = Path(self.box.instance_dir()) / "cidata"
         self.assertEqual(
@@ -3670,20 +2897,17 @@ class TestStart(LibvirtCase):
         mode = (Path(self.box.instance_dir()) / "operator.pub").stat().st_mode
         self.assertEqual(stat.S_IMODE(mode), 0o600)
 
-    def test_a_second_start_changes_nothing_that_did_not_change(self):
+    def test_a_second_start_keeps_the_volumes_and_defines_the_same_domain(self):
         self.start()
+        defined = self.host.domains["yolobox-box"]
         self.host.states["yolobox-box"] = "shut off"
         self.host.calls.clear()
-        self.start()
+        self.start(existing=True)
         subs = self.host.subcommands()
-        for untouched in (
-            "define",
-            "vol-create-as",
-            "vol-upload",
-            "vol-delete",
-            "vol-resize",
-        ):
+        for untouched in ("vol-create-as", "vol-upload", "vol-delete", "vol-resize"):
             self.assertNotIn(untouched, subs)
+        self.assertEqual(subs.count("define"), 1)
+        self.assertEqual(self.host.domains["yolobox-box"], defined)
         self.assertIn("start", subs)
 
     def test_a_changed_operator_name_rebuilds_the_cidata_while_stopped(self):
@@ -3691,10 +2915,9 @@ class TestStart(LibvirtCase):
         self.host.states["yolobox-box"] = "shut off"
         self.host.calls.clear()
         with mock.patch.object(self.box.release, "host_user", return_value="bob"):
-            self.start()
+            self.start(existing=True)
         subs = self.host.subcommands()
         self.assertLess(subs.index("vol-delete"), subs.index("vol-create-as"))
-        self.assertNotIn("define", subs)
         self.assertIn(
             "LIMA_CIDATA_USER=bob",
             (Path(self.box.instance_dir()) / "cidata" / "lima.env").read_text(),
@@ -3739,12 +2962,12 @@ class TestStart(LibvirtCase):
         self.host.fail["vol-upload"] = "no space"
         with mock.patch.object(self.box.release, "host_user", return_value="bob"):
             with self.assertRaisesRegex(self.box.YoError, "no space"):
-                self.start()
+                self.start(existing=True)
             self.assertIn("LIMA_CIDATA_USER=alice", lima_env.read_text())
             self.assertNotIn("yolobox-box-cidata.iso", self.host.volumes)
             self.host.fail.clear()
             self.host.calls.clear()
-            self.start()
+            self.start(existing=True)
         self.assertIn("LIMA_CIDATA_USER=bob", lima_env.read_text())
         self.assertIn("yolobox-box-cidata.iso", self.host.volumes)
         self.assertEqual(self.host.subcommands().count("vol-upload"), 1)
@@ -3764,10 +2987,10 @@ class TestStart(LibvirtCase):
             mock.patch.object(self.box.release, "host_user", return_value="bob"),
         ):
             with self.assertRaisesRegex(self.box.YoError, "xorriso failed"):
-                self.start()
+                self.start(existing=True)
         self.assertEqual(
             sorted(os.listdir(self.box.instance_dir())),
-            ["cidata", "domain.xml", "operator.pub", "ssh.config"],
+            ["cidata", "domain.json", "domain.xml", "operator.pub"],
         )
         self.assertIn(
             "LIMA_CIDATA_USER=alice",
@@ -3781,7 +3004,7 @@ class TestStart(LibvirtCase):
             b"\xff\xfe"
         )
         self.host.calls.clear()
-        self.start()
+        self.start(existing=True)
         self.assertIn("vol-upload", self.host.subcommands())
 
     def test_an_operator_named_agent_stops_before_anything_is_created(self):
@@ -3801,7 +3024,7 @@ class TestStart(LibvirtCase):
 class TestADomainThatDiesWhileYoWaits(LibvirtCase):
     """The host's OOM killer ends qemu while yo waits for the guest to answer."""
 
-    MIGRATING = ["yolobox-unlock: answered id=yolobox:luks-migrate"]
+    ANSWERED = ["yolobox-unlock: answered id=cryptsetup:/dev/vda2"]
 
     def setUp(self):
         super().setUp()
@@ -3834,7 +3057,7 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
 
         def probe(argv):
             self.host.states["yolobox-box"] = killed_as
-            return SSH_REFUSED
+            return NOT_LISTENING
 
         self.host.sshd = probe
 
@@ -3844,7 +3067,7 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         return caught.exception.message
 
     def test_a_domain_killed_after_the_unlock_is_an_error_naming_the_oom_killer(self):
-        self.host.helper = lambda: (self.MIGRATING + ["unlocked"], 0, "")
+        self.host.helper = lambda: (self.ANSWERED + ["unlocked"], 0, "")
         self.killed_on_the_next_probe()
         message = self.up()
         self.assertIn(
@@ -3857,20 +3080,15 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         )
         self.assertIn("possibly killed by the host's OOM killer", message)
         self.assertIn("check `journalctl -k -g oom`", message)
-        self.assertIn(
-            "keeping its disk: yo -m box down && virsh -c qemu:///system undefine "
-            "--nvram yolobox-box, then yo -m box up --memory N; then run this "
-            "command again",
-            message,
-        )
+        self.assertIn("then run this command again", message)
 
-    def test_a_domain_killed_while_the_migration_streamed_is_an_error_at_once(self):
+    def test_a_domain_killed_while_the_helper_streamed_is_an_error_at_once(self):
         def dropped():
             self.host.states["yolobox-box"] = "shut off"
-            return self.MIGRATING, 255, ""
+            return self.ANSWERED, 255, ""
 
         self.host.helper = dropped
-        self.host.sshd = lambda argv: SSH_REFUSED
+        self.host.sshd = lambda argv: NOT_LISTENING
         message = self.up()
         self.assertIn(
             "box is shut off, not Running, while yo waited for its initrd to take "
@@ -3884,12 +3102,7 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         self.killed_on_the_next_probe("paused")
         message = self.up()
         self.assertIn("box is paused, not Running", message)
-        self.assertIn(
-            "resume it with `virsh -c qemu:///system resume yolobox-box`, then run "
-            "this command",
-            message,
-        )
-        self.assertNotIn("oom", message)
+        self.assertIn("domstate --reason yolobox-box", message)
 
     def test_a_domain_in_a_state_yo_has_no_word_for_says_where_to_look(self):
         self.host.helper = lambda: (["unlocked"], 0, "")
@@ -3897,26 +3110,20 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         message = self.up()
         self.assertIn("box is crashed, not Running", message)
         self.assertIn(
-            "check why with `virsh -c qemu:///system domstate --reason yolobox-box`",
-            message,
+            "`virsh -c qemu:///system domstate --reason yolobox-box` says why", message
         )
-        self.assertNotIn("oom", message)
 
     def test_a_domain_undefined_while_yo_waits_says_yo_up_defines_it_again(self):
         self.host.helper = lambda: (["unlocked"], 0, "")
 
         def undefined(argv):
             del self.host.domains["yolobox-box"], self.host.states["yolobox-box"]
-            return SSH_REFUSED
+            return NOT_LISTENING
 
         self.host.sshd = undefined
         message = self.up()
         self.assertIn("box is not listed, not Running", message)
-        self.assertIn(
-            "domain yolobox-box no longer exists: yo -m box up defines it again",
-            message,
-        )
-        self.assertNotIn("domstate", message)
+        self.assertIn("then run this command again", message)
 
     def test_a_domain_paused_during_a_connected_probe_is_named_not_the_ssh_timeout(
         self,
@@ -3930,9 +3137,6 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         self.host.sshd = paused
         message = self.up()
         self.assertIn("box is paused, not Running", message)
-        self.assertIn(
-            "resume it with `virsh -c qemu:///system resume yolobox-box`", message
-        )
         self.assertNotIn("as the operator failed", message)
 
     def test_virsh_speaks_the_c_locale_whatever_the_users_locale(self):
@@ -3951,10 +3155,10 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         # Nothing listening yet, then the key refused while the operator's key
         # is being written: both are a boot in progress, retried.
         key_refused = (255, "operator@127.0.0.1: Permission denied (publickey).")
-        answers = iter([SSH_REFUSED, key_refused, (0, "")])
+        answers = iter([NOT_LISTENING, key_refused, (0, "")])
         self.host.sshd = lambda argv: next(answers)
         with mock.patch.object(self.box.unlock.time, "sleep") as sleep:
-            self.driver.start(b"secret", self.box.NO_SIZE)
+            self.driver.start(b"secret", None)
         self.assertEqual(
             sleep.call_args_list,
             [mock.call(self.box.OPERATOR_POLL_SECONDS)] * 2,
@@ -4126,10 +3330,6 @@ class TestDriverChoice(unittest.TestCase):
         self.addCleanup(unload_yo, name)
         self.assertTrue(
             box.instance_dir().endswith(".local/state/yolobox/instances/e2e")
-        )
-        self.assertEqual(
-            box.box.driver.initrd_identity,
-            ".local/state/yolobox/instances/e2e/operator.pub",
         )
         self.assertTrue(
             box.ssh_cfg().endswith("/.local/state/yolobox/instances/e2e/ssh.config")

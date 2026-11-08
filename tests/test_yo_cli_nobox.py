@@ -8,9 +8,18 @@ import io
 import unittest
 from unittest import mock
 
-from test_yo import host_cpus, load_yo, unload_yo
+from test_yo import (
+    host_cpus,
+    load_yo,
+    unload_yo,
+    refuse_tcp_to_the_host,
+)
 
 yo = load_yo("yo_nobox")
+
+
+def setUpModule():
+    refuse_tcp_to_the_host()
 
 
 def tearDownModule():
@@ -36,8 +45,7 @@ class TestTypeCallablesReadNoBox(unittest.TestCase):
     def setUp(self):
         patches = [
             mock.patch.object(yo.lima.LIMA, "require_tool"),
-            mock.patch.object(yo.lima.LIMA, "require_login_key"),
-            mock.patch.object(yo.cli, "heal_before_command"),
+            mock.patch.object(yo.forwards, "ensure_session"),
             host_cpus(),
         ]
         for patch in patches:
@@ -133,17 +141,6 @@ class TestTypeCallablesReadNoBox(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertIn(said, stderr)
                 self.assertFalse(hasattr(yo.state, "box"))
-
-    def test_an_old_release_is_refused_once_the_machine_is_chosen_naming_it(self):
-        code, stderr = self.entry(
-            ["-m", "box2", "bootstrap", "--version", "1.9.1"], yo.vm, "cmd_bootstrap"
-        )
-        self.assertEqual(code, 2)
-        self.assertIn("cannot build release 1.9.1", stderr)
-        self.assertIn(
-            "nix run github:aka-rider/yolobox/v1.9.1 -- -m box2 bootstrap", stderr
-        )
-        yo.lima.LIMA.require_tool.assert_not_called()
 
 
 if __name__ == "__main__":

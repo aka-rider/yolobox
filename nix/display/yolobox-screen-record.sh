@@ -3,7 +3,6 @@
 # nix/display.nix with writeShellApplication, which prepends
 # `set -o errexit -o nounset -o pipefail` and puts the `runtimeInputs` listed
 # there on PATH.
-# See nix/display.md.
 
 # State lives under ~/.local/state, not /run/user: /run/user is torn
 # down at last logout while a backgrounded ffmpeg keeps running,

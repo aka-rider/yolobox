@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import configparser
-import enum
 import http.client
 import json
 import os
@@ -14,7 +13,16 @@ import signal
 import socket
 import subprocess
 import time
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    ContextManager,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from . import common, proc, sshx, state, ui
 from .config import AGENT_HOME, FILE_MODE_PRIVATE, HELPER, SCRIPT_DIR
@@ -191,21 +199,6 @@ class UnixSocketHTTPConnection(http.client.HTTPConnection):
         self.sock = sock
 
 
-class BrokerState(enum.Enum):
-    UNREACHABLE = "unreachable"
-    HEALTHY = "healthy"
-    # Answers only on the socket forwarded to the guest: a broker started by an
-    # older yo, which has no control socket. It is stopped by the pid it reports.
-    NO_CONTROL = "no control socket"
-
-
-class BrokerHealth(NamedTuple):
-    state: BrokerState
-    info: Dict[str, Any]  # the broker's /health JSON; empty when UNREACHABLE
-    sock: Optional[str]  # the socket that answered; None when UNREACHABLE
-
-
-BROKER_UNREACHABLE = BrokerHealth(BrokerState.UNREACHABLE, {}, None)
 HTTP_OK = 200
 
 
@@ -227,54 +220,39 @@ def health_on(sock_path: str, timeout: float) -> Optional[Dict[str, Any]]:
         return None
 
 
-def aws_broker_health(timeout: float = HEALTH_TIMEOUT_SECONDS) -> BrokerHealth:
-    """Ask the broker on its control socket, which the guest cannot crowd out.
-
-    A broker from an older yo has none, but still answers on the forwarded
-    socket; that is NO_CONTROL, not healthy, so it gets replaced.
-    """
-    control = aws_broker_ctl_sock()
-    info = health_on(control, timeout)
-    if info is not None:
-        return BrokerHealth(BrokerState.HEALTHY, info, control)
-    forwarded = aws_broker_sock()
-    info = health_on(forwarded, timeout)
-    if info is not None:
-        return BrokerHealth(BrokerState.NO_CONTROL, info, forwarded)
-    return BROKER_UNREACHABLE
+def aws_broker_health(
+    timeout: float = HEALTH_TIMEOUT_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """The broker's /health JSON, asked on its control socket, which the guest
+    cannot crowd out; None when no broker answers."""
+    return health_on(aws_broker_ctl_sock(), timeout)
 
 
-def pid_exits_within(pid: int, timeout: float) -> bool:
-    """Whether `pid` has exited, or exits within `timeout` seconds."""
+def stop_broker(pid: int) -> None:
+    """SIGTERM the broker at `pid` and wait for its exit; one that is gone
+    already is stopped."""
     try:
         watch = common.pid_exit_watch(pid)
     except ProcessLookupError:
-        return True
+        return
     except OSError as failure:
         raise YoError("cannot watch pid %d for its exit: %s" % (pid, failure))
     try:
-        return watch.wait(timeout)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            raise YoError(
+                "cannot signal the stale aws-broker (pid %d): permission denied" % pid
+            )
+        if not watch.wait(STALE_BROKER_EXIT_SECONDS):
+            raise YoError(
+                "stale aws-broker (pid %d) did not exit within %gs"
+                % (pid, STALE_BROKER_EXIT_SECONDS)
+            )
     finally:
         watch.close()
-
-
-def wait_for_pid_exit(pid: int, timeout: float) -> None:
-    if not pid_exits_within(pid, timeout):
-        raise YoError(
-            "stale aws-broker (pid %d) did not exit within %gs" % (pid, timeout)
-        )
-
-
-def kill_stale_broker(pid: int) -> None:
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except PermissionError:
-        raise YoError(
-            "cannot signal the stale aws-broker (pid %d): permission denied" % pid
-        )
-    wait_for_pid_exit(pid, timeout=STALE_BROKER_EXIT_SECONDS)
 
 
 def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
@@ -301,6 +279,8 @@ def start_aws_broker(watch_pid: int, allowed_names: Sequence[str]) -> None:
                 str(watch_pid),
                 "--allow",
                 *allowed_names,
+                "--log",
+                log_path,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -390,20 +370,17 @@ def push_aws_guest_files(allowed: Sequence[Tuple[str, str]]) -> None:
         )
 
 
-def kill_broker_in(health: BrokerHealth) -> None:
-    if health.state is BrokerState.UNREACHABLE:
+def kill_broker_in(health: Optional[Dict[str, Any]]) -> None:
+    if health is None:
         return
-    stale_pid = checked_pid(health.info.get("pid"))
+    stale_pid = checked_pid(health.get("pid"))
     if stale_pid is None:
         raise YoError(
             "the aws-broker on %s answered /health without a usable pid (%r), so yo "
-            "cannot stop it — kill it by hand" % (health.sock, health.info.get("pid"))
+            "cannot stop it — kill it by hand"
+            % (aws_broker_ctl_sock(), health.get("pid"))
         )
-    kill_stale_broker(stale_pid)
-
-
-class BrokerDisableError(YoError):
-    """The broker could not be turned off. Recreating the ssh master does not cure it."""
+    stop_broker(stale_pid)
 
 
 # yo's own lock, not the broker's: the broker flocks <socket>.lock while it
@@ -411,54 +388,63 @@ class BrokerDisableError(YoError):
 YO_BROKER_LOCK_NAME = "aws-broker.yo.lock"
 
 
+def broker_lock() -> ContextManager[None]:
+    """Held across everything that reads or changes the broker and the guest's
+    AWS config. Two yos racing through read-allowlist, health, kill, start and
+    push would each see no broker and the second start would fail on the
+    first's, or push a config naming other profiles than the broker serves."""
+    proc.private_dir(state.state_dir())
+    return common.held_flock(
+        os.path.join(state.state_dir(), YO_BROKER_LOCK_NAME), wait=True
+    )
+
+
 def disable_aws_broker() -> None:
-    # The removal is under the lock too, so it cannot land between another
-    # yo's start and its push and leave a broker running with no guest config.
-    try:
-        with state.host_state_lock(YO_BROKER_LOCK_NAME, wait=True):
-            kill_broker_in(aws_broker_health())
-            sshx.ssh_run(AGENT, ["rm", "-f", GUEST_AWS_CONFIG_PATH], check=True)
-    except YoError as failure:
-        raise BrokerDisableError(failure.message, failure.code)
+    """No broker running and no guest AWS config: idempotent. The caller holds
+    the broker lock, so the removal cannot land between another yo's start and
+    its push and leave a broker running with no guest config."""
+    kill_broker_in(aws_broker_health())
+    sshx.ssh_run(AGENT, ["rm", "-f", GUEST_AWS_CONFIG_PATH], check=True)
 
 
 def broker_needs_restart(
-    health: BrokerHealth, watch_pid: int, allowed_names: Sequence[str]
+    health: Optional[Dict[str, Any]], watch_pid: int, allowed_names: Sequence[str]
 ) -> bool:
-    if health.state is not BrokerState.HEALTHY:
+    if health is None:
         return True
-    if checked_pid(health.info.get("watch_pid")) != watch_pid:
+    if checked_pid(health.get("watch_pid")) != watch_pid:
         return True
-    if health.info.get("allow") != list(allowed_names):
+    if health.get("allow") != list(allowed_names):
         return True
     return False
 
 
 def ensure_aws_broker() -> bool:
-    # Reading the allowlist and the pid, checking, killing, starting and
-    # pushing the guest config are one step under yo's lock. Two yos racing
-    # through them would each see no broker, and the second to start would fail
-    # on the first one's; one that read the pid or the config before the other
-    # restarted the broker would then replace a good broker with a stale one,
-    # or push a guest config that names other profiles than the broker serves.
-    with state.host_state_lock(YO_BROKER_LOCK_NAME, wait=True):
+    """A broker serving today's allowlist and a guest config naming it, or
+    neither when there is nothing to allow-list. True when the guest has AWS."""
+    with broker_lock():
         if shutil.which("aws") is None:
             why_not = "'aws' is not on this host's PATH"
             allowed: List[Tuple[str, str]] = []
         else:
             allowed = aws_allowlist()
             why_not = "no SSO profiles in %s" % state.tilde(aws_config_path())
-        if allowed:
-            pid = state.driver().keepalive_pid()
-            if pid is None:
-                raise YoError(state.driver().keepalive_pid_error())
-            allowed_names = sorted(name for name, _ in allowed)
-            health = aws_broker_health()
-            if broker_needs_restart(health, pid, allowed_names):
-                kill_broker_in(health)
-                start_aws_broker(pid, allowed_names)
-            push_aws_guest_files(allowed)
-            return True
-    ui.err("yo: %s — no AWS credentials broker started" % why_not)
-    disable_aws_broker()
-    return False
+        if not allowed:
+            ui.err("yo: %s — no AWS credentials broker started" % why_not)
+            disable_aws_broker()
+            return False
+        pid = state.driver().keepalive_pid()
+        if pid is None:
+            raise YoError(
+                state.not_up_hint(
+                    "cannot read the pid of %s's %s"
+                    % (state.box.name, state.driver().hints.keepalive_name)
+                )
+            )
+        allowed_names = sorted(name for name, _ in allowed)
+        health = aws_broker_health()
+        if broker_needs_restart(health, pid, allowed_names):
+            kill_broker_in(health)
+            start_aws_broker(pid, allowed_names)
+        push_aws_guest_files(allowed)
+        return True

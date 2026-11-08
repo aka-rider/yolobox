@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # One-time, idempotent setup of a Fedora host for yolobox's libvirt path.
 # Run as: sudo bash linux/host-setup.sh
-# The reasons for each step, and how to recognise a failure, are in
-# linux/host-setup.md.
+# Each step says why it exists in the comment above it.
 set -Eeuo pipefail
 # The script greps virsh's output for English words (Autostart, Active, State),
 # which a translated virsh would not print.
@@ -68,20 +67,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Checked before anything is installed or enabled, so a host that fails it is
 # left as it was.
-step "(h) host resolver"
+step "host resolver"
 resolver="$(awk '$1 == "nameserver" { print $2; exit }' /etc/resolv.conf)"
 [[ $resolver =~ ^127\.[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
   die "the first nameserver in /etc/resolv.conf is '${resolver:-none}', not a loopback address. passt would hand the guest that resolver, which sits on the LAN. Point the host at a local resolver (systemd-resolved's stub, 127.0.0.53, is one) and run this again"
 
-step "(a) libvirt repository and packages"
+step "libvirt repository and packages"
 dnf copr enable -y @virtmaint-sig/virt-preview
 dnf install -y libvirt-daemon-kvm libvirt-client edk2-ovmf passt passt-selinux xorriso nftables acl
 
 # The system connection needs its daemons running, so this comes before the
 # version gate and the network step. virtnetworkd is started only so the
 # `default` network can be switched off.
-step "(d) libvirt daemons"
-# The host table is tied to virtqemud (RequiredBy=, step g), and the passt hook
+step "libvirt daemons"
+# The host table is tied to virtqemud (RequiredBy=, set up below), and the passt hook
 # is read by it. The monolithic libvirtd would start domains past both, so a
 # host that still runs or enables it is refused, not silently switched over
 # under its running domains.
@@ -94,7 +93,7 @@ systemctl enable --now virtqemud.socket virtstoraged.socket virtnetworkd.socket
 
 # The daemon's version counts, not the client's: the daemon starts passt. A daemon
 # that dnf upgraded but did not restart still reports the old one.
-step "(b) libvirt version gate"
+step "libvirt version gate"
 daemon_report="$("${VIRSH[@]}" version --daemon)"
 libvirt_version="$(sed -n 's/^Running against daemon:[[:space:]]*//Ip' <<<"$daemon_report" | head -n1 | tr -d '[:space:]')"
 [[ $libvirt_version =~ ^[0-9]+(\.[0-9]+)*$ ]] ||
@@ -102,7 +101,7 @@ libvirt_version="$(sed -n 's/^Running against daemon:[[:space:]]*//Ip' <<<"$daem
 version_at_least "$libvirt_version" "$MIN_LIBVIRT" ||
   die "the libvirt daemon is $libvirt_version, older than $MIN_LIBVIRT; passt needs the interface route option. Check that the virt-preview repository is enabled and its libvirt installed, then restart the daemon (systemctl restart virtqemud) and run this again"
 
-step "(c) libvirt's default network off"
+step "libvirt's default network off"
 networks="$("${VIRSH[@]}" net-list --all --name)"
 if grep -Fxq -- default <<<"$networks"; then
   net_info="$("${VIRSH[@]}" net-info default)"
@@ -118,7 +117,7 @@ else
   printf 'libvirt network default: not defined\n'
 fi
 
-step "(e) polkit rule for $SUDO_USER"
+step "polkit rule for $SUDO_USER"
 install -d -m0755 "$(dirname "$POLKIT_RULE")"
 cat >"$POLKIT_RULE" <<RULE
 polkit.addRule(function(action, subject) {
@@ -129,7 +128,7 @@ polkit.addRule(function(action, subject) {
 RULE
 chmod 0644 "$POLKIT_RULE"
 
-step "(f) system account $VM_USER"
+step "system account $VM_USER"
 if ! getent group "$VM_USER" >/dev/null; then
   groupadd --system "$VM_USER"
 fi
@@ -142,8 +141,8 @@ fi
 # with "Permission denied". An ACL entry for yolobox-vm leaves the owner alone,
 # and the mask is spelled out because an entry is only as wide as the mask.
 # /run is a tmpfs, so a tmpfiles rule re-applies it on every boot, before
-# virtqemud starts. See linux/host-setup.md.
-step "(j) passt socket directory"
+# virtqemud starts.
+step "passt socket directory"
 # A symlink there would send the ACL, and the hook's, to whatever it points at.
 [[ ! -L $PASST_DIR ]] || die "$PASST_DIR is a symlink, which libvirt never makes; remove it and run this again"
 cat >"$PASST_TMPFILES" <<RULE
@@ -161,9 +160,8 @@ setfacl -P -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
 # is restarted if it runs and has been running since before the hook file was
 # written; running domains are not touched. That is read from the two
 # timestamps, not from "this run installed the hook", so a run that died
-# between the install and the restart is finished by the next one. See
-# linux/host-setup.md, "The passt ACL hook".
-step "(l) libvirt hook that keeps the passt ACL"
+# between the install and the restart is finished by the next one.
+step "libvirt hook that keeps the passt ACL"
 if needs_install "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK" 0755; then
   install -D -m0755 "$HERE/yolobox-libvirt-hook.sh" "$PASST_HOOK"
 fi
@@ -178,7 +176,7 @@ elif [[ -n $qemud_started ]]; then
   die "cannot read virtqemud's start time: 'systemctl show --timestamp=unix' printed '$qemud_started', not @<seconds> (systemd 247 or newer prints that). Restart virtqemud by hand (systemctl try-restart virtqemud.service) so it loads $PASST_HOOK"
 fi
 
-step "(g) host egress table"
+step "host egress table"
 [[ -x /usr/sbin/nft ]] || die "/usr/sbin/nft is missing after installing nftables"
 /usr/sbin/nft -c -f "$HERE/yolobox-host.nft"
 if needs_install "$HERE/yolobox-host.nft" "$NFT_DEST" 0644; then
@@ -201,7 +199,7 @@ else
   systemctl enable --now yolobox-host.service
 fi
 
-step "(i) storage pool $POOL_NAME"
+step "storage pool $POOL_NAME"
 pools="$("${VIRSH[@]}" pool-list --all --name)"
 if ! grep -Fxq -- "$POOL_NAME" <<<"$pools"; then
   "${VIRSH[@]}" pool-define-as "$POOL_NAME" dir --target "$POOL_PATH"
@@ -217,7 +215,7 @@ fi
 
 # The operator's key lives in the operator's 1Password agent, not in root's
 # reach, so ask the agent as the operator. Only the comment is compared.
-step "(k) operator key"
+step "operator key"
 operator_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
 [[ -n $operator_home ]] || die "no home directory for $SUDO_USER"
 operator_reminder=""

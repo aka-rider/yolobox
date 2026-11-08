@@ -43,6 +43,7 @@ stdenvNoCC.mkDerivation {
 
     install -Dm755 yo "$out/libexec/yolobox/yo"
     install -Dm755 aws-broker "$out/libexec/yolobox/aws-broker"
+    install -Dm644 facts.json "$out/libexec/yolobox/facts.json"
     cp -r yolobox_cli "$out/libexec/yolobox/yolobox_cli"
     ${if stdenvNoCC.hostPlatform.isDarwin then darwinFiles else linuxFiles}
     # The commit too, so a yo built from main builds that very tree, not the

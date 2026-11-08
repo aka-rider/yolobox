@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # Runs in the initrd, before the initrd sshd starts: copies lima's operator
-# key out of the cidata ISO into the file sshd reads for root. See nix/luks.nix.
+# key out of the cidata ISO into the file sshd reads for root.
 if [ "$#" -ne 1 ]; then
   echo "usage: yolobox-initrd-authorized-keys <output file>" >&2
   exit 2

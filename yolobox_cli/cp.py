@@ -1,19 +1,20 @@
-"""yo cp: scp in both directions with its refusals, staging and merge."""
+"""yo cp: scp up, a tar stream down, with the refusals, staging and merge."""
 
 from __future__ import annotations
 
 import argparse
 import os
 import posixpath
-import re
+import shlex
 import shutil
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import paths, proc, sshx, state, ui
-from .config import AGENT_HOME
+from .config import AGENT_HOME, FACTS
 from .sshx import AGENT
 from .ui import YoError
 
@@ -110,19 +111,6 @@ def cp_mkdir_target(dest_operand: str, resolved_dest: str, source_count: int) ->
     return os.path.dirname(resolved_dest)
 
 
-SCP_GLOB_RE = re.compile(r"([\[\]*?\\])")
-
-
-def scp_glob_escape(path: str) -> str:
-    # scp expands wildcards in a remote *source* itself, so a guest file named
-    # "a[1].txt" would otherwise match nothing, or several other files.
-    return SCP_GLOB_RE.sub(r"\\\1", path)
-
-
-def scp_guest_source(guest_path: str) -> str:
-    return "%s:%s" % (state.box.vm_host, scp_glob_escape(guest_path))
-
-
 def local_cp_operand(operand: str) -> str:
     # Absolute, so a Mac file "a:b.png" is not read as host "a" and a name
     # starting with "-" is not read as an option. Joined, not normalised: a
@@ -196,9 +184,8 @@ def cmd_cp(args: argparse.Namespace) -> None:
 
 
 def scp_transfer(sources: Sequence[str], dest: str) -> None:
-    # -s: sftp, which sshd serves without a login shell (CONSTITUTION: never
-    # disable allowSFTP). Older scp defaulted to the legacy protocol, which
-    # runs `scp` in the agent's shell.
+    # -s: sftp, which sshd serves without a login shell. Older scp defaulted to
+    # the legacy protocol, which runs `scp` in the agent's shell.
     argv = (
         ["scp", "-r", "-p", "-s"]
         + sshx.ssh_options(AGENT)
@@ -242,20 +229,17 @@ def plan_merge(staged: str, target: str, moves: List[Tuple[str, str]]) -> None:
 
 
 def unlock_tree(path: str) -> None:
-    # scp -p keeps a guest directory's mode, and sftp-mode scp adds S_IRWXU to
-    # it. This adds u+rwx anyway, top down so each directory is readable before
-    # it is entered, so the tree can be walked and removed whatever mode scp
-    # left (a read-only Go module cache refuses to lose its children). Group
-    # and other bits stay as scp made them, so a landed directory keeps the
-    # mode scp -p gave it. Symlinks are never followed: chmod would reach the
-    # Mac file they point at. A stack, not recursion: a pulled tree can be
-    # deeper than the interpreter's frame limit.
+    # tar keeps a guest directory's mode (less the umask). This adds u+rwx,
+    # top down so each directory is readable before it is entered, so the tree
+    # can be walked and removed whatever mode it came with (a read-only Go
+    # module cache refuses to lose its children). Group and other bits stay as
+    # tar made them. Symlinks are never followed: chmod would reach the Mac
+    # file they point at. A stack, not recursion: a pulled tree can be deeper
+    # than the interpreter's frame limit.
     pending = [path]
     while pending:
         directory = pending.pop()
         mode = os.lstat(directory).st_mode
-        if stat.S_ISLNK(mode):
-            continue
         os.chmod(directory, stat.S_IMODE(mode) | 0o700)
         with os.scandir(directory) as entries:
             pending += [e.path for e in entries if e.is_dir(follow_symlinks=False)]
@@ -286,7 +270,7 @@ def remove_staging(path: str) -> None:
 
 # Names that make git, jj, an editor or direnv execute what a tree says the
 # next time the operator touches it. A pulled guest tree never lands these: the
-# agent writes them (yo.md, "Downloads never land control paths").
+# agent writes them.
 # Compared with casefold(), because APFS folds names with Unicode case folding
 # (.GIT and .vſcode are .git and .vscode).
 LANDING_CONTROL_NAMES = frozenset(
@@ -295,36 +279,55 @@ LANDING_CONTROL_NAMES = frozenset(
 
 
 # Build output and dependency installs a pulled tree never lands: the project's
-# own tooling recreates them, and they dwarf the source. The same names the
-# guest's gc knows (BUILD_DIRS, REMOVED_OUTRIGHT and NEEDS_MANIFEST in
-# nix/guest/yolobox-guest.sh); tests/test_consistency.py keeps them equal. A
-# value names the manifest that must sit beside the directory, because the
-# name alone proves nothing: a `target` with no Cargo.toml may hold data.
-BUILD_OUTPUT: Dict[str, Optional[str]] = {
-    "node_modules": None,
-    ".venv": None,
-    "target": "Cargo.toml",
-    ".next": "package.json",
-}
-
-MANIFEST_NAMES = frozenset(m for m in BUILD_OUTPUT.values() if m)
+# own tooling recreates them, and they dwarf the source. The names the guest's
+# gc knows. One with a manifest is build output only beside that manifest,
+# because the name alone proves nothing: a `target` with no Cargo.toml may
+# hold code.
+BUILD_OUTPUT = tuple(
+    dict.fromkeys(FACTS["gc_build_dirs"] + FACTS["gc_removed_outright"])
+)
+BUILD_OUTPUT_MANIFESTS: Dict[str, str] = FACTS["build_output_manifests"]
+BUILD_OUTPUT_NOTE = (
+    "build output is never copied to the host; the project's tooling recreates it"
+)
 
 CONTROL_PATH_NOTE = (
     "version-control and editor/direnv control paths are never copied to the "
     "host, because they run code as you"
 )
-BUILD_OUTPUT_NOTE = (
-    "build output is never copied to the host; the project's tooling recreates it"
-)
+
+
+def refuse_unlandable(staging: str, path: str) -> None:
+    # Only plain files and directories land: a symlink, FIFO, device or socket,
+    # or a setuid/setgid file, is the agent's way to reach past the tree.
+    mode = os.lstat(path).st_mode
+    plain = stat.S_ISDIR(mode) or (
+        stat.S_ISREG(mode) and not mode & (stat.S_ISUID | stat.S_ISGID)
+    )
+    if not plain:
+        raise YoError(
+            'refusing to land "%s": the guest sent %s, and only plain files and '
+            "directories land on the host"
+            % (ui.shown(os.path.relpath(path, staging)), staged_kind(mode))
+        )
+
+
+def staged_kind(mode: int) -> str:
+    if stat.S_ISLNK(mode):
+        return "a symlink"
+    if stat.S_ISREG(mode):
+        return "a setuid or setgid file"
+    return "a special file (mode %o)" % stat.S_IFMT(mode)
 
 
 def drop_control_paths(staging: str) -> None:
-    # The one place a staged tree is judged for control paths. It prunes the
-    # staging tree, not the move list, because a directory with no counterpart
-    # on the Mac moves as one rename and never reaches plan_merge's per-entry
-    # walk. Every entry is judged once, and a dropped directory is never
-    # entered, so a control path inside another is not reported on its own.
-    # The guest cannot do this judging: APFS case folding is the Mac's.
+    # The one place a staged tree is judged, entry by entry: control paths are
+    # dropped and anything but a plain file or directory is refused. It prunes
+    # the staging tree, not the move list, because a directory with no
+    # counterpart on the Mac moves as one rename and never reaches plan_merge's
+    # per-entry walk. A dropped directory is never entered, so a control path
+    # inside another is not reported on its own. The guest cannot do this
+    # judging: APFS case folding is the Mac's.
     skipped: List[str] = []
 
     unlock_tree(staging)
@@ -332,6 +335,9 @@ def drop_control_paths(staging: str) -> None:
         judged = sorted(
             name for name in subdirs + files if name.casefold() in LANDING_CONTROL_NAMES
         )
+        for name in subdirs + files:
+            if name not in judged:
+                refuse_unlandable(staging, os.path.join(directory, name))
         for name in judged:
             path = os.path.join(directory, name)
             skipped.append(os.path.relpath(path, staging))
@@ -350,274 +356,149 @@ def drop_control_paths(staging: str) -> None:
         ui.err('yo: skipped "%s": %s' % (ui.shown(relative), CONTROL_PATH_NOTE))
 
 
-@dataclass(frozen=True)
-class GuestEntry:
-    kind: str  # find's %y: "d" directory, "f" file, "l" link, ...
-    mode: int
-    mtime: float
-    path: str
-
-
-# One record per entry, NUL-terminated because a path may hold any byte but NUL.
-GUEST_RECORD = "%y\t%m\t%T@\t%p\\0"
-
-# What a record may say, as narrowly as find prints it: one type letter, an
-# octal mode of at most four digits (%m prints the permission bits, 7777 at
-# most), a decimal time, then the path, which may hold tabs and newlines.
-# Narrow, because int() and float() also take "0o7", "1_0", "nan" and "inf".
-GUEST_RECORD_RE = re.compile(
-    r"([a-zA-Z])\t([0-7]{1,4})\t([0-9]{1,10}(?:\.[0-9]+)?)\t(.+)", re.DOTALL
-)
-
-# The largest mtime a filesystem keeps: APFS and ext4 store signed 64-bit
-# nanoseconds, and os.utime past that is an OverflowError, not an OSError.
-MAX_MTIME = 2**63 / 10**9
-
-
-def parse_guest_record(
-    record: bytes, starts: Sequence[str], lists_starts: bool
-) -> GuestEntry:
-    # The listing came out of the agent's login shell, which the agent owns, so
-    # it is untrusted input (yo.md, "A guest listing is untrusted"). A path
-    # that is not clean (a "..", a "." or an empty component, a trailing
-    # slash) or not under a start would steer scp out of the staging
-    # directory, past the control-path and merge checks.
-    text = os.fsdecode(record)
-    fields = GUEST_RECORD_RE.fullmatch(text)
-    if fields is None or float(fields.group(3)) >= MAX_MTIME:
-        raise YoError(
-            "the guest's listing has a malformed record: '%s'" % ui.shown(text)
-        )
-    kind, mode, mtime, path = fields.groups()
-    clean = posixpath.normpath(path) == path
-    under = any(path.startswith(start + "/") for start in starts) or (
-        lists_starts and path in starts
-    )
-    if not (clean and under):
-        raise YoError(
-            "the guest's listing has a path that is not a clean path under %s: '%s'"
-            % (", ".join(starts), ui.shown(text))
-        )
-    return GuestEntry(kind, int(mode, 8), float(mtime), path)
-
-
-def list_guest(
-    starts: Sequence[str], tests: Sequence[str], lists_starts: bool
-) -> Dict[str, GuestEntry]:
-    """Every record find prints for `starts` and `tests`, checked. `lists_starts`
-    says whether find also prints the starts themselves."""
-    # find -H follows a symlink named on the command line, as scp does for a
-    # source. The starts are absolute, so none can be read as an option, and
-    # ssh_run quotes them, so no wildcard in them is expanded.
-    done = sshx.ssh_run(AGENT, ["find", "-H"] + list(starts) + list(tests), binary=True)
-    if done.returncode != 0:
-        # find's stderr names what it could not read (an unreadable directory
-        # under /tmp); it is guest text, so it is shown as a quoted block.
-        # Its stdout is the listing, never the reason, so only stderr is quoted.
-        raise YoError(
-            "cannot list %s in the guest (find exited %d)%s"
-            % (
-                ", ".join(starts),
-                done.returncode,
-                proc.said_suffix(ui.quoted_block(done.stderr)),
-            )
-        )
-    entries: Dict[str, GuestEntry] = {}
-    for record in done.stdout.split(b"\0"):
-        if not record:
-            continue
-        entry = parse_guest_record(record, starts, lists_starts)
-        # Overlapping sources list a path twice, alike. Two accounts of one path
-        # cannot both be true.
-        if entries.setdefault(entry.path, entry) != entry:
-            raise YoError(
-                "the guest's listing describes '%s' twice, differently"
-                % ui.shown(entry.path)
-            )
-    return entries
-
-
-def any_name(names: Sequence[str]) -> List[str]:
-    tests = ["("]
-    for name in names:
-        tests += ["-name", name, "-o"]
-    return tests[:-1] + [")"]
-
-
-def find_build_output(sources: Sequence[str]) -> List[Tuple[str, str]]:
-    """The (source, path) of each outermost build-output directory inside a
-    guest source. A source itself is never judged: the operator named it."""
-    # A name that needs no manifest is pruned, so find never walks a
-    # node_modules. The others are walked, because a target that proves
-    # nothing may hold a node_modules of its own. The manifests are listed
-    # beside them, and the verdict is made here.
-    plain = [name for name, manifest in BUILD_OUTPUT.items() if manifest is None]
-    needy = [name for name, manifest in BUILD_OUTPUT.items() if manifest]
-    tests = ["-mindepth", "1"]
-    for kind, names, action in (
-        ("d", plain, ["-prune", "-printf", GUEST_RECORD]),
-        ("d", needy, ["-printf", GUEST_RECORD]),
-        ("f", sorted(MANIFEST_NAMES), ["-printf", GUEST_RECORD]),
-    ):
-        tests += ["(", "-type", kind] + any_name(names) + action + [")", "-o"]
-    found = list_guest(sources, tests[:-1], lists_starts=False)
-    asked = {"d": frozenset(BUILD_OUTPUT), "f": MANIFEST_NAMES}
-    for entry in found.values():
-        # find was asked for these names and types only.
-        if posixpath.basename(entry.path) not in asked.get(entry.kind, ()):
-            raise YoError(
-                "the guest's listing has a path find was not asked for: '%s'"
-                % ui.shown(entry.path)
-            )
-    manifests_present = {path for path, entry in found.items() if entry.kind == "f"}
-    confirmed = sorted(
-        path
-        for path, entry in found.items()
-        if entry.kind == "d" and has_manifest(path, manifests_present)
-    )
-    outermost: List[str] = []
-    for path in confirmed:
-        if not any(path.startswith(kept + "/") for kept in outermost):
-            outermost.append(path)
-    # A path under two sources (":~/proj/sub :~/proj") is reached from both,
-    # so both are walked; attributed to one, the other would be fetched whole.
+def build_output_find_argv(sources: Sequence[str]) -> List[str]:
+    """`find` printing, NUL-terminated, each directory below `sources` that is
+    build output (BUILD_OUTPUT, beside its manifest where it has one), and
+    never entering one. A source itself is never judged: the operator named it."""
+    tests: List[str] = []
+    for name in BUILD_OUTPUT:
+        test = ["-name", name]
+        manifest = BUILD_OUTPUT_MANIFESTS.get(name)
+        if manifest is not None:
+            test += ["-exec", "test", "-f", "{}/../%s" % manifest, ";"]
+        tests += (["-o"] if tests else []) + test
     return [
-        (source, path)
-        for path in outermost
-        for source in sources
-        if path.startswith(source + "/")
+        "find",
+        *sources,
+        "-mindepth",
+        "1",
+        "-type",
+        "d",
+        "(",
+        *tests,
+        ")",
+        "-prune",
+        "-print0",
     ]
 
 
-def has_manifest(directory: str, manifests_present: Set[str]) -> bool:
-    manifest = BUILD_OUTPUT[posixpath.basename(directory)]
-    return manifest is None or (
-        posixpath.join(posixpath.dirname(directory), manifest) in manifests_present
+def guest_build_output(sources: Sequence[str]) -> List[str]:
+    """The tar member names (source name, then the path below it) of the build
+    output under `sources`, found on the box before the download, so its bytes
+    never cross."""
+    listing = sshx.probe(AGENT, build_output_find_argv(sources), binary=True)
+    if listing.returncode != 0:
+        raise YoError(
+            "cannot read %s in the guest (find exited %d)%s"
+            % (
+                ", ".join(ui.shown(source) for source in sources),
+                listing.returncode,
+                proc.what_it_said(listing),
+            )
+        )
+    found = [os.fsdecode(raw) for raw in listing.stdout.split(b"\0") if raw]
+    members = []
+    for source in sources:
+        below = source.rstrip("/") + "/"
+        members += [
+            posixpath.join(posixpath.basename(source), path[len(below) :])
+            for path in found
+            if path.startswith(below)
+        ]
+    return members
+
+
+def guest_tar_argv(sources: Sequence[str], excluded: Sequence[str]) -> List[str]:
+    # Each excluded member is matched whole, from the start of its name, never
+    # as a pattern. --add-file takes a name that starts with "-"; the guest's
+    # tar is GNU tar.
+    argv = ["tar", "--anchored", "--no-wildcards"]
+    argv += ["--exclude=" + member for member in excluded] + ["-cf", "-"]
+    for source in sources:
+        parent, name = posixpath.dirname(source), posixpath.basename(source)
+        argv += ["-C", parent, "--add-file=" + name]
+    return argv
+
+
+# The agent writes the stream, so the host's tar lands data, names and mode
+# bits only: never an owner, ACL, extended attribute or file flag it carries.
+# bsdtar (macOS) restores ACLs, xattrs and flags by default; GNU tar spells the
+# refusals differently and has no file flags.
+HOST_TAR_UNPACK_FLAGS = {
+    "bsdtar": [
+        "--no-same-owner",
+        "--no-same-permissions",
+        "--no-acls",
+        "--no-xattrs",
+        "--no-fflags",
+        "--no-mac-metadata",
+    ],
+    "GNU tar": [
+        "--no-same-owner",
+        "--no-same-permissions",
+        "--no-acls",
+        "--no-xattrs",
+        "--no-selinux",
+    ],
+}
+
+
+def host_tar_unpack_argv(staging: str) -> List[str]:
+    said = proc.run(["tar", "--version"], check=True).stdout
+    for flavour, flags in HOST_TAR_UNPACK_FLAGS.items():
+        if flavour in said:
+            return ["tar", "-x"] + flags + ["-C", staging]
+    raise YoError(
+        "the host's tar is neither bsdtar nor GNU tar, so yo cannot tell it to "
+        "drop owners, ACLs and xattrs from a download; it says: %s"
+        % ui.shown(said.strip())
     )
 
 
-def directories_down_to(source: str, path: str) -> Iterator[str]:
-    """The directories from `source` to the parent of `path`, which lies under it."""
-    directory = posixpath.dirname(path)
-    while directory != source:
-        yield directory
-        directory = posixpath.dirname(directory)
-    yield source
-
-
-# The bytes of source operands one scp call is given. A directory with thousands
-# of entries would overflow the argv limit (macOS: ARG_MAX of 1 MiB, shared with
-# the environment and scp's own options); a sixteenth of it leaves that room and
-# still moves a whole directory in a few calls.
-SCP_ARGV_BUDGET = 64 * 1024
-
-
-def in_batches(operands: Sequence[str]) -> Iterator[List[str]]:
-    """`operands` (as scp receives them: host, escapes and all) in runs that fit
-    SCP_ARGV_BUDGET. An operand over the budget by itself gets a run of its own."""
-    batch: List[str] = []
-    size = 0
-    for operand in operands:
-        cost = len(os.fsencode(operand)) + 1  # the NUL that ends it in argv
-        if batch and size + cost > SCP_ARGV_BUDGET:
-            yield batch
-            batch, size = [], 0
-        batch.append(operand)
-        size += cost
-    if batch:
-        yield batch
-
-
-# find's %y letters scp -r copies: directory, regular file, symlink.
-FETCHABLE_KINDS = frozenset({"d", "f", "l"})
-
-
-@dataclass(frozen=True)
-class GuestWalk:
-    # What is left of the directories that held build output: every entry of
-    # `walked`, and for each its children, found on the guest. A directory that
-    # `skipped` names is left out whole.
-    entries: Dict[str, GuestEntry]
-    children: Dict[str, List[str]]
-    walked: Set[str]
-    skipped: Set[str]
-
-
-def as_pulled(source: str, path: str) -> str:
-    """`path`, inside the guest `source`, spelled as it lands: from the source's
-    own name down, which is how every skip is reported. Only for messages, so it
-    is already safe to print."""
-    return ui.shown(posixpath.relpath(path, posixpath.dirname(source)))
-
-
-def fetch_walked(walk: GuestWalk, source: str, directory: str, local: str) -> None:
-    # scp -r takes a whole directory or none of it. So a directory that holds
-    # build output is made here with the mode and time scp -p would give it
-    # (sftp-mode scp makes a directory with its mode plus S_IRWXU), and its
-    # children are fetched one by one, each a whole tree that holds none.
-    entry = walk.entries.get(directory)
-    children = walk.children.get(directory)
-    # The first listing found build output inside every walked directory, so a
-    # second that shows none, or no directory, disagrees with it: the tree
-    # changed between the two (npm removing node_modules) or a listing lies.
-    if entry is None or entry.kind != "d" or children is None:
-        raise YoError(
-            '"%s" changed in the guest while it was being listed; copy it again'
-            % as_pulled(source, directory)
-        )
-    os.makedirs(local, mode=(entry.mode & 0o1777) | stat.S_IRWXU, exist_ok=True)
-    plain: List[str] = []
-    for child in children:
-        if child in walk.walked:
-            fetch_walked(
-                walk, source, child, os.path.join(local, posixpath.basename(child))
-            )
-        elif child in walk.skipped:
-            continue
-        elif walk.entries[child].kind in FETCHABLE_KINDS:
-            plain.append(child)
-        else:
-            # scp -r passes over a fifo or a socket inside a directory with a
-            # warning, but fails when one is named on its own.
-            ui.err('yo: skipped "%s": not a regular file' % as_pulled(source, child))
-    for batch in in_batches([scp_guest_source(path) for path in plain]):
-        scp_transfer(batch, local)
-    os.utime(local, (entry.mtime, entry.mtime))
-
-
 def fetch_guest_sources(sources: Sequence[str], staging: str) -> None:
-    # scp has no exclude option and a directory it fetches is fetched whole, so
-    # build output is found on the guest first (the bytes of a node_modules
-    # never cross) and scp is asked for only what is left.
-    build_output = find_build_output(sources)
-    walked = {
-        directory
-        for source, path in build_output
-        for directory in directories_down_to(source, path)
-    }
-    whole = [source for source in sources if source not in walked]
-    if whole:
-        scp_transfer([scp_guest_source(source) for source in whole], staging)
-    if walked:
-        entries = list_guest(
-            sorted(walked),
-            ["-maxdepth", "1", "-printf", GUEST_RECORD],
-            lists_starts=True,
+    # The guest tars the sources into ssh's stdout and the host's tar unpacks
+    # that stream into staging, which it never leaves: tar refuses a ".."
+    # member and does not write through a symlink. Each stderr goes to a file,
+    # because a pipe would need a reader for the process not to block on it.
+    excluded = guest_build_output(sources)
+    guest_command = shlex.join(guest_tar_argv(sources, excluded))
+    with tempfile.TemporaryFile() as guest_said, tempfile.TemporaryFile() as tar_said:
+        unpack = host_tar_unpack_argv(staging)
+        ssh = proc.spawn(
+            sshx.ssh_argv(AGENT, "-n", state.box.vm_host, guest_command),
+            stdout=subprocess.PIPE,
+            stderr=guest_said,
         )
-        children: Dict[str, List[str]] = {}
-        for path in sorted(entries):
-            children.setdefault(posixpath.dirname(path), []).append(path)
-        walk = GuestWalk(entries, children, walked, {path for _, path in build_output})
-        for source in sources:
-            if source in walked:
-                fetch_walked(
-                    walk,
-                    source,
-                    source,
-                    os.path.join(staging, posixpath.basename(source)),
-                )
-    for source, path in build_output:
-        ui.err('yo: skipped "%s": %s' % (as_pulled(source, path), BUILD_OUTPUT_NOTE))
+        try:
+            tar = proc.spawn(unpack, stdin=ssh.stdout, stderr=tar_said)
+        except BaseException:
+            ssh.kill()
+            ssh.wait()
+            raise
+        finally:
+            ssh.stdout.close()  # tar holds the reading end now
+        tar.wait()
+        ssh.wait()
+        guest_said.seek(0)
+        tar_said.seek(0)
+        said = guest_said.read().decode("utf-8", "replace")
+        unpack_said = tar_said.read().decode("utf-8", "replace")
+    if ssh.returncode != 0:
+        raise YoError(
+            "cannot read %s in the guest (tar exited %d)%s"
+            % (
+                ", ".join(ui.shown(source) for source in sources),
+                ssh.returncode,
+                proc.said_suffix(ui.quoted_block(said)),
+            )
+        )
+    if tar.returncode != 0:
+        raise YoError(
+            "cannot unpack the download (tar exited %d)%s"
+            % (tar.returncode, proc.said_suffix(ui.shown(unpack_said.strip())))
+        )
+    for member in excluded:
+        ui.err('yo: skipped "%s": %s' % (ui.shown(member), BUILD_OUTPUT_NOTE))
 
 
 def land_staged(moves: Sequence[Tuple[str, str]]) -> None:
@@ -651,11 +532,11 @@ def download_from_guest(sources: Sequence[str], dest: str) -> None:
 
 
 def stage_and_land(sources: Sequence[str], dest: str) -> None:
-    # sources are guest paths, not yet escaped for scp.
-    # scp into a staging directory beside the destination instead of onto it:
-    # scp writes through any symlink it meets there, so a link the agent
-    # committed into a repo (notes -> ../../.zshrc) would overwrite a Mac file
-    # on the next pull. Same filesystem, so landing each entry is a rename.
+    # Unpack into a staging directory beside the destination instead of onto
+    # it: landing is then judged entry by entry (plan_merge), so a link the
+    # agent committed into a repo (notes -> ../../.zshrc) cannot be written
+    # through on the next pull. Same filesystem, so landing each entry is a
+    # rename.
     dest_is_dir = os.path.isdir(dest)
     if dest.endswith("/") and not dest_is_dir:
         raise YoError('destination "%s" is not a directory' % ui.shown(dest))

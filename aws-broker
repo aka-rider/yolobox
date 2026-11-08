@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import contextlib
-import fcntl
 import http.server
+import io
 import json
 import os
 import re
@@ -24,48 +24,34 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from yolobox_cli.common import (  # noqa: E402
     PROFILE_NAME_PATTERN,
     PROFILE_NAME_RE,
+    held_flock,
     pid_exit_watch,
     sanitize,
 )
 
-# At most this many /creds/ requests are served at once; the next one is told
-# 503 immediately instead of queueing a thread behind a stuck mint. /health
-# takes no slot, so it is never busy.
-MAX_CONCURRENT_REQUESTS = 32
-# At most this many connections are open on the guest socket at once; the next
-# one is closed at accept, before a thread or a deadline timer is spent on it.
-# The guest is the untrusted side and can open them as fast as it likes. Twice
-# the /creds/ slots, so a full house of mints still leaves room for probes and
-# for the 503 replies.
-MAX_CONNECTIONS = 64
-# The control socket serves yo's /health and nothing else, and only the host
-# reaches it; the bound just keeps a runaway host process from piling up threads.
-MAX_CONTROL_CONNECTIONS = 8
-# The request line and the headers together, a GET's whole request. The stdlib
-# allows 64 KiB for the line and 100 headers of 64 KiB, which is 6.4 MB a
-# connection; a real request is a couple of hundred bytes.
-MAX_REQUEST_HEAD_BYTES = 8192
 EXIT_OK = 0
 # Without a working watch nothing would ever end this broker, so it ends itself
 # and says so in its exit status.
 EXIT_WATCH_FAILED = 1
-# `aws configure export-credentials` gets this long before it is killed; an SSO
-# login prompt or a hung credential_process must not park a profile's lock.
+# `aws configure export-credentials` gets this long before it is killed: an SSO
+# login prompt or a hung credential_process must not park the broker.
 MINT_TIMEOUT_SECONDS = 30
-# One wall-clock budget per connection, from accept to close: reading the
-# request, waiting for the profile lock, and a mint (MINT_TIMEOUT_SECONDS at
-# most). A client that trickles bytes cannot stretch it, as it could a
-# per-recv timeout.
-REQUEST_DEADLINE_SECONDS = 60
-# How long a request waits for a profile's lock before it is told 503. Under
-# the deadline minus a mint, so a waiter that gets the lock can still mint.
-PROFILE_LOCK_TIMEOUT_SECONDS = 15
+# Each socket serves one connection at a time and the rest wait in the listen
+# backlog, so a connection is bounded in time: its request line and headers
+# must have arrived this long after the accept, whatever the pace of the
+# client's bytes, ...
+REQUEST_HEAD_SECONDS = 10
+# ... and in size: a real request is a couple of hundred bytes, the stdlib
+# would allow 6.4 MB.
+MAX_REQUEST_HEAD_BYTES = 8192
+# ... and the reply, a kilobyte at most, is written within this long.
+SEND_TIMEOUT_SECONDS = 10
 # Cached credentials with less than this left are minted again: a guest that
 # gets them has time to use them before they lapse.
 REMINT_WINDOW_SECONDS = 600
-# Default for --min-remint-interval: a failing mint (an expired SSO login) is
-# retried at most this often, not on every request.
-DEFAULT_MIN_REMINT_INTERVAL_SECONDS = 5.0
+# A failing mint (an expired SSO login) is retried at most this often, not on
+# every request.
+MIN_REMINT_INTERVAL_SECONDS = 5.0
 # A live broker answers a connect at once; a probe that hangs is not one.
 SOCKET_PROBE_TIMEOUT_SECONDS = 1.0
 # The "Version" field of botocore's credential_process JSON.
@@ -73,18 +59,13 @@ CREDENTIAL_PROCESS_VERSION = 1
 # The one Expiration shape served: with a zone, because botocore rejects
 # a timestamp without one.
 EXPIRATION_SERVED_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-# The listen backlog, above MAX_CONCURRENT_REQUESTS so a burst waits in the
-# kernel instead of being refused.
+# The listen backlog, which bounds the connections waiting for the one handler.
 REQUEST_QUEUE_SIZE = 64
-# A guest-chosen request path is cut to this many characters in broker.log, so
-# a loop of long requests cannot grow the log by 64 KB a line.
+# A guest-chosen request path is cut to this many characters in broker.log.
 LOGGED_PATH_MAX = 256
-# The detail of an event line: room for a traceback, not for a request head.
-LOGGED_DETAIL_MAX = 4096
-# How long EventLog collapses repeats of a kind of event into a count.
-LOG_WINDOW_SECONDS = 60
-# How long the exit path waits for EventLog's lock before writing the count anyway.
-EXIT_LOG_WAIT_SECONDS = 1.0
+# The guest chooses how often the broker writes a line, so broker.log rolls
+# over to broker.log.1 at this size and the two never hold more than twice it.
+LOG_MAX_BYTES = 1 << 20
 
 
 def clip(text, limit=LOGGED_PATH_MAX):
@@ -94,69 +75,36 @@ def clip(text, limit=LOGGED_PATH_MAX):
 
 
 def log(msg):
-    print(sanitize(msg), file=sys.stderr, flush=True)
+    sys.stderr.write(sanitize(msg) + "\n")
+    sys.stderr.flush()
 
 
-class EventLog:
-    """Every log line a guest connection can cause goes through here.
+class CappedLog(io.TextIOBase):
+    """broker.log as sys.stderr, rolled over to broker.log.1 before a write
+    would take it past LOG_MAX_BYTES. fd 2 follows the live file, so what
+    Python itself writes there (a fatal error) lands beside the lines."""
 
-    The guest is the untrusted side and can send requests as fast as it likes,
-    so broker.log must grow at a rate the guest does not choose. The first event
-    of each kind in a window is written with its detail; the rest of the window
-    only counts repeats, written as one line when the window closes. A kind is
-    a fixed string chosen by this file, never guest text, so a window costs at
-    most one line per kind plus the count line, whatever the guest sends.
-
-    A window opens at its first event and closes at the first event after
-    `window` seconds, with no timer thread: a log line is written only on the
-    thread that caused it, so logging can never need a thread it cannot get.
-    """
-
-    def __init__(self, window=LOG_WINDOW_SECONDS):
-        self.window = window
+    def __init__(self, path):
+        self.path = path
+        # Taken by whichever thread logs, never by a signal handler: a handler
+        # that logged while the thread it interrupted held this would wait
+        # for itself.
         self.lock = threading.Lock()
-        self.repeats = {}  # kind -> events in this window after the first
-        self.opened = None  # monotonic time of the window's first event
+        self.reopen()
 
-    def note(self, kind, detail=""):
+    def reopen(self):
+        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        os.dup2(fd, 2)
+        os.close(fd)
+
+    def write(self, text):
+        data = text.encode("utf-8", "replace")
         with self.lock:
-            now = time.monotonic()
-            if self.opened is not None and now - self.opened >= self.window:
-                self._close_window_locked()
-            if self.opened is None:
-                self.opened = now
-            if kind in self.repeats:
-                self.repeats[kind] += 1
-                return
-            self.repeats[kind] = 0
-            log(f"{kind}: {clip(detail, LOGGED_DETAIL_MAX)}" if detail else kind)
-
-    def close_window(self):
-        with self.lock:
-            self._close_window_locked()
-
-    def close_window_at_exit(self):
-        """close_window on the way out, so the count of a window still open
-        reaches the log. The SIGTERM handler runs on the main thread, which
-        serves the guest socket and can itself be inside note() holding the
-        lock (a refused connection is noted there), so a plain acquire could
-        wait on itself forever. Waits a moment for whoever holds it, then
-        writes the summary anyway: the process exits next, and a count off by
-        the one event in flight beats a broker that never exits."""
-        held = self.lock.acquire(timeout=EXIT_LOG_WAIT_SECONDS)
-        try:
-            self._close_window_locked()
-        finally:
-            if held:
-                self.lock.release()
-
-    def _close_window_locked(self):
-        repeats = {kind: n for kind, n in self.repeats.items() if n}
-        self.repeats = {}
-        self.opened = None
-        if repeats:
-            counted = ", ".join(f"{n} x {kind}" for kind, n in repeats.items())
-            log(f"in the last {self.window:g}s, also: {counted}")
+            if os.fstat(2).st_size + len(data) > LOG_MAX_BYTES:
+                os.replace(self.path, self.path + ".1")
+                self.reopen()
+            os.write(2, data)
+        return len(text)
 
 
 def fail(msg):
@@ -171,38 +119,12 @@ def parse_args():
     p.add_argument("--control-socket", required=True, metavar="PATH")
     p.add_argument("--watch-pid", type=int, required=True)
     p.add_argument("--allow", nargs="+", required=True, metavar="PROFILE")
-    p.add_argument(
-        "--min-remint-interval", type=float, default=DEFAULT_MIN_REMINT_INTERVAL_SECONDS
-    )
+    p.add_argument("--log", required=True, metavar="PATH")
     args = p.parse_args()
     for name in args.allow:
         if not PROFILE_NAME_RE.fullmatch(name):
             fail(f"invalid profile name {name!r}: must match {PROFILE_NAME_PATTERN}")
     return args
-
-
-@contextlib.contextmanager
-def held_socket_lock(socket_path):
-    """Hold an exclusive flock on the sibling `<socket>.lock` for the block.
-
-    Reclaiming a stale socket (probe, then unlink) and binding a new one are
-    two steps. Without the lock a second broker can pass the same probe, and
-    unlink the first one's fresh socket. The lock file is never removed: a
-    removed lock file would let two brokers hold two different ones.
-    """
-    lock_path = socket_path + ".lock"
-    try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    except OSError as e:
-        fail(f"cannot open lock file {lock_path}: {e}")
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError as e:
-            fail(f"cannot lock {lock_path}: {e}")
-        yield
-    finally:
-        os.close(fd)
 
 
 def reclaim_socket_path(path):
@@ -276,25 +198,27 @@ def unlink_bound(sockets):
         unlink_if_same_identity(bound.path, bound.identity)
 
 
-def exit_cleanly(why, sockets, events, status):
-    events.close_window_at_exit()
+def exit_cleanly(why, sockets, status):
     log(f"{why}; shutting down")
-    kill_running_mints()
+    if mint_in_flight is not None:
+        kill_process_group(mint_in_flight)
     unlink_bound(sockets)
     os._exit(status)
 
 
-def wait_for_pid_exit(pid, sockets, events, wait_for_exit):
+def exit_on_sigterm(stopped, sockets):
+    stopped.wait()
+    exit_cleanly("SIGTERM", sockets, EXIT_OK)
+
+
+def wait_for_pid_exit(pid, sockets, wait_for_exit):
     try:
         wait_for_exit()
     except OSError as failure:
         exit_cleanly(
-            f"waiting for pid {pid} failed: {failure}",
-            sockets,
-            events,
-            EXIT_WATCH_FAILED,
+            f"waiting for pid {pid} failed: {failure}", sockets, EXIT_WATCH_FAILED
         )
-    exit_cleanly(f"watched pid {pid} exited", sockets, events, EXIT_OK)
+    exit_cleanly(f"watched pid {pid} exited", sockets, EXIT_OK)
 
 
 EXPIRATION_RE = re.compile(
@@ -324,11 +248,10 @@ def seconds_to_expiry(expiration):
     return (parse_expiration(expiration) - datetime.now(timezone.utc)).total_seconds()
 
 
-# The mints in flight, so that a broker that is stopped can end them: a
-# replaced broker os._exits, and the `aws` it left running, with whatever
-# that spawned (a credential_process, an SSO browser helper), would run on.
-running_mints = set()
-running_mints_lock = threading.Lock()
+# The `aws` a request is waiting on, so that a stopped broker can end it: a
+# replaced broker os._exits, and the `aws` it left running, with whatever that
+# spawned (a credential_process, an SSO browser helper), would run on.
+mint_in_flight = None
 
 
 def kill_process_group(proc):
@@ -338,22 +261,16 @@ def kill_process_group(proc):
         pass
 
 
-def kill_running_mints():
-    with running_mints_lock:
-        mints = list(running_mints)
-    for proc in mints:
-        kill_process_group(proc)
-
-
 # `aws` in its own session, so that a timeout ends its whole process group:
 # killing `aws` alone, as subprocess.run's timeout does, leaves a
 # credential_process it spawned running, with the pipes it inherited open.
 # Raises TimeoutExpired after MINT_TIMEOUT_SECONDS, like run().
 def run_aws(argv):
+    global mint_in_flight
     proc = subprocess.Popen(
         argv,
         # Bytes, decoded by the caller: text=True would raise on a byte that is
-        # not UTF-8 and skip the throttle's timestamp in _remint_locked.
+        # not UTF-8.
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         # The CLI may prompt (an SSO login, a device code). Stdin is
@@ -361,8 +278,7 @@ def run_aws(argv):
         stdin=subprocess.DEVNULL,
         start_new_session=True,
     )
-    with running_mints_lock:
-        running_mints.add(proc)
+    mint_in_flight = proc
     try:
         try:
             stdout, stderr = proc.communicate(timeout=MINT_TIMEOUT_SECONDS)
@@ -375,15 +291,14 @@ def run_aws(argv):
             proc.stderr.close()
             raise
     finally:
-        with running_mints_lock:
-            running_mints.discard(proc)
+        mint_in_flight = None
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 # Runs the host's full credential resolution for the profile (including any
-# credential_process) and returns the
-# process-format JSON, or (None, <one-line error>) on any failure. Never
-# raises: every caller turns a failure into ERROR=/500 output instead.
+# credential_process) and returns the process-format JSON, or
+# (None, <one-line error>) on any failure. Never raises: every caller turns a
+# failure into ERROR=/500 output instead.
 def export_credentials(profile):
     try:
         proc = run_aws(
@@ -460,38 +375,13 @@ def export_credentials(profile):
     }, None
 
 
-class ProfileBusy(Exception):
-    """Another request has held the profile's lock past PROFILE_LOCK_TIMEOUT_SECONDS."""
+class ProfileCache:
+    """One profile's cached credentials, minted by the request that needs them."""
 
-
-class State:
-    def __init__(self, profile, min_remint_interval, events):
+    def __init__(self, profile):
         self.profile = profile
-        self.min_remint_interval = min_remint_interval
-        self.events = events
-        self.lock = threading.Lock()
         self.creds = None
         self.last_mint_attempt = None
-
-    def _remint_locked(self):
-        self.events.note(f"{self.profile}: minting credentials")
-        creds, err = export_credentials(self.profile)
-        self.last_mint_attempt = time.monotonic()
-        if err:
-            self.events.note(f"{self.profile}: mint failed", err)
-            return
-        self.creds = creds
-        self.events.note(f"{self.profile}: minted", f"expires {creds['Expiration']}")
-
-    def _remint_unless_throttled_locked(self):
-        """At most one attempt per min-remint-interval: a failing mint (an
-        expired SSO login) is retried that often, not on every request."""
-        throttled = (
-            self.last_mint_attempt is not None
-            and (time.monotonic() - self.last_mint_attempt) < self.min_remint_interval
-        )
-        if not throttled:
-            self._remint_locked()
 
     def usable(self):
         """The cached credentials while they have not expired, else None."""
@@ -500,75 +390,42 @@ class State:
             return None
         return creds
 
-    # Returns usable creds, or None when nothing usable is left. A cache
-    # within REMINT_WINDOW_SECONDS of expiry is minted again by the one
-    # request that finds the lock free, while every other request is served
-    # the cache: it is still valid, and a mint can take MINT_TIMEOUT_SECONDS.
-    # A request with nothing usable has to wait for a mint, and raises
-    # ProfileBusy when the lock stays taken, so one hung mint cannot park every
-    # slot behind it. A failed refresh keeps serving the cache until it expires.
     def get(self):
+        """Usable credentials, or None when nothing usable is left. A cache within
+        REMINT_WINDOW_SECONDS of expiry is minted again first; a failed mint keeps
+        serving the cache until it expires."""
         creds = self.usable()
-        if creds is None:
-            return self._wait_for_a_mint()
-        if seconds_to_expiry(creds["Expiration"]) < REMINT_WINDOW_SECONDS:
-            self._refresh_unless_in_progress()
+        refresh_due = (
+            creds is None
+            or seconds_to_expiry(creds["Expiration"]) < REMINT_WINDOW_SECONDS
+        )
+        if refresh_due:
+            self.mint_unless_throttled()
         return self.usable()
 
-    def _refresh_unless_in_progress(self):
-        if not self.lock.acquire(blocking=False):
+    def mint_unless_throttled(self):
+        now = time.monotonic()
+        if (
+            self.last_mint_attempt is not None
+            and now - self.last_mint_attempt < MIN_REMINT_INTERVAL_SECONDS
+        ):
             return
-        try:
-            self._remint_unless_throttled_locked()
-        finally:
-            self.lock.release()
-
-    def _wait_for_a_mint(self):
-        if not self.lock.acquire(timeout=PROFILE_LOCK_TIMEOUT_SECONDS):
-            raise ProfileBusy(self.profile)
-        try:
-            # The mint this request queued behind may have filled the cache.
-            if self.usable() is None:
-                self._remint_unless_throttled_locked()
-            return self.usable()
-        finally:
-            self.lock.release()
+        self.last_mint_attempt = now
+        log(f"{self.profile}: minting credentials")
+        creds, err = export_credentials(self.profile)
+        if err:
+            log(f"{self.profile}: mint failed: {err}")
+            return
+        self.creds = creds
+        log(f"{self.profile}: minted, expires {creds['Expiration']}")
 
 
-class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
-    daemon_threads = True
+class UnixHTTPServer(socketserver.UnixStreamServer):
     request_queue_size = REQUEST_QUEUE_SIZE
-
-    def __init__(self, socket_path, handler_factory, max_connections, events):
-        self.connections = threading.BoundedSemaphore(max_connections)
-        self.events = events
-        super().__init__(socket_path, handler_factory)
-
-    # The bound is taken here, in the accept loop, before the base class starts
-    # a thread: whatever a client sends, it costs this broker one of
-    # max_connections threads at most. A connection over the bound is closed at
-    # once.
-    def process_request(self, request, client_address):
-        if not self.connections.acquire(blocking=False):
-            self.events.note("too many open connections; closing new ones")
-            self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            # No thread took the connection over, so its slot is still ours.
-            self.connections.release()
-            raise
-
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self.connections.release()
 
     # The base class prints the traceback to stderr as it is, past sanitize().
     def handle_error(self, request, client_address):
-        self.events.note("request handler crashed", traceback.format_exc())
+        log(f"request handler crashed: {traceback.format_exc()}")
 
 
 # The 500 body the guest sees. Everything that could carry detail (aws
@@ -579,8 +436,6 @@ def mint_failed_body(profile):
         "the detail is in broker.log\n"
     )
 
-
-BUSY_BODY = "broker busy; retry\n"
 
 REQUEST_FAILED_BODY = "request failed; the detail is in broker.log\n"
 
@@ -612,29 +467,51 @@ class RequestHeadTooLarge(Exception):
     """The request line and headers ran past MAX_REQUEST_HEAD_BYTES."""
 
 
-class CappedReader:
-    """The request's rfile, which refuses to hand out more than `limit` bytes.
+class RequestHeadTooSlow(Exception):
+    """The request line and headers were not complete within REQUEST_HEAD_SECONDS."""
 
-    The stdlib's own caps are per line (64 KiB) and per header count (100), far
-    above any request this broker serves.
-    """
 
-    def __init__(self, inner, limit):
-        self.inner = inner
-        self.remaining = limit
+class RequestHeadReader:
+    """The request's rfile: refuses more than `limit` bytes and more than
+    `seconds` in total. The socket's own timeout restarts at every byte, so a
+    client trickling one byte per timeout would otherwise hold the broker for
+    ever."""
+
+    def __init__(self, sock, limit, seconds):
+        self.sock = sock
+        self.limit = limit
+        self.deadline = time.monotonic() + seconds
+        self.received = 0
+        self.buffer = b""
 
     def readline(self, size=-1):
-        # One byte past what is left, so that overshooting is seen as such.
-        if size < 0 or size > self.remaining + 1:
-            size = self.remaining + 1
-        line = self.inner.readline(size)
-        self.remaining -= len(line)
-        if self.remaining < 0:
-            raise RequestHeadTooLarge()
+        while b"\n" not in self.buffer and (size < 0 or len(self.buffer) < size):
+            chunk = self.receive()
+            if not chunk:
+                break
+            self.buffer += chunk
+        end = self.buffer.find(b"\n") + 1 or len(self.buffer)
+        if size >= 0:
+            end = min(end, size)
+        line, self.buffer = self.buffer[:end], self.buffer[end:]
         return line
 
+    def receive(self):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise RequestHeadTooSlow()
+        self.sock.settimeout(left)
+        try:
+            chunk = self.sock.recv(4096)
+        except socket.timeout:
+            raise RequestHeadTooSlow() from None
+        self.received += len(chunk)
+        if self.received > self.limit:
+            raise RequestHeadTooLarge()
+        return chunk
+
     def close(self):
-        self.inner.close()
+        pass
 
 
 class HealthHandler(http.server.BaseHTTPRequestHandler):
@@ -643,68 +520,39 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
     The control socket serves this alone; GuestHandler adds /creds/.
     """
 
+    def __init__(self, caches, watch_pid, *args, **kwargs):
+        self.caches = caches
+        self.watch_pid = watch_pid
+        super().__init__(*args, **kwargs)
+
     # The Server header: the stdlib's names the Python version too.
     def version_string(self):
         return "aws-broker"
 
-    def __init__(self, states, watch_pid, events, *args, **kwargs):
-        self.states = states
-        self.watch_pid = watch_pid
-        self.events = events
-        super().__init__(*args, **kwargs)
-
     def setup(self):
         super().setup()
-        self.rfile = CappedReader(self.rfile, MAX_REQUEST_HEAD_BYTES)
+        self.rfile = RequestHeadReader(
+            self.connection, MAX_REQUEST_HEAD_BYTES, REQUEST_HEAD_SECONDS
+        )
 
-    # Every connection lives under one wall-clock deadline: when it passes,
-    # the timer shuts the socket down, which fails whatever read or write the
-    # handler is blocked in. A trickling client therefore cannot hold a thread
-    # for longer. A timer that fires after the handler finished finds
-    # `finished` set and does nothing: the socket is the base class's to close.
     def handle(self):
-        self.out_of_time = threading.Event()
-        self.finished = False
-        self.finish_lock = threading.Lock()
-        deadline = threading.Timer(REQUEST_DEADLINE_SECONDS, self._deadline_passed)
-        deadline.daemon = True
-        deadline.start()
         try:
             super().handle()
         except RequestHeadTooLarge:
-            self.events.note(
-                f"request head over {MAX_REQUEST_HEAD_BYTES} bytes; closed"
-            )
+            log(f"request head over {MAX_REQUEST_HEAD_BYTES} bytes; closed")
+        except RequestHeadTooSlow:
+            log(f"request head not complete after {REQUEST_HEAD_SECONDS}s; closed")
         except OSError as failure:
-            # What the shutdown below breaks is expected and already noted. Any
-            # other socket error is the client's doing (it closed early, say):
-            # one line, never the traceback the base class would print.
-            if not self.out_of_time.is_set():
-                self.events.note("client connection failed", str(failure))
-        finally:
-            with self.finish_lock:
-                self.finished = True
-            deadline.cancel()
+            # The client's doing (it hung up before the answer, say): one line,
+            # never the traceback the base class would print.
+            log(f"client connection failed: {failure}")
 
-    def _deadline_passed(self):
-        with self.finish_lock:
-            if self.finished:
-                return
-            self.out_of_time.set()
-            self.events.note("request deadline passed; closing the connection")
-            try:
-                self.connection.shutdown(socket.SHUT_RDWR)
-            except OSError as failure:
-                self.events.note("closing the connection failed", str(failure))
-
-    # The base class's access line per response and its line per send_error,
-    # both unbounded; the event log counts them instead. (Its log_message is
-    # never reached: these two are its only callers.)
+    # The base class's access line and error line both go to stderr unsanitized.
     def log_request(self, code="-", size="-"):
-        self.events.note(f"answered {int(code)}", clip(self.requestline))
+        log(f"answered {int(code)}: {clip(self.requestline)}")
 
     def log_error(self, fmt, *args):
-        pass
+        log(fmt % args)
 
     # The base class answers a bad request line or an unsupported method with
     # an HTML page that names the Python version; the guest gets the same
@@ -714,6 +562,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
         self._send(text_reply(HTTPStatus(code), REQUEST_FAILED_BODY))
 
     def _send(self, reply):
+        self.connection.settimeout(SEND_TIMEOUT_SECONDS)
         body = reply.body.encode()
         self.send_response(reply.status)
         self.send_header("Content-Type", reply.content_type)
@@ -721,108 +570,75 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _guarded(self, route, failure_body):
-        """Return route()'s Reply, or a 500 with failure_body if it raises."""
-        try:
-            return route()
-        except Exception:
-            # A bug or an unexpected shape must become a clean 500, never a
-            # dropped connection. The traceback carries the exception's own
-            # message, so no code on this path may put a credential in one.
-            self.events.note(
-                "request failed", f"{clip(self.path)}\n{traceback.format_exc()}"
-            )
-            return text_reply(HTTPStatus.INTERNAL_SERVER_ERROR, failure_body)
-
     def health(self):
         """What /health answers on this socket: yo's view, for the host only."""
         return {
             "pid": os.getpid(),
             "watch_pid": self.watch_pid,
-            "allow": sorted(self.states),
+            "allow": sorted(self.caches),
         }
 
-    def _route(self):
+    def route(self):
         """Return the Reply for GET self.path; may raise."""
         if self.path == "/health":
             return json_reply(HTTPStatus.OK, self.health())
         return text_reply(HTTPStatus.NOT_FOUND, "")
 
     def do_GET(self):
-        self._send(self._guarded(self._route, REQUEST_FAILED_BODY))
+        try:
+            reply = self.route()
+        except Exception:
+            # A bug or an unexpected shape must become a clean 500, never a
+            # dropped connection. The traceback carries the exception's own
+            # message, so no code on this path may put a credential in one.
+            log(f"request failed: {clip(self.path)}\n{traceback.format_exc()}")
+            reply = text_reply(HTTPStatus.INTERNAL_SERVER_ERROR, REQUEST_FAILED_BODY)
+        self._send(reply)
 
 
 class GuestHandler(HealthHandler):
     """The guest's socket: /health, and the credentials under /creds/."""
-
-    def __init__(self, states, watch_pid, events, slots, *args, **kwargs):
-        self.slots = slots
-        super().__init__(states, watch_pid, events, *args, **kwargs)
 
     # The guest learns that the broker is up and nothing about the host: the
     # pids are the host's, and the profile list is in its own config already.
     def health(self):
         return {"ok": True}
 
-    def _creds_route(self, profile):
-        """Return the Reply for GET /creds/<profile>; may raise."""
-        state = self.states.get(profile)
-        if state is None:
-            allowed = ", ".join(sorted(self.states)) or "(none)"
+    def route(self):
+        profile = creds_profile(self.path)
+        if profile is None:
+            return super().route()
+        cache = self.caches.get(profile)
+        if cache is None:
+            allowed = ", ".join(sorted(self.caches)) or "(none)"
             return text_reply(
                 HTTPStatus.FORBIDDEN,
                 f"profile '{profile}' is not allowlisted; allowed: {allowed}\n",
             )
-
-        try:
-            creds = state.get()
-        except ProfileBusy:
-            self.events.note(f"{profile}: profile lock held too long; replying 503")
-            return text_reply(HTTPStatus.SERVICE_UNAVAILABLE, BUSY_BODY)
+        creds = cache.get()
         if creds is None:
             # The mint's own failure line already says why.
             return text_reply(
                 HTTPStatus.INTERNAL_SERVER_ERROR, mint_failed_body(profile)
             )
-
         return json_reply(
             HTTPStatus.OK, {"Version": CREDENTIAL_PROCESS_VERSION, **creds}
         )
 
-    # Bounded concurrency: a /creds/ request holds one slot for its whole life,
-    # and one that finds none is turned away at once with 503 rather than
-    # queued behind a mint that may take MINT_TIMEOUT_SECONDS. /health reads
-    # only memory and takes no slot, so yo can always ask who is serving.
-    def do_GET(self):
-        profile = creds_profile(self.path)
-        if profile is None:
-            super().do_GET()
-        elif self.slots.acquire(blocking=False):
-            try:
-                reply = self._guarded(
-                    lambda: self._creds_route(profile),
-                    mint_failed_body(profile) if profile else REQUEST_FAILED_BODY,
-                )
-            finally:
-                self.slots.release()
-            self._send(reply)
-        else:
-            self.events.note("too many concurrent requests; replying 503")
-            self._send(text_reply(HTTPStatus.SERVICE_UNAVAILABLE, BUSY_BODY))
 
-
-def bind_server(socket_path, handler_factory, max_connections, events):
+def bind_server(socket_path, handler_factory):
     """Bind the 0600 unix socket and return (server, (st_dev, st_ino))."""
     # Only the socket file's own mode governs who can connect: no bearer
     # token guards these requests, and this file only ever runs on the host
     # (a Mac or a Linux PC), as the operator, with no separate agent account
     # there — 0600 restricts the socket to this user's own processes, with
-    # no window where it is world-connectable. bind() creates the socket file at mode 0777 &
-    # ~umask, so clearing every group/other/execute bit needs umask 0o177,
-    # not the 0o077 that a regular file's 0666 default would call for.
+    # no window where it is world-connectable. bind() creates the socket file
+    # at mode 0777 & ~umask, so clearing every group/other/execute bit needs
+    # umask 0o177, not the 0o077 that a regular file's 0666 default would
+    # call for.
     old_umask = os.umask(0o177)
     try:
-        server = UnixHTTPServer(socket_path, handler_factory, max_connections, events)
+        server = UnixHTTPServer(socket_path, handler_factory)
     except OSError as e:
         fail(f"cannot bind unix socket {socket_path}: {e}")
     finally:
@@ -832,29 +648,15 @@ def bind_server(socket_path, handler_factory, max_connections, events):
     return server, (st.st_dev, st.st_ino)
 
 
-def bind_guest_server(
-    socket_path,
-    states,
-    watch_pid,
-    events,
-    max_concurrent=MAX_CONCURRENT_REQUESTS,
-    max_connections=MAX_CONNECTIONS,
-):
-    slots = threading.BoundedSemaphore(max_concurrent)
+def bind_guest_server(socket_path, caches, watch_pid):
     return bind_server(
-        socket_path,
-        lambda *a, **kw: GuestHandler(states, watch_pid, events, slots, *a, **kw),
-        max_connections,
-        events,
+        socket_path, lambda *a, **kw: GuestHandler(caches, watch_pid, *a, **kw)
     )
 
 
-def bind_control_server(socket_path, states, watch_pid, events):
+def bind_control_server(socket_path, caches, watch_pid):
     return bind_server(
-        socket_path,
-        lambda *a, **kw: HealthHandler(states, watch_pid, events, *a, **kw),
-        MAX_CONTROL_CONNECTIONS,
-        events,
+        socket_path, lambda *a, **kw: HealthHandler(caches, watch_pid, *a, **kw)
     )
 
 
@@ -864,13 +666,11 @@ class Bound(NamedTuple):
     sockets: list  # of BoundSocket
 
 
-def bind_servers(socket_path, control_path, states, watch_pid, events):
+def bind_servers(socket_path, control_path, caches, watch_pid):
     """Bind the guest socket and the host-only control socket, or neither."""
-    guest, guest_identity = bind_guest_server(socket_path, states, watch_pid, events)
+    guest, guest_identity = bind_guest_server(socket_path, caches, watch_pid)
     try:
-        control, control_identity = bind_control_server(
-            control_path, states, watch_pid, events
-        )
+        control, control_identity = bind_control_server(control_path, caches, watch_pid)
     except SystemExit:
         # bind_control_server has said why; the guest socket must not outlive it.
         guest.server_close()
@@ -888,36 +688,32 @@ def bind_servers(socket_path, control_path, states, watch_pid, events):
 
 def main():
     args = parse_args()
+    caches = {profile: ProfileCache(profile) for profile in args.allow}
 
-    with held_socket_lock(args.socket):
+    # Before the bind: a failure here must not leave a socket file behind.
+    wait_for_exit = register_pid_watch_event(args.watch_pid)
+
+    # Reclaiming a stale socket (probe, then unlink) and binding a new one are
+    # two steps; the lock keeps a second broker from unlinking this one's
+    # fresh socket between them.
+    lock_path = args.socket + ".lock"
+    with contextlib.ExitStack() as startup:
+        try:
+            startup.enter_context(held_flock(lock_path, wait=True))
+        except OSError as e:
+            fail(f"cannot lock {lock_path}: {e}")
         reclaim_socket_path(args.socket)
         reclaim_socket_path(args.control_socket)
 
-        events = EventLog()
-        states = {
-            profile: State(profile, args.min_remint_interval, events)
-            for profile in args.allow
-        }
-
-        # Before the bind: a failure here must not leave a socket file behind.
-        wait_for_exit = register_pid_watch_event(args.watch_pid)
-
-        # SIGTERM is how a replaced broker is stopped; the default action would
-        # skip the unlink that the end of serve_forever does. The handler needs
-        # the socket's identity, which exists only once the bind is done, so a
-        # SIGTERM that arrives in between is held back until the handler is in
-        # place instead of killing the broker with the socket file left behind.
-        before_bind_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-        bound = bind_servers(
-            args.socket, args.control_socket, states, args.watch_pid, events
-        )
-        signal.signal(
-            signal.SIGTERM,
-            lambda signum, frame: exit_cleanly(
-                "SIGTERM", bound.sockets, events, EXIT_OK
-            ),
-        )
-        signal.pthread_sigmask(signal.SIG_SETMASK, before_bind_mask)
+        # SIGTERM is how a replaced broker is stopped. The handler only says
+        # so; a thread started below does the exiting, because a handler runs
+        # on the main thread between any two of its instructions, and logging
+        # from there could wait for a lock that very thread holds. One that
+        # arrives during the bind waits for that thread, so the socket files
+        # are not left behind.
+        stopped = threading.Event()
+        signal.signal(signal.SIGTERM, lambda signum, frame: stopped.set())
+        bound = bind_servers(args.socket, args.control_socket, caches, args.watch_pid)
 
     print("READY")
     sys.stdout.flush()
@@ -925,19 +721,20 @@ def main():
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.close(devnull_fd)
+    sys.stderr = CappedLog(args.log)
 
     threading.Thread(
+        target=exit_on_sigterm, args=(stopped, bound.sockets), daemon=True
+    ).start()
+    threading.Thread(
         target=wait_for_pid_exit,
-        args=(args.watch_pid, bound.sockets, events, wait_for_exit),
+        args=(args.watch_pid, bound.sockets, wait_for_exit),
         daemon=True,
     ).start()
+    # yo's /health on its own thread: a mint on the guest socket must not make
+    # the broker read as unreachable.
     threading.Thread(target=bound.control.serve_forever, daemon=True).start()
-
-    try:
-        bound.guest.serve_forever()
-    finally:
-        events.close_window()
-        unlink_bound(bound.sockets)
+    bound.guest.serve_forever()
 
 
 if __name__ == "__main__":

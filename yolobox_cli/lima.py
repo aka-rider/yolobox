@@ -5,23 +5,34 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import shutil
+import subprocess
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import aws, driver, proc, state, ui, unlock
+from . import aws, driver, proc, release, state, ui, unlock
 from .config import (
     AWS_BROKER_GUEST_SOCK,
     DEFAULT_INSTANCE,
     KIB,
     MAX_PORT,
-    MIB,
     OP_GUEST_SOCK,
     OPERATOR_GUEST_UID,
     SCRIPT_DIR,
+    SSH_LOCAL_PORT,
     USAGE_EXIT,
 )
-from .driver import NO_SIZE, RUNNING, BoxSize, Removal, Size, StopRefused
+from .driver import (
+    NO_SIZE,
+    DriverHints,
+    NewBox,
+    Removal,
+    Size,
+    SshFacts,
+    StopRefused,
+    VmState,
+    VmStatus,
+)
 from .ui import RunTimeout, YoError
 
 
@@ -35,6 +46,7 @@ GAP_LOAD_DOT_SSH_PUB_KEYS = "ssh.loadDotSSHPubKeys"
 GAP_UDP_FORWARDS = "portForwards.udp"
 GAP_TCP_FORWARDS = "portForwards.tcp"
 GAP_OPERATOR_UID = "user.uid"
+GAP_VM_TYPE = "vmType"
 
 # The guest TCP ports lima mirrors onto the host's 127.0.0.1: unprivileged and
 # below the macOS ephemeral range (49152). A Linux host mirrors nothing: it has no
@@ -52,7 +64,7 @@ MIN_SSH_LOCAL_PORT = MIRRORED_TCP_PORTS[1] + 1
 # Codex CLI 1455-1457, Databricks 8020, gcloud 8085, Firebase 9005, kubelogin 18000.
 # (kubelogin's 8000 stays mirrored on purpose: it is also the Django and
 # http.server default.) Claude Code needs no entry: its login listens on an
-# ephemeral port, above the mirror (lima/yolobox.md).
+# ephemeral port, above the mirror.
 OAUTH_CALLBACK_PORT_RANGES = [
     [1455, 1457],
     [8020, 8020],
@@ -62,7 +74,7 @@ OAUTH_CALLBACK_PORT_RANGES = [
 ]
 
 # The order matters: lima takes the first matching rule, so the deny-list comes
-# before the range and the catch-alls come last. See lima/yolobox.md.
+# before the range and the catch-alls come last.
 LIMA_PORT_FORWARDS = [
     *[
         {
@@ -91,20 +103,23 @@ LIMA_PORT_FORWARDS = [
 
 RESTATE_PORT_FORWARDS = ".portForwards = %s" % json.dumps(LIMA_PORT_FORWARDS)
 
-LIMA_SETTING_GAPS = {
+# Per gap: what the instance does wrong, and the `limactl edit` expression
+# that undoes it while the instance is stopped. None: lima reads the setting
+# only when it creates an instance, so the instance must be recreated. A
+# missing reverse forward is no key here; restating the array adds it.
+LIMA_GAPS: Dict[str, Tuple[str, Optional[str]]] = {
     GAP_MOUNTS: ("mounts host directories into the VM", ".mounts = []"),
     GAP_FORWARD_AGENT: (
         "forwards the host's ssh agent to every lima ssh session",
         ".ssh.forwardAgent = false",
     ),
     GAP_SSH_OVER_VSOCK: (
-        "lets lima proxy ssh over vsock, which the initrd that unlocks the disk cannot answer, "
-        "and which locks the operator out of the booted box: its sshd admits the operator only "
-        "from 192.168.5.2, and a vsock peer has no IP address",
+        "lets lima ssh over vsock, where the initrd cannot answer and the "
+        "operator is locked out",
         ".ssh.overVsock = false",
     ),
     GAP_PROPAGATE_PROXY_ENV: (
-        "copies the host's HTTP(S)_PROXY into the VM, which can point the guest at a proxy on the host's loopback: an entrance to the host nobody controls",
+        "copies the host's proxy variables into the VM",
         ".propagateProxyEnv = false",
     ),
     GAP_LOAD_DOT_SSH_PUB_KEYS: (
@@ -112,52 +127,45 @@ LIMA_SETTING_GAPS = {
         ".ssh.loadDotSSHPubKeys = false",
     ),
     GAP_UDP_FORWARDS: (
-        "mirrors guest UDP listeners onto the host's localhost (including DHCP's 68 and tailscaled's 41641, which collides with the host's own Tailscale)",
+        "mirrors guest UDP listeners onto the host",
         RESTATE_PORT_FORWARDS,
     ),
     GAP_TCP_FORWARDS: (
-        "mirrors guest TCP listeners onto the host's localhost beyond the dev ports 1024–49151 (or publishes one beyond loopback)",
+        "mirrors other guest TCP ports than lima/yolobox.yaml does",
         RESTATE_PORT_FORWARDS,
     ),
-}
-
-# Gaps whose remedy is not a `limactl edit`. All are notes and not fatal: the
-# operator must still be able to start the box to copy their work out.
-# A uid lima does not report is no gap: it may belong to a healthy box, so
-# config_notes() says so and `yo status` still exits 0.
-LIMA_MANUAL_GAPS = {
     GAP_OPERATOR_UID: (
-        "has an operator whose uid is not %d (lima took the Mac account's uid), so "
-        "its files do not match the account nix/base.nix declares. Lima reads "
-        "user.uid only when it creates an instance, and `limactl edit` cannot "
-        "change file ownership. Push out what you need, then recreate the "
-        "instance from lima/yolobox.yaml, which pins the uid" % OPERATOR_GUEST_UID,
-        lambda: LIMA.recreate_command(),
+        "gives the operator another uid than %d" % OPERATOR_GUEST_UID,
+        None,
     ),
+    GAP_VM_TYPE: ("is not a vz instance, so it has no rosetta share", None),
 }
 
-# The gaps vm_up refuses to start with. Every other gap is a note: the healing
-# step adds a missing forward live, and the rest leak but lock nobody out and
-# break no promise the box makes. Over vsock, the initrd that unlocks the disk
-# cannot answer, and the guest's sshd admits the operator only from
-# 192.168.5.2, which a vsock peer, having no IP address, never is
-# (nix/base.md). A mount hands the agent a host directory, which is the one
-# thing the box promises never to do; its remedy edits the instance and
-# deletes nothing, so refusing costs the operator no work.
+# The gaps start() refuses to start with. Every other gap is a warning: the
+# session's master adds a missing forward live, and the rest leak but lock
+# nobody out and break no promise the box makes. Over vsock, the initrd that unlocks
+# the disk cannot answer, and the guest's sshd admits the operator only from
+# 192.168.5.2, which a vsock peer, having no IP address, never is. A mount
+# hands the agent a host directory, which is the one thing the box promises
+# never to do.
 LIMA_FATAL_GAPS = frozenset([GAP_SSH_OVER_VSOCK, GAP_MOUNTS])
-
-# ssh.localPort in lima/yolobox.yaml: where lima's hostagent listens on the Mac
-# for the default instance. state.driver().ssh_port() answers for any instance.
-SSH_LOCAL_PORT = 60022
 
 # The vmType lima/yolobox.yaml pins; the rosetta share exists under it only.
 LIMA_VM_TYPE = "vz"
 
 LIMA_STOP_TIMEOUT = 300
+# What `limactl start` waits for lima's ssh before it gives up: the seed's first
+# boot encrypts the root in place first, which can take an hour on a big disk.
+LIMA_START_TIMEOUT = "4h"
 
 # limactl's status for an instance it cannot load: a lima.yaml it refuses, or a
 # hostagent pid file left behind.
 BROKEN = "Broken"
+# What limactl reports while `limactl start` is still creating, downloading or
+# booting: a start waits through these and through an unlisted instance.
+PRE_BOOT_STATUSES = ("Installing", "Starting", "Stopped")
+# lima's own key file, which logs in as the operator and, in the initrd, as root.
+LIMA_USER_KEY = ".lima/_config/user"
 
 
 class BrokenInstance(YoError):
@@ -199,13 +207,7 @@ def lima_instance_exists() -> bool:
     limactl is broken would otherwise look like a new one to create.
     """
     argv = ["limactl", "list", "-q"]
-    completed = proc.run(argv, check=False)
-    if completed.returncode != 0:
-        raise YoError(
-            proc.failed_message(
-                shlex.join(argv), completed.returncode, proc.failure_detail(completed)
-            )
-        )
+    completed = proc.checked(proc.run(argv), shlex.join(argv))
     return state.box.name in completed.stdout.splitlines()
 
 
@@ -219,13 +221,7 @@ def lima_instance_info() -> Optional[LimaInfo]:
     if not lima_instance_exists():
         return None
     argv = ["limactl", "list", state.box.name, "--json"]
-    completed = proc.run(argv, check=False)
-    if completed.returncode != 0:
-        raise YoError(
-            proc.failed_message(
-                shlex.join(argv), completed.returncode, proc.failure_detail(completed)
-            )
-        )
+    completed = proc.checked(proc.run(argv), shlex.join(argv))
     try:
         data = json.loads(completed.stdout.strip())
     except ValueError:
@@ -299,10 +295,6 @@ def broken_instance_message(argv: Sequence[str], data: dict) -> str:
     )
 
 
-def operator_uid_readable(info: LimaInfo) -> bool:
-    return isinstance(info.user_uid, int) and not isinstance(info.user_uid, bool)
-
-
 def normalize_port_forward(rule: dict) -> dict:
     """A portForwards entry with lima's defaults filled in, as `limactl list --json` shows it.
 
@@ -353,18 +345,18 @@ def listener_rules(forwards: Sequence[object], proto: str) -> List[dict]:
     return [rule for rule in rules if rule["proto"] in (proto, "any")]
 
 
-def lima_edit_command(expression: str) -> str:
-    """The pasteable chain that applies `expression` to the stopped instance.
+def lima_edit_command(expressions: Sequence[str]) -> str:
+    """The pasteable chain that applies `expressions` to the stopped instance.
 
     It starts with `yo down`, not `limactl stop`: lima's stop exits 1 on an
     instance that is already stopped, and the chain must run from either
     state. `--tty=false` declines lima's "start the instance now?" prompt, so
     the start is `yo up`'s, with its unlock.
     """
-    return "%s && limactl edit --tty=false %s --set '%s' && %s" % (
+    return "%s && limactl edit --tty=false %s --set %s && %s" % (
         state.yo_cmd("down"),
         state.box.name,
-        expression,
+        shlex.quote(" | ".join(expressions)),
         state.yo_cmd("up"),
     )
 
@@ -397,7 +389,10 @@ def refuse_mirrored_ssh_port(port: int) -> None:
             MIN_SSH_LOCAL_PORT,
             MAX_PORT,
             lima_edit_command(
-                ".ssh.localPort=<a free port in %d-%d>" % (MIN_SSH_LOCAL_PORT, MAX_PORT)
+                [
+                    ".ssh.localPort=<a free port in %d-%d>"
+                    % (MIN_SSH_LOCAL_PORT, MAX_PORT)
+                ]
             ),
         )
     )
@@ -407,11 +402,16 @@ class LimaDriver:
     """macOS: one Lima instance per machine, run by the vz driver."""
 
     name = "lima"
-    keepalive_name = "host agent"
     instances_dir = ".lima"
-    initrd_identity = ".lima/_config/user"
-    start_command = "limactl start"
-    off_status = "Stopped"
+    hints = DriverHints(
+        keepalive_name="host agent",
+        login_fix="lima's key, ~/%s, unchanged since the box was created"
+        % LIMA_USER_KEY,
+        force_stop_command="limactl stop --force {name}",
+        where_to_look="`limactl list` shows its state, lima's hostagent log says "
+        "why ({dir}/ha.stderr.log) and the guest's console shows how far it got "
+        "({dir}/serialv.log); then run this command again",
+    )
 
     def require_tool(self) -> None:
         proc.require_tool("limactl", "brew install lima")
@@ -422,30 +422,12 @@ class LimaDriver:
             "Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
         )
 
-    def initrd_identity_agent(self) -> str:
-        return "none"
-
-    def require_login_key(self) -> None:
-        pass  # lima's own key file under ~/.lima logs in; no agent is involved
-
-    def unknown_next_step(self) -> str:
-        # serialv.log keeps the whole boot, unlike a live console.
-        return (
-            "If the login is right already, its boot log tells which: %s. While "
-            "'%s' has started and not finished there, the initrd is encrypting the "
-            "disk; leave it running. A login prompt there means a stage 2 built "
-            "before the banner mark: rebuild it with %s once %s succeeds"
-            % (
-                self.boot_log(),
-                unlock.MIGRATE_UNIT_DESCRIPTION,
-                state.yo_cmd("bootstrap"),
-                state.yo_cmd("ssh", "true"),
-            )
-        )
-
-    def login_fix(self) -> str:
-        return "lima's key, ~/%s, unchanged since the box was created" % (
-            self.initrd_identity
+    def ssh_facts(self) -> SshFacts:
+        return SshFacts(
+            self.ssh_port(),
+            release.host_user(),
+            os.path.join(state.home(), LIMA_USER_KEY),
+            "none",
         )
 
     def forward_port(self, guest_port: int) -> int:
@@ -483,15 +465,12 @@ class LimaDriver:
             ]
         )
 
-    def recreate_command(self) -> str:
-        """Delete this machine and make it again, with the `limactl create` a
-        named instance needs between the two (bootstrap's `yo up` creates only
-        the default one)."""
-        destroy, _, bootstrap = state.destroy_then_bootstrap_command().partition(" && ")
-        create = (
-            [] if state.box.name == DEFAULT_INSTANCE else [self.create_command(NO_SIZE)]
-        )
-        return " && ".join([destroy, *create, bootstrap])
+    def recreate_command(self, size: Size) -> str:
+        # A named instance needs its `limactl create` between the two, at the
+        # size; bootstrap creates only the default one.
+        if state.box.name == DEFAULT_INSTANCE:
+            return state.recreate_chain(flags=size.flags())
+        return state.recreate_chain(self.create_command(size))
 
     def ssh_port(self) -> int:
         """Where lima's hostagent listens on the Mac for this instance's sshd.
@@ -527,22 +506,15 @@ class LimaDriver:
         info = lima_instance_info()
         return info.host_agent_pid if info else None
 
-    def running_keepalive_pid(self) -> Optional[int]:
-        # limactl list only reads: the host agent is lima's, not yo's to start.
-        return self.keepalive_pid()
-
-    def keepalive_pid_error(self) -> str:
-        return state.not_up_hint(
-            "cannot read %s's host agent pid (%s %s --json)"
-            % (state.box.name, self.list_command(), state.box.name)
-        )
-
-    def vm_status(self) -> Optional[str]:
+    def vm_status(self) -> Optional[VmStatus]:
         try:
             info = lima_instance_info()
         except BrokenInstance:
-            return BROKEN
-        return info.status if info is not None else None
+            return VmStatus(VmState.OTHER, BROKEN)
+        if info is None:
+            return None
+        states = {"Running": VmState.RUNNING, "Stopped": VmState.OFF}
+        return VmStatus(states.get(info.status, VmState.OTHER), info.status)
 
     def creation_refusal(self, size: Size) -> Optional[str]:
         # Only the default instance is created here, from lima/yolobox.yaml, which
@@ -561,57 +533,17 @@ class LimaDriver:
             rerun,
         )
 
-    def current_size(self) -> BoxSize:
-        # Go template fields of limactl's own instance record (limactl list
-        # --list-fields): Memory and Disk in bytes, CPUs a count.
-        argv = [
-            "limactl",
-            "list",
-            state.box.name,
-            "--format",
-            "{{.Memory}} {{.Disk}} {{.CPUs}}",
-        ]
-        probe = proc.run(argv)
-        if probe.returncode != 0:
+    def disk_gib(self) -> int:
+        # The Disk field of limactl's own instance record, in bytes.
+        argv = ["limactl", "list", state.box.name, "--format", "{{.Disk}}"]
+        probe = proc.checked(proc.run(argv), shlex.join(argv))
+        disk = probe.stdout.strip()
+        if not proc.is_ascii_number(disk):
             raise YoError(
-                proc.failed_message(
-                    shlex.join(argv), probe.returncode, proc.failure_detail(probe)
-                )
+                "limactl reports no disk size for %s — does the instance exist? (%s)"
+                % (state.box.name, state.yo_cmd("status"))
             )
-        fields = probe.stdout.split()
-        if len(fields) != 3 or not all(proc.is_ascii_number(f) for f in fields):
-            raise YoError(
-                "limactl reports no memory, disk and CPUs for %s — does the instance "
-                "exist? (%s)" % (state.box.name, state.yo_cmd("status"))
-            )
-        memory, disk, cpus = (int(field) for field in fields)
-        return BoxSize(
-            driver.exact_gib(memory, "memory"), driver.exact_gib(disk, "disk"), cpus
-        )
-
-    def resize_refusal(self, current: BoxSize, wanted: BoxSize) -> Optional[str]:
-        # lima does not look at the host's memory when it creates one either
-        return None
-
-    def resize(self, memory_gib: int, cpus: int) -> None:
-        edit = proc.run(
-            [
-                "limactl",
-                "edit",
-                "--tty=false",
-                state.box.name,
-                "--memory",
-                str(memory_gib),
-                "--cpus",
-                str(cpus),
-            ],
-            capture=False,
-        )
-        if edit.returncode != 0:
-            raise YoError(
-                "limactl edit refused the resize (exit %d), so %s is left stopped "
-                "at its old size" % (edit.returncode, state.box.name)
-            )
+        return driver.exact_gib(int(disk), "disk")
 
     def config_gaps(self) -> List[str]:
         info = lima_instance_info()
@@ -648,124 +580,81 @@ class LimaDriver:
             gaps.append(GAP_PROPAGATE_PROXY_ENV)
         if info.load_dot_ssh_pub_keys is not False:
             gaps.append(GAP_LOAD_DOT_SSH_PUB_KEYS)
-        if operator_uid_readable(info) and info.user_uid != OPERATOR_GUEST_UID:
+        # Both read only at creation: the uid decides whose files the operator's
+        # are, and only vz has the rosetta share.
+        if info.user_uid != OPERATOR_GUEST_UID:
             gaps.append(GAP_OPERATOR_UID)
+        if info.vm_type != LIMA_VM_TYPE:
+            gaps.append(GAP_VM_TYPE)
         return gaps
 
-    def config_notes(self) -> List[str]:
-        info = lima_instance_info()
-        if info is None:
-            return []
-        notes = []
-        if not operator_uid_readable(info):
-            notes.append(
-                "%s reports no user.uid in `limactl list --json`, so yo cannot tell "
-                "whether the operator's uid is %d, as nix/base.md declares. Nothing "
-                "says the box is wrong. Check by hand, and recreate the instance only "
-                "if it is not %d: limactl list --json %s (config.user.uid), or %s"
-                % (
-                    state.box.name,
-                    OPERATOR_GUEST_UID,
-                    OPERATOR_GUEST_UID,
-                    state.box.name,
-                    state.yo_cmd("ssh", "id", "-u"),
-                )
-            )
-        if info.vm_type != LIMA_VM_TYPE:
-            # No gap: the box works, only without the rosetta share, and the
-            # remedy deletes it, so `yo status` must not fail for ever on it.
-            notes.append(
-                "%s runs on vmType %r, not %s as lima/yolobox.yaml pins, so the "
-                "rosetta share, which lets the box run x86_64 binaries, is not "
-                "there. Nothing else is wrong. Lima reads vmType when it creates an "
-                "instance, so to get %s push out what you need, then recreate it: %s"
-                % (
-                    state.box.name,
-                    info.vm_type,
-                    LIMA_VM_TYPE,
-                    LIMA_VM_TYPE,
-                    self.recreate_command(),
-                )
-            )
-        return notes
-
-    def fatal_gaps(self, gaps: Sequence[str]) -> List[str]:
-        return [gap for gap in gaps if gap in LIMA_FATAL_GAPS]
-
-    def host_gaps(self) -> List[str]:
-        return []
+    def refuse_fatal_gaps(self) -> None:
+        """Refuse an instance whose settings break the box's promises; warn
+        about the rest, which leak but lock nobody out."""
+        gaps = self.config_gaps()
+        if any(gap in LIMA_FATAL_GAPS for gap in gaps):
+            raise YoError(self.config_gap_message(gaps))
+        if gaps:
+            ui.err("yo: %s" % self.config_gap_message(gaps))
 
     def config_gap_message(self, gaps: Sequence[str]) -> str:
-        missing = [
-            gap
+        """Each gap with what it does, then the one remedy for them all: a
+        `limactl edit` of the stopped instance, or, when a gap is a setting
+        lima reads only at creation, the instance made anew."""
+        known = {
+            gap: LIMA_GAPS.get(
+                gap, ("has no reverse forward for it", RESTATE_PORT_FORWARDS)
+            )
             for gap in gaps
-            if gap not in LIMA_SETTING_GAPS and gap not in LIMA_MANUAL_GAPS
-        ]
-        lines = []
-        restated = bool(missing)
-        if missing:
+        }
+        lines = ["instance %s departs from lima/yolobox.yaml:" % state.box.name]
+        lines += ["    %s: %s" % (gap, problem) for gap, (problem, _) in known.items()]
+        edits = list(dict.fromkeys(edit for _, edit in known.values()))
+        if None in edits:
             lines.append(
-                "%s has no reverse forward for %s — restate the full array:\n    %s"
+                "lima reads %s only when it creates an instance, so recreate it; "
+                "that deletes its disk, so copy out what you need first: %s"
                 % (
-                    state.box.name,
-                    " and ".join(missing),
-                    lima_edit_command(RESTATE_PORT_FORWARDS),
+                    " and ".join(
+                        gap for gap, (_, edit) in known.items() if edit is None
+                    ),
+                    self.recreate_command(NO_SIZE),
                 )
             )
-        for gap in gaps:
-            if gap in LIMA_MANUAL_GAPS:
-                problem, remedy = LIMA_MANUAL_GAPS[gap]
-                lines.append("%s %s:\n    %s" % (state.box.name, problem, remedy()))
-                continue
-            if gap not in LIMA_SETTING_GAPS:
-                continue
-            problem, expression = LIMA_SETTING_GAPS[gap]
-            if expression == RESTATE_PORT_FORWARDS and restated:
-                lines.append(
-                    "%s %s (the restate above fixes it too)" % (state.box.name, problem)
-                )
-                continue
-            restated = restated or expression == RESTATE_PORT_FORWARDS
+        else:
             lines.append(
-                "%s %s:\n    %s"
-                % (state.box.name, problem, lima_edit_command(expression))
+                "fix it while it is stopped: %s"
+                % lima_edit_command([edit for edit in edits if edit is not None])
             )
         return "\n".join(lines)
 
     def verify_initrd_listener(self, port: int) -> None:
-        # The unlock reads its port from lima's ssh.config, not from ssh_port(),
-        # so the check ssh_port() makes is made again here. Above the mirrored
-        # range only lima's hostagent, which runs as the host user, holds the port.
+        # Above the mirrored range only lima's hostagent, which runs as the host
+        # user, holds the port.
         refuse_mirrored_ssh_port(port)
 
-    def start(self, passphrase: bytes, size: Size) -> None:
-        if lima_instance_exists():
-            start_argv = ["limactl", "start", "--tty=false", state.box.name]
+    def start(self, passphrase: bytes, new_box: Optional[NewBox]) -> None:
+        self.refuse_fatal_gaps()
+        if new_box is None:
+            instance = [state.box.name]
         else:
-            start_argv = [
-                "limactl",
-                "start",
+            instance = [
                 "--name",
                 state.box.name,
-                "--tty=false",
-                *size.flags(),
+                *new_box.flags(),
                 str(SCRIPT_DIR / "lima" / "yolobox.yaml"),
             ]
         # limactl start blocks until lima's own ssh works, which needs the disk
-        # unlocked, so it runs beside the unlock instead of before it.
-        starter = proc.spawn(start_argv)
+        # unlocked, so it runs beside the unlock instead of before it, and its
+        # own deadline must outlast the seed's in-place encryption.
+        starter = proc.spawn(
+            ["limactl", "start", "--tty=false", "--timeout", LIMA_START_TIMEOUT]
+            + instance
+        )
         try:
-            migrated = unlock.unlock_disk(passphrase, starter)
+            self.wait_until_running(starter)
+            unlock.unlock_disk(passphrase)
             rc = starter.wait()
-            if rc != 0 and migrated:
-                ui.err(
-                    "yo: lima gave up waiting while the disk was being encrypted; "
-                    "restarting the instance cleanly"
-                )
-                self.stop()
-                starter = proc.spawn(start_argv)
-                unlock.unlock_disk(passphrase, starter)
-                rc = starter.wait()
             if rc != 0:
                 raise YoError(
                     "limactl start exited %d — the VM may still be running; check: limactl list"
@@ -778,9 +667,26 @@ class LimaDriver:
             starter.wait()
             raise
 
+    def wait_until_running(self, starter: subprocess.Popen) -> None:
+        """Poll limactl until it reports the instance Running; `limactl start`
+        exiting first, or any status but a pre-boot one, ends the wait."""
+        while True:
+            status = self.vm_status()
+            if status is not None and status.state is VmState.RUNNING:
+                return
+            if starter.poll() is not None:
+                raise YoError(
+                    "limactl start exited %d before %s was Running"
+                    % (starter.returncode, state.box.name)
+                )
+            if status is not None and status.word not in PRE_BOOT_STATUSES:
+                raise unlock.vm_lost_error(status, "lima to report it Running")
+            time.sleep(unlock.INITRD_POLL_SECONDS)
+
     def stop(self) -> None:
         # An instance that is not there is left to limactl to refuse.
-        if self.vm_status() == self.off_status:
+        status = self.vm_status()
+        if status is not None and status.state is VmState.OFF:
             return
         # `yo down` reaches this without proof the box is past its initrd, so
         # the hostagent's kill, which ends the VM, is offered only once `yo ssh
@@ -788,7 +694,7 @@ class LimaDriver:
         # permission error), and only stage 2 runs `true` and exits 0.
         self.limactl_stop(
             [state.box.name],
-            "limactl stop hangs on the vz driver sometimes (TODO.md). If %s "
+            "limactl stop hangs on the vz driver sometimes. If %s "
             "succeeds (exits 0 and prints nothing), the box is past its initrd: "
             "recover with %s, then kill -9 any leftover 'limactl hostagent' for %s, "
             "then %s. If it fails in any way, the box may be in its initrd, "
@@ -807,13 +713,10 @@ class LimaDriver:
         # recovery is the hostagent's kill alone (under vz that ends the VM).
         self.limactl_stop(
             ["--force", state.box.name],
-            "limactl stop hangs on the vz driver sometimes (TODO.md); recover with: "
+            "limactl stop hangs on the vz driver sometimes; recover with: "
             "kill -9 any 'limactl hostagent' for %s (that also ends the VM) and any "
             "child it left spinning, then %s" % (state.box.name, state.yo_cmd("up")),
         )
-
-    def force_stop_command(self) -> str:
-        return "limactl stop --force %s" % state.box.name
 
     def limactl_stop(self, args: List[str], hang_recovery: str) -> None:
         argv = ["limactl", "stop", *args]
@@ -827,23 +730,10 @@ class LimaDriver:
         failed = proc.failed_message(shlex.join(argv), completed.returncode, None)
         # A stop that gave up on a box still running needs the hang's recovery;
         # one that failed on a box lima reports as not running is only a failure.
-        if self.vm_status() == RUNNING:
+        status = self.vm_status()
+        if status is not None and status.state is VmState.RUNNING:
             raise StopRefused(failed, hang_recovery)
         raise YoError(failed)
-
-    def stop_command(self) -> str:
-        return "limactl stop %s" % state.box.name
-
-    def stop_failed(self, detail: str) -> str:
-        return "limactl stop failed: %s" % detail
-
-    def stop_recovery(self) -> List[str]:
-        return [
-            "Recover with: %s" % self.stop_command(),
-            "If the stop hangs too: %s, and kill -9 any leftover"
-            % state.yo_cmd("ssh", "sudo", "systemctl", "reboot"),
-            "`limactl hostagent` process for %s." % state.box.name,
-        ]
 
     def removals(self) -> List[Removal]:
         if not lima_instance_exists():
@@ -861,38 +751,6 @@ class LimaDriver:
             ["limactl", "delete", "--force", state.box.name], capture=False, check=True
         )
 
-    def list_command(self) -> str:
-        return "limactl list"
-
-    def shown_instance_file(self, name: str) -> str:
-        """A file of the instance directory, spelled from ~ for a printed hint."""
-        return "~/%s/%s/%s" % (self.instances_dir, state.box.name, name)
-
-    def boot_log(self) -> str:
-        # Lima's own: serialv.log keeps the whole boot, unlike a live console.
-        return self.shown_instance_file("serialv.log")
-
-    def initrd_unseen_hint(self) -> str:
-        return "its boot log shows how far it got: %s" % self.boot_log()
-
-    def vm_lost_hint(self, status: Optional[str]) -> str:
-        if status is None:
-            return "instance %s no longer exists — %s" % (
-                state.box.name,
-                "%s creates it again" % state.yo_cmd("up")
-                if state.box.name == DEFAULT_INSTANCE
-                else "create it with: %s" % self.create_command(NO_SIZE),
-            )
-        return (
-            "%s shows its state, lima's hostagent log says why: %s, and the guest's "
-            "console shows how far it got: %s; then run this command again"
-            % (
-                self.list_command(),
-                self.shown_instance_file("ha.stderr.log"),
-                self.boot_log(),
-            )
-        )
-
     def show_status(self) -> Optional[str]:
         argv = ["limactl", "list", state.box.name]
         listed = proc.run(argv, capture=False)
@@ -906,23 +764,10 @@ class LimaDriver:
         kib = du_kib(os.path.join(state.instance_dir(), "disk"))
         if kib is None:
             return None
-        return self.shown_instance_file("disk"), kib
+        return "%s/disk" % state.box.tilde_dir, kib
 
-    def grow_disk(self, current_gib: int, wanted_gib: int) -> None:
-        free_kib = (
-            shutil.disk_usage(os.path.join(state.home(), self.instances_dir)).free
-            // KIB
-        )
-        image_kib = du_kib(os.path.join(state.instance_dir(), "disk")) or 0
-        ui.out(
-            "host: ~/%s has %dGiB free; the disk image allocates %dGiB today"
-            % (self.instances_dir, free_kib // MIB, image_kib // MIB)
-        )
-        ui.out(
-            "lima: raising %s from %dGiB to %dGiB"
-            % (state.box.name, current_gib, wanted_gib)
-        )
-
+    def grow_disk(self, wanted_gib: int) -> None:
+        ui.out("lima: raising %s's disk to %dGiB" % (state.box.name, wanted_gib))
         resize = proc.run(
             [
                 "limactl",

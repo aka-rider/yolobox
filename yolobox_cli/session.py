@@ -11,7 +11,7 @@ import sys
 import urllib.parse
 from typing import Optional
 
-from . import aws, common, forwards, guest, paths, proc, sshconfig, sshx, state, ui
+from . import common, forwards, guest, paths, proc, sshconfig, sshx, state, ui
 from .config import AGENT_HOME, AGENT_USER, LOOPBACK
 from .sshx import AGENT, OPERATOR
 from .ui import YoError
@@ -140,17 +140,10 @@ def cmd_zed(args: argparse.Namespace) -> None:
 
 
 def cmd_aws_check(args: argparse.Namespace) -> None:
-    if not guest.vm_units_present():
-        raise YoError(forwards.units_missing_note())
-    if not aws.ensure_aws_broker():
+    sshx.require_agent_account()
+    if not forwards.vm_services():
         raise YoError(
             "AWS is disabled on this host (no 'aws' CLI, or no SSO profiles in ~/.aws/config) — nothing to check"
-        )
-    if not forwards.heal_reverse_forward(forwards.aws_broker_forward()):
-        raise YoError(
-            "the aws-broker forward into the VM is still dead after re-issuing it — "
-            "recreate the master: %s && %s"
-            % (state.driver().stop_command(), state.yo_cmd("up"))
         )
     completed = guest.guest_helper(AGENT, "aws-check", stream=True)
     if completed.returncode != 0:

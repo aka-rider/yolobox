@@ -1,16 +1,12 @@
-{ config, pkgs, modulesPath, username, agentUser, lib, version, hostname, flakeRef, ... }:
+{ config, pkgs, modulesPath, username, lib, version, hostname, flakeRef, yolobox, facts, ... }:
 let
-  agentEnv = import ./lib/agent-env.nix {
-    agentHome = config.users.users.${agentUser}.home;
-  };
-
   opProxy = { name, listen, target }: {
     systemd.sockets.${name} = {
       description = "Agent-owned socket proxied to the operator's ${name} forward";
       wantedBy = [ "sockets.target" ];
       socketConfig = {
         ListenStream = listen;
-        SocketUser = agentUser;
+        SocketUser = facts.agent_user;
         SocketGroup = "users";
         SocketMode = "0600";
       };
@@ -25,23 +21,26 @@ let
         PrivateTmp = true;
         # The proxy runs as the operator, whose processes the agent cannot
         # ptrace, but a bug in proxyd itself would run as the operator: it
-        # gets only what copying bytes between two unix sockets needs
-        # (nix/base.md, "The proxies carry no privilege").
+        # gets only what copying bytes between two unix sockets needs.
+        # ProtectHome still allows the connect(): a unix connect needs write
+        # on the socket inode, not on the mount.
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateNetwork = true;
         RestrictAddressFamilies = "AF_UNIX";
         SystemCallFilter = "@system-service";
         CapabilityBoundingSet = "";
-        ExecStart = "${config.systemd.package}/lib/systemd/systemd-socket-proxyd /run/yolobox-op/${target}";
+        ExecStart = "${config.systemd.package}/lib/systemd/systemd-socket-proxyd ${target}";
       };
     };
   };
 
   opProxies = map opProxy [
-    { name = "yolobox-op-agent"; listen = agentEnv.env.SSH_AUTH_SOCK; target = "agent.sock"; }
-    { name = "yolobox-aws-broker"; listen = agentEnv.awsBrokerSock; target = "aws-broker.sock"; }
+    { name = facts.op_agent_proxy_unit; listen = facts.agent_auth_sock; target = facts.op_guest_sock; }
+    { name = facts.aws_broker_proxy_unit; listen = facts.agent_aws_broker_sock; target = facts.aws_broker_guest_sock; }
   ];
+  # Where the host's forwards land, the operator's alone.
+  opDir = builtins.dirOf facts.op_guest_sock;
 in
 {
   # Lets someone drop a package or setting into the running box without a
@@ -51,22 +50,9 @@ in
   ] ++ lib.optional (builtins.pathExists /etc/yolobox/local.nix) /etc/yolobox/local.nix
     ++ opProxies;
 
-  # /boot is the ESP itself, as the shipped nixos-lima image mounts it —
-  # matching the image is what keeps the first `nixos-rebuild switch` on a
-  # fresh instance from having to migrate anything. The cost is that vda1 is
-  # 249 MiB (make-disk-image's bootSize default, baked into the prebuilt
-  # qcow2 and not overridable from here), and a kernel set is ~92 MiB on top
-  # of ~14 MiB of GRUB, so two sets fit and three never do.
-  # linuxPackages_latest brings a new set every few weeks, and a full ESP
-  # fails late and ugly: the closure builds, the system profile advances,
-  # then activation dies installing the bootloader with "No space left on
-  # device" — the box still booted on the old generation while the profile
-  # claims otherwise. install-grub.pl copies every retained generation's
-  # kernel before it unlinks any obsolete one, so peak occupancy is retained
-  # plus dropped, and one is the only limit whose steady-state peak — the
-  # retained set alongside the incoming one — fits. Keeping a rollback
-  # generation across a kernel bump is thus impossible at this ESP size; on
-  # a disposable box that is a fair trade.
+  # /boot is the ESP itself, as the shipped nixos-lima image mounts it. It is
+  # 249 MiB, a kernel set is ~92 MiB beside ~14 MiB of GRUB, and GRUB copies
+  # the incoming kernel before it prunes: only one retained generation fits.
   boot.loader.grub = {
     device = "nodev";
     efiSupport = true;
@@ -78,7 +64,7 @@ in
     fsType = "vfat";
   };
   fileSystems."/" = {
-    device = "/dev/mapper/root";
+    device = "/dev/mapper/${facts.luks_mapper}";
     fsType = "ext4";
     options = [ "noatime" "nodiratime" "discard" ];
   };
@@ -93,14 +79,10 @@ in
   # vda1 ends at the sector vda2 starts on, so the ESP above is unaffected.
   boot.growPartition = true;
   boot.kernelPackages = pkgs.linuxPackages_latest;
-  # Same-uid ptrace (py-spy, gdb, strace -p). The uid split, not Yama, is the
-  # boundary; see nix/base.md#same-uid-ptrace.
-  boot.kernel.sysctl."kernel.yama.ptrace_scope" = 0;
-
   # nixos-lima's lima-init.nix sets kernel.unprivileged_userns_clone, a knob
   # only the removed -hardened kernels had; mainline has none, so systemd-sysctl
   # warned about it on every boot. User namespaces stay on through
-  # user.max_user_namespaces. See nix/base.md#sysctl-keys-the-kernel-lacks.
+  # user.max_user_namespaces.
   boot.kernel.sysctl."kernel.unprivileged_userns_clone" = lib.mkForce null;
 
   # A crash-looping language server (marksman, missing ICU) filled
@@ -111,32 +93,21 @@ in
 
   # journald's default cap is 10% of the disk, at most 4 GiB, so nothing
   # bounded a flood below that. This is the backstop for every emitter; the
-  # fix for container output is in nix/podman.nix (story: nix/podman.md).
+  # fix for container output is in nix/podman.nix.
   services.journald.settings.Journal.SystemMaxUse = "512M";
 
   services.lima.enable = true;
-  # nixos-lima declares lima-init and lima-guestagent as ordinary NixOS
-  # units, so a nixpkgs bump alone rehashes the store paths their
-  # Environment= and ExecStart= embed and switch-to-configuration reads that
-  # as "restart". Restarting the guestagent is not an ordinary bounce: lima
-  # 2.2.0 serves the event stream and the TCP Tunnel RPC from one
-  # grpc.ClientConn, and on reconnect it replaces that conn but never
-  # refreshes the dialer an existing listener already captured, so every
-  # forwarded port accepts and then resets until the host agent itself is
-  # restarted. That behaviour began with lima PR #4889 in v2.1.2, which
-  # closes the stale conn on reconnect. Both units must be pinned, not just
-  # the guestagent: systemd propagates a restart of lima-init to the
-  # guestagent through its Requires=. mkForce only on lima-init,
-  # which upstream already assigns explicitly. New guestagent code lands on
-  # the next boot, which is when the host agent is recreated anyway.
+  # A switch must not restart lima-guestagent: it breaks every port Lima
+  # forwards until the host agent restarts. systemd propagates a restart of
+  # lima-init to it through Requires=, so both are pinned.
   systemd.services.lima-guestagent.restartIfChanged = false;
   systemd.services.lima-init.restartIfChanged = lib.mkForce false;
   # The unit runs the binary Lima ships on its cidata disk; a libvirt box's
-  # cidata has none, so there it is skipped (nix/base.md, "No host OS ...").
+  # cidata has none, so there it is skipped. The gate is the binary, never the host OS.
   systemd.services.lima-guestagent.unitConfig.ConditionPathExists = "/mnt/lima-cidata/lima-guestagent";
   # nixos-lima links /etc/environment to the cidata disk, which it mounts root
-  # 0700, so every user manager failed to read it. It is always empty here
-  # (nix/base.md, "/etc/environment").
+  # 0700, so every user manager failed to read it ("Failed to chase ...
+  # Permission denied"). It is always empty here.
   environment.etc.environment.enable = false;
 
   # Upstream's user@.service ships OOMScoreAdjust=100, making the per-user
@@ -159,7 +130,7 @@ in
   # This is the operator's account — the human who drives the Mac, not any
   # agent. Takes over lima-init's existence-guarded useradd from first boot, including lima >=2.1.0's ".guest"-suffixed home
   # (lima-vm/lima#4578). That account is named after the host Mac user
-  # (`username`, threaded in impurely — see flake.nix), not a fixed name:
+  # (`username`, threaded in impurely from YOLOBOX_USERNAME), not a fixed name:
   # there is no separate "yolobox account", this declares the same account
   # cidata already created so nix and interactive SSH sessions share one
   # $HOME. NixOS refuses isNormalUser below uid 1000 (lima's cidata UID
@@ -169,14 +140,14 @@ in
   users.users.${username} = {
     isSystemUser = true;
     group = "users";
-    uid = 501;
-    home = "/home/${username}.guest";
+    uid = facts.operator_uid;
+    home = "/home/${username}${facts.operator_home_suffix}";
     extraGroups = [ "wheel" ];
     shell = pkgs.zsh;
   };
 
   # The agent's account. uid must not be 501: a second account sharing
-  # lima's uid splits state silently (see docs/accounts.md#two-accounts) —
+  # lima's uid splits state silently —
   # passwd lookups resolve a uid to
   # whichever entry comes first, so two accounts at 501 are indistinguishable
   # to whoami/SUDO_USER while modules silently write state into the wrong
@@ -188,11 +159,11 @@ in
   # the operator's `sudo ... COMMAND=<argv>` lines live. xvfb and openbox
   # therefore run as agent user units (nix/display.nix), whose logs sit in
   # the agent's own user journal, which it owns without any group.
-  users.users.${agentUser} = {
+  users.users.${facts.agent_user} = {
     isNormalUser = true;
-    uid = 1000;
+    uid = facts.agent_uid;
     group = "users";
-    home = "/home/${agentUser}";
+    home = facts.agent_home;
     shell = pkgs.zsh;
     autoSubUidGidRange = true;
     # Locked, so a hand-run `passwd` cannot turn this account into a password
@@ -213,11 +184,11 @@ in
   # another !. A missing shadow entry fails the activation: the `false`
   # trips the runner's ERR trap, which marks this snippet failed and makes
   # the activation exit nonzero after the later snippets have run. An
-  # `exit` here would skip them instead (nix/base.md, "Activation snippets").
+  # `exit` here would skip them instead.
   system.activationScripts.lockRootAndAgent = {
     deps = [ "users" ];
     text = ''
-      for account in root ${agentUser}; do
+      for account in root ${facts.agent_user}; do
         if ! entry="$(${pkgs.getent}/bin/getent shadow "$account")"; then
           echo "lockRootAndAgent: no shadow entry for $account" >&2
           false
@@ -237,14 +208,14 @@ in
   # agent's and root's names.
   assertions = [
     {
-      assertion = builtins.match "[a-z_][a-z0-9_-]*" username != null;
-      message = "YOLOBOX_USERNAME \"${username}\" is not a plain lowercase unix name ([a-z_][a-z0-9_-]*).";
+      assertion = builtins.match facts.operator_account_re username != null;
+      message = "YOLOBOX_USERNAME \"${username}\" is not a plain lowercase unix name (${facts.operator_account_re}).";
     }
   ];
 
   # github.com's published host keys, in /etc/ssh/ssh_known_hosts for both
   # accounts, so the first clone needs no trust-on-first-use prompt
-  # (nix/base.md, "github.com host keys", with the fingerprints).
+  # (verify.yml checks their fingerprints against GitHub's published ones).
   programs.ssh.knownHosts = {
     github-ed25519 = {
       hostNames = [ "github.com" ];
@@ -265,7 +236,7 @@ in
   # (enp0s1, lima's NAT network, unreachable from the LAN), so 22 is the only
   # port open there. tailscale0 is trusted whole (nix/tailscale.nix).
   services.openssh.openFirewall = false;
-  networking.firewall.interfaces.enp0s1.allowedTCPPorts = [ 22 ];
+  networking.firewall.interfaces.${facts.guest_nic}.allowedTCPPorts = [ 22 ];
   services.openssh.settings = {
     PasswordAuthentication = false;
     KbdInteractiveAuthentication = false;
@@ -274,7 +245,7 @@ in
     # unlock login, renders its own config (nix/luks.nix).
     PermitRootLogin = "no";
   };
-  # `yo cp` rides scp's sftp mode, and the story (yo.md, "yo cp") rests on no
+  # `yo cp` uploads with scp's sftp mode, and an upload rests on no
   # guest shell running for a transfer. An external sftp-server is spawned
   # through the user's login shell (`$SHELL -c`), which sources the agent's
   # ~/.zshenv first; the in-process server runs no shell at all.
@@ -283,19 +254,19 @@ in
   # session arrives, and which the agent cannot spoof off enp0s1. The agent
   # holds the forwarded 1Password agent, which serves the operator's key, and
   # on a Linux host that one key opens every box of the host: from anywhere
-  # else (the tailnet, loopback) neither account is a way in
-  # (docs/linux-host.md, "The operator's key"; nix/base.md, "No host OS ...").
-  services.openssh.settings.AllowUsers = [ "${username}@192.168.5.2" "${agentUser}@192.168.5.2" ];
+  # else (the tailnet, loopback) neither account is a way in. It holds on every
+  # box, whatever the host OS.
+  services.openssh.settings.AllowUsers = [ "${username}@${facts.gateway}" "${facts.agent_user}@${facts.gateway}" ];
   # Every host connection arrives from the gateway, so a penalty on it locks
-  # the host out; yo reads the banner mark (nix/base.md, "sshd penalties").
-  services.openssh.settings.PerSourcePenaltyExemptList = "192.168.5.2";
-  services.openssh.settings.VersionAddendum = "yolobox-stage2";
+  # the host out; yo reads the banner mark so it never offers stage 2 a root login.
+  services.openssh.settings.PerSourcePenaltyExemptList = facts.gateway;
+  services.openssh.settings.VersionAddendum = facts.stage2_ssh_banner_mark;
   networking.firewall.extraCommands = ''
-    iptables -I nixos-fw 1 ! -i enp0s1 -s 192.168.5.2 -j DROP
+    iptables -I nixos-fw 1 ! -i ${facts.guest_nic} -s ${facts.gateway} -j DROP
   '';
   networking.firewall.extraStopCommands = ''
-    if iptables -C nixos-fw ! -i enp0s1 -s 192.168.5.2 -j DROP; then
-      iptables -D nixos-fw ! -i enp0s1 -s 192.168.5.2 -j DROP
+    if iptables -C nixos-fw ! -i ${facts.guest_nic} -s ${facts.gateway} -j DROP; then
+      iptables -D nixos-fw ! -i ${facts.guest_nic} -s ${facts.gateway} -j DROP
     fi
   '';
   # The default (~agent/.ssh/authorized_keys) must not be honoured: it is
@@ -308,7 +279,7 @@ in
   # rejects any path with a group-writable component and the store is 1775,
   # which is why this is a copied /etc file (a non-symlink mode makes
   # environment.etc copy it) and not a store path.
-  environment.etc."ssh/agent-authorized-keys" = {
+  environment.etc.${lib.removePrefix "/etc/" facts.agent_keys_command} = {
     mode = "0555";
     text = ''
       #!${pkgs.runtimeShell}
@@ -318,29 +289,24 @@ in
   # `Match all` closes the block: a Match block runs to the end of the file,
   # so a later extraConfig line would otherwise apply to the agent only.
   services.openssh.extraConfig = ''
-    Match User ${agentUser}
+    Match User ${facts.agent_user}
       AuthorizedKeysFile none
-      AuthorizedKeysCommand /etc/ssh/agent-authorized-keys
+      AuthorizedKeysCommand ${facts.agent_keys_command}
       AuthorizedKeysCommandUser root
     Match all
   '';
 
-  # /var/lib/yolobox holds what yo bootstrap stamped after the build (the
-  # commit and NAR hash it built, release.py's STATE_DIR): state, not the
-  # system, so a docs-only commit keeps the generation. Nothing here writes
-  # the files; `yolobox-guest rebuild` reads them.
   systemd.tmpfiles.rules = [
-    "d /run/yolobox-op 0700 ${username} users -"
-    "d /var/lib/yolobox 0755 root root -"
+    "d ${opDir} 0700 ${username} users -"
   ];
 
   environment.localBinInPath = true;
 
   environment.extraInit = ''
-    if [ "$(id -un)" = ${lib.escapeShellArg agentUser} ]; then
+    if [ "$(id -un)" = ${lib.escapeShellArg facts.agent_user} ]; then
       ${lib.concatStringsSep "\n" (lib.mapAttrsToList
         (name: value: "export ${name}=${lib.escapeShellArg value}")
-        agentEnv.env)}
+        yolobox.agentEnv)}
     fi
   '';
 
@@ -365,8 +331,7 @@ in
     lfs.enable = true;
     config = {
       # A push into a project checkout in the VM updates its worktree, and
-      # git refuses it when the worktree or index differs from HEAD; see
-      # nix/base.md#pushing-into-a-vm-checkout.
+      # git refuses it when the worktree or index differs from HEAD.
       receive.denyCurrentBranch = "updateInstead";
       init.defaultBranch = "main";
     };
@@ -382,7 +347,7 @@ in
   environment.variables.CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
 
   # Only Lima/vz on Apple silicon runs an aarch64 guest, and it always has the
-  # rosetta share; not `nofail`, which races systemd-binfmt (nix/base.md).
+  # rosetta share; not `nofail`, which races systemd-binfmt.
   virtualisation.rosetta = lib.mkIf pkgs.stdenv.hostPlatform.isAarch64 {
     enable = true;
     mountTag = "vz-rosetta";
@@ -416,16 +381,18 @@ in
   ];
 
   environment.etc."yolobox/version".text = version + "\n";
-  # What built the box, so a rebuild from inside it reuses both instead of
-  # guessing: the flake ref and the hostname. `yolobox-guest rebuild` reads
-  # them (nix/guest/yolobox-guest.md).
+  # The exact tree the box was built from, so `yolobox-guest rebuild` builds
+  # it again instead of guessing.
   environment.etc."yolobox/flake-ref".text = flakeRef + "\n";
-  environment.etc."yolobox/hostname".text = hostname + "\n";
+  # Every fact the box's shell scripts read, one KEY=value line each, for
+  # `. /etc/yolobox/facts.sh`. The modules contribute them through
+  # yolobox.facts; this is the one place that renders them.
+  environment.etc."yolobox/facts.sh".text =
+    lib.concatStrings (lib.mapAttrsToList (key: value: "${key}=${lib.escapeShellArg value}\n") config.yolobox.facts);
 
   # The box is built from a flake ref with three variables set, which a bare
   # `nixos-rebuild switch` knows none of. Without a nixos-config it fails with
   # "file 'nixos-config' was not found", so this one says what to run instead.
-  # See nix/base.md#a-bare-nixos-rebuild.
   nix.nixPath = [
     "nixpkgs=flake:nixpkgs"
     "nixos-config=${pkgs.writeText "nixos-config.nix" ''

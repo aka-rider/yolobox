@@ -3,7 +3,7 @@
 # find expressions, the gc tiers and the AWS probe are shellchecked at build
 # time instead of living in yo's Python string literals where nothing checks
 # them. Subcommands: projects, landing-dir,
-# gc-machine, gc-user, aws-creds, aws-check, net-check, and rebuild, the one a
+# gc-machine, gc-user, aws-creds, aws-check, status, and rebuild, the one a
 # person runs inside the box rather than `yo`.
 #
 # writeShellApplication prepends `set -o errexit -o nounset -o pipefail`. The
@@ -14,23 +14,26 @@
 # `if`; the few captures that are NOT already inside an `if` are guarded
 # individually with `|| true` or an explicit `rc=$?`, right where they are.
 
-# The one place the project walk's and the Go-cache walk's pruned directory
-# names are spelled: a repo inside node_modules is not a project. gc --deep
-# walks these names too, plus REMOVED_OUTRIGHT. `yo cp` downloads drop the same
-# names on the host side (BUILD_OUTPUT in `yo`), kept equal by
-# tests/test_consistency.py.
-BUILD_DIRS=(node_modules target .next)
+# The facts of the box, YOLOBOX_<KEY>=value lines nix renders from facts.json.
+# The YOLOBOX_FACTS override is a test seam.
+# shellcheck source=/dev/null
+. "${YOLOBOX_FACTS:-/etc/yolobox/facts.sh}"
+
+# The project walk's and the Go-cache walk's pruned directory names: a repo
+# inside node_modules is not a project. gc --deep walks these names too, plus
+# REMOVED_OUTRIGHT, and `yo cp` downloads drop both lists on the host side.
+read -ra BUILD_DIRS <<<"${YOLOBOX_GC_BUILD_DIRS}"
 
 # Directories gc --deep removes with remove_tree, each only if git ignores it.
 # They are dependency installs: the project's own tooling recreates them.
-REMOVED_OUTRIGHT=(node_modules .venv)
+read -ra REMOVED_OUTRIGHT <<<"${YOLOBOX_GC_REMOVED_OUTRIGHT}"
 
-# NAME:MANIFEST pairs: a directory called NAME is build output only when
+# NAME:MANIFEST pairs, as facts.json renders a map: a directory called NAME is build output only when
 # MANIFEST sits beside it, because the name alone proves nothing (a `target`
 # can hold code or data). Without the manifest gc --deep keeps it and says so.
 # A `target` with its Cargo.toml is cleaned by `cargo clean`; a `.next` with
 # its package.json is removed outright.
-NEEDS_MANIFEST=(target:Cargo.toml .next:package.json)
+read -ra NEEDS_MANIFEST <<<"${YOLOBOX_BUILD_OUTPUT_MANIFESTS}"
 
 # The one place cache names under ~/.cache are spelled; gc --yes deletes
 # them all. Only caches a tool rebuilds or refetches by itself belong here:
@@ -40,37 +43,10 @@ LOCAL_CACHES=(go-build gopls goimports golangci-lint staticcheck uv pip pip-tool
 # What `go` writes as the first line of a build cache's README.
 GO_BUILD_CACHE_HEADER='This directory holds cached build artifacts from the Go build system.'
 
-# A box whose local configuration blocks lima's gateway by design creates this
-# file. The YOLOBOX_GATEWAY_BLOCKED override is a test seam.
-GATEWAY_BLOCKED="${YOLOBOX_GATEWAY_BLOCKED:-/etc/yolobox/gateway-blocked}"
-
-# The operator's uid: lima's cidata account, which nix/base.nix declares. Only
-# the operator rebuilds; root and the agent are refused.
-OPERATOR_UID=501
-
-# The lock a rebuild holds while nixos-rebuild runs, and the exit code flock -n
-# gives when another rebuild holds it, both equal to yo's (REBUILD_LOCK,
-# REBUILD_BUSY_EXIT). It lives in /run, which only root writes, so flock runs
-# under sudo. yo bootstrap takes the same lock: an interrupted one leaves its
-# nixos-rebuild running in the box, and a second must not start beside it. The
-# YOLOBOX_REBUILD_LOCK override is a test seam.
-REBUILD_LOCK="${YOLOBOX_REBUILD_LOCK:-/run/yolobox-rebuild.lock}"
-REBUILD_BUSY_EXIT=75
-
-# Where nix/base.nix stamps what built the box (flake-ref, hostname). The
-# YOLOBOX_STAMPS override is a test seam.
+# Where nix/base.nix stamps the version and the exact tree that built the box
+# (version, flake-ref).
+# The YOLOBOX_STAMPS override is a test seam.
 YOLOBOX_STAMPS="${YOLOBOX_STAMPS:-/etc/yolobox}"
-
-# The one flake ref shape a rebuild accepts, equal to yo's GITHUB_FLAKE_RE and
-# the flake's own check: exactly github:OWNER/REPO/REF. The stamp is root's, so
-# this is defence in depth for the --flake argument: no path:, no '#' and no
-# leading '-'. Matched whole, so it carries no anchors.
-FLAKE_REF_RE='github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*'
-
-# The one hostname shape a rebuild accepts, equal to yo's HOSTNAME_LABEL_RE
-# and the flake's own check: one lowercase DNS label. The stamp is root's, so
-# this is defence in depth for the value handed to sudo. Matched whole.
-HOSTNAME_RE='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
 
 # Exits 2 with SUB's usage line unless exactly COUNT arguments follow. Every
 # subcommand goes through it, so an argument it does not take is refused
@@ -83,18 +59,6 @@ want_args() {
         exit 2
     fi
 }
-# Where yo bootstrap stamps the commit it built and the NAR hash of its tree
-# (yo's STATE_DIR, REV_STAMP and NARHASH_STAMP): state, never the system, so
-# a docs-only commit keeps the generation. A box bootstrapped by an older yo
-# has neither file. The YOLOBOX_STATE_DIR override is a test seam.
-YOLOBOX_STATE_DIR="${YOLOBOX_STATE_DIR:-/var/lib/yolobox}"
-
-# What the two stamps must hold before either reaches the --flake argument,
-# equal to yo's COMMIT_RE and NARHASH_RE: a commit, and an SRI sha256 (43
-# base64 characters and one '='). Matched whole, so they carry no anchors.
-REV_RE='[0-9a-f]{40}'
-NARHASH_RE='sha256-[A-Za-z0-9+/]{43}='
-
 # Sets EXPR to a find expression matching any of the given directory names.
 build_expr() {
     EXPR=('(')
@@ -168,7 +132,7 @@ measure() {
 }
 
 # The ESP is small and GRUB copies the incoming kernel before pruning old
-# ones (see nix/base.md#the-esp-holds-one-kernel), so a nixos-rebuild that runs out of space there
+# ones, so a nixos-rebuild that runs out of space there
 # advances the system profile and then dies installing the bootloader,
 # leaving the booted generation and the profile pointing at different
 # closures. gc-machine's half-failed-switch guard reads this pair. `yo
@@ -723,7 +687,7 @@ cmd_aws_creds() {
 
     # The same shape yo's allowlist enforces; checked here too because the
     # name goes into a URL path and this is the process that builds it.
-    if ! [[ "${profile}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    if ! [[ "${profile}" =~ ^${YOLOBOX_PROFILE_NAME_RE}$ ]]; then
         printf 'yolobox-guest: aws-creds: invalid profile name: %s\n' "${profile}" >&2
         exit 2
     fi
@@ -732,7 +696,7 @@ cmd_aws_creds() {
     # stdout, so curl's own progress or warnings must never join it.
     local response errors errfile rc=0
     errfile="$(mktemp)"
-    response="$(curl -sS -g --fail-with-body --unix-socket "${YOLOBOX_AWS_BROKER_SOCK}" "http://broker/creds/${profile}" 2>"${errfile}")" || rc=$?
+    response="$(curl -sS -g --fail-with-body --unix-socket "${YOLOBOX_AGENT_AWS_BROKER_SOCK}" "http://broker/creds/${profile}" 2>"${errfile}")" || rc=$?
     errors="$(cat "${errfile}")"
     rm -f "${errfile}"
 
@@ -748,7 +712,7 @@ cmd_aws_creds() {
     case "${rc}" in
     7 | 52 | 56)
         # shellcheck disable=SC2016
-        printf 'yolobox-guest: AWS broker socket %s not answering; run `yo up` on the host\n' "${YOLOBOX_AWS_BROKER_SOCK}" >&2
+        printf 'yolobox-guest: AWS broker socket %s not answering; run `yo up` on the host\n' "${YOLOBOX_AGENT_AWS_BROKER_SOCK}" >&2
         exit 1
         ;;
     esac
@@ -804,7 +768,7 @@ cmd_aws_check() {
     [ "${failed}" = 0 ] || exit 1
 }
 
-# The one egress probe: net-check classifies by it. Exits nonzero on every
+# The one egress probe: status classifies by it. Exits nonzero on every
 # failure: a missing curl (127), a timeout (curl's 28) or a refused fetch. The
 # caller reads nonzero as dead, so a probe that cannot run is never a pass.
 EGRESS_PROBE_URL=https://github.com
@@ -814,10 +778,6 @@ probe_egress() {
     curl -sS -o /dev/null --max-time "${EGRESS_PROBE_SECONDS}" "${EGRESS_PROBE_URL}" 2>/dev/null
 }
 
-# Lima's gateway, the one address a plain box may talk to, and then only for
-# DNS (nix/egress.nix).
-GATEWAY_DNS=192.168.5.2
-
 # Succeeds only if a DNS reply arrived. `dig` prints its ->>HEADER<<- line
 # exactly when one did, whatever the reply's status, so that line is the
 # answer. dig's exit code is not: bind9 reports 0 on an ICMP unreachable or a
@@ -826,19 +786,18 @@ GATEWAY_DNS=192.168.5.2
 # that pipefail turns into a failed probe.
 probe_gateway_dns() {
     local reply
-    reply=$(dig +time=2 +tries=1 "@${GATEWAY_DNS}" . NS 2>&1) || true
+    reply=$(dig +time=2 +tries=1 "@${YOLOBOX_GATEWAY}" . NS 2>&1) || true
     [[ "${reply}" == *'->>HEADER<<-'* ]]
 }
 
-# Free space on / below which net-check reports the disk full. `stat -f` counts
+# Free space on / below which status reports the disk full. `stat -f` counts
 # the blocks ext4 reserves for root (%f), which `df`'s Avail column leaves out:
 # dhcpcd and tailscaled run as root, and only when those are gone does a full
 # disk look like a DNS failure (empty resolv.conf, ENOSPC in dhcpcd).
 ROOT_MIN_FREE_MIB=64
 
 # Prints the whole MiB free on / for root. A stat that fails or prints anything
-# but two numbers is an error, never "not full": the caller must not run this
-# as an `if` condition, where errexit would swallow the failure.
+# but two numbers returns 1 with the reason on stderr, never "not full".
 root_free_mib() {
     local blocks free_blocks block_bytes
     blocks=$(stat -f -c '%f %S' /) || return 1
@@ -852,37 +811,99 @@ root_free_mib() {
     printf '%s\n' "$((free_blocks * block_bytes / 1024 / 1024))"
 }
 
-# Tells apart the two host-VPN shapes (docs/host-network.md#vpn-shapes): a VPN
-# that owns the host's default route kills egress while the gateway still
-# answers DNS; a VPN that blackholes lima's gateway leaves egress working
-# while the gateway's DNS goes silent. Both probes only classify, so this
-# exits 0 whatever the network state. A third line, rootdisk=, names a full
-# root disk, which breaks name resolution and would otherwise be blamed on the
-# network (docs/disk.md#a-full-disk-looks-like-a-dns-failure).
-cmd_net_check() {
-    want_args net-check 'net-check (takes no arguments)' 0 "$@"
-    local egress=dead gateway=dead rootdisk=ok free_mib
-    free_mib=$(root_free_mib)
-    if [ "${free_mib}" -lt "${ROOT_MIN_FREE_MIB}" ]; then
-        rootdisk=full
-    fi
-    if probe_egress; then
-        egress=ok
-    fi
-    # A box whose local configuration blocks the gateway by design marks it
-    # with GATEWAY_BLOCKED, so probing it would report a fault that is not
-    # there (docs/host-network.md).
-    if [ -e "${GATEWAY_BLOCKED}" ]; then
-        gateway=skipped
-    elif probe_gateway_dns; then
-        gateway=ok
-    fi
-    printf 'egress=%s\ngateway=%s\nrootdisk=%s\n' "${egress}" "${gateway}" "${rootdisk}"
+# Use% of / at which status reports the root filesystem nearly full.
+ROOTFS_FULL_PERCENT=90
+
+# The socket units that hand the agent the host's forwarded sockets, judged
+# like the egress unit by their ActiveState.
+PROXY_UNITS=("${YOLOBOX_OP_AGENT_PROXY_UNIT}.socket" "${YOLOBOX_AWS_BROKER_PROXY_UNIT}.socket")
+
+# One KEY=value line of the status block. A value is cut at its first newline,
+# so a probe that prints several lines cannot forge a second key, and an empty
+# one is a key yo reports as not reported.
+field() {
+    printf '%s=%s\n' "$1" "${2%%$'\n'*}"
 }
 
-# Prints the one line of a stamp file. Fails, naming the file, when it is
-# missing, empty or holds more than one line: a stamp is written by
-# nix/base.nix as one value and a newline, so anything else is not one.
+# A unit's ActiveState; empty when systemctl cannot say.
+unit_state() {
+    systemctl show -p ActiveState --value "$1" 2>/dev/null || true
+}
+
+# tailscale's BackendState, out of its own JSON; empty when there is none.
+# `tailscale status` exits nonzero while logged out and still prints it.
+tailscale_state() {
+    local json
+    json=$(tailscale status --json 2>/dev/null) || true
+    if [[ "${json}" =~ \"BackendState\":[[:space:]]*\"([^\"]*)\" ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
+}
+
+# `df -h /`'s data line, as the operator reads it; empty when df fails.
+rootfs_line() {
+    local out
+    out=$(df -h / 2>/dev/null) || return 0
+    sed -n 2p <<<"${out}"
+}
+
+# yes when / is ROOTFS_FULL_PERCENT or more in use (df -P's Use% column), no
+# otherwise, empty when df answers no number.
+rootfs_full() {
+    local out pct
+    out=$(df -P / 2>/dev/null) || return 0
+    pct=$(awk 'NR == 2 { sub("%", "", $5); print $5 }' <<<"${out}")
+    case "${pct}" in
+    '' | *[!0-9]*) return 0 ;;
+    esac
+    if [ "${pct}" -ge "${ROOTFS_FULL_PERCENT}" ]; then
+        printf 'yes\n'
+    else
+        printf 'no\n'
+    fi
+}
+
+# Everything `yo status` asks the box, as KEY=value lines in one round trip;
+# yo prints a line per key and warns about a key that is missing, so a probe
+# that fails leaves its value empty and never fails the block. internet= and
+# gateway_dns= tell apart the two host-VPN shapes: a VPN that owns the host's
+# default route kills egress while the gateway still answers DNS; one that
+# blackholes lima's gateway leaves egress working while the gateway's DNS goes
+# silent. rootdisk=full names a root disk too full for dhcpcd to write
+# resolv.conf, which would otherwise be blamed on the network.
+cmd_status() {
+    want_args status 'status (takes no arguments)' 0 "$@"
+    local unit free_mib rootdisk='' internet=dead gateway_dns=dead
+    field version "$(cat "${YOLOBOX_STAMPS}/version" 2>/dev/null || true)"
+    field flake_ref "$(cat "${YOLOBOX_STAMPS}/flake-ref" 2>/dev/null || true)"
+    field egress "$(unit_state "${YOLOBOX_EGRESS_UNIT}")"
+    for unit in "${PROXY_UNITS[@]}"; do
+        field "${unit}" "$(unit_state "${unit}")"
+    done
+    field tailscale "$(tailscale_state)"
+    field fstype "$(lsblk -dno FSTYPE "${YOLOBOX_LUKS_DEVICE}" 2>/dev/null || true)"
+    field rootfs "$(rootfs_line)"
+    field rootfs_full "$(rootfs_full)"
+    if free_mib=$(root_free_mib); then
+        rootdisk=ok
+        if [ "${free_mib}" -lt "${ROOT_MIN_FREE_MIB}" ]; then
+            rootdisk=full
+        fi
+    fi
+    field rootdisk "${rootdisk}"
+    if probe_egress; then
+        internet=ok
+    fi
+    if probe_gateway_dns; then
+        gateway_dns=ok
+    fi
+    field internet "${internet}"
+    field gateway_dns "${gateway_dns}"
+}
+
+# Prints the one line of the flake-ref stamp. Fails, naming the file, when it
+# is missing, empty or holds more than one line: nix/base.nix writes one value
+# and a newline, so anything else is not a stamp.
 read_stamp() {
     local file=$1 line value="" count=0
     if [ ! -f "${file}" ]; then
@@ -901,80 +922,44 @@ read_stamp() {
     printf '%s\n' "${value}"
 }
 
-# Prints the flake a rebuild of `ref` builds: the stamped commit with its NAR
-# hash (github:OWNER/REPO/<rev>?narHash=<hash>, as yo bootstrap built it; nix
-# refuses a tree whose hash differs), or, on a box no yo has stamped, the ref
-# by name, said aloud. A commit stamp that is missing its hash, or either
-# stamp that is not one value of its shape, refuses naming the file: the
-# stamps are root's, so this is defence in depth for the --flake argument.
-# A hash without a commit is what an interrupted bootstrap leaves, and it is
-# ignored.
-pinned_flake() {
-    local ref=$1 rev nar
-    if [ ! -f "${YOLOBOX_STATE_DIR}/flake-rev" ]; then
-        printf 'yolobox-guest: rebuild: no commit stamp in %s (the box was bootstrapped by an older yo), so this builds %s at its tip; yo bootstrap pins it\n' \
-            "${YOLOBOX_STATE_DIR}" "${ref}" >&2
-        printf '%s\n' "${ref}"
-        return 0
-    fi
-    rev=$(read_stamp "${YOLOBOX_STATE_DIR}/flake-rev") || return 1
-    if [[ ! "${rev}" =~ ^${REV_RE}$ ]]; then
-        printf 'yolobox-guest: rebuild: %s/flake-rev is not a commit; run yo bootstrap on the host to rewrite it\n' \
-            "${YOLOBOX_STATE_DIR}" >&2
-        return 1
-    fi
-    nar=$(read_stamp "${YOLOBOX_STATE_DIR}/flake-narhash") || return 1
-    if [[ ! "${nar}" =~ ^${NARHASH_RE}$ ]]; then
-        printf 'yolobox-guest: rebuild: %s/flake-narhash is not an SRI sha256; run yo bootstrap on the host to rewrite it\n' \
-            "${YOLOBOX_STATE_DIR}" >&2
-        return 1
-    fi
-    printf '%s/%s?narHash=%s\n' "${ref%/*}" "${rev}" "${nar}"
-}
-
-# The one way to rebuild the box from inside it: the flake ref and hostname
-# come from the stamps of the build that made the box, so a hand rebuild can
-# neither rename an -m machine nor switch trees, and the commit and NAR hash
-# come from what yo bootstrap stamped, so it cannot move along a branch
-# either (pinned_flake). A different ref goes through `yo bootstrap --version`
-# on the host. Only switch and boot, because they are the actions that keep
-# the box what yo built. The flags are yo's NIX_REBUILD_FLAGS: --refresh,
-# because an unstamped box builds the ref by name, and a branch moves while
-# nix would reuse an hour-old fetch of it.
+# The one way to rebuild the box from inside it: the flake ref is the exact
+# tree yo bootstrap built (github:OWNER/REPO/<rev>?narHash=<hash>, stamped by
+# nix/base.nix), and the hostname is the kernel's, so a hand rebuild can
+# neither switch trees nor rename an -m machine. A different ref goes through
+# `yo bootstrap --version` on the host. Only switch and boot, because they are
+# the actions that keep the box what yo built. The flags are yo's
+# NIX_REBUILD_FLAGS.
 cmd_rebuild() {
     want_args rebuild 'rebuild switch|boot' 1 "$@"
     if [ "$1" != switch ] && [ "$1" != boot ]; then
         printf 'yolobox-guest: rebuild: usage: rebuild switch|boot\n' >&2
         exit 2
     fi
-    local action=$1 uid user ref host flake
+    local action=$1 uid user ref host
     uid=$(id -u)
-    if [ "${uid}" != "${OPERATOR_UID}" ]; then
+    if [ "${uid}" != "${YOLOBOX_OPERATOR_UID}" ]; then
         printf 'yolobox-guest: rebuild: run as the operator (uid %s), not uid %s\n' \
-            "${OPERATOR_UID}" "${uid}" >&2
+            "${YOLOBOX_OPERATOR_UID}" "${uid}" >&2
         exit 2
     fi
     ref=$(read_stamp "${YOLOBOX_STAMPS}/flake-ref") || exit 1
-    if [[ ! "${ref}" =~ ^${FLAKE_REF_RE}$ ]]; then
-        printf 'yolobox-guest: rebuild: %s/flake-ref is not github:OWNER/REPO/REF\n' \
-            "${YOLOBOX_STAMPS}" >&2
+    case "${ref}" in
+    github:*) ;;
+    *)
+        printf 'yolobox-guest: rebuild: %s holds %q, not a github: flake ref\n' "${YOLOBOX_STAMPS}/flake-ref" "${ref}" >&2
         exit 1
-    fi
-    host=$(read_stamp "${YOLOBOX_STAMPS}/hostname") || exit 1
-    if [[ ! "${host}" =~ ^${HOSTNAME_RE}$ ]]; then
-        printf 'yolobox-guest: rebuild: %s/hostname is not one lowercase DNS label\n' \
-            "${YOLOBOX_STAMPS}" >&2
-        exit 1
-    fi
-    flake=$(pinned_flake "${ref}") || exit 1
+        ;;
+    esac
+    host=$(uname -n)
     user=$(id -un)
     local status=0
-    sudo env "YOLOBOX_USERNAME=${user}" "YOLOBOX_HOSTNAME=${host}" \
-        "YOLOBOX_FLAKE_REF=${ref}" flock -n -E "${REBUILD_BUSY_EXIT}" "${REBUILD_LOCK}" \
-        nixos-rebuild "${action}" --impure --refresh --flake "${flake}#yolobox" || status=$?
-    if [ "${status}" -eq "${REBUILD_BUSY_EXIT}" ]; then
+    sudo env "${YOLOBOX_NIX_ENV_USERNAME}=${user}" "${YOLOBOX_NIX_ENV_HOSTNAME}=${host}" \
+        "${YOLOBOX_NIX_ENV_FLAKE_REF}=${ref}" \
+        flock -n -E "${YOLOBOX_REBUILD_BUSY_EXIT}" "${YOLOBOX_REBUILD_LOCK}" \
+        nixos-rebuild "${action}" --impure --flake "${ref}#yolobox" || status=$?
+    if [ "${status}" -eq "${YOLOBOX_REBUILD_BUSY_EXIT}" ]; then
         printf 'yolobox-guest: rebuild: another rebuild is running (it holds %s); wait for it to finish\n' \
-            "${REBUILD_LOCK}" >&2
+            "${YOLOBOX_REBUILD_LOCK}" >&2
     fi
     exit "${status}"
 }
@@ -989,11 +974,11 @@ main() {
     gc-user) cmd_gc_user "$@" ;;
     aws-creds) cmd_aws_creds "$@" ;;
     aws-check) cmd_aws_check "$@" ;;
-    net-check) cmd_net_check "$@" ;;
+    status) cmd_status "$@" ;;
     rebuild) cmd_rebuild "$@" ;;
     *)
         printf "yolobox-guest: unknown subcommand '%s'\n" "${sub}" >&2
-        exit 64
+        exit "${YOLOBOX_USAGE_EXIT}"
         ;;
     esac
 }

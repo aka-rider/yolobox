@@ -8,7 +8,6 @@ pid-exit watch).
 import argparse
 import contextlib
 import errno
-import fcntl
 import http.server
 import importlib.util
 import io
@@ -16,12 +15,15 @@ import itertools
 import json
 import os
 import select
+import shlex
 import shutil
+import signal
 import socket
 import stat
 import socketserver
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import types
@@ -29,13 +31,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from shell_harness import is_gnu
+
 REPO = Path(__file__).resolve().parent.parent
 PKG = REPO / "yolobox_cli"
-FIXTURES = Path(__file__).resolve().parent / "fixtures"
-FIXTURE_EGRESS = (FIXTURES / "egress.nft").read_text()
-FIXTURE_EGRESS_TUNNEL = (FIXTURES / "egress-tunnel.nft").read_text()
-FIXTURE_EMPTY_TABLE = "table inet yolobox-egress {\n}\n"
-# A release this yo can build: at or above release.FIRST_HOST_OS_FREE_RELEASE.
+# A release this yo can build.
 A_RELEASE = "2.3.4"
 
 # The host's CPU count in tests that create a box or read --cpus, so the default
@@ -58,12 +58,23 @@ def no_tcp_to_the_host(address, *args, **kwargs):
     )
 
 
-# yo's only TCP client is unlock.ssh_banner, and Lima's default port is the one
-# a real box on the machine running the tests listens on. A test that does not
-# fake the banner would meet that box's stage-2 sshd and take a different branch
-# than on a machine with none. Refused is what the tests were written against;
-# a test that serves its own port restores REAL_CREATE_CONNECTION.
-mock.patch.object(socket, "create_connection", no_tcp_to_the_host).start()
+def refuse_tcp_to_the_host():
+    """Every module that loads yo calls this from its setUpModule, and the
+    refusal ends with the module.
+
+    yo's only TCP client is unlock.ssh_banner, and Lima's default port is the
+    one a real box on the machine running the tests listens on. A test that
+    does not fake the banner would meet that box's stage-2 sshd and take a
+    different branch than on a machine with none. Refused is what the tests
+    were written against; a test that serves its own port restores
+    REAL_CREATE_CONNECTION."""
+    refusal = mock.patch.object(socket, "create_connection", no_tcp_to_the_host)
+    refusal.start()
+    unittest.addModuleCleanup(refusal.stop)
+
+
+def setUpModule():
+    refuse_tcp_to_the_host()
 
 
 class YoNamespace:
@@ -148,6 +159,83 @@ def unload_yo(name):
 
 
 yo = load_yo()
+
+
+def fake_bin(test, tools):
+    """A scratch directory, removed after `test`, holding each of `tools`
+    ({name: text, the text starting with its shebang}) as an executable.
+    Returns it with `path`, the PATH that finds the fakes first."""
+    bin_dir = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, bin_dir)
+    for name, text in tools.items():
+        tool = Path(bin_dir, name)
+        tool.write_text(text)
+        tool.chmod(0o755)
+    return bin_dir, bin_dir + os.pathsep + os.environ["PATH"]
+
+
+class VirtualClock:
+    """time.sleep and time.monotonic for a wait under test, patched while it
+    is entered: a sleep advances the clock the deadlines read, at once. A wait
+    that sleeps more than MAX_SLEEPS times is polling forever."""
+
+    MAX_SLEEPS = 2000
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        if len(self.sleeps) > self.MAX_SLEEPS:
+            raise AssertionError("yo is polling forever")
+        self.now += seconds
+
+    def __enter__(self):
+        self.patched = contextlib.ExitStack()
+        self.patched.enter_context(mock.patch.object(yo.time, "sleep", self.sleep))
+        self.patched.enter_context(
+            mock.patch.object(yo.time, "monotonic", lambda: self.now)
+        )
+        return self
+
+    def __exit__(self, *exc):
+        self.patched.close()
+        return False
+
+
+# What ssh says when nothing listens on the box's port.
+NOT_LISTENING = (255, "ssh: connect to host 127.0.0.1 port 60022: Connection refused")
+
+
+class FakeHelper:
+    """The initrd's `yolobox-unlock` ssh session: scripted stdout lines, exit
+    code and stderr; `stdin.sent` is what yo wrote to it."""
+
+    class Stdin:
+        def __init__(self):
+            self.sent = b""
+
+        def write(self, data):
+            self.sent += data
+
+        def close(self):
+            pass
+
+    def __init__(self, lines, code, stderr):
+        self.stdout = io.BytesIO("".join(line + "\n" for line in lines).encode())
+        self.stderr = io.BytesIO(stderr.encode())
+        self.stdin = self.Stdin()
+        self.code = code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def wait(self):
+        return self.code
 
 
 def with_home(path):
@@ -242,28 +330,109 @@ class TestAtomicWrite(FakeHome):
         self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o640)
 
 
-class TestGuestHelperCheck(unittest.TestCase):
+class TestYoNamespace(unittest.TestCase):
+    """The tests' view of the package: one name, one object, read-only."""
+
+    SHARED = object()
+
+    def namespace(self):
+        return YoNamespace(
+            {
+                "proc": types.SimpleNamespace(run="proc.run", SHARED=self.SHARED),
+                "sshx": types.SimpleNamespace(
+                    run="sshx.run", SHARED=self.SHARED, only="here"
+                ),
+            }
+        )
+
+    def test_a_name_is_found_in_the_module_that_defines_it(self):
+        self.assertEqual(self.namespace().only, "here")
+
+    def test_one_object_imported_into_two_modules_is_that_object(self):
+        self.assertIs(self.namespace().SHARED, self.SHARED)
+
+    def test_a_module_name_is_the_module(self):
+        self.assertEqual(self.namespace().proc.run, "proc.run")
+
+    def test_a_name_two_modules_define_differently_is_refused_naming_both(self):
+        with self.assertRaisesRegex(AttributeError, "'run' is defined by proc, sshx"):
+            self.namespace().run
+
+    def test_an_unknown_name_is_refused(self):
+        with self.assertRaisesRegex(AttributeError, "no module of yolobox_cli"):
+            self.namespace().lizard
+
+    def test_a_write_is_refused_and_names_the_module_to_patch(self):
+        with self.assertRaisesRegex(AttributeError, "patch yo.<module>.only"):
+            self.namespace().only = "elsewhere"
+
+
+class TestFileChokepointsFailAsYoErrors(unittest.TestCase):
+    """A host file yo cannot make or delete is one message, never a traceback."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.file = Path(scratch.name, "file")
+        self.file.write_text("")
+
+    def test_a_private_dir_under_a_file_names_the_path(self):
+        wanted = str(self.file / "dir")
+        with self.assertRaisesRegex(
+            yo.YoError, "cannot make the directory %s" % wanted
+        ):
+            yo.proc.private_dir(wanted)
+
+    def test_a_file_already_gone_is_removed(self):
+        yo.proc.remove_file(str(self.file.parent / "never-there"))
+
+    def test_a_directory_is_not_a_file_to_remove(self):
+        with self.assertRaisesRegex(yo.YoError, "cannot delete %s" % self.file.parent):
+            yo.proc.remove_file(str(self.file.parent))
+
+
+class TestChecked(unittest.TestCase):
+    """proc.checked: the one message of a command that failed."""
+
     def failed(self, stdout, stderr):
-        return subprocess.CompletedProcess(["ssh"], 3, stdout, stderr)
+        return yo.proc.GuestRun(["ssh"], 3, stdout, stderr)
+
+    def test_a_success_comes_back_as_it_is(self):
+        completed = subprocess.CompletedProcess(["ssh"], 0, "out", "")
+        self.assertIs(yo.proc.checked(completed, "x"), completed)
 
     def test_a_failure_with_only_binary_stdout_is_a_yo_error_with_that_text(self):
         # agent_paths runs the helper with binary=True: stdout is bytes there.
         with self.assertRaises(yo.YoError) as caught:
-            yo.guest.guest_helper_check(self.failed(b"find: odd\n", ""), "projects")
+            yo.proc.checked(self.failed(b"find: odd\n", ""), "projects")
         self.assertEqual(
-            caught.exception.message, "projects failed (exit 3): find: odd"
+            caught.exception.message, "projects failed (exit 3):\n  | find: odd"
         )
 
     def test_a_failure_that_said_nothing_is_a_yo_error_that_says_so(self):
         with self.assertRaises(yo.YoError) as caught:
-            yo.guest.guest_helper_check(self.failed(b"", ""), "projects")
+            yo.proc.checked(self.failed(b"", ""), "projects", "on the box")
         self.assertEqual(
-            caught.exception.message, "projects failed (exit 3) with no output"
+            caught.exception.message,
+            "projects failed on the box (exit 3) with no output",
         )
 
+    def test_a_failure_whose_output_went_to_the_terminal_ends_at_the_exit(self):
+        with self.assertRaises(yo.YoError) as caught:
+            yo.proc.checked(subprocess.CompletedProcess(["x"], 3, None, None), "x")
+        self.assertEqual(caught.exception.message, "x failed (exit 3)")
+
     def test_stderr_comes_before_stdout(self):
-        with self.assertRaisesRegex(yo.YoError, "exit 3.: boom"):
-            yo.guest.guest_helper_check(self.failed("out", "boom\n"), "x")
+        with self.assertRaisesRegex(yo.YoError, "exit 3.:\n  \\| boom"):
+            yo.proc.checked(self.failed("out", "boom\n"), "x")
+
+    def test_a_host_tools_words_stay_inline_and_unquoted(self):
+        host_tool = subprocess.CompletedProcess(["virsh"], 3, "", "error: lizard\n")
+        with self.assertRaises(yo.YoError) as caught:
+            yo.proc.checked(host_tool, "virsh x")
+        self.assertEqual(
+            caught.exception.message, "virsh x failed (exit 3): error: lizard"
+        )
 
 
 class TestMirror(FakeHome):
@@ -352,6 +521,9 @@ class TestGuestPath(unittest.TestCase):
             yo.guest_path("/tmp/x")
 
 
+LIMA_FACTS = yo.SshFacts(60022, "user", "/Users/user/.lima/_config/user", "none")
+
+
 class TestSshRunArgv(FakeHome):
     def capture_argv(self, role=None, **kwargs):
         seen = {}
@@ -375,24 +547,28 @@ class TestSshRunArgv(FakeHome):
         self.assertIn("User=agent", argv)
         self.assertIn("ControlPath=%s/.lima/yolobox/ssh-agent.sock" % self.home, argv)
 
-    def test_a_home_too_long_for_the_ssh_master_socket_is_named_before_ssh_runs(self):
+    def test_a_home_too_long_for_the_ssh_master_socket_is_named_when_the_config_is_written(
+        self,
+    ):
         # ssh would exit 255 on it, which yo reports as a box it cannot reach.
         # ssh binds the master at "<ControlPath>.<16 random characters>", 17
         # bytes more than the ControlPath, so that is the length the limit
         # applies to (measured against OpenSSH: a 87-byte path fails on macOS).
         bound = len(os.fsencode(yo.state.agent_control_path())) + 17
-        with mock.patch.object(yo.state, "UNIX_SOCKET_PATH_LIMIT", bound + 1):
-            yo.ssh_options(yo.AGENT, mux=True)
-        with mock.patch.object(yo.state, "UNIX_SOCKET_PATH_LIMIT", bound):
-            with self.assertRaises(yo.YoError) as caught:
-                yo.ssh_options(yo.OPERATOR)
+        with mock.patch.object(yo.LIMA, "ssh_facts", return_value=LIMA_FACTS):
+            os.makedirs(yo.instance_dir())
+            with mock.patch.object(yo.state, "UNIX_SOCKET_PATH_LIMIT", bound + 1):
+                yo.sshconfig.write_ssh_config()
+            with mock.patch.object(yo.state, "UNIX_SOCKET_PATH_LIMIT", bound):
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.sshconfig.write_ssh_config()
         self.assertIn("must be shorter than %d" % bound, caught.exception.message)
         self.assertIn(self.home, caught.exception.message)
 
     def test_a_real_overlong_home_is_refused(self):
         with with_home("/" + "d" * yo.state.UNIX_SOCKET_PATH_LIMIT):
             with self.assertRaisesRegex(yo.YoError, "unix socket path must be shorter"):
-                yo.ssh_options(yo.OPERATOR)
+                yo.sshconfig.write_ssh_config()
 
 
 class TestResolveCpOperands(unittest.TestCase):
@@ -600,10 +776,6 @@ class TestCpArgv(CpHarness):
             argv.index(os.path.join(self.cwd, "-oProxyCommand=x")), argv.index("--")
         )
 
-    def test_guest_source_globs_are_escaped_for_scp(self):
-        argv = self.run_cp([":~/a[1]*?\\.txt", "out"])["run"]
-        self.assertIn("lima-yolobox:/home/agent/a\\[1\\]\\*\\?\\\\.txt", argv)
-
     def test_guest_destination_is_not_escaped(self):
         # scp never globs a destination; escaping would create a file whose
         # name contains the backslashes.
@@ -643,153 +815,102 @@ class TestCpArgv(CpHarness):
         self.assertEqual(steps, ["mkdir", "run"])
         self.assertEqual(events[-1][1][0], "scp")
 
-    def test_no_mkdir_for_from_guest(self):
-        calls = self.run_cp([":~/x", "dest.txt"])
-        # The agent probe, then the one find that lists the source: no mkdir,
-        # and nothing else is run in the guest.
-        self.assertEqual([argv[0] for argv in calls["ssh_run"]], ["true", "find"])
-        self.assertIn("lima-yolobox:/home/agent/x", calls["run"])
-
-
-class FakeGuest:
-    """The agent's home in the guest, answering the two commands cmd_cp sends it:
-    find over ssh and scp. Like the real scp it takes a source whole, rejects
-    glob characters unless they are escaped, and leaves a directory with its
-    mode plus u+wx."""
-
-    HOME = "/home/agent"
-    PRUNED = ("node_modules", ".venv")
-    LISTED = ("target", ".next")
-    MANIFESTS = ("Cargo.toml", "package.json")
-
-    def __init__(self, files, modes, scp_sources, scp_destinations, scp_fails):
-        self.files = {self.HOME + "/" + name: text for name, text in files.items()}
-        self.modes = {self.HOME + "/" + name: mode for name, mode in modes.items()}
-        self.scp_sources = scp_sources
-        self.scp_destinations = scp_destinations
-        self.scp_fails = scp_fails
-        self.received = []  # each scp call's source operands, as scp gets them
-        self.destination_modes = []  # the destination's mode when scp is called
-
-    def is_dir(self, path):
-        return any(name.startswith(path + "/") for name in self.files)
-
-    def exists(self, path):
-        return path in self.files or self.is_dir(path)
-
-    def children(self, path):
-        prefix = path + "/"
-        return sorted(
-            {
-                prefix + name[len(prefix) :].split("/")[0]
-                for name in self.files
-                if name.startswith(prefix)
-            }
-        )
-
-    def record(self, path):
-        kind = "d" if self.is_dir(path) else "p" if self.files[path] is None else "f"
-        mode = self.modes.get(path, 0o755 if kind == "d" else 0o644)
-        return os.fsencode("%s\t%o\t1700000000.5\t%s\0" % (kind, mode, path))
-
-    def below(self, start):
-        # find's walk under `start`, printing what the build-output expression
-        # asks for and not entering what it prunes.
-        for path in self.children(start):
-            name = path.rsplit("/", 1)[1]
-            is_dir = self.is_dir(path)
-            if is_dir and name in self.PRUNED:
-                yield path
-                continue
-            if (is_dir and name in self.LISTED) or (
-                not is_dir and name in self.MANIFESTS
-            ):
-                yield path
-            if is_dir:
-                yield from self.below(path)
-
-    def ssh_run(self, role, argv, **kwargs):
-        done = mock.Mock(returncode=0, stdout=b"", stderr="")
-        if argv[0] != "find":
-            return done
-        assert argv[1] == "-H", argv
-        assert argv[argv.index("-printf") + 1] == "%y\t%m\t%T@\t%p\\0", argv
-        options = next(i for i, arg in enumerate(argv) if i > 1 and arg.startswith("-"))
-        for start in argv[2:options]:
-            if not self.exists(start):
-                done.returncode = 1
-                done.stderr = "find: %s: No such file or directory" % start
-                return done
-            if "-maxdepth" in argv:
-                found = [start] + self.children(start)
-            else:
-                found = list(self.below(start))
-            done.stdout += b"".join(self.record(path) for path in found)
-        return done
-
-    def unescape(self, source):
-        host, _, escaped = source.partition(":")
-        assert host == "lima-yolobox", source
-        path, chars = "", iter(escaped)
-        for char in chars:
-            assert char not in "*?[", "unescaped glob character in %r" % source
-            path += next(chars) if char == "\\" else char
-        return path
-
-    def copy_into(self, path, directory):
-        target = os.path.join(directory, path.rsplit("/", 1)[1])
-        if path in self.files:
-            if self.files[path] is not None:  # None is a fifo, which scp -r passes over
-                Path(target).write_text(self.files[path])
-            return
-        os.makedirs(target, exist_ok=True)
-        for child in self.children(path):
-            self.copy_into(child, target)
-        # sftp-mode scp, like OpenSSH's download_dir: mkdir(mode | S_IRWXU).
-        os.chmod(target, self.modes.get(path, 0o755) | stat.S_IRWXU)
-        os.utime(target, (1700000000, 1700000000))
-
-    def scp(self, argv, **kwargs):
-        separator = argv.index("--")
-        sources = [self.unescape(source) for source in argv[separator + 1 : -1]]
-        self.scp_sources.append(sources)
-        self.scp_destinations.append(argv[-1])
-        self.received.append(argv[separator + 1 : -1])
-        self.destination_modes.append(stat.S_IMODE(os.stat(argv[-1]).st_mode))
-        if self.scp_fails:
-            raise yo.YoError("scp failed")
-        for path in sources:
-            if not self.exists(path):
-                raise yo.YoError("scp: %s: No such file or directory" % path)
-            self.copy_into(path, argv[-1])
-        return mock.Mock(returncode=0, stdout="", stderr="")
-
 
 class CpFromGuestHarness(CpHarness):
-    """The guest is a FakeGuest: cmd_cp lists it with find and pulls from it with
-    scp, and the files land in the download directory like the real ones would."""
+    """The guest is a directory on this machine: the fake ssh runs the guest's
+    tar command against it, the real host tar unpacks the stream, and the files
+    land in the download directory as they would from a box. The guest's tar
+    and find are GNU's, so a test that runs them skips where this machine's
+    are another; one that fakes the stream runs anywhere."""
+
+    GUEST_HOME = "/home/agent"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.guest_tools_are_gnu = is_gnu("tar") and is_gnu("find")
 
     def setUp(self):
         super().setUp()
-        self.scp_destinations = []
-        self.scp_sources = []
+        self.guest_root = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, self.guest_root, ignore_errors=True)
+        self.guest_commands = []  # each command the fake ssh ran in the guest
+        self.unpacked_into = []  # the directory each host tar unpacked into
 
-    def copy(self, paths, guest_files, scp_fails=False, guest_modes=None):
-        # guest_files: {path relative to the guest home: content}
-        # guest_modes: {directory relative to the guest home: mode}
-        guest = FakeGuest(
-            guest_files,
-            guest_modes or {},
-            self.scp_sources,
-            self.scp_destinations,
-            scp_fails,
+    def guest_path(self, relative):
+        return os.path.join(self.guest_root, self.GUEST_HOME[1:], relative)
+
+    def write_guest(self, guest_files):
+        # guest_files: {path relative to the guest home: content, or None for
+        # an empty directory}
+        for name, text in guest_files.items():
+            path = self.guest_path(name)
+            if text is None:
+                os.makedirs(path)
+                continue
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            Path(path).write_text(text)
+
+    def guest_find(self, role, argv, **kwargs):
+        # The build-output listing, run on the guest directory: its absolute
+        # paths live under guest_root here, and come back as the guest's.
+        if argv[0] != "find":
+            return mock.Mock(returncode=0, stdout=b"", stderr="")
+        found = subprocess.run(
+            [self.guest_root + arg if arg.startswith("/") else arg for arg in argv],
+            capture_output=True,
         )
-        self.guest = guest
+        root = os.fsencode(self.guest_root)
+        listing = b"\0".join(
+            path[len(root) :] if path.startswith(root) else path
+            for path in found.stdout.split(b"\0")
+        )
+        return yo.proc.GuestRun(argv, found.returncode, listing, found.stderr.decode())
+
+    def guest_tar(self, argv, **kwargs):
+        # ssh's last argument is the shell command; -C names a guest directory,
+        # which lives under guest_root here.
+        command = shlex.split(argv[-1])
+        self.guest_commands.append(command)
+        moved = [
+            self.guest_root + arg if previous == "-C" else arg
+            for previous, arg in zip([""] + command, command)
+        ]
+        return subprocess.Popen(moved, **kwargs)
+
+    def spawn(self, argv, **kwargs):
+        if argv[0] == "ssh":
+            return self.guest_tar(argv, **kwargs)
+        self.unpacked_into.append(argv[argv.index("-C") + 1])
+        return subprocess.Popen(list(argv), **kwargs)
+
+    def copy(self, paths, guest_files=None, spawn=None):
+        if spawn is None and not self.guest_tools_are_gnu:
+            self.skipTest("the guest's tar and find are GNU's")
+        self.write_guest(guest_files or {})
+        # A faked stream comes with a guest that holds no build output.
+        nothing_built = yo.proc.GuestRun(["find"], 0, b"", "")
         with (
-            mock.patch.object(yo.proc, "run", guest.scp),
-            mock.patch.object(yo.sshx, "ssh_run", guest.ssh_run),
+            mock.patch.object(yo.proc, "spawn", spawn or self.spawn),
+            mock.patch.object(
+                yo.sshx,
+                "ssh_run",
+                self.guest_find if spawn is None else lambda *_, **__: nothing_built,
+            ),
         ):
             yo.cmd_cp(yo.build_parser().parse_args(["cp"] + paths))
+
+    def filling_staging(self, fill, fails=False):
+        """A download whose guest says nothing and whose host tar is `fill`,
+        called with the staging directory, then exits (non-zero if `fails`)."""
+
+        def spawn(argv, **kwargs):
+            if argv[0] != "tar":
+                return subprocess.Popen(["true"], **kwargs)
+            fill(argv[argv.index("-C") + 1])
+            return subprocess.Popen(["false" if fails else "true"], **kwargs)
+
+        return spawn
 
     def read(self, path):
         with open(path) as handle:
@@ -803,12 +924,12 @@ class CpFromGuestHarness(CpHarness):
         name that forged one would show up here."""
         return [line for line in reported.splitlines() if not line.startswith("yo: ")]
 
-    def pull(self, guest_files, source=":~/proj", guest_modes=None):
+    def pull(self, guest_files, source=":~/proj"):
         stderr = io.StringIO()
         with mock.patch.object(
             yo.ui, "err", side_effect=lambda line="": stderr.write(line + "\n")
         ):
-            self.copy([source, "dest/"], guest_files, guest_modes=guest_modes)
+            self.copy([source, "dest/"], guest_files)
         return stderr.getvalue()
 
     def landed(self):
@@ -816,6 +937,319 @@ class CpFromGuestHarness(CpHarness):
         for directory, _, files in os.walk("dest"):
             found += [os.path.join(directory, f) for f in files]
         return sorted(found)
+
+
+class TestTheHostTarIsToldToLandDataOnly(unittest.TestCase):
+    """The agent writes the download's stream, so the host's tar, whichever
+    flavour it is, keeps no owner, ACL, xattr or file flag from it."""
+
+    def unpack_argv(self, says):
+        _, path = fake_bin(self, {"tar": "#!/bin/sh\nprintf '%%s\\n' '%s'\n" % says})
+        with mock.patch.dict(os.environ, {"PATH": path}):
+            return yo.cp.host_tar_unpack_argv("/staging")
+
+    def test_bsdtar_drops_owners_acls_xattrs_file_flags_and_mac_metadata(self):
+        argv = self.unpack_argv("bsdtar 3.5.3 - libarchive 3.5.3 zlib/1.2.12")
+        for flag in (
+            "--no-same-owner",
+            "--no-same-permissions",
+            "--no-acls",
+            "--no-xattrs",
+            "--no-fflags",
+            "--no-mac-metadata",
+        ):
+            self.assertIn(flag, argv)
+        self.assertEqual(argv[-2:], ["-C", "/staging"])
+
+    def test_gnu_tar_drops_owners_acls_xattrs_and_selinux_labels(self):
+        argv = self.unpack_argv("tar (GNU tar) 1.35")
+        for flag in ("--no-same-owner", "--no-acls", "--no-xattrs", "--no-selinux"):
+            self.assertIn(flag, argv)
+        self.assertNotIn("--no-mac-metadata", argv)
+
+    def test_a_tar_of_neither_flavour_is_refused_naming_what_it_said(self):
+        for says in ("lizard", ""):
+            with self.subTest(says=says):
+                with self.assertRaisesRegex(yo.YoError, "neither bsdtar nor GNU tar"):
+                    self.unpack_argv(says)
+
+
+class TestCpFromGuestDownload(CpFromGuestHarness):
+    """One tar stream from the guest, unpacked into staging on the host."""
+
+    def test_a_download_lands_files_under_the_destination(self):
+        os.makedirs("dest")
+        self.pull({"proj/a": "1", "proj/sub/deeper/b": "2", "proj/empty": None})
+        self.assertEqual(self.landed(), ["dest/proj/a", "dest/proj/sub/deeper/b"])
+        self.assertTrue(os.path.isdir("dest/proj/empty"))
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_a_host_tar_that_cannot_start_ends_the_guest_side_too(self):
+        os.makedirs("dest")
+        started = []
+
+        def spawn(argv, **kwargs):
+            if argv[0] == "ssh":
+                guest = subprocess.Popen(
+                    [sys.executable, "-c", "import signal; signal.pause()"], **kwargs
+                )
+                started.append(guest)
+                return guest
+            raise yo.YoError("tar not found on PATH")
+
+        with self.assertRaisesRegex(yo.YoError, "tar not found on PATH"):
+            self.copy([":~/proj", "dest/"], spawn=spawn)
+        (guest,) = started
+        self.assertEqual(guest.returncode, -signal.SIGKILL)
+        self.assertEqual(self.leftovers("dest"), [])
+
+    def test_an_empty_directory_lands_as_one(self):
+        self.copy([":~/empty", "here"], {"empty": None})
+        self.assertEqual(os.listdir("here"), [])
+
+    def test_names_with_spaces_dashes_newlines_and_wildcards_travel_intact(self):
+        os.makedirs("dest")
+        names = ["a b.txt", "-rf", "line\nbreak", "w[1]*?\\.txt", "sp ace/in"]
+        self.pull({"proj/%s" % name: name for name in names})
+        for name in names:
+            self.assertEqual(self.read("dest/proj/%s" % name), name)
+
+    def test_a_source_whose_name_starts_with_a_dash_is_not_an_option(self):
+        self.copy([":~/-rf", "out"], {"-rf": "data"})
+        self.assertEqual(self.read("out"), "data")
+
+    def test_nothing_but_the_one_tar_runs_in_the_guest(self):
+        os.makedirs("dest")
+        self.pull({"proj/a": "1"})
+        self.assertEqual([command[0] for command in self.guest_commands], ["tar"])
+
+    def test_overlapping_sources_each_land_under_their_own_name(self):
+        os.makedirs("dest")
+        self.copy([":~/proj", ":~/proj/a", "dest/"], {"proj/a/b": "1"})
+        self.assertEqual(self.read("dest/a/b"), "1")
+        self.assertEqual(self.read("dest/proj/a/b"), "1")
+
+    def test_an_absent_source_fails_with_what_the_guest_said(self):
+        os.makedirs("dest")
+        with self.assertRaises(yo.YoError) as caught:
+            self.pull({"other/a": "1"})
+        message = caught.exception.message
+        self.assertIn("cannot read /home/agent/proj in the guest", message)
+        self.assertIn(yo.ui.GUEST_LINE_PREFIX, message)
+        self.assertIn("No such file or directory", message)
+        self.assertEqual(os.listdir("dest"), [])
+
+    def test_a_guest_that_says_nothing_and_fails_is_still_an_error(self):
+        os.makedirs("dest")
+
+        def spawn(argv, **kwargs):
+            return subprocess.Popen(["false"], **kwargs)
+
+        with self.assertRaises(yo.YoError) as caught:
+            self.copy([":~/proj", "dest/"], spawn=spawn)
+        self.assertIn("with no output", caught.exception.message)
+        self.assertEqual(os.listdir("dest"), [])
+
+    def test_a_stream_the_host_tar_cannot_unpack_is_an_error_naming_tar(self):
+        os.makedirs("dest")
+
+        def spawn(argv, **kwargs):
+            if argv[0] == "ssh":
+                return subprocess.Popen(["echo", "not a tar archive"], **kwargs)
+            return subprocess.Popen(list(argv), **kwargs)
+
+        with self.assertRaisesRegex(yo.YoError, "cannot unpack the download"):
+            self.copy([":~/proj", "dest/"], spawn=spawn)
+        self.assertEqual(os.listdir("dest"), [])
+
+    def test_a_crafted_stream_cannot_write_outside_the_staging_directory(self):
+        # The agent owns its PATH, so the stream can be anything: members that
+        # climb out, absolute ones, and a file through a symlink member.
+        os.makedirs("dest")
+        Path("victim").write_text("precious")
+        crafted = os.path.join(self.guest_root, "crafted.tar")
+        with tarfile.open(crafted, "w") as archive:
+            for name in ("../escaped", "/abs-escaped", "proj/ok"):
+                member = tarfile.TarInfo(name)
+                member.size = 1
+                archive.addfile(member, io.BytesIO(b"x"))
+            link = tarfile.TarInfo("proj/lnk")
+            link.type = tarfile.SYMTYPE
+            link.linkname = os.path.join(self.cwd, "victim")
+            archive.addfile(link)
+            through = tarfile.TarInfo("proj/lnk/through")
+            through.size = 1
+            archive.addfile(through, io.BytesIO(b"x"))
+
+        def spawn(argv, **kwargs):
+            if argv[0] == "ssh":
+                return subprocess.Popen(["cat", crafted], **kwargs)
+            return subprocess.Popen(list(argv), **kwargs)
+
+        with self.assertRaises(yo.YoError):
+            self.copy([":~/proj", "dest/"], spawn=spawn)
+        self.assertEqual(self.read("victim"), "precious")
+        self.assertFalse(os.path.lexists("escaped"))
+        self.assertFalse(os.path.lexists("dest/escaped"))
+        self.assertFalse(os.path.lexists("/abs-escaped"))
+        self.assertEqual(os.listdir("dest"), [])
+
+    def test_a_guest_source_named_like_a_host_symlink_is_not_checked_here(self):
+        # The upload check walks host paths. A guest operand only ever names a
+        # guest file, so a host symlink with the same name is no reason to refuse.
+        os.symlink("a.txt", "link")
+        self.copy([":link", "out"], {"link": "guest data"})
+        self.assertEqual(self.read("out"), "guest data")
+        self.assertTrue(os.path.islink("link"))
+
+
+class TestCpFromGuestLandsOnlyPlainEntries(CpFromGuestHarness):
+    """The agent writes the stream, so only plain files and directories land:
+    no link, special file or setuid bit reaches the Mac."""
+
+    def pull_crafted(self, *members):
+        """A pull of :~/proj whose guest sends a tar of (TarInfo, data) pairs."""
+        os.makedirs("dest", exist_ok=True)
+        crafted = os.path.join(self.guest_root, "crafted.tar")
+        with tarfile.open(crafted, "w", format=tarfile.PAX_FORMAT) as archive:
+            for member, data in members:
+                member.size = len(data or b"")
+                archive.addfile(member, io.BytesIO(data) if data else None)
+
+        def spawn(argv, **kwargs):
+            if argv[0] == "ssh":
+                return subprocess.Popen(["cat", crafted], **kwargs)
+            return subprocess.Popen(list(argv), **kwargs)
+
+        self.copy([":~/proj", "dest/"], spawn=spawn)
+
+    def member(self, name, kind=tarfile.REGTYPE, linkname="", mode=0o644):
+        info = tarfile.TarInfo(name)
+        info.type, info.linkname, info.mode = kind, linkname, mode
+        return info
+
+    def assert_refused(self, *members):
+        with self.assertRaises(yo.YoError) as caught:
+            self.pull_crafted((self.member("proj/ok"), b"1"), *members)
+        self.assertEqual(os.listdir("dest"), [])
+        return caught.exception.message
+
+    def test_a_fifo_is_refused_by_its_escaped_name(self):
+        message = self.assert_refused(
+            (self.member("proj/f\x1b[2J\nx", tarfile.FIFOTYPE), None)
+        )
+        self.assertIn('refusing to land "proj/f\\x1b[2J\\nx"', message)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\n", message)
+
+    def test_a_symlink_is_refused_even_when_it_points_inside_the_tree(self):
+        message = self.assert_refused(
+            (self.member("proj/lnk", tarfile.SYMTYPE, linkname="ok"), None)
+        )
+        self.assertIn('"proj/lnk": the guest sent a symlink', message)
+
+    def test_a_hard_link_to_a_host_file_outside_the_tree_never_lands(self):
+        Path("victim").write_text("precious")
+        for target in (os.path.join(self.cwd, "victim"), "../../victim"):
+            with self.subTest(target=target), self.assertRaises(yo.YoError):
+                self.pull_crafted(
+                    (self.member("proj/hl", tarfile.LNKTYPE, linkname=target), None)
+                )
+            self.assertEqual(os.stat("victim").st_nlink, 1)
+            self.assertEqual(os.listdir("dest"), [])
+
+    def test_a_staged_setuid_file_is_refused_whatever_the_host_tar_kept(self):
+        os.makedirs("dest")
+
+        def fill(staging):
+            os.makedirs(os.path.join(staging, "proj"))
+            path = os.path.join(staging, "proj", "run")
+            Path(path).write_text("x")
+            os.chmod(path, 0o4755)
+
+        with self.assertRaisesRegex(yo.YoError, "a setuid or setgid file"):
+            self.copy([":~/proj", "dest/"], spawn=self.filling_staging(fill))
+        self.assertEqual(os.listdir("dest"), [])
+
+    def test_a_host_tar_that_is_neither_bsdtar_nor_gnu_tar_is_refused(self):
+        os.makedirs("dest")
+        busybox = mock.Mock(returncode=0, stdout="BusyBox v1.36.1", stderr="")
+        with (
+            mock.patch.object(yo.proc, "run", return_value=busybox),
+            self.assertRaisesRegex(yo.YoError, "neither bsdtar nor GNU tar"),
+        ):
+            self.copy([":~/proj", "dest/"], {"proj/a": "1"})
+        self.assertEqual(os.listdir("dest"), [])
+
+
+class TestCpFromGuestExcludesBuildOutput(CpFromGuestHarness):
+    """node_modules, .venv, a Rust target and a Next.js .next dwarf the source
+    and the project's tooling recreates them, so a pulled tree leaves them in
+    the guest, at any depth, and says so. A target or .next is build output
+    only beside its manifest: the name alone proves nothing."""
+
+    def test_build_output_at_any_depth_is_left_in_the_guest_and_named(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {
+                "proj/Cargo.toml": "",
+                "proj/package.json": "{}",
+                "proj/node_modules/x/index.js": "js",
+                "proj/.venv/bin/python": "py",
+                "proj/target/debug/bin": "elf",
+                "proj/.next/x": "built",
+                "proj/web/deeper/node_modules/y": "js",
+                "proj/web/src/a.py": "a",
+            }
+        )
+        self.assertEqual(
+            self.landed(),
+            [
+                "dest/proj/Cargo.toml",
+                "dest/proj/package.json",
+                "dest/proj/web/src/a.py",
+            ],
+        )
+        self.assertFalse(os.path.lexists("dest/proj/web/deeper/node_modules"))
+        for skipped in (
+            "proj/node_modules",
+            "proj/.venv",
+            "proj/target",
+            "proj/.next",
+            "proj/web/deeper/node_modules",
+        ):
+            self.assertIn(
+                'skipped "%s": build output is never copied' % skipped, reported
+            )
+
+    def test_a_target_or_next_without_its_manifest_lands_as_code(self):
+        os.makedirs("dest")
+        reported = self.pull({"proj/target/notes.md": "mine", "proj/web/.next/x": "y"})
+        self.assertEqual(
+            self.landed(), ["dest/proj/target/notes.md", "dest/proj/web/.next/x"]
+        )
+        self.assertNotIn("build output", reported)
+
+    def test_a_source_the_operator_named_lands_even_when_it_is_build_output(self):
+        os.makedirs("dest")
+        self.pull({"proj/node_modules/a": "x"}, source=":~/proj/node_modules")
+        self.assertEqual(self.landed(), ["dest/node_modules/a"])
+
+    def test_build_output_already_on_the_host_is_left_untouched(self):
+        os.makedirs("dest/proj/node_modules")
+        Path("dest/proj/node_modules/keep").write_text("mine")
+        self.pull({"proj/node_modules/new": "agent", "proj/ok": "1"})
+        self.assertEqual(self.read("dest/proj/node_modules/keep"), "mine")
+        self.assertFalse(os.path.lexists("dest/proj/node_modules/new"))
+        self.assertEqual(self.read("dest/proj/ok"), "1")
+
+    def test_a_control_path_beside_build_output_is_still_dropped(self):
+        os.makedirs("dest")
+        reported = self.pull(
+            {"proj/node_modules/x": "dep", "proj/.git/config": "evil", "proj/a": "1"}
+        )
+        self.assertEqual(self.landed(), ["dest/proj/a"])
+        self.assertIn('skipped "proj/.git"', reported)
 
 
 class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
@@ -936,7 +1370,7 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
             self.copy([":~/a", ":~/b", "nowhere"], {"a": "1", "b": "2"})
 
         self.assertIn("nowhere", caught.exception.message)
-        self.assertEqual(self.scp_destinations, [])
+        self.assertEqual(self.guest_commands, [])
 
     def test_a_file_cannot_replace_a_directory(self):
         os.makedirs("dest/x")
@@ -952,15 +1386,15 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
         self.copy([":~/x", "newname"], {"x": "data"})
 
         self.assertEqual(
-            os.path.dirname(self.scp_destinations[0]), os.path.join(self.cwd, "dest")
+            os.path.dirname(self.unpacked_into[0]), os.path.join(self.cwd, "dest")
         )
-        self.assertEqual(os.path.dirname(self.scp_destinations[1]), self.cwd)
+        self.assertEqual(os.path.dirname(self.unpacked_into[1]), self.cwd)
 
-    def test_staging_is_removed_when_scp_fails(self):
+    def test_staging_is_removed_when_the_transfer_fails(self):
         os.makedirs("dest")
 
-        with self.assertRaisesRegex(yo.YoError, "scp failed"):
-            self.copy([":~/x", "dest/"], {"x": "data"}, scp_fails=True)
+        with self.assertRaisesRegex(yo.YoError, "cannot read /home/agent/x in the"):
+            self.copy([":~/x", "dest/"], {})
 
         self.assertEqual(os.listdir("dest"), [])
 
@@ -968,60 +1402,34 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
         os.makedirs("dest/proj")
         os.symlink("/etc/hosts", "dest/proj/b")
 
-        def fake_run(argv, **kwargs):
-            tree = os.path.join(argv[-1], "proj")
+        def fill(staging):
+            tree = os.path.join(staging, "proj")
             os.makedirs(tree)
             Path(tree, "b").write_text("x")
             os.chmod(tree, 0o555)
-            return mock.Mock(returncode=0, stdout="", stderr="")
 
-        with (
-            mock.patch.object(yo.proc, "run", fake_run),
-            mock.patch.object(
-                yo.sshx,
-                "ssh_run",
-                return_value=mock.Mock(returncode=0, stdout=b"", stderr=""),
-            ),
-            self.assertRaisesRegex(yo.YoError, "refusing to copy over symlink"),
-        ):
-            yo.cmd_cp(yo.build_parser().parse_args(["cp", ":~/proj", "dest/"]))
+        with self.assertRaisesRegex(yo.YoError, "refusing to copy over symlink"):
+            self.copy([":~/proj", "dest/"], spawn=self.filling_staging(fill))
 
         self.assertEqual(self.leftovers("dest"), [])
 
-    def scp_creating(self, relative, mode):
-        # A fake scp that leaves one directory with the given mode, as sftp-mode
-        # scp does for a guest directory the agent chmodded.
-        def fake_run(argv, **kwargs):
-            tree = os.path.join(argv[-1], relative)
+    def making_staged(self, relative, mode):
+        # A host tar that leaves one directory with the given mode, as -p would
+        # for a guest directory the agent chmodded.
+        def fill(staging):
+            tree = os.path.join(staging, relative)
             os.makedirs(tree)
             os.chmod(tree, mode)
-            return mock.Mock(returncode=0, stdout="", stderr="")
 
-        return fake_run
-
-    def run_cp_with(self, fake_run, paths):
-        with (
-            mock.patch.object(yo.proc, "run", fake_run),
-            mock.patch.object(
-                yo.sshx,
-                "ssh_run",
-                return_value=mock.Mock(returncode=0, stdout=b"", stderr=""),
-            ),
-        ):
-            yo.cmd_cp(yo.build_parser().parse_args(["cp"] + paths))
+        return fill
 
     def test_an_unreadable_staged_subdirectory_is_cleaned_up(self):
         os.makedirs("dest")
-        make_dir = self.scp_creating("proj/sub", 0o300)
+        spawn = self.filling_staging(self.making_staged("proj/sub", 0o300), fails=True)
 
-        def fake_run(argv, **kwargs):
-            make_dir(argv)
-            raise yo.YoError("scp failed")
+        with self.assertRaisesRegex(yo.YoError, "cannot unpack the download"):
+            self.copy([":~/proj", "dest/"], spawn=spawn)
 
-        with self.assertRaises(yo.YoError) as caught:
-            self.run_cp_with(fake_run, [":~/proj", "dest/"])
-
-        self.assertEqual(caught.exception.message, "scp failed")
         self.assertEqual(self.leftovers("dest"), [])
 
     def test_an_unreadable_staged_subdirectory_does_not_break_a_good_copy(self):
@@ -1029,7 +1437,8 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
 
         self.addCleanup(os.chmod, os.path.join(self.cwd, "dest/proj/sub"), 0o700)
 
-        self.run_cp_with(self.scp_creating("proj/sub", 0o300), [":~/proj", "dest/"])
+        spawn = self.filling_staging(self.making_staged("proj/sub", 0o300))
+        self.copy([":~/proj", "dest/"], spawn=spawn)
 
         self.assertEqual(self.leftovers("dest"), [])
         self.assertTrue(os.path.isdir("dest/proj/sub"))
@@ -1038,17 +1447,14 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
         os.makedirs("dest")
         stderr = io.StringIO()
 
-        def fake_run(argv, **kwargs):
-            raise yo.YoError("scp failed")
-
         with (
             mock.patch.object(yo.cp, "remove_staging", side_effect=yo.YoError("stuck")),
             mock.patch("sys.stderr", stderr),
             self.assertRaises(yo.YoError) as caught,
         ):
-            self.run_cp_with(fake_run, [":~/proj", "dest/"])
+            self.copy([":~/proj", "dest/"], {})
 
-        self.assertEqual(caught.exception.message, "scp failed")
+        self.assertIn("cannot read /home/agent/proj", caught.exception.message)
         self.assertIn("stuck", stderr.getvalue())
 
     def test_a_move_the_mac_refuses_is_a_yo_error_counting_what_landed(self):
@@ -1074,7 +1480,7 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
             '"%s/" is not a directory' % os.path.join(self.cwd, "newdir"),
             caught.exception.message,
         )
-        self.assertEqual(self.scp_destinations, [])
+        self.assertEqual(self.guest_commands, [])
         self.assertFalse(os.path.lexists("newdir"))
 
     def test_a_trailing_slash_on_a_file_is_refused(self):
@@ -1240,120 +1646,6 @@ class TestCpFromGuestNeverLandsControlPaths(CpFromGuestHarness):
         self.assertIn('skipped ".git"', reported)
         self.assertEqual(self.leftovers("dest"), [])
 
-    def test_a_control_path_under_an_unreadable_staged_directory_is_removed(self):
-        os.makedirs("dest")
-        reported = self.pull(
-            {"proj/sub/.git/config": "evil", "proj/sub/ok": "ok"},
-            guest_modes={"proj/sub": 0o300},
-        )
-        self.assertEqual(self.landed(), ["dest/proj/sub/ok"])
-        self.assertIn('skipped "proj/sub/.git"', reported)
-        self.assertEqual(self.leftovers("dest"), [])
-
-    def test_directory_modes_scp_kept_survive_the_landing(self):
-        os.makedirs("dest")
-        self.pull(
-            {"proj/pub/x": "1", "proj/priv/x": "2"},
-            guest_modes={"proj/pub": 0o755, "proj/priv": 0o700},
-        )
-        for name, mode in (("pub", 0o755), ("priv", 0o700)):
-            landed_mode = stat.S_IMODE(os.stat("dest/proj/%s" % name).st_mode)
-            self.assertEqual(landed_mode, mode, name)
-
-
-class TestCpFromGuestNeverLandsBuildOutput(CpFromGuestHarness):
-    """node_modules, .venv, Rust target and Next.js .next dwarf the source and
-    the project's tooling recreates them, so a pulled tree does not carry them."""
-
-    def skipped_lines(self, reported):
-        return [line for line in reported.splitlines() if "skipped" in line]
-
-    def test_dependency_installs_are_skipped_and_reported_once_each(self):
-        os.makedirs("dest")
-        reported = self.pull(
-            {
-                "proj/node_modules/x/index.js": "js",
-                "proj/.venv/bin/python": "py",
-                "proj/src/a.py": "a",
-            }
-        )
-        self.assertEqual(self.landed(), ["dest/proj/src/a.py"])
-        for skipped in ("node_modules", ".venv"):
-            self.assertEqual(reported.count('skipped "proj/%s"' % skipped), 1)
-        self.assertEqual(len(self.skipped_lines(reported)), 2)
-        self.assertEqual(self.leftovers("dest"), [])
-
-    def test_rust_target_beside_its_cargo_toml_is_skipped(self):
-        os.makedirs("dest")
-        reported = self.pull({"proj/target/debug/bin": "elf", "proj/Cargo.toml": "c"})
-        self.assertEqual(self.landed(), ["dest/proj/Cargo.toml"])
-        self.assertIn('skipped "proj/target"', reported)
-
-    def test_a_target_without_cargo_toml_is_a_data_directory_and_lands(self):
-        os.makedirs("dest")
-        reported = self.pull({"proj/target/data.csv": "1,2"})
-        self.assertEqual(self.landed(), ["dest/proj/target/data.csv"])
-        self.assertEqual(self.skipped_lines(reported), [])
-
-    def test_next_output_beside_its_package_json_is_skipped(self):
-        os.makedirs("dest")
-        reported = self.pull({"proj/.next/x": "built", "proj/package.json": "{}"})
-        self.assertEqual(self.landed(), ["dest/proj/package.json"])
-        self.assertIn('skipped "proj/.next"', reported)
-
-    def test_a_dot_next_without_package_json_lands(self):
-        os.makedirs("dest")
-        reported = self.pull({"proj/.next/x": "data"})
-        self.assertEqual(self.landed(), ["dest/proj/.next/x"])
-        self.assertEqual(self.skipped_lines(reported), [])
-
-    def test_a_manifest_that_is_a_directory_does_not_count(self):
-        os.makedirs("dest")
-        reported = self.pull({"proj/Cargo.toml/x": "1", "proj/target/y": "2"})
-        self.assertEqual(
-            self.landed(), ["dest/proj/Cargo.toml/x", "dest/proj/target/y"]
-        )
-        self.assertEqual(self.skipped_lines(reported), [])
-
-    def test_build_output_nested_in_the_tree_is_skipped(self):
-        os.makedirs("dest")
-        reported = self.pull({"proj/web/node_modules/a": "dep", "proj/web/src/b": "b"})
-        self.assertEqual(self.landed(), ["dest/proj/web/src/b"])
-        self.assertIn('skipped "proj/web/node_modules"', reported)
-
-    def test_a_source_the_operator_named_lands_even_when_it_is_build_output(self):
-        os.makedirs("dest")
-        reported = self.pull(
-            {"proj/node_modules/a": "x"}, source=":~/proj/node_modules"
-        )
-        self.assertEqual(self.landed(), ["dest/node_modules/a"])
-        self.assertEqual(self.skipped_lines(reported), [])
-
-    def test_a_file_called_node_modules_lands(self):
-        os.makedirs("dest")
-        reported = self.pull({"proj/node_modules": "not a directory"})
-        self.assertEqual(self.landed(), ["dest/proj/node_modules"])
-        self.assertEqual(self.skipped_lines(reported), [])
-
-    def test_a_control_path_inside_build_output_is_reported_only_as_build_output(
-        self,
-    ):
-        os.makedirs("dest")
-        reported = self.pull({"proj/node_modules/.git/config": "evil", "proj/ok": "1"})
-        self.assertEqual(self.landed(), ["dest/proj/ok"])
-        self.assertEqual(
-            self.skipped_lines(reported),
-            ['yo: skipped "proj/node_modules": ' + yo.BUILD_OUTPUT_NOTE],
-        )
-
-    def test_build_output_already_on_the_host_is_left_untouched(self):
-        os.makedirs("dest/proj/node_modules")
-        Path("dest/proj/node_modules/keep").write_text("mine")
-        self.pull({"proj/node_modules/new": "agent", "proj/ok": "1"})
-        self.assertEqual(self.read("dest/proj/node_modules/keep"), "mine")
-        self.assertFalse(os.path.lexists("dest/proj/node_modules/new"))
-        self.assertEqual(self.read("dest/proj/ok"), "1")
-
 
 class TestCpFromGuestFailsWithAMessage(CpFromGuestHarness):
     """A Mac-side failure while staging or landing is a message that names the
@@ -1392,8 +1684,8 @@ class TestCpFromGuestFailsWithAMessage(CpFromGuestHarness):
             ),
             self.assertRaises(yo.YoError) as caught,
         ):
-            self.copy([":~/proj", "dest/"], {"proj/a": "1"}, scp_fails=True)
-        self.assertEqual(caught.exception.message, "scp failed")
+            self.copy([":~/proj", "dest/"], {})
+        self.assertIn("cannot read /home/agent/proj", caught.exception.message)
         self.assertIn("cannot remove the staging directory", stderr.getvalue())
         self.assertIn("maximum recursion depth exceeded", stderr.getvalue())
 
@@ -1408,445 +1700,6 @@ class TestCpFromGuestFailsWithAMessage(CpFromGuestHarness):
         os.chmod(dirs[-1], 0)
         yo.unlock_tree(dirs[0])
         self.assertEqual(stat.S_IMODE(os.stat(dirs[-1]).st_mode) & 0o700, 0o700)
-
-
-class TestCpFromGuestKeepsDirectoryModes(CpFromGuestHarness):
-    """A directory made beside build output gets the mode OpenSSH's sftp client
-    gives one: the guest's mode with the owner's rwx added."""
-
-    def setUp(self):
-        super().setUp()
-        previous = os.umask(0o022)
-        self.addCleanup(os.umask, previous)
-        os.makedirs("dest")
-
-    def test_the_owner_can_read_write_and_enter_the_directory_scp_fills(self):
-        self.pull(
-            {"proj/sub/node_modules/x": "dep", "proj/sub/a": "1"},
-            guest_modes={"proj/sub": 0o100},
-        )
-        # the directory the children are fetched into, while scp writes there
-        self.assertEqual(self.guest.destination_modes[-1], 0o700)
-
-    def test_a_read_only_directory_lands_with_the_group_and_other_bits_it_had(self):
-        for guest_files in (
-            {"proj/sub/a": "1"},
-            {"proj/sub/node_modules/x": "dep", "proj/sub/a": "1"},
-        ):
-            with self.subTest(files=sorted(guest_files)):
-                shutil.rmtree("dest")
-                os.makedirs("dest")
-                self.pull(guest_files, guest_modes={"proj/sub": 0o555})
-                self.assertEqual(stat.S_IMODE(os.stat("dest/proj/sub").st_mode), 0o755)
-
-
-class TestCpFromGuestNeverFetchesBuildOutput(CpFromGuestHarness):
-    """Build output is left out on the guest, so its bytes never cross the wire."""
-
-    def requested(self):
-        return sorted(path for call in self.scp_sources for path in call)
-
-    def test_no_build_output_byte_is_asked_of_scp(self):
-        os.makedirs("dest")
-        self.pull(
-            {
-                "proj/node_modules/x/index.js": "js",
-                "proj/web/node_modules/y": "js",
-                "proj/web/.venv/bin/python": "py",
-                "proj/web/src/a.py": "a",
-                "proj/target/debug/bin": "elf",
-                "proj/Cargo.toml": "c",
-                "proj/README": "r",
-            }
-        )
-        self.assertEqual(
-            self.requested(),
-            [
-                "/home/agent/proj/Cargo.toml",
-                "/home/agent/proj/README",
-                "/home/agent/proj/web/src",
-            ],
-        )
-        self.assertEqual(
-            self.landed(),
-            [
-                "dest/proj/Cargo.toml",
-                "dest/proj/README",
-                "dest/proj/web/src/a.py",
-            ],
-        )
-
-    def test_a_tree_without_build_output_is_one_whole_transfer(self):
-        os.makedirs("dest")
-        self.pull({"proj/a": "1", "proj/sub/b": "2"})
-        self.assertEqual(self.scp_sources, [["/home/agent/proj"]])
-
-    def test_build_output_under_two_nested_sources_crosses_through_neither(self):
-        # Attributed to the inner source alone, the outer one was fetched whole.
-        os.makedirs("dest")
-        self.copy(
-            [":~/proj/sub", ":~/proj", "dest/"],
-            {"proj/sub/node_modules/x": "dep", "proj/sub/a": "1", "proj/b": "2"},
-        )
-        self.assertEqual(
-            self.landed(), ["dest/proj/b", "dest/proj/sub/a", "dest/sub/a"]
-        )
-        self.assertEqual(
-            self.requested(),
-            ["/home/agent/proj/b", "/home/agent/proj/sub/a", "/home/agent/proj/sub/a"],
-        )
-
-    def test_a_nested_target_that_proves_nothing_is_still_searched(self):
-        os.makedirs("dest")
-        reported = self.pull(
-            {"proj/target/data.csv": "1,2", "proj/target/node_modules/z": "dep"}
-        )
-        self.assertEqual(self.landed(), ["dest/proj/target/data.csv"])
-        self.assertIn('skipped "proj/target/node_modules"', reported)
-        self.assertEqual(self.requested(), ["/home/agent/proj/target/data.csv"])
-
-    def test_build_output_inside_build_output_is_reported_once(self):
-        os.makedirs("dest")
-        reported = self.pull(
-            {"proj/target/debug/node_modules/x": "dep", "proj/Cargo.toml": "c"}
-        )
-        self.assertEqual(self.landed(), ["dest/proj/Cargo.toml"])
-        self.assertEqual(reported.count("skipped"), 1)
-        self.assertIn('skipped "proj/target"', reported)
-
-    def test_a_fifo_beside_build_output_is_passed_over_with_a_note(self):
-        os.makedirs("dest")
-        reported = self.pull(
-            {"proj/node_modules/x": "dep", "proj/pipe": None, "proj/a": "1"}
-        )
-        self.assertEqual(self.landed(), ["dest/proj/a"])
-        self.assertIn('skipped "proj/pipe": not a regular file', reported)
-        self.assertEqual(self.requested(), ["/home/agent/proj/a"])
-
-    def test_hostile_names_in_skip_reports_are_escaped(self):
-        os.makedirs("dest")
-        reported = self.pull(
-            {
-                "proj/a\x1b[2J\nb/node_modules/x": "dep",
-                "proj/p\rq": None,
-                "proj/node_modules/y": "dep",
-            }
-        )
-        self.assertEqual(self.unprefixed_lines(reported), [])
-        self.assertNotIn("\x1b", reported)
-        self.assertNotIn("\r", reported)
-        self.assertIn('skipped "proj/a\\x1b[2J\\nb/node_modules"', reported)
-        self.assertIn('skipped "proj/p\\rq": not a regular file', reported)
-
-    def test_the_skip_is_reported_relative_to_the_named_source(self):
-        os.makedirs("dest")
-        reported = self.pull(
-            {"proj/web/node_modules/a": "x", "proj/web/b": "1"}, ":~/proj/web"
-        )
-        self.assertIn('skipped "web/node_modules"', reported)
-        self.assertEqual(self.landed(), ["dest/web/b"])
-
-    def test_every_source_is_judged_and_the_others_still_go_whole(self):
-        os.makedirs("dest")
-        self.copy(
-            [":~/a", ":~/b", "dest/"],
-            {"a/node_modules/x": "dep", "a/keep": "1", "b/f": "2"},
-        )
-        self.assertEqual(self.landed(), ["dest/a/keep", "dest/b/f"])
-        self.assertEqual(self.requested(), ["/home/agent/a/keep", "/home/agent/b"])
-
-    def test_names_with_spaces_dashes_newlines_and_wildcards_travel_intact(self):
-        os.makedirs("dest")
-        names = ["a b.txt", "-rf", "line\nbreak", "w[1]*?\\.txt", "sp ace/in"]
-        files = {"proj/%s" % name: name for name in names}
-        files["proj/node_modules/x"] = "dep"
-        self.pull(files)
-        for name in names:
-            self.assertEqual(self.read("dest/proj/%s" % name), name)
-        self.assertFalse(os.path.exists("dest/proj/node_modules"))
-
-    def test_a_directory_beside_build_output_keeps_the_mode_and_time_scp_gave_it(self):
-        os.makedirs("dest")
-        self.pull(
-            {"proj/node_modules/x": "dep", "proj/a": "1"},
-            guest_modes={"proj": 0o750},
-        )
-        status = os.stat("dest/proj")
-        self.assertEqual(stat.S_IMODE(status.st_mode), 0o750)
-        self.assertEqual(status.st_mtime, 1700000000.5)
-
-    def test_a_read_only_directory_beside_build_output_is_made_writable_like_scp_does(
-        self,
-    ):
-        os.makedirs("dest")
-        self.pull(
-            {"proj/sub/node_modules/x": "dep", "proj/sub/a": "1"},
-            guest_modes={"proj/sub": 0o500},
-        )
-        self.assertEqual(stat.S_IMODE(os.stat("dest/proj/sub").st_mode), 0o700)
-        self.assertEqual(self.read("dest/proj/sub/a"), "1")
-
-    def test_a_directory_of_thousands_of_entries_does_not_overflow_the_command_line(
-        self,
-    ):
-        os.makedirs("dest")
-        names = ["%04d-%s" % (n, "x" * 90) for n in range(2000)]
-        files = {"proj/%s" % name: "1" for name in names}
-        files["proj/node_modules/x"] = "dep"
-        self.pull(files)
-        self.assertEqual(len(self.landed()), 2000)
-        for call in self.scp_sources:
-            self.assertLess(sum(len(path) + 1 for path in call), 100000)
-        self.assertGreater(len(self.scp_sources), 1)
-
-    def test_batches_are_measured_as_scp_receives_them_with_host_and_escapes(self):
-        os.makedirs("dest")
-        # Every character is a wildcard, so the escaped spelling is twice the path.
-        names = ["%03d-%s" % (n, "[" * 150) for n in range(400)]
-        files = {"proj/%s" % name: "1" for name in names}
-        files["proj/node_modules/x"] = "dep"
-        self.pull(files)
-        self.assertEqual(len(self.landed()), 400)
-        received = [sum(len(arg) + 1 for arg in call) for call in self.guest.received]
-        self.assertGreater(len(received), 1)
-        self.assertLessEqual(max(received), 65536)
-
-    def test_a_source_the_guest_does_not_have_is_an_error_naming_it(self):
-        os.makedirs("dest")
-        with self.assertRaisesRegex(
-            yo.YoError, "No such file.*proj|proj.*No such file"
-        ):
-            self.pull({"other/a": "1"})
-        self.assertEqual(self.scp_sources, [])
-        self.assertEqual(self.leftovers("dest"), [])
-
-    def test_a_control_path_beside_build_output_is_still_dropped(self):
-        os.makedirs("dest")
-        reported = self.pull(
-            {"proj/node_modules/x": "dep", "proj/.git/config": "evil", "proj/a": "1"}
-        )
-        self.assertEqual(self.landed(), ["dest/proj/a"])
-        self.assertIn('skipped "proj/.git"', reported)
-        self.assertIn('skipped "proj/node_modules"', reported)
-
-
-class TestCpFromGuestDistrustsTheListing(CpFromGuestHarness):
-    """The listing is whatever the agent's login shell prints, so every record
-    is untrusted: one that is not a clean path under a named source, or is
-    malformed, or contradicts the second listing, is an error and nothing is
-    fetched on its strength."""
-
-    FILES = {"proj/node_modules/x": "dep", "proj/a/b": "1", "z/node_modules/q": "d"}
-
-    def pull_listing_through(self, forge, files=None):
-        # forge(argv, stdout) -> stdout, applied to every find the guest answers.
-        os.makedirs("dest", exist_ok=True)
-        guest = FakeGuest(
-            files or self.FILES, {}, self.scp_sources, self.scp_destinations, False
-        )
-        real_ssh_run = guest.ssh_run
-
-        def forged(role, argv, **kwargs):
-            done = real_ssh_run(role, argv, **kwargs)
-            if argv[0] == "find":
-                done.stdout = forge(argv, done.stdout)
-            return done
-
-        with (
-            mock.patch.object(yo.proc, "run", guest.scp),
-            mock.patch.object(yo.sshx, "ssh_run", forged),
-        ):
-            yo.cmd_cp(yo.build_parser().parse_args(["cp", ":~/proj", "dest/"]))
-
-    def refused(self, forge, message, files=None):
-        with self.assertRaisesRegex(yo.YoError, message):
-            self.pull_listing_through(forge, files)
-        self.assertEqual(self.scp_sources, [])
-        self.assertEqual(os.listdir("dest"), [])
-
-    @staticmethod
-    def first_listing_adds(record):
-        def forge(argv, stdout):
-            return stdout if "-maxdepth" in argv else stdout + record
-
-        return forge
-
-    @staticmethod
-    def record(path, kind="d", mode="755", mtime="1.0"):
-        return os.fsencode("%s\t%s\t%s\t%s\0" % (kind, mode, mtime, path))
-
-    def test_a_record_that_is_not_a_clean_path_under_a_source_is_refused(self):
-        for forged in (
-            "/home/agent/proj/a/../../../z/node_modules",
-            "/home/agent/proj/../z/node_modules",
-            "/etc/node_modules",
-            "/home/agent/z/node_modules",
-            "/home/agent/projx/node_modules",
-            "/home/agent/proj//node_modules",
-            "/home/agent/proj/./node_modules",
-            "/home/agent/proj/node_modules/",
-            "/home/agent/proj",
-            "proj/node_modules",
-            "",
-        ):
-            with self.subTest(forged=forged):
-                self.refused(
-                    self.first_listing_adds(self.record(forged)), "the guest's listing"
-                )
-
-    def test_a_forged_path_names_the_record_without_letting_escapes_through(self):
-        forged = "/home/agent/proj/\x1b[31m../../x/node_modules"
-        with self.assertRaises(yo.YoError) as caught:
-            self.pull_listing_through(self.first_listing_adds(self.record(forged)))
-        self.assertIn(repr("d\t755\t1.0\t" + forged), caught.exception.message)
-        self.assertNotIn("\x1b", caught.exception.message)
-
-    def test_a_forged_listing_cannot_make_scp_leave_staging(self):
-        # Used to land /home/agent/proj/a/../../../.envrc in the download.
-        with self.assertRaises(yo.YoError):
-            self.pull_listing_through(
-                self.first_listing_adds(
-                    self.record("/home/agent/proj/a/../../../z/node_modules")
-                )
-            )
-        self.assertEqual(
-            [source for call in self.scp_sources for source in call if ".." in source],
-            [],
-        )
-
-    def test_a_malformed_record_is_refused_and_named(self):
-        for malformed in (
-            "d\t755\t1.0",
-            "d\t755",
-            "garbage",
-            "d\t999\t1.0\t/home/agent/proj/node_modules",
-            "d\t77777\t1.0\t/home/agent/proj/node_modules",
-            "d\t0o755\t1.0\t/home/agent/proj/node_modules",
-            "d\t-755\t1.0\t/home/agent/proj/node_modules",
-            "d\t755\tsoon\t/home/agent/proj/node_modules",
-            "d\t755\tnan\t/home/agent/proj/node_modules",
-            "d\t755\tinf\t/home/agent/proj/node_modules",
-            "d\t755\t1_0\t/home/agent/proj/node_modules",
-            "d\t755\t99999999999999999999\t/home/agent/proj/node_modules",
-            "d\t755\t99999999999\t/home/agent/proj/node_modules",
-            "d\t755\t9223372037\t/home/agent/proj/node_modules",
-            "dd\t755\t1.0\t/home/agent/proj/node_modules",
-            "\t755\t1.0\t/home/agent/proj/node_modules",
-        ):
-            with self.subTest(malformed=malformed):
-                with self.assertRaises(yo.YoError) as caught:
-                    self.pull_listing_through(
-                        self.first_listing_adds(os.fsencode(malformed) + b"\0")
-                    )
-                self.assertIn(repr(malformed), caught.exception.message)
-
-    def test_a_find_that_failed_quotes_what_it_could_not_read(self):
-        # find exits 1 when a directory under a source is unreadable, and its
-        # stderr names it; the copy is refused with that name, escaped.
-        os.makedirs("dest")
-        guest = FakeGuest(
-            self.FILES, {}, self.scp_sources, self.scp_destinations, False
-        )
-        said = {}
-
-        def failing(role, argv, **kwargs):
-            done = guest.ssh_run(role, argv, **kwargs)
-            if argv[0] == "find":
-                done.returncode = 1
-                done.stderr = yo.ui.GuestText(said["stderr"], role.name)
-            return done
-
-        for stderr in ("find: '/home/agent/proj/lock\x1bed': Permission denied\n", ""):
-            with self.subTest(stderr=stderr):
-                said["stderr"] = stderr
-                with (
-                    mock.patch.object(yo.proc, "run", guest.scp),
-                    mock.patch.object(yo.sshx, "ssh_run", failing),
-                    self.assertRaises(yo.YoError) as caught,
-                ):
-                    yo.cmd_cp(yo.build_parser().parse_args(["cp", ":~/proj", "dest/"]))
-                message = caught.exception.message
-                self.assertIn("find exited 1", message)
-                self.assertNotIn("\x1b", message)
-                if stderr:
-                    self.assertIn(
-                        yo.ui.quoted_line(
-                            "find: '/home/agent/proj/lock?ed': Permission denied"
-                        ),
-                        message,
-                    )
-                else:
-                    self.assertNotIn("\n", message)
-                    self.assertIn("with no output", message)
-        self.assertEqual(self.scp_sources, [])
-
-    def test_the_largest_mode_and_mtime_a_filesystem_holds_are_accepted(self):
-        # %m prints 7777 at most; APFS and ext4 keep an mtime as int64 nanoseconds.
-        entry = yo.parse_guest_record(
-            b"d\t7777\t9223372036\t/home/agent/proj/x", ["/home/agent/proj"], False
-        )
-        self.assertEqual((entry.mode, entry.mtime), (0o7777, 9223372036.0))
-
-    def test_two_records_that_disagree_about_one_path_are_refused(self):
-        self.refused(
-            # the guest's own record of node_modules says 755
-            self.first_listing_adds(
-                self.record("/home/agent/proj/node_modules", mode="700")
-            ),
-            "the guest's listing",
-        )
-
-    def test_a_record_for_a_name_find_was_never_asked_for_is_refused(self):
-        self.refused(
-            self.first_listing_adds(self.record("/home/agent/proj/a")),
-            "the guest's listing",
-        )
-
-    def test_a_directory_listed_twice_by_overlapping_sources_is_not_a_forgery(self):
-        os.makedirs("dest")
-        guest = FakeGuest(
-            self.FILES, {}, self.scp_sources, self.scp_destinations, False
-        )
-        with (
-            mock.patch.object(yo.proc, "run", guest.scp),
-            mock.patch.object(yo.sshx, "ssh_run", guest.ssh_run),
-        ):
-            args = ["cp", ":~/proj", ":~/proj/a", "dest/"]
-            yo.cmd_cp(yo.build_parser().parse_args(args))
-        self.assertEqual(self.read("dest/a/b"), "1")
-        self.assertEqual(self.read("dest/proj/a/b"), "1")
-
-    def test_a_start_missing_from_the_second_listing_is_an_error_not_a_traceback(self):
-        def forge(argv, stdout):
-            if "-maxdepth" not in argv:
-                return stdout
-            return b"".join(
-                r + b"\0"
-                for r in stdout.split(b"\0")
-                if r and b"\t/home/agent/proj\0" not in r + b"\0"
-            )
-
-        self.refused(forge, "changed")
-
-    def test_a_directory_that_stopped_being_one_is_an_error_not_a_traceback(self):
-        def forge(argv, stdout):
-            if "-maxdepth" not in argv:
-                return stdout
-            return stdout.replace(
-                b"d\t755\t1700000000.5\t/home/agent/proj\0",
-                b"f\t644\t1700000000.5\t/home/agent/proj\0",
-            )
-
-        self.refused(forge, "changed")
-
-    def test_a_walked_directory_emptied_between_the_listings_is_an_error(self):
-        # npm removing node_modules between the two finds.
-        def forge(argv, stdout):
-            if "-maxdepth" not in argv:
-                return stdout
-            return stdout.split(b"\0")[0] + b"\0"
-
-        self.refused(forge, "changed")
 
 
 class TestCpRefusesSymlinks(CpHarness):
@@ -1952,14 +1805,6 @@ class TestCpRefusesSymlinks(CpHarness):
         Path("repo/sub/f").write_text("x")
         argv = self.run_cp(["repo", ":~/x"])["run"]
         self.assertIn(os.path.join(self.cwd, "repo"), argv)
-
-    def test_a_guest_source_named_like_a_host_symlink_is_not_checked_here(self):
-        # The upload check walks host paths. A guest operand is only ever handed
-        # to scp, so a host symlink with the same name is not a reason to refuse.
-        os.symlink("a.txt", "link")
-        argv = self.run_cp([":link", "out"])["run"]
-        self.assertIn("lima-yolobox:/home/agent/link", argv)
-        self.assertTrue(os.path.islink("link"))
 
 
 class TestHome(unittest.TestCase):
@@ -2279,246 +2124,225 @@ LIMA_BLOCK = (
     "  Port 60022\n"
 )
 
-LIMA_BLOCK_MISSING_ALIAS_FIELDS = (
-    "Host lima-yolobox\n  ControlPath ~/.lima/yolobox/ssh.sock\n  User agent\n"
-)
 
+class SshConfigCase(FakeHome):
+    """The machine's ssh.config written from the driver's facts (Lima's, unless
+    a test says otherwise), and what a real ssh makes of it."""
 
-class TestEnsureAgentSshConfig(FakeHome):
+    facts = LIMA_FACTS
+
     def setUp(self):
         super().setUp()
-        patcher = mock.patch.object(yo.ui, "err")
-        self.err = patcher.start()
+        patcher = mock.patch.object(yo.LIMA, "ssh_facts", return_value=self.facts)
+        patcher.start()
         self.addCleanup(patcher.stop)
+        os.makedirs(yo.instance_dir())
 
-    def config_path(self):
-        ssh_dir = os.path.join(self.home, ".lima", "yolobox")
-        os.makedirs(ssh_dir, exist_ok=True)
-        return os.path.join(ssh_dir, "ssh.config")
-
-    def write_config(self, text):
-        path = self.config_path()
-        with open(path, "w") as handle:
-            handle.write(text)
-        return path
+    def write(self):
+        yo.sshconfig.write_ssh_config()
+        return self.read_config()
 
     def read_config(self):
-        with open(self.config_path(), "r") as handle:
+        with open(yo.ssh_cfg(), "r") as handle:
             return handle.read()
 
-    def test_missing_file_is_not_an_error(self):
-        yo.ensure_agent_ssh_config()
-        self.err.assert_not_called()
+    def effective(self, argv, host=None):
+        completed = subprocess.run(
+            list(argv) + ["-G", host or yo.box.vm_host],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return dict(line.split(" ", 1) for line in completed.stdout.splitlines())
 
-    def test_yolobox_block_precedes_limas_own_control_path(self):
-        path = self.write_config(LIMA_BLOCK)
 
-        yo.ensure_agent_ssh_config()
-
-        content = self.read_config()
-        self.assertLess(content.index("ssh-agent.sock"), content.index("ssh.sock"))
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
-
-    def test_the_agent_match_block_forwards_no_agent(self):
-        self.write_config(LIMA_BLOCK)
-        yo.ensure_agent_ssh_config()
-        match = self.read_config().split("Match host", 1)[1].split("\n\n", 1)[0]
-        self.assertIn("user agent", match)
-        self.assertIn("\n  ForwardAgent no", match)
-
-    def test_second_call_is_byte_identical(self):
-        self.write_config(LIMA_BLOCK)
-        yo.ensure_agent_ssh_config()
-        first = self.read_config()
-
-        yo.ensure_agent_ssh_config()
-
+class TestWriteSshConfig(SshConfigCase):
+    def test_the_file_is_private_and_a_second_write_changes_nothing(self):
+        first = self.write()
+        self.assertEqual(stat.S_IMODE(os.stat(yo.ssh_cfg()).st_mode), 0o600)
+        with mock.patch.object(yo.proc, "atomic_write") as write:
+            yo.sshconfig.write_ssh_config()
+        write.assert_not_called()
         self.assertEqual(self.read_config(), first)
 
-    def test_lima_regenerated_file_is_repaired_without_duplicating(self):
-        path = self.write_config(LIMA_BLOCK)
-        yo.ensure_agent_ssh_config()
-
-        with open(path, "w") as handle:
+    def test_the_file_lima_regenerates_at_a_start_is_put_back(self):
+        wanted = self.write()
+        with open(yo.ssh_cfg(), "w") as handle:
             handle.write(LIMA_BLOCK)
-        yo.ensure_agent_ssh_config()
+        self.assertEqual(self.write(), wanted)
 
-        content = self.read_config()
-        self.assertEqual(content.count("ssh-agent.sock"), 1)
-        self.assertLess(content.index("ssh-agent.sock"), content.index("ssh.sock"))
+    def test_the_operators_block_names_the_facts_and_pins_the_key(self):
+        text = self.write()
+        block = "\n" + text.split("Host lima-yolobox\n", 1)[1].split("\n\n", 1)[0]
+        for line in (
+            "Hostname 127.0.0.1",
+            "Port 60022",
+            "User user",
+            'IdentityFile "/Users/user/.lima/_config/user"',
+            'IdentityAgent "none"',
+            "IdentitiesOnly yes",
+            "ForwardAgent no",
+            "ControlMaster auto",
+            'ControlPath "%s"' % os.path.join(yo.instance_dir(), "ssh.sock"),
+            'UserKnownHostsFile "%s"' % yo.known_hosts_path(),
+            "StrictHostKeyChecking accept-new",
+            "NoHostAuthenticationForLocalhost no",
+        ):
+            self.assertIn("\n  " + line + "\n", block + "\n", line)
 
-    def test_herdr_alias_is_present_as_agent_with_no_shared_control_path(self):
-        self.write_config(LIMA_BLOCK)
+    def test_the_agent_role_gets_its_own_master_above_the_operators_block(self):
+        text = self.write()
+        match = text.split("Match host lima-yolobox user agent\n", 1)[1]
+        self.assertIn('  ControlPath "%s"' % yo.agent_control_path(), match)
+        self.assertLess(text.index("ssh-agent.sock"), text.index("ssh.sock"))
 
-        yo.ensure_agent_ssh_config()
+    def test_herdrs_alias_is_the_agent_with_no_shared_master_and_the_same_facts(self):
+        text = self.write()
+        alias = text.split("Host yolobox\n", 1)[1]
+        for line in (
+            "User agent",
+            'ControlPath "none"',
+            "ForwardAgent no",
+            "Hostname 127.0.0.1",
+            "Port 60022",
+            'IdentityFile "/Users/user/.lima/_config/user"',
+            'UserKnownHostsFile "%s"' % yo.known_hosts_path(),
+            "NoHostAuthenticationForLocalhost no",
+        ):
+            self.assertIn("  " + line + "\n", alias, line)
+        self.assertNotIn("StrictHostKeyChecking no", alias)
 
-        content = self.read_config()
-        self.assertIn("Host yolobox\n", content)
-        alias = content.split("Host yolobox\n", 1)[1]
-        self.assertIn("  User agent\n", alias)
-        self.assertIn("  ControlPath none\n", alias)
-        self.assertIn("  ForwardAgent no\n", alias)
+    def test_an_identity_held_by_an_agent_is_named_for_both_names(self):
+        self.facts = yo.SshFacts(61234, "alice", "/h/box/operator.pub", "/h/agent.sock")
+        with mock.patch.object(yo.LIMA, "ssh_facts", return_value=self.facts):
+            text = self.write()
+        self.assertEqual(text.count('  IdentityAgent "/h/agent.sock"\n'), 2)
+        self.assertEqual(text.count('  IdentityFile "/h/box/operator.pub"\n'), 2)
+        self.assertEqual(text.count("  Port 61234\n"), 2)
+
+    def test_a_path_with_a_double_quote_cannot_be_written(self):
+        with mock.patch.object(
+            yo.LIMA, "ssh_facts", return_value=yo.SshFacts(1, "u", '/k"ey', "none")
+        ):
+            with self.assertRaisesRegex(yo.YoError, "double quote"):
+                yo.sshconfig.write_ssh_config()
 
     @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_no_user_forwards_even_if_a_later_host_block_says_yes(self):
+    def test_no_role_forwards_an_agent_whatever_a_later_block_says(self):
         # A user's own "Host lima-yolobox / ForwardAgent yes" sits after the
-        # Include; ssh keeps the first value, so the owned blocks must win, for
-        # the operator too: only `yo ssh` forwards, by its own command line.
-        self.write_config(LIMA_BLOCK + "\nHost lima-yolobox\n  ForwardAgent yes\n")
-        yo.ensure_agent_ssh_config()
-
-        def forwardagent(user):
-            proc = subprocess.run(
-                ["ssh", "-G", "-F", self.config_path(), "-o", "User=" + user]
-                + ["lima-yolobox"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            return [line for line in proc.stdout.splitlines() if "forwardagent" in line]
-
-        self.assertEqual(forwardagent("agent"), ["forwardagent no"])
-        self.assertEqual(forwardagent("user"), ["forwardagent no"])
+        # Include; ssh keeps the first value. Only `yo ssh` forwards, by its
+        # own command line.
+        self.write()
+        with open(yo.ssh_cfg(), "a") as handle:
+            handle.write("\nHost lima-yolobox\n  ForwardAgent yes\n")
+        for role in (yo.OPERATOR, yo.AGENT):
+            with self.subTest(role=role.name):
+                argv = ["ssh"] + yo.ssh_options(role)
+                self.assertEqual(self.effective(argv)["forwardagent"], "no")
+        argv = ["ssh"] + yo.ssh_options(yo.OPERATOR) + yo.forward_agent_opts()
+        self.assertEqual(self.effective(argv)["forwardagent"], yo.LIMA.op_sock())
 
     @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
     def test_every_connection_gives_up_on_a_guest_that_stops_answering(self):
-        # Whatever lima's block or a later user block says, as ssh resolves it.
+        self.write()
         later = "  ServerAliveInterval 0\n  ConnectTimeout 0\n"
-        self.write_config(
-            LIMA_BLOCK + "\nHost lima-yolobox\n" + later + "\nHost yolobox\n" + later
-        )
-        yo.ensure_agent_ssh_config()
-        # yo's roles as either account, and herdr through its alias.
+        with open(yo.ssh_cfg(), "a") as handle:
+            handle.write("\nHost lima-yolobox\n" + later + "\nHost yolobox\n" + later)
         for user, host in (
             ("agent", "lima-yolobox"),
             ("user", "lima-yolobox"),
             ("agent", "yolobox"),
         ):
             with self.subTest(user=user, host=host):
-                resolved = subprocess.run(
-                    ["ssh", "-G", "-F", self.config_path(), "-o", "User=" + user]
-                    + [host],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                ).stdout.splitlines()
-                self.assertIn("connecttimeout 30", resolved)
-                self.assertIn("serveraliveinterval 15", resolved)
-                self.assertIn("serveralivecountmax 8", resolved)
+                resolved = self.effective(
+                    ["ssh", "-F", yo.ssh_cfg(), "-o", "User=" + user], host
+                )
+                self.assertEqual(resolved["connecttimeout"], "30")
+                self.assertEqual(resolved["serveraliveinterval"], "15")
+                self.assertEqual(resolved["serveralivecountmax"], "8")
 
-    def test_a_marker_without_a_blank_line_keeps_limas_host_block(self):
-        self.write_config(yo.AGENT_SSH_CONFIG_MARKER + "\n" + LIMA_BLOCK)
-
-        yo.ensure_agent_ssh_config()
-
-        content = self.read_config()
-        self.assertIn(LIMA_BLOCK, content)
-        self.assertIn("Host yolobox\n", content)
-        first = content
-        yo.ensure_agent_ssh_config()
-        self.assertEqual(self.read_config(), first)
-
-    def test_herdr_alias_takes_hostname_port_identityfile_from_lima(self):
-        self.write_config(LIMA_BLOCK)
-
-        yo.ensure_agent_ssh_config()
-
-        alias = self.read_config().split("Host yolobox\n", 1)[1]
-        self.assertIn("  Hostname 127.0.0.1\n", alias)
-        self.assertIn("  Port 60022\n", alias)
-        self.assertIn('  IdentityFile "/Users/user/.lima/_config/user"\n', alias)
-
-    def test_herdr_alias_is_idempotent_across_reapplication(self):
-        path = self.write_config(LIMA_BLOCK)
-        yo.ensure_agent_ssh_config()
-        first = self.read_config()
-
-        with open(path, "w") as handle:
-            handle.write(LIMA_BLOCK)
-        yo.ensure_agent_ssh_config()
-
-        content = self.read_config()
-        self.assertEqual(content, first)
-        self.assertEqual(content.count("Host yolobox\n"), 1)
-
-    def test_unparseable_lima_block_skips_alias_without_writing_broken_block(self):
-        self.write_config(LIMA_BLOCK_MISSING_ALIAS_FIELDS)
-
-        yo.ensure_agent_ssh_config()
-
-        content = self.read_config()
-        self.assertNotIn("Host yolobox\n", content)
-        self.err.assert_called_once()
-        self.assertIn("yolobox", self.err.call_args[0][0])
-
-    def test_missing_lima_block_entirely_skips_alias(self):
-        self.write_config(
-            "Host somewhere-else\n  Hostname 1.2.3.4\n  Port 22\n  IdentityFile x\n"
-        )
-
-        yo.ensure_agent_ssh_config()
-
-        content = self.read_config()
-        self.assertNotIn("Host yolobox\n", content)
-        self.err.assert_called_once()
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_the_agent_role_rides_its_own_master(self):
+        self.write()
+        resolved = self.effective(["ssh"] + yo.ssh_options(yo.AGENT, mux=True))
+        self.assertEqual(resolved["controlpath"], yo.agent_control_path())
+        resolved = self.effective(["ssh", "-F", yo.ssh_cfg(), "-o", "User=agent"])
+        self.assertEqual(resolved["controlpath"], yo.agent_control_path())
 
 
-LIMA_BLOCK_WITH_TWO_KEYS = (
-    "Host lima-yolobox\n"
-    '  IdentityFile "/Users/user/.lima/_config/user"\n'
-    '  IdentityFile "/Users/user/.ssh/id_ed25519"\n'
-    "  Hostname 127.0.0.1\n"
-    "  Port 60022\n"
-    "  Hostname 10.0.0.9\n"
-    "  Port 1\n"
-)
+class TestHostKeyPinning(SshConfigCase):
+    PINNED = {
+        "stricthostkeychecking": "accept-new",
+        "nohostauthenticationforlocalhost": "no",
+    }
 
+    def pinned_keywords(self, argv, host=None):
+        wanted = ("stricthostkeychecking", "userknownhostsfile", "nohostauth")
+        return {
+            key: value
+            for key, value in self.effective(argv, host).items()
+            if key.startswith(wanted)
+        }
 
-class TestParseLimaSshBlock(unittest.TestCase):
-    def test_keeps_every_identity_file_in_order_and_the_first_other_value(self):
-        block = yo.parse_ssh_host_block(LIMA_BLOCK_WITH_TWO_KEYS, "lima-yolobox")
-        self.assertEqual(block.hostname, "127.0.0.1")
-        self.assertEqual(block.port, "60022")
-        self.assertEqual(
-            block.identity_files,
-            ("/Users/user/.lima/_config/user", "/Users/user/.ssh/id_ed25519"),
-        )
+    def assert_pinned(self, effective):
+        for keyword, value in self.PINNED.items():
+            self.assertEqual(effective[keyword], value)
+        self.assertEqual(effective["userknownhostsfile"], yo.known_hosts_path())
 
-    def test_the_herdr_alias_offers_every_identity_in_order(self):
-        block = yo.parse_ssh_host_block(LIMA_BLOCK_WITH_TWO_KEYS, "lima-yolobox")
-        lines = yo.herdr_alias_block(block).splitlines()
-        self.assertEqual(
-            [line for line in lines if "IdentityFile" in line],
-            [
-                '  IdentityFile "/Users/user/.lima/_config/user"',
-                '  IdentityFile "/Users/user/.ssh/id_ed25519"',
-            ],
-        )
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_every_yo_role_pins_the_key(self):
+        self.write()
+        for role in (yo.OPERATOR, yo.AGENT):
+            with self.subTest(role=role.name):
+                self.assert_pinned(self.pinned_keywords(["ssh"] + yo.ssh_options(role)))
 
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_a_bare_ssh_through_the_written_file_pins_the_key_for_both_names(self):
+        self.write()
+        for user, host in (([], None), (["-o", "User=agent"], None), ([], "yolobox")):
+            with self.subTest(user=user, host=host):
+                argv = ["ssh", "-F", yo.ssh_cfg()] + user
+                self.assert_pinned(self.pinned_keywords(argv, host))
 
-class TestHerdrAliasBlock(FakeHome):
-    def block(self):
-        return yo.herdr_alias_block(
-            yo.SshHostBlock(
-                "127.0.0.1", "60022", ("/Users/user/.lima/_config/user",), None
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_editors_reach_the_pin_through_the_users_include(self):
+        self.write()
+        user_config = os.path.join(self.home, ".ssh", "config")
+        os.makedirs(os.path.dirname(user_config))
+        with open(user_config, "w") as handle:
+            handle.write("Include %s\n" % yo.ssh_cfg())
+        self.assert_pinned(self.pinned_keywords(["ssh", "-F", user_config]))
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_herdrs_alias_keeps_loopback_verification_against_a_later_host_star(self):
+        # herdr reaches the alias through ~/.ssh/config, where the operator's
+        # own `Host *` may switch verification off for 127.0.0.1.
+        self.write()
+        user_config = os.path.join(self.home, ".ssh", "config")
+        os.makedirs(os.path.dirname(user_config))
+        with open(user_config, "w") as handle:
+            handle.write(
+                "Include %s\nHost *\n  NoHostAuthenticationForLocalhost yes\n"
+                % yo.ssh_cfg()
             )
+        resolved = self.effective(["ssh", "-F", user_config], yo.box.herdr_alias)
+        self.assertEqual(resolved["nohostauthenticationforlocalhost"], "no")
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    def test_first_contact_overrides_all_three_pinned_keywords(self):
+        self.write()
+        effective = self.pinned_keywords(
+            ["ssh"] + yo.ssh_options(yo.OPERATOR_FIRST_CONTACT)
         )
-
-    def test_pins_the_yo_owned_known_hosts_file(self):
-        self.assertIn('  UserKnownHostsFile "%s"' % yo.known_hosts_path(), self.block())
-
-    def test_never_disables_strict_checking(self):
-        block = self.block()
-        self.assertNotIn("StrictHostKeyChecking no", block)
-        self.assertNotIn("UserKnownHostsFile /dev/null", block)
+        self.assertEqual(effective["stricthostkeychecking"], "false")
+        self.assertEqual(effective["userknownhostsfile"], "/dev/null")
+        self.assertEqual(effective["nohostauthenticationforlocalhost"], "yes")
 
 
 class TestKnownHostsLines(unittest.TestCase):
-    LIMA_VALUES = yo.SshHostBlock("127.0.0.1", "60022", ("x",), None)
-
     def test_formats_host_port_type_and_key(self):
         pubkeys = "ssh-ed25519 AAAAC3abc== root@yolobox\n"
-        lines = yo.known_hosts_lines(self.LIMA_VALUES, pubkeys)
+        lines = yo.known_hosts_lines(60022, pubkeys)
         self.assertEqual(lines, ["[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc=="])
 
     def test_handles_multiple_key_types_and_drops_the_comment(self):
@@ -2526,7 +2350,7 @@ class TestKnownHostsLines(unittest.TestCase):
             "ssh-ed25519 AAAAC3abc== root@yolobox\n"
             "ecdsa-sha2-nistp256 AAAAE2abc== root@yolobox\n"
         )
-        lines = yo.known_hosts_lines(self.LIMA_VALUES, pubkeys)
+        lines = yo.known_hosts_lines(60022, pubkeys)
         self.assertEqual(
             lines,
             [
@@ -2535,125 +2359,16 @@ class TestKnownHostsLines(unittest.TestCase):
             ],
         )
 
-    def test_skips_blank_lines(self):
-        pubkeys = "ssh-ed25519 AAAAC3abc== root@yolobox\n\n"
-        lines = yo.known_hosts_lines(self.LIMA_VALUES, pubkeys)
+    def test_blank_lines_and_lines_with_no_key_field_are_skipped(self):
+        pubkeys = "ssh-ed25519 AAAAC3abc== root@yolobox\n\nnot-a-key-line\n"
+        lines = yo.known_hosts_lines(60022, pubkeys)
         self.assertEqual(len(lines), 1)
-
-    def test_ignores_a_line_with_no_key_field(self):
-        pubkeys = "not-a-key-line\n"
-        lines = yo.known_hosts_lines(self.LIMA_VALUES, pubkeys)
-        self.assertEqual(lines, [])
-
-
-LIMA_ALIAS_BLOCK = (
-    "Host lima-yolobox\n"
-    "  StrictHostKeyChecking no\n"
-    "  UserKnownHostsFile /dev/null\n"
-    "  NoHostAuthenticationForLocalhost yes\n"
-    "  User user\n"
-    "  Hostname 127.0.0.1\n"
-    "  Port 60022\n"
-)
-
-
-class TestHostKeyPinning(FakeHome):
-    PINNED = {
-        "stricthostkeychecking": "accept-new",
-        "nohostauthenticationforlocalhost": "no",
-    }
-
-    def write_lima_config(self):
-        lima = os.path.join(self.home, ".lima", "yolobox")
-        os.makedirs(lima, exist_ok=True)
-        with open(os.path.join(lima, "ssh.config"), "w") as handle:
-            handle.write(LIMA_ALIAS_BLOCK)
-        with mock.patch.object(yo.ui, "err"):
-            yo.ensure_agent_ssh_config()
-
-    def effective(self, argv):
-        proc = subprocess.run(
-            list(argv) + ["-G", yo.box.vm_host],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        wanted = ("stricthostkeychecking", "userknownhostsfile", "nohostauth")
-        lines = [line for line in proc.stdout.splitlines() if line.startswith(wanted)]
-        return dict(line.split(" ", 1) for line in lines)
-
-    def assert_pinned(self, effective):
-        for keyword, value in self.PINNED.items():
-            self.assertEqual(effective[keyword], value)
-        self.assertEqual(effective["userknownhostsfile"], yo.known_hosts_path())
-
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_every_yo_role_pins_the_key_over_limas_loopback_exemption(self):
-        self.write_lima_config()
-        for role in (yo.OPERATOR, yo.AGENT):
-            with self.subTest(role=role):
-                self.assert_pinned(self.effective(["ssh"] + yo.ssh_options(role)))
-
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_a_bare_ssh_through_the_written_file_pins_the_key(self):
-        self.write_lima_config()
-        for user in ([], ["-o", "User=agent"]):
-            with self.subTest(user=user):
-                argv = ["ssh", "-F", yo.ssh_cfg()] + user
-                self.assert_pinned(self.effective(argv))
-
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_yo_code_and_zed_reach_the_pin_through_the_users_include(self):
-        self.write_lima_config()
-        user_config = os.path.join(self.home, ".ssh", "config")
-        os.makedirs(os.path.dirname(user_config))
-        with open(user_config, "w") as handle:
-            handle.write("Include %s\n" % yo.ssh_cfg())
-        self.assert_pinned(self.effective(["ssh", "-F", user_config]))
-
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_herdrs_alias_keeps_loopback_verification_against_a_later_host_star(self):
-        # herdr reaches the alias through ~/.ssh/config, where the operator's
-        # own `Host *` may switch verification off for 127.0.0.1.
-        lima = os.path.join(self.home, ".lima", "yolobox")
-        os.makedirs(lima, exist_ok=True)
-        with open(os.path.join(lima, "ssh.config"), "w") as handle:
-            handle.write(LIMA_BLOCK + "  NoHostAuthenticationForLocalhost yes\n")
-        yo.ensure_agent_ssh_config()
-        user_config = os.path.join(self.home, ".ssh", "config")
-        os.makedirs(os.path.dirname(user_config))
-        with open(user_config, "w") as handle:
-            handle.write(
-                "Include %s\nHost *\n  NoHostAuthenticationForLocalhost yes\n"
-                % yo.ssh_cfg()
-            )
-        proc = subprocess.run(
-            ["ssh", "-F", user_config, "-G", yo.box.herdr_alias],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        self.assertIn("nohostauthenticationforlocalhost no", proc.stdout.splitlines())
-
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_first_contact_overrides_all_three_pinned_keywords(self):
-        self.write_lima_config()
-        effective = self.effective(["ssh"] + yo.ssh_options(yo.OPERATOR_FIRST_CONTACT))
-        self.assertEqual(effective["stricthostkeychecking"], "false")
-        self.assertEqual(effective["userknownhostsfile"], "/dev/null")
-        self.assertEqual(effective["nohostauthenticationforlocalhost"], "yes")
 
 
 class TestSshOptionValuesSurviveAHomeWithASpace(FakeHome):
     """Every -o value goes through ssh_opt(): ssh reads the argument as a
     config line, so an unquoted path with a blank is cut there and ssh exits
     255, which reads as a box that cannot be reached."""
-
-    def write_lima_config(self):
-        lima = os.path.join(yo.home(), ".lima", "yolobox")
-        os.makedirs(lima, exist_ok=True)
-        with open(os.path.join(lima, "ssh.config"), "w") as handle:
-            handle.write(LIMA_ALIAS_BLOCK)
 
     def effective(self, argv):
         completed = subprocess.run(
@@ -2669,10 +2384,11 @@ class TestSshOptionValuesSurviveAHomeWithASpace(FakeHome):
         home = os.path.join(self.home, "h o m e")
         os.makedirs(home)
         with with_home(home):
-            self.write_lima_config()
-            with mock.patch.object(yo.ui, "err"):
-                argv = ["ssh"] + yo.ssh_options(yo.AGENT, mux=True)
-                argv += yo.sshx.forward_agent_opts()
+            os.makedirs(yo.instance_dir())
+            with mock.patch.object(yo.LIMA, "ssh_facts", return_value=LIMA_FACTS):
+                yo.sshconfig.write_ssh_config()
+            argv = ["ssh"] + yo.ssh_options(yo.AGENT, mux=True)
+            argv += yo.sshx.forward_agent_opts()
             effective = self.effective(argv)
             self.assertEqual(effective["controlpath"], yo.state.agent_control_path())
             self.assertEqual(effective["forwardagent"], yo.state.driver().op_sock())
@@ -2692,37 +2408,14 @@ class TestSshOptionValuesSurviveAHomeWithASpace(FakeHome):
 
 
 class TestEnsureGuestKnownHosts(FakeHome):
-    def config_path(self):
-        ssh_dir = os.path.join(self.home, ".lima", "yolobox")
-        os.makedirs(ssh_dir, exist_ok=True)
-        return os.path.join(ssh_dir, "ssh.config")
-
-    def write_config(self, text):
-        path = self.config_path()
-        with open(path, "w") as handle:
-            handle.write(text)
-        return path
-
-    def test_missing_file_is_not_an_error(self):
-        with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
-            yo.ensure_guest_known_hosts()
-        fake_ssh_run.assert_not_called()
-
-    def test_an_unreadable_file_is_an_error_not_a_first_start(self):
-        os.makedirs(self.config_path())
-        with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
-            with self.assertRaisesRegex(yo.YoError, "cannot read .*/ssh.config"):
-                yo.ensure_guest_known_hosts()
-        fake_ssh_run.assert_not_called()
-
-    def test_unparseable_lima_block_is_skipped_without_ssh(self):
-        self.write_config(LIMA_BLOCK_MISSING_ALIAS_FIELDS)
-        with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
-            yo.ensure_guest_known_hosts()
-        fake_ssh_run.assert_not_called()
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(yo.LIMA, "ssh_facts", return_value=LIMA_FACTS)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.makedirs(yo.instance_dir())
 
     def test_fetches_via_operator_and_writes_the_known_hosts_file(self):
-        self.write_config(LIMA_BLOCK)
         proc = mock.Mock(
             returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
         )
@@ -2745,7 +2438,6 @@ class TestEnsureGuestKnownHosts(FakeHome):
             handle.write(text)
 
     def test_with_a_pin_the_fetch_is_pinned_and_a_passing_one_rewrites_it(self):
-        self.write_config(LIMA_BLOCK)
         self.write_pin("[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
         proc = mock.Mock(
             returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
@@ -2759,7 +2451,6 @@ class TestEnsureGuestKnownHosts(FakeHome):
             )
 
     def test_a_pin_of_only_whitespace_is_no_pin(self):
-        self.write_config(LIMA_BLOCK)
         self.write_pin(" \n\t\n")
         proc = mock.Mock(
             returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
@@ -2771,7 +2462,6 @@ class TestEnsureGuestKnownHosts(FakeHome):
     def test_a_changed_key_is_sshs_refusal_and_the_pin_stays(self):
         # A VM recreated behind yo's back, or something else on the port: the
         # old pin is kept and the warning shown, never a key learned anew.
-        self.write_config(LIMA_BLOCK)
         self.write_pin("[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
         warning = "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"
         proc = mock.Mock(returncode=255, stdout="", stderr=warning + "\n")
@@ -2782,23 +2472,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
         with open(yo.known_hosts_path()) as handle:
             self.assertEqual(handle.read(), "[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
 
-    def test_a_comment_that_is_not_utf8_does_not_stop_the_pinning(self):
-        # ensure_agent_ssh_config reads the same file with surrogateescape.
-        path = self.config_path()
-        with open(path, "wb") as handle:
-            handle.write(b"# caf\xe9\n" + LIMA_BLOCK.encode())
-        proc = mock.Mock(
-            returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
-        )
-        with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
-            yo.ensure_guest_known_hosts()
-        with open(yo.known_hosts_path()) as handle:
-            self.assertEqual(
-                handle.read(), "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==\n"
-            )
-
     def test_failed_fetch_raises_naming_the_cause(self):
-        self.write_config(LIMA_BLOCK)
         proc = mock.Mock(
             returncode=255,
             stdout="",
@@ -2812,7 +2486,6 @@ class TestEnsureGuestKnownHosts(FakeHome):
         self.assertFalse(caught.exception.message.startswith("yo:"))
 
     def test_no_parseable_keys_raises(self):
-        self.write_config(LIMA_BLOCK)
         proc = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
             with self.assertRaises(yo.YoError) as caught:
@@ -3209,10 +2882,7 @@ class TestAwsBrokerHealth(FakeHome):
     def test_a_healthy_broker_carries_what_it_reported(self):
         info = {"pid": 5, "watch_pid": 7, "allow": ["work"]}
         health = self.health_of(200, json.dumps(info).encode())
-        self.assertEqual(
-            health,
-            yo.BrokerHealth(yo.BrokerState.HEALTHY, info, yo.aws.aws_broker_ctl_sock()),
-        )
+        self.assertEqual(health, info)
 
     def test_anything_else_the_socket_says_is_unreachable(self):
         for status, body in (
@@ -3224,47 +2894,26 @@ class TestAwsBrokerHealth(FakeHome):
             (200, b""),
         ):
             with self.subTest(status=status, body=body):
-                self.assertIs(self.health_of(status, body), yo.BROKER_UNREACHABLE)
+                self.assertIsNone(self.health_of(status, body))
 
     def test_no_socket_is_unreachable(self):
-        self.assertIs(yo.aws_broker_health(), yo.BROKER_UNREACHABLE)
+        self.assertIsNone(yo.aws_broker_health())
 
-    def test_a_broker_answering_only_on_the_forwarded_socket_has_no_control_socket(
-        self,
-    ):
-        # What an older yo's broker looks like: it has no control socket.
+    def test_a_broker_without_a_usable_pid_is_named_by_its_socket(self):
+        sock = yo.aws.aws_broker_ctl_sock()
+        health = self.health_on(sock, 200, json.dumps({"pid": None}).encode())
+        with self.assertRaises(yo.YoError) as caught:
+            yo.kill_broker_in(health)
+        self.assertIn(
+            "the aws-broker on %s answered /health" % sock, caught.exception.message
+        )
+
+    def test_the_forwarded_socket_is_never_asked(self):
+        # The guest can crowd out the forwarded socket, so a broker that answers
+        # only there is as good as none.
         info = {"pid": 5, "watch_pid": 7, "allow": ["work"]}
         health = self.health_on(yo.aws_broker_sock(), 200, json.dumps(info).encode())
-        self.assertEqual(
-            health,
-            yo.BrokerHealth(yo.BrokerState.NO_CONTROL, info, yo.aws_broker_sock()),
-        )
-
-    def test_a_broker_without_a_usable_pid_is_named_by_the_socket_that_answered(self):
-        for sock in (yo.aws.aws_broker_ctl_sock(), yo.aws_broker_sock()):
-            with self.subTest(sock=sock):
-                health = self.health_on(sock, 200, json.dumps({"pid": None}).encode())
-                with self.assertRaises(yo.YoError) as caught:
-                    yo.kill_broker_in(health)
-                self.assertIn(
-                    "the aws-broker on %s answered /health" % sock,
-                    caught.exception.message,
-                )
-
-    def test_the_control_socket_is_asked_first(self):
-        # A control socket that answers decides, whatever the forwarded one says.
-        os.makedirs(yo.state_dir(), exist_ok=True)
-        control = BrokerStub(
-            yo.aws.aws_broker_ctl_sock(), 200, json.dumps({"pid": 1}).encode()
-        )
-        guest = BrokerStub(yo.aws_broker_sock(), 503, b"broker busy; retry\n")
-        try:
-            health = yo.aws_broker_health()
-        finally:
-            guest.close()
-            control.close()
-        self.assertEqual(health.sock, yo.aws.aws_broker_ctl_sock())
-        self.assertEqual(health.info, {"pid": 1})
+        self.assertIsNone(health)
 
 
 class TestOpProbeAlive(unittest.TestCase):
@@ -3303,10 +2952,6 @@ class TestOpProbeAlive(unittest.TestCase):
 BAD_PIDS = [0, 1, -1, True, False, "123", 12.0, None]
 
 
-def healthy(info):
-    return yo.BrokerHealth(yo.BrokerState.HEALTHY, info, "/state/aws-broker.ctl.sock")
-
-
 class TestCheckedPid(unittest.TestCase):
     def test_a_plain_pid_above_init_is_accepted(self):
         self.assertEqual(yo.checked_pid(2), 2)
@@ -3321,37 +2966,28 @@ class TestBrokerNeedsRestart(unittest.TestCase):
     def test_a_watch_pid_that_is_not_a_real_pid_needs_restart(self):
         for value in BAD_PIDS:
             with self.subTest(value=value):
-                health = healthy({"pid": 5, "watch_pid": value, "allow": ["work"]})
+                health = {"pid": 5, "watch_pid": value, "allow": ["work"]}
                 self.assertTrue(yo.broker_needs_restart(health, 123, ["work"]))
 
-    def test_a_broker_without_a_control_socket_needs_restart(self):
-        health = yo.BrokerHealth(
-            yo.BrokerState.NO_CONTROL,
-            {"pid": 1, "watch_pid": 123, "allow": ["work"]},
-            "/state/aws-broker.sock",
-        )
-        self.assertTrue(yo.broker_needs_restart(health, 123, ["work"]))
-
     def test_an_unreachable_broker_needs_restart(self):
-        self.assertTrue(yo.broker_needs_restart(yo.BROKER_UNREACHABLE, 123, ["work"]))
+        self.assertTrue(yo.broker_needs_restart(None, 123, ["work"]))
 
     def test_matching_watch_pid_and_allowlist_does_not_restart(self):
-        health = healthy({"pid": 1, "watch_pid": 123, "allow": ["work"]})
+        health = {"pid": 1, "watch_pid": 123, "allow": ["work"]}
         self.assertFalse(yo.broker_needs_restart(health, 123, ["work"]))
 
     def test_stale_watch_pid_needs_restart(self):
-        health = healthy({"pid": 1, "watch_pid": 999, "allow": ["work"]})
+        health = {"pid": 1, "watch_pid": 999, "allow": ["work"]}
         self.assertTrue(yo.broker_needs_restart(health, 123, ["work"]))
 
     def test_allowlist_drift_needs_restart(self):
-        health = healthy({"pid": 1, "watch_pid": 123, "allow": ["work"]})
+        health = {"pid": 1, "watch_pid": 123, "allow": ["work"]}
         self.assertTrue(yo.broker_needs_restart(health, 123, ["personal", "work"]))
 
 
 class TestEnsureAwsBrokerStaleBroker(FakeHome):
     def test_kills_the_brokers_own_pid_not_the_watched_pid(self):
-        health = healthy({"pid": 111, "watch_pid": 999, "allow": ["work"]})
-        killed = []
+        health = {"pid": 111, "watch_pid": 999, "allow": ["work"]}
         with (
             mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
             mock.patch.object(
@@ -3359,109 +2995,13 @@ class TestEnsureAwsBrokerStaleBroker(FakeHome):
             ),
             mock.patch.object(yo.box.driver, "keepalive_pid", return_value=555),
             mock.patch.object(yo.aws, "aws_broker_health", return_value=health),
-            mock.patch.object(yo.aws, "wait_for_pid_exit"),
+            mock.patch.object(yo.aws, "stop_broker") as fake_stop,
             mock.patch.object(yo.aws, "start_aws_broker") as fake_start,
             mock.patch.object(yo.aws, "push_aws_guest_files"),
-            mock.patch.object(
-                yo.os, "kill", side_effect=lambda pid, sig: killed.append(pid)
-            ),
         ):
             result = yo.ensure_aws_broker()
         self.assertTrue(result)
-        self.assertEqual(killed, [111])
-        fake_start.assert_called_once_with(555, ["work"])
-
-
-class TestEnsureAwsBrokerSerializesYos(FakeHome):
-    def setUp(self):
-        super().setUp()
-        self.held_during = {}
-
-    def lock_is_held(self):
-        os.makedirs(yo.state_dir(), exist_ok=True)
-        fd = os.open(
-            os.path.join(yo.state_dir(), "aws-broker.yo.lock"), os.O_RDWR | os.O_CREAT
-        )
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        finally:
-            os.close(fd)  # drops the lock when this probe got it
-        return False
-
-    def seen(self, step, result=None):
-        """A stand-in for `step` that records whether yo's broker lock is held when it runs."""
-
-        def record(*args, **kwargs):
-            self.held_during[step] = self.lock_is_held()
-            return result
-
-        return record
-
-    def test_checking_killing_and_starting_happen_under_one_lock(self):
-        stale = healthy({"pid": 111, "watch_pid": 999, "allow": ["work"]})
-        with (
-            mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
-            mock.patch.object(
-                yo.aws, "aws_allowlist", return_value=[("work", "us-east-1")]
-            ),
-            mock.patch.object(yo.box.driver, "keepalive_pid", return_value=555),
-            mock.patch.object(
-                yo.aws, "aws_broker_health", side_effect=self.seen("check", stale)
-            ),
-            mock.patch.object(
-                yo.aws, "kill_stale_broker", side_effect=self.seen("kill")
-            ),
-            mock.patch.object(
-                yo.aws, "start_aws_broker", side_effect=self.seen("start")
-            ),
-            mock.patch.object(yo.aws, "push_aws_guest_files"),
-        ):
-            yo.ensure_aws_broker()
-        self.assertEqual(self.held_during, {"check": True, "kill": True, "start": True})
-        self.assertFalse(self.lock_is_held())
-
-    def test_disabling_checks_and_kills_under_the_same_lock(self):
-        stale = healthy({"pid": 111, "watch_pid": 999, "allow": []})
-        with (
-            mock.patch.object(
-                yo.aws, "aws_broker_health", side_effect=self.seen("check", stale)
-            ),
-            mock.patch.object(
-                yo.aws, "kill_stale_broker", side_effect=self.seen("kill")
-            ),
-            mock.patch.object(yo.sshx, "ssh_run"),
-        ):
-            yo.disable_aws_broker()
-        self.assertEqual(self.held_during, {"check": True, "kill": True})
-        self.assertFalse(self.lock_is_held())
-
-
-class TestEnsureAwsBrokerUpgradesAnOlderBroker(FakeHome):
-    def test_a_broker_without_a_control_socket_is_killed_by_its_pid_and_replaced(self):
-        older = yo.BrokerHealth(
-            yo.BrokerState.NO_CONTROL,
-            {"pid": 111, "watch_pid": 555, "allow": ["work"]},
-            "/state/aws-broker.sock",
-        )
-        killed = []
-        with (
-            mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
-            mock.patch.object(
-                yo.aws, "aws_allowlist", return_value=[("work", "us-east-1")]
-            ),
-            mock.patch.object(yo.box.driver, "keepalive_pid", return_value=555),
-            mock.patch.object(yo.aws, "aws_broker_health", return_value=older),
-            mock.patch.object(yo.aws, "wait_for_pid_exit"),
-            mock.patch.object(yo.aws, "start_aws_broker") as fake_start,
-            mock.patch.object(yo.aws, "push_aws_guest_files"),
-            mock.patch.object(
-                yo.os, "kill", side_effect=lambda pid, sig: killed.append(pid)
-            ),
-        ):
-            yo.ensure_aws_broker()
-        self.assertEqual(killed, [111])
+        fake_stop.assert_called_once_with(111)
         fake_start.assert_called_once_with(555, ["work"])
 
 
@@ -3469,30 +3009,49 @@ class TestEnsureAwsBrokerUpgradesAnOlderBroker(FakeHome):
     hasattr(os, "pidfd_open") or hasattr(select, "kqueue"),
     "needs os.pidfd_open or select.kqueue to watch a pid",
 )
-class TestPidExitsWithin(unittest.TestCase):
-    def setUp(self):
-        self.child = subprocess.Popen(
-            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+class TestStopBroker(unittest.TestCase):
+    """stop_broker against real children: one that exits on SIGTERM, one that
+    ignores it, one already gone."""
+
+    def child(self, body):
+        """A child that has run `body` (a signal disposition is in place
+        before any signal is sent), then waits for its stdin to close."""
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                body + "\nimport sys; print('ready', flush=True); sys.stdin.read()",
+            ],
             stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
         )
-        self.addCleanup(self.child.wait)
-        self.addCleanup(self.child.stdin.close)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.stdin.close)
+        self.assertEqual(child.stdout.readline(), b"ready\n")
+        return child
 
-    def test_a_running_process_has_not_exited(self):
-        self.assertFalse(yo.pid_exits_within(self.child.pid, 0))
+    def test_a_broker_that_exits_on_sigterm_is_stopped(self):
+        child = self.child("")
+        yo.aws.stop_broker(child.pid)
+        self.assertEqual(child.wait(30), -signal.SIGTERM)
 
-    def test_a_process_that_exits_is_seen(self):
-        self.child.stdin.close()
-        self.assertTrue(yo.pid_exits_within(self.child.pid, 30))
+    def test_a_broker_that_ignores_sigterm_is_an_error_naming_it(self):
+        child = self.child(
+            "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+        )
+        with mock.patch.object(yo.aws, "STALE_BROKER_EXIT_SECONDS", 0):
+            with self.assertRaisesRegex(
+                yo.YoError, "stale aws-broker \\(pid %d\\) did not exit" % child.pid
+            ):
+                yo.aws.stop_broker(child.pid)
+        self.assertIsNone(child.poll())
 
-    def test_a_pid_that_is_gone_has_exited(self):
-        self.child.stdin.close()
-        self.child.wait()
-        self.assertTrue(yo.pid_exits_within(self.child.pid, 0))
-
-    def test_waiting_for_a_running_process_names_the_stale_broker(self):
-        with self.assertRaisesRegex(yo.YoError, "did not exit within 0s"):
-            yo.wait_for_pid_exit(self.child.pid, 0)
+    def test_a_pid_that_is_gone_is_stopped_already(self):
+        child = self.child("")
+        child.stdin.close()
+        child.wait()
+        yo.aws.stop_broker(child.pid)
 
 
 class TestStaleBrokerPidIsValidated(FakeHome):
@@ -3500,7 +3059,7 @@ class TestStaleBrokerPidIsValidated(FakeHome):
         # A broker that answers but cannot be stopped is reported, not skipped.
         for value in BAD_PIDS:
             with self.subTest(value=value):
-                health = healthy({"pid": value, "watch_pid": 999, "allow": []})
+                health = {"pid": value, "watch_pid": 999, "allow": []}
                 with mock.patch.object(yo.os, "kill") as fake_kill:
                     with self.assertRaisesRegex(yo.YoError, "cannot stop it"):
                         yo.kill_broker_in(health)
@@ -3508,7 +3067,7 @@ class TestStaleBrokerPidIsValidated(FakeHome):
 
     def test_an_unreachable_broker_has_nothing_to_stop(self):
         with mock.patch.object(yo.os, "kill") as fake_kill:
-            yo.kill_broker_in(yo.BROKER_UNREACHABLE)
+            yo.kill_broker_in(None)
         fake_kill.assert_not_called()
 
 
@@ -3594,12 +3153,8 @@ class TestStartAwsBrokerHandshakeFailures(FakeHome):
     """start_aws_broker against real children: a script standing in for aws-broker."""
 
     def start_with_broker_script(self, body):
-        script_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, script_dir)
+        script_dir, _ = fake_bin(self, {"aws-broker": "#!/bin/sh\n" + body})
         script = os.path.join(script_dir, "aws-broker")
-        with open(script, "w") as handle:
-            handle.write("#!/bin/sh\n" + body)
-        os.chmod(script, 0o755)
         spawn = yo.proc.spawn
         with mock.patch.object(
             yo.proc,
@@ -3690,10 +3245,10 @@ class TestEnsureAwsBrokerDisabling(FakeHome):
             mock.patch.object(
                 yo.aws,
                 "aws_broker_health",
-                return_value=healthy({"pid": 222, "watch_pid": 1, "allow": []}),
+                return_value={"pid": 222, "watch_pid": 1, "allow": []},
             ),
             mock.patch.object(
-                yo.aws, "kill_stale_broker", side_effect=lambda pid: killed.append(pid)
+                yo.aws, "stop_broker", side_effect=lambda pid: killed.append(pid)
             ),
             mock.patch.object(yo.sshx, "ssh_run", side_effect=fake_ssh_run),
         ):
@@ -3705,21 +3260,18 @@ class TestEnsureAwsBrokerDisabling(FakeHome):
 class TestDisableAwsBrokerFailsLoudly(FakeHome):
     def disable_with_ssh_exit(self, returncode, stderr):
         with (
-            mock.patch.object(
-                yo.aws, "aws_broker_health", return_value=yo.BROKER_UNREACHABLE
-            ),
-            mock.patch.object(yo.sshconfig, "ensure_agent_ssh_config"),
+            mock.patch.object(yo.aws, "aws_broker_health", return_value=None),
             mock.patch.object(
                 yo.proc,
                 "run_capped",
-                return_value=subprocess.CompletedProcess([], returncode, b"", stderr),
+                return_value=yo.proc.GuestRun([], returncode, b"", stderr),
             ),
         ):
             yo.disable_aws_broker()
 
     def test_a_guest_config_that_cannot_be_removed_is_an_error_not_a_note(self):
         with self.assertRaisesRegex(
-            yo.aws.BrokerDisableError, r"rm -f .*aws-config.*\n  \| Permission denied"
+            yo.YoError, r"rm -f .*aws-config.*\n  \| Permission denied"
         ):
             self.disable_with_ssh_exit(1, b"Permission denied")
 
@@ -3745,25 +3297,6 @@ class TestGuestAwsConfigText(unittest.TestCase):
 
 
 MISSING = object()
-
-
-def initrd_probe(migrate, ask_ids=(), unlock_running=False):
-    """What yo.unlock.INITRD_PROBE_COMMAND prints in an initrd in this state."""
-    lines = ["migrate=%s" % migrate]
-    if unlock_running:
-        lines.append("unlock-fifo=/tmp/yolobox-unlock.Ab12Cd")
-    for ask_id in ask_ids:
-        lines += [
-            "ask-begin",
-            "[Ask]",
-            "PID=170",
-            "Socket=/run/systemd/ask-password/sck.1",
-            "Id=%s" % ask_id,
-            "Message=Please enter passphrase for disk root:",
-            "",
-            "ask-end",
-        ]
-    return "\n".join(lines + ["probe=end", ""])
 
 
 def df_output(
@@ -3803,15 +3336,9 @@ def fake_limactl(
 
 class TestDeletingPaths(FakeHome):
     def test_a_path_that_is_already_gone_is_the_wanted_end_state(self):
-        gone = os.path.join(self.home, "gone")
-        yo.proc.delete_file(gone)
-        yo.proc.delete_tree(gone)
+        yo.proc.delete_tree(os.path.join(self.home, "gone"))
 
     def test_a_path_of_the_wrong_kind_is_a_yo_error_naming_it(self):
-        directory = os.path.join(self.home, "dir")
-        os.mkdir(directory)
-        with self.assertRaisesRegex(yo.YoError, "cannot delete .*dir: "):
-            yo.proc.delete_file(directory)
         file = os.path.join(self.home, "file")
         Path(file).touch()
         with self.assertRaisesRegex(yo.YoError, "cannot delete .*file: "):
@@ -3864,11 +3391,6 @@ class TestLimaDestroy(FakeHome):
         self.lines = []
         for patcher in (
             mock.patch.object(yo.subprocess, "run", side_effect=self.subprocess_run),
-            mock.patch.object(
-                yo.proc,
-                "run_capped",
-                side_effect=lambda argv, **kw: self.subprocess_run(argv),
-            ),
             mock.patch.object(yo.shutil, "which", return_value=None),
             mock.patch.object(yo.ui, "out", side_effect=self.lines.append),
         ):
@@ -3984,14 +3506,16 @@ class TestLimaConfigGaps(FakeHome):
     def test_a_limactl_that_fails_is_not_a_box_without_gaps(self):
         with fake_limactl("", 1, "vz exploded"):
             with self.assertRaisesRegex(
-                yo.YoError, "limactl list yolobox --json failed .exit 1.: vz exploded"
+                yo.YoError,
+                "limactl list yolobox --json failed .exit 1.: vz exploded",
             ):
                 yo.LIMA.config_gaps()
 
     def test_a_listing_that_fails_is_not_a_missing_instance(self):
         with fake_limactl("", listing_returncode=1):
             with self.assertRaisesRegex(
-                yo.YoError, "limactl list -q failed .exit 1.: limactl: list exploded"
+                yo.YoError,
+                "limactl list -q failed .exit 1.: limactl: list exploded",
             ):
                 yo.LIMA.config_gaps()
 
@@ -4060,8 +3584,10 @@ class TestLimaConfigGaps(FakeHome):
                 self.assertIn("limactl list yolobox", message)
                 self.assertNotIn("delete", message.replace("Do not delete", ""))
             # The status itself stays readable: the callers that decide by it
-            # (the wait for sshd, a resize) say where to look themselves.
-            self.assertEqual(yo.LIMA.vm_status(), "Broken")
+            # (the waits for the VM and its sshd) say where to look themselves.
+            self.assertEqual(
+                yo.LIMA.vm_status(), yo.VmStatus(yo.VmState.OTHER, "Broken")
+            )
 
     def test_a_broken_instance_without_a_reason_is_still_an_error(self):
         for errors in (MISSING, None, [], [{}], "lizard"):
@@ -4245,72 +3771,23 @@ class TestLimaConfigGaps(FakeHome):
                         yo.LIMA.config_gaps(), [yo.GAP_LOAD_DOT_SSH_PUB_KEYS]
                     )
 
-    def test_an_operator_uid_other_than_the_boxs_is_reported_unless_it_is_501(self):
-        # Lima took the Mac account's uid when it created the instance.
-        for value in (502, 0):
+    def test_an_operator_uid_that_is_not_501_or_not_reported_is_a_gap(self):
+        # Lima reads user.uid only when it creates the instance.
+        for value in (502, 0, None, MISSING, "501", 501.5, True, [501]):
             with self.subTest(value=value):
                 with self.mock_lima_list(self.restated_forwards(), user_uid=value):
                     self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_OPERATOR_UID])
         with self.mock_lima_list(self.restated_forwards(), user_uid=501):
             self.assertEqual(yo.LIMA.config_gaps(), [])
 
-    def test_a_uid_limactl_does_not_report_as_an_integer_is_a_note_not_a_gap(self):
-        for value in (None, MISSING, "501", 501.5, True, [501]):
-            with self.subTest(value=value):
-                with self.mock_lima_list(self.restated_forwards(), user_uid=value):
-                    self.assertEqual(yo.LIMA.config_gaps(), [])
-                    (note,) = yo.LIMA.config_notes()
-                self.assertIn("cannot tell whether the operator's uid is 501", note)
-
-    def test_a_readable_uid_or_a_missing_instance_has_no_note(self):
-        for value in (501, 502, 0):
-            with self.subTest(value=value):
-                with self.mock_lima_list(self.restated_forwards(), user_uid=value):
-                    self.assertEqual(yo.LIMA.config_notes(), [])
-        with fake_limactl("", 1, "whatever limactl says", listed=["other"]):
-            self.assertEqual(yo.LIMA.config_notes(), [])
-
-    def test_an_unreadable_uid_says_how_to_check_and_never_offers_to_destroy(self):
-        with self.mock_lima_list(self.restated_forwards(), user_uid=MISSING):
-            (message,) = yo.LIMA.config_notes()
-        self.assertIn("limactl list --json yolobox", message)
-        self.assertIn("yo ssh id -u", message)
-        for destructive in ("destroy", "limactl delete", "bootstrap", "--set"):
-            self.assertNotIn(destructive, message)
-
-    def test_a_vm_type_other_than_vz_is_a_note_naming_the_recreate_not_a_gap(self):
-        # The box works without the rosetta share; the remedy deletes it.
+    def test_a_vm_type_other_than_vz_is_a_gap(self):
+        # Only vz has the rosetta share, and lima reads vmType at creation.
         for value in ("qemu", None, 1):
             with self.subTest(vm_type=value):
                 with self.mock_lima_list(self.restated_forwards(), vm_type=value):
-                    self.assertEqual(yo.LIMA.config_gaps(), [])
-                    (note,) = yo.LIMA.config_notes()
-                self.assertIn("vmType %r, not vz" % value, note)
-                self.assertIn("yo destroy --yes && yo bootstrap", note)
+                    self.assertEqual(yo.LIMA.config_gaps(), [yo.GAP_VM_TYPE])
         with self.mock_lima_list(self.restated_forwards(), vm_type="vz"):
-            self.assertEqual(yo.LIMA.config_notes(), [])
-
-    def test_the_uid_gap_says_to_recreate_the_instance_not_to_edit_it(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_OPERATOR_UID])
-        self.assertIn("cannot change file ownership", message)
-        self.assertIn("yo destroy --yes && yo bootstrap", message)
-        self.assertNotIn("--set", message)
-        self.assertNotIn("portForwards", message)
-
-    def test_the_proxy_env_remedy_sets_it_false(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_PROPAGATE_PROXY_ENV])
-        self.assertIn("--set '.propagateProxyEnv = false'", message)
-        self.assertNotIn("portForwards", message)
-
-    def test_the_pubkey_remedy_sets_it_false(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_LOAD_DOT_SSH_PUB_KEYS])
-        self.assertIn("--set '.ssh.loadDotSSHPubKeys = false'", message)
-        self.assertNotIn("portForwards", message)
-
-    def test_the_over_vsock_remedy_sets_it_false(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_SSH_OVER_VSOCK])
-        self.assertIn("--set '.ssh.overVsock = false'", message)
-        self.assertNotIn("portForwards", message)
+            self.assertEqual(yo.LIMA.config_gaps(), [])
 
     def udp_ignore_rule(self, **overrides):
         rule = {
@@ -4486,53 +3963,6 @@ class TestLimaConfigGaps(FakeHome):
             self.assertIsNone(yo.box.driver.keepalive_pid())
 
 
-class TestNoOperatorRoleForwardsTheMacsAgent(FakeHome):
-    """A lima instance created with ssh.forwardAgent true writes `ForwardAgent
-    yes` into its own Host block. The agent block covers the agent role and the
-    herdr alias; the pin block covers every other connection through the file,
-    the operator roles included, since ssh keeps the first value. Only `yo ssh`
-    forwards, by its own command line."""
-
-    def write_lima_config_forwarding(self):
-        os.makedirs(yo.instance_dir(), exist_ok=True)
-        with open(yo.ssh_cfg(), "w") as handle:
-            handle.write(
-                LIMA_ALIAS_BLOCK.replace(
-                    "  User user\n", "  ForwardAgent yes\n  User user\n"
-                )
-            )
-        with mock.patch.object(yo.ui, "err"):
-            yo.ensure_agent_ssh_config()
-
-    def effective_forward_agent(self, argv):
-        completed = subprocess.run(
-            list(argv) + ["-G", yo.box.vm_host],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        (line,) = [
-            line
-            for line in completed.stdout.splitlines()
-            if line.startswith("forwardagent ")
-        ]
-        return line.split(" ", 1)[1]
-
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_every_role_reads_no_over_limas_yes(self):
-        self.write_lima_config_forwarding()
-        for role in (yo.OPERATOR, yo.AGENT):
-            with self.subTest(role=role):
-                argv = ["ssh"] + yo.ssh_options(role)
-                self.assertEqual(self.effective_forward_agent(argv), "no")
-
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
-    def test_yo_ssh_still_forwards_the_1password_socket_from_its_command_line(self):
-        self.write_lima_config_forwarding()
-        argv = ["ssh"] + yo.ssh_options(yo.OPERATOR) + yo.forward_agent_opts()
-        self.assertEqual(self.effective_forward_agent(argv), yo.LIMA.op_sock())
-
-
 class TestNormalizePortForward(unittest.TestCase):
     def test_a_bare_guest_port_gets_lima_defaults(self):
         self.assertEqual(
@@ -4580,185 +4010,93 @@ class TestNormalizePortForward(unittest.TestCase):
 
 
 class TestLimaConfigGapMessage(unittest.TestCase):
-    def test_names_the_full_array_migration_command(self):
+    def test_a_gap_lima_reads_only_at_creation_recreates_and_warns_of_the_loss(self):
+        gaps = [yo.OP_GUEST_SOCK, yo.GAP_MOUNTS, yo.GAP_FORWARD_AGENT, yo.GAP_VM_TYPE]
+        message = yo.LIMA.config_gap_message(gaps)
+        for gap in gaps:
+            self.assertIn(gap, message)
+        self.assertIn("yo destroy --yes && yo bootstrap", message)
+        self.assertIn("deletes its disk", message)
+        self.assertNotIn("--set", message)
+
+    def test_settings_limactl_edit_can_change_are_one_edit_of_the_stopped_box(self):
         message = yo.LIMA.config_gap_message(
-            [yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK]
+            [yo.GAP_MOUNTS, yo.GAP_UDP_FORWARDS, yo.GAP_TCP_FORWARDS]
         )
-        self.assertIn(".portForwards = ", message)
-        self.assertIn(json.dumps(yo.LIMA_PORT_FORWARDS), message)
-        self.assertIn(yo.OP_GUEST_SOCK, message)
-        self.assertIn(yo.AWS_BROKER_GUEST_SOCK, message)
+        remedy = message.splitlines()[-1]
+        self.assertTrue(remedy.startswith("fix it while it is stopped: yo down && "))
+        (expression,) = [
+            word
+            for word in shlex.split(remedy.split(": ", 1)[1])
+            if word.startswith(".mounts")
+        ]
+        # One restate covers both forward gaps.
+        self.assertEqual(expression, ".mounts = [] | " + yo.lima.RESTATE_PORT_FORWARDS)
+        self.assertNotIn("destroy", message)
 
 
-class TestLimaSettingGapMessage(unittest.TestCase):
-    def test_mounts_are_remedied_by_editing_mounts_alone(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_MOUNTS])
-        self.assertIn("--set '.mounts = []'", message)
-        self.assertNotIn("portForwards", message)
+class TestLimaStartRefusesOnlyTheGapsThatBreakThePromises(FakeHome):
+    """An instance's settings are judged at its start: a gap that breaks a
+    promise the box makes refuses the start, any other is a warning."""
 
-    def test_forward_agent_is_remedied_by_editing_forward_agent_alone(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_FORWARD_AGENT])
-        self.assertIn("--set '.ssh.forwardAgent = false'", message)
-        self.assertNotIn("portForwards", message)
-
-    def test_the_udp_gap_is_remedied_by_restating_the_full_array(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_UDP_FORWARDS])
-        self.assertIn(yo.RESTATE_PORT_FORWARDS, message)
-        self.assertIn("41641", message)
-
-    def test_the_tcp_gap_is_remedied_by_restating_the_full_array(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_TCP_FORWARDS])
-        self.assertEqual(message.count(".portForwards = "), 1)
-        self.assertIn("1024–49151", message)
-
-    def test_a_socket_gap_the_udp_gap_and_the_tcp_gap_print_one_restate(self):
-        message = yo.LIMA.config_gap_message(
-            [yo.OP_GUEST_SOCK, yo.GAP_UDP_FORWARDS, yo.GAP_TCP_FORWARDS]
-        )
-        self.assertEqual(message.count(".portForwards = "), 1)
-        self.assertIn("41641", message)
-        self.assertIn("1024–49151", message)
-
-    def test_the_udp_gap_and_the_tcp_gap_print_one_restate(self):
-        message = yo.LIMA.config_gap_message([yo.GAP_UDP_FORWARDS, yo.GAP_TCP_FORWARDS])
-        self.assertEqual(message.count(".portForwards = "), 1)
-
-    def test_every_gap_kind_gets_its_own_remedy(self):
-        message = yo.LIMA.config_gap_message(
-            [yo.OP_GUEST_SOCK, yo.GAP_MOUNTS, yo.GAP_FORWARD_AGENT]
-        )
-        for needle in (
-            yo.OP_GUEST_SOCK,
-            ".portForwards = ",
-            ".mounts = []",
-            ".ssh.forwardAgent = false",
-        ):
-            self.assertIn(needle, message)
-
-
-class TestVmUpRefusesOnlyTheLimaGapsThatBreakThePromises(FakeHome):
-    def refused_vm_up(self, gaps):
+    def start(self, gaps):
+        warnings = []
+        starter = mock.Mock()
+        starter.poll.return_value = None
+        starter.wait.return_value = 0
         with (
             mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
-            mock.patch.object(yo.LIMA, "vm_status") as status,
-            mock.patch.object(yo.agent, "luks_passphrase") as passphrase,
-            mock.patch.object(yo.forwards, "vm_services") as services,
+            mock.patch.object(yo.lima, "lima_instance_exists", return_value=True),
+            mock.patch.object(yo.proc, "spawn", return_value=starter) as spawn,
+            mock.patch.object(yo.LIMA, "wait_until_running"),
+            mock.patch.object(yo.unlock, "unlock_disk"),
+            mock.patch.object(yo.unlock, "wait_for_operator"),
+            mock.patch.object(yo.ui, "err", side_effect=warnings.append),
         ):
-            with self.assertRaises(yo.YoError) as caught:
-                yo.vm_up()
-        status.assert_not_called()
-        passphrase.assert_not_called()
-        services.assert_not_called()
-        return caught.exception.message
+            try:
+                yo.LIMA.start(b"pass", None)
+            except yo.YoError as refused:
+                return refused, spawn, warnings
+        return None, spawn, warnings
 
-    def test_ssh_over_vsock_refuses_before_the_vm_is_touched_naming_the_fix(self):
+    def test_ssh_over_vsock_or_a_host_mount_refuses_before_the_vm_is_touched(self):
         for gaps in (
             [yo.GAP_SSH_OVER_VSOCK],
             [yo.OP_GUEST_SOCK, yo.GAP_FORWARD_AGENT, yo.GAP_SSH_OVER_VSOCK],
+            [yo.OP_GUEST_SOCK, yo.GAP_MOUNTS],
         ):
             with self.subTest(gaps=gaps):
-                message = self.refused_vm_up(gaps)
-                self.assertIn("--set '.ssh.overVsock = false'", message)
+                refused, spawn, _ = self.start(gaps)
+                for gap in gaps:
+                    self.assertIn(gap, refused.message)
+                # Both are settings `limactl edit` undoes: nothing is lost.
+                self.assertIn("limactl edit", refused.message)
+                self.assertNotIn("destroy", refused.message)
+                spawn.assert_not_called()
 
-    def test_a_host_mount_refuses_before_the_vm_is_touched_naming_the_fix(self):
-        # The one promise the box makes is no host mounts: a box with one must
-        # not start, and the remedy edits the instance without deleting anything.
-        message = self.refused_vm_up([yo.OP_GUEST_SOCK, yo.GAP_MOUNTS])
-        self.assertIn("--set '.mounts = []'", message)
-        self.assertNotIn("destroy", message)
+    def test_every_other_gap_is_one_warning_and_the_start_goes_on(self):
+        others = [
+            yo.GAP_FORWARD_AGENT,
+            yo.GAP_PROPAGATE_PROXY_ENV,
+            yo.GAP_LOAD_DOT_SSH_PUB_KEYS,
+            yo.GAP_UDP_FORWARDS,
+            yo.GAP_TCP_FORWARDS,
+            yo.GAP_OPERATOR_UID,
+            yo.GAP_VM_TYPE,
+            yo.OP_GUEST_SOCK,
+        ]
+        refused, spawn, warnings = self.start(others)
+        self.assertIsNone(refused)
+        spawn.assert_called_once()
+        self.assertEqual(len(warnings), 1)
+        for gap in others:
+            self.assertIn(gap, warnings[0])
 
-    def test_every_other_lima_gap_is_only_a_note(self):
-        others = [gap for gap in yo.LIMA_SETTING_GAPS if gap not in yo.LIMA_FATAL_GAPS]
-        others += list(yo.LIMA_MANUAL_GAPS)
-        self.assertEqual(yo.LIMA.fatal_gaps(others + [yo.OP_GUEST_SOCK, ""]), [])
-        self.assertEqual(
-            yo.LIMA.fatal_gaps(others + [yo.GAP_MOUNTS, yo.GAP_SSH_OVER_VSOCK]),
-            [yo.GAP_MOUNTS, yo.GAP_SSH_OVER_VSOCK],
-        )
-
-
-class TestVmUpNoticesLimaConfigGapsInsteadOfRefusing(FakeHome):
-    def vm_up_on_a_running_box(self, gaps):
-        running = yo.LimaInfo(
-            host_agent_pid=1,
-            port_forwards=[],
-            mounts=[],
-            forward_agent=False,
-            status="Running",
-            over_vsock=False,
-            propagate_proxy_env=False,
-            load_dot_ssh_pub_keys=False,
-            user_uid=yo.OPERATOR_GUEST_UID,
-            ssh_local_port=yo.SSH_LOCAL_PORT,
-            vm_type="vz",
-        )
-        with (
-            mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
-            mock.patch.object(yo.lima, "lima_instance_info", return_value=running),
-            mock.patch.object(
-                yo.unlock, "endpoint_kind", return_value=yo.Endpoint.STAGE2
-            ),
-            mock.patch.object(yo.unlock, "stage2_up", return_value=True),
-            mock.patch.object(yo.sshconfig, "ensure_agent_ssh_config"),
-            mock.patch.object(yo.guest, "ensure_guest_known_hosts"),
-            mock.patch.object(yo.forwards, "vm_services") as fake_services,
-            mock.patch.object(yo.ui, "err") as fake_err,
-        ):
-            yo.vm_up()
-        return fake_err, fake_services
-
-    def test_a_gap_is_reported_on_stderr_and_the_vm_still_comes_up(self):
-        fake_err, fake_services = self.vm_up_on_a_running_box([yo.OP_GUEST_SOCK])
-        message = " ".join(call.args[0] for call in fake_err.call_args_list)
-        self.assertIn(yo.OP_GUEST_SOCK, message)
-        fake_services.assert_called_once_with()
-
-    def test_no_gaps_prints_nothing_about_lima_config(self):
-        fake_err, _ = self.vm_up_on_a_running_box([])
-        fake_err.assert_not_called()
-
-
-class TestADiskGrowIsJudgedBeforeItsStop(FakeHome):
-    """grow_running_disk stops the box to edit the ceiling, so what would refuse
-    the restart (a fatal config gap, a dead 1Password) is checked before the
-    stop, as vm_up checks it before a start."""
-
-    def grow(self, gaps, login_failure=None):
-        self.login = mock.Mock(side_effect=login_failure)
-        self.stop = mock.Mock()
-        self.passphrase = mock.Mock(return_value=b"p" * 64)
-        with (
-            mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
-            mock.patch.object(yo.LIMA, "vm_status", return_value="Running"),
-            mock.patch.object(yo.LIMA, "require_login_key", self.login),
-            mock.patch.object(yo.LIMA, "stop", self.stop),
-            mock.patch.object(yo.LIMA, "grow_disk"),
-            mock.patch.object(yo.agent, "luks_passphrase", self.passphrase),
-            mock.patch.object(yo.vm, "root_usage_before_grow"),
-            mock.patch.object(yo.vm, "vm_up"),
-            mock.patch.object(yo.vm, "grow_mapping_and_filesystem"),
-            mock.patch.object(yo.ui, "err"),
-        ):
-            yo.grow_running_disk(100, 200)
-
-    def test_a_fatal_gap_refuses_the_grow_before_the_stop_and_the_prompt(self):
-        with self.assertRaises(yo.YoError) as caught:
-            self.grow([yo.lima.GAP_SSH_OVER_VSOCK])
-        self.assertIn("overVsock", caught.exception.message)
-        self.stop.assert_not_called()
-        self.passphrase.assert_not_called()
-
-    def test_a_login_key_that_is_not_on_offer_refuses_before_the_stop(self):
-        with self.assertRaisesRegex(yo.YoError, "1Password is locked"):
-            self.grow([], login_failure=yo.YoError("1Password is locked"))
-        self.stop.assert_not_called()
-        self.passphrase.assert_not_called()
-
-    def test_a_box_that_passes_is_stopped_after_the_key_check_and_the_prompt(self):
-        self.grow([])
-        self.login.assert_called_once_with()
-        self.passphrase.assert_called_once_with()
-        self.stop.assert_called_once_with()
+    def test_no_gap_prints_nothing(self):
+        refused, spawn, warnings = self.start([])
+        self.assertIsNone(refused)
+        spawn.assert_called_once()
+        self.assertEqual(warnings, [])
 
 
 class TestHerdrMachineId(unittest.TestCase):
@@ -4813,304 +4151,6 @@ class TestHerdrMachineId(unittest.TestCase):
                     yo.herdr_machine_id("[%s]" % entry)
 
 
-class TestYoNamespace(unittest.TestCase):
-    def module(self, **attributes):
-        module = types.ModuleType("fake")
-        vars(module).update(attributes)
-        return module
-
-    def test_a_module_is_found_by_its_name_and_a_function_by_its_owner(self):
-        self.assertIs(yo.proc, sys.modules["yo.proc"])
-        self.assertIs(yo.run, yo.proc.run)
-
-    def test_a_name_no_module_defines_is_an_attribute_error(self):
-        with self.assertRaisesRegex(AttributeError, "no module .* 'lizard'"):
-            yo.lizard
-
-    def test_a_name_two_modules_define_differently_is_refused(self):
-        namespace = YoNamespace({"one": self.module(x=1), "two": self.module(x=2)})
-        with self.assertRaisesRegex(AttributeError, "'x' is defined by one, two"):
-            namespace.x
-
-    def test_a_name_two_modules_share_as_one_object_is_found(self):
-        shared = object()
-        namespace = YoNamespace(
-            {"one": self.module(x=shared), "two": self.module(x=shared)}
-        )
-        self.assertIs(namespace.x, shared)
-
-    def test_a_write_names_the_module_to_patch(self):
-        with self.assertRaisesRegex(AttributeError, r"patch yo\.<module>\.run"):
-            yo.run = None
-
-    def test_a_read_sees_a_rebinding_made_in_the_module(self):
-        name = "yo_live"
-        self.addCleanup(unload_yo, name)
-        copy = load_yo(name)
-        copy.state.set_box(copy.state.box.driver, "second")
-        self.assertEqual(copy.box.name, "second")
-
-    def test_unloading_forgets_the_package_and_its_modules_only(self):
-        for name in ("yo_gone", "yo_gone_not"):
-            self.addCleanup(unload_yo, name)
-            load_yo(name)
-        unload_yo("yo_gone")
-        self.assertNotIn("yo_gone", sys.modules)
-        self.assertNotIn("yo_gone.proc", sys.modules)
-        self.assertIn("yo_gone_not", sys.modules)
-        self.assertIn("yo_gone_not.proc", sys.modules)
-
-
-class TestYoVersionLiteral(unittest.TestCase):
-    # nix/pkgs/yolobox.nix (--replace-fail) and homebrew/yolobox.rb (inreplace)
-    # both patch this exact line; if it is reformatted the brew build ships a
-    # binary that still reports "dev" without failing.
-    def test_config_has_exactly_one_line_that_is_the_dev_version_literal(self):
-        lines = (yo.PKG_DIR / "config.py").read_text().splitlines()
-        self.assertEqual(lines.count('YO_VERSION = "dev"'), 1)
-
-
-class TestTailscaleStatusLine(unittest.TestCase):
-    def probe(self, backend):
-        return json.dumps({"BackendState": backend})
-
-    def test_running_is_healthy(self):
-        line = yo.tailscale_status_line(self.probe("Running"), "")
-        self.assertEqual(line, yo.StatusLine("tailscale: Running"))
-
-    def test_not_logged_in_is_optional_and_names_login(self):
-        line = yo.tailscale_status_line(self.probe("NeedsLogin"), "")
-        self.assertEqual(
-            line,
-            yo.StatusLine(
-                "tailscale: not logged in (optional) — to join a tailnet: "
-                "yo ssh sudo tailscale up"
-            ),
-        )
-
-    def test_awaiting_approval_is_optional(self):
-        line = yo.tailscale_status_line(self.probe("NeedsMachineAuth"), "")
-        self.assertEqual(
-            line,
-            yo.StatusLine(
-                "tailscale: awaiting approval in the tailnet admin console (optional)"
-            ),
-        )
-
-    def test_a_stopped_backend_is_a_warning_naming_login(self):
-        line = yo.tailscale_status_line(self.probe("Stopped"), "")
-        self.assertEqual(
-            line,
-            yo.StatusLine(
-                "tailscale: WARNING Stopped — fix with: yo ssh sudo tailscale up", True
-            ),
-        )
-
-    def test_unparseable_output_surfaces_stderr(self):
-        line = yo.tailscale_status_line("", "failed to connect to local tailscaled")
-        self.assertIn(
-            "status unreadable:\n  | failed to connect to local tailscaled", line.text
-        )
-        self.assertTrue(line.warning)
-
-    def test_json_that_is_not_an_object_is_unreadable(self):
-        for payload in ("null", "[]"):
-            with self.subTest(payload=payload):
-                line = yo.tailscale_status_line(payload + "\n", "")
-                self.assertIn("status unreadable:\n  | " + payload, line.text)
-                self.assertTrue(line.warning)
-
-    def test_silent_failure_says_no_output(self):
-        line = yo.tailscale_status_line("", "")
-        self.assertIn("status unreadable: no output", line.text)
-
-    def test_box_without_tailscale_says_to_bootstrap(self):
-        line = yo.tailscale_status_line("NO_TAILSCALE\n", "")
-        self.assertIn("yo bootstrap", line.text)
-        self.assertFalse(line.warning)
-
-
-class TestEgressStatusLine(unittest.TestCase):
-    def probe(self, stdout="", stderr="", returncode=0):
-        return subprocess.CompletedProcess([], returncode, stdout, stderr)
-
-    def table(self, stdout="", stderr="", returncode=0):
-        # What `sudo nft list table` answered; the unit branches below it
-        # that never look at the table pass a probe that must not be called.
-        return lambda: self.probe(stdout, stderr, returncode)
-
-    def never_read(self):
-        self.fail("the table must not be read for this unit state")
-
-    def answer(self, load_state, active_state):
-        return self.probe("LoadState=%s\nActiveState=%s\n" % (load_state, active_state))
-
-    def test_a_loaded_active_unit_says_the_host_and_lan_are_blocked(self):
-        self.assertEqual(
-            yo.egress_status_line(
-                self.answer("loaded", "active"), self.table(FIXTURE_EGRESS)
-            ),
-            yo.StatusLine("egress: host and LAN blocked"),
-        )
-
-    def test_a_loaded_unit_in_any_other_state_reads_the_table_and_names_the_state(self):
-        recovery = "table inet yolobox-egress {\n\tchain output_recovery {\n"
-        for state in ("failed", "inactive", "activating", "lizard"):
-            with self.subTest(state=state):
-                line = yo.egress_status_line(
-                    self.answer("loaded", state), self.table(recovery)
-                )
-                self.assertTrue(line.warning)
-                self.assertTrue(line.text.startswith("egress: WARNING recovery table"))
-                self.assertIn("(yolobox-egress %s)" % state, line.text)
-                self.assertIn("yo ssh sudo nixos-rebuild switch --rollback", line.text)
-                self.assertIn("yo ssh journalctl -u yolobox-egress", line.text)
-
-    def test_a_stopped_unit_over_the_full_table_is_not_a_recovery_table(self):
-        # The unit has no ExecStop: stopping it leaves the full table loaded.
-        for state in ("inactive", "failed"):
-            for listing in (FIXTURE_EGRESS, FIXTURE_EGRESS_TUNNEL):
-                with self.subTest(state=state):
-                    line = yo.egress_status_line(
-                        self.answer("loaded", state), self.table(listing)
-                    )
-                    self.assertTrue(line.warning)
-                    self.assertTrue(
-                        line.text.startswith(
-                            "egress: WARNING full rules loaded, unit yolobox-egress %s"
-                            % state
-                        ),
-                        line.text,
-                    )
-                    self.assertNotIn("recovery", line.text)
-
-    def test_a_recovery_table_named_output_is_still_a_recovery_table(self):
-        # Boxes built before the tiers called their recovery table plain "output".
-        old_recovery = (
-            (FIXTURES / "egress-recovery.nft")
-            .read_text()
-            .replace("output_recovery", "output")
-        )
-        line = yo.egress_status_line(
-            self.answer("loaded", "failed"), self.table(old_recovery)
-        )
-        self.assertTrue(line.text.startswith("egress: WARNING recovery table"))
-
-    def test_a_unit_the_box_does_not_know_means_the_box_predates_the_table(self):
-        # systemctl prints ActiveState=inactive for an unknown unit.
-        self.assertEqual(
-            yo.egress_status_line(
-                self.answer("not-found", "inactive"), self.never_read
-            ),
-            yo.StatusLine(
-                "egress: box predates the egress table; run yo bootstrap", True
-            ),
-        )
-
-    def test_a_silent_probe_is_not_checked_rather_than_recovery_mode(self):
-        line = yo.egress_status_line(self.probe(), self.never_read)
-        self.assertEqual(
-            line, yo.StatusLine("egress: not checked — the probe answered '' (exit 0)")
-        )
-
-    def test_a_failed_ssh_is_not_checked_and_says_why(self):
-        line = yo.egress_status_line(
-            self.probe(
-                stderr="ssh: connect to host lima-yolobox: refused\n", returncode=255
-            ),
-            self.never_read,
-        )
-        self.assertEqual(
-            line,
-            yo.StatusLine(
-                "egress: not checked — the probe answered '' (exit 255): "
-                "ssh: connect to host lima-yolobox: refused"
-            ),
-        )
-
-    def test_an_unrecognised_load_state_is_not_checked(self):
-        for load_state in ("lizard", "error"):
-            with self.subTest(load_state=load_state):
-                line = yo.egress_status_line(
-                    self.answer(load_state, "active"), self.never_read
-                )
-                self.assertTrue(line.text.startswith("egress: not checked"))
-                self.assertIn("LoadState=%s" % load_state, line.text)
-
-    def test_a_masked_unit_warns_that_the_box_may_reach_the_host(self):
-        for active_state in ("inactive", "active"):
-            with self.subTest(active_state=active_state):
-                self.assertEqual(
-                    yo.egress_status_line(
-                        self.answer("masked", active_state), self.never_read
-                    ),
-                    yo.StatusLine(
-                        "egress: WARNING the egress table is masked — the box may reach "
-                        "the host; unmask with: yo ssh sudo systemctl unmask yolobox-egress",
-                        True,
-                    ),
-                )
-
-    def test_a_loaded_unit_with_no_active_state_is_not_checked(self):
-        line = yo.egress_status_line(self.probe("LoadState=loaded\n"), self.never_read)
-        self.assertTrue(line.text.startswith("egress: not checked"))
-
-    def active_line(self, table):
-        return yo.egress_status_line(self.answer("loaded", "active"), table)
-
-    def test_a_tunnel_profile_table_is_not_a_false_alarm(self):
-        # lanAllow / tunnelInterfaces boxes carry extra accepts and a
-        # postrouting chain; only the invariants are checked.
-        self.assertEqual(
-            self.active_line(self.table(FIXTURE_EGRESS_TUNNEL)),
-            yo.StatusLine("egress: host and LAN blocked"),
-        )
-
-    def test_an_active_unit_over_a_wrong_table_gets_its_own_warning(self):
-        wrong = {
-            "empty": FIXTURE_EMPTY_TABLE,
-            "no output chain": FIXTURE_EGRESS_TUNNEL.replace("chain output", "chain x"),
-            "no output hook": FIXTURE_EGRESS_TUNNEL.replace(
-                "hook output", "hook input"
-            ),
-            "no local accept": FIXTURE_EGRESS_TUNNEL.replace('"tailscale0", ', ""),
-            "no v4 private reject": FIXTURE_EGRESS_TUNNEL.replace(
-                "10.0.0.0/8", "11.0.0.0/8"
-            ),
-            "no v6 private reject": FIXTURE_EGRESS_TUNNEL.replace(
-                "fc00::/7", "fd00::/8"
-            ),
-            "no reject": FIXTURE_EGRESS_TUNNEL.replace("reject", "accept"),
-            "gibberish": "lizard\n",
-        }
-        for name, listing in wrong.items():
-            with self.subTest(name=name):
-                line = self.active_line(self.table(listing))
-                self.assertTrue(line.warning)
-                self.assertTrue(
-                    line.text.startswith(
-                        "egress: WARNING unit active but table looks wrong"
-                    )
-                )
-
-    def test_a_missing_table_under_an_active_unit_is_the_wrong_table_warning(self):
-        line = self.active_line(
-            self.table(stderr="Error: No such file or directory\n", returncode=1)
-        )
-        self.assertIn("table looks wrong", line.text)
-
-    def test_a_failed_table_probe_falls_back_to_the_unit_state(self):
-        for stderr, code in (
-            ("sudo: a password is required\n", 1),
-            ("ssh: connect to host lima-yolobox: refused\n", 255),
-        ):
-            with self.subTest(stderr=stderr):
-                self.assertEqual(
-                    self.active_line(self.table(stderr=stderr, returncode=code)),
-                    yo.StatusLine("egress: host and LAN blocked"),
-                )
-
-
 class TestStatusWithVmDown(unittest.TestCase):
     def test_unreachable_vm_is_reported_once_fails_the_run_and_no_guest_probe_runs(
         self,
@@ -5127,17 +4167,8 @@ class TestStatusWithVmDown(unittest.TestCase):
             mock.patch.object(
                 yo.proc, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0)
             ),
-            mock.patch.object(
-                yo.sshx, "account_status", lambda: (yo.AccountStatus.UNREACHABLE, "")
-            ),
             mock.patch.object(yo.sshx, "ssh_run", ssh_run),
-            mock.patch.object(yo.LIMA, "config_gaps", lambda: []),
-            mock.patch.object(yo.LIMA, "config_notes", lambda: []),
-            mock.patch.object(
-                yo.unlock,
-                "sshd_answers",
-                lambda endpoint, user: yo.SshOutcome.NOT_LISTENING,
-            ),
+            # The port sends no banner: nothing listens.
             mock.patch.object(yo.unlock, "ssh_banner", lambda endpoint: ""),
             mock.patch.object(yo.shutil, "which", lambda name: None),
         ):
@@ -5158,7 +4189,7 @@ ACCEPT_TIMEOUT_SECONDS = 10
 class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
     """boot_stage reads a real TCP banner and asks for root only off stage 2:
     root there is an invalid user, which sshd penalises per source address,
-    and every host connection shares the gateway's (nix/base.md)."""
+    and every host connection shares the gateway's address."""
 
     STAGE2 = "SSH-2.0-OpenSSH_10.6 %s\r\n" % yo.STAGE2_SSH_BANNER_MARK
 
@@ -5201,9 +4232,7 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
 
         with (
             mock.patch.object(
-                yo.sshconfig,
-                "initrd_endpoint",
-                return_value=yo.sshconfig.InitrdEndpoint("127.0.0.1", port, ("/k",)),
+                yo.LIMA, "ssh_facts", return_value=yo.SshFacts(port, "op", "/k", "none")
             ),
             mock.patch.object(yo.unlock, "sshd_answers", answers),
             mock.patch.object(yo.release, "host_user", return_value="op"),
@@ -5253,38 +4282,29 @@ class TestWaitForOperatorRetriesEveryShapeUntilTheDeadline(unittest.TestCase):
     in that window a probe came back once as RAN and once as ERROR: both are
     retried, like a refused key or a closed port, until the deadline."""
 
-    def wait(self, outcomes, status=yo.driver.RUNNING):
+    def wait(self, outcomes, status=yo.VmStatus(yo.VmState.RUNNING, "running")):
         outcomes = iter(outcomes)
-        clock = [0.0]
-        sleeps = []
+        clock = VirtualClock()
         driver = mock.Mock()
         driver.vm_status.return_value = status
-        driver.vm_lost_hint.return_value = "hint"
+        driver.hints = yo.LIMA.hints
         box = mock.Mock()
         box.name = "e2e1"
-
-        def sleep(seconds):
-            sleeps.append(seconds)
-            clock[0] += seconds
-            if len(sleeps) > 2000:
-                raise AssertionError("yo is polling forever")
 
         def probe(endpoint, user):
             outcome = next(outcomes)
             return outcome, "ssh said %s" % outcome.value
 
         with (
-            mock.patch.object(yo.sshconfig, "initrd_endpoint", return_value=None),
             mock.patch.object(yo.release, "host_user", return_value="op"),
             mock.patch.object(yo.unlock, "probe_sshd", probe),
             mock.patch.object(yo.state, "driver", return_value=driver),
             mock.patch.object(yo.state, "box", box),
             mock.patch.object(yo.state, "yo_cmd", lambda *a: "yo -m e2e1 status"),
-            mock.patch.object(yo.time, "sleep", sleep),
-            mock.patch.object(yo.time, "monotonic", lambda: clock[0]),
+            clock,
         ):
             yo.unlock.wait_for_operator()
-        return sleeps
+        return clock.sleeps
 
     def test_every_failed_shape_is_retried_until_the_operator_answers(self):
         sleeps = self.wait(
@@ -5330,7 +4350,10 @@ class TestWaitForOperatorRetriesEveryShapeUntilTheDeadline(unittest.TestCase):
 
     def test_a_domain_that_went_away_ends_the_wait_at_once(self):
         with self.assertRaisesRegex(yo.YoError, "e2e1 is shut off, not Running"):
-            self.wait(itertools.repeat(yo.SshOutcome.ERROR), status="shut off")
+            self.wait(
+                itertools.repeat(yo.SshOutcome.ERROR),
+                status=yo.VmStatus(yo.VmState.OFF, "shut off"),
+            )
 
 
 class TestUnlockDiskSendsThePassphraseOnlyToAnUnmarkedSshd(unittest.TestCase):
@@ -5338,7 +4361,7 @@ class TestUnlockDiskSendsThePassphraseOnlyToAnUnmarkedSshd(unittest.TestCase):
     read before every helper run: a marked stage 2, the one switch-root lands
     in, is asked for the operator and nothing else."""
 
-    DROPPED = yo.HelperRun(yo.SSH_UNREACHABLE, "", False, True)
+    DROPPED = yo.HelperRun(yo.SSH_UNREACHABLE, "", True)
 
     def run_unlock(self, kinds, operator_answers, helper_runs):
         kinds = iter(kinds)
@@ -5346,14 +4369,13 @@ class TestUnlockDiskSendsThePassphraseOnlyToAnUnmarkedSshd(unittest.TestCase):
         helper_runs = iter(helper_runs)
         helper_calls = []
         driver = mock.Mock()
-        driver.vm_status.return_value = yo.driver.RUNNING
+        driver.vm_status.return_value = yo.VmStatus(yo.VmState.RUNNING, "Running")
 
         def helper(passphrase):
             helper_calls.append(passphrase)
             return next(helper_runs)
 
         with (
-            mock.patch.object(yo.sshconfig, "initrd_endpoint", return_value=None),
             mock.patch.object(yo.unlock, "endpoint_kind", lambda endpoint: next(kinds)),
             mock.patch.object(
                 yo.unlock,
@@ -5396,10 +4418,14 @@ class TestUnlockDiskSendsThePassphraseOnlyToAnUnmarkedSshd(unittest.TestCase):
         self.assertEqual(helper_calls, [])
 
 
+LIMA_RUNNING = yo.VmStatus(yo.VmState.RUNNING, "Running")
+LIMA_FORCE_STOP = "limactl stop --force yolobox"
+
+
 class TestLimaStopHangOffersTheKillOnlyPastTheInitrd(unittest.TestCase):
     def test_the_kill_is_conditional_on_ssh_answering(self):
         with (
-            mock.patch.object(yo.LIMA, "vm_status", return_value="Running"),
+            mock.patch.object(yo.LIMA, "vm_status", return_value=LIMA_RUNNING),
             mock.patch.object(
                 yo.proc, "run", side_effect=yo.RunTimeout("limactl stop timed out")
             ),
@@ -5415,7 +4441,7 @@ class TestLimaStopHangOffersTheKillOnlyPastTheInitrd(unittest.TestCase):
         )
         self.assertIn("If it fails in any way", message)
         self.assertIn("do not kill the hostagent", message)
-        self.assertNotIn(yo.LIMA.force_stop_command(), message)
+        self.assertNotIn(LIMA_FORCE_STOP, message)
 
 
 class TestLimaStopThatExitsNonZeroOnARunningBox(unittest.TestCase):
@@ -5433,13 +4459,13 @@ class TestLimaStopThatExitsNonZeroOnARunningBox(unittest.TestCase):
         return caught.exception
 
     def test_a_polite_stop_carries_the_hang_recovery_and_its_exit(self):
-        refused = self.failed_stop(yo.LIMA.stop, ["Running", "Running"])
+        refused = self.failed_stop(yo.LIMA.stop, [LIMA_RUNNING, LIMA_RUNNING])
         self.assertEqual(refused.reason, "limactl stop yolobox failed (exit 1)")
         self.assertIn("If yo ssh true succeeds", refused.message)
         self.assertIn("do not kill the hostagent", refused.message)
 
     def test_a_forced_stop_carries_the_hostagent_kill_alone(self):
-        refused = self.failed_stop(yo.LIMA.force_stop, ["Running"])
+        refused = self.failed_stop(yo.LIMA.force_stop, [LIMA_RUNNING])
         self.assertEqual(refused.reason, "limactl stop --force yolobox failed (exit 1)")
         self.assertIn("kill -9 any 'limactl hostagent'", refused.message)
         self.assertNotIn("systemctl reboot", refused.message)
@@ -5448,22 +4474,18 @@ class TestLimaStopThatExitsNonZeroOnARunningBox(unittest.TestCase):
 class TestLimaInitrdTimeoutNamesItsBootLog(unittest.TestCase):
     def test_serialv_log_keeps_the_boot_so_it_is_named(self):
         text = yo.unlock.initrd_timeout_error(False).message
-        self.assertIn(
-            "its boot log shows how far it got: ~/.lima/yolobox/serialv.log", text
-        )
+        self.assertIn("never offered its initrd sshd", text)
+        self.assertIn("~/.lima/yolobox/serialv.log", text)
+        self.assertIn("~/.lima/yolobox/ha.stderr.log", text)
 
 
 class TestUnknownStageOffersNoForceOnLima(unittest.TestCase):
     def test_the_way_out_is_lima_s_key_and_never_a_forced_stop(self):
-        for login in (None, "lizard"):
-            with self.subTest(login=login):
-                text = yo.unknown_stage_message(login, yo.vm.RERUN)
-                self.assertIn("~/.lima/_config/user", text)
-                # The next step when the key is right: Lima's own boot log.
-                self.assertIn("~/.lima/yolobox/serialv.log", text)
-                self.assertIn(yo.unlock.MIGRATE_UNIT_DESCRIPTION, text)
-                self.assertNotIn(yo.LIMA.force_stop_command(), text)
-                self.assertNotIn("--force", text)
+        text = yo.unlock.unknown_stage_message()
+        self.assertIn("~/.lima/_config/user", text)
+        self.assertIn("run the command again", text)
+        self.assertNotIn(LIMA_FORCE_STOP, text)
+        self.assertNotIn("--force", text)
 
 
 class TestSshBannerReadsTheWholeLine(unittest.TestCase):
@@ -5512,7 +4534,7 @@ class TestSshBannerReadsTheWholeLine(unittest.TestCase):
             "create_connection",
             lambda address, timeout: self.Client(client, received),
         ):
-            return yo.unlock.ssh_banner(yo.sshconfig.InitrdEndpoint("127.0.0.1", 1, ()))
+            return yo.unlock.ssh_banner(yo.SshFacts(1, "op", "/k", "none"))
 
     def test_a_line_sent_in_two_segments_is_read_whole(self):
         mark = yo.STAGE2_SSH_BANNER_MARK.encode()
@@ -5534,26 +4556,32 @@ class TestSshBannerReadsTheWholeLine(unittest.TestCase):
         self.assertEqual(self.banner(b"SSH-2.0-Open"), "SSH-2.0-Open")
 
 
-class TestClassifyDisk(unittest.TestCase):
-    def test_each_filesystem_type_has_its_state(self):
-        for fstype, state in (
-            ("", yo.DiskState.UNREADABLE),
-            ("ext4", yo.DiskState.PLAIN_EXT4),
-            ("crypto_LUKS", yo.DiskState.ENCRYPTED),
-            ("xfs", yo.DiskState.OTHER),
-            ("lizard", yo.DiskState.OTHER),
+class TestSshBannerTellsNothingListeningFromAHostFailure(unittest.TestCase):
+    def banner_when_connect_raises(self, failure):
+        with mock.patch.object(
+            yo.unlock.socket, "create_connection", side_effect=failure
         ):
-            with self.subTest(fstype=fstype):
-                self.assertIs(yo.classify_disk(fstype), state)
+            return yo.unlock.ssh_banner(yo.SshFacts(60022, "op", "/k", "none"))
+
+    def test_a_port_nothing_answers_on_has_no_banner(self):
+        for failure in (
+            ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
+            ConnectionResetError(errno.ECONNRESET, "reset"),
+            socket.timeout("timed out"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                self.assertEqual(self.banner_when_connect_raises(failure), "")
+
+    def test_a_host_that_cannot_connect_at_all_is_an_error_not_a_silent_port(self):
+        for code in (errno.EMFILE, errno.EPERM):
+            with self.subTest(errno=errno.errorcode[code]):
+                with self.assertRaisesRegex(
+                    yo.YoError, "cannot read the ssh banner on 127.0.0.1:60022"
+                ):
+                    self.banner_when_connect_raises(OSError(code, os.strerror(code)))
 
 
 class TestSshArgv(FakeHome):
-    def test_it_is_ssh_then_the_roles_options_then_the_tail(self):
-        argv = yo.sshx.ssh_argv(yo.AGENT, "-t", "host", mux=True)
-        self.assertEqual(
-            argv, ["ssh"] + yo.ssh_options(yo.AGENT, mux=True) + ["-t", "host"]
-        )
-
     def test_the_multiplexing_off_by_default_says_so(self):
         self.assertIn("ControlPath=none", yo.sshx.ssh_argv(yo.OPERATOR))
 
@@ -5563,7 +4591,6 @@ class TestPortOnLima(unittest.TestCase):
         with self.assertRaises(yo.YoError) as caught:
             yo.LIMA.forward_port(8080)
         self.assertEqual(caught.exception.code, 64)
-        self.assertEqual(yo.USAGE_EXIT, 64)
 
 
 class TestNumbersFromOtherSystemsAreAsciiDigitsOnly(FakeHome):
@@ -5591,11 +4618,12 @@ class TestNumbersFromOtherSystemsAreAsciiDigitsOnly(FakeHome):
     def test_a_failed_ssh_or_df_is_an_error_with_what_it_said(self):
         for returncode, stderr in ((255, "ssh: connect refused"), (1, "df: /: gone")):
             with self.subTest(returncode=returncode):
-                completed = mock.Mock(returncode=returncode, stdout="", stderr=stderr)
+                completed = yo.proc.GuestRun(["ssh"], returncode, "", stderr)
                 with mock.patch.object(yo.sshx, "ssh_run", return_value=completed):
                     with self.assertRaisesRegex(
                         yo.YoError,
-                        r"root usage from df \(exit %d\): %s" % (returncode, stderr),
+                        r"root usage from df \(exit %d\):\n  \| %s"
+                        % (returncode, stderr),
                     ):
                         yo.guest.guest_root_usage()
 
@@ -5611,10 +4639,10 @@ class TestNumbersFromOtherSystemsAreAsciiDigitsOnly(FakeHome):
         with mock.patch.object(
             yo.proc,
             "run",
-            return_value=mock.Mock(returncode=0, stdout="1 \u00b2 1\n"),
+            return_value=mock.Mock(returncode=0, stdout="\u00b2\n"),
         ):
-            with self.assertRaisesRegex(yo.YoError, "reports no memory, disk and CPUs"):
-                yo.LIMA.current_size()
+            with self.assertRaisesRegex(yo.YoError, "reports no disk size"):
+                yo.LIMA.disk_gib()
 
 
 class TestDuKib(FakeHome):

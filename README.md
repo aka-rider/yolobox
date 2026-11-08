@@ -1,203 +1,161 @@
 # yolobox
 
-A development sanbox virtual machine. It's a NixOS Linux run by Lima on a Mac, or by libvirt on a Linux PC.
+A development sandbox for coding agents. It is one NixOS virtual machine, run by Lima on a Mac or by libvirt on a Linux PC. The agent works inside it as an account with no `sudo`, the VM mounts nothing from your computer, and the only ways files move are git and `yo cp`.
 
-## To protect against
+It protects against:
 
-- An agent that runs `rm -rf ~` or installs malware via `curl2sudo`™.
-- A supply chain attack.
-- macOS `systempolicyd` write scans, which make builds slow.
+- an agent that runs `rm -rf ~` or pipes a script from the internet into `sudo`;
+- a supply chain attack in a package the agent installs;
+- macOS `systempolicyd` scanning every build write, which makes builds slow.
 
-It limits what an agent can do. It doesn't lock the agent in.
+It limits what an agent can do. It does not lock the agent in: the VM reaches the internet, just not your computer or your local network.
 
-- The agent runs as its own user with no `sudo`. The filesystem is airgaped. Files move only through git, scp, or rsync.
-- The VM can use your 1Password SSH agent. You must approve the access (TouchID or similarly).
-- The VM reaches the internet, but not your computer or your local network. To let it reach one address, such as a package cache on your LAN, name it in `/etc/yolobox/local.nix`, for example `yolobox.network.lanAllow = [ "192.168.1.20/32" ];`. On a Linux host this has no effect: the host table rejects the same ranges for the VM, see [docs/linux-host.md](docs/linux-host.md#the-host-table).
-- On a Mac, open VM ports from 1024 to 49151 are mapped on the host, except a few login-callback ports such as 8085 (you can open `http://localhost:<port>` directly in your browser). On Linux nothing is mapped on its own: `yo port <guest-port>` opens one.
+## What you need
 
+On a Mac: [Lima](https://lima-vm.io/) and `fzf` (`brew install lima fzf`), and [1Password](https://1password.com/) with its SSH agent turned on.
 
-## Quickstart
+On a Linux PC: Fedora on x86_64 with KVM, 1Password with its SSH agent, Python 3.9 or newer, `git`, `ssh` and `fzf`. The host setup script below installs libvirt, passt and `xorriso`.
 
-You need [1Password](https://1password.com/) with its SSH agent turned on. It holds your keys.
+In 1Password create an `SSH Key` item, type Ed25519, titled `yolobox-disk`. It unlocks the VM's encrypted disk. Put it in a vault of its own that the 1Password SSH agent serves: the VM can ask the forwarded 1Password agent for a signature with any key the agent serves, and one approved `yolobox-disk` signature is the disk passphrase. Keep the item safe. The disk has no recovery key, so losing the item loses the disk.
 
-Create an `SSH Key` item in 1Password, type Ed25519, titled `yolobox-disk`. It unlocks the VM's disk: `yo up` asks 1Password for it (Touch ID) every time the VM starts. Approve that prompt only when you ran `yo` yourself. Keep the item: if it is lost, the disk is lost.
-
-### Homebrew
+On a Linux PC also create a second Ed25519 `SSH Key` item titled `yolobox-operator`, in a vault the 1Password agent serves. `yo` logs in to the VM with it, so no private key file is ever written on the host. Then, once per host, from a checkout of this repo:
 
 ```bash
-brew install aka-rider/tap/yolobox
+sudo bash linux/host-setup.sh
 ```
 
-### Nix
+It installs libvirt and passt, adds a host firewall table that keeps the VM off your LAN, creates the account `yolobox-vm` that runs the VM, and lets your account manage libvirt.
+
+## Install
 
 ```bash
-nix run github:aka-rider/yolobox/v<version> -- bootstrap
+brew install aka-rider/tap/yolobox                    # Mac
+nix profile install github:aka-rider/yolobox/v<version>   # Mac or Linux, with nix
 ```
 
-Run a release, not the repo's tip: an unpinned `nix run github:aka-rider/yolobox` builds `main` but reports and bootstraps the last release in `.version`, so the box lags the `yo` that runs it (see `yo.md`, "bootstrap --version"). To run `main` on purpose, add `--version main`, so the box builds the same tree.
+Or run it once without installing: `nix run github:aka-rider/yolobox/v<version> -- bootstrap`. Always name a release; `yo bootstrap` builds the VM from the same release as the `yo` that runs it.
 
-### Init the VM
-
-The whole bring-up, on a Mac or on a Linux host once it is set up (below):
+## Bring-up
 
 ```bash
-yo bootstrap
-yo ssh       # you, the operator
-git clone <your dotfiles repo> ~/.dotfiles; ~/.dotfiles/<its install script>
+yo bootstrap   # creates, unlocks and builds the VM
+yo ssh         # you, the operator
+git clone <your dotfiles repo> ~/.dotfiles && ~/.dotfiles/<its install script>
 exit
-yo enter     # the agent; it lands in the mirror of your current directory
-git clone <your dotfiles repo> ~/.dotfiles; ~/.dotfiles/<its install script>
+yo enter       # the agent; it lands in the mirror of your current directory
+git clone <your dotfiles repo> ~/.dotfiles && ~/.dotfiles/<its install script>
 exit
 ```
 
-`yo bootstrap` creates, unlocks and builds the VM. It offers to add one line at the top of `~/.ssh/config`, above any `Host` or `Match` line, which serves every machine on a Mac and on a Linux host:
+`yo bootstrap` offers to add one line at the top of `~/.ssh/config`, above any `Host` or `Match` line. It serves every machine on both kinds of host:
 
 ```
 Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config
 ```
 
-Both accounts clone over ssh with keys from your 1Password, and the VM already trusts github.com's published host keys, so the first clone asks nothing but 1Password's approval. `yo` itself never clones dotfiles; what they install is yours.
+The first bootstrap encrypts the disk in place. That can take many minutes on a large disk, and the first few must not be interrupted. If it is interrupted anyway, run `yo destroy --yes && yo bootstrap`.
 
-### Linux host
-
-A Linux PC (Fedora, x86_64, with KVM) runs the box under libvirt instead of Lima. The guest and the way you use it are the same. How the host side works, and why, is in [docs/linux-host.md](docs/linux-host.md).
-
-1. In 1Password, create a second `SSH Key` item, Ed25519, titled `yolobox-operator`, in a vault the 1Password agent serves, next to `yolobox-disk`. It is the key `yo` uses to log in to the VM as you, so no private key file is written on the host.
-2. Once per host, from a checkout of this repo, set the host up. It installs libvirt and passt, adds a host firewall table and an account `yolobox-vm`, and lets your account manage libvirt. Read [linux/host-setup.md](linux/host-setup.md) first:
-
-   ```bash
-   sudo bash linux/host-setup.sh
-   ```
-
-3. Install `yo`. With Nix, the package puts `yo` on your `PATH` with its tools, `xorriso` included (it builds the VM's cloud-init disk):
-
-   ```bash
-   nix profile install github:aka-rider/yolobox/<version>
-   ```
-
-   Or run it from the checkout as `./yo`. Step 2 installed `xorriso`; Python 3.9 or newer, `git`, `ssh`, `curl` and `fzf` must already be on your `PATH`.
-4. Bring the VM up as in [Init the VM](#init-the-vm): `yo bootstrap` creates and starts it, then builds it.
-
-   The box gets 16 GiB of memory, a 100 GiB disk and up to 4 CPUs (one less than your machine has, at most 4). To size it, pass the sizes to the `yo bootstrap` that creates it: `yo bootstrap --memory 24 --disk 250 --cpus 3` (memory and disk in GiB; `--cpus` takes 1 to one less than your machine's CPU count). To resize a box that exists, stop it (`yo down`) and run `yo up` with the same flags: memory and CPUs change, a disk only grows. See [Sizing a box](docs/linux-host.md#sizing-a-box).
-
-5. To open a VM port on the host, run `yo port <guest-port>`. It prints the `127.0.0.1` port it chose.
-
-A host whose sshd listens on the tailnet should read the tailnet section of the linux-host story first.
+The box gets 16 GiB of memory, a 100 GiB disk and one CPU less than your machine has, at most 4. Sizes apply only when a box is created: `yo bootstrap --memory 24 --disk 250 --cpus 3`. Later, `yo disk-grow <GiB>` grows the disk; any other size change means `yo destroy --yes` and a new bootstrap.
 
 ## Daily use
 
-The VM has two users. You are the operator. You have the same name as on the host, and you have `sudo`. The agents run as `agent`, which has no `sudo`.
+The VM has two accounts. You are the operator: same name as on the host, with `sudo`. Agents run as `agent`, which has no `sudo`.
 
-- `yo enter` opens a shell as `agent`. Use it every day.
-- `yo ssh` opens a shell as you, for maintenance.
-- `yo code [proj]` to the project on the VM with [Visual Studio Code](https://code.visualstudio.com/) (via ssh).
-- `yo zed [proj]` same but for [Zed](https://zed.dev)
+| Command | What it does |
+|---|---|
+| `yo enter [proj]` | a shell as the agent, in the mirror of your current directory or in a project |
+| `yo ssh [cmd...]` | a shell or one command as the operator, for maintenance |
+| `yo code [proj]`, `yo zed [proj]` | VS Code Remote-SSH or Zed, as the agent |
+| `yo cp SRC... DST` | copy like `scp`; a leading `:` means the VM |
+| `yo up`, `yo down` | start and unlock the VM, stop it |
+| `yo status` | describe the VM; exits 1 when any check warns |
+| `yo gc [--deep] [--yes]` | report disk usage; `--yes` reclaims caches, `--deep` also build output |
+| `yo disk-grow <GiB>` | grow the disk |
+| `yo port <guest-port>` | Linux hosts only: open a VM port on the host's `127.0.0.1` |
+| `yo aws-check` | check every allow-listed AWS profile from inside the VM |
+| `yo destroy [--yes]` | list, or with `--yes` delete, the VM and everything on it |
+| `yo -m NAME <command>` | drive a second machine instead of `yolobox` |
 
-`yo enter`, `yo code` and `yo zed` try to match the directory you're in.
-
-```bash
-cd ~/code/project && yo enter
-```
-
-puts you in `~/code/project` in the VM, if the VM has it.
-
-`yo enter <proj>`, `yo zed <proj>`, and `yo code <proj>` open a project in the VM.
-They treat a directory with `.git` in it as a project. Fuzzy search works.
-
-
-`yo --help` gives up to date commands list. `yo help <command>` or `yo <command> --help` explains one command.
-
-### Copying files
-
-`yo cp` works like `scp`. A leading `:` means the VM.
+`yo help <command>` explains one command. `yo enter <proj>` picks among the VM's git repositories with fuzzy search.
 
 ```sh
-cd <project> && yo cp README.md :  # host to VM, same directory
-yo cp :notes.md ~/Desktop/         # VM to host
-yo cp a.txt b.txt :dump/           # several files into one VM directory
+cd <project> && yo cp README.md :   # host to VM, same directory
+yo cp :notes.md ~/Desktop/          # VM to host
+yo cp -- -odd.txt :                 # a name that starts with -
 ```
 
-For a file whose name starts with `-`, write `yo cp -- -odd.txt :`.
+`yo cp` never uploads a symlink, and a download never lands `.git`, `.envrc`, `.vscode` or similar control files on the host: the agent wrote them, and your tools would run them as you. A download also skips `node_modules` and `.venv`, and `target` and `.next` where a `Cargo.toml` or `package.json` sits beside them; it names each skipped path. A `target` with no `Cargo.toml` may hold code, so it is copied.
 
-### herdr
+`yo ssh`, `yo enter`, `yo cp`, `yo code` and `yo zed` still run when the 1Password and AWS forwards cannot be set up; they print a warning. `yo ssh` is the way into a box whose forwards are broken.
 
-[herdr](https://herdr.dev/) runs inside the VM, and `yo bootstrap` adds it to herdr on your host as the `yolobox` machine.
+On a Mac, VM ports 1024 to 49151 are mirrored onto the host's `localhost`, except a few fixed login-callback ports such as 8085. A service listening on `127.0.0.1` or on all addresses in the VM is mirrored. On Linux nothing is mapped until `yo port` opens it.
 
-Run `claude` or `pi` in a workspace on that machine. It's the only place herdr can see them. An agent started from `yo enter`, `yo ssh`, `yo code` or `yo zed` is invisible to herdr.
+## Git is the bridge
 
-You can paste images from the host's clipboard into a herdr pane in the VM.
+Add the VM as a git remote over ssh. The host alias is `lima-yolobox`, or `lima-NAME` for `yo -m NAME`, on both kinds of host: `git remote add box agent@lima-yolobox:code/project` reaches the agent's checkout of `~/code/project`. Every checkout in the VM accepts pushes into its current branch, but only while its worktree is clean. The VM commits `devbox.lock`, so pull before you push again. Review what the agent committed before you run any of it on the host.
 
-### 1Password and AWS
+## Secrets
 
-1Password's SSH agent works in the VM automatically.
+1Password's SSH agent and the AWS credentials reach the VM over reverse unix sockets. Nothing secret is copied in. 1Password asks for approval per application, not per signature, and an approval can cover later signatures from the same application until 1Password locks. Approve a `yolobox-disk` prompt only while you yourself run `yo up`, `yo bootstrap` or `yo disk-grow`.
 
-The VM's disk is encrypted. `yo up` asks 1Password for the `yolobox-disk` key to unlock it.
-
-For AWS, log in on the host, then pick the profile in the VM:
+For AWS, log in on the host and pick the profile per process in the VM:
 
 ```bash
-# on the host
-aws sso login --profile <profile>
-
-# in the VM
-export AWS_PROFILE=<profile>
-aws sts get-caller-identity
+aws sso login --profile <profile>                             # on the host
+AWS_PROFILE=<profile> aws sts get-caller-identity             # in the VM
 ```
 
-### Tailscale (optional)
+Copies of the VM's disk image made before its first bootstrap, such as Time Machine backups or APFS snapshots, still hold the unencrypted disk.
 
-To reach the VM from anywhere on your [Tailscale](https://tailscale.com/) network, log it in once:
+## herdr, Tailscale, devbox
 
-```bash
-yo ssh sudo tailscale up
-```
+[herdr](https://herdr.dev/) runs inside the VM, and `yo bootstrap` adds it to herdr on your host as a machine. Run `claude` or `pi` in a workspace on that machine; an agent started from `yo enter`, `yo ssh` or an editor is invisible to herdr. When `claude update` prints a "Fix" line about `~/.local/bin/claude`, ignore it: that file is the box's launcher.
 
-Tailscale is optional. Without it nothing changes, and `yo status` just says the VM is not logged in.
+[Tailscale](https://tailscale.com/) is optional. `yo ssh sudo tailscale up` logs the VM in. Then every port in it is open to whatever your tailnet's access policy admits, so review the policy. ssh from a tailnet peer is refused by design. If `tailscale up` refuses with "requires mentioning all non-default flags", do not pass `--reset`: it clears the flags the box pins. Run `yo ssh sudo tailscale up`, then `yo ssh sudo systemctl restart tailscaled-set`, which applies the flags again.
 
-Once the VM is on a tailnet, every service in it is reachable at its tailnet address (`yo ssh tailscale ip -4`), by whatever the tailnet's access policy admits. Without a tailnet, make the service listen on `0.0.0.0` and open `localhost:<port>` on the host (ports 1024 to 49151 only, minus a few login-callback ports).
+Each project gets its tools from [devbox](https://www.jetify.com/devbox): `devbox add nodejs`, then `devbox shell` or `devbox run -- <cmd>`. Nothing loads a project's tools because you changed into its directory. Editor language servers run through devbox, so add them to the project's `devbox.json`.
 
-### Devbox
-
-Each project gets its tools from [devbox](https://www.jetify.com/devbox). Inside the VM:
-
-```bash
-devbox init
-devbox add typescript bun nodejs
-devbox run -- bun --version
-devbox shell   # or work inside it
-```
-
-Devbox is entered explicitly, with `devbox shell` or `devbox run`. Nothing loads a project's tools just because you changed into its directory. The editors' language servers pick up the project's tools through devbox on their own.
-
-`devbox search <name>` finds packages.
-
-Zed's own language servers don't run on NixOS. Add them explicitly to the project's `devbox.json` instead.
+The VM has a virtual screen (`DISPLAY=:0`) and Chromium, so agents can drive a real browser. `yolobox-screen-record start` and `stop` record it into `~/artifacts/`.
 
 ## Make it yours
 
-Fork it and change whatever you like.
+Put extra packages or settings in `/etc/yolobox/local.nix` inside the VM, a NixOS module, and rebuild with `yolobox-guest rebuild switch` (or `boot` for the next boot). The rebuild uses the exact tree the box was last built from. `yo bootstrap --version <release>` moves the box to another release.
 
-To add tools you use every day, like `neovim` or `emacs`, put them in `/etc/yolobox/local.nix` inside the VM and rebuild:
+`yolobox.swapSizeMiB` sets the swapfile, 16384 by default and 0 for none. The VM's network rules are not configurable. A box that must reach a LAN address can replace the rule file in its `local.nix`: set both `ExecStart` and `ExecReload` of the unit, because a switch reloads it in place.
 
-```bash
-yolobox-guest rebuild switch
+```nix
+systemd.services.yolobox-egress.serviceConfig =
+  let load = lib.mkForce "${pkgs.nftables}/bin/nft --file ${./my-egress.nft}";
+  in { ExecStart = load; ExecReload = load; };
 ```
 
-It rebuilds from the flake ref the last build stamped into `/etc/yolobox/flake-ref`, with the box's own name from `/etc/yolobox/hostname`. For a box built from a release that is the same release; for a box built from a branch it is that branch's current tip, which may have moved since. Use `boot` instead of `switch` to apply the change at the next boot. To move the box to another release, run `yo bootstrap --version <version>` on the host.
+On a Linux host the host table still keeps the VM off the LAN.
 
-Lima reads `lima/yolobox.yaml` only once, when it creates the VM, so editing that file later changes nothing. To give an existing VM more memory, CPUs or disk, stop it and start it with the new size:
+## Upgrading
 
-```bash
-yo down
-yo up --memory 24 --cpus 4 --disk 250
-```
+A new `yo` is used with a box it built itself. When `yo status` reports that the box's version differs, run `yo bootstrap`. A major release recreates the box: push your work out, then `yo destroy --yes && yo bootstrap`. Your data lives in git, not in the box.
 
-A flag equal to the box's current size changes nothing, and `yo up` refuses a size change while the box is not stopped.
+## When something breaks
 
-## Browser and screen
+- **DNS fails in the VM.** A full disk shows up as DNS failure first, because dhcpcd cannot write `resolv.conf`. Run `yo gc --yes` from the host, then `yo gc --deep --yes`.
+- **`yo` refuses a box it did not make, or the two do not understand each other.** Push your work out of the VM, then `yo destroy --yes && yo bootstrap`. A box is disposable; only the latest `yo` and box are supported together.
+- **The VM has no network at all after a boot.** Its egress table failed to load, and without the table the box takes no address. Recreate the box.
+- **No network in the VM while the host has it.** A full-tunnel VPN on the host blackholes the VM's traffic, and a fake-IP proxy (Clash, Surge) answers with addresses in `198.18.0.0/15`, which the VM refuses. On a Mac, `limactl stop <name> && yo up` clears Lima flows stuck after a VPN disconnects.
+- **`yo up` says the box is not bootstrapped yet.** The box has no agent account: it is a fresh box, or a broken one. Run `yo bootstrap`.
+- **`yo` says a Lima instance departs from `lima/yolobox.yaml` (Mac).** It names the cause. If `limactl edit` can fix it while the instance is stopped, `yo` prints that one command. A setting Lima reads only at creation means a new instance, which deletes the disk: push your work out, then run the `yo destroy --yes && limactl create ... && yo bootstrap` chain it prints.
+- **`yo destroy`** keeps the `Include` line, the downloaded base image and the AWS broker, which other machines share.
 
-The VM has a virtual screen (`DISPLAY=:0`) and the VM's Chromium, so agents can drive a real browser. `yolobox-screen-record start` and `stop` record the screen into `~/artifacts/`, not into the project, so the recordings don't end up in git.
+## Limits
+
+- Disk encryption protects the image file at rest, not the running VM: its memory and its unlocked disk are plaintext to whoever controls the host.
+- The initrd lives on the unencrypted boot partition and is not signed. Whoever can write the image file can replace it, and the replacement receives the passphrase at your next `yo up`.
+- One `yolobox-disk` item is one passphrase for every box: all boxes derive it from the same key and message, so losing or leaking one box's passphrase exposes the others.
+- On a Mac, `yo` sends the passphrase to whatever answers on the forwarded ssh port (Lima's hostagent holds it) and does not check which process owns the port.
+- A program in the VM can bind a mirrored port before a host tool binds it, and then the host tool fails or talks to the VM. Only a few fixed login-callback ports are held back.
+- The box sets `PI_CLIPBOARD_OSC52=1`, so pi copies through the terminal's OSC 52 escape, and any program in a pane can emit the same escape. Whether it reaches your host clipboard depends on your terminal.
+- `yo code` and `yo zed` make your editor install and run a server in the agent's home, which the agent can replace.
+- The `narHash` that `yo bootstrap` pins comes from the box's own first fetch of the release, so it holds later fetches to that tree and does not vouch for the first.
 
 ## Credits
 
-[Lima](https://github.com/lima-vm/lima), [NixOS](https://nixos.org/), [devbox](https://github.com/jetify-com/devbox)
+[Lima](https://github.com/lima-vm/lima), [NixOS](https://nixos.org/), [devbox](https://github.com/jetify-com/devbox), [herdr](https://herdr.dev/).

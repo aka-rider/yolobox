@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import json
 import os
 import re
 import select
-from typing import Callable, NamedTuple, Optional
+from pathlib import Path
+from typing import Callable, Iterator, NamedTuple, Optional
+
+# Where yo is installed: the package directory's parent, with facts.json beside.
+SCRIPT_DIR = Path(__file__).resolve().parent.parent
+# Every literal spelled in more than one language, read once: flake.nix reads
+# the same file, and the box renders it into /etc/yolobox/facts.sh.
+FACTS = json.loads((SCRIPT_DIR / "facts.json").read_text())
 
 # Guest-controlled text reaches yo's terminal output and aws-broker's log
 # (ssh stderr, paths, helper output). A terminal acts on escape sequences and C1
@@ -17,7 +27,7 @@ CONTROL_BYTES_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
 # A valid profile name must start with an alphanumeric, so it can never read as
 # an option. yo filters the guest's profiles with it and the broker refuses any
 # other name.
-PROFILE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+PROFILE_NAME_PATTERN = "^%s$" % FACTS["profile_name_re"]
 PROFILE_NAME_RE = re.compile(PROFILE_NAME_PATTERN)
 
 
@@ -65,3 +75,29 @@ def pid_exit_watch(pid: int) -> PidExitWatch:
         lambda timeout=None: bool(select.select([pidfd], [], [], timeout)[0]),
         lambda: os.close(pidfd),
     )
+
+
+class LockBusy(Exception):
+    """Another process holds the lock, and the caller asked not to wait."""
+
+
+@contextlib.contextmanager
+def held_flock(path: str, wait: bool) -> Iterator[None]:
+    """Hold an exclusive flock on `path`, created private (its directory too)
+    when missing. With `wait` False a held lock raises LockBusy instead of
+    blocking.
+
+    The lock file is never deleted: a process blocked in `flock` holds the old
+    inode, so with the file unlinked under it the next one would create and
+    lock a fresh file, and the two would hold "the" lock at once.
+    """
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise LockBusy()
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor drops the lock

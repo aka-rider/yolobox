@@ -6,14 +6,12 @@ the second answers for the directory's owner.
 Tools whose absence skips tests: none beyond bash.
 """
 
-import os
-import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
-HOOK = Path(__file__).resolve().parent.parent / "linux" / "yolobox-libvirt-hook.sh"
-TEMPLATE = Path(__file__).resolve().parent.parent / "libvirt" / "domain.xml"
+from shell_harness import FACTS, REPO, ShellCase
+
+HOOK = REPO / "linux" / "yolobox-libvirt-hook.sh"
+TEMPLATE = REPO / "libvirt" / "domain.xml"
 
 FAKE_SETFACL = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_SETFACL_CALLS"
@@ -28,40 +26,34 @@ printf '%s\\n' "$FAKE_DIR_OWNER"
 FOREIGN_XML = "<domain type='kvm'><name>other</name><devices/></domain>"
 
 
-class TestPasstAclHook(unittest.TestCase):
+class TestPasstAclHook(ShellCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name)
-        bin_dir = self.tmp / "bin"
-        bin_dir.mkdir()
-        for name, body in (("setfacl", FAKE_SETFACL), ("stat", FAKE_STAT)):
-            fake = bin_dir / name
-            fake.write_text(body)
-            fake.chmod(0o755)
+        super().setUp()
+        self.fake("setfacl", FAKE_SETFACL)
+        self.fake("stat", FAKE_STAT)
         self.passt_dir = self.tmp / "passt"
         self.passt_dir.mkdir()
         self.calls = self.tmp / "calls"
-        self.env = {
-            "YOLOBOX_HOOK_PATH": os.pathsep.join(
-                [str(bin_dir), os.environ.get("PATH", "/usr/bin:/bin")]
-            ),
-            "YOLOBOX_HOOK_PASST_DIR": str(self.passt_dir),
-            "FAKE_SETFACL_CALLS": str(self.calls),
-            "FAKE_SETFACL_RC": "0",
-            "FAKE_DIR_OWNER": "qemu",
-        }
+        # libvirt passes no PATH: the hook sets its own, with this seam.
+        self.env.update(
+            YOLOBOX_HOOK_PATH=self.env["PATH"],
+            YOLOBOX_HOOK_PASST_DIR=str(self.passt_dir),
+            FAKE_SETFACL_CALLS=str(self.calls),
+            FAKE_SETFACL_RC="0",
+            FAKE_DIR_OWNER="qemu",
+        )
         # A yolobox domain as libvirt hands it over: the template, filled in.
         self.yolobox_xml = TEMPLATE.read_text().replace("$name", "box")
 
     def hook(self, operation, sub, xml, setfacl_rc=0, owner="qemu"):
-        return subprocess.run(
-            ["bash", str(HOOK), "yolobox-box", operation, sub, "-"],
+        return self.run_bash(
+            HOOK,
+            "yolobox-box",
+            operation,
+            sub,
+            "-",
             input=xml,
-            capture_output=True,
-            text=True,
-            env=dict(self.env, FAKE_SETFACL_RC=str(setfacl_rc), FAKE_DIR_OWNER=owner),
-            timeout=20,
+            env=dict(FAKE_SETFACL_RC=str(setfacl_rc), FAKE_DIR_OWNER=owner),
         )
 
     def setfacl_calls(self):
@@ -74,7 +66,7 @@ class TestPasstAclHook(unittest.TestCase):
         # -P: the ACL goes on the directory itself, never through a symlink.
         self.assertEqual(
             self.setfacl_calls(),
-            ["-P -m u:yolobox-vm:rwx,m::rwx %s" % self.passt_dir],
+            ["-P -m u:%s:rwx,m::rwx %s" % (FACTS["vm_user"], self.passt_dir)],
         )
 
     def assert_left_alone(self, result, code, said):
