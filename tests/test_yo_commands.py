@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import io
 import json
@@ -336,6 +337,15 @@ class TestMainPreflight(unittest.TestCase):
             self.help_text(["bootstrap", "--help"]),
         )
 
+    def test_help_command_keeps_the_colors_the_help_flag_prints(self):
+        with mock.patch.dict(os.environ, {"FORCE_COLOR": "1"}):
+            os.environ.pop("NO_COLOR", None)
+            os.environ.pop("PYTHON_COLORS", None)
+            via_help = self.help_text(["help", "bootstrap"])
+            via_flag = self.help_text(["bootstrap", "--help"])
+        self.assertEqual(via_help, via_flag)
+        self.assertNotIn("?[", via_help)
+
     def test_help_of_an_unknown_command_is_a_usage_error(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as caught:
@@ -498,7 +508,7 @@ class TestMainEnsuresTheSessionBeforeSomeCommands(unittest.TestCase):
         (["up"], (yo.vm, "vm_up")),
         (["bootstrap"], (yo.vm, "cmd_bootstrap")),
         (["disk-grow", "40"], (yo.vm, "cmd_disk_grow")),
-        (["help"], (yo.ui, "out")),
+        (["help"], (argparse.ArgumentParser, "print_help")),
     ]
 
     def run_main(self, argv, target, services=None, bootstrapped=True):

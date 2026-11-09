@@ -428,7 +428,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def cmd_help(args: argparse.Namespace) -> None:
         target = parser if args.topic is None else subparsers.choices[args.topic]
-        ui.out(target.format_help().rstrip("\n"))
+        target.print_help()
 
     help_.set_defaults(func=cmd_help, needs_driver=False)
 
