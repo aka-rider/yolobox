@@ -72,7 +72,11 @@ jobs:
       - name: Smoke test — yo --help
         run: ./yo --help
 
+      # Every tool a test names is on this runner, so a test that skips
+      # although its tool is on PATH fails here instead of hiding a broken probe.
       - name: Unit tests
+        env:
+          YOLOBOX_FORBID_SKIP: "1"
         run: python -m unittest discover -s tests
 
   # Evaluates the box's NixOS configuration without building it, so an
@@ -102,7 +106,9 @@ jobs:
       # job's own builds and runs target the guest's system too, and on the
       # aarch64 leg that binary cannot run on this x86_64 runner (the two
       # x86_64 legs would run it, so the mistake would show on one leg only).
-      NIX_EVAL: nix eval --impure --system ${{ matrix.system }}
+      # --eval-system, not --system: the daemon may ignore that restricted
+      # setting for an untrusted user and evaluate the runner's own system.
+      NIX_EVAL: nix eval --impure --eval-system ${{ matrix.system }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -114,12 +120,13 @@ jobs:
           extra_nix_config: experimental-features = nix-command flakes
 
       # The default configuration, with no stand-in: it proves a box without
-      # /etc/yolobox/local.nix evaluates.
+      # /etc/yolobox/local.nix evaluates, and for the leg's system, not the
+      # runner's.
       - name: Evaluate nixosConfigurations.yolobox
-        run: >
-          $NIX_EVAL --raw
-          --option allow-import-from-derivation false
-          .#nixosConfigurations.yolobox.config.system.build.toplevel.drvPath
+        run: |
+          toplevel=.#nixosConfigurations.yolobox.config.system.build.toplevel
+          $NIX_EVAL --raw --option allow-import-from-derivation false "$toplevel.drvPath"
+          test "$($NIX_EVAL --raw "$toplevel.system")" = "$GUEST_SYSTEM"
 
       # The ref is stamped into /etc/yolobox/flake-ref, and a rebuild without it
       # would delete the stamp, so the flake must refuse when it is unset. The
@@ -186,12 +193,12 @@ jobs:
           $NIX_EVAL --json .#nixosConfigurations.yolobox.config.programs.ssh.knownHosts \
             | python3 -c 'import json, sys; [print(" ".join(h["hostNames"]), h["publicKey"]) for h in json.load(sys.stdin).values()]' \
             > known_hosts
-          ssh-keygen -lf known_hosts | awk '{print $2, $3}' | sort > fingerprints
+          ssh-keygen -lf known_hosts | awk '{print $2, $3}' | LC_ALL=C sort > fingerprints
           printf '%s\n' \
             'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU github.com' \
             'SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM github.com' \
             'SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s github.com' \
-            | sort > published
+            | LC_ALL=C sort > published
           diff -u published fingerprints
 
       # vz cannot emulate, so only an Apple-silicon Mac's guest has a rosetta

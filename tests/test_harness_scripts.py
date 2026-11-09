@@ -13,7 +13,7 @@ import os
 import time
 import unittest
 
-from shell_harness import BASH, REPO, ShellCase, is_gnu
+from shell_harness import BASH, REPO, ShellCase, is_gnu, needs_tool
 
 HARNESSES = REPO / "nix" / "harnesses"
 VERSIONS = HARNESSES / "yolobox-claude-versions.sh"
@@ -25,7 +25,9 @@ VERSION_RE = r"[0-9]+(\.[0-9]+)*(-[A-Za-z0-9.]+)?"
 HOUR = 3600
 
 
-@unittest.skipUnless(is_gnu("find") and is_gnu("sort"), "needs GNU find and sort")
+@needs_tool(
+    ["find", "sort"], is_gnu("find") and is_gnu("sort"), "needs GNU find and sort"
+)
 class HarnessCase(ShellCase):
     def setUp(self):
         super().setUp()

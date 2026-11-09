@@ -5,18 +5,20 @@ import contextlib
 import io
 import json
 import os
-import shutil
 import subprocess
 import unittest
 from unittest import mock
 
+from shell_harness import needs_tool
 from test_yo import (
     A_RELEASE,
     FakeHome,
     fake_bin,
     fake_limactl,
-    host_cpus,
+    hostagent_holds_the_port,
     load_yo,
+    locked,
+    proved_initrd,
     unload_yo,
     yo,
     refuse_tcp_to_the_host,
@@ -80,8 +82,10 @@ class TestNamesFollowTheMachine(unittest.TestCase):
                 self.assertIn("not a usable machine name", str(caught.exception))
 
     def test_the_longest_name_whose_hostname_is_a_label_is_accepted(self):
+        # Under a home short enough for its sockets on a Mac.
         longest = "x" * 55
-        self.assertEqual(yo.instance_name(longest), longest)
+        with mock.patch.dict(os.environ, {"HOME": "/h"}):
+            self.assertEqual(yo.instance_name(longest), longest)
         self.assertEqual(yo.instance_name("Mixed-Case"), "Mixed-Case")
 
     def test_a_refused_name_exits_2_and_leaves_the_default_machine(self):
@@ -191,7 +195,7 @@ class TestSeveralInstancesCoexist(FakeHome):
             self.write_ssh_config(box)
         self.assertEqual([self.read_ssh_config(box) for box in self.boxes], before)
 
-    @unittest.skipIf(shutil.which("ssh") is None, "no ssh")
+    @needs_tool("ssh")
     def test_one_glob_line_reaches_every_machine_through_real_ssh(self):
         for box in self.boxes:
             self.write_ssh_config(box)
@@ -235,7 +239,8 @@ class TestSshPort(unittest.TestCase):
                     with self.assertRaises(yo.YoError) as caught:
                         yo.box.driver.ssh_port()
                 self.assertIn(
-                    "limactl create --name second --set '.ssh.localPort=",
+                    "Recreate the instance, which deletes everything on it: "
+                    "yo -m second destroy --yes && yo -m second bootstrap",
                     caught.exception.message,
                 )
 
@@ -250,7 +255,11 @@ class TestSshPort(unittest.TestCase):
                 self.assertIn("ssh.localPort %d" % port, caught.exception.message)
                 self.assertIn(
                     "yo -m second down && limactl edit --tty=false second --set "
-                    "'.ssh.localPort=<a free port in 49152-65535>' && yo -m second up",
+                    "'.ssh.localPort=<PORT>' && yo -m second up",
+                    caught.exception.message,
+                )
+                self.assertIn(
+                    "yo -m second destroy --yes && yo -m second bootstrap",
                     caught.exception.message,
                 )
 
@@ -259,7 +268,7 @@ class TestSshPort(unittest.TestCase):
     ):
         # ssh.config is lima's own file, so the port read from it gets the
         # bounds ssh_port() gives the one read from limactl.
-        with as_instance(INSTANCE_B):
+        with as_instance(INSTANCE_B), hostagent_holds_the_port():
             yo.LIMA.verify_initrd_listener(65535)
             for port in (65536, 70000):
                 with self.subTest(port=port):
@@ -278,31 +287,6 @@ class TestSshPort(unittest.TestCase):
         for port in (49152, 65535):
             with as_instance(INSTANCE_B), fake_limactl(limactl_json(port)):
                 self.assertEqual(yo.box.driver.ssh_port(), port)
-
-    def test_the_port_a_create_command_names_is_one_ssh_port_accepts(self):
-        with as_instance(INSTANCE_B), host_cpus(16):
-            command = yo.box.driver.create_command(yo.NO_SIZE)
-        self.assertIn(
-            "<a free port in %d-%d>" % (yo.MIN_SSH_LOCAL_PORT, 65535), command
-        )
-
-    def test_every_create_command_carries_the_cpus_the_box_would_get(self):
-        # Lima's own default CPU count is not yo's, whichever message prints it.
-        with as_instance(INSTANCE_B), host_cpus(16):
-            for size, flags in (
-                (yo.NO_SIZE, "--cpus 4"),
-                (yo.Size(None, 250, None), "--disk 250 --cpus 4"),
-                (yo.Size(24, None, 2), "--memory 24 --cpus 2"),
-            ):
-                with self.subTest(size=size):
-                    self.assertIn(
-                        "%s %s" % (flags, yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
-                        yo.box.driver.create_command(size),
-                    )
-            with fake_limactl("", listed=[]):
-                with self.assertRaises(yo.YoError) as caught:
-                    yo.box.driver.ssh_port()
-            self.assertIn("--cpus 4 ", caught.exception.message)
 
     def test_an_instance_limactl_does_not_know_is_an_error_naming_the_remedy(self):
         with as_instance(INSTANCE_B), fake_limactl("", listed=[]):
@@ -331,7 +315,7 @@ class TestSshPort(unittest.TestCase):
 class TestNothingFallsBackToTheDefaultPortForAnotherInstance(FakeHome):
     def test_the_initrd_probe_uses_the_created_port(self):
         with as_instance(INSTANCE_B), fake_limactl(limactl_json(60023)):
-            argv = yo.initrd_ssh_argv("true", yo.LIMA.ssh_facts())
+            argv = yo.unlock.operator_argv("true", yo.LIMA.ssh_facts())
         self.assertIn("Port=60023", argv)
         self.assertNotIn("Port=%d" % yo.SSH_LOCAL_PORT, argv)
 
@@ -340,15 +324,15 @@ class TestNothingFallsBackToTheDefaultPortForAnotherInstance(FakeHome):
             with self.assertRaisesRegex(
                 yo.YoError, "second has ssh\\.localPort 0, which is not a"
             ):
-                yo.initrd_ssh_argv("true", yo.LIMA.ssh_facts())
+                yo.unlock.operator_argv("true", yo.LIMA.ssh_facts())
 
     def test_every_message_that_names_the_port_names_the_instances(self):
         attempt = yo.HelperRun(returncode=yo.SSH_UNREACHABLE, stderr="", streamed=False)
         with as_instance(INSTANCE_B), fake_limactl(limactl_json(60023)):
+            gate = proved_initrd(yo.LIMA.ssh_facts())
             messages = [
-                yo.helper_failure_message(attempt),
-                yo.initrd_timeout_error(True).message,
-                yo.initrd_timeout_error(False).message,
+                yo.helper_failure_message(attempt, gate),
+                yo.initrd_timeout_error(yo.unlock.Round("no banner", "")).message,
             ]
         for message in messages:
             with self.subTest(message=message[:40]):
@@ -374,14 +358,11 @@ class TestVmUpOnARunningBoxWithoutSshd(unittest.TestCase):
         with (
             as_instance(INSTANCE_B),
             mock.patch.object(yo.lima, "lima_instance_info", return_value=running),
-            mock.patch.object(yo.unlock, "stage2_up", return_value=False),
-            mock.patch.object(
-                yo.unlock, "sshd_answers", return_value=yo.SshOutcome.NOT_LISTENING
-            ),
             mock.patch.object(yo.unlock, "ssh_banner", return_value=""),
+            yo.box_lock(wait=True) as held,
         ):
             with self.assertRaises(yo.YoError) as caught:
-                yo.vm_up()
+                yo.vm_up(held)
         self.assertIn("127.0.0.1:60023", caught.exception.message)
 
 
@@ -402,7 +383,7 @@ def lima_info(status, port=60023):
 
 
 # The calls whose order the start tests check.
-ORDERED = ("luks_passphrase", "start")
+ORDERED = ("luks_passphrase", "start", "create")
 
 
 class VmUpOnLima(unittest.TestCase):
@@ -420,11 +401,16 @@ class VmUpOnLima(unittest.TestCase):
             )
             for target, name in (
                 (yo.agent, "luks_passphrase"),
+                (yo.agent.PassphraseSource, "require_key"),
                 (yo.LIMA, "start"),
+                (yo.LIMA, "create"),
                 (yo.proc, "spawn"),
                 (yo.sshconfig, "write_ssh_config"),
                 (yo.guest, "ensure_guest_known_hosts"),
                 (yo.forwards, "vm_services"),
+                (yo.sshx, "bootstrapped"),
+                (yo.sshx, "broken_agent_login"),
+                (yo.ui, "err"),
                 (yo.proc, "run"),
             ):
                 stubs[name] = stack.enter_context(mock.patch.object(target, name))
@@ -432,80 +418,48 @@ class VmUpOnLima(unittest.TestCase):
                     stubs[name].side_effect = lambda *a, _n=name, **k: (
                         self.order.append(_n) or mock.DEFAULT
                     )
+            stubs["broken_agent_login"].return_value = None
             stack.enter_context(
                 mock.patch.object(yo.lima, "lima_instance_info", return_value=info)
             )
             try:
-                yo.vm_up(size=size)
+                with yo.box_lock(wait=True) as held:
+                    yo.vm_up(held, size=size)
             except yo.YoError as failure:
                 return failure, stubs
         return None, stubs
 
     def assert_refused_before_anything(self, stubs):
         stubs["luks_passphrase"].assert_not_called()
-        for name in ("start", "spawn", "run"):
+        for name in ("start", "create", "spawn", "run"):
             stubs[name].assert_not_called()
 
 
-class TestVmUpNeverCreatesAnotherInstance(VmUpOnLima):
-    def test_a_missing_instance_fails_before_touch_id_and_before_limactl_start(self):
-        error, stubs = self.vm_up(INSTANCE_B)
-        self.assertIn("limactl create --name second", error.message)
-        self.assert_refused_before_anything(stubs)
-
-    def test_the_default_instance_is_still_created_when_missing(self):
-        error, stubs = self.vm_up(yo.DEFAULT_INSTANCE)
-        self.assertIsNone(error)
-        stubs["luks_passphrase"].assert_called_once_with()
-        stubs["start"].assert_called_once()
-
-    def test_a_missing_named_instance_asked_for_no_size_gets_the_default_cpus_in_the_hint(
-        self,
-    ):
-        # Lima's own default CPU count is not yo's, and the user passed no flag
-        # to drop, so the command has --cpus and the message does not say "without".
-        for host, expected in ((16, "4"), (3, "2")):
-            with self.subTest(host=host):
-                error, _ = self.vm_up(INSTANCE_B, cpus=host)
-                self.assertIn(
-                    "--set '.ssh.localPort=<a free port in 49152-65535>' --cpus %s "
-                    % expected,
-                    error.message,
-                )
-                self.assertNotIn("without", error.message)
-
-    def test_a_sized_named_instance_also_needs_its_own_port(self):
-        error, stubs = self.vm_up(INSTANCE_B, yo.Size(None, 250, 3))
-        self.assertIn(
-            "limactl create --name second --set '.ssh.localPort=<a free port in 49152-65535>' "
-            "--disk 250 --cpus 3 %s" % (yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
-            error.message,
-        )
-        self.assertNotIn("--memory", error.message)
-        self.assertTrue(
-            error.message.endswith(
-                "then run this command again without --disk 250 --cpus 3"
-            )
-        )
-        self.assert_refused_before_anything(stubs)
+class TestVmUpCreatesAMissingInstance(VmUpOnLima):
+    def test_a_missing_instance_is_created_without_a_passphrase(self):
+        # A new box is the seed image, whose root is plaintext: no Touch ID.
+        for instance in (yo.DEFAULT_INSTANCE, INSTANCE_B):
+            with self.subTest(instance=instance):
+                error, stubs = self.vm_up(instance)
+                self.assertIsNone(error)
+                self.assertEqual(self.order, ["create", "start"])
+                # The start gets a source that derives only if an initrd asks.
+                stubs["luks_passphrase"].assert_not_called()
 
 
 class TestVmUpCreatesAtTheAskedSize(VmUpOnLima):
     def test_a_missing_box_is_created_at_all_three_sizes_asked(self):
-        error, stubs = self.vm_up(yo.DEFAULT_INSTANCE, yo.Size(24, 250, 3))
+        error, stubs = self.vm_up(INSTANCE_B, yo.Size(24, 250, 3))
         self.assertIsNone(error)
-        stubs["start"].assert_called_once_with(
-            stubs["luks_passphrase"].return_value, yo.NewBox(24, 250, 3)
-        )
+        stubs["create"].assert_called_once_with(mock.ANY, yo.NewBox(24, 250, 3))
 
     def test_a_box_created_without_cpus_gets_one_less_than_the_host_up_to_four(self):
         for host, expected in ((2, 1), (3, 2), (5, 4), (64, 4)):
             with self.subTest(host=host):
                 error, stubs = self.vm_up(yo.DEFAULT_INSTANCE, cpus=host)
                 self.assertIsNone(error)
-                stubs["start"].assert_called_once_with(
-                    stubs["luks_passphrase"].return_value,
-                    yo.NewBox(None, None, expected),
+                stubs["create"].assert_called_once_with(
+                    mock.ANY, yo.NewBox(None, None, expected)
                 )
 
     def test_a_host_with_one_cpu_or_an_unknown_count_creates_nothing(self):
@@ -516,26 +470,45 @@ class TestVmUpCreatesAtTheAskedSize(VmUpOnLima):
                 self.assertIn("CPU", error.message)
                 self.assert_refused_before_anything(stubs)
 
-    def test_the_actual_start_passes_every_flag_to_limactl(self):
+    def create(self, instance, listing):
+        """LIMA.create of a box asked 24 GiB, 250 GiB and 3 CPUs, with `listing`
+        what `limactl list --json` prints and 49152 held on the host. Returns
+        the `limactl create` argv; nothing is started."""
+        ran = []
+
+        def run(argv, **kwargs):
+            ran.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, listing, "")
+
         with (
-            as_instance(INSTANCE_B),
-            mock.patch.object(yo.LIMA, "config_gaps", return_value=[]),
+            as_instance(instance),
+            mock.patch.object(yo.lima, "lima_instance_exists", return_value=False),
+            mock.patch.object(yo.proc, "run", side_effect=run),
+            mock.patch.object(
+                yo.driver, "loopback_port_bound", side_effect=lambda p: p == 49152
+            ),
             mock.patch.object(yo.proc, "spawn") as spawn,
-            mock.patch.object(yo.LIMA, "wait_until_running"),
-            mock.patch.object(yo.unlock, "unlock_disk"),
-            mock.patch.object(yo.unlock, "wait_for_operator"),
         ):
-            spawn.return_value.wait.return_value = 0
-            yo.LIMA.start(b"pass", yo.NewBox(24, 250, 3))
-        spawn.assert_called_once_with(
+            locked(yo, yo.LIMA.create, yo.NewBox(24, 250, 3))
+        spawn.assert_not_called()
+        creates = ["limactl", "--log-level=warn", "create"]
+        (create,) = [argv for argv in ran if argv[:3] == creates]
+        return create
+
+    def test_a_named_instance_is_created_on_the_lowest_port_no_one_holds(self):
+        # 49152 is bound on the host and 49153 is another instance's.
+        argv = self.create(INSTANCE_B, limactl_json(49153) + "\n")
+        self.assertEqual(
+            argv,
             [
                 "limactl",
-                "start",
+                "--log-level=warn",
+                "create",
                 "--tty=false",
-                "--timeout",
-                yo.lima.LIMA_START_TIMEOUT,
                 "--name",
                 "second",
+                "--set",
+                ".ssh.localPort=49154",
                 "--memory",
                 "24",
                 "--disk",
@@ -543,8 +516,25 @@ class TestVmUpCreatesAtTheAskedSize(VmUpOnLima):
                 "--cpus",
                 "3",
                 str(yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
-            ]
+            ],
         )
+
+    def test_the_default_instance_keeps_the_port_its_template_fixes(self):
+        argv = self.create(yo.DEFAULT_INSTANCE, "")
+        self.assertNotIn("--set", argv)
+
+    def test_a_listing_yo_cannot_read_creates_nothing(self):
+        for listing in (
+            "lizard\n",
+            "[]\n",
+            json.dumps({"config": None}) + "\n",
+            limactl_json("49153") + "\n",
+            limactl_json(True) + "\n",
+            limactl_json() + "\n",
+        ):
+            with self.subTest(listing=listing):
+                with self.assertRaises(yo.YoError):
+                    self.create(INSTANCE_B, listing)
 
 
 class TestVmUpRefusesSizeFlagsOnAnExistingBox(VmUpOnLima):
@@ -566,30 +556,32 @@ class TestVmUpRefusesSizeFlagsOnAnExistingBox(VmUpOnLima):
                     self.assertIn(
                         "%s applies only when a box is created" % flags, error.message
                     )
-                    # A named instance is recreated by its own limactl create.
                     self.assertIn(
-                        "yo -m second destroy --yes && limactl create --name second",
+                        "yo -m second destroy --yes && yo -m second bootstrap %s."
+                        % flags,
                         error.message,
                     )
-                    self.assertIn("&& yo -m second bootstrap.", error.message)
                     self.assertIn("yo -m second disk-grow <GiB>", error.message)
                     self.assert_refused_before_anything(stubs)
 
     def test_a_stopped_box_asked_for_nothing_is_started_as_it_is(self):
         error, stubs = self.up(yo.NO_SIZE)
         self.assertIsNone(error)
-        self.assertEqual(self.order, ["luks_passphrase", "start"])
-        stubs["start"].assert_called_once_with(
-            stubs["luks_passphrase"].return_value, None
-        )
+        self.assertEqual(self.order, ["start"])
+        ((held, source), _) = stubs["start"].call_args
+        self.assertIsInstance(held, yo.state.HeldBox)
+        self.assertIsInstance(source, yo.agent.PassphraseSource)
+        # A box that is off may be encrypted: the key is listed before it starts.
+        stubs["require_key"].assert_called_once_with()
 
     def test_a_running_box_asked_for_nothing_goes_on_to_the_boot_stage(self):
         with mock.patch.object(
-            yo.unlock, "boot_stage", return_value=yo.BootStage.UNKNOWN
+            yo.unlock, "boot_stage", return_value=yo.Stage(yo.BootStage.UNKNOWN, "")
         ) as stage:
             error, stubs = self.up(yo.NO_SIZE, "Running")
-        stage.assert_called_once_with()
-        self.assertIn("refused both the operator's key and root's", error.message)
+        ((held,), _) = stage.call_args
+        self.assertIsInstance(held, yo.state.HeldBox)
+        self.assertIn("refused root's key", error.message)
         stubs["start"].assert_not_called()
 
 
@@ -605,7 +597,7 @@ class TestLimaGrowDisk(unittest.TestCase):
             ) as run,
             self.assertRaises(yo.YoError) as caught,
         ):
-            yo.LIMA.grow_disk(200)
+            locked(yo, yo.LIMA.grow_disk, 200)
         self.assertEqual(
             run.call_args.args[0],
             ["limactl", "edit", "--tty=false", "second", "--disk", "200"],
@@ -747,18 +739,11 @@ class TestTheEditRemedyRunsFromEitherState(unittest.TestCase):
         self.assertEqual(applied, [])
 
 
-class TestAConfigGapRecreatesANamedInstanceInFull(FakeHome):
-    def test_destroy_then_limactl_create_then_bootstrap(self):
-        # `yo -m NAME bootstrap` refuses to create a named instance, so the
-        # chain must create it between the destroy and the bootstrap.
-        with as_instance(INSTANCE_B), host_cpus(16):
+class TestAConfigGapRecreatesAnInstanceByBootstrap(FakeHome):
+    def test_destroy_then_bootstrap_which_creates_it(self):
+        with as_instance(INSTANCE_B):
             message = yo.LIMA.config_gap_message([yo.GAP_OPERATOR_UID])
-        self.assertIn(
-            "yo -m second destroy --yes && limactl create --name second "
-            "--set '.ssh.localPort=<a free port in 49152-65535>' --cpus 4 %s "
-            "&& yo -m second bootstrap" % (yo.SCRIPT_DIR / "lima" / "yolobox.yaml"),
-            message,
-        )
+        self.assertIn("yo -m second destroy --yes && yo -m second bootstrap", message)
 
     def test_the_default_instance_is_recreated_by_bootstrap_alone(self):
         self.assertEqual(
@@ -786,13 +771,6 @@ class TestRemediesNameTheMachine(FakeHome):
         with as_instance("box2"):
             self.assertEqual(yo.yo_cmd("up"), "yo -m box2 up")
             self.assertIn("yo -m box2 bootstrap", yo.version_drift(A_RELEASE, "0.9.0"))
-
-    def test_the_enter_refusal_names_the_machine(self):
-        with as_instance("box2"), mock.patch.object(yo.sys, "stdin") as stdin:
-            stdin.isatty.return_value = False
-            with self.assertRaises(yo.YoError) as caught:
-                yo.cmd_enter(yo.build_parser().parse_args(["enter"]))
-        self.assertTrue(caught.exception.message.startswith("yo -m box2 enter "))
 
 
 if __name__ == "__main__":

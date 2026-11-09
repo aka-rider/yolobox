@@ -95,9 +95,9 @@ class TestEnsureAwsBrokerIsOneStep(FakeHome):
         self.held_during = {}
 
     def lock_is_held(self):
-        os.makedirs(yo.state_dir(), exist_ok=True)
+        os.makedirs(yo.state.aws_broker_dir(), exist_ok=True)
         fd = os.open(
-            os.path.join(yo.state_dir(), yo.aws.YO_BROKER_LOCK_NAME),
+            os.path.join(yo.state.aws_broker_dir(), yo.aws.YO_BROKER_LOCK_NAME),
             os.O_RDWR | os.O_CREAT,
         )
         try:
@@ -174,6 +174,55 @@ class TestEnsureAwsBrokerIsOneStep(FakeHome):
         self.assertFalse(self.lock_is_held())
 
 
+class TestEachBoxHasItsOwnBroker(FakeHome):
+    """A broker watches one box's keepalive process, so a session command on
+    one box must leave another box's broker serving it."""
+
+    def ensure_on(self, name, keepalive_pid):
+        yo.set_box(yo.box.driver, name)
+        try:
+            with mock.patch.object(
+                yo.box.driver, "keepalive_pid", return_value=keepalive_pid
+            ):
+                return yo.ensure_aws_broker()
+        finally:
+            yo.set_box(yo.box.driver, yo.DEFAULT_INSTANCE)
+
+    def test_a_session_on_a_second_box_leaves_the_first_boxs_broker_alone(self):
+        brokers = {}  # control socket -> /health of the broker listening there
+
+        def start(watch_pid, allow):
+            brokers[yo.state.aws_broker_ctl_sock()] = {
+                "pid": 4000 + watch_pid,
+                "watch_pid": watch_pid,
+                "allow": list(allow),
+            }
+
+        with (
+            mock.patch.object(yo.shutil, "which", return_value="/usr/local/bin/aws"),
+            mock.patch.object(
+                yo.aws, "aws_allowlist", return_value=[("work", "us-east-1")]
+            ),
+            mock.patch.object(
+                yo.aws, "health_on", side_effect=lambda path, _: brokers.get(path)
+            ),
+            mock.patch.object(yo.aws, "start_aws_broker", side_effect=start),
+            mock.patch.object(yo.aws, "stop_broker") as stop,
+            mock.patch.object(yo.aws, "push_aws_guest_files"),
+        ):
+            self.assertTrue(self.ensure_on(yo.DEFAULT_INSTANCE, 111))
+            self.assertTrue(self.ensure_on("e2e1", 222))
+            self.assertTrue(self.ensure_on(yo.DEFAULT_INSTANCE, 111))
+        stop.assert_not_called()
+        self.assertEqual(
+            sorted((health["watch_pid"], path) for path, health in brokers.items()),
+            [
+                (111, os.path.join(self.home, ".lima/yolobox/aws-broker/ctl.sock")),
+                (222, os.path.join(self.home, ".lima/e2e1/aws-broker/ctl.sock")),
+            ],
+        )
+
+
 class TestPushConfigCommand(unittest.TestCase):
     """The guest-side command that installs the rendered AWS config: the whole
     text or nothing, atomically, with no temp file left on any failure."""
@@ -219,6 +268,42 @@ class TestPushConfigCommand(unittest.TestCase):
         self.assertEqual(self.leftovers(), ["aws-config"])
 
 
+class TestAHiddenGuestAwsConfigIsNamed(FakeHome):
+    """After the push, yo asks whether the agent's own ~/.aws/config exists,
+    which AWS_CONFIG_FILE hides, and tells only a named answer from none."""
+
+    def push(self, answer):
+        warnings = []
+
+        def ssh_run(role, argv, **kwargs):
+            if argv[:2] == ["sh", "-c"]:
+                return yo.proc.GuestRun(argv, *answer)
+            return yo.proc.GuestRun(argv, 0, "", "")
+
+        with (
+            mock.patch.object(yo.sshx, "ssh_run", ssh_run),
+            mock.patch.object(yo.ui, "err", warnings.append),
+        ):
+            yo.aws.push_aws_guest_files([("work", "us-east-1")])
+        return warnings
+
+    def test_an_existing_config_is_named_and_a_missing_one_is_not(self):
+        (warning,) = self.push((0, "present\n", ""))
+        self.assertIn("/home/agent/.aws/config exists in the VM", warning)
+        self.assertEqual(self.push((0, "absent\n", "")), [])
+
+    def test_an_answer_that_names_neither_is_an_error_showing_it(self):
+        for answer in ((0, "lizard\n", ""), (0, "", ""), (1, "", "zsh: boom")):
+            with self.subTest(answer=answer):
+                with self.assertRaises(yo.YoError) as caught:
+                    self.push(answer)
+                self.assertNotIsInstance(caught.exception, yo.Unreachable)
+
+    def test_a_box_out_of_reach_is_unreachable(self):
+        with self.assertRaises(yo.Unreachable):
+            self.push((yo.SSH_UNREACHABLE, "", "ssh: Connection refused"))
+
+
 class TestBrokerLogGenerations(FakeHome):
     """A restart keeps the previous broker's log as broker.log.1."""
 
@@ -236,7 +321,7 @@ class TestBrokerLogGenerations(FakeHome):
             yo.start_aws_broker(555, ["work"])
 
     def log(self, suffix=""):
-        return os.path.join(yo.state_dir(), "aws-broker", "broker.log" + suffix)
+        return os.path.join(yo.state.aws_broker_dir(), "broker.log" + suffix)
 
     def test_a_first_start_makes_no_previous_generation(self):
         self.start()

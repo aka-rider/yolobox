@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import shlex
 from typing import List, Optional, Tuple
 
 from . import (
     agent,
+    aws,
     common,
     forwards,
     guest,
@@ -35,14 +35,16 @@ DISK_FSTYPE_LUKS = "crypto_LUKS"
 
 
 def preflight(size: Size) -> Tuple[Optional[VmStatus], Optional[NewBox]]:
-    """The size flags, judged before the box is touched: no start or 1Password
-    prompt is spent on a box that was going to be refused. Returns the box's
-    status and the size a creation gets (None: the box exists)."""
+    """The size flags and the host, judged before the box or the host is
+    touched: no creation, start or 1Password prompt is spent on a box that was
+    going to be refused. Returns the box's status and the size a creation
+    gets: exactly one of the two is None."""
     status = state.driver().vm_status()
     if status is None:
         refusal = state.driver().creation_refusal(size)
         if refusal is not None:
             raise YoError(refusal)
+        refuse_start()
         # The default CPU count is decided here, so a host that cannot give one
         # is refused before the passphrase and both drivers create the same box.
         return status, size.for_creation()
@@ -60,55 +62,92 @@ def preflight(size: Size) -> Tuple[Optional[VmStatus], Optional[NewBox]]:
                 state.yo_cmd("disk-grow", "<GiB>"),
             )
         )
+    if status.state is not VmState.RUNNING:
+        refuse_start()
     return status, None
 
 
+def refuse_start() -> None:
+    refusal = state.driver().start_refusal()
+    if refusal is not None:
+        raise YoError(refusal)
+
+
 def vm_up(
+    held: state.HeldBox,
     run_services: bool = True,
-    passphrase: Optional[agent.Passphrase] = None,
+    passphrase: Optional[agent.PassphraseSource] = None,
     size: Size = NO_SIZE,
-) -> Optional[agent.Passphrase]:
-    status, new_box = preflight(size)
-    if status is None or status.state is not VmState.RUNNING:
-        # Derived before anything changes, so a missing 1Password key leaves the
-        # box as it was.
-        passphrase = passphrase or agent.luks_passphrase()
-        state.driver().start(passphrase, new_box)
-    else:
-        stage = unlock.boot_stage()
-        if stage is BootStage.UNKNOWN:
-            raise YoError(unlock.unknown_stage_message())
-        if stage is BootStage.NONE:
-            raise YoError(
-                "%s is Running but neither its initrd nor its sshd answers on 127.0.0.1:%d "
-                "— %s"
-                % (
-                    state.box.name,
-                    state.driver().ssh_facts().port,
-                    state.hint(state.driver().hints.where_to_look),
-                )
-            )
-        if stage is BootStage.INITRD:
-            passphrase = passphrase or agent.luks_passphrase()
-            unlock.unlock_disk(passphrase)
-            unlock.wait_for_operator()
+) -> agent.PassphraseSource:
+    """Bring the box up, unlocked, under the caller's box lock; the passphrase
+    source it used, which derives only when an initrd asks (a plaintext seed
+    boots without 1Password)."""
+    passphrase = passphrase or agent.PassphraseSource()
+    power_up(held, passphrase, size)
     sshconfig.write_ssh_config()
     guest.ensure_guest_known_hosts()
     if run_services:
-        # The seed image has no agent account: it is up, and waits for its
-        # bootstrap, so the problem is said and nothing is served.
-        problem = sshx.agent_login_problem()
-        if problem is None:
+        # The seed image is up and waits for its bootstrap, so that is said
+        # and nothing is served; a bootstrapped box must serve the agent.
+        if sshx.bootstrapped(mux=True):
+            problem = sshx.broken_agent_login()
+            if problem is not None:
+                raise YoError(problem)
             forwards.vm_services()
         else:
-            ui.err("yo: %s" % problem)
+            ui.err("yo: %s" % sshx.not_bootstrapped_message())
     return passphrase
 
 
+def power_up(
+    held: state.HeldBox, passphrase: agent.PassphraseSource, size: Size
+) -> None:
+    """Create, start and unlock the box as it needs, judged from what it is now,
+    under the box lock; every check that can refuse runs before the first
+    step that changes the box."""
+    status, new_box = preflight(size)
+    if new_box is not None:
+        state.driver().create(held, new_box)
+        state.driver().start(held, passphrase)
+    elif status.state is not VmState.RUNNING:
+        # A box that exists may be encrypted, and its initrd asks for the
+        # passphrase only after the start: a 1Password that cannot give the
+        # key is refused while the box is still off.
+        passphrase.require_key()
+        state.driver().start(held, passphrase)
+    else:
+        stage = unlock.boot_stage(held)
+        if stage.kind is BootStage.UNKNOWN:
+            raise YoError(unlock.unknown_stage_message(stage))
+        if stage.kind is BootStage.NONE:
+            raise YoError(
+                "%s is Running but yo cannot reach it on 127.0.0.1:%d%s — %s"
+                % (
+                    state.box.name,
+                    state.driver().ssh_facts().port,
+                    unlock.stage_said(stage),
+                    state.hint(state.driver().hints.where_to_look),
+                )
+            )
+        if stage.kind is BootStage.INITRD:
+            unlock.unlock_disk(held, passphrase)
+            unlock.wait_for_operator()
+
+
 def luks_device_fstype() -> str:
+    """DISK_FSTYPE_LUKS or DISK_FSTYPE_PLAIN, as lsblk names the root device;
+    any other answer is an error that shows it."""
     # -d: the device alone. Without it lsblk lists the mapped child too, and on
     # the live box it printed the child's ext4 before the device's crypto_LUKS.
-    return sshx.guest_out(["lsblk", "-dno", "FSTYPE", LUKS_DEVICE]).strip()
+    fstype = sshx.guest_out(["lsblk", "-dno", "FSTYPE", LUKS_DEVICE]).strip()
+    if fstype not in (DISK_FSTYPE_LUKS, DISK_FSTYPE_PLAIN):
+        raise YoError(
+            state.not_up_hint(
+                "lsblk names the type of %s '%s', neither %s nor %s"
+                % (LUKS_DEVICE, ui.shown(fstype), DISK_FSTYPE_LUKS, DISK_FSTYPE_PLAIN)
+            )
+        )
+    return fstype
 
 
 def guest_generations() -> Tuple[str, str]:
@@ -152,10 +191,11 @@ def asked_size(args: argparse.Namespace) -> Size:
 
 @agent.clearing_passphrases
 def cmd_up(args: argparse.Namespace) -> None:
-    vm_up(size=asked_size(args))
+    with state.box_lock(wait=True) as held:
+        vm_up(held, size=asked_size(args))
 
 
-def initrd_down_refusal() -> str:
+def initrd_down_refusal(initrd: unlock.InitrdEndpoint) -> str:
     """`yo down` on a box in its initrd with no passphrase ask pending: the seed's
     first boot may be encrypting the disk, and a power cut there destroys it."""
     return (
@@ -168,64 +208,68 @@ def initrd_down_refusal() -> str:
             state.box.name,
             state.yo_cmd("up"),
             state.yo_cmd("down"),
-            unlock.initrd_root_ssh_command("journalctl -b"),
+            unlock.initrd_root_ssh_command("journalctl -b", initrd),
             state.hint(state.driver().hints.force_stop_command),
         )
     )
 
 
-def unlock_busy_refusal(consequence: str, rerun: str) -> YoError:
-    """The refusal of a command that needs the unlock lock while a yo holds it."""
+def box_busy_refusal(consequence: str, rerun: str) -> YoError:
+    """The refusal of a command that needs the box lock while a yo holds it."""
     return YoError(
-        "another yo is unlocking %s (%s, %s or %s is sending its passphrase). %s "
-        "Wait for that command to finish, then run %s again"
-        % (
-            state.box.name,
-            state.yo_cmd("up"),
-            state.yo_cmd("bootstrap"),
-            state.yo_cmd("disk-grow"),
-            consequence,
-            rerun,
-        )
+        "another yo is acting on %s (%s holds its lock). %s Wait for that command "
+        "to finish, then run %s again"
+        % (state.box.name, state.box_lock_holders(), consequence, rerun)
     )
 
 
 def cmd_down(args: argparse.Namespace) -> None:
-    stage = unlock.boot_stage()
-    if stage is BootStage.UNKNOWN:
+    try:
+        with state.box_lock(wait=False) as held:
+            stop_box(held)
+    except common.LockBusy:
+        raise box_busy_refusal(
+            "Not stopping it: an up's answer may start the in-place encryption.",
+            state.yo_cmd("down"),
+        )
+
+
+def stop_box(held: state.HeldBox) -> None:
+    """`yo down` under the box lock, judged from the stage read under it."""
+    stage = unlock.boot_stage(held)
+    if stage.kind is BootStage.UNKNOWN:
         # Maybe an initrd, which ignores a shutdown request and may be encrypting
         # the disk, so neither stop is safe. On libvirt a dead or locked
         # 1Password is the usual cause.
-        raise YoError("not stopping it: %s" % unlock.unknown_stage_message())
-    if stage is not BootStage.INITRD:
-        state.driver().stop()
+        raise YoError("not stopping it: %s" % unlock.unknown_stage_message(stage))
+    if stage.kind is not BootStage.INITRD:
+        state.driver().stop(held)
         return
     # A box parked in its initrd has no ACPI handler, so a polite shutdown would
     # only wait out the stop timeout, and a forced one is safe only while nothing
     # is writing: the first boot's in-place encryption runs in this same initrd.
     # So it is powered off only when proved idle, and otherwise left alone: a
     # polite stop would hang, and a force would be a power cut mid-encryption.
-    # The lock spans the probe and the power-off, so no yo can answer the
-    # passphrase prompt between the proof and the kill.
-    try:
-        with state.unlock_lock(wait=False):
-            if not unlock.initrd_ask_pending():
-                raise YoError(initrd_down_refusal())
-            ui.out(
-                "%s is waiting in its initrd for the passphrase, which cannot shut down; "
-                "powering it off" % state.box.name
-            )
-            state.driver().force_stop()
-    except common.LockBusy:
-        raise unlock_busy_refusal(
-            "Not stopping it: its answer may start the in-place encryption.",
-            state.yo_cmd("down"),
-        )
+    # The caller's lock spans the probe and the power-off, so no yo can answer
+    # the passphrase prompt between the proof and the kill.
+    gate = unlock.require_initrd(held)
+    if not unlock.initrd_ask_pending(gate):
+        raise YoError(initrd_down_refusal(gate))
+    ui.out(
+        "%s is waiting in its initrd for the passphrase, which cannot shut down; "
+        "powering it off" % state.box.name
+    )
+    state.driver().force_stop(held)
 
 
 def destruction_steps() -> List[Removal]:
-    """Every piece of this machine that exists now, in the order to remove it."""
-    steps = sshx.agent_master_removals() + state.driver().removals()
+    """Every piece of this machine that exists now, in the order to remove it.
+    The broker goes before the driver's pieces: it lives in the instance
+    directory, and one that ends with its box's keepalive process unlinks
+    its sockets while that directory is being deleted."""
+    steps = (
+        sshx.agent_master_removals() + aws.broker_removals() + state.driver().removals()
+    )
     herdr = forwards.herdr_binary()
     if herdr is not None:
         steps += forwards.herdr_machine_removals(herdr)
@@ -233,45 +277,58 @@ def destruction_steps() -> List[Removal]:
 
 
 def cmd_destroy(args: argparse.Namespace) -> None:
-    # The lock comes before the list: a yo that is unlocking can start a box that
-    # is off, and a list made earlier would leave it running at its undefine. The
-    # listing changes nothing, so it takes no lock.
-    lock = state.unlock_lock(wait=False) if args.yes else contextlib.nullcontext()
+    if not args.yes:
+        list_destruction()
+        return
+    # The lock comes before the list: a yo up can create or start the box, and a
+    # list made earlier would leave pieces behind or a box running at its
+    # undefine. The listing alone changes nothing, so it takes no lock.
     try:
-        with lock:
-            steps = destruction_steps()
-            if not steps:
-                ui.out("%s has nothing to destroy" % state.box.name)
-            elif args.yes:
-                for step in steps:
-                    ui.out(step.what)
-                    step.remove()
-            else:
-                ui.out("Destroying %s would:" % state.box.name)
-                for step in steps:
-                    ui.out("  - %s" % step.what)
-                ui.out(
-                    "Everything on %s is lost. Run %s to do it."
-                    % (state.box.name, state.yo_cmd("destroy", "--yes"))
-                )
+        with state.box_lock(wait=False) as held:
+            destroy(held)
     except common.LockBusy:
-        raise unlock_busy_refusal(
-            "Not destroying it.", state.yo_cmd("destroy", "--yes")
-        )
+        raise box_busy_refusal("Not destroying it.", state.yo_cmd("destroy", "--yes"))
+
+
+def list_destruction() -> None:
+    steps = destruction_steps()
+    if not steps:
+        ui.out("%s has nothing to destroy" % state.box.name)
+        return
+    ui.out("Destroying %s would:" % state.box.name)
+    for step in steps:
+        ui.out("  - %s" % step.what)
+    ui.out(
+        "Everything on %s is lost. Run %s to do it."
+        % (state.box.name, state.yo_cmd("destroy", "--yes"))
+    )
+
+
+def destroy(held: state.HeldBox) -> None:
+    steps = destruction_steps()
+    if not steps:
+        ui.out("%s has nothing to destroy" % state.box.name)
+    for step in steps:
+        ui.out(step.what)
+        step.remove(held)
 
 
 @agent.clearing_passphrases
 def cmd_bootstrap(args: argparse.Namespace) -> None:
+    # Under the box lock from the first read to the last step: a `yo down`
+    # must not stop the box mid-rebuild or between its stop and its start.
+    with state.box_lock(wait=True) as held:
+        bootstrap(held, args)
+
+
+def bootstrap(held: state.HeldBox, args: argparse.Namespace) -> None:
     report = Report()
     ref = args.version if args.version is not None else release.flake_ref(None)
 
-    passphrase = vm_up(run_services=False, size=asked_size(args))
+    passphrase = vm_up(held, run_services=False, size=asked_size(args))
     report.ok("VM up")
 
-    fstype = luks_device_fstype()
-    if not fstype:
-        raise YoError(state.not_up_hint("cannot read the type of %s" % LUKS_DEVICE))
-    if fstype == DISK_FSTYPE_PLAIN:
+    if luks_device_fstype() == DISK_FSTYPE_PLAIN:
         usage = guest.guest_root_usage()
         total, used = usage.total_kib, usage.used_kib
         if used * 100 > total * IN_PLACE_MAX_USED_PERCENT:
@@ -306,8 +363,9 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     if profile == booted:
         report.ok("already running the built generation")
     else:
-        # Derived before the VM stops, so a missing 1Password key leaves the box running.
-        passphrase = passphrase or agent.luks_passphrase()
+        # Derived before the VM stops, so a missing 1Password key leaves the box
+        # running; the reboot's initrd asks for it to encrypt the plain root.
+        passphrase()
 
         def stop_aborted(detail: str) -> YoError:
             # The box just ran nixos-rebuild, so it is in stage 2: say what
@@ -325,12 +383,12 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
             )
 
         try:
-            state.driver().stop()
+            state.driver().stop(held)
         except StopRefused as e:
             raise stop_aborted(e.reason)
         except YoError as e:
             raise stop_aborted(e.message)
-        vm_up(run_services=False, passphrase=passphrase)
+        vm_up(held, run_services=False, passphrase=passphrase)
         profile, booted = booted_generations(report)
         if profile != booted:
             raise report.abort(
@@ -344,7 +402,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
 
     include_present = sshconfig.ensure_ssh_config_include(refuse=False)
     guest.ensure_guest_known_hosts()
-    forwards.ensure_herdr_machine(include_present)
+    forwards.ensure_herdr_machine(held, include_present)
 
     sshx.require_agent_account()
     forwards.vm_services()
@@ -395,29 +453,39 @@ def grow_mapping_and_filesystem(passphrase: agent.Passphrase) -> None:
     )
 
 
-@agent.clearing_passphrases
-def cmd_disk_grow(args: argparse.Namespace) -> None:
-    wanted = args.size
-    current = state.driver().disk_gib()
+def refuse_shrink(wanted: int, current: int) -> None:
     if wanted < current:
         raise YoError(
             "%s's disk is already %dGiB and %s can only grow it — ask for at least %d"
             % (state.box.name, current, state.driver().name, current)
         )
+
+
+@agent.clearing_passphrases
+def cmd_disk_grow(args: argparse.Namespace) -> None:
+    # Under the box lock from the size read to the resize: a `yo down` must not
+    # stop the box mid-resize, and no other yo may grow it meanwhile.
+    with state.box_lock(wait=True) as held:
+        grow_disk(held, args.size)
+
+
+def grow_disk(held: state.HeldBox, wanted: int) -> None:
+    current = state.driver().disk_gib()
+    # Refused before anything is spent on the box.
+    refuse_shrink(wanted, current)
     # The box up first: the reads below need its guest, and vm_up's preflight
     # judges the box before anything is spent on it.
-    passphrase = vm_up()
+    passphrase = vm_up(held)
     require_encrypted_root()
     before = guest.guest_root_usage()
     # Derived before the stop, so a missing 1Password key leaves the box running.
-    passphrase = passphrase or agent.luks_passphrase()
-    if wanted > current:
-        # The ceiling is raised only while the VM is off; the partition grows
-        # at the next boot (boot.growPartition).
-        state.driver().stop()
-        state.driver().grow_disk(wanted)
-        vm_up(passphrase=passphrase)
-    grow_mapping_and_filesystem(passphrase)
+    key = passphrase()
+    if wanted != current:
+        # The partition grows at the next boot (boot.growPartition).
+        state.driver().stop(held)
+        state.driver().grow_disk(held, wanted)
+        vm_up(held, passphrase=passphrase)
+    grow_mapping_and_filesystem(key)
     after = guest.guest_root_usage()
     ui.out("before: %s" % before.human_line)
     ui.out("after:  %s" % after.human_line)

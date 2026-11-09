@@ -33,6 +33,9 @@
 set -Eeuo pipefail
 # No globbing: the unquoted word lists below (wrapper names) must stay literal.
 set -f
+# The checks read the words of sudo, ss, journalctl and the rest, and compare
+# sorted lists bytewise; a translated tool would say something else.
+export LC_ALL=C
 
 readonly FACTS=/etc/yolobox/facts.sh
 readonly WRAPPERS=/run/wrappers/bin
@@ -86,9 +89,10 @@ as_agent() {
 # agent's rc files and the agent's ~/.local/bin first, so an agent could make
 # any refusal print. No shell, an environment of PATH and HOME alone, and
 # callers name every binary by its ${SYSBIN} path. Arguments reach the command
-# verbatim, so quotes and `$` are fine here.
+# verbatim, so quotes and `$` are fine here. It runs in /, because the
+# operator's cwd (a 0700 home) is no directory the agent may enter.
 as_agent_bare() {
-    sudo -n -u "${YOLOBOX_AGENT_USER}" "${SYSBIN}/env" -i "PATH=${SYSBIN}" "HOME=${AGENT_HOME}" "$@"
+    sudo -n -u "${YOLOBOX_AGENT_USER}" "${SYSBIN}/env" -i -C / "PATH=${SYSBIN}" "HOME=${AGENT_HOME}" "$@"
 }
 
 cleanup() {
@@ -245,6 +249,27 @@ derivation {
 EOF
 }
 
+# Every refusal is judged beside a positive control: the same probe, through
+# the same path (the agent, sudo, the same tool), asked for something the box
+# allows, must get it, because a probe that cannot succeed at all is refused
+# for reasons that have nothing to do with the hardening. $1 says what the
+# control shows, $2 is the exit status that means it succeeded (a perl probe's
+# 3: the kernel allowed it), and the rest is the command.
+positive_control() {
+    local what=$1 want=$2 out status=0
+    shift 2
+    out=$("$@" 2>&1) || status=$?
+    [ "${status}" -eq "${want}" ] ||
+        fail "${what} failed (exit ${status}), so a refusal would prove nothing: ${out}"
+    ok "positive control: ${what}"
+}
+
+# The perl probes' positive control: the agent opens a TCP socket.
+perl_probe_control() {
+    positive_control "the agent opens a TCP socket through the same perl probe" 3 \
+        as_agent_bare "${SYSBIN}/perl" "${WORK}/socket.pl" 2 1 6
+}
+
 # Runs a perl probe as the agent and leaves its output in PROBE_OUT. A probe
 # exits 0 when the kernel refused, 3 when the hardening did not hold. Any other
 # status means sudo or perl broke, which says nothing about the hardening, so
@@ -264,6 +289,7 @@ agent_probe() {
 # protocol module (net-pf-N alias) for an unprivileged process.
 check_socket_refused() {
     local label=$1 module=$2 domain=$3 type=$4 proto=$5 mods
+    perl_probe_control
     agent_probe "agent could open a ${label} socket (${module} autoloads)" \
         "${WORK}/socket.pl" "${domain}" "${type}" "${proto}"
     mods=$(lsmod)
@@ -275,6 +301,7 @@ check_socket_refused() {
 
 # The sysctl read-back proves the setting; this proves the agent really meets it.
 check_io_uring() {
+    perl_probe_control
     agent_probe "io_uring_setup was not refused with EPERM for the agent" "${WORK}/iouring.pl"
     ok "io_uring_setup ${PROBE_OUT} for the agent"
 }
@@ -310,7 +337,7 @@ check_modules() {
 # `ip link add ... type KIND` in the agent's own namespace asks the kernel for
 # the module rtnl-link-KIND, before the kernel looks at the kind's options.
 # The blocked kinds must be refused as unsupported, with their module not
-# loaded; the positive control is a bridge, which stays, and must attach.
+# loaded, while a bridge, which stays, attaches.
 # `kind|module|parent|options`, one per word: a kind on top of another device
 # (macsec, ipvlan) takes `link PARENT` before the name, where iproute2 reads
 # it; after `type KIND` every word is the kind's own option, and `link` there
@@ -318,9 +345,8 @@ check_modules() {
 # refusal. hsr's slaves are its own options.
 check_link_kinds() {
     local entry kind module parent options out loaded
-    as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/ip" link add b0 type bridge ||
-        fail "the agent could not add a bridge in its own namespace, so a refused link kind would prove nothing"
-    ok "the agent can add a bridge in its own namespace"
+    positive_control "the agent adds a bridge in its own namespace" 0 \
+        as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/ip" link add b0 type bridge
     for entry in \
         "vxlan|vxlan||id 1 dstport 4789" \
         "geneve|geneve||id 1 remote 192.0.2.1" \
@@ -352,6 +378,8 @@ check_link_kinds() {
 # The net/sched modules are blocked (nix/hardening.nix), except sch_fq_codel.
 check_net_sched() {
     local out status=0 loaded
+    positive_control "the agent attaches fq_codel in its own namespace" 0 \
+        as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/tc" qdisc add dev lo root fq_codel
     if out=$(as_agent_bare "${SYSBIN}/unshare" -Urn "${SYSBIN}/tc" qdisc add dev lo root netem delay 1ms 2>&1); then
         fail "the agent attached a netem qdisc in its own namespace (sch_netem autoloads)"
     fi
@@ -471,9 +499,13 @@ check_no_su() {
 }
 
 # The mode check above says sudo is not executable by others; this is the
-# agent trying anyway.
+# agent trying anyway. The control execs a wrapper open to others the same
+# way: newuidmap without its arguments prints its usage and exits 1, which
+# proves the exec itself was allowed.
 check_sudo_refuses_agent() {
     local out status=0
+    positive_control "the agent execs the newuidmap wrapper, which is open to it" 1 \
+        as_agent_bare "${WRAPPERS}/newuidmap"
     out=$(as_agent_bare "${WRAPPERS}/sudo" -n true 2>&1) || status=$?
     [ "${status}" -ne 0 ] || fail "the agent ran sudo -n true"
     case ${out} in
@@ -518,6 +550,8 @@ check_hidepid() {
         grep -qxF -- "${opt}" <<<"${options//,/$'\n'}" || fail "/proc is mounted without ${opt}: ${options}"
     done
     ok "/proc is mounted with ${YOLOBOX_PROC_OPTIONS// /,}"
+    positive_control "the agent lists its own /proc/self" 0 \
+        as_agent_bare "${SYSBIN}/ls" /proc/self
     for pid in 1 $$; do
         if out=$(as_agent_bare "${SYSBIN}/ls" "/proc/${pid}" 2>&1); then
             fail "the agent listed /proc/${pid} (${out//$'\n'/ })"
@@ -571,12 +605,11 @@ agent_podman() {
 
 # A rootless container's traffic is the agent's, so the egress table must
 # refuse it the gateway's ssh port, through pasta and on the host network
-# alike. The positive control is the same nc reaching the internet.
+# alike, while the same nc reaches the internet.
 check_container_egress() {
     local network out
-    agent_podman run --rm docker.io/library/busybox nc -z -w 3 github.com 443 ||
-        fail "a container cannot reach github.com:443, so a refused gateway would prove nothing"
-    ok "a rootless container reaches github.com:443"
+    positive_control "a rootless container reaches github.com:443" 0 \
+        agent_podman run --rm docker.io/library/busybox nc -z -w 3 github.com 443
     for network in "" --network=host; do
         # ${network} is one option or nothing; an empty word would be an image name.
         # shellcheck disable=SC2086
@@ -619,10 +652,12 @@ restore_zed() {
 # ~/.config/zed pointed at /etc by the
 # agent, systemd-tmpfiles must refuse the path (an unsafe transition from
 # the agent's home into root's directory) rather than write
-# /etc/settings.json. The positive control is the same run passing once the
+# /etc/settings.json. The same run passes before the swap and once the
 # directory is back.
 check_tmpfiles_refuses_agent_symlink() {
     local out status=0
+    positive_control "systemd-tmpfiles --create passes before the swap" 0 \
+        sudo -n systemd-tmpfiles --create
     ZED_STAMP_DIR=$(as_agent_bare "${SYSBIN}/mktemp" -d /tmp/hk-zed.XXXXXX) ||
         fail "could not create a directory as the agent"
     as_agent_bare "${SYSBIN}/bash" "${WORK}/zed-swap.sh" "${ZED_STAMP_DIR}" swap ||
@@ -641,8 +676,11 @@ check_tmpfiles_refuses_agent_symlink() {
 }
 
 # The gateway is the host's own loopback, so a connection to its port 22 would
-# reach the host's sshd. The egress table must refuse it for the agent.
+# reach the host's sshd. The egress table must refuse it for the agent; the
+# same probe reaches an address on the internet.
 check_gateway_ssh_closed() {
+    positive_control "the agent connects to 1.1.1.1:443 through the same perl probe" 3 \
+        as_agent_bare "${SYSBIN}/perl" "${WORK}/tcp.pl" 1.1.1.1 443
     agent_probe "the agent connected to ${YOLOBOX_GATEWAY}:22, the host's loopback" \
         "${WORK}/tcp.pl" "${YOLOBOX_GATEWAY}" 22
     ok "the agent cannot reach ${YOLOBOX_GATEWAY}:22 (${PROBE_OUT})"
@@ -812,11 +850,18 @@ unit_property() {
 # any name, so the unit must be loaded, and a skip must come from a condition
 # systemd evaluated (ConditionTimestamp set).
 check_guestagent() {
-    local unit=lima-guestagent.service load state result evaluated
+    local unit=lima-guestagent.service load state result evaluated shipped
     load=$(unit_property "${unit}" LoadState)
     [ "${load}" = loaded ] || fail "${unit} is not loaded (LoadState=${load}): the unit is missing or renamed"
     state=$(unit_property "${unit}" ActiveState)
-    if sudo -n test -e /mnt/lima-cidata/lima-guestagent; then
+    # A word, not `test -e`'s exit code: its 1 is also sudo failing.
+    shipped=$(sudo -n sh -c 'if [ -e "$1" ]; then echo shipped; else echo absent; fi' sh \
+        /mnt/lima-cidata/lima-guestagent) || fail "could not look for the guest agent in Lima's cidata"
+    case ${shipped} in
+    shipped | absent) ;;
+    *) fail "the look for the guest agent in Lima's cidata answered '${shipped}'" ;;
+    esac
+    if [ "${shipped}" = shipped ]; then
         [ "${state}" = active ] ||
             fail "Lima's cidata ships the guest agent, but ${unit} is ${state}"
         ok "${unit} is active, and Lima's cidata ships its binary"

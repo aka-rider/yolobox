@@ -25,8 +25,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parent.parent
-BROKER_PATH = str(ROOT / "aws-broker")
+from shell_harness import REPO
+
+BROKER_PATH = str(REPO / "aws-broker")
 
 
 def load_broker():

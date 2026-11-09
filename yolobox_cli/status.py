@@ -6,11 +6,24 @@ import argparse
 import shutil
 from typing import Callable, List, Optional, Tuple, TypeVar
 
-from . import aws, config, forwards, guest, proc, release, sshx, state, ui, unlock, vm
+from . import (
+    aws,
+    common,
+    config,
+    forwards,
+    guest,
+    proc,
+    release,
+    sshx,
+    state,
+    ui,
+    unlock,
+    vm,
+)
 from .config import EGRESS_UNIT, LUKS_DEVICE, MIB, PROXY_SOCKET_UNITS
 from .sshx import OPERATOR
 from .ui import Report, StatusLine, YoError
-from .unlock import BootStage
+from .unlock import BootStage, Endpoint
 
 Read = TypeVar("Read")
 
@@ -108,9 +121,15 @@ def proxy_line(unit: str, active_state: str) -> StatusLine:
 def fstype_line(fstype: str) -> StatusLine:
     if fstype == vm.DISK_FSTYPE_LUKS:
         return StatusLine("disk: %s is %s" % (LUKS_DEVICE, fstype))
+    if fstype == vm.DISK_FSTYPE_PLAIN:
+        return StatusLine(
+            "disk: %s is %s — NOT encrypted; rebuild and reboot: %s"
+            % (LUKS_DEVICE, fstype, state.yo_cmd("bootstrap")),
+            True,
+        )
     return StatusLine(
-        "disk: %s is %s — NOT encrypted; rebuild and reboot: %s"
-        % (LUKS_DEVICE, fstype, state.yo_cmd("bootstrap")),
+        "disk: %s is '%s', neither %s nor %s"
+        % (LUKS_DEVICE, ui.shown(fstype), vm.DISK_FSTYPE_LUKS, vm.DISK_FSTYPE_PLAIN),
         True,
     )
 
@@ -136,13 +155,14 @@ def network_line(
         return StatusLine("network: ok")
     if gateway_ok:
         return StatusLine(
-            "network: WARNING guest egress is dead while the gateway answers DNS — "
+            "network: WARNING guest egress is dead while the gateway resolves "
+            "names — "
             "a VPN on the host likely owns its default route",
             True,
         )
     if internet_ok:
         return StatusLine(
-            "network: WARNING the gateway does not answer DNS while egress works — "
+            "network: WARNING the gateway resolves no name while egress works — "
             "DNS through the gateway will fail; check the host's VPN or DNS filter",
             True,
         )
@@ -198,17 +218,29 @@ def guest_lines(status: GuestStatus) -> List[StatusLine]:
     return lines
 
 
+def forward_line(name: str, forward: forwards.ReverseForward) -> StatusLine:
+    """How a guest forward stands: up, or down with what its probe said and the
+    command that declares it again."""
+    failure = forwards.forward_failure(forward)
+    if failure is None:
+        return StatusLine("%s: guest forward is up" % name)
+    return StatusLine(
+        "%s: guest forward is down (%s) — restore it with: %s"
+        % (name, failure, state.yo_cmd("up")),
+        True,
+    )
+
+
 def status_guest(report: Report) -> None:
     """The guest's side of the report, from one `yolobox-guest status` as the
     operator and the agent's probe of the 1Password forward."""
     completed = guest.guest_helper(OPERATOR, "status")
     if completed.returncode != 0:
-        # The seed image has no helper; a box built by another yo may lack the
-        # subcommand. Either way the one remedy is a bootstrap.
+        # A bootstrapped box whose helper fails: a box built by another yo may
+        # lack the subcommand, and the one remedy is a bootstrap.
         report.warn(
-            "yolobox: host yo %s, box built by nothing readable — %s; run %s"
+            "yolobox: %s; run %s"
             % (
-                config.YO_VERSION,
                 proc.failed_message(
                     "%s status" % config.HELPER,
                     completed.returncode,
@@ -234,13 +266,7 @@ def status_guest(report: Report) -> None:
         if drift:
             report.warn(drift)
 
-    op_alive = forwards.forward_is_up(forwards.one_password_forward())
-    report.emit(
-        StatusLine(
-            "1password: guest forward is %s" % ("up" if op_alive else "down"),
-            not op_alive,
-        )
-    )
+    report.emit(forward_line("1password", forwards.one_password_forward()))
     for line in guest_lines(status):
         report.emit(line)
 
@@ -256,7 +282,9 @@ def disk_image_lines(image: Optional[Tuple[str, int]]) -> List[StatusLine]:
     ]
 
 
-def aws_lines(vm_reachable: bool) -> List[StatusLine]:
+def aws_lines(unchecked: Optional[str]) -> List[StatusLine]:
+    """The aws lines; `unchecked` says why the guest forward is not probed
+    (None: it is)."""
     disabled = StatusLine(
         "aws: disabled (no 'aws' CLI or no SSO profiles in %s)"
         % state.tilde(aws.aws_config_path())
@@ -269,17 +297,10 @@ def aws_lines(vm_reachable: bool) -> List[StatusLine]:
         return [StatusLine("aws: config unreadable: %s" % failure.message, True)]
     if not allowed:
         return [disabled]
-    if not vm_reachable:
-        return [StatusLine("aws: guest forward not checked (VM unreachable)")]
+    if unchecked is not None:
+        return [StatusLine("aws: guest forward not checked (%s)" % unchecked)]
 
-    forward_up = forwards.forward_is_up(forwards.aws_broker_forward())
-    lines = [
-        StatusLine(
-            "aws: guest forward is %s" % ("up" if forward_up else "down"),
-            not forward_up,
-        )
-    ]
-    return lines + driver_lines(
+    return [forward_line("aws", forwards.aws_broker_forward())] + driver_lines(
         "the pid the broker watches",
         state.driver().keepalive_pid,
         broker_lines,
@@ -290,12 +311,15 @@ def broker_lines(pid: Optional[int]) -> List[StatusLine]:
     """The broker's line against `pid`, the one it should be watching (None: the
     host has no such process now)."""
     keepalive = state.driver().hints.keepalive_name
-    health = aws.aws_broker_health()
+    try:
+        health = aws.aws_broker_health()
+    except YoError as failure:
+        return [StatusLine("aws: broker unhealthy: %s" % failure.message, True)]
     if health is None:
         return [
             StatusLine(
-                "aws: broker not reachable on this host's %s"
-                % aws.aws_broker_ctl_sock(),
+                "aws: no broker listens on this host's %s"
+                % state.aws_broker_ctl_sock(),
                 True,
             )
         ]
@@ -335,6 +359,50 @@ def initrd_disk_line(ask_pending: bool) -> str:
     )
 
 
+def status_boot_stage(report: Report) -> bool:
+    """Report which sshd answers, and whether the VM is reachable as the
+    operator. The stage is read off the banner and the unpinned channel: a box
+    locked in its initrd answers with a per-boot host key that a pinned probe
+    would warn about. Root is asked only under the box lock, so a box in its
+    initrd is looked inside only while no other yo acts on it."""
+    endpoint = state.driver().ssh_facts()
+    banner = unlock.endpoint_kind(endpoint)
+    if banner.kind is Endpoint.UNKNOWN:
+        report.warn("vm: %s" % unlock.unknown_banner_error(banner).message)
+        return False
+    if banner.kind is not Endpoint.INITRD:
+        return report_stage(report, unlock.operator_stage(endpoint, banner))
+    try:
+        with state.box_lock(wait=False) as held:
+            stage = unlock.boot_stage(held)
+            reachable = report_stage(report, stage)
+            if stage.kind is BootStage.INITRD:
+                gate = unlock.require_initrd(held)
+                ui.out(initrd_disk_line(unlock.initrd_ask_pending(gate)))
+            return reachable
+    except common.LockBusy:
+        report.warn(
+            "vm: %s is in its initrd, and another yo is acting on it (an up may "
+            "be unlocking it), so yo does not look inside; run %s again when "
+            "that command is done" % (state.box.name, state.yo_cmd("status"))
+        )
+        return False
+
+
+def report_stage(report: Report, stage: unlock.Stage) -> bool:
+    """Whether the VM is reachable as the operator; a warning when it is not."""
+    if stage.kind is BootStage.STAGE2:
+        return True
+    if stage.kind is BootStage.UNKNOWN:
+        report.warn("vm: %s" % unlock.unknown_stage_message(stage))
+    else:
+        report.warn(
+            "vm: unreachable%s — is it up? start it with: %s"
+            % (unlock.stage_said(stage), state.yo_cmd("up"))
+        )
+    return False
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     report = Report()
     listing_failure = state.driver().show_status()
@@ -342,29 +410,21 @@ def cmd_status(args: argparse.Namespace) -> None:
         report.warn(listing_failure)
 
     # Every guest probe below fails the same way on a VM that is down, so ask
-    # once and say it once instead of printing a warning per probe. The stage
-    # is read off the banner and the unpinned channel: a box locked in its
-    # initrd answers with a per-boot host key that a pinned probe would warn about.
-    stage = unlock.boot_stage()
-    vm_reachable = stage is BootStage.STAGE2
-    if not vm_reachable:
-        if stage is BootStage.UNKNOWN:
-            report.warn("vm: %s" % unlock.unknown_stage_message())
-        else:
-            report.warn(
-                "vm: unreachable — is it up? start it with: %s" % state.yo_cmd("up")
-            )
-        if stage is BootStage.INITRD:
-            ui.out(initrd_disk_line(unlock.initrd_ask_pending()))
-
+    # once and say it once instead of printing a warning per probe.
+    vm_reachable = status_boot_stage(report)
+    aws_unchecked: Optional[str] = None if vm_reachable else "VM unreachable"
     if vm_reachable:
         try:
-            agent_problem = sshx.agent_login_problem()
-            if agent_problem is not None:
-                report.warn("agent: login fails — %s" % agent_problem)
-            status_guest(report)
+            if sshx.bootstrapped(mux=False):
+                agent_problem = sshx.broken_agent_login()
+                if agent_problem is not None:
+                    report.warn("agent: login fails — %s" % agent_problem)
+                status_guest(report)
+            else:
+                report.warn("yolobox: %s" % sshx.not_bootstrapped_message())
+                aws_unchecked = "not bootstrapped"
         except sshx.Unreachable as lost:
-            vm_reachable = False
+            aws_unchecked = "VM unreachable"
             report.warn("vm: lost while probing — %s" % lost.message)
 
     for line in driver_lines(
@@ -372,7 +432,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     ):
         report.emit(line)
 
-    for line in aws_lines(vm_reachable):
+    for line in aws_lines(aws_unchecked):
         report.emit(line)
 
     if report.warnings:

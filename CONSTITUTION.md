@@ -12,6 +12,11 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 - ALWAYS bump the major version for a breaking change. The release note is where an operator learns that the cure is a new box.
 - ALWAYS keep the seed image's first bootstrap working: a plaintext root, no `yolobox-guest`, no agent account, no version stamp. That is a box not yet bootstrapped, not an older version, and every new box passes through it.
 - ALWAYS make `yo` define the box, not judge and repair it. Declare the desired state idempotently, or refuse with one message that names the one command to run; inferring a state from exit codes and picking among repairs multiplies the states that can go wrong.
+- ALWAYS decide a state only from an answer that names it: a banner word, a stamp, one word of a closed set the probe prints. NEVER from an absence, a bare exit code or an error other failures share, and give every classifier an outcome for an answer it has no name for, shown in that answer's words. A missing mark, ssh's silent 255, a failing `cat`, `dig`'s 0 and `sudo test -e`'s 1 each also mean something else. The one state read off an absence is an ssh banner with neither mark, and only in the safe direction: it gets the operator's login alone, never `root` or the passphrase.
+- ALWAYS run every check that can refuse a command before the command's first step that changes the box or the host. A refusal after a step leaves a half-done state nobody chose.
+- ALWAYS build each remedy `yo` prints in one place, and test it by running the printed command against fakes from every state that prints it. A remedy that does not run is a second refusal.
+- ALWAYS write a file another process or a later run reads atomically: a sibling temporary file, fsync, rename, fsync the directory, and remove the temporary file on failure. A reader must never see half a file.
+- ALWAYS judge a name, path, address or rule by fullmatch, whole words or parsed membership, NEVER by substring, prefix or `re.search`. A search accepts whatever merely contains the name.
 - ALWAYS prefer the trivial implementation, and delete when in doubt. Fewer states, branches and parsers leave less to break.
 - ALWAYS spell a literal that more than one language reads (uids, account names, socket paths, the LUKS names, exit codes, ports) once, in `facts.json`. nix reads it with `fromJSON`, Python with `json`, and the shell scripts source the `/etc/yolobox/facts.sh` nix renders from it; two spellings drift.
 - ALWAYS route repeated logic through one chokepoint, push branching up into the caller and hand helpers whole batches. A fix then lands once.
@@ -30,8 +35,9 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 
 - ALWAYS test behaviour through a public interface: a function, a command, a script run under bash with fakes. A test that restates the code (a constant equals its literal, an argv equals the concatenation the function does) proves nothing and is deleted.
 - ALWAYS test the extremes (empty, zero, negative, huge, malformed) and the happy path once.
-- NEVER let a unit test depend on the host OS, a hypervisor or a running box. Skip cleanly when a tool is missing, never assert that it is present, so the suite runs on a Mac, a Linux PC and CI alike.
-- ALWAYS flip the condition a new test guards and watch it fail before you commit it. A test that cannot fail is noise.
+- NEVER let a test reach the operator's real home. Every test module imports `tests/shell_harness.py`, which points `$HOME` at a scratch directory and fails a test that opens, lists or connects to anything under the real one; otherwise a test talks to the operator's 1Password agent, ssh config and boxes, and passes or fails by what they hold.
+- NEVER let a unit test depend on the host OS, a hypervisor or a running box. Skip cleanly when a tool is missing, never assert that it is present, so the suite runs on a Mac, a Linux PC and CI alike; and CI fails a test that skips although its runner has the tool, because there the skip hides a broken probe.
+- ALWAYS flip each new test and watch it fail, run every live check beside a positive control through the same path, and make a probe ask a question only its target can answer, one layer at a time. A check that cannot fail, or that fails for reasons of its own, proves nothing.
 
 ## The VM
 
@@ -68,11 +74,11 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 
 ## SSH and identities
 
-- ALWAYS let an ssh role own its `ControlPath`. OpenSSH never re-checks the login user on a multiplexed connection, so `-o User=agent` over the operator's master runs as the operator.
+- ALWAYS give each ssh role a `ControlPath` of its own that no other tool uses (Lima's hostagent keeps `ssh.sock`). OpenSSH never re-checks the login user on a multiplexed connection, so `-o User=agent` over the operator's master runs as the operator, and a master another tool opened carries none of `yo`'s forwards.
 - ALWAYS reach 1Password in the guest through a reverse unix-socket forward proxied to an agent-owned socket, never through `ForwardAgent` in a shared config. A forward in the shared file would reach every role `yo` spawns, editors included.
-- ALWAYS limit `yo ssh`'s `ForwardAgent` to its own command line over `ControlPath=none`. A forward on a shared master outlives its pane.
+- ALWAYS limit `yo ssh`'s `ForwardAgent` (and the `IdentityAgent` ssh needs before it forwards anything) to its own command line over `ControlPath=none`. A forward on a shared master outlives its pane.
 - ALWAYS verify the guest's host key from the instance's `known_hosts`, with `NoHostAuthenticationForLocalhost no` first in the ssh config. A changed key must surface as ssh's own refusal, never as a silent rewrite, which would hand the forwarded agent to whatever holds the port.
-- NEVER offer `root` or the passphrase to an sshd whose banner carries `yolobox-stage2` or is empty. After switch-root the port belongs to stage 2, which penalises a `root` login and must never see the passphrase.
+- ALWAYS offer `root`, and the passphrase, only through `unlock.initrd_endpoint()`, under the box's lock: it proves the listener the VM's (Lima's hostagent, or passt's account), then reads the banner, and lets through only one that carries the initrd's word `yolobox-initrd`; `unlock.root_argv()` proves the listener again right before each `root` login, since a port can be taken after the gate. Every other sshd (stage 2, the seed image's unmarked one, no banner) penalises a `root` login and must never see the passphrase, and a missing word proves nothing, since the seed image's stage 2 has none either. A `yo` that cannot take the lock, `yo status` while another `yo` acts on the box, asks `root` nothing.
 - ALWAYS keep the gateway in stage 2's `PerSourcePenaltyExemptList` and admit both accounts only from the gateway, with the anti-spoof rule off `enp0s1`. Every host connection comes from that one address, and the agent holds a 1Password agent that serves the operator's key.
 - ALWAYS let the guest's ssh identity setup live in the guest. A host that reads paths the guest can influence once followed a symlink to a private key.
 - NEVER set `IdentityAgent` unconditionally in the guest's shared ssh config, and NEVER let an rc file replace an inherited `SSH_AUTH_SOCK`. Either takes the forwarded agent away.
@@ -115,6 +121,8 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 - ALWAYS unpack a `yo cp` download into a staging directory beside the destination, let only regular files and directories land, drop control paths there, and merge only then. The guest's `tar` runs through the agent's login shell, so the agent controls the stream, and a pulled tree never lands `.git`, `.hg`, `.svn`, `.jj`, `.husky`, `.envrc`, `.vscode` or `.idea`, matched case-insensitively, because the host would run them as the operator.
 - ALWAYS derive a guest path by mirroring the host's logical `$PWD` under `$HOME`, never `realpath`. Physical resolution loses the spelling the user stands in.
 - NEVER let a `yo` command target a guest path outside the guest `$HOME`, except `yo cp` under `/tmp`, where agents keep scratch output.
+- ALWAYS read, decide and act under one lock when two `yo` processes can reach the same box, master, forward, broker or host port, and read again after taking it. What another `yo` did while this one waited is in no earlier read.
+- ALWAYS take the box lock once, at the top of a command that creates, starts, unlocks, stops, rebuilds, grows or destroys the box, hold it to the command's end, and hand its `HeldBox` to every step that must run under it. `flock` is not re-entrant across two descriptors of one process, so a nested `box_lock()` would wait on itself; it raises instead.
 
 ## Distribution and release
 
@@ -130,12 +138,14 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 - ALWAYS `git add` new files before nix evaluates a local clone. Nix ignores untracked files.
 - ALWAYS run `nixos-rebuild` unpiped and read its exit code. A pipe reports a failed bootloader install as success.
 - ALWAYS run shellcheck at its default severity, as `writeShellApplication` does. A finding that passes at `-S warning` fails the box build at bootstrap.
+- NEVER pipe into `grep -q` under `set -o pipefail`. The producer dies of SIGPIPE and a present thing reads as missing.
+- ALWAYS assign a `mktemp` result on a line of its own, and delete only a variable the script set, after checking it is not empty. Inside another command or after `local` its failure is lost, and the empty path is deleted from.
+- ALWAYS run every tool whose words you match or whose sort order you compare under `LC_ALL=C`, host or guest: `yo` runs its host tools through `proc` and every guest command it builds through `sshx.ssh_run` that way, and a script that matches a tool's words exports it at its top level. A translated tool says something else, and nix and every byte comparison sort bytewise. Only an interactive session keeps the operator's locale.
 
 ## Harnesses, herdr and the display
 
 - NEVER let anything but the box own `~/.local/bin/claude`, and NEVER give the launcher `runtimeInputs`. The launcher exports `HERDR_AGENT`, and `runtimeInputs` would shadow every tool a session runs.
 - ALWAYS watch the claude version directory with `PathChanged`, never `PathModified`, and set `StartLimitIntervalSec = 0` on the service it triggers. One download is thousands of writes.
-- NEVER pipe into `grep -q` under `set -o pipefail`. The producer dies of SIGPIPE and a present thing reads as missing.
 - NEVER let a vendor installer edit an rc file, and keep `~/.claude/settings.json` a regular file and pi's settings pi's own. An rc line changes `PATH` behind the box's back, and a symlinked settings file sends writes elsewhere or drops them.
 - NEVER drop a retired `L+` link from the config without an `r` rule. A rebuild does not remove what it stops declaring.
 - ALWAYS keep the VM free of a C and Python toolchain. It keeps native npm modules from compiling at install time.
@@ -152,7 +162,6 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 ## AWS credentials
 
 - ALWAYS choose an AWS profile per process with `AWS_PROFILE`, never one switchable global profile. botocore fixes its credential source at first use.
-- ALWAYS tie the broker's lifetime to the box's keepalive process (Lima's hostagent, or the operator's ssh master on Linux), and reach it over a reverse unix socket, never TCP. A host VPN can blackhole the gateway's TCP while egress works.
+- ALWAYS run one broker per box, its sockets, `yo`'s lock on it and its log in that box's own directory, and tie its lifetime to a host process that lives exactly as long as the box (Lima's hostagent, or the operator's ssh master on Linux). Reach it over a reverse unix socket on `yo`'s own master, never TCP. A broker that outlives its box serves nobody, one shared by all boxes is re-pinned to whichever box last ran a session command, and a host VPN can blackhole the gateway's TCP while egress works.
 - NEVER guard the reversed socket with a bearer token, and NEVER write a secret to stdout after the handshake or to a log. File permissions are the boundary, and logs are read later by anyone.
-- ALWAYS match a profile name with `fullmatch`, require a `region`, refuse a response without `SessionToken`, answer every failure with the same generic 500, and bound connections, request size and time. The guest is the untrusted side.
-- ALWAYS write the guest's AWS config atomically. A `credential_process` call must never read half a file.
+- ALWAYS require a `region`, refuse a response without `SessionToken`, answer every failure with the same generic 500, and bound connections, request size and time. The guest is the untrusted side.

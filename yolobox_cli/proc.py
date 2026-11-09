@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, BinaryIO, Callable, Dict, Iterator, Optional, Sequence
 
 from . import ui
 from .ui import RunTimeout, YoError
@@ -36,36 +36,50 @@ def read_text_file(
 
 
 def atomic_write(path: str, content: str, mode: int) -> None:
-    """Write `content` to `path` in one step: a temporary file beside it, synced
-    to disk, renamed over it, and the directory synced so the new name survives
-    a crash. A failure removes the temporary file and is a YoError naming `path`."""
+    """Write `content` to `path` in one step (atomic_file)."""
+    with atomic_file(path, mode) as handle:
+        handle.write(content.encode("utf-8", "surrogateescape"))
+
+
+@contextlib.contextmanager
+def atomic_file(path: str, mode: int) -> Iterator[BinaryIO]:
+    """A binary handle on a temporary file beside `path`, which becomes `path` in
+    one step when the block ends: synced to disk, given `mode`, renamed over it,
+    and the directory synced so the new name survives a crash. A block that
+    raises leaves `path` as it was. Either way no temporary file is left, and a
+    failure of these steps is a YoError naming `path`. Every file yo writes for
+    another process or a later run to read is written here."""
     directory = os.path.dirname(path) or "."
+    with naming_write_failures(path):
+        fd, tmp_path = tempfile.mkstemp(dir=directory)
     try:
-        write_and_rename(directory, path, content, mode)
-    except OSError as failure:
-        raise YoError("cannot write %s: %s" % (path, ui.os_error_reason(failure)))
-
-
-def write_and_rename(directory: str, path: str, content: str, mode: int) -> None:
-    fd, tmp_path = tempfile.mkstemp(dir=directory)
-    try:
-        with os.fdopen(fd, "w", errors="surrogateescape") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp_path, mode)
-        os.replace(tmp_path, path)
+        with os.fdopen(fd, "wb") as handle:
+            yield handle
+            with naming_write_failures(path):
+                handle.flush()
+                os.fsync(handle.fileno())
+        with naming_write_failures(path):
+            os.chmod(tmp_path, mode)
+            os.replace(tmp_path, path)
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     except BaseException:
-        # The write's own error is the one to raise; the temporary file may
-        # already be gone (an interrupt landing after the rename).
+        # The block's own error is the one to raise; the temporary file is
+        # already gone after the rename.
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         raise
-    dir_fd = os.open(directory, os.O_RDONLY)
+
+
+@contextlib.contextmanager
+def naming_write_failures(path: str) -> Iterator[None]:
     try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        yield
+    except OSError as failure:
+        raise YoError("cannot write %s: %s" % (path, ui.os_error_reason(failure)))
 
 
 def remove_file(path: str) -> None:
@@ -127,6 +141,13 @@ GUEST_CAPTURE_LIMIT = 1 << 20
 GUEST_LINE_LIMIT = 64 * 1024
 
 
+def tool_env(env: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """The environment of every tool yo runs and reads: `env` (else yo's own)
+    in the C locale, because yo matches the words tools print and compares their
+    sort order, and a translated virsh or ssh says something else."""
+    return dict(os.environ if env is None else env, LC_ALL="C")
+
+
 class GuestRun(subprocess.CompletedProcess):
     """A finished guest session: what it printed is the guest's, so a message
     shows it only as a quoted block (failure_detail)."""
@@ -182,7 +203,7 @@ def run(
                 stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE)
                 if capture
                 else None,
-                env=env,
+                env=tool_env(env),
                 timeout=timeout,
             )
     except FileNotFoundError:
@@ -224,7 +245,7 @@ def run_capped(
         stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
-        env=env,
+        env=tool_env(env),
     ) as child:
         sources = {"stdout": child.stdout}
         if not merge_stderr:
@@ -322,10 +343,13 @@ def failure_detail(completed: subprocess.CompletedProcess) -> str:
     return said.strip()
 
 
-def spawn(argv: Sequence[str], **popen_kwargs: Any) -> subprocess.Popen:
-    """Start a process that outlives the call; a missing program is a YoError."""
+def spawn(
+    argv: Sequence[str], env: Optional[Dict[str, str]] = None, **popen_kwargs: Any
+) -> subprocess.Popen:
+    """Start a process that outlives the call, in tool_env(env); a missing
+    program is a YoError."""
     try:
-        return subprocess.Popen(list(argv), **popen_kwargs)
+        return subprocess.Popen(list(argv), env=tool_env(env), **popen_kwargs)
     except FileNotFoundError:
         raise YoError("%s not found on PATH" % argv[0])
 
@@ -342,7 +366,10 @@ def run_filtered(argv: Sequence[str]) -> subprocess.CompletedProcess:
             sink(ui.quoted_line(raw.decode("utf-8", "replace").rstrip("\n")))
 
     with subprocess.Popen(
-        list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        list(argv),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=tool_env(None),
     ) as child:
         errors = threading.Thread(target=pump, args=(child.stderr, ui.err))
         errors.start()

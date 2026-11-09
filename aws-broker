@@ -559,6 +559,9 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
     # generic text as every other failure.
     def send_error(self, code, message=None, explain=None):
         self.close_connection = True
+        # A request line that did not parse leaves the base class's HTTP/0.9,
+        # under which some Pythons (3.9.6) send neither a status line nor headers.
+        self.request_version = self.protocol_version
         self._send(text_reply(HTTPStatus(code), REQUEST_FAILED_BODY))
 
     def _send(self, reply):

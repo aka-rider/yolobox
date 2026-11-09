@@ -1,4 +1,4 @@
-"""The ssh config file yo writes per machine, the Include line in the user's own config and the initrd's ssh."""
+"""The ssh config file yo writes per machine and the Include line in the user's own config."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import stat
 import sys
 from typing import List
 
-from . import proc, state, ui
+from . import common, proc, state, ui
 from .config import AGENT_USER, FILE_MODE_PRIVATE, LOOPBACK, SSH_CONFIG_INCLUDE_LINE
 from .driver import SshFacts
 from .ui import YoError
@@ -110,7 +110,6 @@ def write_ssh_config() -> None:
 
     The one writer: on a Mac lima regenerates the file in its own shape at
     every start, and this puts yo's back after the start."""
-    state.require_control_path_fits()
     wanted = ssh_config_text(state.driver().ssh_facts())
     current = proc.read_text_file(state.ssh_cfg(), errors="surrogateescape")
     if current != wanted:
@@ -139,32 +138,6 @@ FIRST_CONTACT_OPTS = [
     "-o",
     "NoHostAuthenticationForLocalhost=yes",
 ]
-
-
-def initrd_ssh_argv(remote: str, facts: SshFacts, user: str = "root") -> List[str]:
-    # Before the disk is unlocked only the initrd's sshd answers, with a host key
-    # it generated this boot. Nothing is pinned, so whoever holds the loopback
-    # port is trusted with the answer: on macOS that is lima's hostagent, running
-    # as the host user; on Linux it is passt, running as the yolobox-vm account,
-    # and state.driver().verify_initrd_listener() checks the owner before every
-    # passphrase is sent. And no pinned role may be used here: accept-new would
-    # write the initrd's key into known_hosts, and every stage-2 connection after
-    # it would be refused. The caller reads the facts once, so the listener it
-    # checked is the one this dials.
-    return (
-        ["ssh", "-F", "/dev/null", "-i", facts.identity_file]
-        + ssh_opt("IdentitiesOnly", "yes")
-        + ssh_opt("IdentityAgent", facts.identity_agent)
-        + ssh_opt("User", user)
-        + ssh_opt("Port", str(facts.port))
-        + ssh_opt("ControlPath", "none")
-        + ssh_opt("BatchMode", "yes")
-        + ssh_opt("ConnectTimeout", str(SSH_CONNECT_TIMEOUT_SECONDS))
-        + ssh_opt("ServerAliveInterval", str(SSH_ALIVE_INTERVAL_SECONDS))
-        + ssh_opt("LogLevel", "ERROR")
-        + FIRST_CONTACT_OPTS
-        + [LOOPBACK, remote]
-    )
 
 
 def ssh_config_reaches_box() -> bool:
@@ -209,6 +182,15 @@ def ssh_config_reaches_box() -> bool:
 
 
 def add_ssh_config_include() -> None:
+    """Put the include line on top of ~/.ssh/config, which every box on this
+    host shares: under the host's lock on that file, read again after taking
+    it, so two yo commands neither add it twice nor drop an edit."""
+    with common.held_flock(os.path.join(state.state_dir(), "ssh-config.lock"), True):
+        if not ssh_config_reaches_box():
+            prepend_ssh_config_include()
+
+
+def prepend_ssh_config_include() -> None:
     ssh_dir = os.path.join(state.home(), ".ssh")
     if not os.path.isdir(ssh_dir):
         proc.private_dir(ssh_dir)

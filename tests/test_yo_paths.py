@@ -175,6 +175,13 @@ class TestVersionDrift(unittest.TestCase):
                 self.assertIn("this yo is 1.2.3", drift)
                 self.assertTrue(drift.endswith("run yo bootstrap"), drift)
 
+    def test_an_unreleased_yo_has_no_version_to_drift_from(self):
+        # A checkout's yo is `dev`; it builds whatever --version names, so no
+        # box version is wrong for it, and its bootstrap needs --version anyway.
+        for guest in ("1.9.3", "", "lizard"):
+            with self.subTest(guest=guest):
+                self.assertIsNone(yo.version_drift("dev", guest))
+
 
 if __name__ == "__main__":
     unittest.main()

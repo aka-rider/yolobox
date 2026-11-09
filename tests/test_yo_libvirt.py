@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -31,12 +32,19 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
+from shell_harness import require_tool
 from test_yo import (
     ACCEPT_TIMEOUT_SECONDS,
     NOT_LISTENING,
     FakeHelper,
     FakeHome,
+    box_lock_held_elsewhere,
+    box_lock_is_held,
+    guest_words,
     load_yo,
+    locked,
+    ssh_ends,
+    ssh_log_of,
     unload_yo,
     refuse_tcp_to_the_host,
 )
@@ -50,6 +58,9 @@ REPO = Path(__file__).resolve().parent.parent
 # LibvirtCase.setUp patches `which` on the stdlib module itself, which yo shares,
 # so a test that looks for a real tool needs the function as it was at import.
 REAL_WHICH = shutil.which
+FACTS = json.loads((REPO / "facts.json").read_text())
+INITRD_SSH_BANNER_MARK = FACTS["initrd_ssh_banner_mark"]
+VERSION_STAMP = FACTS["version_stamp"]
 INITRD_KEYS_SCRIPT = REPO / "nix" / "luks" / "yolobox-initrd-authorized-keys.sh"
 
 VM_UID, VM_GID = 990, 989
@@ -160,12 +171,11 @@ class FakeHost:
         self.before_dominfo = lambda name: None
         # The same as `virsh dumpxml NAME` starts.
         self.before_dumpxml = lambda name: None
-        self.virsh_envs = []  # the environment of each `virsh` run
         # The guest's sshds, for the `ssh ... true` probes: argv -> (code, stderr).
         self.sshd = lambda argv: (0, "")
-        # What the box's port sends before any login: an sshd without the
-        # stage-2 mark, unless a test says the port is silent ("") or marked.
-        self.banner = "SSH-2.0-OpenSSH_10.6"
+        # What the box's port sends before any login: the initrd's sshd,
+        # unless a test says the port is silent ("") or another sshd's.
+        self.banner = "SSH-2.0-OpenSSH_10.6 " + INITRD_SSH_BANNER_MARK
         # The initrd's yolobox-unlock session: (stdout lines, exit code, stderr).
         self.helper = None
         # What `herdr machine list --json` prints, entry by entry.
@@ -186,9 +196,6 @@ class FakeHost:
         argv = list(argv)
         self.calls.append(argv)
         if argv[0] == "virsh":
-            # yo parses what virsh prints, which virsh translates.
-            assert kwargs["env"]["LC_ALL"] == "C", "virsh run in the user's locale"
-            self.virsh_envs.append(kwargs["env"])
             result = self.virsh(argv[3], argv[4:])
         elif argv[0] == "xorriso":
             self.iso_inputs.append((argv[-1], sorted(os.listdir(argv[-1]))))
@@ -201,7 +208,13 @@ class FakeHost:
                 else self.master_running
             )
             result = completed(
-                returncode=0 if running else 255, stderr=self.master_output
+                returncode=0 if running else 255,
+                stderr=self.master_output
+                or (
+                    "Master running (pid=4242)\r\n"
+                    if running
+                    else "Control socket connect(x): No such file or directory\r\n"
+                ),
             )
         elif argv[0] == "ssh" and "-O" in argv and "forward" in argv:
             if self.master_running and self.master_session[0] == 0:
@@ -228,7 +241,16 @@ class FakeHost:
                 if not fresh and code == 0:
                     self.master_running = True
                     self.master_session = (0, "")
-            result = completed(returncode=code, stderr=stderr)
+            # The box's build stamped it, and holds nothing else an exists
+            # probe asks about.
+            stdout = ""
+            if code == 0 and "echo present" in argv[-1]:
+                stamp = argv[-1].endswith(" " + VERSION_STAMP)
+                stdout = "present\n" if stamp else "absent\n"
+            stdout, stderr = ssh_ends(
+                guest_words(argv[-1]), ssh_log_of(argv), code, stdout, stderr
+            )
+            result = completed(stdout, returncode=code, stderr=stderr)
         elif argv[0] == HERDR and argv[1:3] == ["machine", "list"]:
             result = completed(json.dumps(self.herdr_machines))
         elif argv[0] == HERDR and argv[1:3] == ["machine", "remove"]:
@@ -259,7 +281,6 @@ class FakeHost:
         if argv[0] == "ssh" and argv[-1] == "yolobox-unlock":
             return FakeHelper(*self.helper())
         assert argv[0] == "virsh" and argv[3] == "event", argv
-        assert kwargs["env"]["LC_ALL"] == "C", "virsh run in the user's locale"
         assert not self.watchers, "virsh event was armed a second time"
         events, ending = self.event_script
         watcher = FakeEventStream(self, argv[4], events, ending, self.off_at_eof)
@@ -452,10 +473,25 @@ class LibvirtCase(FakeHome):
         patcher = mock.patch.object(
             self.box.agent,
             "ssh_agent_identities",
-            return_value=[(KEY_BLOB, "yolobox-operator")],
+            return_value=[(KEY_BLOB, "yolobox-operator"), (OTHER_BLOB, "yolobox-disk")],
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def kept_volume(self, gib, record="built"):
+        """A disk volume of `gib` GiB left from an earlier run, and this host's
+        record of building it (None: no record)."""
+        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+        self.host.capacity["yolobox-box.qcow2"] = gib << 30
+        if record is not None:
+            os.makedirs(self.box.instance_dir(), exist_ok=True)
+            Path(self.box.instance_dir(), "disk-volume").write_text(record + "\n")
+
+    def derived(self, passphrase):
+        """A passphrase source that derived `passphrase` earlier in the command."""
+        source = self.box.agent.PassphraseSource()
+        source.derived = bytearray(passphrase)
+        return source
 
     def dead_agent(self):
         """The real agent client, against a socket file nobody listens on:
@@ -684,7 +720,7 @@ class TestPortAllocation(LibvirtCase):
         )
         self.host.states["span"] = "shut off"
         with mock.patch.object(
-            self.box.libvirt, "loopback_port_bound", return_value=False
+            self.box.driver, "loopback_port_bound", return_value=False
         ):
             self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 6)
 
@@ -695,7 +731,7 @@ class TestPortAllocation(LibvirtCase):
             "yolobox-first", None
         )
         with mock.patch.object(
-            self.box.libvirt, "loopback_port_bound", return_value=False
+            self.box.driver, "loopback_port_bound", return_value=False
         ):
             self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT)
 
@@ -718,13 +754,13 @@ class TestPortAllocation(LibvirtCase):
         self.host.domains["foreign"] = self.FOREIGN
         self.host.tagged_domain("first", FIRST_PORT)
         with mock.patch.object(
-            self.box.libvirt, "loopback_port_bound", return_value=False
+            self.box.driver, "loopback_port_bound", return_value=False
         ):
             self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 1)
 
     def test_the_driver_skips_a_port_bound_on_the_host(self):
         with mock.patch.object(
-            self.box.libvirt,
+            self.box.driver,
             "loopback_port_bound",
             side_effect=lambda port: port == FIRST_PORT,
         ):
@@ -777,7 +813,7 @@ class TestYoPort(LibvirtCase):
         with (
             mock.patch.object(self.box.box.driver, "require_tool"),
             mock.patch.object(
-                self.box.libvirt, "loopback_port_bound", return_value=False
+                self.box.driver, "loopback_port_bound", return_value=False
             ),
             contextlib.redirect_stdout(stdout),
         ):
@@ -789,7 +825,7 @@ class TestYoPort(LibvirtCase):
     ):
         printed = self.run_main("port", "5173")
         self.assertEqual(printed, "127.0.0.1:%d\n" % FIRST_PORT)
-        forward = [call for call in self.host.calls if "forward" in call][0]
+        (forward,) = [call for call in self.host.calls if "-L" in call]
         self.assertEqual(forward[forward.index("-O") + 1], "forward")
         self.assertEqual(
             forward[forward.index("-L") + 1], "127.0.0.1:%d:127.0.0.1:5173" % FIRST_PORT
@@ -801,14 +837,14 @@ class TestYoPort(LibvirtCase):
         run = self.host.run
 
         def spy(argv, **kwargs):
-            if "forward" in argv:
+            if "-L" in argv:
                 held.append(self.lock_held())
             return run(argv, **kwargs)
 
         with (
             mock.patch.object(self.box.proc, "run", spy),
             mock.patch.object(
-                self.box.libvirt,
+                self.box.driver,
                 "loopback_port_bound",
                 side_effect=lambda port: held.append(self.lock_held()) or False,
             ),
@@ -951,7 +987,11 @@ def gawk_argv():
         return ["gawk"]
     if REAL_WHICH("nix"):
         return ["nix", "shell", "nixpkgs#gawk", "-c", "gawk"]
-    raise unittest.SkipTest("the initrd's key program needs gawk, or nix to fetch it")
+    require_tool(
+        ["gawk", "nix"],
+        have=False,
+        why="the initrd's key program needs gawk, or nix to fetch it",
+    )
 
 
 def initrd_awk_program():
@@ -1046,7 +1086,7 @@ class TestSshConfig(LibvirtCase):
 
     def test_the_initrd_probe_uses_the_agent_and_the_public_key(self):
         self.host.tagged_domain("box", 61234)
-        argv = self.box.initrd_ssh_argv("true", self.driver.ssh_facts())
+        argv = self.box.unlock.operator_argv("true", self.driver.ssh_facts())
         self.assertIn("IdentityAgent=%s" % self.driver.op_sock(), argv)
         self.assertEqual(
             argv[argv.index("-i") + 1],
@@ -1063,7 +1103,7 @@ class TestSshConfig(LibvirtCase):
         mac = load_yo("yo_mac_initrd")
         self.addCleanup(unload_yo, "yo_mac_initrd")
         with mock.patch.object(mac.box.driver, "ssh_port", return_value=60022):
-            argv = mac.initrd_ssh_argv("true", mac.box.driver.ssh_facts())
+            argv = mac.unlock.operator_argv("true", mac.box.driver.ssh_facts())
         self.assertIn("IdentityAgent=none", argv)
         self.assertTrue(argv[argv.index("-i") + 1].endswith(".lima/_config/user"))
 
@@ -1284,10 +1324,6 @@ class TestStatusAndSize(LibvirtCase):
     def refusal(self, memory_gib=None, disk_gib=None):
         return self.driver.creation_refusal(self.box.Size(memory_gib, disk_gib))
 
-    def finished_volume(self, gib):
-        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
-        self.host.capacity["yolobox-box.qcow2"] = gib << 30
-
     def test_any_valid_name_and_size_is_created_where_there_is_no_volume(self):
         self.assertIsNone(self.refusal())
         self.assertIsNone(self.refusal(memory_gib=24, disk_gib=250))
@@ -1394,7 +1430,7 @@ class TestStatusAndSize(LibvirtCase):
             self.refusal(memory_gib=24)
 
     def test_a_bigger_disk_than_the_kept_volume_is_refused_pointing_at_disk_grow(self):
-        self.finished_volume(100)
+        self.kept_volume(100)
         refusal = self.refusal(disk_gib=250)
         self.assertIn("100 GiB", refusal)
         self.assertIn("--disk 250", refusal)
@@ -1405,7 +1441,7 @@ class TestStatusAndSize(LibvirtCase):
     def test_a_smaller_disk_than_the_kept_volume_is_refused_since_a_disk_cannot_shrink(
         self,
     ):
-        self.finished_volume(250)
+        self.kept_volume(250)
         refusal = self.refusal(disk_gib=100)
         self.assertIn("a disk cannot shrink", refusal)
         self.assertIn(
@@ -1414,13 +1450,12 @@ class TestStatusAndSize(LibvirtCase):
         )
 
     def test_the_kept_volumes_own_size_or_memory_alone_is_created(self):
-        self.finished_volume(100)
+        self.kept_volume(100)
         self.assertIsNone(self.refusal(disk_gib=100))
         self.assertIsNone(self.refusal(memory_gib=24))
 
     def test_an_unfinished_volume_is_rebuilt_at_any_disk_size(self):
-        self.host.volumes["yolobox-box.qcow2"] = b""
-        self.host.capacity["yolobox-box.qcow2"] = 4096
+        self.kept_volume(100, record="building")
         self.assertIsNone(self.refusal(disk_gib=250))
 
     def test_the_disk_image_is_the_pool_volumes_allocation(self):
@@ -1453,11 +1488,11 @@ class TestStatusAndSize(LibvirtCase):
                 self.box.YoError, "only while the domain is shut off"
             ),
         ):
-            self.driver.grow_disk(200)
+            locked(self.box, self.driver.grow_disk, 200)
         self.assertEqual(self.host.calls_of("vol-resize"), [])
         self.host.states["yolobox-box"] = "shut off"
         with mock.patch.object(self.box.ui, "out"):
-            self.driver.grow_disk(200)
+            locked(self.box, self.driver.grow_disk, 200)
         self.assertEqual(
             self.host.calls_of("vol-resize")[0][3:],
             ["vol-resize", "--pool", "default", "yolobox-box.qcow2", "200G"],
@@ -1485,7 +1520,7 @@ class TestOwnDomain(LibvirtCase):
                 for look in (
                     self.driver.vm_status,
                     self.driver.ssh_port,
-                    self.driver.stop,
+                    lambda: locked(self.box, self.driver.stop),
                     self.driver.removals,
                 ):
                     with self.assertRaises(self.box.YoError) as caught:
@@ -1514,7 +1549,15 @@ class TestKeepalive(LibvirtCase):
         self.assertEqual(self.pid("Master running (pid=4242)\r\n"), 4242)
 
     def test_no_master_means_no_pid(self):
+        self.host.master_running = False
         self.assertIsNone(self.pid("Control socket connect(/x): No such file\n"))
+
+    def test_an_answer_with_no_pid_and_no_missing_socket_is_an_error_showing_it(self):
+        for running, output in ((True, "lizard\n"), (False, "Bad option: lizard\n")):
+            with self.subTest(running=running):
+                self.host.master_running = running
+                with self.assertRaisesRegex(self.box.YoError, "lizard"):
+                    self.pid(output)
 
     def test_a_pid_that_would_hit_init_is_not_a_pid(self):
         self.assertIsNone(self.pid("Master running (pid=1)\n"))
@@ -1592,7 +1635,7 @@ class TestStop(LibvirtCase):
 
     def stop(self, events=(), ending="hang"):
         self.host.event_script = (list(events), ending)
-        self.driver.stop()
+        locked(self.box, self.driver.stop)
 
     def test_the_watcher_is_armed_once_before_the_shutdown_is_asked_for(self):
         self.stop(["shut off"])
@@ -1695,7 +1738,7 @@ class TestStop(LibvirtCase):
         # the host: free space and resume, never a power cut.
         self.host.states["yolobox-box"] = "paused"
         with self.assertRaises(self.box.YoError) as caught:
-            self.driver.stop()
+            locked(self.box, self.driver.stop)
         message = caught.exception.message
         self.assertIn("host's disk is full", message)
         self.assertIn("domblkerror yolobox-box", message)
@@ -1754,7 +1797,7 @@ class TestStop(LibvirtCase):
             with self.subTest(state=state):
                 self.host.states["yolobox-box"] = state
                 with self.assertRaises(self.box.YoError) as caught:
-                    self.driver.stop()
+                    locked(self.box, self.driver.stop)
                 self.assertNotIn("destroy", caught.exception.message)
                 self.assertNotIn(self.force_stop_command(), caught.exception.message)
 
@@ -1765,7 +1808,7 @@ class TestStop(LibvirtCase):
             with self.subTest(state=state):
                 self.host.states["yolobox-box"] = state
                 with self.assertRaises(self.box.YoError) as caught:
-                    self.driver.stop()
+                    locked(self.box, self.driver.stop)
                 message = caught.exception.message
                 self.assertIn("does not know how to leave that state", message)
                 self.assertIn(
@@ -1794,7 +1837,7 @@ class TestStop(LibvirtCase):
     def test_a_domain_that_does_not_exist_is_an_error(self):
         del self.host.domains["yolobox-box"]
         with self.assertRaisesRegex(self.box.YoError, "does not exist"):
-            self.driver.stop()
+            locked(self.box, self.driver.stop)
 
 
 class TestUpWithASize(LibvirtCase):
@@ -1815,8 +1858,7 @@ class TestUpWithASize(LibvirtCase):
     def test_a_disk_the_kept_volume_does_not_have_is_refused_before_the_passphrase(
         self,
     ):
-        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
-        self.host.capacity["yolobox-box.qcow2"] = 100 << 30
+        self.kept_volume(100)
         refusal = self.up("--disk", "250")
         self.assertIn("finished 100 GiB disk", refusal)
         self.assertIn("--disk 250", refusal)
@@ -1845,7 +1887,9 @@ class TestDown(LibvirtCase):
     def down(self, stage, ask_pending=True):
         self.host.event_script = (["shut off"], "hang")
         with (
-            mock.patch.object(self.box.unlock, "boot_stage", return_value=stage),
+            mock.patch.object(
+                self.box.unlock, "boot_stage", return_value=self.box.Stage(stage, "")
+            ),
             mock.patch.object(
                 self.box.unlock, "initrd_ask_pending", return_value=ask_pending
             ),
@@ -1921,7 +1965,7 @@ class TestDestroy(LibvirtCase):
         ]
         self.instance_dir = Path(self.box.state.instance_dir())
         (self.instance_dir / "operator.pub").write_text(PUBLIC_KEY)
-        self.lock_file = Path(self.box.state.state_dir()) / "box.unlock.lock"
+        self.lock_file = Path(self.box.state.state_dir()) / "box.box.lock"
         self.lines = []
         for patcher in (
             mock.patch.object(self.box.ui, "out", side_effect=self.lines.append),
@@ -1955,9 +1999,7 @@ class TestDestroy(LibvirtCase):
     def test_yes_removes_every_piece_of_a_running_box_and_only_that_box(self):
         def assert_lock_held_while_it_mutates(argv, **kwargs):
             if argv[0] == "virsh" and argv[3] not in READS:
-                with self.assertRaises(self.box.LockBusy):
-                    with self.box.state.unlock_lock(wait=False):
-                        pass
+                self.assertTrue(box_lock_is_held(self.box.state))
             return self.host.run(argv, **kwargs)
 
         with mock.patch.object(
@@ -1988,6 +2030,25 @@ class TestDestroy(LibvirtCase):
         )
         self.assertLess(agent_exit, first_virsh_change)
 
+    def test_the_boxs_broker_stops_while_its_master_and_directory_are_there(self):
+        # The broker watches the operator's master: closed first, the broker
+        # would end by itself and unlink its sockets while the directory goes.
+        seen = []
+
+        def stop(pid):
+            seen.append((pid, self.host.master_running, self.instance_dir.exists()))
+
+        self.host.master_running = True
+        with (
+            mock.patch.object(
+                self.box.aws, "aws_broker_health", return_value={"pid": 77}
+            ),
+            mock.patch.object(self.box.aws, "stop_broker", side_effect=stop),
+        ):
+            self.destroy(yes=True)
+        self.assertEqual(seen, [(77, True, True)])
+        self.assertFalse(self.instance_dir.exists())
+
     def test_a_box_that_is_already_off_is_not_powered_off_again(self):
         self.host.states["yolobox-box"] = "shut off"
         self.destroy(yes=True)
@@ -1999,7 +2060,7 @@ class TestDestroy(LibvirtCase):
         # start the box that was off, and undefining it running leaves qemu on a
         # deleted volume.
         self.host.states["yolobox-box"] = "shut off"
-        take_the_lock = self.box.state.unlock_lock
+        take_the_lock = self.box.state.box_lock
 
         @contextlib.contextmanager
         def lock_after_a_yo_up_started_the_box(wait):
@@ -2008,7 +2069,7 @@ class TestDestroy(LibvirtCase):
                 yield held
 
         with mock.patch.object(
-            self.box.state, "unlock_lock", lock_after_a_yo_up_started_the_box
+            self.box.state, "box_lock", lock_after_a_yo_up_started_the_box
         ):
             self.destroy(yes=True)
         self.assertEqual(self.mutations()[:2], ["destroy", "undefine"])
@@ -2024,7 +2085,7 @@ class TestDestroy(LibvirtCase):
         self.host.states["yolobox-box"] = "running"
         self.host.calls.clear()
         undefine = next(step for step in steps if step.what.startswith("undefine"))
-        undefine.remove()
+        locked(self.box, undefine.remove)
         self.assertEqual(self.mutations(), ["destroy", "undefine"])
         self.assertNotIn("yolobox-box", self.host.domains)
 
@@ -2054,7 +2115,7 @@ class TestDestroy(LibvirtCase):
             with self.subTest(piece=piece):
                 self.assertIn(piece, listing)
         self.assertNotIn("yolobox-other", listing)
-        self.assertNotIn("unlock.lock", listing)
+        self.assertNotIn("box.lock", listing)
         self.assertIn("yo -m box destroy --yes", self.lines[-1])
 
     def test_a_box_with_nothing_left_has_nothing_to_destroy(self):
@@ -2068,7 +2129,7 @@ class TestDestroy(LibvirtCase):
         self.assert_the_other_machine_is_untouched()
 
     def test_the_lock_file_stays_so_a_waiting_yo_and_the_next_one_share_it(self):
-        with self.box.state.unlock_lock(wait=True):
+        with self.box.state.box_lock(wait=True):
             pass
         waiting_yo = os.open(self.lock_file, os.O_RDWR)
         self.addCleanup(os.close, waiting_yo)
@@ -2106,18 +2167,18 @@ class TestDestroy(LibvirtCase):
         ):
             self.destroy(yes=True)
 
-    def test_a_box_another_yo_is_unlocking_is_not_destroyed(self):
-        with self.box.state.unlock_lock(wait=True):
+    def test_a_box_another_yo_is_acting_on_is_not_destroyed(self):
+        with box_lock_held_elsewhere(self.box.state):
             with self.assertRaisesRegex(
-                self.box.YoError, "another yo is unlocking box"
+                self.box.YoError, "another yo is acting on box"
             ):
                 self.destroy(yes=True)
         self.assertLessEqual(set(self.host.subcommands()), READS)
         self.assertIn("yolobox-box", self.host.domains)
         self.assertTrue(self.instance_dir.exists())
 
-    def test_the_listing_does_not_wait_for_an_unlocking_yo(self):
-        with self.box.state.unlock_lock(wait=True):
+    def test_the_listing_does_not_wait_for_a_yo_acting_on_the_box(self):
+        with box_lock_held_elsewhere(self.box.state):
             self.destroy(yes=False)
         self.assertIn("yo -m box destroy --yes", self.lines[-1])
 
@@ -2147,7 +2208,7 @@ class TestADeadAgent(LibvirtCase):
                 return_value="SSH-2.0-OpenSSH_10.6 " + self.box.STAGE2_SSH_BANNER_MARK,
             ),
             mock.patch.object(
-                self.box.libvirt, "loopback_port_bound", return_value=False
+                self.box.driver, "loopback_port_bound", return_value=False
             ),
         ):
             patcher.start()
@@ -2191,11 +2252,13 @@ class TestADeadAgent(LibvirtCase):
         self.assertIn("yo -m box destroy --yes", self.lines[-1])
 
     def test_down_refuses_an_sshd_it_cannot_identify_and_names_the_login(self):
-        # An unmarked banner and both logins refused: an initrd, maybe encrypting
-        # the disk, or a stage 2. Neither stop is safe on an initrd.
+        # The initrd's banner and root refused: yo cannot look inside, and the
+        # initrd may be encrypting the disk, so neither stop is safe.
         self.host.states["yolobox-box"] = "running"
         with mock.patch.object(
-            self.box.unlock, "ssh_banner", return_value="SSH-2.0-OpenSSH_10.6"
+            self.box.unlock,
+            "ssh_banner",
+            return_value="SSH-2.0-OpenSSH_10.6 " + INITRD_SSH_BANNER_MARK,
         ):
             with self.assertRaises(self.box.YoError) as caught:
                 self.box.main(["-m", "box", "down"])
@@ -2212,7 +2275,12 @@ class TestADeadAgent(LibvirtCase):
         # bootstrap's second vm_up: the box stopped, the passphrase in hand.
         self.host.states["yolobox-box"] = "shut off"
         with self.assertRaises(self.box.YoError) as caught:
-            self.box.vm_up(run_services=False, passphrase=b"cached")
+            locked(
+                self.box,
+                self.box.vm_up,
+                run_services=False,
+                passphrase=self.derived(b"cached"),
+            )
         self.assertTrue(
             caught.exception.message.startswith(self.dead()), caught.exception.message
         )
@@ -2223,8 +2291,12 @@ class TestADeadAgent(LibvirtCase):
         with self.assertRaises(self.box.YoError) as caught:
             self.box.main(["-m", "box", "status"])
         self.assertEqual(caught.exception.code, 1)
+        # The operator's refused login is shown in ssh's own words.
         self.assertEqual(
-            self.lines[0], "vm: unreachable — is it up? start it with: yo -m box up"
+            self.lines[0],
+            "vm: unreachable (its sshd did not let the operator in; ssh said: "
+            "Connection closed by authenticating user op 127.0.0.1 port 1 "
+            "[preauth]) — is it up? start it with: yo -m box up",
         )
         self.assertTrue(
             any(line.startswith("aws: ") for line in self.lines), self.lines
@@ -2239,7 +2311,7 @@ class TestADeadAgent(LibvirtCase):
         ):
             self.box.main(["-m", "box", "ssh"])
         (warning,) = errors
-        self.assertIn("the 1Password and AWS forwards are not up", warning)
+        self.assertIn("box does not take the operator's login", warning)
         self.assertIn(self.REFUSED, warning)
         self.assertEqual(self.host.forwarded, [])
         (argv,), _ = exec_ssh.call_args
@@ -2249,10 +2321,9 @@ class TestADeadAgent(LibvirtCase):
         self.box.main(["-m", "box", "port", "5173"])
         self.assertEqual(len(self.lines), 1)
         self.assertRegex(self.lines[0], r"^127\.0\.0\.1:\d+$")
-        self.assertEqual(len(self.host.forwarded), 1)
+        (port_forward,) = [argv for argv in self.host.forwarded if "-L" in argv]
         self.assertIn(
-            "127.0.0.1:%s:127.0.0.1:5173" % self.lines[0].split(":")[1],
-            self.host.forwarded[0],
+            "127.0.0.1:%s:127.0.0.1:5173" % self.lines[0].split(":")[1], port_forward
         )
 
     def test_port_without_a_master_reports_what_ssh_said(self):
@@ -2268,16 +2339,18 @@ class TestAnInitrdThatNeverAnswersPointsAtWhatTheHostShows(LibvirtCase):
         # virsh console keeps no history and the initrd writes to tty0, so
         # it would show nothing; the domain state and the cidata disk do.
         self.host.tagged_domain("box", FIRST_PORT)
-        text = self.box.unlock.initrd_timeout_error(False).message
-        self.assertIn("never offered its initrd sshd", text)
+        last = self.box.unlock.Round("no banner", self.box.unlock.where_to_look())
+        text = self.box.unlock.initrd_timeout_error(last).message
+        self.assertIn("did not let the operator in", text)
         self.assertIn("virsh -c qemu:///system domstate --reason yolobox-box", text)
         self.assertIn("yolobox-box-cidata.iso", text)
         self.assertNotIn("console", text)
 
 
 class TestAnSshdYoCannotIdentify(LibvirtCase):
-    """The key is on offer, yet an unmarked sshd refused the operator and root:
-    yo cannot tell an initrd from a stage 2, so it neither starts nor stops."""
+    """The key is on offer, yet the initrd's sshd refused root: yo cannot tell
+    an initrd waiting for its passphrase from one encrypting the disk, so it
+    neither starts nor stops."""
 
     def setUp(self):
         super().setUp()
@@ -2286,7 +2359,9 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
         for patcher in (
             mock.patch.object(self.box.proc, "spawn", self.host.spawn),
             mock.patch.object(
-                self.box.unlock, "ssh_banner", return_value="SSH-2.0-OpenSSH_10.6"
+                self.box.unlock,
+                "ssh_banner",
+                return_value="SSH-2.0-OpenSSH_10.6 " + INITRD_SSH_BANNER_MARK,
             ),
         ):
             patcher.start()
@@ -2306,22 +2381,26 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
     def test_the_unknown_text_names_no_force(self):
         # A listed key may not sign, and root's probe may only have timed out:
         # the initrd may be encrypting whatever the login state says.
-        self.assert_names_the_way_out(self.box.unlock.unknown_stage_message())
+        self.assert_names_the_way_out(
+            self.box.unlock.unknown_stage_message(
+                self.box.Stage(self.box.BootStage.UNKNOWN, "")
+            )
+        )
 
     def test_down_refuses_names_the_way_out_and_stops_nothing(self):
         with self.assertRaises(self.box.YoError) as caught:
             self.box.cmd_down(None)
-        self.assertIn("not stopping it: an sshd answers", caught.exception.message)
+        self.assertIn(
+            "not stopping it: the initrd's sshd answers", caught.exception.message
+        )
         self.assert_names_the_way_out(caught.exception.message)
         self.assertNotIn("shutdown", self.host.subcommands())
         self.assertNotIn("destroy", self.host.subcommands())
 
     def test_up_refuses_instead_of_taking_it_for_stage2(self):
         with self.assertRaises(self.box.YoError) as caught:
-            self.box.vm_up(passphrase=b"cached")
-        self.assertIn(
-            "refused both the operator's key and root's", caught.exception.message
-        )
+            locked(self.box, self.box.vm_up, passphrase=self.derived(b"cached"))
+        self.assertIn("refused root's key", caught.exception.message)
         self.assert_names_the_way_out(caught.exception.message)
 
     def test_status_names_the_way_out_and_runs_no_pinned_probe(self):
@@ -2335,7 +2414,7 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
         self.assertEqual(caught.exception.code, 1)
         vm_lines = [line for line in lines if line.startswith("vm: ")]
         self.assertEqual(len(vm_lines), 1, lines)
-        self.assertIn("an sshd answers", vm_lines[0])
+        self.assertIn("the initrd's sshd answers", vm_lines[0])
         self.assert_names_the_way_out(vm_lines[0])
         self.assertNotIn("start it with", vm_lines[0])
         # Only the unpinned boot-stage probes ran; the pinned agent probe, which
@@ -2349,8 +2428,8 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
 
 
 class TestEnsureSession(LibvirtCase):
-    """`yo port` rides the operator's master: one that answers -O check is
-    taken as it is, and without one a login opens it and carries the forwards."""
+    """`yo port` rides the operator's master, and both reverse forwards are
+    asked for first, whether a master answered or a login opened one."""
 
     def setUp(self):
         super().setUp()
@@ -2363,7 +2442,7 @@ class TestEnsureSession(LibvirtCase):
             mock.patch.object(self.box.box.driver, "require_tool"),
             mock.patch.object(self.box.ui, "out", lines.append),
             mock.patch.object(
-                self.box.libvirt, "loopback_port_bound", return_value=False
+                self.box.driver, "loopback_port_bound", return_value=False
             ),
         ):
             self.box.main(["-m", "box", "port", "5173"])
@@ -2375,46 +2454,53 @@ class TestEnsureSession(LibvirtCase):
             argv[argv.index("-R") + 1] for argv in self.host.forwarded if "-R" in argv
         ]
 
-    def test_a_master_that_answers_carries_the_port_and_is_not_touched(self):
-        printed = self.port()
-        host_port = printed.split(":")[1]
-        self.assertEqual(len(self.host.forwarded), 1)
-        self.assertIn("127.0.0.1:%s:127.0.0.1:5173" % host_port, self.host.forwarded[0])
-        self.assertEqual([argv for argv in self.host.calls if "exit" in argv], [])
-
-    def test_a_master_whose_connection_died_is_not_judged_and_the_forward_reports_it(
-        self,
-    ):
-        # -O check answers, so nothing is torn down: the forward fails with
-        # ssh's own words, and `yo up` is the repair.
-        self.host.master_session = (255, "Connection to lima-box closed")
-        with self.assertRaisesRegex(self.box.YoError, "mux_client_forward"):
-            self.port()
-        self.assertEqual([argv for argv in self.host.calls if "exit" in argv], [])
-
-    def test_with_no_master_a_login_opens_one_with_both_reverse_forwards(self):
-        self.host.master_running = False
-        printed = self.port()
-        host_port = printed.split(":")[1]
-        self.assertTrue(self.host.master_running)
+    def assert_forwarded_whole(self, printed):
         self.assertEqual(
             self.reverse_forwards(),
             [
                 "%s:%s" % (self.box.OP_GUEST_SOCK, self.driver.op_sock()),
                 "%s:%s"
-                % (self.box.AWS_BROKER_GUEST_SOCK, self.box.aws.aws_broker_sock()),
+                % (self.box.AWS_BROKER_GUEST_SOCK, self.box.state.aws_broker_sock()),
             ],
         )
         self.assertIn(
-            "127.0.0.1:%s:127.0.0.1:5173" % host_port, self.host.forwarded[-1]
+            "127.0.0.1:%s:127.0.0.1:5173" % printed.split(":")[1],
+            self.host.forwarded[-1],
         )
-        opener = [
+
+    def test_a_master_that_answers_still_gets_both_reverse_forwards(self):
+        # It may be a master git or an editor opened, which carries none.
+        self.assert_forwarded_whole(self.port())
+        self.assertEqual([argv for argv in self.host.calls if "exit" in argv], [])
+
+    def test_a_master_whose_connection_died_fails_with_ssh_s_words(self):
+        self.host.master_session = (255, "Connection to lima-box closed")
+        with self.assertRaisesRegex(self.box.YoError, "Connection to lima-box closed"):
+            self.port()
+        self.assertEqual([argv for argv in self.host.calls if "exit" in argv], [])
+
+    def test_a_session_command_logs_in_over_the_masters_alone(self):
+        # Every session command declares the services; on libvirt each fresh
+        # login is a 1Password signature, so all of it rides the masters.
+        self.host.master_running = False
+        with (
+            mock.patch.object(self.box.box.driver, "require_tool"),
+            mock.patch.object(self.box.proc, "exec_process"),
+            mock.patch.object(self.box.ui, "err"),
+        ):
+            self.box.main(["-m", "box", "ssh"])
+        fresh = [
             argv
             for argv in self.host.calls
-            if argv[0] == "ssh" and "-O" not in argv and "ControlPath=none" not in argv
+            if argv[0] == "ssh" and "ControlPath=none" in argv
         ]
-        self.assertEqual(len(opener), 1)
-        self.assertIn(self.box.OP_GUEST_SOCK, opener[0][-1])
+        self.assertEqual(fresh, [])
+        self.assertEqual(len(self.reverse_forwards()), 2)
+
+    def test_with_no_master_a_login_opens_one_with_both_reverse_forwards(self):
+        self.host.master_running = False
+        self.assert_forwarded_whole(self.port())
+        self.assertTrue(self.host.master_running)
 
 
 class TestDefinition(LibvirtCase):
@@ -2443,7 +2529,7 @@ class TestDefinition(LibvirtCase):
             self.addCleanup(patcher.stop)
 
     def start(self):
-        self.driver.start(b"pass", None)
+        locked(self.box, self.driver.start, lambda: b"pass")
 
     def test_a_stopped_domain_is_defined_again_from_the_template_on_up(self):
         self.start()
@@ -2508,14 +2594,18 @@ class TestVmUpRefusesSizeFlagsOnAnExistingBox(LibvirtCase):
             stack.enter_context(mock.patch.object(self.box.ui, "out"))
             for target, name in (
                 (self.box.agent, "luks_passphrase"),
+                (self.box.agent, "luks_key"),
                 (self.driver, "start"),
                 (self.box.sshconfig, "write_ssh_config"),
                 (self.box.guest, "ensure_guest_known_hosts"),
                 (self.box.forwards, "vm_services"),
+                (self.box.sshx, "bootstrapped"),
+                (self.box.sshx, "broken_agent_login"),
             ):
                 stubs[name] = stack.enter_context(mock.patch.object(target, name))
+            stubs["broken_agent_login"].return_value = None
             try:
-                self.box.vm_up(size=size)
+                locked(self.box, self.box.vm_up, size=size)
             except self.box.YoError as failure:
                 return failure, stubs
         return None, stubs
@@ -2544,12 +2634,54 @@ class TestVmUpRefusesSizeFlagsOnAnExistingBox(LibvirtCase):
                     self.assertEqual(self.writes(), [])
                     self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 100 << 30)
 
+    def test_the_printed_recreate_remedy_runs_and_leads_out_of_the_refusal(self):
+        # The remedy is pasted as printed: each command of the chain is run
+        # through yo's own parser, against this host, from the refusing state.
+        size = self.box.Size(24, 250, 2)
+        error, _ = self.vm_up(size)
+        chain = error.message.split("which deletes everything on it: ", 1)[1]
+        chain = chain.split(". A disk grows in place", 1)[0]
+        destroy, bootstrap = [shlex.split(c) for c in chain.split(" && ")]
+        self.assertEqual(destroy[0], "yo")
+        with (
+            mock.patch.object(self.box.ui, "out"),
+            mock.patch.object(self.box.box.driver, "require_tool"),
+        ):
+            self.box.main(destroy[1:])
+        self.assertNotIn("yolobox-box", self.host.domains)
+        parsed = self.box.build_parser().parse_args(bootstrap[3:])
+        self.assertEqual(self.box.asked_size(parsed), size)
+        status, new_box = self.box.vm.preflight(self.box.asked_size(parsed))
+        self.assertIsNone(status)
+        self.assertEqual((new_box.memory_gib, new_box.disk_gib), (24, 250))
+
+    def test_a_passt_directory_the_vm_user_cannot_write_in_refuses_before_any_change(
+        self,
+    ):
+        # A refusal after the cidata sync or the definition would leave a host
+        # changed for a box that never started.
+        self.host.acl = getfacl_listing(mask="r-x")
+        for domain in ("defined", "missing"):
+            with self.subTest(domain=domain):
+                if domain == "missing":
+                    self.host.domains.clear()
+                    self.host.states.clear()
+                error, stubs = self.vm_up(self.box.NO_SIZE)
+                self.assertIn("sudo setfacl -m u:yolobox-vm", error.message)
+                stubs["luks_key"].assert_not_called()
+                stubs["start"].assert_not_called()
+                self.assertEqual(self.writes(), [])
+
     def test_a_box_asked_for_nothing_is_started_as_it_is(self):
         error, stubs = self.vm_up(self.box.NO_SIZE)
         self.assertIsNone(error)
-        stubs["start"].assert_called_once_with(
-            stubs["luks_passphrase"].return_value, None
-        )
+        ((held, source), _) = stubs["start"].call_args
+        self.assertIsInstance(held, self.box.state.HeldBox)
+        self.assertIsInstance(source, self.box.agent.PassphraseSource)
+        # The key is listed before the start; it is derived only when an
+        # initrd asks.
+        stubs["luks_key"].assert_called_once_with(self.driver.op_sock())
+        stubs["luks_passphrase"].assert_not_called()
 
 
 class TestVmUpCreatesAtTheAskedSize(LibvirtCase):
@@ -2558,36 +2690,40 @@ class TestVmUpCreatesAtTheAskedSize(LibvirtCase):
             mock.patch.object(self.driver, "require_tool"),
             mock.patch.object(self.box.os, "cpu_count", return_value=host_cpus),
             mock.patch.object(self.box.agent, "luks_passphrase") as passphrase,
-            mock.patch.object(self.driver, "start") as start,
+            mock.patch.object(self.driver, "create") as create,
+            mock.patch.object(self.driver, "start"),
         ):
             try:
                 self.box.main(["-m", "box", "up", *flags])
             except self.box.YoError as failure:
-                return failure, passphrase, start
-        return None, passphrase, start
+                return failure, passphrase, create
+        return None, passphrase, create
 
     def test_all_three_flags_reach_the_creation(self):
         with (
             mock.patch.object(self.box.sshconfig, "write_ssh_config"),
             mock.patch.object(self.box.guest, "ensure_guest_known_hosts"),
             mock.patch.object(self.box.forwards, "vm_services"),
+            mock.patch.object(self.box.sshx, "bootstrapped", return_value=False),
+            mock.patch.object(self.box.ui, "err") as err,
         ):
-            error, passphrase, start = self.up(
+            error, passphrase, create = self.up(
                 16, "--memory", "24", "--disk", "250", "--cpus", "3"
             )
         self.assertIsNone(error)
+        err.assert_called_once_with("yo: " + self.box.sshx.not_bootstrapped_message())
         self.assertEqual(self.host.calls_of("vol-resize"), [])
-        start.assert_called_once_with(
-            passphrase.return_value, self.box.NewBox(24, 250, 3)
-        )
+        create.assert_called_once_with(mock.ANY, self.box.NewBox(24, 250, 3))
+        # A new box is the plaintext seed: 1Password is not asked for its disk.
+        passphrase.assert_not_called()
 
     def test_a_host_that_cannot_give_a_default_creates_nothing(self):
         for host in (1, None):
             with self.subTest(host=host):
-                error, passphrase, start = self.up(host)
+                error, passphrase, create = self.up(host)
                 self.assertIn("CPU", error.message)
                 passphrase.assert_not_called()
-                start.assert_not_called()
+                create.assert_not_called()
 
 
 SS_LINE = (
@@ -2608,11 +2744,20 @@ class TestInitrdListener(LibvirtCase):
         )
         self.assertEqual(self.box.listener_uids(""), [])
 
-    def test_a_line_without_an_owner_is_a_root_listener_and_so_a_stranger(self):
-        line = "LISTEN 0 4096 127.0.0.1:61000 0.0.0.0:*"
+    def test_a_line_with_its_details_and_no_owner_is_a_root_listener_and_a_stranger(
+        self,
+    ):
+        # ss prints uid: only for an owner that is not root; ino: always.
+        line = "LISTEN 0 4096 127.0.0.1:61000 0.0.0.0:* ino:4242 sk:1 <->"
         self.assertEqual(self.box.listener_uids(line + "\n"), [0])
         with self.assertRaisesRegex(self.box.YoError, "uid 0"):
             self.verify(line)
+
+    def test_a_line_without_its_details_is_an_error_showing_it(self):
+        for line in ("LISTEN 0 4096 127.0.0.1:61000 0.0.0.0:*", "lizard"):
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(self.box.YoError, "no ino:.*" + line[:6]):
+                    self.box.listener_uids(line + "\n")
 
     def test_the_vm_accounts_own_listener_is_trusted(self):
         self.verify(SS_LINE % VM_UID)
@@ -2634,42 +2779,52 @@ class TestInitrdListener(LibvirtCase):
         with self.assertRaisesRegex(self.box.YoError, "held by uid 1000"):
             self.verify(SS_LINE % VM_UID, SS_LINE % 1000)
 
-    def test_the_passphrase_is_not_sent_when_the_listener_is_a_strangers(self):
+    def send_passphrase(self, passphrase=lambda: b"secret"):
+        """The initrd's gate, then its helper with `passphrase`, as unlock_disk
+        runs them; whether ssh was started for the helper."""
+
+        def gate_then_helper(held):
+            gate = self.box.unlock.initrd_endpoint(held)
+            self.box.run_initrd_helper(gate, passphrase)
+
         self.host.tagged_domain("box", 61000)
-        self.host.listeners = SS_LINE % 1000 + "\n"
         with mock.patch.object(
             self.box.subprocess, "Popen", side_effect=FileNotFoundError
         ) as popen:
             with self.assertRaises(self.box.YoError) as caught:
-                self.box.run_initrd_helper(b"secret")
-        popen.assert_not_called()
-        self.assertIn("not sent there", caught.exception.message)
+                locked(self.box, gate_then_helper)
+        return popen.called, caught.exception.message
+
+    def test_the_passphrase_is_not_sent_when_the_listener_is_a_strangers(self):
+        self.host.listeners = SS_LINE % 1000 + "\n"
+        started, message = self.send_passphrase()
+        self.assertFalse(started)
+        self.assertIn("not sent there", message)
+
+    def test_a_stranger_that_takes_the_port_after_the_gate_gets_no_session(self):
+        # Nothing held the port at the gate, which is fine there; the check
+        # right before ssh dials sees who took it since.
+        self.host.listeners = ""
+
+        def passphrase():
+            self.host.listeners = SS_LINE % 1000 + "\n"
+            return b"secret"
+
+        started, message = self.send_passphrase(passphrase)
+        self.assertFalse(started)
+        self.assertIn("held by uid 1000", message)
 
     def test_the_vm_accounts_listener_lets_the_helper_run(self):
-        self.host.tagged_domain("box", 61000)
         self.host.listeners = SS_LINE % VM_UID + "\n"
-        with mock.patch.object(
-            self.box.subprocess, "Popen", side_effect=FileNotFoundError
-        ) as popen:
-            with self.assertRaises(self.box.YoError) as caught:
-                self.box.run_initrd_helper(b"secret")
-        popen.assert_called_once()
-        self.assertIn("ssh not found", caught.exception.message)
-
-    def test_lima_asks_no_process_and_refuses_only_a_port_lima_mirrors(self):
-        mac = load_yo("yo_mac_listener")
-        self.addCleanup(unload_yo, "yo_mac_listener")
-        with mock.patch.object(mac.proc, "run") as run:
-            mac.box.driver.verify_initrd_listener(60022)
-            with self.assertRaisesRegex(mac.YoError, "ssh.localPort 22222"):
-                mac.box.driver.verify_initrd_listener(22222)
-        run.assert_not_called()
+        started, message = self.send_passphrase()
+        self.assertTrue(started)
+        self.assertIn("ssh not found", message)
 
 
 class TestStart(LibvirtCase):
     def start(self, memory_gib=None, disk_gib=None, cpus=None, existing=False):
-        """driver.start() of the flags as vm_up decides a creation size from
-        them, or of an existing domain."""
+        """driver.create() of the flags as vm_up decides a creation size from
+        them (unless the domain exists), then driver.start()."""
         seed = Path(self.home) / "seed.qcow2"
         seed.write_bytes(b"Q" * 4096)
         with (
@@ -2681,16 +2836,20 @@ class TestStart(LibvirtCase):
             mock.patch.object(self.box.unlock, "unlock_disk") as unlock,
             mock.patch.object(self.box.unlock, "wait_for_operator"),
             mock.patch.object(
-                self.box.libvirt, "loopback_port_bound", return_value=False
+                self.box.driver, "loopback_port_bound", return_value=False
             ),
         ):
-            new_box = (
-                None
-                if existing
-                else self.box.Size(memory_gib, disk_gib, cpus).for_creation()
-            )
-            self.driver.start(b"pass", new_box)
+            if not existing:
+                locked(
+                    self.box,
+                    self.driver.create,
+                    self.box.Size(memory_gib, disk_gib, cpus).for_creation(),
+                )
+            locked(self.box, self.driver.start, self.passphrase)
         return unlock
+
+    def passphrase(self):
+        return b"pass"
 
     def test_a_new_instance_gets_its_volumes_then_its_domain_then_starts(self):
         unlock = self.start()
@@ -2701,6 +2860,8 @@ class TestStart(LibvirtCase):
             "vol-resize",
             "vol-create-as",
             "vol-upload",
+            "define",
+            # start() defines the stopped domain from the template again.
             "define",
             "start",
         ]
@@ -2717,7 +2878,8 @@ class TestStart(LibvirtCase):
         self.assertEqual(
             set(self.host.volumes), {"yolobox-box.qcow2", "yolobox-box-cidata.iso"}
         )
-        unlock.assert_called_once_with(b"pass")
+        # The unlock gets the source, which derives only if an initrd asks.
+        unlock.assert_called_once_with(mock.ANY, self.passphrase)
 
     def memory(self):
         """The <memory> of the defined domain, as (unit, value)."""
@@ -2753,7 +2915,7 @@ class TestStart(LibvirtCase):
             with self.subTest(host=host):
                 with mock.patch.object(self.box.os, "cpu_count", return_value=host):
                     unlock = self.start(existing=True)
-                unlock.assert_called_once_with(b"pass")
+                unlock.assert_called_once_with(mock.ANY, self.passphrase)
                 self.assertNotIn("yolobox-box.qcow2", self.host.volumes)
 
     def test_a_box_is_created_with_the_cpus_asked_for(self):
@@ -2768,12 +2930,6 @@ class TestStart(LibvirtCase):
                 with mock.patch.object(self.box.os, "cpu_count", return_value=host):
                     self.start()
                 self.assertEqual(self.vcpus(), expected)
-
-    def test_a_passt_directory_the_vm_user_cannot_write_in_refuses_the_start(self):
-        self.host.acl = getfacl_listing(mask="r-x")
-        with self.assertRaisesRegex(self.box.YoError, "sudo setfacl -m u:yolobox-vm"):
-            self.start()
-        self.assertNotIn("start", self.host.subcommands())
 
     BIND_DENIED = (
         "error: Failed to start domain 'yolobox-box'\nerror: internal error: "
@@ -2791,19 +2947,11 @@ class TestStart(LibvirtCase):
         self.assertEqual(self.host.states["yolobox-box"], "running")
 
     def test_a_passt_that_could_not_bind_with_the_acl_still_short_is_the_remedy(self):
+        # The ACL was whole when vm_up judged the host; another passt domain's
+        # start narrowed it since.
         self.host.fail_once["start"] = self.BIND_DENIED
-        acl = [getfacl_listing(), getfacl_listing(mask="r-x")]
-        run = self.host.run
-
-        def acl_changes_under_yo(argv, **kwargs):
-            if argv[0] == "getfacl":
-                self.host.acl = acl.pop(0)
-            return run(argv, **kwargs)
-
-        with (
-            mock.patch.object(self.box.proc, "run", acl_changes_under_yo),
-            self.assertRaisesRegex(self.box.YoError, "sudo setfacl -m u:yolobox-vm"),
-        ):
+        self.host.acl = getfacl_listing(mask="r-x")
+        with self.assertRaisesRegex(self.box.YoError, "sudo setfacl -m u:yolobox-vm"):
             self.start()
         self.assertEqual(len(self.host.calls_of("start")), 1)
 
@@ -2839,7 +2987,9 @@ class TestStart(LibvirtCase):
 
         with mock.patch.object(self.driver, "allocate_host_port", spy_allocate):
             self.start()
-        self.assertEqual(held, [True, True])
+        # The first define is the creation's, under the lock; start() defines
+        # the stopped domain again from its record, which needs no lock.
+        self.assertEqual(held, [True, True, False])
         self.assertFalse(self.lock_held())
 
     def test_every_virsh_call_names_the_system_connection(self):
@@ -2868,7 +3018,7 @@ class TestStart(LibvirtCase):
         self.assertFalse(os.path.exists(built_from))
         self.assertEqual(
             sorted(os.listdir(self.box.instance_dir())),
-            ["cidata", "domain.json", "domain.xml", "operator.pub"],
+            ["cidata", "disk-volume", "domain.json", "domain.xml", "operator.pub"],
         )
         staged = Path(self.box.instance_dir()) / "cidata"
         self.assertEqual(
@@ -2990,7 +3140,7 @@ class TestStart(LibvirtCase):
                 self.start(existing=True)
         self.assertEqual(
             sorted(os.listdir(self.box.instance_dir())),
-            ["cidata", "domain.json", "domain.xml", "operator.pub"],
+            ["cidata", "disk-volume", "domain.json", "domain.xml", "operator.pub"],
         )
         self.assertIn(
             "LIMA_CIDATA_USER=alice",
@@ -3063,11 +3213,16 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
 
     def up(self):
         with self.assertRaises(self.box.YoError) as caught:
-            self.box.vm_up(run_services=False, passphrase=b"secret")
+            locked(
+                self.box,
+                self.box.vm_up,
+                run_services=False,
+                passphrase=self.derived(b"secret"),
+            )
         return caught.exception.message
 
     def test_a_domain_killed_after_the_unlock_is_an_error_naming_the_oom_killer(self):
-        self.host.helper = lambda: (self.ANSWERED + ["unlocked"], 0, "")
+        self.host.helper = lambda: (self.ANSWERED + ["yolobox-unlock: unlocked"], 0, "")
         self.killed_on_the_next_probe()
         message = self.up()
         self.assertIn(
@@ -3098,14 +3253,14 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         self.assertIn("`journalctl -k -g oom`", message)
 
     def test_a_domain_paused_under_yo_names_the_way_to_resume_it(self):
-        self.host.helper = lambda: (["unlocked"], 0, "")
+        self.host.helper = lambda: (["yolobox-unlock: unlocked"], 0, "")
         self.killed_on_the_next_probe("paused")
         message = self.up()
         self.assertIn("box is paused, not Running", message)
         self.assertIn("domstate --reason yolobox-box", message)
 
     def test_a_domain_in_a_state_yo_has_no_word_for_says_where_to_look(self):
-        self.host.helper = lambda: (["unlocked"], 0, "")
+        self.host.helper = lambda: (["yolobox-unlock: unlocked"], 0, "")
         self.killed_on_the_next_probe("crashed")
         message = self.up()
         self.assertIn("box is crashed, not Running", message)
@@ -3114,7 +3269,7 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         )
 
     def test_a_domain_undefined_while_yo_waits_says_yo_up_defines_it_again(self):
-        self.host.helper = lambda: (["unlocked"], 0, "")
+        self.host.helper = lambda: (["yolobox-unlock: unlocked"], 0, "")
 
         def undefined(argv):
             del self.host.domains["yolobox-box"], self.host.states["yolobox-box"]
@@ -3128,7 +3283,7 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
     def test_a_domain_paused_during_a_connected_probe_is_named_not_the_ssh_timeout(
         self,
     ):
-        self.host.helper = lambda: (["unlocked"], 0, "")
+        self.host.helper = lambda: (["yolobox-unlock: unlocked"], 0, "")
 
         def paused(argv):
             self.host.states["yolobox-box"] = "paused"
@@ -3139,26 +3294,15 @@ class TestADomainThatDiesWhileYoWaits(LibvirtCase):
         self.assertIn("box is paused, not Running", message)
         self.assertNotIn("as the operator failed", message)
 
-    def test_virsh_speaks_the_c_locale_whatever_the_users_locale(self):
-        with mock.patch.dict(
-            os.environ, {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}
-        ):
-            self.driver.vm_status()
-        envs = self.host.virsh_envs
-        self.assertTrue(envs)
-        for env in envs:
-            self.assertEqual(env["LC_ALL"], "C")
-            self.assertEqual(env["LANG"], "de_DE.UTF-8")
-
     def test_a_domain_that_stays_up_is_waited_for_as_before(self):
-        self.host.helper = lambda: (["unlocked"], 0, "")
+        self.host.helper = lambda: (["yolobox-unlock: unlocked"], 0, "")
         # Nothing listening yet, then the key refused while the operator's key
         # is being written: both are a boot in progress, retried.
         key_refused = (255, "operator@127.0.0.1: Permission denied (publickey).")
         answers = iter([NOT_LISTENING, key_refused, (0, "")])
         self.host.sshd = lambda argv: next(answers)
         with mock.patch.object(self.box.unlock.time, "sleep") as sleep:
-            self.driver.start(b"secret", None)
+            locked(self.box, self.driver.start, lambda: b"secret")
         self.assertEqual(
             sleep.call_args_list,
             [mock.call(self.box.OPERATOR_POLL_SECONDS)] * 2,
@@ -3199,15 +3343,13 @@ class TestDiskVolume(LibvirtCase):
         self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 100 << 30)
 
     def test_a_volume_an_interrupt_left_behind_is_rebuilt(self):
-        self.host.volumes["yolobox-box.qcow2"] = b""
-        self.host.capacity["yolobox-box.qcow2"] = 4096
+        self.kept_volume(4, record="building")
         self.ensure()
         self.assertIn("vol-delete", self.host.subcommands())
         self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 100 << 30)
 
-    def test_a_volume_of_the_smallest_box_size_is_adopted_as_it_is(self):
-        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
-        self.host.capacity["yolobox-box.qcow2"] = 40 << 30
+    def test_a_volume_recorded_built_is_adopted_as_it_is(self):
+        self.kept_volume(40)
         self.ensure()
         self.assertEqual(
             [sub for sub in self.host.subcommands() if sub not in READS], []
@@ -3215,12 +3357,20 @@ class TestDiskVolume(LibvirtCase):
         self.assertEqual(self.host.volumes["yolobox-box.qcow2"], b"a whole disk")
         self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 40 << 30)
 
-    def test_a_volume_below_the_smallest_box_size_is_rebuilt(self):
-        self.host.volumes["yolobox-box.qcow2"] = b"half a disk"
-        self.host.capacity["yolobox-box.qcow2"] = 39 << 30
-        self.ensure()
-        self.assertIn("vol-delete", self.host.subcommands())
-        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 100 << 30)
+    def test_a_volume_yo_has_no_record_of_is_never_deleted_on_a_guess(self):
+        for record in (None, "lizard", ""):
+            with self.subTest(record=record):
+                Path(self.box.instance_dir(), "disk-volume").unlink(missing_ok=True)
+                self.kept_volume(100, record=record)
+                with self.assertRaises(self.box.YoError) as caught:
+                    self.ensure()
+                message = caught.exception.message
+                self.assertIn("cannot tell whether it holds a finished disk", message)
+                self.assertIn("yo -m box destroy --yes && yo -m box bootstrap", message)
+                self.assertEqual(
+                    self.host.volumes["yolobox-box.qcow2"], b"a whole disk"
+                )
+                self.assertNotIn("vol-delete", self.host.subcommands())
 
 
 class FakeReply(io.BytesIO):

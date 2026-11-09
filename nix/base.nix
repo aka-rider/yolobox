@@ -45,9 +45,13 @@ in
 {
   # Lets someone drop a package or setting into the running box without a
   # checkout or push: the guest carries no copy of this repo to edit.
+  # Set to 1, the nix_env_skip_local_nix variable leaves it out, so a flake
+  # check run inside a box evaluates the box CI evaluates.
   imports = [
     (modulesPath + "/profiles/qemu-guest.nix")
-  ] ++ lib.optional (builtins.pathExists /etc/yolobox/local.nix) /etc/yolobox/local.nix
+  ] ++ lib.optional
+    (builtins.getEnv facts.nix_env_skip_local_nix != "1" && builtins.pathExists /etc/yolobox/local.nix)
+    /etc/yolobox/local.nix
     ++ opProxies;
 
   # /boot is the ESP itself, as the shipped nixos-lima image mounts it. It is
@@ -244,6 +248,9 @@ in
     # the one place sshd reads first. The initrd's sshd, where root is the
     # unlock login, renders its own config (nix/luks.nix).
     PermitRootLogin = "no";
+    # yo asks its master for both reverse forwards on every session command,
+    # and a socket left by a master that died must not refuse the next bind.
+    StreamLocalBindUnlink = true;
   };
   # `yo cp` uploads with scp's sftp mode, and an upload rests on no
   # guest shell running for a transfer. An external sftp-server is spawned
@@ -380,10 +387,10 @@ in
     awscli2
   ];
 
-  environment.etc."yolobox/version".text = version + "\n";
+  environment.etc.${lib.removePrefix "/etc/" facts.version_stamp}.text = version + "\n";
   # The exact tree the box was built from, so `yolobox-guest rebuild` builds
   # it again instead of guessing.
-  environment.etc."yolobox/flake-ref".text = flakeRef + "\n";
+  environment.etc.${lib.removePrefix "/etc/" facts.flake_ref_stamp}.text = flakeRef + "\n";
   # Every fact the box's shell scripts read, one KEY=value line each, for
   # `. /etc/yolobox/facts.sh`. The modules contribute them through
   # yolobox.facts; this is the one place that renders them.

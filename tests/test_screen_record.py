@@ -14,14 +14,13 @@ tests: util-linux `flock`.
 import ctypes
 import os
 import select
-import shutil
 import signal
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 
-from shell_harness import BASH, REPO, ShellCase
+from shell_harness import BASH, REPO, ShellCase, needs_tool
 
 SCRIPT = REPO / "nix" / "display" / "yolobox-screen-record.sh"
 
@@ -87,7 +86,7 @@ def starttime_of(pid):
 
 @unittest.skipUnless(BOOT_ID.exists(), "needs /proc/<pid>/stat and boot_id")
 @unittest.skipUnless(hasattr(os, "pidfd_open"), "needs os.pidfd_open")
-@unittest.skipUnless(shutil.which("flock"), "needs util-linux flock")
+@needs_tool("flock", why="needs util-linux flock")
 class TestScreenRecord(ShellCase):
     timeout = 30
 

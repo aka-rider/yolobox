@@ -10,6 +10,7 @@ from unittest import mock
 
 from test_yo import (
     FakeHome,
+    proved_initrd,
     yo,
     refuse_tcp_to_the_host,
 )
@@ -377,10 +378,13 @@ class TestSshAgentClientFailures(FakeAgent):
         self.assertIn("hung up", caught.exception.message)
         self.assertNotIn("declined", caught.exception.message)
 
-    def test_a_missing_socket_is_refused_without_a_prompt_hint(self):
+    def test_a_missing_socket_says_1password_is_not_running_without_a_prompt_hint(
+        self,
+    ):
         with self.assertRaises(yo.YoError) as caught:
             yo.ssh_agent_identities(os.path.join(self.dir, "nothing.sock"))
-        self.assertIn("not answering", caught.exception.message)
+        self.assertIn("1Password is not running", caught.exception.message)
+        self.assertIn("No such file or directory", caught.exception.message)
         self.assertNotIn("approve", caught.exception.message)
 
     def test_a_reply_that_never_comes_names_the_prompt_to_approve(self):
@@ -444,6 +448,93 @@ class TestClassifyInitrdAttempt(unittest.TestCase):
                 )
 
 
+class TestJudgeHelperRun(FakeHome):
+    def setUp(self):
+        super().setUp()
+        self.initrd = proved_initrd(yo.SshFacts(61234, "op", "/k/user", "none"))
+
+    def test_an_ssh_failure_yo_has_no_name_for_is_an_error_shown_in_its_words(self):
+        attempt = yo.HelperRun(
+            yo.SSH_UNREACHABLE, "Bad configuration option: lizard", False
+        )
+        self.assertIs(yo.judge_helper_run(attempt), yo.Verdict.ERROR)
+        self.assertIn("lizard", yo.helper_failure_message(attempt, self.initrd))
+
+    def test_an_unlock_is_exit_0_with_the_helpers_unlocked_line_last(self):
+        done = yo.HelperRun(0, "", True, yo.unlock.HELPER_UNLOCKED_LINE)
+        self.assertIs(yo.judge_helper_run(done), yo.Verdict.UNLOCKED)
+        for last in ("", "lizard", "yolobox-unlock: answered id=1"):
+            with self.subTest(last=last):
+                cut = yo.HelperRun(0, "", bool(last), last)
+                self.assertIs(yo.judge_helper_run(cut), yo.Verdict.ERROR)
+                self.assertIn(
+                    "exited 0 without its last line saying '%s'; it last said '%s'"
+                    % (yo.unlock.HELPER_UNLOCKED_LINE, last),
+                    yo.helper_failure_message(cut, self.initrd),
+                )
+
+    def test_a_helper_that_said_why_it_failed_is_failed(self):
+        attempt = yo.HelperRun(yo.HELPER_EXIT_WRONG_KEY, "", False)
+        self.assertIs(yo.judge_helper_run(attempt), yo.Verdict.FAILED)
+
+
+class TestRootLogsInOnlyThroughTheInitrdGate(FakeHome):
+    """The gate proves the listener the VM's before it reads the banner, and
+    only the initrd's word lets root through."""
+
+    INITRD_BANNER = "SSH-2.0-OpenSSH_10.6 %s\r" % yo.INITRD_SSH_BANNER_MARK
+    FACTS = yo.SshFacts(61234, "op", "/k/user", "none")
+
+    def gate(self, banner, listener=None):
+        order = []
+
+        def verify(port):
+            order.append("listener")
+            if listener is not None:
+                raise listener
+
+        def read(endpoint):
+            order.append("banner")
+            return banner
+
+        with (
+            mock.patch.object(yo.LIMA, "ssh_facts", return_value=self.FACTS),
+            mock.patch.object(yo.LIMA, "verify_initrd_listener", side_effect=verify),
+            mock.patch.object(yo.unlock, "ssh_banner", side_effect=read),
+            yo.box_lock(wait=True) as held,
+        ):
+            try:
+                return yo.unlock.initrd_endpoint(held), order
+            except yo.YoError as refused:
+                return refused, order
+
+    def test_the_initrds_banner_behind_the_vms_listener_opens_the_gate(self):
+        gate, order = self.gate(self.INITRD_BANNER)
+        self.assertIsInstance(gate, yo.unlock.InitrdEndpoint)
+        self.assertEqual(gate.facts, self.FACTS)
+        self.assertEqual(order, ["listener", "banner"])
+
+    def test_only_the_gate_makes_the_proof_of_an_initrd(self):
+        with self.assertRaisesRegex(TypeError, "only unlock.initrd_endpoint"):
+            yo.unlock.InitrdEndpoint(object(), self.FACTS)
+
+    def test_any_other_banner_comes_back_as_read(self):
+        for banner, kind in (
+            ("SSH-2.0-OpenSSH_10.6 %s\r" % yo.STAGE2_SSH_BANNER_MARK, "STAGE2"),
+            ("SSH-2.0-OpenSSH_10.6\r", "UNMARKED"),
+            ("", "NONE"),
+            ("lizard", "UNKNOWN"),
+        ):
+            with self.subTest(banner=banner):
+                gate, _ = self.gate(banner)
+                self.assertEqual(gate, yo.unlock.Banner(yo.Endpoint[kind], banner))
+
+    def test_a_listener_that_is_not_the_vms_is_refused_before_its_banner_is_read(self):
+        gate, order = self.gate(self.INITRD_BANNER, listener=yo.YoError("stranger"))
+        self.assertEqual(gate.message, "stranger")
+        self.assertEqual(order, ["listener"])
+
+
 class TestInitrdAskPending(FakeHome):
     """`yo down` may power off a box in its initrd only while a passphrase ask
     nobody has answered waits there: the one moment nothing writes to the disk."""
@@ -463,11 +554,53 @@ class TestInitrdAskPending(FakeHome):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return completed.stdout
 
-    def pending_after(self, completed):
-        with mock.patch.object(yo.proc, "run", return_value=completed) as run:
-            result = yo.unlock.initrd_ask_pending()
-        self.assertEqual(run.call_args.args[0][-1], yo.unlock.INITRD_ASK_PROBE)
+    FACTS = yo.SshFacts(61234, "op", "/k/user", "none")
+
+    def pending_after(self, completed, listener=None):
+        """initrd_ask_pending on a proved initrd whose probe ends `completed`;
+        `listener` is what the listener check raises right before the login."""
+        gate = proved_initrd(self.FACTS)
+        self.order = []
+
+        def verify(port):
+            self.order.append("listener")
+            if listener is not None:
+                raise listener
+
+        def run(argv, **kwargs):
+            self.order.append("login")
+            self.argv = list(argv)
+            return completed
+
+        with (
+            mock.patch.object(yo.LIMA, "verify_initrd_listener", side_effect=verify),
+            mock.patch.object(yo.proc, "run", side_effect=run),
+        ):
+            result = yo.unlock.initrd_ask_pending(gate)
+        self.assertEqual(self.argv[-1], yo.unlock.INITRD_ASK_PROBE)
+        self.assertIn("User=root", self.argv)
         return result
+
+    def test_the_listener_is_proved_again_right_before_the_root_login(self):
+        # A port nothing held at the gate may be taken after it.
+        self.pending_after(self.completed(self.probe_says([])))
+        self.assertEqual(self.order, ["listener", "login"])
+        with self.assertRaisesRegex(yo.YoError, "stranger"):
+            self.pending_after(None, listener=yo.YoError("stranger"))
+        self.assertEqual(self.order, ["listener"])
+
+    def test_a_port_that_no_longer_offers_the_initrd_is_never_asked_as_root(self):
+        stage2 = "SSH-2.0-x " + yo.STAGE2_SSH_BANNER_MARK
+        with (
+            mock.patch.object(yo.LIMA, "ssh_facts", return_value=self.FACTS),
+            mock.patch.object(yo.LIMA, "verify_initrd_listener"),
+            mock.patch.object(yo.unlock, "ssh_banner", return_value=stage2),
+            mock.patch.object(yo.proc, "run") as run,
+            yo.box_lock(wait=True) as held,
+        ):
+            with self.assertRaisesRegex(yo.YoError, "no longer offers the initrd"):
+                yo.unlock.require_initrd(held)
+        run.assert_not_called()
 
     def test_the_probe_sees_an_ask_whether_or_not_it_ends_in_a_newline(self):
         self.assertTrue(self.pending_after(self.completed(self.probe_says(["ask.1"]))))
@@ -500,24 +633,26 @@ class TestInitrdAskPending(FakeHome):
         return subprocess.CompletedProcess([], 0, stdout, "")
 
 
-class TestInitrdSshArgv(FakeHome):
+class TestUnpinnedSshArgv(FakeHome):
     FACTS = yo.SshFacts(61234, "op", "/k/user", "none")
 
     def test_dials_the_facts_port_on_loopback_with_their_key(self):
-        argv = yo.initrd_ssh_argv("true", self.FACTS)
+        argv = yo.unlock.operator_argv("true", self.FACTS)
         self.assertEqual(argv[-2:], ["127.0.0.1", "true"])
         self.assertIn("Port=61234", argv)
         self.assertEqual(argv[argv.index("-i") + 1], "/k/user")
         self.assertIn("IdentityAgent=none", argv)
 
-    def test_logs_in_as_root_unless_told_otherwise(self):
-        self.assertIn("User=root", yo.initrd_ssh_argv("true", self.FACTS))
-        self.assertIn(
-            "User=someone", yo.initrd_ssh_argv("true", self.FACTS, user="someone")
-        )
+    def test_the_operator_is_the_host_account_and_root_needs_the_proved_initrd(self):
+        operator = yo.unlock.operator_argv("true", self.FACTS)
+        self.assertIn("User=%s" % yo.release.host_user(), operator)
+        self.assertNotIn("User=root", operator)
+        with mock.patch.object(yo.LIMA, "verify_initrd_listener"):
+            root = yo.unlock.root_argv("true", proved_initrd(self.FACTS))
+        self.assertIn("User=root", root)
 
     def test_pins_nothing_and_never_reads_a_config_file(self):
-        argv = yo.initrd_ssh_argv("true", self.FACTS)
+        argv = yo.unlock.operator_argv("true", self.FACTS)
         self.assertEqual(argv[argv.index("-F") + 1], "/dev/null")
         self.assertNotIn(yo.ssh_cfg(), argv)
         for index in range(0, len(yo.FIRST_CONTACT_OPTS), 2):

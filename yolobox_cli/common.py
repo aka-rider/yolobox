@@ -82,10 +82,12 @@ class LockBusy(Exception):
 
 
 @contextlib.contextmanager
-def held_flock(path: str, wait: bool) -> Iterator[None]:
+def held_flock(
+    path: str, wait: bool, on_wait: Optional[Callable[[], None]] = None
+) -> Iterator[None]:
     """Hold an exclusive flock on `path`, created private (its directory too)
-    when missing. With `wait` False a held lock raises LockBusy instead of
-    blocking.
+    when missing. A held lock raises LockBusy with `wait` False; with `wait`
+    True, `on_wait` is called once before this blocks on it.
 
     The lock file is never deleted: a process blocked in `flock` holds the old
     inode, so with the file unlinked under it the next one would create and
@@ -95,9 +97,13 @@ def held_flock(path: str, wait: bool) -> Iterator[None]:
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise LockBusy()
+            if not wait:
+                raise LockBusy()
+            if on_wait is not None:
+                on_wait()
+            fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)  # closing the descriptor drops the lock

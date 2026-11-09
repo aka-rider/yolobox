@@ -64,21 +64,26 @@ def herdr_machine_removals(herdr: str) -> List[Removal]:
     if machine_id is None:
         return []
 
-    def remove() -> None:
+    def remove(held: state.HeldBox) -> None:
         proc.run([herdr, "machine", "remove", machine_id], check=True)
 
     return [Removal("delete the herdr machine %s" % state.box.herdr_alias, remove)]
 
 
-def ensure_herdr_machine(ssh_config_includes_the_vm: bool) -> None:
+def ensure_herdr_machine(held: state.HeldBox, ssh_config_includes_the_vm: bool) -> None:
+    """Under the box lock, listed and added in one hold: two bootstraps must
+    not both add the machine."""
     herdr = herdr_binary()
     if herdr is None:
         ui.err(
             "yo: herdr not found on this host's PATH — skipping herdr machine registration"
         )
         return
-    if listed_herdr_machine_id(herdr) is not None:
-        return
+    if listed_herdr_machine_id(herdr) is None:
+        add_herdr_machine(herdr, ssh_config_includes_the_vm)
+
+
+def add_herdr_machine(herdr: str, ssh_config_includes_the_vm: bool) -> None:
     if not ssh_config_includes_the_vm:
         # herdr runs `ssh <alias>`, and the alias exists only in the file that
         # ~/.ssh/config includes; without the line ssh cannot resolve it.
@@ -141,7 +146,7 @@ def aws_broker_forward() -> ReverseForward:
     return ReverseForward(
         "aws-broker",
         AWS_BROKER_GUEST_SOCK,
-        aws.aws_broker_sock(),
+        state.aws_broker_sock(),
         (
             "curl",
             "-sS",
@@ -156,37 +161,37 @@ def aws_broker_forward() -> ReverseForward:
 
 
 def forward_control_cmd(action: str, forward: ReverseForward) -> List[str]:
-    return sshx.ssh_argv(
-        OPERATOR,
-        "-O",
-        action,
-        "-R",
-        "%s:%s" % (forward.guest_path, forward.host_path),
-        state.box.vm_host,
-        mux=True,
+    return sshx.control_argv(
+        OPERATOR, action, "-R", "%s:%s" % (forward.guest_path, forward.host_path)
     )
 
 
-def forward_is_up(forward: ReverseForward) -> bool:
-    """Whether the agent can use the forward: the one probe of it, for `yo status`."""
-    return forward.alive(sshx.ssh_run(AGENT, list(forward.probe)))
+def forward_failure(forward: ReverseForward) -> Optional[str]:
+    """None when the agent can use the forward; else what its probe said, for
+    `yo status` to show. The one probe of a forward."""
+    completed = sshx.ssh_run(AGENT, list(forward.probe))
+    if forward.alive(completed):
+        return None
+    said = " ".join((completed.stderr or completed.stdout or "").split())
+    return "its probe exited %d%s" % (
+        completed.returncode,
+        proc.said_suffix(ui.shown(said)),
+    )
 
 
 def ensure_session() -> None:
-    """The operator's ssh master, carrying both reverse forwards: left alone
-    when it answers `-O check`, opened otherwise. Nothing is probed or judged:
-    a master that answers is taken as whole, and `yo up` is the repair."""
-    if sshx.master_alive(OPERATOR):
-        return
-    forwards = [one_password_forward(), aws_broker_forward()]
-    # The first mux session opens the master (ControlMaster auto; ssh unlinks
-    # the socket a dead master left) and clears the guest sockets a previous
-    # master left behind, which a forward cannot bind over.
-    cleanup = ["rm", "-f", *(forward.guest_path for forward in forwards)]
+    """The operator's ssh master, carrying both reverse forwards, declared
+    whole on every call: any master at the operator's ControlPath may have
+    been opened by a session that asked for no forward (git, an editor, `yo
+    gc`). A mux session opens the master when none answers (ControlMaster
+    auto), then both forwards are asked for. A master answers a forward it
+    already carries with success, and the guest's sshd runs with
+    StreamLocalBindUnlink, so it replaces a socket a dead master left."""
+    opener = ["true"]
     proc.checked(
-        sshx.probe(OPERATOR, cleanup, mux=True), shlex.join(cleanup), "on the box"
+        sshx.probe(OPERATOR, opener, mux=True), shlex.join(opener), "on the box"
     )
-    for forward in forwards:
+    for forward in (one_password_forward(), aws_broker_forward()):
         proc.run(forward_control_cmd("forward", forward), check=True)
 
 

@@ -96,7 +96,7 @@ Add the VM as a git remote over ssh. The host alias is `lima-yolobox`, or `lima-
 
 ## Secrets
 
-1Password's SSH agent and the AWS credentials reach the VM over reverse unix sockets. Nothing secret is copied in. 1Password asks for approval per application, not per signature, and an approval can cover later signatures from the same application until 1Password locks. Approve a `yolobox-disk` prompt only while you yourself run `yo up`, `yo bootstrap` or `yo disk-grow`.
+1Password's SSH agent and the AWS credentials reach the VM over reverse unix sockets. Nothing secret is copied in. 1Password asks for approval per application, not per signature, and an approval can cover later signatures from the same application until 1Password locks. Approve a `yolobox-disk` prompt only while you yourself run `yo up`, `yo bootstrap` or `yo disk-grow`. `yo` asks only when the box's initrd asks for the passphrase: a box whose disk is not encrypted yet (a fresh one) boots without a prompt, and its bootstrap asks once, for the passphrase the disk is encrypted under. Before `yo up` starts a stopped box it checks, without a prompt, that 1Password is running and serves `yolobox-disk`, and otherwise refuses with the box still off.
 
 For AWS, log in on the host and pick the profile per process in the VM:
 
@@ -133,7 +133,13 @@ On a Linux host the host table still keeps the VM off the LAN.
 
 ## Upgrading
 
-A new `yo` is used with a box it built itself. When `yo status` reports that the box's version differs, run `yo bootstrap`. A major release recreates the box: push your work out, then `yo destroy --yes && yo bootstrap`. Your data lives in git, not in the box.
+A new `yo` is used with a box it built itself. When `yo status` reports that the box's version differs, run `yo bootstrap`. A `yo` run from a checkout has no version and reports no drift. A major release recreates the box: push your work out, then `yo destroy --yes && yo bootstrap`. The next one, v2, must: its `yo` offers the passphrase only to an initrd whose banner says `yolobox-initrd`, and a box built before it has an initrd that does not. Such a box keeps running until it stops; after that, v2's `yo up` takes its initrd for the seed image's sshd, asks it for your login alone for 600 s, and then ends with:
+
+```
+yo: yolobox did not let the operator in within 600 s of lima reporting it Running; the last attempt on 127.0.0.1:60022: its unmarked sshd (the seed image's stage 2) sent its banner and was asked for the operator: refused (ssh said: you@127.0.0.1: Permission denied (publickey).) — an unmarked sshd that keeps refusing the operator is a seed image whose key never landed; recreate it: yo destroy --yes && yo bootstrap
+```
+
+So recreate it before you upgrade, while it still runs and you can push your work out. Your data lives in git, not in the box.
 
 ## When something breaks
 
@@ -141,16 +147,18 @@ A new `yo` is used with a box it built itself. When `yo status` reports that the
 - **`yo` refuses a box it did not make, or the two do not understand each other.** Push your work out of the VM, then `yo destroy --yes && yo bootstrap`. A box is disposable; only the latest `yo` and box are supported together.
 - **The VM has no network at all after a boot.** Its egress table failed to load, and without the table the box takes no address. Recreate the box.
 - **No network in the VM while the host has it.** A full-tunnel VPN on the host blackholes the VM's traffic, and a fake-IP proxy (Clash, Surge) answers with addresses in `198.18.0.0/15`, which the VM refuses. On a Mac, `limactl stop <name> && yo up` clears Lima flows stuck after a VPN disconnects.
-- **`yo up` says the box is not bootstrapped yet.** The box has no agent account: it is a fresh box, or a broken one. Run `yo bootstrap`.
-- **`yo` says a Lima instance departs from `lima/yolobox.yaml` (Mac).** It names the cause. If `limactl edit` can fix it while the instance is stopped, `yo` prints that one command. A setting Lima reads only at creation means a new instance, which deletes the disk: push your work out, then run the `yo destroy --yes && limactl create ... && yo bootstrap` chain it prints.
-- **`yo destroy`** keeps the `Include` line, the downloaded base image and the AWS broker, which other machines share.
+- **`yo up` says the box is not bootstrapped yet.** The box has no version stamp: it is a fresh box from the seed image, with no agent account and no forwards. Run `yo bootstrap`. A bootstrapped box whose agent cannot log in is broken, and `yo up` fails naming `yo bootstrap` too.
+- **`yo` says a Lima instance departs from `lima/yolobox.yaml` (Mac).** It names the cause. If `limactl edit` can fix it while the instance is stopped, `yo` prints that one command. A setting Lima reads only at creation means a new instance, which deletes the disk: push your work out, then run the `yo destroy --yes && yo bootstrap` chain it prints. An instance whose port forwards still reverse the 1Password and AWS sockets into the guest departs too (`portForwards.guestSocket`): `yo` forwards those itself, and the printed `limactl edit` removes Lima's.
+- **`yo` says another yo is acting on the box.** `yo up`, `yo bootstrap` and `yo disk-grow` say so in one line and wait for that command to finish; `yo down` and `yo destroy --yes` refuse and name themselves to run again.
+- **`yo` refuses a machine name as too long.** A unix socket path is shorter than 104 bytes on macOS and 108 on Linux, and the box's sockets live under `$HOME` in a directory named after the machine. Pick a shorter `-m` name.
+- **`yo destroy`** keeps the `Include` line and the downloaded base image, which other machines share. It stops the box's own AWS broker first, which lives in the box's directory.
 
 ## Limits
 
 - Disk encryption protects the image file at rest, not the running VM: its memory and its unlocked disk are plaintext to whoever controls the host.
 - The initrd lives on the unencrypted boot partition and is not signed. Whoever can write the image file can replace it, and the replacement receives the passphrase at your next `yo up`.
 - One `yolobox-disk` item is one passphrase for every box: all boxes derive it from the same key and message, so losing or leaking one box's passphrase exposes the others.
-- On a Mac, `yo` sends the passphrase to whatever answers on the forwarded ssh port (Lima's hostagent holds it) and does not check which process owns the port.
+- On a Mac, `yo` sends the passphrase only while `lsof` names the instance's own hostagent as the one listener on the box's ssh port, checked right before the login. Another process of your account could still take the port in the moment between that check and ssh's connect.
 - A program in the VM can bind a mirrored port before a host tool binds it, and then the host tool fails or talks to the VM. Only a few fixed login-callback ports are held back.
 - The box sets `PI_CLIPBOARD_OSC52=1`, so pi copies through the terminal's OSC 52 escape, and any program in a pane can emit the same escape. Whether it reaches your host clipboard depends on your terminal.
 - `yo code` and `yo zed` make your editor install and run a server in the agent's home, which the agent can replace.

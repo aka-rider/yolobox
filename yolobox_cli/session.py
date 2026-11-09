@@ -62,12 +62,10 @@ def on_terminal() -> bool:
 
 def cmd_ssh(args: argparse.Namespace) -> None:
     proc.exec_process(
-        sshx.ssh_argv(
+        sshx.interactive_argv(
             OPERATOR,
-            *sshx.forward_agent_opts(),
-            *(["-t"] if on_terminal() else []),
-            state.box.vm_host,
-            *args.ssh_cmd,
+            sshx.forward_agent_opts() + (["-t"] if on_terminal() else []),
+            args.ssh_cmd,
         )
     )
 
@@ -77,8 +75,7 @@ def cmd_enter(args: argparse.Namespace) -> None:
     # print "Pseudo-terminal will not be allocated" and run it without a pty.
     if not on_terminal():
         raise YoError(
-            "%s opens an interactive shell, and stdin or stdout is not a terminal"
-            % state.yo_cmd("enter")
+            "enter opens an interactive shell, and stdin or stdout is not a terminal"
         )
     sshx.require_agent_account()
     if os.environ.get("HERDR_ENV") == "1":
@@ -89,11 +86,8 @@ def cmd_enter(args: argparse.Namespace) -> None:
     target = target_dir(args.project)
 
     proc.exec_process(
-        sshx.ssh_argv(
-            AGENT,
-            "-t",
-            state.box.vm_host,
-            shlex.join(["cd", target]) + ' && exec "$SHELL" -l',
+        sshx.interactive_argv(
+            AGENT, ["-t"], [shlex.join(["cd", target]) + ' && exec "$SHELL" -l']
         )
     )
 

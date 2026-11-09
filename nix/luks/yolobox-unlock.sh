@@ -1,8 +1,9 @@
 # shellcheck shell=bash
 # Runs in the initrd over ssh, started by `yo up`: reads the passphrase on
 # stdin, answers systemd's password asks with it, and reports how the unlock
-# ended through its exit code. Exit 0 is an open disk with its root filesystem
-# mounted. The failure codes are facts.json's unlock_exit_* values, passed in
+# ended through its exit code. Exit 0, with YOLOBOX_UNLOCK_UNLOCKED_LINE (the
+# fact unlock_unlocked_line) as the last line on stdout, is an open disk with
+# its root filesystem mounted. The failure codes are facts.json's unlock_exit_* values, passed in
 # as YOLOBOX_UNLOCK_EXIT_*:
 #   wrong_key       the passphrase does not open the disk; an asker rejected its reply
 #   encrypt_failed  the in-place encryption failed; its journal tail is on stderr
@@ -12,6 +13,9 @@
 #   unexpected      anything else failed; stderr names the command, not bash's code
 #   open_failed     the open failed for a reason other than the key; journal on stderr
 shopt -s nullglob
+# inotifywait's and the journal's words are read below; a translated tool would
+# say something else.
+export LC_ALL=C
 EXIT_WRONG_KEY="${YOLOBOX_UNLOCK_EXIT_WRONG_KEY:?}"
 EXIT_ENCRYPT_FAILED="${YOLOBOX_UNLOCK_EXIT_ENCRYPT_FAILED:?}"
 EXIT_WATCH_FAILED="${YOLOBOX_UNLOCK_EXIT_WATCH_FAILED:?}"
@@ -21,6 +25,7 @@ EXIT_UNEXPECTED="${YOLOBOX_UNLOCK_EXIT_UNEXPECTED:?}"
 EXIT_OPEN_FAILED="${YOLOBOX_UNLOCK_EXIT_OPEN_FAILED:?}"
 LUKS_DEVICE="${YOLOBOX_UNLOCK_LUKS_DEVICE:?}"
 REPLY_PASSWORD="${YOLOBOX_UNLOCK_REPLY_PASSWORD:?}"
+UNLOCKED_LINE="${YOLOBOX_UNLOCK_UNLOCKED_LINE:?}"
 # -E carries the ERR trap into functions, where most commands run.
 set -E
 trap 'echo "yolobox-unlock: unexpected failure (exit $?) at line ${LINENO}: ${BASH_COMMAND}" >&2; exit "$EXIT_UNEXPECTED"' ERR
@@ -195,4 +200,4 @@ if systemctl is-active --quiet "$EMERGENCY_UNIT"; then
   echo "yolobox-unlock: ${ROOT_MOUNT_UNIT} mounted only on retry and the initrd is in emergency mode (${EMERGENCY_UNIT}), so the boot will not continue" >&2
   exit "$EXIT_MOUNT_FAILED"
 fi
-echo "yolobox-unlock: unlocked"
+echo "${UNLOCKED_LINE}"

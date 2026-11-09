@@ -3,6 +3,8 @@
 # opened. A plain ext4 root (the seed image's first boot) is encrypted in place;
 # a LUKS disk carrying the label is left alone and nothing is asked; any other
 # disk is refused.
+# dumpe2fs's field names are read below; a translated tool would say otherwise.
+export LC_ALL=C
 if [ "$#" -ne 3 ]; then
   echo "usage: yolobox-luks-encrypt <device> <label> <mapper>" >&2
   exit 2

@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import unittest
 
-from shell_harness import REPO, ShellCase, facts_sh, is_gnu
+from shell_harness import REPO, ShellCase, facts_sh, is_gnu, require_tool
 
 SCRIPT = REPO / "tests" / "box-hardening-check.sh"
 
@@ -76,8 +76,11 @@ class BoxCheck(ShellCase):
     timeout = 60
 
     def setUp(self):
-        if not (is_gnu("find") and is_gnu("stat")):
-            self.skipTest("needs GNU find and stat")
+        require_tool(
+            ["find", "stat"],
+            have=is_gnu("find") and is_gnu("stat"),
+            why="needs GNU find and stat",
+        )
         super().setUp()
         # A symlink, as /run/wrappers/bin is on the box (to the generation's
         # directory): find does not follow a start point without a trailing slash.
@@ -89,11 +92,9 @@ class BoxCheck(ShellCase):
         self.facts = self.tmp / "facts.sh"
         self.write_facts(FACTS)
         self.fake("sudo", FAKE_SUDO)
+        require_tool(REAL_TOOLS)
         for tool in REAL_TOOLS:
-            real = shutil.which(tool)
-            if real is None:
-                self.skipTest("needs %s" % tool)
-            (self.bin_dir / tool).symlink_to(real)
+            (self.bin_dir / tool).symlink_to(shutil.which(tool))
         self.real_stat = shutil.which("stat")
 
     def write_facts(self, facts):
@@ -158,6 +159,17 @@ class BoxCheck(ShellCase):
                 self.assert_fail(
                     self.run_check("true"), "%s does not set %s" % (self.facts, key)
                 )
+
+    # -- the agent helpers ---------------------------------------------
+
+    def test_a_bare_agent_command_runs_in_the_root_directory(self):
+        # The operator's cwd is a 0700 home the agent cannot enter, and podman
+        # refuses to start in a cwd it cannot reach.
+        result = self.run_check(
+            'cd "%s" && as_agent_bare "${SYSBIN}/bash" -c pwd' % self.home
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "/\n")
 
     # -- the wrapper set -----------------------------------------------
 
@@ -247,7 +259,17 @@ class BoxCheck(ShellCase):
 
     # -- sudo and the accounts -----------------------------------------
 
+    def open_wrapper(self):
+        """newuidmap as the box keeps it for the agent: exec'd without its
+        arguments, it prints its usage and exits 1."""
+        (self.wrappers / "newuidmap").write_text(
+            "#!/bin/sh\necho 'usage: newuidmap <pid> <uid> <loweruid> <count>' >&2\n"
+            "exit 1\n"
+        )
+        (self.wrappers / "newuidmap").chmod(0o755)
+
     def test_sudo_that_runs_for_the_agent_fails(self):
+        self.open_wrapper()
         (self.wrappers / "sudo").write_text("#!/bin/sh\nexit 0\n")
         (self.wrappers / "sudo").chmod(0o755)
         self.assert_fail(
@@ -283,19 +305,33 @@ class BoxCheck(ShellCase):
 
     PROC_OPTIONS = "rw,nosuid,nodev,noexec,relatime,hidepid=invisible,gid=1"
 
-    def proc(self, options=PROC_OPTIONS, ls="enoent", ps_users=("agent",)):
+    def proc(self, options=PROC_OPTIONS, ls="enoent", ps_users=("agent",), own=True):
+        """/proc as `ls` shows it to the agent: its own /proc/self when `own`,
+        and every other pid the way `ls` names."""
         self.fake("findmnt", '#!/bin/sh\nprintf "%s\\n"\n' % options)
+        self_listed = 'case $1 in /proc/self) printf "cmdline\\n"; exit 0 ;; esac\n'
         self.fake(
             "ls",
-            {
-                "enoent": '#!/bin/sh\nprintf "ls: cannot access %s: No such file or directory\\n" "$1" >&2\nexit 2\n',
-                "eacces": '#!/bin/sh\nprintf "ls: cannot open directory %s: Permission denied\\n" "$1" >&2\nexit 2\n',
-                "lists": '#!/bin/sh\nprintf "cmdline\\nenviron\\n"\n',
+            "#!/bin/sh\n"
+            + (self_listed if own else "")
+            + {
+                "enoent": 'printf "ls: cannot access %s: No such file or directory\\n" "$1" >&2\nexit 2\n',
+                "eacces": 'printf "ls: cannot open directory %s: Permission denied\\n" "$1" >&2\nexit 2\n',
+                "lists": 'printf "cmdline\\nenviron\\n"\n',
             }[ls],
         )
         self.fake(
             "ps",
             "#!/bin/sh\n" + "".join('printf "%-8s\\n"\n' % u for u in ps_users),
+        )
+
+    def test_an_agent_that_cannot_list_even_its_own_pid_fails(self):
+        # Then the refusals of the other pids are the probe's, not hidepid's.
+        self.proc(own=False)
+        self.assert_fail(
+            self.run_check("check_hidepid"),
+            "the agent lists its own /proc/self failed (exit 2), so a refusal "
+            "would prove nothing",
         )
 
     def test_a_missing_findmnt_fails(self):
@@ -659,7 +695,18 @@ class BoxCheck(ShellCase):
         self.box_wrappers()
         self.assert_passes(self.run_check("check_wrappers"))
 
+    def test_a_wrapper_dir_the_agent_cannot_exec_from_proves_no_sudo_refusal(self):
+        (self.wrappers / "sudo").write_text(
+            "#!/bin/sh\necho 'sudo: Permission denied' >&2\nexit 1\n"
+        )
+        (self.wrappers / "sudo").chmod(0o755)
+        self.assert_fail(
+            self.run_check("check_sudo_refuses_agent"),
+            "the agent execs the newuidmap wrapper, which is open to it failed",
+        )
+
     def test_sudo_that_refuses_the_agent_passes(self):
+        self.open_wrapper()
         (self.wrappers / "sudo").write_text(
             "#!/bin/sh\necho 'sudo: Permission denied' >&2\nexit 1\n"
         )
@@ -713,13 +760,14 @@ class BoxCheck(ShellCase):
         self.assert_passes(self.run_check("check_guestagent"))
 
     def test_tmpfiles_that_refuses_the_symlink_and_then_runs_clean_passes(self):
+        # It refuses while the agent's ~/.config/zed is a symlink, and only then.
         self.fake(
             "systemd-tmpfiles",
             "#!/bin/sh\n"
-            'if [ -e "$0.ran" ]; then exit 0; fi\n'
-            'touch "$0.ran"\n'
-            "echo 'Detected unsafe path transition' >&2\n"
-            "exit 1\n",
+            'if [ -L "%s/.config/zed" ]; then\n'
+            "    echo 'Detected unsafe path transition' >&2\n"
+            "    exit 1\n"
+            "fi\n" % self.home,
         )
         self.assert_passes(
             self.run_check(

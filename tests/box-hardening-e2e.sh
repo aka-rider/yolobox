@@ -24,6 +24,8 @@
 # bash 3.2 compatible: macOS /bin/bash is 3.2, so no associative arrays, no
 # mapfile, no ${var,,}, and no array expansions that can be empty.
 set -euo pipefail
+# The steps read the words yo and the guest print.
+export LC_ALL=C
 
 if [ "$#" -ne 1 ]; then
     echo "usage: $0 <instance>" >&2
@@ -44,7 +46,7 @@ if [ "${inst}" = yolobox ] && [ "${FORCE:-}" != 1 ]; then
 fi
 
 step=""
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/box-hardening-e2e.XXXXXX")
+scratch=""
 guest_dir="/tmp/hk-e2e-$$"
 guest_dir_used=""
 
@@ -56,13 +58,19 @@ cleanup() {
         "${yo}" -m "${inst}" ssh "sudo rm -rf ${guest_dir}" </dev/null ||
             echo "WARN: could not remove ${guest_dir} on ${inst}" >&2
     fi
-    rm -rf "${tmp}"
+    if [ -n "${scratch}" ]; then
+        rm -rf "${scratch}"
+    fi
     if [ "${status}" -ne 0 ]; then
         echo "FAIL: step '${step}' (instance ${inst})" >&2
     fi
     exit "${status}"
 }
 trap cleanup EXIT
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/box-hardening-e2e.XXXXXX")
+# Resolved, because `yo cp` refuses a path through a symlink (macOS's /tmp, /var).
+tmp=$(cd "${scratch}" && pwd -P)
 
 begin() {
     step=$1

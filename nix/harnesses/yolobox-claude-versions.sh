@@ -9,4 +9,4 @@
 [ -d "$CLAUDE_VERSIONS_DIR" ] || exit 0
 find "$CLAUDE_VERSIONS_DIR" -maxdepth 1 -type f -perm -u+x \
     -regextype posix-extended -regex ".*/$CLAUDE_VERSION_RE" "$@" -printf '%f\n' |
-    sort -V
+    LC_ALL=C sort -V

@@ -14,16 +14,28 @@ rebuild lock).
 """
 
 import fcntl
+import ipaddress
+import shlex
 import shutil
 import subprocess
 import unittest
+import urllib.parse
 
-from shell_harness import FACTS, REPO, ShellCase, facts_sh, is_gnu, render_fact
+from shell_harness import (
+    FACTS,
+    REPO,
+    ShellCase,
+    facts_sh,
+    is_gnu,
+    needs_tool,
+    render_fact,
+)
 
 GUEST_SCRIPT = REPO / "nix" / "guest" / "yolobox-guest.sh"
 
 FAKE_CURL = """#!/bin/sh
 printf '%s\\n' "$@" > "$FAKE_CURL_ARGV"
+printf '%s' "${FAKE_CURL_ERR:-}" >&2
 printf '%s' "$FAKE_CURL_BODY"
 exit "$FAKE_CURL_RC"
 """
@@ -39,6 +51,7 @@ class GuestScript(ShellCase):
         self.fake("curl", FAKE_CURL)
         self.curl_argv = self.tmp / "curl-argv"
         self.facts = self.tmp / "facts.sh"
+        self.fact_overrides = {}
         self.write_facts()
         self.env.update(
             HOME=str(self.home),
@@ -49,8 +62,9 @@ class GuestScript(ShellCase):
         )
 
     def write_facts(self, **overrides):
-        """The box's facts file, with `overrides` over facts.json."""
-        self.facts.write_text(facts_sh(**overrides))
+        """The box's facts file, with every override so far over facts.json."""
+        self.fact_overrides.update(overrides)
+        self.facts.write_text(facts_sh(**self.fact_overrides))
 
     def run_script(self, *args, curl_rc=0, curl_body="", extra_env=None):
         env = dict(FAKE_CURL_RC=str(curl_rc), FAKE_CURL_BODY=curl_body)
@@ -286,7 +300,7 @@ fi
 CLEAN_MAKEFILE = "all:\n\ttrue\nclean:\n\trm -rf out\n"
 
 
-@unittest.skipUnless(is_gnu("find"), "gc-user needs GNU find's -printf")
+@needs_tool("find", is_gnu("find"), "gc-user needs GNU find's -printf")
 class TestGcUserGoCaches(GuestScript):
     def setUp(self):
         super().setUp()
@@ -347,7 +361,7 @@ class TestGcUserGoCaches(GuestScript):
         self.assertFalse(cache.exists())
 
 
-@unittest.skipUnless(is_gnu("find"), "gc-user --deep needs GNU find's -printf")
+@needs_tool("find", is_gnu("find"), "gc-user --deep needs GNU find's -printf")
 class TestGcUserDeep(GuestScript):
     def setUp(self):
         super().setUp()
@@ -673,8 +687,8 @@ printf '%s\\n' "$FAKE_STAT_OUT"
 exit "$FAKE_STAT_RC"
 """
 
-DNS_REPLY = ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n"
-DNS_SERVFAIL = ";; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 1\n"
+# `dig +short NAME A` resolved: a CNAME on the way, then the address.
+DNS_REPLY = "lb.example.net.\n140.82.121.4\n"
 
 
 # `systemctl show -p ActiveState --value UNIT` answers the file FAKE_UNITS/UNIT.
@@ -739,11 +753,11 @@ class TestStatusBlock(GuestScript):
             "yolobox-aws-broker.socket",
         ):
             self.set_unit(unit, "active")
-        self.env.update(
-            FAKE_DIG_ARGV=str(self.dig_argv),
-            FAKE_UNITS=str(self.units),
-            YOLOBOX_STAMPS=str(self.stamps),
+        self.write_facts(
+            version_stamp=str(self.stamps / "version"),
+            flake_ref_stamp=str(self.stamps / "flake-ref"),
         )
+        self.env.update(FAKE_DIG_ARGV=str(self.dig_argv), FAKE_UNITS=str(self.units))
 
     def set_unit(self, unit, state):
         (self.units / unit).write_text(state + "\n")
@@ -752,6 +766,8 @@ class TestStatusBlock(GuestScript):
         self,
         *args,
         curl_rc=0,
+        curl_out="200",
+        curl_err="",
         dig_out=DNS_REPLY,
         dig_rc=0,
         stat_out="1000000 4096",
@@ -776,12 +792,23 @@ class TestStatusBlock(GuestScript):
             "FAKE_DF_H": df_h,
             "FAKE_DF_P": df_p,
             "FAKE_DF_RC": str(df_rc),
+            "FAKE_CURL_ERR": curl_err,
         }
-        return self.run_script("status", *args, curl_rc=curl_rc, extra_env=env)
+        return self.run_script(
+            "status", *args, curl_rc=curl_rc, curl_body=curl_out, extra_env=env
+        )
 
     def fields(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
         return dict(line.split("=", 1) for line in result.stdout.splitlines())
+
+    def test_the_egress_probe_needs_no_name_resolved(self):
+        # The box resolves through the gateway, so a probe by name would read a
+        # dead gateway DNS as dead egress, and the two could never be told apart.
+        self.fields(self.status())
+        url = self.curl_argv.read_text().splitlines()[-1]
+        host = urllib.parse.urlsplit(url).hostname
+        ipaddress.ip_address(host)
 
     def test_a_healthy_box_reports_every_key(self):
         result = self.status()
@@ -803,7 +830,7 @@ class TestStatusBlock(GuestScript):
             },
         )
         argv = self.dig_argv.read_text().split("\n")
-        self.assertEqual(argv[-4:-1], ["@192.168.5.2", ".", "NS"])
+        self.assertEqual(argv[-4:-1], ["@192.168.5.2", "github.com", "A"])
 
     def test_a_unit_state_is_reported_as_systemctl_says_it(self):
         self.set_unit("yolobox-egress", "failed")
@@ -842,7 +869,7 @@ class TestStatusBlock(GuestScript):
 
     def test_a_value_is_cut_at_its_first_newline_so_it_cannot_forge_a_key(self):
         (self.stamps / "version").write_text("2.0.0\ninternet=ok\n")
-        fields = self.fields(self.status(curl_rc=6))
+        fields = self.fields(self.status(curl_rc=7, curl_out="000"))
         self.assertEqual(fields["version"], "2.0.0")
         self.assertEqual(fields["internet"], "dead")
 
@@ -854,23 +881,82 @@ class TestStatusBlock(GuestScript):
                 )
                 self.assertEqual(fields["rootfs_full"], word)
 
-    def test_a_dns_error_reply_still_proves_the_gateway_answers(self):
-        fields = self.fields(self.status(dig_out=DNS_SERVFAIL, dig_rc=0))
-        self.assertEqual(fields["gateway_dns"], "ok")
+    def test_a_gateway_that_answers_without_an_address_is_dead(self):
+        # Lima's gateway answers some questions itself while a name it must
+        # ask the host for can fail: only a resolved address proves lookups work.
+        for out in ("", "lb.example.net.\n", "a.example.\nb.example.net.\n"):
+            with self.subTest(out=out):
+                fields = self.fields(self.status(dig_out=out, dig_rc=0))
+                self.assertEqual(fields["gateway_dns"], "dead")
+
+    def test_a_dig_answer_with_no_name_is_unknown_with_digs_words(self):
+        for out, rc, said in (
+            ("lizard\n", 0, "lizard"),
+            # A refusal only counts as dig's own `;;` line.
+            ("connection refused\n", 0, "connection refused"),
+            ("140.82.121\n", 0, "140.82.121"),
+            ("dig: bad\nx\n", 10, "dig: bad x"),
+        ):
+            with self.subTest(out=out):
+                fields = self.fields(self.status(dig_out=out, dig_rc=rc))
+                self.assertEqual(
+                    fields["gateway_dns"], "unknown: dig exited %d: %s" % (rc, said)
+                )
+
+    def test_the_tools_whose_words_it_reads_run_in_the_c_locale(self):
+        # A translated dig would print its no-reply line in other words.
+        seen = self.tmp / "dig-locale"
+        self.fake(
+            "dig",
+            '#!/bin/sh\nprintf %%s "${LC_ALL-unset}" > %s\nprintf "1.2.3.4\\n"\n'
+            % shlex.quote(str(seen)),
+        )
+        self.env.update(LC_ALL="fr_FR.UTF-8", LANG="fr_FR.UTF-8")
+        self.assertEqual(self.fields(self.status())["gateway_dns"], "ok")
+        self.assertEqual(seen.read_text(), "C")
 
     def test_a_gateway_that_sends_no_reply_is_dead_whatever_dig_exits(self):
         # bind9 #3235 and #3615: exit 0 on an ICMP unreachable.
         for out, rc in (
             (";; no servers could be reached\n", 9),
             (";; Connection refused\n", 0),
+            (";; communications error to 192.168.5.2#53: timed out\n", 0),
+            # bind 9.18 and later, in lower case; the egress table's ICMP answer.
+            (";; communications error to 192.168.5.2#53: connection refused\n", 0),
+            (";; communications error to 192.168.5.2#53: host unreachable\n", 0),
+            (";; communications error to 192.168.5.2#53: Host Unreachable\n", 9),
         ):
             with self.subTest(out=out, rc=rc):
                 fields = self.fields(self.status(dig_out=out, dig_rc=rc))
                 self.assertEqual(fields["gateway_dns"], "dead")
 
-    def test_egress_that_fails_is_dead_whatever_the_gateway_does(self):
-        fields = self.fields(self.status(curl_rc=6))
-        self.assertEqual((fields["internet"], fields["gateway_dns"]), ("dead", "ok"))
+    def test_egress_that_cannot_connect_or_times_out_is_dead(self):
+        for rc, err in (
+            (7, "curl: (7) Failed to connect"),
+            (28, "curl: (28) timed out"),
+        ):
+            with self.subTest(rc=rc):
+                fields = self.fields(
+                    self.status(curl_rc=rc, curl_out="000", curl_err=err)
+                )
+                self.assertEqual(
+                    (fields["internet"], fields["gateway_dns"]), ("dead", "ok")
+                )
+
+    def test_any_other_curl_answer_is_unknown_with_curls_words(self):
+        for rc, out, err, said in (
+            (35, "000", "curl: (35) TLS alert\n", "curl: (35) TLS alert 000"),
+            (127, "", "curl: not found\n", "curl: not found"),
+            (0, "lizard", "", "lizard"),
+            (0, "000", "", "000"),
+        ):
+            with self.subTest(rc=rc, out=out):
+                fields = self.fields(
+                    self.status(curl_rc=rc, curl_out=out, curl_err=err)
+                )
+                self.assertEqual(
+                    fields["internet"], "unknown: curl exited %d: %s" % (rc, said)
+                )
 
     def test_the_root_disk_is_full_just_below_64_mib_free_for_root_and_not_at_64(self):
         blocks_64_mib = 64 * 1024 * 1024 // 4096
@@ -947,8 +1033,8 @@ class RebuildCase(GuestScript):
         self.stamps = self.tmp / "stamps"
         self.stamps.mkdir()
         self.sudo_argv = self.tmp / "sudo-argv"
+        self.write_facts(flake_ref_stamp=str(self.stamps / "flake-ref"))
         self.env.update(
-            YOLOBOX_STAMPS=str(self.stamps),
             FAKE_SUDO_ARGV=str(self.sudo_argv),
             FAKE_USER="alice",
             FAKE_HOSTNAME="yolobox-e2e",
@@ -1038,7 +1124,7 @@ printf '%s %s %s\\n' "$YOLOBOX_USERNAME" "$YOLOBOX_HOSTNAME" "$YOLOBOX_FLAKE_REF
 """
 
 
-@unittest.skipUnless(shutil.which("flock"), "needs flock")
+@needs_tool("flock")
 class TestRebuildLock(RebuildCase):
     """With the real flock, a rebuild runs only while no other holds the lock."""
 

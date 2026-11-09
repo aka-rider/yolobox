@@ -8,13 +8,12 @@ forwards. Only libvirt.py imports this module.
 
 from __future__ import annotations
 
-import os
 import pwd
 import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from . import proc, ui
 from .config import FACTS, KIB, MAX_PORT, SCRIPT_DIR
@@ -41,23 +40,14 @@ def host_setup_hint() -> str:
     return "run: sudo bash %s" % (SCRIPT_DIR / "linux" / "host-setup.sh")
 
 
-def virsh_env() -> Dict[str, str]:
-    # virsh translates what it prints (`domstate` says "laufend" under de_DE),
-    # and yo parses it, so every virsh runs in the C locale.
-    return dict(os.environ, LC_ALL="C")
-
-
 def virsh(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
-    return proc.run(
-        ["virsh", "-c", LIBVIRT_URI, *args], check=check, env=virsh_env(), **kwargs
-    )
+    return proc.run(["virsh", "-c", LIBVIRT_URI, *args], check=check, **kwargs)
 
 
 def spawn_virsh(*args: str) -> subprocess.Popen:
     """A virsh that outlives the call (`virsh event`), text on both pipes."""
     return proc.spawn(
         ["virsh", "-c", LIBVIRT_URI, *args],
-        env=virsh_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -181,19 +171,30 @@ def vm_account() -> Tuple[int, int]:
 
 
 LISTENER_UID_RE = re.compile(r"\buid:(\d+)\b")
+LISTENER_INODE_RE = re.compile(r"\bino:\d+\b")
 
 
 def listener_uids(ss_output: str) -> List[int]:
     """The owner uid of each socket in `ss -ltnHe` output (root is not needed).
 
-    ss prints no `uid:` for a root-owned socket, so a line without one is root's.
+    ss's -e details always carry `ino:`, and `uid:` only for an owner that is
+    not root, so a line with its `ino:` and no `uid:` is root's. A line without
+    the details is an answer yo has no name for, and an error showing it.
     """
     uids = []
     for line in ss_output.splitlines():
         if not line.strip():
             continue
         found = LISTENER_UID_RE.search(line)
-        uids.append(int(found.group(1)) if found is not None else 0)
+        if found is not None:
+            uids.append(int(found.group(1)))
+        elif LISTENER_INODE_RE.search(line) is not None:
+            uids.append(0)
+        else:
+            raise YoError(
+                "`ss -ltnHe` printed a listener without its details (no ino:), so "
+                "yo cannot tell who owns it: %s" % ui.shown(line.strip())
+            )
     return uids
 
 

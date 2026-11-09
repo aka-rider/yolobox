@@ -3,24 +3,20 @@
 from __future__ import annotations
 
 import base64
-import contextlib
-import errno
 import hashlib
 import json
 import os
 import re
-import socket
 import string
 import subprocess
-import tempfile
 import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from typing import (
     Callable,
+    ContextManager,
     Dict,
-    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -31,7 +27,6 @@ from typing import (
 from . import (
     agent,
     aws,
-    common,
     config,
     driver,
     forwards,
@@ -49,7 +44,6 @@ from .config import (
     GIB,
     KIB,
     LOOPBACK,
-    MIN_DISK_GIB,
     MIN_MEMORY_GIB,
     OPERATOR_GUEST_UID,
     OPERATOR_HOME_SUFFIX,
@@ -109,7 +103,6 @@ STATE_REMEDIES = {
     "paused": ("resume", "resume"),
     "pmsuspended": ("wake", "dompmwakeup"),
 }
-PORT_LOCK_NAME = ".port.lock"
 # In the instance directory: what the template is filled in with, kept so every
 # start defines the same domain (libvirt refuses a new uuid under a known name).
 DOMAIN_FACTS_NAME = "domain.json"
@@ -125,7 +118,6 @@ SEED_SHA512 = (
 SEED_CHUNK_BYTES = 1 << 20
 SEED_CONNECT_TIMEOUT = 60
 CIDATA_FILES = ("user-data", "meta-data", "lima.env", "etc_environment")
-MASTER_PID_RE = re.compile(r"Master running \(pid=(\d+)\)")
 SIZE_LINE_RE = re.compile(r"^(Capacity|Allocation):\s+(\d+) bytes\s*$", re.M)
 MAX_MEMORY_LINE_RE = re.compile(r"^Max memory:\s+(\d+) KiB\s*$", re.M)
 
@@ -172,38 +164,21 @@ def domain_name() -> str:
     return state.box.vm_name
 
 
+# The record of building the disk volume (disk_volume_built): written before
+# the volume is created, and again once it is uploaded and resized.
+DISK_BUILDING, DISK_BUILT = "building", "built"
+
+
+def disk_record_path() -> str:
+    return os.path.join(state.instance_dir(), "disk-volume")
+
+
 def disk_volume() -> str:
     return state.box.vm_name + ".qcow2"
 
 
 def cidata_volume() -> str:
     return state.box.vm_name + "-cidata.iso"
-
-
-def loopback_port_bound(port: int) -> bool:
-    """Whether something already holds 127.0.0.1:port (a bind probe)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        try:
-            probe.bind((LOOPBACK, port))
-        except OSError as failure:
-            if failure.errno == errno.EADDRINUSE:
-                return True
-            raise YoError(
-                "cannot probe %s:%d: %s" % (LOOPBACK, port, ui.os_error_reason(failure))
-            )
-    return False
-
-
-def lowest_free_port(
-    window: range, taken: Sequence[int], is_bound: Callable[[int], bool]
-) -> int:
-    for port in window:
-        if port not in taken and not is_bound(port):
-            return port
-    raise YoError(
-        "no free host port in %d-%d: every one is bound or belongs to a box; stop a "
-        "box or end a forward" % (window.start, window[-1])
-    )
 
 
 def domain_size(new_box: NewBox) -> BoxSize:
@@ -280,26 +255,23 @@ def file_sha512(path: str) -> str:
 
 
 def download_seed(path: str) -> None:
-    """Download the seed to `path`, through a file of its own, checked before it is moved."""
-    fd, part = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".part")
+    """Download the seed to `path`, which it reaches only checked and whole."""
+    digest = hashlib.sha512()
     try:
-        with os.fdopen(fd, "wb") as handle:
+        with proc.atomic_file(path, FILE_MODE_PRIVATE) as handle:
             with urllib.request.urlopen(
                 SEED_URL, timeout=SEED_CONNECT_TIMEOUT
             ) as reply:
                 for chunk in iter(lambda: reply.read(SEED_CHUNK_BYTES), b""):
+                    digest.update(chunk)
                     handle.write(chunk)
-        digest = file_sha512(part)
-        if digest != SEED_SHA512:
-            raise YoError(
-                "the download of %s has sha512 %s, not the pinned %s"
-                % (SEED_URL, digest, SEED_SHA512)
-            )
-        os.replace(part, path)
+            if digest.hexdigest() != SEED_SHA512:
+                raise YoError(
+                    "the download of %s has sha512 %s, not the pinned %s"
+                    % (SEED_URL, digest.hexdigest(), SEED_SHA512)
+                )
     except (urllib.error.URLError, OSError) as failure:
         raise YoError("cannot download %s: %s" % (SEED_URL, failure))
-    finally:
-        proc.remove_file(part)
 
 
 def ensure_seed() -> str:
@@ -422,7 +394,7 @@ def state_hint(domain_state: str) -> Optional[str]:
 
 
 def virsh_removal(what: str, *args: str) -> Removal:
-    def remove() -> None:
+    def remove(held: state.HeldBox) -> None:
         libvirt_host.virsh(*args)
 
     return Removal(what, remove)
@@ -552,45 +524,30 @@ class LibvirtDriver:
             for root in domain_roots()
             for port in libvirt_host.forwarded_host_ports(root)
         ]
-        return lowest_free_port(
-            libvirt_host.read_port_window(), taken, loopback_port_bound
+        return driver.lowest_free_port(
+            libvirt_host.read_port_window(), taken, driver.loopback_port_bound
         )
 
-    @contextlib.contextmanager
-    def port_lock(self) -> Iterator[None]:
-        """Hold the host-wide lock that makes picking a port and taking it one step.
-
-        Two `yo` processes would otherwise both pick the lowest free port, and
-        one of the two forwards would fail or, worse, land on the other's port.
-        """
-        directory = os.path.join(state.home(), self.instances_dir)
-        with common.held_flock(os.path.join(directory, PORT_LOCK_NAME), wait=True):
-            yield
+    def port_lock(self) -> ContextManager[None]:
+        return driver.port_lock(os.path.join(state.home(), self.instances_dir))
 
     def forward_port(self, guest_port: int) -> int:
         forwards.ensure_session()
         with self.port_lock():
             host_port = self.allocate_host_port()
             proc.run(
-                sshx.ssh_argv(
+                sshx.control_argv(
                     OPERATOR,
-                    "-O",
                     "forward",
                     "-L",
                     "%s:%d:%s:%d" % (LOOPBACK, host_port, LOOPBACK, guest_port),
-                    state.box.vm_host,
-                    mux=True,
                 ),
                 check=True,
             )
         return host_port
 
     def keepalive_pid(self) -> Optional[int]:
-        check = proc.run(
-            sshx.ssh_argv(OPERATOR, "-O", "check", state.box.vm_host, mux=True)
-        )
-        found = MASTER_PID_RE.search(check.stderr + check.stdout)
-        return aws.checked_pid(int(found.group(1))) if found else None
+        return aws.checked_pid(sshx.master_pid(OPERATOR))
 
     def vm_status(self) -> Optional[VmStatus]:
         if not self.domain_exists():
@@ -624,7 +581,7 @@ class LibvirtDriver:
         if size.disk_gib is None or not self.volume_exists(disk_volume()):
             return None
         capacity = self.volume_sizes()["Capacity"]
-        if not self.disk_volume_finished(capacity) or capacity == size.disk_gib * GIB:
+        if not self.disk_volume_built() or capacity == size.disk_gib * GIB:
             return None
         if size.disk_gib * GIB > capacity:
             way = (
@@ -649,7 +606,8 @@ class LibvirtDriver:
 
     def verify_initrd_listener(self, port: int) -> None:
         # No listener at all is fine: ssh finds nothing and the passphrase goes
-        # nowhere. Any listener on the port must be the domain's passt.
+        # nowhere, and root_argv() checks again right before ssh dials, so a
+        # port taken after the gate is caught. Any listener must be passt's.
         listing = proc.run(["ss", "-ltnHe", "sport = :%d" % port], check=True).stdout
         uid, _ = libvirt_host.vm_account()
         strangers = [
@@ -723,25 +681,40 @@ class LibvirtDriver:
                 failure.code,
             )
 
-    def disk_volume_finished(self, capacity: int) -> bool:
-        """Whether the existing disk volume, of `capacity` bytes, was uploaded
-        and resized.
-
-        The volume is created at the seed's 4.7 GiB, and only the last step,
-        the resize after a successful upload, takes it to `MIN_DISK_GIB` or
-        more, the floor no box is created below. A smaller volume is one an
-        earlier run did not finish (a Ctrl-C, a failed upload or resize).
-        """
-        return capacity >= MIN_DISK_GIB * GIB
+    def disk_volume_built(self) -> bool:
+        """Whether the existing disk volume holds a finished disk, as the record
+        this host's yo writes in the instance directory says: BUILDING before
+        the volume is created, BUILT once it is uploaded and resized. BUILDING
+        is a volume an earlier run did not finish (a Ctrl-C, a failed upload or
+        resize). No record, or another word, is an error: a volume yo cannot
+        account for may hold a disk, and is never deleted on a guess."""
+        record = proc.read_text_file(disk_record_path(), errors="surrogateescape")
+        word = (record or "").strip()
+        if word in (DISK_BUILT, DISK_BUILDING):
+            return word == DISK_BUILT
+        raise YoError(
+            "volume %s exists, but %s, so yo cannot tell whether it holds a "
+            "finished disk — recreate the box, which deletes the volume: %s"
+            % (
+                disk_volume(),
+                "this host's yo has no record of building it"
+                if record is None
+                else "the record of building it says '%s'" % ui.shown(word),
+                self.recreate_command(NO_SIZE),
+            )
+        )
 
     def ensure_disk_volume(self, disk_gib: int) -> None:
         """Make the disk volume exist, uploaded and resized to `disk_gib`, or fail.
 
         A finished volume is adopted as it is; an unfinished one is rebuilt.
         """
-        if self.volume_exists(disk_volume()):
-            if self.disk_volume_finished(self.volume_sizes()["Capacity"]):
-                return
+        exists = self.volume_exists(disk_volume())
+        if exists and self.disk_volume_built():
+            return
+        proc.private_dir(state.instance_dir())
+        proc.atomic_write(disk_record_path(), DISK_BUILDING + "\n", FILE_MODE_PRIVATE)
+        if exists:
             ui.err(
                 "yo: volume %s was never finished; deleting it to build it again"
                 % disk_volume()
@@ -752,6 +725,7 @@ class LibvirtDriver:
         libvirt_host.virsh(
             "vol-resize", "--pool", LIBVIRT_POOL, disk_volume(), "%dG" % disk_gib
         )
+        proc.atomic_write(disk_record_path(), DISK_BUILT + "\n", FILE_MODE_PRIVATE)
 
     def sync_cidata(self, files: Dict[str, str]) -> None:
         """Make the pool's cidata volume carry `files`; rebuilt only on change.
@@ -828,9 +802,38 @@ class LibvirtDriver:
     def recreate_command(self, size: Size) -> str:
         return state.recreate_chain(flags=size.flags())
 
-    def start(self, passphrase: bytes, new_box: Optional[NewBox]) -> None:
+    def create(self, held: state.HeldBox, new_box: NewBox) -> None:
+        size = domain_size(new_box)
+        cidata = self.cidata()
+        self.ensure_disk_volume(size.disk_gib)
+        self.sync_cidata(cidata)
+        # The port is chosen last: the volume upload above is slow, and the port
+        # lock is held from choosing until the domain claims the port.
+        self.create_domain(size.memory_gib, size.cpus)
+
+    def start_refusal(self) -> Optional[str]:
+        # Only a start needs passt to bind its socket, so only a start is
+        # refused for the directory's ACL; down, ssh and status work without it.
+        # start_domain() reads it again should another domain's start narrow it.
+        return libvirt_host.passt_dir_gap()
+
+    def start(self, held: state.HeldBox, passphrase: Callable[[], bytes]) -> None:
+        self.sync_cidata(self.cidata())
+        facts = self.domain_facts()
+        # A stopped domain is always what this yo's template makes; a domain
+        # that is up keeps the definition it runs.
+        if self.domain_state() == STATE_OFF:
+            self.define_domain(facts)
+        # libvirt starts no foreground process: the domain is Running as soon as
+        # `virsh start` returns, and unlock_disk judges it by its state alone.
+        self.start_domain()
+        unlock.unlock_disk(held, passphrase)
+        unlock.wait_for_operator()
+
+    def cidata(self) -> Dict[str, str]:
+        """The cidata files, from the operator's key, whose public half is
+        written beside the instance first."""
         public_key = public_key_line(self.operator_key())
-        files = cidata_files(release.host_user(), public_key, state.box.name)
         proc.private_dir(state.instance_dir())
         # 0600 though it is public: when the agent is gone, ssh tries the
         # IdentityFile as a private key and warns UNPROTECTED PRIVATE KEY FILE
@@ -840,30 +843,7 @@ class LibvirtDriver:
             public_key + "\n",
             FILE_MODE_PRIVATE,
         )
-        created = None if new_box is None else domain_size(new_box)
-        if created is not None:
-            self.ensure_disk_volume(created.disk_gib)
-        self.sync_cidata(files)
-        # The port is chosen last: the volume upload above is slow, and the port
-        # lock is held from choosing until the domain claims the port.
-        if created is not None:
-            facts = self.create_domain(created.memory_gib, created.cpus)
-        else:
-            facts = self.domain_facts()
-            # A stopped domain is always what this yo's template makes; a
-            # domain that is up keeps the definition it runs.
-            if self.domain_state() == STATE_OFF:
-                self.define_domain(facts)
-        # Only a start needs passt to bind its socket, so only a start is
-        # refused for the directory's ACL; down, ssh and status work without it.
-        gap = libvirt_host.passt_dir_gap()
-        if gap is not None:
-            raise YoError(gap)
-        self.start_domain()
-        # libvirt starts no foreground process: the domain is Running as soon as
-        # `virsh start` returns, and unlock_disk judges it by its state alone.
-        unlock.unlock_disk(passphrase)
-        unlock.wait_for_operator()
+        return cidata_files(release.host_user(), public_key, state.box.name)
 
     def start_domain(self) -> None:
         """`virsh start`, tried once more when passt could not bind its socket.
@@ -884,7 +864,7 @@ class LibvirtDriver:
             raise YoError(gap)
         libvirt_host.virsh("start", domain_name())
 
-    def stop(self) -> None:
+    def stop(self, held: state.HeldBox) -> None:
         if not self.domain_exists():
             raise YoError("domain %s does not exist" % domain_name())
         domain_state = self.domain_state()
@@ -925,18 +905,18 @@ class LibvirtDriver:
                 watcher.terminate()
             watcher.communicate()
 
-    def force_stop(self) -> None:
+    def force_stop(self, held: state.HeldBox) -> None:
         self.require_domain()
         if self.domain_state() != STATE_OFF:
             libvirt_host.virsh("destroy", domain_name())
 
-    def undefine_domain(self) -> None:
+    def undefine_domain(self, held: state.HeldBox) -> None:
         """Remove the definition, after powering the domain off if it is active now.
 
         The state is read here, not when the steps were listed: a `yo up` can
         start the domain in between, and undefining a running one leaves qemu
         on the volume the next step deletes."""
-        self.force_stop()
+        self.force_stop(held)
         libvirt_host.virsh("undefine", "--nvram", domain_name())
 
     def require_stoppable(self, domain_state: str) -> None:
@@ -997,7 +977,7 @@ class LibvirtDriver:
             )
         return YoError(proc.failed_message("virsh event", code, stderr.strip()))
 
-    def close_master(self) -> None:
+    def close_master(self, held: state.HeldBox) -> None:
         sshx.stop_master(
             OPERATOR,
             "%s's ssh master is still running after `ssh -O exit`" % state.box.name,
@@ -1060,7 +1040,7 @@ class LibvirtDriver:
         allocation = self.volume_sizes()["Allocation"]
         return "pool %s volume %s" % (LIBVIRT_POOL, disk_volume()), allocation // KIB
 
-    def grow_disk(self, wanted_gib: int) -> None:
+    def grow_disk(self, held: state.HeldBox, wanted_gib: int) -> None:
         # qemu holds the image of a running domain open, so only a stopped one
         # is resized.
         domain_state = self.domain_state()

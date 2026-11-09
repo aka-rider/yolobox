@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import os
 import posixpath
-import shlex
 import shutil
 import stat
 import subprocess
@@ -461,11 +460,10 @@ def fetch_guest_sources(sources: Sequence[str], staging: str) -> None:
     # member and does not write through a symlink. Each stderr goes to a file,
     # because a pipe would need a reader for the process not to block on it.
     excluded = guest_build_output(sources)
-    guest_command = shlex.join(guest_tar_argv(sources, excluded))
     with tempfile.TemporaryFile() as guest_said, tempfile.TemporaryFile() as tar_said:
         unpack = host_tar_unpack_argv(staging)
         ssh = proc.spawn(
-            sshx.ssh_argv(AGENT, "-n", state.box.vm_host, guest_command),
+            sshx.guest_argv(AGENT, guest_tar_argv(sources, excluded), stdin=False),
             stdout=subprocess.PIPE,
             stderr=guest_said,
         )

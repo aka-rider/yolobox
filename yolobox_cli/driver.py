@@ -2,16 +2,29 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
+import errno
 import os
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional, Protocol, Tuple
+import socket
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
-from .config import GIB
+from . import common, ui
+from .config import GIB, LOOPBACK
 from .ui import YoError
 
 if TYPE_CHECKING:
-    # Only for the annotation: agent imports state, which imports this module.
-    from . import agent
+    from .state import HeldBox
 
 
 class StopRefused(YoError):
@@ -137,11 +150,12 @@ class Removal(NamedTuple):
     """One piece of a machine `yo destroy` removes: what it is, and the way to remove it.
 
     `what` reads as an action ("delete volume X"), because the same line is
-    printed before a --yes run and as each step of it.
+    printed before a --yes run and as each step of it. Listing the pieces
+    changes nothing; removing one runs under the box lock, which `remove` takes.
     """
 
     what: str
-    remove: Callable[[], None]
+    remove: Callable[[HeldBox], None]
 
 
 class VmState(enum.Enum):
@@ -202,17 +216,19 @@ class Driver(Protocol):
     def vm_status(self) -> Optional[VmStatus]: ...  # None: no such instance
     # Why start() will not create the instance, at that size.
     def creation_refusal(self, size: Size) -> Optional[str]: ...
+    # Why start() will not start it on this host, read before anything changes.
+    def start_refusal(self) -> Optional[str]: ...
     # The disk ceiling of the instance that exists, in whole GiB, read from the
     # host (YoError when it cannot be read).
     def disk_gib(self) -> int: ...
     def verify_initrd_listener(self, port: int) -> None: ...  # YoError: not the VM's
-    # Start, unlock, operator's ssh. `new_box` is the size of the instance
-    # this start creates; None: the instance exists.
-    def start(
-        self, passphrase: agent.Passphrase, new_box: Optional[NewBox]
-    ) -> None: ...
-    def stop(self) -> None: ...  # YoError when it will not stop
-    def force_stop(self) -> None: ...  # a hard power-off, for an initrd box
+    # Create the instance at `new_box` from the seed image, stopped.
+    def create(self, held: HeldBox, new_box: NewBox) -> None: ...
+    # Start the instance, unlock its disk with `passphrase()` should an initrd
+    # ask, and wait for the operator's ssh, under the box lock.
+    def start(self, held: HeldBox, passphrase: Callable[[], bytes]) -> None: ...
+    def stop(self, held: HeldBox) -> None: ...  # YoError when it will not stop
+    def force_stop(self, held: HeldBox) -> None: ...  # a hard power-off
     # What of this machine the driver holds and `yo destroy` removes, in the order
     # to remove it. Only what exists is listed, so a machine with nothing left
     # gives [].
@@ -222,7 +238,50 @@ class Driver(Protocol):
     def show_status(self) -> Optional[str]: ...
     def disk_image(self) -> Optional[Tuple[str, int]]: ...  # label and host KiB
     # Raise the disk's ceiling. The VM must be off, and it stays off.
-    def grow_disk(self, wanted_gib: int) -> None: ...
+    def grow_disk(self, held: HeldBox, wanted_gib: int) -> None: ...
     # The one remedy for a box that must be made anew, to paste: destroy it,
-    # then bootstrap it at `size` (and whatever creation needs between the two).
+    # then bootstrap it at `size`, which creates it.
     def recreate_command(self, size: Size) -> str: ...
+
+
+# In the directory of every instance: the lock that makes picking a host
+# port and taking it one step.
+PORT_LOCK_NAME = ".port.lock"
+
+
+@contextlib.contextmanager
+def port_lock(instances_dir: str) -> Iterator[None]:
+    """Hold the host-wide lock in `instances_dir` that makes picking a port and
+    taking it one step.
+
+    Two `yo` processes would otherwise both pick the lowest free port, and
+    one of the two would fail or, worse, land on the other's port.
+    """
+    with common.held_flock(os.path.join(instances_dir, PORT_LOCK_NAME), wait=True):
+        yield
+
+
+def loopback_port_bound(port: int) -> bool:
+    """Whether something already holds 127.0.0.1:port (a bind probe)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((LOOPBACK, port))
+        except OSError as failure:
+            if failure.errno == errno.EADDRINUSE:
+                return True
+            raise YoError(
+                "cannot probe %s:%d: %s" % (LOOPBACK, port, ui.os_error_reason(failure))
+            )
+    return False
+
+
+def lowest_free_port(
+    window: range, taken: Sequence[int], is_bound: Callable[[int], bool]
+) -> int:
+    for port in window:
+        if port not in taken and not is_bound(port):
+            return port
+    raise YoError(
+        "no free host port in %d-%d: every one is bound or belongs to a box; stop a "
+        "box or end a forward" % (window.start, window[-1])
+    )

@@ -46,7 +46,7 @@
         else u;
       # The box's hostname, and with it the tailnet node name, is the one
       # input that is optional: unset or empty means "yolobox", so CI and a
-      # bare `nix flake check` evaluate without it. `yo` sets it per machine
+      # bare `nix eval` of the box evaluate without it. `yo` sets it per machine
       # (-m NAME gives yolobox-NAME). A set value must be one RFC 1123 label,
       # lowercase, because it reaches the kernel, DHCP and tailscale.
       hostname =
@@ -68,7 +68,7 @@
       guestSystem =
         let s = builtins.currentSystem;
         in if builtins.elem s linuxSystems then s
-        else throw "the box builds for aarch64-linux or x86_64-linux, not ${s} — pass --system aarch64-linux (Apple silicon) or --system x86_64-linux (Intel Mac) when evaluating on a Mac";
+        else throw "the box builds for aarch64-linux or x86_64-linux, not ${s} — pass --eval-system aarch64-linux (Apple silicon) or --eval-system x86_64-linux (Intel Mac) when evaluating on a Mac";
     in {
       packages = forAllSystems (system:
         let

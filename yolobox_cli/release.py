@@ -26,12 +26,14 @@ GIT_REF_RE = re.compile(GIT_REF_PATTERN)
 GITHUB_FLAKE_RE = re.compile(
     r"github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/%s" % GIT_REF_PATTERN
 )
+# What YO_VERSION and YO_SOURCE_REV hold in a yo no build stamped: a checkout's.
+UNRELEASED = "dev"
 
 
 def version_drift(host: str, guest: str) -> Optional[str]:
     """Why the box should be bootstrapped again, or None: it was built by another
-    version than this yo."""
-    if guest != host:
+    version than this yo. An unreleased yo (`dev`) has no version to compare."""
+    if host != UNRELEASED and guest != host:
         return "yo: the box was built by %s and this yo is %s — run %s" % (
             guest,
             host,
@@ -67,9 +69,9 @@ def own_release_ref() -> Optional[str]:
     built from main while its .version names the last release: building that
     tag would give a box of another tree than the yo, and `yo status` would
     report a skew no bootstrap can fix."""
-    if config.YO_SOURCE_REV != "dev":
+    if config.YO_SOURCE_REV != UNRELEASED:
         return "%s/%s" % (UPSTREAM_FLAKE, config.YO_SOURCE_REV)
-    if config.YO_VERSION == "dev":
+    if config.YO_VERSION == UNRELEASED:
         return None
     return "%s/v%s" % (UPSTREAM_FLAKE, config.YO_VERSION)
 

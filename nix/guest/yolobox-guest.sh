@@ -19,6 +19,10 @@
 # shellcheck source=/dev/null
 . "${YOLOBOX_FACTS:-/etc/yolobox/facts.sh}"
 
+# The subcommands read the words curl, dig, sudo, systemctl and the rest print,
+# and yo reads theirs: a translated tool would say something else.
+export LC_ALL=C
+
 # The project walk's and the Go-cache walk's pruned directory names: a repo
 # inside node_modules is not a project. gc --deep walks these names too, plus
 # REMOVED_OUTRIGHT, and `yo cp` downloads drop both lists on the host side.
@@ -42,11 +46,6 @@ LOCAL_CACHES=(go-build gopls goimports golangci-lint staticcheck uv pip pip-tool
 
 # What `go` writes as the first line of a build cache's README.
 GO_BUILD_CACHE_HEADER='This directory holds cached build artifacts from the Go build system.'
-
-# Where nix/base.nix stamps the version and the exact tree that built the box
-# (version, flake-ref).
-# The YOLOBOX_STAMPS override is a test seam.
-YOLOBOX_STAMPS="${YOLOBOX_STAMPS:-/etc/yolobox}"
 
 # Exits 2 with SUB's usage line unless exactly COUNT arguments follow. Every
 # subcommand goes through it, so an argument it does not take is refused
@@ -768,26 +767,77 @@ cmd_aws_check() {
     [ "${failed}" = 0 ] || exit 1
 }
 
-# The one egress probe: status classifies by it. Exits nonzero on every
-# failure: a missing curl (127), a timeout (curl's 28) or a refused fetch. The
-# caller reads nonzero as dead, so a probe that cannot run is never a pass.
-EGRESS_PROBE_URL=https://github.com
+# The one egress probe. It prints the word status reports: ok when curl
+# reached the address and got an HTTP status back (its %{http_code}), dead when
+# curl says it could not connect (exit 7) or timed out (exit 28), and any other
+# answer as `unknown:` with curl's own words, so a missing curl, a TLS failure
+# or a code it never prints is shown, never read as either. An address, not a
+# name: the box resolves through the gateway, so a probe by name dies with the
+# gateway's DNS and egress could never be told apart from it.
+EGRESS_PROBE_URL=https://1.1.1.1
 EGRESS_PROBE_SECONDS=5
 
 probe_egress() {
-    curl -sS -o /dev/null --max-time "${EGRESS_PROBE_SECONDS}" "${EGRESS_PROBE_URL}" 2>/dev/null
+    local out rc=0
+    out=$(curl -sS -o /dev/null -w '%{http_code}' --max-time "${EGRESS_PROBE_SECONDS}" "${EGRESS_PROBE_URL}" 2>&1) || rc=$?
+    if [ "${rc}" = 0 ] && [[ ${out} =~ ^[1-5][0-9][0-9]$ ]]; then
+        echo ok
+    elif [ "${rc}" = 7 ] || [ "${rc}" = 28 ]; then
+        echo dead
+    else
+        echo "unknown: curl exited ${rc}: ${out//$'\n'/ }"
+    fi
 }
 
-# Succeeds only if a DNS reply arrived. `dig` prints its ->>HEADER<<- line
-# exactly when one did, whatever the reply's status, so that line is the
-# answer. dig's exit code is not: bind9 reports 0 on an ICMP unreachable or a
-# reset connection (isc-projects/bind9 #3235, #3615). The reply is captured
-# first, because `grep -q` closing the pipe early would hand dig a SIGPIPE
-# that pipefail turns into a failed probe.
+# The gateway's DNS probe, printing the word status reports. ok when the
+# gateway resolved a real name to an address. Lima's gateway answers some
+# questions itself while a name it must ask the host for can time out, so only
+# a resolved address proves lookups work. dead when the gateway answered with
+# no address (nothing, or a CNAME chain alone) or dig says no reply came; any
+# other answer is `unknown:` with dig's words. dig's exit code says nothing:
+# bind9 reports 0 on an ICMP unreachable or a reset connection
+# (isc-projects/bind9 #3235, #3615), and +short prints its errors as ;; lines
+# on stdout.
+GATEWAY_DNS_PROBE_NAME=github.com
+
+# Whether a line of dig's is its word for a question no server answered: `;;
+# no servers could be reached`, or bind 9.18's `;; communications error to
+# ADDR#53:` and `timed out`, `connection refused` or `host unreachable` (the
+# egress table's ICMP answer). The case differs across bind versions, so it is
+# matched without it.
+dig_no_reply() {
+    local found=1
+    shopt -s nocasematch
+    case "$1" in
+    ';;'*'timed out'* | ';;'*'no servers could be reached'* | ';;'*'connection refused'* | ';;'*'unreachable'*)
+        found=0
+        ;;
+    esac
+    shopt -u nocasematch
+    return "${found}"
+}
+
 probe_gateway_dns() {
-    local reply
-    reply=$(dig +time=2 +tries=1 "@${YOLOBOX_GATEWAY}" . NS 2>&1) || true
-    [[ "${reply}" == *'->>HEADER<<-'* ]]
+    local reply line rc=0 address=0 unnamed=0
+    reply=$(dig +short +time=2 +tries=1 "@${YOLOBOX_GATEWAY}" "${GATEWAY_DNS_PROBE_NAME}" A 2>&1) || rc=$?
+    while IFS= read -r line; do
+        if [[ ${line} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            address=1
+        elif [ -z "${line}" ] || [[ ${line} =~ ^([A-Za-z0-9-]+\.)+$ ]]; then
+            :
+        elif dig_no_reply "${line}"; then
+            :
+        else
+            unnamed=1
+        fi
+    done <<<"${reply}"
+    if [ "${address}" = 1 ]; then
+        echo ok
+    elif [ "${unnamed}" = 0 ]; then
+        echo dead
+    else
+        echo "unknown: dig exited ${rc}: ${reply//$'\n'/ }"
+    fi
 }
 
 # Free space on / below which status reports the disk full. `stat -f` counts
@@ -873,9 +923,9 @@ rootfs_full() {
 # resolv.conf, which would otherwise be blamed on the network.
 cmd_status() {
     want_args status 'status (takes no arguments)' 0 "$@"
-    local unit free_mib rootdisk='' internet=dead gateway_dns=dead
-    field version "$(cat "${YOLOBOX_STAMPS}/version" 2>/dev/null || true)"
-    field flake_ref "$(cat "${YOLOBOX_STAMPS}/flake-ref" 2>/dev/null || true)"
+    local unit free_mib rootdisk=''
+    field version "$(cat "${YOLOBOX_VERSION_STAMP}" 2>/dev/null || true)"
+    field flake_ref "$(cat "${YOLOBOX_FLAKE_REF_STAMP}" 2>/dev/null || true)"
     field egress "$(unit_state "${YOLOBOX_EGRESS_UNIT}")"
     for unit in "${PROXY_UNITS[@]}"; do
         field "${unit}" "$(unit_state "${unit}")"
@@ -891,14 +941,8 @@ cmd_status() {
         fi
     fi
     field rootdisk "${rootdisk}"
-    if probe_egress; then
-        internet=ok
-    fi
-    if probe_gateway_dns; then
-        gateway_dns=ok
-    fi
-    field internet "${internet}"
-    field gateway_dns "${gateway_dns}"
+    field internet "$(probe_egress)"
+    field gateway_dns "$(probe_gateway_dns)"
 }
 
 # Prints the one line of the flake-ref stamp. Fails, naming the file, when it
@@ -942,11 +986,11 @@ cmd_rebuild() {
             "${YOLOBOX_OPERATOR_UID}" "${uid}" >&2
         exit 2
     fi
-    ref=$(read_stamp "${YOLOBOX_STAMPS}/flake-ref") || exit 1
+    ref=$(read_stamp "${YOLOBOX_FLAKE_REF_STAMP}") || exit 1
     case "${ref}" in
     github:*) ;;
     *)
-        printf 'yolobox-guest: rebuild: %s holds %q, not a github: flake ref\n' "${YOLOBOX_STAMPS}/flake-ref" "${ref}" >&2
+        printf 'yolobox-guest: rebuild: %s holds %q, not a github: flake ref\n' "${YOLOBOX_FLAKE_REF_STAMP}" "${ref}" >&2
         exit 1
         ;;
     esac

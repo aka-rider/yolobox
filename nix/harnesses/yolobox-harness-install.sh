@@ -4,6 +4,9 @@
 # versions) is set by the build; yolobox-claude-launcher-keep is on the unit's
 # PATH.
 
+# probe_has reads what a tool prints; a translated tool would say otherwise.
+export LC_ALL=C
+
 cd "$HOME"
 mkdir -p "$HOME/.local/bin"
 

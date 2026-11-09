@@ -12,14 +12,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from shell_harness import REPO, ShellCase, is_gnu
+from shell_harness import REPO, ShellCase, is_gnu, needs_tool
 
 HOST_SETUP = REPO / "linux" / "host-setup.sh"
 HOOK_STEP = "libvirt hook that keeps the passt ACL"
 EGRESS_STEP = "host egress table"
 
 
-@unittest.skipUnless(is_gnu("stat") and is_gnu("install"), "needs GNU stat and install")
+@needs_tool(
+    ["stat", "install"],
+    is_gnu("stat") and is_gnu("install"),
+    "needs GNU stat and install",
+)
 class TestHostSetupCanBeRerun(ShellCase):
     """A second run of linux/host-setup.sh changes nothing on a healthy host and
     finishes what a run that died left half done, and a

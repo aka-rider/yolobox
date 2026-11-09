@@ -50,10 +50,13 @@ in
     authorizedKeys = [ "# lima's key is read from cidata at boot" ];
     # Lima's readiness loop fails as an invalid user every 3 s from the same
     # source address as `yo`; OpenSSH 10's per-source penalties would block
-    # that address for up to 600 s. The global keyword must precede `Match`,
-    # or it belongs to the block and sshd refuses the whole config.
+    # that address for up to 600 s. The banner word is how yo knows this sshd
+    # is the initrd's, the only one it offers root and the passphrase. Global
+    # keywords must precede `Match`, or they belong to the block and sshd
+    # refuses the whole config.
     extraConfig = ''
       PerSourcePenalties no
+      VersionAddendum ${facts.initrd_ssh_banner_mark}
       Match User root
         AuthorizedKeysFile /etc/ssh/yolobox_authorized_keys
     '';

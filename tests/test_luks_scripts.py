@@ -14,7 +14,15 @@ import signal
 import subprocess
 import unittest
 
-from shell_harness import BASH, FACTS, REPO, ShellCase
+from shell_harness import (
+    BASH,
+    FACTS,
+    REPO,
+    ShellCase,
+    bash_version,
+    needs_tool,
+    require_tool,
+)
 
 LUKS_DIR = REPO / "nix" / "luks"
 ENCRYPT = LUKS_DIR / "yolobox-luks-encrypt.sh"
@@ -492,6 +500,11 @@ class UnlockScript(ShellCase):
     ENCRYPT_UNIT = FACTS["luks_encrypt_unit"] + ".service"
 
     def setUp(self):
+        require_tool(
+            "bash",
+            have=bash_version() >= (5, 1),
+            why="the helper's `wait -n -p` needs bash 5.1",
+        )
         super().setUp()
         self.state = self.tmp / "state"
         self.state.mkdir()
@@ -580,6 +593,7 @@ printf 'reply %s %s [%s]\\n' "$1" "$2" "$body" >> "$FAKE_REPLY_LOG"
             },
             YOLOBOX_UNLOCK_REPLY_PASSWORD=str(self.bin_dir / "reply-password"),
             YOLOBOX_UNLOCK_LUKS_DEVICE="/dev/fake",
+            YOLOBOX_UNLOCK_UNLOCKED_LINE=FACTS["unlock_unlocked_line"],
             YOLOBOX_UNLOCK_UNIT=self.UNIT,
             YOLOBOX_UNLOCK_ENCRYPT_UNIT=self.ENCRYPT_UNIT,
             YOLOBOX_ASK_DIR=str(self.ask_dir),
@@ -716,6 +730,7 @@ class TestUnlockAnswersAsks(UnlockScript):
             "YOLOBOX_ASK_DIR",
             "YOLOBOX_UNLOCK_LUKS_DEVICE",
             "YOLOBOX_UNLOCK_REPLY_PASSWORD",
+            "YOLOBOX_UNLOCK_UNLOCKED_LINE",
         ):
             with self.subTest(name=name):
                 value = self.env.pop(name)
@@ -830,7 +845,7 @@ class TestUnlockOutcomes(UnlockScript):
         self.start()
         rc, out, err = self.finish()
         self.assertEqual(rc, 0, err)
-        self.assertIn("yolobox-unlock: unlocked", out)
+        self.assertEqual(out.splitlines()[-1], FACTS["unlock_unlocked_line"])
         self.assertEqual(self.replies(), [])
         self.assertEqual(self.started_units(), ["sysroot.mount"])
 
@@ -948,7 +963,7 @@ class TestUnlockOutcomes(UnlockScript):
         self.send("start", "0")
         rc, out, err = self.finish()
         self.assertEqual(rc, 0, err)
-        self.assertIn("yolobox-unlock: unlocked", out)
+        self.assertEqual(out.splitlines()[-1], FACTS["unlock_unlocked_line"])
         self.assertEqual(self.replies(), [])
         self.assertEqual(self.started_units(), [self.UNIT, "sysroot.mount"])
 
@@ -1075,7 +1090,7 @@ class InitrdKeysScript(ShellCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("usage", result.stderr)
 
-    @unittest.skipUnless(shutil.which("gawk"), "lima's key program needs gawk")
+    @needs_tool("gawk", why="lima's key program needs gawk")
     def test_the_keys_under_ssh_authorized_keys_are_written_unquoted(self):
         self.user_data.write_text(
             "#cloud-config\n"
@@ -1094,7 +1109,7 @@ class InitrdKeysScript(ShellCase):
         )
         self.assertEqual(oct(self.out.stat().st_mode & 0o777), "0o600")
 
-    @unittest.skipUnless(shutil.which("gawk"), "lima's key program needs gawk")
+    @needs_tool("gawk", why="lima's key program needs gawk")
     def test_the_mount_leaves_its_run_directory_readable_to_users(self):
         # /run/mount outlives switch-root; 0700 denies user managers their watch.
         self.user_data.write_text(
@@ -1104,7 +1119,7 @@ class InitrdKeysScript(ShellCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(oct(self.run_mount.stat().st_mode & 0o777), "0o755")
 
-    @unittest.skipUnless(shutil.which("gawk"), "lima's key program needs gawk")
+    @needs_tool("gawk", why="lima's key program needs gawk")
     def test_user_data_without_a_key_fails_instead_of_authorizing_nobody(self):
         self.user_data.write_text("#cloud-config\nusers:\n  - name: user\n")
         result = self.run_keys(str(self.out))

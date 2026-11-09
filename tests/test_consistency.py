@@ -9,15 +9,23 @@ reads, and a change to one side alone fails here instead of on a user's box.
 Tools whose absence skips tests: git (the shellcheck-list test).
 """
 
+import ast
+import collections
+import contextlib
+import io
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from shell_harness import FACTS, REPO
+import shell_harness
+from shell_harness import FACTS, REPO, require_tool
 from test_yo import yo
 
 GUEST_SCRIPT = REPO / "nix" / "guest" / "yolobox-guest.sh"
@@ -328,6 +336,21 @@ class TestLinuxHostFilesStateTheFacts(unittest.TestCase):
         self.assertIn("LIMA_CIDATA_HOME=%s\n" % home, lima_env)
 
 
+class TestEtcFilesBaseNixWritesAreUnderEtc(unittest.TestCase):
+    """base.nix names each such file `lib.removePrefix "/etc/" facts.KEY`,
+    which leaves a path elsewhere whole and so writes a different file."""
+
+    def test_every_fact_base_nix_writes_into_etc_lies_under_etc(self):
+        keys = re.findall(
+            r'lib\.removePrefix "/etc/" facts\.(\w+)',
+            (REPO / "nix" / "base.nix").read_text(),
+        )
+        self.assertTrue(keys)
+        for key in keys:
+            with self.subTest(key=key):
+                self.assertTrue(FACTS[key].startswith("/etc/"), FACTS[key])
+
+
 class TestEachDriverModuleImportsWithoutTheOther(unittest.TestCase):
     """A host ships only its own driver module."""
 
@@ -410,25 +433,10 @@ class TestVerifyWorkflowCoversTheScripts(unittest.TestCase):
                 self.assertTrue((REPO / script).is_file())
 
     def test_every_shell_script_of_the_repo_is_shellchecked(self):
-        if shutil.which("git") is None:
-            self.skipTest("needs git")
-        listing = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(REPO),
-                "ls-files",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "*.sh",
-            ],
-            capture_output=True,
-            text=True,
+        self.assertEqual(
+            self.shellchecked(),
+            sorted(str(path.relative_to(REPO)) for path in tracked("*.sh")),
         )
-        if listing.returncode != 0:
-            self.skipTest("not a git checkout: %s" % listing.stderr.strip())
-        self.assertEqual(self.shellchecked(), sorted(listing.stdout.split()))
 
     def test_every_script_package_the_box_exposes_is_built_by_ci(self):
         exposed = set()
@@ -464,11 +472,16 @@ class TestFailClosedPieces(unittest.TestCase):
         self.assertNotIn("ExecStop", unit)
         self.assertRegex(unit, r"(?m)^RequiredBy=virtqemud\.service$")
 
-    def test_the_initrd_sshd_global_keyword_comes_before_its_match_block(self):
+    def test_the_initrd_sshd_global_keywords_come_before_its_match_block(self):
         # A global keyword after `Match` belongs to the block, and sshd refuses
         # the whole config.
         luks = uncommented(REPO / "nix" / "luks.nix")
-        self.assertLess(luks.index("PerSourcePenalties no"), luks.index("Match "))
+        for keyword in (
+            "PerSourcePenalties no",
+            "VersionAddendum ${facts.initrd_ssh_banner_mark}",
+        ):
+            with self.subTest(keyword=keyword):
+                self.assertLess(luks.index(keyword), luks.index("Match "))
 
     def test_the_claude_launcher_watches_with_path_changed(self):
         # One download is thousands of writes, past the path unit's trigger limit.
@@ -500,6 +513,703 @@ class TestPinnedActionsNameTheirFullTag(unittest.TestCase):
                     self.assertRegex(action, self.PINNED)
                     self.assertRegex(rest, self.TAG)
         self.assertGreater(seen, 0)
+
+
+def tracked(*patterns):
+    """The tracked files (with the untracked ones git does not ignore) that
+    match `patterns`, as paths."""
+    require_tool("git")
+    listing = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "--cached", "--others"]
+        + ["--exclude-standard", *patterns],
+        capture_output=True,
+        text=True,
+    )
+    # A tree unpacked from `git archive` (a box's copy) has no index to list.
+    require_tool(
+        "git",
+        have=listing.returncode == 0,
+        why="needs a git checkout (git ls-files: %s)" % listing.stderr.strip(),
+    )
+    return [REPO / name for name in listing.stdout.split()]
+
+
+def scripts():
+    """Every file that holds shell: the scripts, nix (whose strings are
+    scripts) and the workflows' run blocks."""
+    return tracked("*.sh", "*.nix", ".github/workflows/*.yml")
+
+
+def logical_lines(path):
+    """(number, line) per line of the file, a line that ends in `|` or `\\`
+    joined with the next, so a pipe split across lines reads as one."""
+    joined, start, lines = "", None, []
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        start = start or number
+        stripped = line.rstrip()
+        if stripped.endswith("\\") or stripped.endswith("|"):
+            joined += stripped.rstrip("\\") + " "
+            continue
+        lines.append((start, joined + line))
+        joined, start = "", None
+    return lines
+
+
+def shell_code(line):
+    """The line without a trailing `# comment` (a `#` after a blank)."""
+    return re.split(r"(?:^|\s)#", line, maxsplit=1)[0]
+
+
+class TestScriptsKeepTheirResultsHonest(unittest.TestCase):
+    """Shell idioms that turn a failure into a wrong answer."""
+
+    def offenders(self, pattern):
+        return [
+            "%s:%d: %s" % (path.relative_to(REPO), number, line.strip())
+            for path in scripts()
+            for number, line in logical_lines(path)
+            if re.search(pattern, shell_code(line))
+        ]
+
+    def test_no_script_pipes_into_grep_q(self):
+        # grep -q exits at its first match, the producer dies of SIGPIPE, and
+        # under pipefail a present thing reads as missing.
+        self.assertEqual(self.offenders(r"\|\s*grep\s(?:[^|;&]*\s)?-[A-Za-z]*q"), [])
+
+    def test_no_mktemp_result_is_assigned_inside_another_command(self):
+        # Nested in another $( ), or after local/export, its failure is lost
+        # and the variable holds an empty path that a later rm deletes from.
+        nested = r"\$\([^)]*\$\(\s*mktemp\b"
+        declared = r"\b(?:local|export|readonly|declare)\s+[^=\s]+=\"?\$\(\s*mktemp\b"
+        self.assertEqual(self.offenders(nested), [])
+        self.assertEqual(self.offenders(declared), [])
+
+    def test_every_sort_runs_in_the_c_locale(self):
+        # sort orders by the locale's collation, and nix and the comparisons
+        # downstream order bytewise. A sort is in the C locale when its own
+        # command line says so, or after the script exports it at top level.
+        offenders = [
+            "%s:%d: %s" % (path.relative_to(REPO), number, line.strip())
+            for path in scripts()
+            for number, line in logical_lines(path)
+            if re.search(r"(?:^|[|;&(`]|\$\()\s*sort\b", shell_code(line))
+            and number < c_locale_exported_at(path)
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_only_a_top_level_export_puts_the_script_in_the_c_locale(self):
+        cases = {
+            "export LC_ALL=C\nsort x\n": 1,
+            "# export LC_ALL=C\nsort x\n": NEVER,
+            "f() {\n    export LC_ALL=C\n}\nsort x\n": NEVER,
+            "cat <<EOF\nexport LC_ALL=C\nEOF\nsort x\n": NEVER,
+            "cat <<'EOF'\nexport LC_ALL=C\nEOF\nexport LC_ALL=C\n": 4,
+            "echo 'export LC_ALL=C'\n": NEVER,
+            "sort x\nexport LC_ALL=C\n": 2,
+        }
+        for text, line in cases.items():
+            with self.subTest(text=text):
+                with tempfile.TemporaryDirectory() as scratch:
+                    script = Path(scratch, "s.sh")
+                    script.write_text(text)
+                    self.assertEqual(c_locale_exported_at(script), line)
+
+
+# A script that never exports LC_ALL=C at top level.
+NEVER = sys.maxsize
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+
+
+def c_locale_exported_at(path):
+    """The number of the script's first top-level `export LC_ALL=C` line: at
+    the start of a line, outside every heredoc. NEVER when it has none."""
+    ends = []
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        if ends:
+            if line.strip() == ends[0]:
+                ends.pop(0)
+            continue
+        if re.fullmatch(r"export LC_ALL=C(?:\s+#.*)?", line):
+            return number
+        ends = [match.group(2) for match in HEREDOC_RE.finditer(shell_code(line))]
+    return NEVER
+
+
+def spelled(word, text):
+    """Each place `text` spells `word` as a whole word (a `-` joins words)."""
+    return re.findall(r"(?<![\w-])%s(?![\w-])" % re.escape(word), text)
+
+
+class TestTheBannerMarksAreTheFacts(unittest.TestCase):
+    """yo tells the box's sshds apart by the word each one's banner carries,
+    so each word is rendered by nix from its fact and read by yo only from it."""
+
+    MARKS = sorted(key for key in FACTS if key.endswith("_ssh_banner_mark"))
+
+    def test_nix_renders_each_mark_as_a_version_addendum_once(self):
+        nix = "\n".join(uncommented(path) for path in tracked("*.nix"))
+        for key in self.MARKS:
+            with self.subTest(key=key):
+                rendered = re.findall(
+                    r"VersionAddendum(?: | = )\$?\{?facts\.%s\b" % key, nix
+                )
+                self.assertEqual(len(rendered), 1, rendered)
+                self.assertEqual(spelled(FACTS[key], nix), [])
+
+    def test_yo_spells_each_mark_only_through_its_fact(self):
+        sources = python_sources()
+        for key in self.MARKS:
+            with self.subTest(key=key):
+                for path, text in sources.items():
+                    self.assertEqual(spelled(FACTS[key], text), [], path)
+                lookups = [
+                    path
+                    for path, text in sources.items()
+                    for _ in re.findall(r"FACTS\[\"%s\"\]" % key, text)
+                ]
+                self.assertEqual(lookups, ["config.py"])
+
+
+def python_sources():
+    """{name: text} of every Python file yo ships: the package and aws-broker."""
+    sources = {p.name: p.read_text() for p in sorted(yo.PKG_DIR.glob("*.py"))}
+    sources["aws-broker"] = (REPO / "aws-broker").read_text()
+    return sources
+
+
+def nodes(source, kind):
+    """(function, node) for every node of `kind` in the module, by the name of
+    the innermost def around it ("<module>" at the top level)."""
+    found = []
+
+    def walk(node, function):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                walk(child, child.name)
+            else:
+                if isinstance(child, kind):
+                    found.append((function, child))
+                walk(child, function)
+
+    walk(ast.parse(source), "<module>")
+    return found
+
+
+def calls(source):
+    return nodes(source, ast.Call)
+
+
+def called_name(call):
+    """`open`, `os.open`, `X.search`: the dotted name a call is made through.
+    A receiver that is no name (`Path(p).open`) is left empty: `.open`."""
+    parts, node = [], call.func
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    parts.append(node.id if isinstance(node, ast.Name) else "")
+    return ".".join(reversed(parts))
+
+
+def sites(predicate):
+    """{(source, function): how many calls there `predicate` accepts}, so a
+    second call in an allowed function is a site of its own."""
+    return dict(
+        collections.Counter(
+            (name, function)
+            for name, text in python_sources().items()
+            for function, call in calls(text)
+            if predicate(call)
+        )
+    )
+
+
+def call_arg(call, index, keyword):
+    """The call's argument at `index`, or its `keyword` one; None for neither."""
+    if len(call.args) > index:
+        return call.args[index]
+    return next((k.value for k in call.keywords if k.arg == keyword), None)
+
+
+def writes_by_mode(mode):
+    """Whether an open's mode writes: a literal with w, a, x or +, or any mode
+    that is not a literal, which nothing here can read."""
+    if mode is None:
+        return False
+    if not isinstance(mode, ast.Constant) or not isinstance(mode.value, str):
+        return True
+    return bool(set(mode.value) & set("wax+"))
+
+
+# Each writes its target in place, never through a sibling and a rename.
+COPIES = {
+    "shutil.copy",
+    "shutil.copy2",
+    "shutil.copyfile",
+    "shutil.copyfileobj",
+    "shutil.copytree",
+    "shutil.move",
+}
+OS_OPEN_WRITE_FLAGS = {"O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC"}
+
+
+def opens_for_writing(call):
+    name = called_name(call)
+    if name in ("open", "io.open", "os.fdopen"):
+        return writes_by_mode(call_arg(call, 1, "mode"))
+    if name == "os.open":
+        flags = call_arg(call, 1, "flags")
+        named = {n.attr for n in ast.walk(flags) if isinstance(n, ast.Attribute)}
+        literal = isinstance(flags, ast.Attribute) or isinstance(flags, ast.BinOp)
+        return bool(named & OS_OPEN_WRITE_FLAGS) or not literal
+    if name.endswith(".open"):
+        # Path.open(mode): the mode comes first.
+        return writes_by_mode(call_arg(call, 0, "mode"))
+    return (
+        name in COPIES
+        or name.endswith((".write_text", ".write_bytes"))
+        or name in ("tempfile.mkstemp", "tempfile.NamedTemporaryFile")
+    )
+
+
+class TestFilesAreWrittenWhole(unittest.TestCase):
+    """Every file another process or a later run reads is written through
+    proc.atomic_file, so no reader ever sees half of it."""
+
+    ALLOWED = {
+        # The chokepoint itself: its temporary file and the descriptor it
+        # writes through.
+        ("proc.py", "atomic_file"): 2,
+        # A lock file: its content is never read, only its flock.
+        ("common.py", "held_flock"): 1,
+        # The broker's log, a stream the broker appends to while it runs.
+        ("aws.py", "start_aws_broker"): 2,
+        ("aws-broker", "reopen"): 1,
+        # ssh's own log (-E) of the agent's login, which ssh appends to and yo
+        # reads once ssh has exited.
+        ("sshx.py", "broken_agent_login"): 1,
+        # /dev/null, for the daemon's standard streams.
+        ("aws-broker", "main"): 1,
+    }
+
+    def test_no_file_is_opened_for_writing_outside_atomic_file(self):
+        self.assertEqual(sites(opens_for_writing), self.ALLOWED)
+
+    def test_every_way_to_open_for_writing_is_seen(self):
+        writes = [
+            "open(p, 'w')",
+            "open(p, mode='a')",
+            "open(p, mode)",
+            "io.open(p, 'r+')",
+            "Path(p).open('w')",
+            "path.open(mode='x')",
+            "path.open(how)",
+            "os.open(p, os.O_WRONLY | os.O_CREAT)",
+            "os.open(p, flags)",
+            "os.fdopen(fd, 'wb')",
+            "shutil.copy(a, b)",
+            "shutil.copyfile(a, b)",
+            "shutil.move(a, b)",
+            "Path(p).write_text(t)",
+            "tempfile.mkstemp()",
+        ]
+        reads = [
+            "open(p)",
+            "open(p, 'rb')",
+            "Path(p).open()",
+            "os.open(p, os.O_RDONLY)",
+        ]
+        cases = [(w, True) for w in writes] + [(r, False) for r in reads]
+        for source, writing in cases:
+            with self.subTest(source=source):
+                call = ast.parse(source, mode="eval").body
+                self.assertEqual(opens_for_writing(call), writing)
+
+
+def searches(call):
+    name = called_name(call)
+    return name.endswith((".search", ".match")) or name in ("re.search", "re.match")
+
+
+class TestNamesAreJudgedWhole(unittest.TestCase):
+    """A name, path, address or rule is judged by fullmatch, whole words or
+    parsed membership: a search or a prefix match accepts what merely contains
+    it. A search may only pull a value out of a tool's output."""
+
+    ALLOWED = {
+        # The daemon's version out of `virsh version --daemon`.
+        ("libvirt_host.py", "parse_daemon_version"): 1,
+        # MemTotal's number out of /proc/meminfo.
+        ("libvirt_host.py", "host_memory_bytes"): 1,
+        # The uid field out of each `ss -e` line, and its inode field.
+        ("libvirt_host.py", "listener_uids"): 2,
+        # The Max memory number out of `virsh dominfo`.
+        ("libvirt.py", "active_domains_memory"): 1,
+        # The master's pid out of `ssh -O check`.
+        ("sshx.py", "master_pid"): 1,
+    }
+
+    def test_every_search_extracts_a_value_from_a_tools_output(self):
+        self.assertEqual(sites(searches), self.ALLOWED)
+
+
+def builds_an_unpinned_login(call):
+    """A call that makes the proof of an initrd, or an unpinned ssh argv,
+    whose user is whatever the caller passes."""
+    name = called_name(call).rsplit(".", 1)[-1]
+    return name in ("InitrdEndpoint", "unpinned_argv")
+
+
+class TestRootLogsInOnlyThroughTheInitrdGate(unittest.TestCase):
+    """Only unlock.initrd_endpoint() proves an initrd, after its listener and
+    its banner, and only root_argv() turns that proof into a root login. The
+    unpinned builder takes any user, so it is called only by the operator's
+    login, which names the host account, and by the two that take the proof:
+    root_argv() and the printed remedy, text for the operator to paste."""
+
+    def test_no_other_function_builds_an_unpinned_login(self):
+        self.assertEqual(
+            sites(builds_an_unpinned_login),
+            {
+                ("unlock.py", "initrd_endpoint"): 1,
+                ("unlock.py", "operator_argv"): 1,
+                ("unlock.py", "root_argv"): 1,
+                ("unlock.py", "initrd_root_ssh_command"): 1,
+            },
+        )
+
+
+def ssh_command_lines(source):
+    """(function, list) for every list literal that starts with "ssh"."""
+    return [
+        (function, node)
+        for function, node in nodes(source, ast.List)
+        if node.elts
+        and isinstance(node.elts[0], ast.Constant)
+        and node.elts[0].value == "ssh"
+    ]
+
+
+class TestEveryGuestCommandGoesThroughSshx(unittest.TestCase):
+    """An ssh command line is built in sshx alone, whose guest_argv() starts
+    every command yo reads with env LC_ALL=C; the others there run none
+    (control_argv) or an interactive session in the operator's locale. Outside
+    it only the initrd's unpinned login and `ssh -G`, which reaches no box."""
+
+    def test_no_other_function_builds_an_ssh_command_line(self):
+        found = collections.Counter(
+            (name, function)
+            for name, text in python_sources().items()
+            for function, _ in ssh_command_lines(text)
+        )
+        self.assertEqual(
+            dict(found),
+            {
+                ("sshx.py", "guest_argv"): 1,
+                ("sshx.py", "interactive_argv"): 1,
+                ("sshx.py", "control_argv"): 1,
+                ("unlock.py", "unpinned_argv"): 1,
+                ("sshconfig.py", "ssh_config_reaches_box"): 1,
+            },
+        )
+
+
+class TestEveryRefusalHasAPositiveControl(unittest.TestCase):
+    """A live check that asserts the box refuses something first runs the
+    same probe, through the same path, on something the box allows: a
+    positive_control whose command runs the same program the same way (the
+    agent's env, sudo, podman), or perl_probe_control for a perl probe. A
+    probe that cannot succeed at all is refused for reasons of its own."""
+
+    SCRIPT = REPO / "tests" / "box-hardening-check.sh"
+    # Nothing the box admits over ssh is reachable from inside it, so sshd's
+    # journal, which names AllowUsers, is the proof instead.
+    WITHOUT_CONTROL = {"check_logins_refused_off_gateway"}
+
+    def checks(self):
+        text = self.SCRIPT.read_text()
+        return dict(re.findall(r"(?ms)^(check_\w+)\(\) \{\n(.*?)^\}$", text))
+
+    def test_each_refusal_comes_after_a_control_of_the_same_probe(self):
+        refusing, uncontrolled = set(), []
+        for name, body in self.checks().items():
+            controls = []
+            for start, kind, probe in probe_sites(body):
+                if kind == "control":
+                    controls.append(probe)
+                    continue
+                refusing.add(name)
+                if probe not in controls:
+                    uncontrolled.append((name, probe))
+        self.assertGreaterEqual(len(refusing), 8, sorted(refusing))
+        self.assertEqual(
+            sorted(uncontrolled),
+            [("check_logins_refused_off_gateway", ("agent_ssh", "ssh"))],
+        )
+
+    def test_every_refusal_idiom_is_read_with_its_probe(self):
+        agent_ls = ("as_agent_bare", "SYSBIN/ls")
+        perl = ("as_agent_bare", "SYSBIN/perl")
+        for body, sites in (
+            (
+                'if out=$(as_agent_bare "${SYSBIN}/ls" /x 2>&1); then\n  fail "y"\n',
+                [("refusal", agent_ls)],
+            ),
+            (
+                'out=$(as_agent_bare "${SYSBIN}/ls" /x) || status=$?\n'
+                '[ "${status}" -ne 0 ] || fail "y"\n',
+                [("refusal", agent_ls)],
+            ),
+            (
+                '! as_agent_bare "${SYSBIN}/ls" /x || fail "y"\n',
+                [("refusal", agent_ls)],
+            ),
+            (
+                'if as_agent_bare "${SYSBIN}/ls" /x; then\n  fail "y"\n',
+                [("refusal", agent_ls)],
+            ),
+            ('agent_probe "y" "${WORK}/t.pl"\n', [("refusal", perl)]),
+            (
+                'positive_control "x" 0 \\\n  as_agent_bare "${SYSBIN}/ls" /\n',
+                [("control", agent_ls)],
+            ),
+            ("perl_probe_control\n", [("control", perl)]),
+            (
+                'out=$(as_agent_bare "${WRAPPERS}/sudo" -n true) || status=$?\n'
+                '[ "${status}" -ne 0 ] || fail "y"\n',
+                [("refusal", ("as_agent_bare", "WRAPPERS"))],
+            ),
+            (
+                'if out=$(sudo -n systemd-tmpfiles --create); then\n  fail "y"\n',
+                [("refusal", ("sudo", "systemd-tmpfiles"))],
+            ),
+            # Not the agent's or root's probe: the box's own state.
+            ('if grep -q "^m " <<<"${mods}"; then\n  fail "y"\n', []),
+        ):
+            with self.subTest(body=body):
+                found = [(kind, probe) for _, kind, probe in probe_sites(body)]
+                self.assertEqual(found, sites)
+
+
+# What runs a probe as the agent or as root, and the probe's program after it.
+PROBE_RUNNER_RE = re.compile(r"\b(as_agent_bare|agent_podman|agent_ssh|sudo -n)\b")
+PROBE_PROGRAM_RE = re.compile(r"\$\{(SYSBIN|WRAPPERS)\}/([\w.-]+)")
+PERL_PROBE = ("as_agent_bare", "SYSBIN/perl")
+PROBE_SITE_RES = (
+    ("control", re.compile(r"^[ \t]*positive_control \"[^\"]*\" \d+ (.*)$", re.M)),
+    ("control", re.compile(r"^[ \t]*(perl_probe_control)$", re.M)),
+    ("refusal", re.compile(r"^[ \t]*(agent_probe) ", re.M)),
+    ("refusal", re.compile(r"^[ \t]*if \w+=\$\((.*)\); then\n[ \t]*fail ", re.M)),
+    (
+        "refusal",
+        re.compile(
+            r"^[ \t]*\w+=\$\((.*)\) \|\| status=\$\?\n"
+            r"[ \t]*\[ \"\$\{status\}\" -ne 0 \] \|\| fail ",
+            re.M,
+        ),
+    ),
+    ("refusal", re.compile(r"^[ \t]*! (.*) \|\| fail ", re.M)),
+    # `if CMD; then fail`, CMD neither an assignment nor a test.
+    (
+        "refusal",
+        re.compile(
+            r"^[ \t]*if (?!\w+=\$\()(?![\[!])(.*); then\n[ \t]*fail ",
+            re.M,
+        ),
+    ),
+)
+
+
+def probe_of(command):
+    """(runner, program) of a probe's command, or None for a command that is no
+    probe of the agent's or root's."""
+    if command in ("agent_probe", "perl_probe_control"):
+        return PERL_PROBE
+    runner = PROBE_RUNNER_RE.search(command)
+    if runner is None:
+        return None
+    after = command[runner.end() :]
+    program = PROBE_PROGRAM_RE.search(after)
+    if runner.group(1) == "sudo -n":
+        return ("sudo", after.split()[0])
+    if runner.group(1) != "as_agent_bare":
+        return (runner.group(1), runner.group(1).split("_")[1])
+    # A wrapper is the path itself: exec'ing any of them is the one question.
+    if program.group(1) == "WRAPPERS":
+        return ("as_agent_bare", "WRAPPERS")
+    return ("as_agent_bare", "SYSBIN/" + program.group(2))
+
+
+def probe_sites(body):
+    """(offset, "control" or "refusal", probe) of each probe in a check's body,
+    in order, its continued lines joined."""
+    joined = re.sub(r"\\\n[ \t]*", " ", body)
+    sites = [
+        (match.start(), kind, probe_of(match.group(1)))
+        for kind, pattern in PROBE_SITE_RES
+        for match in pattern.finditer(joined)
+    ]
+    return sorted(site for site in sites if site[2] is not None)
+
+
+class TestCiFailsASkipWhoseToolIsThere(unittest.TestCase):
+    """Every tool skip goes through shell_harness.missing_tool_reason, and CI
+    turns one whose tools are all on PATH into a failure."""
+
+    def reason(self, forbid, tools, have=None):
+        with mock.patch.object(shell_harness, "FORBID_SKIP", forbid):
+            return shell_harness.missing_tool_reason(tools, have)
+
+    def test_a_tool_on_path_that_the_probe_judged_missing_fails_under_ci(self):
+        with self.assertRaisesRegex(AssertionError, "the probe that judged it"):
+            self.reason(True, "sh", have=False)
+        self.assertEqual(self.reason(False, "sh", have=False), "needs sh")
+
+    def test_a_tool_that_is_missing_is_still_a_skip_under_ci(self):
+        self.assertEqual(self.reason(True, "lizard-yo-test"), "needs lizard-yo-test")
+        self.assertIsNone(self.reason(True, "sh"))
+
+    def test_no_test_skips_for_a_tool_but_through_the_harness(self):
+        offenders = [
+            "%s:%d" % (path.name, line)
+            for path in sorted((REPO / "tests").glob("test_*.py"))
+            for line in direct_tool_skips(path.read_text())
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_a_direct_skip_is_seen_however_it_is_spelled(self):
+        for source, lines in (
+            ("self.skipTest('no git')", [1]),
+            ("raise unittest.SkipTest('x')", [1]),
+            ("@skipUnless(\n    shutil.which('gawk'), 'x')\ndef f(): pass", [1]),
+            ("@skipIf(not is_gnu('find'), 'x')\nclass C: pass", [1]),
+            ("@unittest.skipUnless(bash_version() >= (5, 1), 'x')\ndef f(): pass", [1]),
+            ("@unittest.skipUnless(HAS_PID_WATCH, 'no kqueue')\ndef f(): pass", []),
+            ("@unittest.skipIf(os.geteuid() == 0, 'root')\ndef f(): pass", []),
+            ("require_tool('git')", []),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(direct_tool_skips(source), lines)
+
+
+# What a skip that judges a tool calls, which needs_tool and require_tool do.
+TOOL_PROBES = {"which", "WHICH", "is_gnu", "bash_version"}
+
+
+def direct_tool_skips(source):
+    """The line of each skip in `source` that does not go through the harness:
+    any skipTest or SkipTest, and a skipIf or skipUnless that probes a tool.
+    A skip for a Python feature or for root is not a tool's."""
+    lines = []
+    for _, call in calls(source):
+        name = called_name(call).rsplit(".", 1)[-1]
+        probed = {
+            node.id if isinstance(node, ast.Name) else node.attr
+            for node in ast.walk(call)
+            if isinstance(node, (ast.Name, ast.Attribute))
+        }
+        if name in ("skipTest", "SkipTest") or (
+            name in ("skipIf", "skipUnless") and probed & TOOL_PROBES
+        ):
+            lines.append(call.lineno)
+    return sorted(lines)
+
+
+class TestNoTestReachesTheOperatorsHome(unittest.TestCase):
+    """Every test runs under shell_harness's scratch $HOME, so none reaches the
+    operator's real 1Password agent, ~/.ssh, ~/.lima or ~/.local/state."""
+
+    def test_yo_resolves_its_state_under_the_scratch_home(self):
+        self.assertTrue(shell_harness.REAL_HOMES)
+        for path in (yo.state.state_dir(), yo.state.instance_dir(), yo.LIMA.op_sock()):
+            with self.subTest(path=path):
+                resolved = Path(path).resolve()
+                self.assertTrue(resolved.is_relative_to(shell_harness.SCRATCH_HOME))
+
+    def test_asking_the_real_1password_agent_fails_the_test(self):
+        scratch_sock = Path(yo.LIMA.op_sock()).relative_to(shell_harness.SCRATCH_HOME)
+        real_sock = Path(shell_harness.REAL_HOMES[0]) / scratch_sock
+        with self.assertRaises(shell_harness.RealHomeTouched):
+            yo.agent.luks_key(str(real_sock))
+
+    def test_reading_the_real_ssh_config_fails_the_test(self):
+        with self.assertRaises(shell_harness.RealHomeTouched):
+            (Path(shell_harness.REAL_HOMES[0]) / ".ssh" / "config").read_text()
+
+    @staticmethod
+    def outcome(body):
+        """The failures and errors of a one-test case whose test runs `body`,
+        run under the harness as any test is."""
+
+        class Case(unittest.TestCase):
+            def test(self):
+                body()
+
+        result = unittest.TestResult()
+        Case("test").run(result)
+        return [text for _, text in result.failures + result.errors]
+
+    def test_a_thread_that_reaches_the_real_home_fails_its_test(self):
+        def touch():
+            (Path(shell_harness.REAL_HOMES[0]) / ".ssh" / "config").read_text()
+
+        def body():
+            # The thread's traceback is printed; the test is about its verdict.
+            with contextlib.redirect_stderr(io.StringIO()):
+                thread = threading.Thread(target=touch)
+                thread.start()
+                thread.join()
+
+        (failure,) = self.outcome(body)
+        self.assertIn("a thread reached the real home", failure)
+
+    def test_a_test_that_prints_fails_with_what_it_printed(self):
+        for body, said in (
+            (lambda: print("on stdout"), "on stdout"),
+            (lambda: yo.ui.err("yo: on stderr"), "yo: on stderr"),
+            (lambda: os.write(2, b"by fd\n"), "by fd"),
+            (lambda: subprocess.run(["echo", "by a child"]), "by a child"),
+        ):
+            with self.subTest(said=said):
+                (failure,) = self.outcome(body)
+                self.assertIn("the test printed", failure)
+                self.assertIn(said, failure)
+        self.assertEqual(self.outcome(lambda: None), [])
+
+    def test_bash_under_shellcase_expands_tilde_to_the_scratch_home(self):
+        case = shell_harness.ShellCase()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        script = case.tmp / "tilde.sh"
+        script.write_text("echo ~\n")
+        ran = case.run_bash(script)
+        self.assertEqual(ran.stdout, shell_harness.SCRATCH_HOME + "\n")
+
+    def test_ssh_without_a_config_of_its_own_never_runs(self):
+        # ssh takes ~ from the account database, so only -F keeps it off ~/.ssh.
+        require_tool("ssh")
+        refused = subprocess.run(["ssh", "-G", "x"], capture_output=True, text=True)
+        self.assertEqual(refused.returncode, 97)
+        self.assertIn("ssh without -F reads the real ~/.ssh", refused.stderr)
+        ran = subprocess.run(
+            ["ssh", "-F", "/dev/null", "-G", "x"], capture_output=True, text=True
+        )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+
+    def test_every_test_module_loads_the_harness(self):
+        # A module that imports neither runs, alone, under the real $HOME.
+        loaders = {"shell_harness", "test_yo"}
+        unguarded = [
+            path.name
+            for path in sorted((REPO / "tests").glob("test_*.py"))
+            if not loaders
+            & {
+                node.module if isinstance(node, ast.ImportFrom) else alias.name
+                for node in ast.parse(path.read_text()).body
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+                for alias in node.names
+            }
+        ]
+        self.assertEqual(unguarded, [])
 
 
 if __name__ == "__main__":

@@ -8,12 +8,14 @@ pid-exit watch).
 import argparse
 import contextlib
 import errno
+import fcntl
 import http.server
 import importlib.util
 import io
 import itertools
 import json
 import os
+import re
 import select
 import shlex
 import shutil
@@ -31,7 +33,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from shell_harness import is_gnu
+from shell_harness import is_gnu, needs_tool, require_tool
 
 REPO = Path(__file__).resolve().parent.parent
 PKG = REPO / "yolobox_cli"
@@ -238,6 +240,104 @@ class FakeHelper:
         return self.code
 
 
+def box_lock_is_held(state=None):
+    """Whether some yo holds the box lock, probed as another yo would: through
+    a descriptor of its own, never waiting. `state` is the namespace's state
+    module, yo's by default."""
+    path = (state or yo.state).box_lock_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)  # drops the lock when this probe got it
+    return False
+
+
+@contextlib.contextmanager
+def box_lock_held_elsewhere(state=None):
+    """The box lock held by another yo, through a descriptor of its own."""
+    path = (state or yo.state).box_lock_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def guest_words(remote):
+    """The words of the command an ssh argv's last element runs in the guest,
+    without the C locale yo runs every guest command in."""
+    words = shlex.split(remote)
+    return words[2:] if words[:2] == ["env", "LC_ALL=C"] else words
+
+
+AGENT_LOGIN = ["echo", yo.sshx.AGENT_LOGIN_WORD]
+
+
+def ssh_ends(words, ssh_log, code, stdout="", stderr=""):
+    """(stdout, stderr) of an ssh that ran `words` in the guest and ended with
+    `code`: the agent's login prints its word when it ran, and a 255's stderr
+    is ssh's own, which an ssh given -E (`ssh_log`) writes to that file."""
+    if code == 0 and list(words) == AGENT_LOGIN:
+        stdout = yo.sshx.AGENT_LOGIN_WORD + "\n"
+    if code == yo.SSH_UNREACHABLE and ssh_log is not None and stderr:
+        with open(ssh_log, "a") as log:
+            log.write(stderr)
+        stderr = ""
+    return stdout, stderr
+
+
+def ssh_log_of(argv):
+    """The -E file an ssh argv names, or None."""
+    return argv[argv.index("-E") + 1] if "-E" in argv else None
+
+
+def proved_initrd(facts, namespace=None):
+    """An InitrdEndpoint of `facts`, made the one way there is: by
+    initrd_endpoint() under the box lock, against a listener and a banner
+    faked as the initrd's."""
+    ns = namespace or yo
+    driver = ns.state.box.driver
+    banner = "SSH-2.0-OpenSSH_10.0 " + ns.config.INITRD_SSH_BANNER_MARK
+    with (
+        mock.patch.object(driver, "ssh_facts", return_value=facts),
+        mock.patch.object(driver, "verify_initrd_listener"),
+        mock.patch.object(ns.unlock, "ssh_banner", return_value=banner),
+        ns.state.box_lock(wait=True) as held,
+    ):
+        gate = ns.unlock.initrd_endpoint(held)
+    assert isinstance(gate, ns.unlock.InitrdEndpoint), gate
+    return gate
+
+
+def locked(namespace, step, *args, **kwargs):
+    """`step(held, *args, **kwargs)` under the box lock of `namespace`, a loaded
+    yo, as the command that runs it holds the lock."""
+    with namespace.state.box_lock(wait=True) as held:
+        return step(held, *args, **kwargs)
+
+
+# The pid of the Lima hostagent the fakes run, which holds the box's ssh port.
+HOSTAGENT_PID = 4242
+
+
+@contextlib.contextmanager
+def hostagent_holds_the_port(namespace=None):
+    """The Lima instance's hostagent, and it alone, listening on the box's
+    ssh port, for a test whose subject is not the listener check."""
+    lima = (namespace or yo).lima
+    with (
+        mock.patch.object(lima.LIMA, "keepalive_pid", return_value=HOSTAGENT_PID),
+        mock.patch.object(lima, "tcp_listener_pids", return_value=[HOSTAGENT_PID]),
+    ):
+        yield
+
+
 def with_home(path):
     return mock.patch.dict(os.environ, {"HOME": path}, clear=False)
 
@@ -313,6 +413,44 @@ class TestRunToolMissing(unittest.TestCase):
             with self.assertRaises(yo.YoError) as caught:
                 yo.exec_process(["ssh", "host"])
         self.assertEqual(caught.exception.message, "ssh not found on PATH")
+
+
+class TestToolsSpeakTheCLocale(unittest.TestCase):
+    """yo matches the words tools print, which a translated tool changes, so
+    every way yo runs a tool runs it under LC_ALL=C, whatever the operator's
+    locale, and keeps the rest of the environment."""
+
+    PRINT_LOCALE = ["sh", "-c", 'echo "$LC_ALL $LANG"']
+
+    def setUp(self):
+        german = {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}
+        patcher = mock.patch.dict(os.environ, german)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_host_tool_a_guest_session_and_a_spawned_tool_run_in_c(self):
+        runs = {
+            "host": yo.run(self.PRINT_LOCALE).stdout,
+            "guest": yo.run(self.PRINT_LOCALE, guest="agent").stdout,
+            "given env": yo.run(self.PRINT_LOCALE, env={"LANG": "x"}).stdout,
+        }
+        child = yo.spawn(self.PRINT_LOCALE, stdout=subprocess.PIPE, text=True)
+        runs["spawned"] = child.communicate()[0]
+        self.assertEqual(
+            runs,
+            {
+                "host": "C de_DE.UTF-8\n",
+                "guest": "C de_DE.UTF-8\n",
+                "given env": "C x\n",
+                "spawned": "C de_DE.UTF-8\n",
+            },
+        )
+
+    def test_a_streamed_guest_session_runs_in_c(self):
+        printed = []
+        with mock.patch.object(yo.ui, "out", printed.append):
+            yo.run(self.PRINT_LOCALE, filtered=True)
+        self.assertEqual(printed, [yo.ui.quoted_line("C de_DE.UTF-8")])
 
 
 class TestAtomicWrite(FakeHome):
@@ -536,6 +674,25 @@ class TestSshRunArgv(FakeHome):
             yo.ssh_run(role or yo.OPERATOR, ["true"], **kwargs)
         return seen["argv"]
 
+    def test_a_guest_command_runs_in_the_c_locale_whatever_the_guests_is(self):
+        # yo reads lsblk's, df's and ssh-add's words. The remote command runs
+        # under the guest's shell, here a local sh in another locale.
+        seen = {}
+
+        def fake_run(argv, **rest):
+            seen["remote"] = argv[-1]
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(yo.proc, "run", fake_run):
+            yo.ssh_run(yo.AGENT, ["sh", "-c", 'printf "%s" "${LC_ALL-unset}"'])
+        ran = subprocess.run(
+            ["sh", "-c", seen["remote"]],
+            env=dict(os.environ, LC_ALL="fr_FR.UTF-8"),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual((ran.returncode, ran.stdout), (0, "C"))
+
     def test_no_stdin_closes_it_with_dash_n(self):
         self.assertIn("-n", self.capture_argv())
 
@@ -547,28 +704,58 @@ class TestSshRunArgv(FakeHome):
         self.assertIn("User=agent", argv)
         self.assertIn("ControlPath=%s/.lima/yolobox/ssh-agent.sock" % self.home, argv)
 
-    def test_a_home_too_long_for_the_ssh_master_socket_is_named_when_the_config_is_written(
-        self,
-    ):
-        # ssh would exit 255 on it, which yo reports as a box it cannot reach.
-        # ssh binds the master at "<ControlPath>.<16 random characters>", 17
-        # bytes more than the ControlPath, so that is the length the limit
-        # applies to (measured against OpenSSH: a 87-byte path fails on macOS).
-        bound = len(os.fsencode(yo.state.agent_control_path())) + 17
-        with mock.patch.object(yo.LIMA, "ssh_facts", return_value=LIMA_FACTS):
-            os.makedirs(yo.instance_dir())
-            with mock.patch.object(yo.state, "UNIX_SOCKET_PATH_LIMIT", bound + 1):
-                yo.sshconfig.write_ssh_config()
-            with mock.patch.object(yo.state, "UNIX_SOCKET_PATH_LIMIT", bound):
-                with self.assertRaises(yo.YoError) as caught:
-                    yo.sshconfig.write_ssh_config()
-        self.assertIn("must be shorter than %d" % bound, caught.exception.message)
-        self.assertIn(self.home, caught.exception.message)
 
-    def test_a_real_overlong_home_is_refused(self):
-        with with_home("/" + "d" * yo.state.UNIX_SOCKET_PATH_LIMIT):
-            with self.assertRaisesRegex(yo.YoError, "unix socket path must be shorter"):
-                yo.sshconfig.write_ssh_config()
+class TestAMachineNameMustLeaveRoomForItsSockets(unittest.TestCase):
+    """The longest socket under a box's instance directory is the agent's ssh
+    master, which ssh binds at its ControlPath plus 17 bytes; a unix socket
+    path must be shorter than 104 bytes on macOS and 108 on Linux. -m is
+    refused at parse time, before anything runs, when $HOME plus the name
+    leaves no room."""
+
+    HOSTS = (("darwin", ".lima", 104), ("linux", ".local/state/yolobox/instances", 108))
+
+    def parse(self, home, platform, *argv):
+        """(exit code, stderr) of `yo ARGV` under `home` on `platform`; exit
+        None when it parsed."""
+        stderr = io.StringIO()
+        with (
+            with_home(home),
+            mock.patch.object(yo.config, "HOST_PLATFORM", platform),
+            contextlib.redirect_stderr(stderr),
+        ):
+            try:
+                yo.build_parser().parse_args(list(argv))
+            except SystemExit as refused:
+                return refused.code, stderr.getvalue()
+        return None, stderr.getvalue()
+
+    def test_the_last_name_that_fits_is_accepted_and_one_byte_more_is_refused(self):
+        # A home that leaves fewer bytes than the 55 a hostname allows.
+        home = "/" + "h" * 20
+        for platform, instances, limit in self.HOSTS:
+            # <home>/<instances>/<name>/ssh-agent.sock, plus ssh's 17 bytes.
+            room = limit - 1 - len("%s/%s//ssh-agent.sock" % (home, instances)) - 17
+            with self.subTest(platform=platform):
+                fits = self.parse(home, platform, "-m", "x" * room, "status")
+                self.assertEqual(fits, (None, ""))
+                name = "x" * (room + 1)
+                code, said = self.parse(home, platform, "-m", name, "up")
+                self.assertEqual(code, 2)
+                self.assertIn(
+                    "%s/%s/%s/ssh-agent.sock plus the 17 bytes of ssh's temporary "
+                    "socket name is %d bytes, and a unix socket path must be shorter "
+                    "than %d on this host: $HOME (%s) plus the machine name '%s' is "
+                    "too long for yo's sockets; pick a shorter -m name"
+                    % (home, instances, name, limit, limit, home, name),
+                    " ".join(said.split()),
+                )
+
+    def test_a_home_too_long_for_any_name_refuses_the_default_machine_too(self):
+        for platform, _, limit in self.HOSTS:
+            with self.subTest(platform=platform):
+                code, said = self.parse("/" + "d" * limit, platform, "status")
+                self.assertEqual(code, 2)
+                self.assertIn("unix socket path must be shorter", said)
 
 
 class TestResolveCpOperands(unittest.TestCase):
@@ -731,11 +918,14 @@ class CpHarness(FakeHome):
 
         def fake_ssh_run(role, argv, **kwargs):
             calls["ssh_run"].append(list(argv))
-            return mock.Mock(returncode=0, stdout=b"", stderr="")
+            stdout, _ = ssh_ends(argv, None, 0, stdout=b"")
+            return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
         with (
             mock.patch.object(yo.proc, "run", fake_run),
             mock.patch.object(yo.sshx, "ssh_run", fake_ssh_run),
+            # What cp says of each guest path goes to the test, not the run's stderr.
+            mock.patch.object(yo.ui, "err"),
         ):
             args = yo.build_parser().parse_args(["cp"] + paths)
             yo.cmd_cp(args)
@@ -799,18 +989,21 @@ class TestCpArgv(CpHarness):
 
         def fake_ssh_run(role, argv, **kwargs):
             events.append(("ssh_run", list(argv)))
-            return mock.Mock(returncode=0, stdout="", stderr="")
+            stdout, _ = ssh_ends(argv, None, 0)
+            return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
         with (
             mock.patch.object(yo.proc, "run", fake_run),
             mock.patch.object(yo.sshx, "ssh_run", fake_ssh_run),
+            mock.patch.object(yo.ui, "err") as err,
         ):
             yo.cmd_cp(yo.build_parser().parse_args(["cp", "a.txt", ":~/x"]))
+        err.assert_called_once_with("yo: guest path :~/x -> /home/agent/x")
 
         steps = [
             "mkdir" if argv[:2] == ["mkdir", "-p"] else kind
             for kind, argv in events
-            if argv != ["true"]
+            if argv != AGENT_LOGIN
         ]
         self.assertEqual(steps, ["mkdir", "run"])
         self.assertEqual(events[-1][1][0], "scp")
@@ -855,7 +1048,8 @@ class CpFromGuestHarness(CpHarness):
         # The build-output listing, run on the guest directory: its absolute
         # paths live under guest_root here, and come back as the guest's.
         if argv[0] != "find":
-            return mock.Mock(returncode=0, stdout=b"", stderr="")
+            stdout, _ = ssh_ends(argv, None, 0, stdout=b"")
+            return mock.Mock(returncode=0, stdout=stdout, stderr="")
         found = subprocess.run(
             [self.guest_root + arg if arg.startswith("/") else arg for arg in argv],
             capture_output=True,
@@ -871,7 +1065,7 @@ class CpFromGuestHarness(CpHarness):
         # ssh's last argument is the shell command; -C names a guest directory,
         # which lives under guest_root here.
         command = shlex.split(argv[-1])
-        self.guest_commands.append(command)
+        self.guest_commands.append(guest_words(argv[-1]))
         moved = [
             self.guest_root + arg if previous == "-C" else arg
             for previous, arg in zip([""] + command, command)
@@ -885,18 +1079,26 @@ class CpFromGuestHarness(CpHarness):
         return subprocess.Popen(list(argv), **kwargs)
 
     def copy(self, paths, guest_files=None, spawn=None):
-        if spawn is None and not self.guest_tools_are_gnu:
-            self.skipTest("the guest's tar and find are GNU's")
+        if spawn is None:
+            require_tool(
+                ["tar", "find"],
+                have=self.guest_tools_are_gnu,
+                why="the guest's tar and find are GNU's",
+            )
         self.write_guest(guest_files or {})
-        # A faked stream comes with a guest that holds no build output.
-        nothing_built = yo.proc.GuestRun(["find"], 0, b"", "")
+
+        def nothing_built(role, argv, **kwargs):
+            # A faked stream comes with a guest that holds no build output.
+            stdout, _ = ssh_ends(argv, None, 0, stdout=b"")
+            return yo.proc.GuestRun(argv, 0, stdout, "")
+
+        self.said = []
         with (
             mock.patch.object(yo.proc, "spawn", spawn or self.spawn),
             mock.patch.object(
-                yo.sshx,
-                "ssh_run",
-                self.guest_find if spawn is None else lambda *_, **__: nothing_built,
+                yo.sshx, "ssh_run", self.guest_find if spawn is None else nothing_built
             ),
+            mock.patch.object(yo.ui, "err", side_effect=self.said.append),
         ):
             yo.cmd_cp(yo.build_parser().parse_args(["cp"] + paths))
 
@@ -925,12 +1127,9 @@ class CpFromGuestHarness(CpHarness):
         return [line for line in reported.splitlines() if not line.startswith("yo: ")]
 
     def pull(self, guest_files, source=":~/proj"):
-        stderr = io.StringIO()
-        with mock.patch.object(
-            yo.ui, "err", side_effect=lambda line="": stderr.write(line + "\n")
-        ):
-            self.copy([source, "dest/"], guest_files)
-        return stderr.getvalue()
+        """A copy of `source` into dest/; what yo said on stderr."""
+        self.copy([source, "dest/"], guest_files)
+        return "".join(line + "\n" for line in self.said)
 
     def landed(self):
         found = []
@@ -1014,6 +1213,38 @@ class TestCpFromGuestDownload(CpFromGuestHarness):
         for name in names:
             self.assertEqual(self.read("dest/proj/%s" % name), name)
 
+    def test_non_ascii_names_land_byte_for_byte_from_a_tar_in_the_c_locale(self):
+        # The guest's GNU tar writes its default format, each name as its raw
+        # bytes; the host's tar runs in yo's C locale and must land them as sent.
+        names = ["café.txt", "日本語/ファイル.txt", "naïve/ü.md"]
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w", format=tarfile.GNU_FORMAT) as tar:
+            for directory in ("proj", "proj/日本語", "proj/naïve"):
+                info = tarfile.TarInfo(directory)
+                info.type, info.mode = tarfile.DIRTYPE, 0o755
+                tar.addfile(info)
+            for name in names:
+                info = tarfile.TarInfo("proj/" + name)
+                info.size = len(name.encode())
+                tar.addfile(info, io.BytesIO(name.encode()))
+        archive = Path(self.guest_root, "stream.tar")
+        archive.write_bytes(stream.getvalue())
+        host_spawn = yo.proc.spawn
+
+        def spawn(argv, **kwargs):
+            if argv[0] == "ssh":
+                return subprocess.Popen(["cat", str(archive)], **kwargs)
+            return host_spawn(argv, **kwargs)
+
+        os.makedirs("dest")
+        self.copy([":~/proj", "dest/"], spawn=spawn)
+        self.assertEqual(
+            [os.fsencode(path) for path in self.landed()],
+            sorted(os.fsencode("dest/proj/" + name) for name in names),
+        )
+        for name in names:
+            self.assertEqual(self.read("dest/proj/" + name), name)
+
     def test_a_source_whose_name_starts_with_a_dash_is_not_an_option(self):
         self.copy([":~/-rf", "out"], {"-rf": "data"})
         self.assertEqual(self.read("out"), "data")
@@ -1022,6 +1253,29 @@ class TestCpFromGuestDownload(CpFromGuestHarness):
         os.makedirs("dest")
         self.pull({"proj/a": "1"})
         self.assertEqual([command[0] for command in self.guest_commands], ["tar"])
+
+    def test_the_guest_tar_runs_in_the_c_locale(self):
+        # yo names what the guest's tar printed, whatever the guest's locale:
+        # its command, run by a local sh in another locale, sees C.
+        def spawn(argv, **kwargs):
+            remote = shlex.split(argv[-1])
+            probe = remote[: -len(guest_words(argv[-1]))] + ["sh", "-c", "echo $LC_ALL"]
+            ran = subprocess.run(
+                probe,
+                env=dict(os.environ, LC_ALL="fr_FR.UTF-8"),
+                capture_output=True,
+                text=True,
+            )
+            raise Reached(ran.stdout)
+
+        with (
+            mock.patch.object(yo.proc, "spawn", spawn),
+            mock.patch.object(yo.cp, "guest_build_output", return_value=[]),
+            mock.patch.object(yo.cp, "host_tar_unpack_argv", return_value=["tar"]),
+        ):
+            with self.assertRaises(Reached) as reached:
+                yo.cp.fetch_guest_sources(["/home/agent/proj"], self.home)
+        self.assertEqual(reached.exception.args, ("C\n",))
 
     def test_overlapping_sources_each_land_under_their_own_name(self):
         os.makedirs("dest")
@@ -1133,6 +1387,10 @@ class TestCpFromGuestLandsOnlyPlainEntries(CpFromGuestHarness):
             self.pull_crafted((self.member("proj/ok"), b"1"), *members)
         self.assertEqual(os.listdir("dest"), [])
         return caught.exception.message
+
+    def test_a_download_names_the_guest_path_it_reads(self):
+        self.pull_crafted((self.member("proj/ok"), b"1"))
+        self.assertEqual(self.said, ["yo: guest path :~/proj -> /home/agent/proj"])
 
     def test_a_fifo_is_refused_by_its_escaped_name(self):
         message = self.assert_refused(
@@ -1445,17 +1703,15 @@ class TestCpFromGuestNeverWritesThroughSymlinks(CpFromGuestHarness):
 
     def test_a_cleanup_failure_is_reported_next_to_the_original_error(self):
         os.makedirs("dest")
-        stderr = io.StringIO()
 
         with (
             mock.patch.object(yo.cp, "remove_staging", side_effect=yo.YoError("stuck")),
-            mock.patch("sys.stderr", stderr),
             self.assertRaises(yo.YoError) as caught,
         ):
             self.copy([":~/proj", "dest/"], {})
 
         self.assertIn("cannot read /home/agent/proj", caught.exception.message)
-        self.assertIn("stuck", stderr.getvalue())
+        self.assertIn("stuck", "\n".join(self.said))
 
     def test_a_move_the_mac_refuses_is_a_yo_error_counting_what_landed(self):
         os.makedirs("dest")
@@ -1672,24 +1928,25 @@ class TestCpFromGuestFailsWithAMessage(CpFromGuestHarness):
 
     def test_a_cleanup_failure_that_is_no_os_error_joins_the_copys_own_error(self):
         os.makedirs("dest")
-        stderr = io.StringIO()
         with (
             mock.patch.object(
                 yo.cp.shutil,
                 "rmtree",
                 side_effect=RecursionError("maximum recursion depth exceeded"),
             ),
-            mock.patch.object(
-                yo.ui, "err", side_effect=lambda line="": stderr.write(line + "\n")
-            ),
             self.assertRaises(yo.YoError) as caught,
         ):
             self.copy([":~/proj", "dest/"], {})
+        said = "\n".join(self.said)
         self.assertIn("cannot read /home/agent/proj", caught.exception.message)
-        self.assertIn("cannot remove the staging directory", stderr.getvalue())
-        self.assertIn("maximum recursion depth exceeded", stderr.getvalue())
+        self.assertIn("cannot remove the staging directory", said)
+        self.assertIn("maximum recursion depth exceeded", said)
 
     def test_a_tree_deeper_than_the_frame_limit_is_unlocked(self):
+        # A low frame limit keeps the deepest path under macOS's 1024-byte PATH_MAX.
+        limit = sys.getrecursionlimit()
+        self.addCleanup(sys.setrecursionlimit, limit)
+        sys.setrecursionlimit(200)
         dirs = [os.path.join(self.cwd, "deep")]
         for _ in range(sys.getrecursionlimit() + 100):
             dirs.append(os.path.join(dirs[-1], "d"))
@@ -1736,15 +1993,17 @@ class TestCpRefusesSymlinks(CpHarness):
 
         def fake_ssh_run(role, argv, **kwargs):
             calls["ssh_run"].append(list(argv))
-            return mock.Mock(returncode=0, stdout=b"", stderr="")
+            stdout, _ = ssh_ends(argv, None, 0, stdout=b"")
+            return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
         with (
             mock.patch.object(yo.proc, "run", fake_run),
             mock.patch.object(yo.sshx, "ssh_run", fake_ssh_run),
+            mock.patch.object(yo.ui, "err"),
             self.assertRaisesRegex(yo.YoError, "refusing to upload symlink"),
         ):
             yo.cmd_cp(yo.build_parser().parse_args(["cp", "a.txt", "link", ":~/x"]))
-        self.assertEqual(calls, {"run": [], "ssh_run": [["true"]]})
+        self.assertEqual(calls, {"run": [], "ssh_run": [AGENT_LOGIN]})
 
     def test_a_trailing_slash_does_not_hide_a_symlink_source(self):
         os.makedirs("real")
@@ -1814,7 +2073,7 @@ class TestHome(unittest.TestCase):
                 self.assertEqual(yo.home(), "/Users/x")
 
 
-@unittest.skipIf(shutil.which("ssh") is None, "no ssh")
+@needs_tool("ssh")
 class TestSshConfigReachesBox(FakeHome):
     """Real `ssh -G` against a ~/.ssh/config in the fake home. Include paths are
     absolute, so the tests hold whichever home an ssh expands ~ against (OpenSSH
@@ -1960,6 +2219,13 @@ class TestEnsureSshConfigInclude(FakeHome):
     def read_config(self):
         with open(self.config_path(), "r") as handle:
             return handle.read()
+
+    def test_a_line_another_yo_added_after_the_prompt_is_not_added_again(self):
+        # Two yo bootstraps prompted at once and both were answered y.
+        self.write_config("Host other\n")
+        yo.sshconfig.add_ssh_config_include()
+        yo.sshconfig.add_ssh_config_include()
+        self.assertEqual(self.read_config().count(yo.SSH_CONFIG_INCLUDE_LINE), 1)
 
     def test_already_present_is_left_untouched(self):
         self.write_config(INCLUDE)
@@ -2183,7 +2449,7 @@ class TestWriteSshConfig(SshConfigCase):
             "IdentitiesOnly yes",
             "ForwardAgent no",
             "ControlMaster auto",
-            'ControlPath "%s"' % os.path.join(yo.instance_dir(), "ssh.sock"),
+            'ControlPath "%s"' % os.path.join(yo.instance_dir(), "yo-op.sock"),
             'UserKnownHostsFile "%s"' % yo.known_hosts_path(),
             "StrictHostKeyChecking accept-new",
             "NoHostAuthenticationForLocalhost no",
@@ -2194,7 +2460,21 @@ class TestWriteSshConfig(SshConfigCase):
         text = self.write()
         match = text.split("Match host lima-yolobox user agent\n", 1)[1]
         self.assertIn('  ControlPath "%s"' % yo.agent_control_path(), match)
-        self.assertLess(text.index("ssh-agent.sock"), text.index("ssh.sock"))
+        self.assertLess(text.index("ssh-agent.sock"), text.index("yo-op.sock"))
+
+    def test_no_role_rides_the_master_lima_keeps_at_ssh_sock(self):
+        # Lima's hostagent opened that master without yo's forwards.
+        text = self.write()
+        paths = re.findall(r'^\s*ControlPath "([^"]*)"$', text, re.M)
+        for role in (yo.OPERATOR, yo.AGENT, yo.OPERATOR_FIRST_CONTACT):
+            argv = yo.sshx.control_argv(role, "check")
+            paths += [
+                o.split("=", 1)[1].strip('"')
+                for o in argv
+                if o.startswith("ControlPath=")
+            ]
+        self.assertGreaterEqual(len(paths), 4, paths)
+        self.assertNotIn(os.path.join(yo.instance_dir(), "ssh.sock"), paths)
 
     def test_herdrs_alias_is_the_agent_with_no_shared_master_and_the_same_facts(self):
         text = self.write()
@@ -2227,7 +2507,7 @@ class TestWriteSshConfig(SshConfigCase):
             with self.assertRaisesRegex(yo.YoError, "double quote"):
                 yo.sshconfig.write_ssh_config()
 
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    @needs_tool("ssh")
     def test_no_role_forwards_an_agent_whatever_a_later_block_says(self):
         # A user's own "Host lima-yolobox / ForwardAgent yes" sits after the
         # Include; ssh keeps the first value. Only `yo ssh` forwards, by its
@@ -2240,9 +2520,16 @@ class TestWriteSshConfig(SshConfigCase):
                 argv = ["ssh"] + yo.ssh_options(role)
                 self.assertEqual(self.effective(argv)["forwardagent"], "no")
         argv = ["ssh"] + yo.ssh_options(yo.OPERATOR) + yo.forward_agent_opts()
-        self.assertEqual(self.effective(argv)["forwardagent"], yo.LIMA.op_sock())
+        effective = self.effective(argv)
+        self.assertEqual(effective["forwardagent"], yo.LIMA.op_sock())
+        # ssh asks for the forward only while it holds an agent itself: with
+        # IdentityAgent none it silently forwards nothing.
+        self.assertEqual(effective["identityagent"], yo.LIMA.op_sock())
+        # The login still offers only the instance's own key, so 1Password
+        # signs nothing for it.
+        self.assertEqual(effective["identitiesonly"], "yes")
 
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    @needs_tool("ssh")
     def test_every_connection_gives_up_on_a_guest_that_stops_answering(self):
         self.write()
         later = "  ServerAliveInterval 0\n  ConnectTimeout 0\n"
@@ -2261,7 +2548,7 @@ class TestWriteSshConfig(SshConfigCase):
                 self.assertEqual(resolved["serveraliveinterval"], "15")
                 self.assertEqual(resolved["serveralivecountmax"], "8")
 
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    @needs_tool("ssh")
     def test_the_agent_role_rides_its_own_master(self):
         self.write()
         resolved = self.effective(["ssh"] + yo.ssh_options(yo.AGENT, mux=True))
@@ -2289,14 +2576,14 @@ class TestHostKeyPinning(SshConfigCase):
             self.assertEqual(effective[keyword], value)
         self.assertEqual(effective["userknownhostsfile"], yo.known_hosts_path())
 
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    @needs_tool("ssh")
     def test_every_yo_role_pins_the_key(self):
         self.write()
         for role in (yo.OPERATOR, yo.AGENT):
             with self.subTest(role=role.name):
                 self.assert_pinned(self.pinned_keywords(["ssh"] + yo.ssh_options(role)))
 
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    @needs_tool("ssh")
     def test_a_bare_ssh_through_the_written_file_pins_the_key_for_both_names(self):
         self.write()
         for user, host in (([], None), (["-o", "User=agent"], None), ([], "yolobox")):
@@ -2304,7 +2591,7 @@ class TestHostKeyPinning(SshConfigCase):
                 argv = ["ssh", "-F", yo.ssh_cfg()] + user
                 self.assert_pinned(self.pinned_keywords(argv, host))
 
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    @needs_tool("ssh")
     def test_editors_reach_the_pin_through_the_users_include(self):
         self.write()
         user_config = os.path.join(self.home, ".ssh", "config")
@@ -2313,7 +2600,7 @@ class TestHostKeyPinning(SshConfigCase):
             handle.write("Include %s\n" % yo.ssh_cfg())
         self.assert_pinned(self.pinned_keywords(["ssh", "-F", user_config]))
 
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    @needs_tool("ssh")
     def test_herdrs_alias_keeps_loopback_verification_against_a_later_host_star(self):
         # herdr reaches the alias through ~/.ssh/config, where the operator's
         # own `Host *` may switch verification off for 127.0.0.1.
@@ -2328,7 +2615,7 @@ class TestHostKeyPinning(SshConfigCase):
         resolved = self.effective(["ssh", "-F", user_config], yo.box.herdr_alias)
         self.assertEqual(resolved["nohostauthenticationforlocalhost"], "no")
 
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    @needs_tool("ssh")
     def test_first_contact_overrides_all_three_pinned_keywords(self):
         self.write()
         effective = self.pinned_keywords(
@@ -2379,7 +2666,7 @@ class TestSshOptionValuesSurviveAHomeWithASpace(FakeHome):
         )
         return dict(line.split(" ", 1) for line in completed.stdout.splitlines())
 
-    @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
+    @needs_tool("ssh")
     def test_the_agents_control_path_and_the_forwarded_socket_reach_ssh_whole(self):
         home = os.path.join(self.home, "h o m e")
         os.makedirs(home)
@@ -2869,7 +3156,7 @@ class BrokerStub:
 
 class TestAwsBrokerHealth(FakeHome):
     def health_on(self, sock, status, body):
-        os.makedirs(yo.state_dir(), exist_ok=True)
+        os.makedirs(yo.state.aws_broker_dir(), exist_ok=True)
         stub = BrokerStub(sock, status, body)
         try:
             return yo.aws_broker_health()
@@ -2877,30 +3164,53 @@ class TestAwsBrokerHealth(FakeHome):
             stub.close()
 
     def health_of(self, status, body):
-        return self.health_on(yo.aws.aws_broker_ctl_sock(), status, body)
+        return self.health_on(yo.state.aws_broker_ctl_sock(), status, body)
 
     def test_a_healthy_broker_carries_what_it_reported(self):
         info = {"pid": 5, "watch_pid": 7, "allow": ["work"]}
         health = self.health_of(200, json.dumps(info).encode())
         self.assertEqual(health, info)
 
-    def test_anything_else_the_socket_says_is_unreachable(self):
+    def test_any_other_answer_is_an_error_showing_it(self):
+        # A broker that answers wrong still runs and holds its socket.
         for status, body in (
             (500, b"oops"),
             (503, b"broker busy; retry\n"),
             (404, b"{}"),
             (200, b"not json"),
             (200, b"[1, 2]"),
+            (200, b"lizard"),
             (200, b""),
         ):
             with self.subTest(status=status, body=body):
-                self.assertIsNone(self.health_of(status, body))
+                with self.assertRaises(yo.YoError) as caught:
+                    self.health_of(status, body)
+                self.assertIn(
+                    "answered /health with HTTP %d and %r" % (status, body),
+                    caught.exception.message,
+                )
 
-    def test_no_socket_is_unreachable(self):
+    def test_no_socket_means_no_broker_listens(self):
         self.assertIsNone(yo.aws_broker_health())
 
+    def test_a_socket_nothing_accepts_on_means_no_broker_listens(self):
+        os.makedirs(yo.state.aws_broker_dir(), exist_ok=True)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(yo.state.aws_broker_ctl_sock())
+        stale.close()
+        self.assertIsNone(yo.aws_broker_health())
+
+    def test_a_broker_that_never_answers_is_an_error_naming_it(self):
+        os.makedirs(yo.state.aws_broker_dir(), exist_ok=True)
+        mute = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(mute.close)
+        mute.bind(yo.state.aws_broker_ctl_sock())
+        mute.listen(1)
+        with self.assertRaisesRegex(yo.YoError, "cannot ask the aws-broker on"):
+            yo.aws.health_on(yo.state.aws_broker_ctl_sock(), 0.2)
+
     def test_a_broker_without_a_usable_pid_is_named_by_its_socket(self):
-        sock = yo.aws.aws_broker_ctl_sock()
+        sock = yo.state.aws_broker_ctl_sock()
         health = self.health_on(sock, 200, json.dumps({"pid": None}).encode())
         with self.assertRaises(yo.YoError) as caught:
             yo.kill_broker_in(health)
@@ -3100,9 +3410,9 @@ class TestStartAwsBrokerFiles(FakeHome):
         argv = popen.call_args.args[0]
         self.assertEqual(argv[argv.index("--socket") + 1], yo.aws_broker_sock())
         self.assertEqual(
-            argv[argv.index("--control-socket") + 1], yo.aws.aws_broker_ctl_sock()
+            argv[argv.index("--control-socket") + 1], yo.state.aws_broker_ctl_sock()
         )
-        self.assertNotEqual(yo.aws_broker_sock(), yo.aws.aws_broker_ctl_sock())
+        self.assertNotEqual(yo.aws_broker_sock(), yo.state.aws_broker_ctl_sock())
 
     def test_the_broker_does_not_inherit_yos_stdin(self):
         proc = mock.Mock()
@@ -3123,24 +3433,22 @@ class TestStartAwsBrokerFiles(FakeHome):
             with self.assertRaisesRegex(yo.YoError, "aws-broker not found on PATH"):
                 yo.start_aws_broker(555, ["work"])
 
-    def test_state_dir_and_log_are_private(self):
+    def test_the_broker_dir_and_log_are_private(self):
         self.start()
-        state = yo.state_dir()
-        log_dir = os.path.join(state, "aws-broker")
-        self.assertEqual(stat.S_IMODE(os.stat(state).st_mode), 0o700)
+        log_dir = yo.state.aws_broker_dir()
         self.assertEqual(stat.S_IMODE(os.stat(log_dir).st_mode), 0o700)
         log = os.path.join(log_dir, "broker.log")
         self.assertEqual(stat.S_IMODE(os.stat(log).st_mode), 0o600)
 
     def test_an_existing_permissive_dir_is_tightened(self):
-        log_dir = os.path.join(yo.state_dir(), "aws-broker")
+        log_dir = yo.state.aws_broker_dir()
         os.makedirs(log_dir)
         os.chmod(log_dir, 0o755)
         self.start()
         self.assertEqual(stat.S_IMODE(os.stat(log_dir).st_mode), 0o700)
 
     def test_an_existing_log_is_truncated_not_appended_to(self):
-        log_dir = os.path.join(yo.state_dir(), "aws-broker")
+        log_dir = yo.state.aws_broker_dir()
         os.makedirs(log_dir)
         log = os.path.join(log_dir, "broker.log")
         with open(log, "w") as handle:
@@ -3399,17 +3707,21 @@ class TestLimaDestroy(FakeHome):
 
     def subprocess_run(self, argv, **kwargs):
         self.calls.append(list(argv))
-        code, stdout = 0, b""
+        code, stdout, stderr = 0, b"", b""
         if argv[:3] == ["limactl", "list", "-q"]:
             code = self.list_code
             stdout = "".join(name + "\n" for name in self.listed).encode()
         elif argv[:2] == ["limactl", "delete"]:
             code = self.delete_code
         elif argv[0] == "ssh" and "check" in argv:
-            code = 0 if self.agent_master else 255
+            code, stderr = (
+                (0, b"Master running (pid=4242)\r\n")
+                if self.agent_master
+                else (255, b"Control socket connect(x): No such file or directory\r\n")
+            )
         elif argv[0] == "ssh" and "exit" in argv:
             self.agent_master = self.agent_master_survives_exit
-        return subprocess.CompletedProcess(argv, code, stdout, b"")
+        return subprocess.CompletedProcess(argv, code, stdout, stderr)
 
     def destroy(self, yes):
         yo.cmd_destroy(argparse.Namespace(yes=yes))
@@ -3437,6 +3749,29 @@ class TestLimaDestroy(FakeHome):
         self.assertFalse(self.agent_master)
         exit_at = next(i for i, call in enumerate(self.calls) if "exit" in call)
         self.assertLess(exit_at, self.calls.index(self.deletes()[0]))
+
+    def test_the_boxs_broker_stops_before_its_directory_is_deleted(self):
+        # A broker that ends with the hostagent would unlink its sockets in
+        # the directory limactl is deleting.
+        stopped = []
+
+        def stop(pid):
+            stopped.append(pid)
+            self.calls.append(["stop the broker", pid])
+
+        with (
+            mock.patch.object(yo.aws, "aws_broker_health", return_value={"pid": 77}),
+            mock.patch.object(yo.aws, "stop_broker", side_effect=stop),
+        ):
+            self.destroy(yes=False)
+            self.assertIn("stop the AWS broker of yolobox", "\n".join(self.lines))
+            self.assertEqual(stopped, [])
+            self.destroy(yes=True)
+        self.assertEqual(stopped, [77])
+        self.assertLess(
+            self.calls.index(["stop the broker", 77]),
+            self.calls.index(self.deletes()[0]),
+        )
 
     def test_an_agent_master_that_will_not_quit_stops_the_run(self):
         self.agent_master = True
@@ -3589,6 +3924,23 @@ class TestLimaConfigGaps(FakeHome):
                 yo.LIMA.vm_status(), yo.VmStatus(yo.VmState.OTHER, "Broken")
             )
 
+    def test_a_status_yo_has_no_name_for_is_another_state_shown_in_its_words(self):
+        data = {"status": "lizard", "config": {"ssh": {}, "user": {}}}
+        with fake_limactl(json.dumps(data)):
+            self.assertEqual(
+                yo.LIMA.vm_status(), yo.VmStatus(yo.VmState.OTHER, "lizard")
+            )
+
+    def test_an_instance_without_a_status_word_is_an_error(self):
+        for status in (MISSING, None, "", 1):
+            with self.subTest(status=status):
+                data = {"config": {"ssh": {}, "user": {}}}
+                if status is not MISSING:
+                    data["status"] = status
+                with fake_limactl(json.dumps(data)):
+                    with self.assertRaisesRegex(yo.YoError, "not a word"):
+                        yo.LIMA.vm_status()
+
     def test_a_broken_instance_without_a_reason_is_still_an_error(self):
         for errors in (MISSING, None, [], [{}], "lizard"):
             with self.subTest(errors=errors):
@@ -3600,41 +3952,6 @@ class TestLimaConfigGaps(FakeHome):
                         yo.YoError, "as Broken and prints no reason"
                     ):
                         yo.LIMA.config_gaps()
-
-    def test_present_reverse_rules_are_no_gaps(self):
-        with self.mock_lima_list(self.restated_forwards()):
-            self.assertEqual(yo.LIMA.config_gaps(), [])
-
-    def test_missing_reverse_rule_is_reported_not_raised(self):
-        forwards = [
-            forward
-            for forward in self.restated_forwards()
-            if "guestSocket" not in forward
-        ]
-        with self.mock_lima_list(forwards):
-            gaps = yo.LIMA.config_gaps()
-        self.assertEqual(gaps, [yo.OP_GUEST_SOCK, yo.AWS_BROKER_GUEST_SOCK])
-
-    def test_only_one_missing_rule_is_reported(self):
-        forwards = [
-            forward
-            for forward in self.restated_forwards()
-            if forward.get("guestSocket") != yo.AWS_BROKER_GUEST_SOCK
-        ]
-        with self.mock_lima_list(forwards):
-            gaps = yo.LIMA.config_gaps()
-        self.assertEqual(gaps, [yo.AWS_BROKER_GUEST_SOCK])
-
-    def test_mismatched_host_socket_is_reported(self):
-        forwards = [
-            {**forward, "hostSocket": "/somewhere/else.sock"}
-            if forward.get("guestSocket") == yo.OP_GUEST_SOCK
-            else forward
-            for forward in self.restated_forwards()
-        ]
-        with self.mock_lima_list(forwards):
-            gaps = yo.LIMA.config_gaps()
-        self.assertIn(yo.OP_GUEST_SOCK, gaps)
 
     def test_an_instance_that_only_ignores_dhcp_still_mirrors_udp_listeners(self):
         # Older instances ignore UDP 68 alone; tailscaled's 41641 is still
@@ -3818,19 +4135,6 @@ class TestLimaConfigGaps(FakeHome):
                 "ignore": True,
             }
 
-        def reverse_socket(guest_socket, host_socket):
-            return {
-                "proto": "any",
-                "guestIP": "127.0.0.1",
-                "guestIPMustBeZero": False,
-                "guestPortRange": [1, 65535],
-                "guestSocket": guest_socket,
-                "hostIP": "127.0.0.1",
-                "hostPortRange": [0, 0],
-                "hostSocket": host_socket,
-                "reverse": True,
-            }
-
         return [
             ignored_tcp_range(1455, 1457),
             ignored_tcp_range(8020, 8020),
@@ -3845,15 +4149,6 @@ class TestLimaConfigGaps(FakeHome):
                 "hostIP": "127.0.0.1",
                 "hostPortRange": [1024, 49151],
             },
-            reverse_socket(
-                "/run/yolobox-op/agent.sock",
-                self.home
-                + "/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
-            ),
-            reverse_socket(
-                "/run/yolobox-op/aws-broker.sock",
-                self.home + "/.local/state/yolobox/aws-broker.sock",
-            ),
             {
                 "proto": "udp",
                 "guestIP": "0.0.0.0",
@@ -3940,22 +4235,38 @@ class TestLimaConfigGaps(FakeHome):
             *(
                 forward
                 for forward in self.restated_forwards()
-                if "guestSocket" in forward or forward.get("proto") == "udp"
+                if forward.get("proto") == "udp"
             ),
         ]
         self.assertEqual(self.gaps_for(old), [yo.GAP_TCP_FORWARDS])
+
+    def test_a_socket_rule_the_yaml_does_not_have_is_a_gap(self):
+        socket_rule = {
+            "proto": "any",
+            "guestIP": "127.0.0.1",
+            "guestIPMustBeZero": False,
+            "guestPortRange": [1, 65535],
+            "guestSocket": yo.OP_GUEST_SOCK,
+            "hostIP": "127.0.0.1",
+            "hostPortRange": [0, 0],
+            "hostSocket": "/somewhere/agent.sock",
+            "reverse": True,
+        }
+        forwards = self.restated_forwards()
+        forwards.insert(6, socket_rule)
+        # One gap of its own: lima never matches a socket rule to a listener,
+        # so the listener rules have no gap.
+        self.assertEqual(self.gaps_for(forwards), [yo.GAP_REVERSE_SOCKETS])
+        message = yo.LIMA.config_gap_message([yo.GAP_REVERSE_SOCKETS])
+        self.assertIn("limactl edit", message)
+        self.assertNotIn("destroy", message)
 
     def test_no_usable_port_forwards_reports_every_gap_without_raising(self):
         for forwards in ([], None, ["lizard"], [None, 0, "lizard"]):
             with self.subTest(forwards=forwards):
                 self.assertEqual(
                     self.gaps_for(forwards),
-                    [
-                        yo.OP_GUEST_SOCK,
-                        yo.AWS_BROKER_GUEST_SOCK,
-                        yo.GAP_UDP_FORWARDS,
-                        yo.GAP_TCP_FORWARDS,
-                    ],
+                    [yo.GAP_UDP_FORWARDS, yo.GAP_TCP_FORWARDS],
                 )
 
     def test_missing_instance_ha_pid_is_none(self):
@@ -3997,8 +4308,6 @@ class TestNormalizePortForward(unittest.TestCase):
 
     def test_normalizing_twice_changes_nothing(self):
         for forward in yo.LIMA_PORT_FORWARDS:
-            if "guestSocket" in forward:
-                continue
             with self.subTest(forward=forward):
                 once = yo.normalize_port_forward(forward)
                 self.assertEqual(yo.normalize_port_forward(once), once)
@@ -4011,7 +4320,7 @@ class TestNormalizePortForward(unittest.TestCase):
 
 class TestLimaConfigGapMessage(unittest.TestCase):
     def test_a_gap_lima_reads_only_at_creation_recreates_and_warns_of_the_loss(self):
-        gaps = [yo.OP_GUEST_SOCK, yo.GAP_MOUNTS, yo.GAP_FORWARD_AGENT, yo.GAP_VM_TYPE]
+        gaps = [yo.GAP_MOUNTS, yo.GAP_FORWARD_AGENT, yo.GAP_VM_TYPE]
         message = yo.LIMA.config_gap_message(gaps)
         for gap in gaps:
             self.assertIn(gap, message)
@@ -4052,9 +4361,10 @@ class TestLimaStartRefusesOnlyTheGapsThatBreakThePromises(FakeHome):
             mock.patch.object(yo.unlock, "unlock_disk"),
             mock.patch.object(yo.unlock, "wait_for_operator"),
             mock.patch.object(yo.ui, "err", side_effect=warnings.append),
+            yo.box_lock(wait=True) as held,
         ):
             try:
-                yo.LIMA.start(b"pass", None)
+                yo.LIMA.start(held, lambda: b"pass")
             except yo.YoError as refused:
                 return refused, spawn, warnings
         return None, spawn, warnings
@@ -4062,8 +4372,8 @@ class TestLimaStartRefusesOnlyTheGapsThatBreakThePromises(FakeHome):
     def test_ssh_over_vsock_or_a_host_mount_refuses_before_the_vm_is_touched(self):
         for gaps in (
             [yo.GAP_SSH_OVER_VSOCK],
-            [yo.OP_GUEST_SOCK, yo.GAP_FORWARD_AGENT, yo.GAP_SSH_OVER_VSOCK],
-            [yo.OP_GUEST_SOCK, yo.GAP_MOUNTS],
+            [yo.GAP_FORWARD_AGENT, yo.GAP_SSH_OVER_VSOCK],
+            [yo.GAP_UDP_FORWARDS, yo.GAP_MOUNTS],
         ):
             with self.subTest(gaps=gaps):
                 refused, spawn, _ = self.start(gaps)
@@ -4083,7 +4393,6 @@ class TestLimaStartRefusesOnlyTheGapsThatBreakThePromises(FakeHome):
             yo.GAP_TCP_FORWARDS,
             yo.GAP_OPERATOR_UID,
             yo.GAP_VM_TYPE,
-            yo.OP_GUEST_SOCK,
         ]
         refused, spawn, warnings = self.start(others)
         self.assertIsNone(refused)
@@ -4181,20 +4490,75 @@ class TestStatusWithVmDown(unittest.TestCase):
         self.assertIn("yo up", stdout.getvalue())
 
 
+class TestStatusLooksInsideAnInitrdOnlyUnderTheBoxLock(FakeHome):
+    """`yo status` asks root nothing while another yo acts on the box, and an
+    answer on the port that is no ssh at all is a warning, not an abort."""
+
+    INITRD = "SSH-2.0-OpenSSH_10.6 %s\r" % yo.INITRD_SSH_BANNER_MARK
+
+    def status(self, banner):
+        stdout = io.StringIO()
+        logins = []
+
+        def run(argv, **kwargs):
+            if argv[0] == "ssh":
+                logins.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "ask=pending\n", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            mock.patch.object(yo.LIMA, "show_status", return_value=None),
+            mock.patch.object(yo.LIMA, "disk_image", return_value=None),
+            mock.patch.object(yo.LIMA, "ssh_port", return_value=60022),
+            mock.patch.object(yo.proc, "run", run),
+            mock.patch.object(yo.unlock, "ssh_banner", lambda endpoint: banner),
+            hostagent_holds_the_port(),
+            mock.patch.object(yo.shutil, "which", lambda name: None),
+            self.assertRaises(yo.YoError) as caught,
+        ):
+            yo.cmd_status(yo.build_parser().parse_args(["status"]))
+        self.assertEqual(caught.exception.code, 1)
+        return stdout.getvalue(), logins
+
+    def test_a_box_in_its_initrd_is_looked_inside_as_root_under_the_lock(self):
+        out, logins = self.status(self.INITRD)
+        self.assertEqual(len(logins), 2, logins)  # the root probe and the ask probe
+        self.assertTrue(all("User=root" in argv for argv in logins))
+        self.assertIn("waiting for the passphrase", out)
+        self.assertFalse(box_lock_is_held())
+
+    def test_a_box_in_its_initrd_that_another_yo_acts_on_is_not_asked_as_root(self):
+        with box_lock_held_elsewhere():
+            out, logins = self.status(self.INITRD)
+        self.assertEqual(logins, [])
+        self.assertIn("another yo is acting on it", out)
+
+    def test_a_port_that_answers_no_ssh_is_a_warning_and_the_report_goes_on(self):
+        out, logins = self.status("lizard")
+        self.assertEqual(logins, [])
+        self.assertIn("answers lizard, which is no ssh identification", out)
+        self.assertIn("aws: disabled", out)
+
+
 # How long a test's fake server waits for the connection the code under test
 # should make; a run that never connects ends the server, not the suite.
 ACCEPT_TIMEOUT_SECONDS = 10
 
 
 class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
-    """boot_stage reads a real TCP banner and asks for root only off stage 2:
-    root there is an invalid user, which sshd penalises per source address,
-    and every host connection shares the gateway's address."""
+    """boot_stage reads a real TCP banner and asks for root only off the
+    initrd's: root on any stage 2 is an invalid user, which sshd penalises per
+    source address, and every host connection shares the gateway's address."""
 
     STAGE2 = "SSH-2.0-OpenSSH_10.6 %s\r\n" % yo.STAGE2_SSH_BANNER_MARK
+    INITRD = "SSH-2.0-OpenSSH_10.6 %s\r\n" % yo.INITRD_SSH_BANNER_MARK
 
     def serve(self, banner):
-        """A port whose sshd sends `banner`, or that nothing listens on (None)."""
+        """A port whose sshd sends `banner`, or that nothing listens on (None).
+        The initrd's banner is read twice: once to tell the sshds apart, and
+        once more at the gate of the root login."""
+        reads = 2 if banner == self.INITRD else 1
         server = socket.socket()
         server.bind(("127.0.0.1", 0))
         port = server.getsockname()[1]
@@ -4208,12 +4572,13 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
         server.settimeout(ACCEPT_TIMEOUT_SECONDS)
 
         def answer():
-            try:
-                conn, _ = server.accept()
-            except socket.timeout:
-                return
-            with conn:
-                conn.sendall(banner.encode())
+            for _ in range(reads):
+                try:
+                    conn, _ = server.accept()
+                except socket.timeout:
+                    return
+                with conn:
+                    conn.sendall(banner.encode())
 
         thread = threading.Thread(target=answer)
         thread.start()
@@ -4223,42 +4588,72 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
     def boot_stage(
         self, banner, operator=yo.SshOutcome.REFUSED, root=yo.SshOutcome.ANSWERED
     ):
+        """The stage's kind and the accounts asked; the stage is self.stage."""
         port = self.serve(banner)
         asked = []
 
-        def answers(endpoint, user):
+        def probe(argv, user):
             asked.append(user)
-            return operator if user != "root" else root
+            outcome = operator if user != "root" else root
+            return yo.unlock.SshAttempt(outcome, "%s's words" % user)
 
         with (
             mock.patch.object(
                 yo.LIMA, "ssh_facts", return_value=yo.SshFacts(port, "op", "/k", "none")
             ),
-            mock.patch.object(yo.unlock, "sshd_answers", answers),
+            # The test's port is whatever the OS gave, maybe in Lima's mirrored range.
+            mock.patch.object(yo.LIMA, "verify_initrd_listener"),
+            mock.patch.object(yo.unlock, "ssh_attempt", probe),
             mock.patch.object(yo.release, "host_user", return_value="op"),
             mock.patch.object(socket, "create_connection", REAL_CREATE_CONNECTION),
+            yo.box_lock(wait=True) as held,
         ):
-            return yo.boot_stage(), asked
+            self.stage = yo.boot_stage(held)
+            return self.stage.kind, asked
 
     def test_a_marked_stage2_that_refuses_the_operator_is_never_asked_for_root(self):
         self.assertEqual(self.boot_stage(self.STAGE2), (yo.BootStage.NONE, ["op"]))
+        self.assertEqual(
+            self.stage.said,
+            "its sshd did not let the operator in; ssh said: op's words",
+        )
 
-    def test_an_unmarked_sshd_is_asked_for_root_as_the_initrd(self):
+    def test_a_port_that_answers_no_ssh_line_is_named_with_its_words(self):
+        # Something else holds the port: no login at all, and the error quotes it.
+        for banner in ("lizard\r\n", "SSH-1.5-ancient\r\n", "\x1b[31mred\r\n"):
+            with self.subTest(banner=banner):
+                with self.assertRaises(yo.YoError) as caught:
+                    self.boot_stage(banner)
+                self.assertIn(
+                    "answers %s, which is no ssh identification"
+                    % yo.ui.shown(banner.split("\n")[0]),
+                    caught.exception.message,
+                )
+
+    def test_the_initrds_banner_is_asked_for_root_alone(self):
+        self.assertEqual(self.boot_stage(self.INITRD), (yo.BootStage.INITRD, ["root"]))
+
+    def test_an_unmarked_sshd_is_the_seeds_stage2_and_never_asked_for_root(self):
+        # The seed image's stage 2, or a word that only resembles a mark.
         for banner in (
             "SSH-2.0-OpenSSH_10.6\r\n",
             "SSH-2.0-OpenSSH_10.6 %s-old\r\n" % yo.STAGE2_SSH_BANNER_MARK,
+            "SSH-2.0-OpenSSH_10.6 %s-old\r\n" % yo.INITRD_SSH_BANNER_MARK,
         ):
             with self.subTest(banner=banner):
                 self.assertEqual(
-                    self.boot_stage(banner), (yo.BootStage.INITRD, ["op", "root"])
+                    self.boot_stage(banner, operator=yo.SshOutcome.ANSWERED),
+                    (yo.BootStage.STAGE2, ["op"]),
                 )
+                self.assertEqual(self.boot_stage(banner), (yo.BootStage.NONE, ["op"]))
 
-    def test_an_unmarked_sshd_that_refuses_both_is_unknown_not_absent(self):
+    def test_an_initrd_that_refuses_root_is_unknown_not_absent(self):
         # A dead 1Password in front of an initrd looks exactly like this.
         self.assertEqual(
-            self.boot_stage("SSH-2.0-OpenSSH_10.6\r\n", root=yo.SshOutcome.REFUSED),
-            (yo.BootStage.UNKNOWN, ["op", "root"]),
+            self.boot_stage(self.INITRD, root=yo.SshOutcome.REFUSED),
+            (yo.BootStage.UNKNOWN, ["root"]),
         )
+        self.assertIn("(ssh said: root's words)", yo.unknown_stage_message(self.stage))
 
     def test_an_empty_banner_offers_no_login_at_all(self):
         # Nothing listening, or an sshd that sent nothing in time: whoever it
@@ -4291,13 +4686,13 @@ class TestWaitForOperatorRetriesEveryShapeUntilTheDeadline(unittest.TestCase):
         box = mock.Mock()
         box.name = "e2e1"
 
-        def probe(endpoint, user):
+        def probe(endpoint):
             outcome = next(outcomes)
             return outcome, "ssh said %s" % outcome.value
 
         with (
             mock.patch.object(yo.release, "host_user", return_value="op"),
-            mock.patch.object(yo.unlock, "probe_sshd", probe),
+            mock.patch.object(yo.unlock, "probe_operator", probe),
             mock.patch.object(yo.state, "driver", return_value=driver),
             mock.patch.object(yo.state, "box", box),
             mock.patch.object(yo.state, "yo_cmd", lambda *a: "yo -m e2e1 status"),
@@ -4356,42 +4751,58 @@ class TestWaitForOperatorRetriesEveryShapeUntilTheDeadline(unittest.TestCase):
             )
 
 
-class TestUnlockDiskSendsThePassphraseOnlyToAnUnmarkedSshd(unittest.TestCase):
+class TestUnlockDiskSendsThePassphraseOnlyToTheInitrd(unittest.TestCase):
     """The passphrase goes to root over an unpinned channel, so the banner is
-    read before every helper run: a marked stage 2, the one switch-root lands
-    in, is asked for the operator and nothing else."""
+    read before every helper run: only the initrd's banner gets the helper,
+    and any other sshd (a stage 2, the seed image's unmarked one) is asked for
+    the operator and nothing else."""
 
     DROPPED = yo.HelperRun(yo.SSH_UNREACHABLE, "", True)
 
     def run_unlock(self, kinds, operator_answers, helper_runs):
+        """unlock_disk with `kinds` the sshd each round finds; the helper
+        stands in for run_initrd_helper and derives the passphrase as it does."""
         kinds = iter(kinds)
         operator_answers = iter(operator_answers)
         helper_runs = iter(helper_runs)
         helper_calls = []
+        self.derived = 0
         driver = mock.Mock()
         driver.vm_status.return_value = yo.VmStatus(yo.VmState.RUNNING, "Running")
 
-        def helper(passphrase):
-            helper_calls.append(passphrase)
+        def passphrase():
+            self.derived += 1
+            return b"secret"
+
+        def helper(gate, source):
+            helper_calls.append(source())
             return next(helper_runs)
 
+        gate = proved_initrd(yo.SshFacts(60022, "op", "/k/user", "none"))
         with (
-            mock.patch.object(yo.unlock, "endpoint_kind", lambda endpoint: next(kinds)),
             mock.patch.object(
                 yo.unlock,
-                "sshd_answers",
-                lambda endpoint, user: next(operator_answers),
+                "endpoint_kind",
+                lambda endpoint: yo.unlock.Banner(next(kinds), "SSH-2.0-x"),
+            ),
+            # The gate reads the banner again; these rounds are about the first read.
+            mock.patch.object(yo.unlock, "initrd_endpoint", lambda held: gate),
+            mock.patch.object(
+                yo.unlock,
+                "probe_operator",
+                lambda endpoint: yo.unlock.SshAttempt(next(operator_answers), ""),
             ),
             mock.patch.object(yo.unlock, "run_initrd_helper", helper),
             mock.patch.object(yo.state, "driver", return_value=driver),
             mock.patch.object(yo.state, "box", mock.Mock(name="box")),
             mock.patch.object(yo.ui, "err"),
             mock.patch.object(yo.time, "sleep"),
+            yo.box_lock(wait=True) as held,
         ):
-            yo.unlock_disk(b"secret")
+            yo.unlock_disk(held, passphrase)
         return helper_calls
 
-    def test_after_the_session_dropped_a_marked_stage2_never_sees_the_helper(self):
+    def test_after_the_session_dropped_a_stage2_never_sees_the_helper(self):
         helper_calls = self.run_unlock(
             kinds=[yo.Endpoint.INITRD, yo.Endpoint.NONE] + [yo.Endpoint.STAGE2] * 2,
             # The new stage 2 refuses the operator once (its key not written
@@ -4401,13 +4812,30 @@ class TestUnlockDiskSendsThePassphraseOnlyToAnUnmarkedSshd(unittest.TestCase):
         )
         self.assertEqual(helper_calls, [b"secret"])
 
-    def test_a_marked_stage2_that_refuses_the_operator_is_retried_without_root(self):
+    def test_a_stage2_that_refuses_the_operator_is_retried_without_root(self):
         helper_calls = self.run_unlock(
             kinds=[yo.Endpoint.STAGE2, yo.Endpoint.STAGE2],
             operator_answers=[yo.SshOutcome.REFUSED, yo.SshOutcome.ANSWERED],
             helper_runs=[],
         )
         self.assertEqual(helper_calls, [])
+
+    def test_the_seeds_unmarked_sshd_boots_without_root_or_the_passphrase(self):
+        helper_calls = self.run_unlock(
+            kinds=[yo.Endpoint.UNMARKED] * 2,
+            operator_answers=[yo.SshOutcome.REFUSED, yo.SshOutcome.ANSWERED],
+            helper_runs=[],
+        )
+        self.assertEqual(helper_calls, [])
+        self.assertEqual(self.derived, 0)
+
+    def test_a_helper_that_fails_in_a_way_ssh_names_is_an_error_with_its_words(self):
+        # "Too many authentication failures", a bad key file: nothing a retry fixes.
+        failed = yo.HelperRun(yo.SSH_UNREACHABLE, "Load key: invalid format", False)
+        with self.assertRaisesRegex(yo.YoError, "Load key: invalid format"):
+            self.run_unlock(
+                kinds=[yo.Endpoint.INITRD], operator_answers=[], helper_runs=[failed]
+            )
 
     def test_nothing_listening_gets_no_helper_and_no_login(self):
         helper_calls = self.run_unlock(
@@ -4431,7 +4859,7 @@ class TestLimaStopHangOffersTheKillOnlyPastTheInitrd(unittest.TestCase):
             ),
         ):
             with self.assertRaises(yo.YoError) as caught:
-                yo.LIMA.stop()
+                locked(yo, yo.LIMA.stop)
         message = caught.exception.message
         # "answers" would admit the initrd's host-key or permission errors.
         self.assertIn(
@@ -4455,7 +4883,7 @@ class TestLimaStopThatExitsNonZeroOnARunningBox(unittest.TestCase):
             mock.patch.object(yo.subprocess, "run", return_value=failed),
         ):
             with self.assertRaises(yo.StopRefused) as caught:
-                stop()
+                locked(yo, stop)
         return caught.exception
 
     def test_a_polite_stop_carries_the_hang_recovery_and_its_exit(self):
@@ -4473,15 +4901,16 @@ class TestLimaStopThatExitsNonZeroOnARunningBox(unittest.TestCase):
 
 class TestLimaInitrdTimeoutNamesItsBootLog(unittest.TestCase):
     def test_serialv_log_keeps_the_boot_so_it_is_named(self):
-        text = yo.unlock.initrd_timeout_error(False).message
-        self.assertIn("never offered its initrd sshd", text)
+        last = yo.unlock.Round("no banner", yo.unlock.where_to_look())
+        text = yo.unlock.initrd_timeout_error(last).message
+        self.assertIn("did not let the operator in", text)
         self.assertIn("~/.lima/yolobox/serialv.log", text)
         self.assertIn("~/.lima/yolobox/ha.stderr.log", text)
 
 
 class TestUnknownStageOffersNoForceOnLima(unittest.TestCase):
     def test_the_way_out_is_lima_s_key_and_never_a_forced_stop(self):
-        text = yo.unlock.unknown_stage_message()
+        text = yo.unlock.unknown_stage_message(yo.Stage(yo.BootStage.UNKNOWN, ""))
         self.assertIn("~/.lima/_config/user", text)
         self.assertIn("run the command again", text)
         self.assertNotIn(LIMA_FORCE_STOP, text)
@@ -4555,22 +4984,40 @@ class TestSshBannerReadsTheWholeLine(unittest.TestCase):
     def test_a_peer_that_closes_early_leaves_what_it_sent(self):
         self.assertEqual(self.banner(b"SSH-2.0-Open"), "SSH-2.0-Open")
 
+    def test_a_peer_that_closes_before_any_byte_sent_no_banner(self):
+        with self.assertRaisesRegex(
+            yo.unlock.NoBanner, "the connection closed before a line came"
+        ):
+            self.banner()
+
 
 class TestSshBannerTellsNothingListeningFromAHostFailure(unittest.TestCase):
     def banner_when_connect_raises(self, failure):
         with mock.patch.object(
             yo.unlock.socket, "create_connection", side_effect=failure
         ):
-            return yo.unlock.ssh_banner(yo.SshFacts(60022, "op", "/k", "none"))
+            return yo.unlock.endpoint_kind(yo.SshFacts(60022, "op", "/k", "none"))
 
-    def test_a_port_nothing_answers_on_has_no_banner(self):
-        for failure in (
-            ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
-            ConnectionResetError(errno.ECONNRESET, "reset"),
-            socket.timeout("timed out"),
+    def test_a_port_that_sends_no_line_is_no_banner_naming_what_came_instead(self):
+        for failure, said in (
+            (
+                ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
+                "no ssh banner: Connection refused",
+            ),
+            (
+                ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"),
+                "no ssh banner: Connection reset by peer",
+            ),
+            (
+                socket.timeout("timed out"),
+                "no ssh banner within %d s" % yo.sshconfig.SSH_CONNECT_TIMEOUT_SECONDS,
+            ),
         ):
             with self.subTest(failure=type(failure).__name__):
-                self.assertEqual(self.banner_when_connect_raises(failure), "")
+                self.assertEqual(
+                    self.banner_when_connect_raises(failure),
+                    yo.unlock.Banner(yo.Endpoint.NONE, said),
+                )
 
     def test_a_host_that_cannot_connect_at_all_is_an_error_not_a_silent_port(self):
         for code in (errno.EMFILE, errno.EPERM):
@@ -4581,9 +5028,156 @@ class TestSshBannerTellsNothingListeningFromAHostFailure(unittest.TestCase):
                     self.banner_when_connect_raises(OSError(code, os.strerror(code)))
 
 
+class TestTheBoxLockIsTakenOnceAndHandedDown(FakeHome):
+    """flock is not re-entrant across two descriptors of one process, so a
+    box_lock() inside another would wait on itself: it is refused at once."""
+
+    def test_taking_the_lock_inside_itself_is_refused_at_once(self):
+        for wait in (True, False):
+            with self.subTest(wait=wait):
+                with yo.box_lock(wait=True):
+                    with self.assertRaisesRegex(RuntimeError, "inside itself"):
+                        with yo.box_lock(wait=wait):
+                            pass
+                    self.assertTrue(box_lock_is_held())
+                self.assertFalse(box_lock_is_held())
+
+    def test_another_boxs_lock_may_be_held_beside_it(self):
+        with yo.box_lock(wait=True):
+            yo.set_box(yo.box.driver, "e2e1")
+            try:
+                with yo.box_lock(wait=False):
+                    self.assertTrue(box_lock_is_held())
+            finally:
+                yo.set_box(yo.box.driver, yo.DEFAULT_INSTANCE)
+            self.assertTrue(box_lock_is_held())
+
+    def test_the_lock_is_free_again_after_a_step_that_raised(self):
+        with self.assertRaises(yo.YoError):
+            with yo.box_lock(wait=True):
+                raise yo.YoError("a step failed")
+        with yo.box_lock(wait=False):
+            pass
+
+    def test_only_box_lock_hands_out_the_proof_that_it_is_held(self):
+        with self.assertRaisesRegex(TypeError, "only state.box_lock"):
+            yo.state.HeldBox(object())
+
+    HOLDERS = (
+        "yo up, yo bootstrap, yo disk-grow, yo down, yo destroy --yes or yo status"
+    )
+
+    def test_a_wait_for_another_yo_is_said_in_one_line_before_it_blocks(self):
+        # The line is the moment to let the other yo go: the wait then ends.
+        path = yo.state.box_lock_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        other = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(other, fcntl.LOCK_EX)
+        said = []
+
+        def err(line):
+            said.append(line)
+            os.close(other)
+
+        with mock.patch.object(yo.ui, "err", side_effect=err):
+            with yo.box_lock(wait=True):
+                self.assertTrue(box_lock_is_held())
+        self.assertEqual(
+            said,
+            [
+                "yo: another yo is acting on yolobox (%s holds its lock); waiting "
+                "for it" % self.HOLDERS
+            ],
+        )
+
+    def test_a_lock_nobody_holds_is_taken_without_a_word(self):
+        with mock.patch.object(yo.ui, "err") as err:
+            with yo.box_lock(wait=True):
+                pass
+        err.assert_not_called()
+
+    def test_a_command_that_will_not_wait_names_every_command_that_may_hold_it(self):
+        with box_lock_held_elsewhere():
+            with self.assertRaises(yo.YoError) as caught:
+                yo.cmd_down(argparse.Namespace())
+        self.assertIn(
+            "another yo is acting on yolobox (%s holds its lock)" % self.HOLDERS,
+            caught.exception.message,
+        )
+
+
 class TestSshArgv(FakeHome):
     def test_the_multiplexing_off_by_default_says_so(self):
-        self.assertIn("ControlPath=none", yo.sshx.ssh_argv(yo.OPERATOR))
+        argv = yo.sshx.guest_argv(yo.OPERATOR, ["true"], stdin=False)
+        self.assertIn("ControlPath=none", argv)
+
+
+class TestLimaProvesItsHostagentHoldsTheSshPort(unittest.TestCase):
+    """Root, and the passphrase, go to the box's port only while lsof names
+    this instance's hostagent as its one listener: any process of the host
+    user's can bind a port nothing holds."""
+
+    def verify(self, lsof, hostagent=HOSTAGENT_PID, port=60022):
+        """verify_initrd_listener(port) with lsof ending as `lsof` (exit,
+        stdout, stderr); the argv lsof ran with, or the refusal's message."""
+        self.ran = []
+
+        def run(argv, **kwargs):
+            self.ran.append(list(argv))
+            return subprocess.CompletedProcess(argv, *lsof)
+
+        with (
+            mock.patch.object(yo.LIMA, "keepalive_pid", return_value=hostagent),
+            mock.patch.object(yo.proc, "run", side_effect=run),
+        ):
+            try:
+                yo.LIMA.verify_initrd_listener(port)
+            except yo.YoError as refused:
+                return refused.message
+        return None
+
+    def test_the_hostagent_alone_on_the_port_is_the_vms_listener(self):
+        held = (0, "p%d\nf7\n" % HOSTAGENT_PID, "")
+        self.assertIsNone(self.verify(held))
+        self.assertEqual(
+            self.ran, [["lsof", "-nP", "-iTCP:60022", "-sTCP:LISTEN", "-Fp"]]
+        )
+
+    def test_any_other_holder_is_refused_naming_its_pid_and_the_lookup(self):
+        for listing in ("p77\nf3\n", "p%d\nf7\np77\nf3\n" % HOSTAGENT_PID):
+            with self.subTest(listing=listing):
+                message = self.verify((0, listing, ""))
+                self.assertIn("127.0.0.1:60022 is held by pid 77", message)
+                self.assertIn("lsof -nP -iTCP:60022 -sTCP:LISTEN", message)
+
+    def test_a_listener_with_no_hostagent_running_is_a_strangers(self):
+        message = self.verify((0, "p77\nf3\n", ""), hostagent=None)
+        self.assertIn("held by pid 77, not by yolobox's hostagent (none runs)", message)
+
+    def test_an_answer_that_names_no_listener_is_an_error_in_lsofs_words(self):
+        # lsof exits 1 with no output when nothing listens, and for other
+        # reasons too: nothing proves the port the VM's.
+        for lsof, said in (
+            ((1, "", ""), "failed (exit 1) with no output"),
+            ((1, "", "lsof: WARNING: lizard"), "lsof: WARNING: lizard"),
+            ((0, "", ""), "printed no listener's pid but ''"),
+            ((0, "p12x\n", ""), "printed no listener's pid but 'p12x'"),
+            ((0, "p%d\nlizard\n" % HOSTAGENT_PID, ""), "lizard"),
+            ((0, "f7\n", ""), "printed no listener's pid but 'f7'"),
+        ):
+            with self.subTest(lsof=lsof):
+                message = self.verify(lsof)
+                self.assertIn(
+                    "cannot prove that yolobox's hostagent holds 127.0.0.1:60022, "
+                    "so root is not offered there",
+                    message,
+                )
+                self.assertIn(said, message)
+
+    def test_a_port_another_box_can_claim_is_refused_before_lsof_is_asked(self):
+        message = self.verify((0, "p%d\n" % HOSTAGENT_PID, ""), port=22222)
+        self.assertIn("ssh.localPort 22222", message)
+        self.assertEqual(self.ran, [])
 
 
 class TestPortOnLima(unittest.TestCase):

@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 import hashlib
 import hmac
-import os
 import socket
 import struct
 from typing import Callable, List, Optional, Sequence, Tuple, TypeVar
@@ -280,6 +279,13 @@ def ssh_agent_call(sock_path: str, payload: bytes) -> bytes:
                     "1Password's SSH agent at %s hung up before it answered: %s"
                     % (sock_path, failure)
                 )
+    except (FileNotFoundError, ConnectionRefusedError) as failure:
+        raise YoError(
+            "1Password is not running on this host: nothing serves its SSH agent "
+            "at %s (%s), and it holds the %s key that unlocks the box — start "
+            "1Password with its SSH agent turned on, then run the command again"
+            % (sock_path, ui.os_error_reason(failure), LUKS_KEY_ITEM)
+        )
     except OSError as failure:
         raise YoError(
             "1Password's SSH agent at %s is not answering: %s" % (sock_path, failure)
@@ -353,16 +359,36 @@ def clearing_passphrases(command: Command) -> Command:
     return run  # type: ignore[return-value]
 
 
+class PassphraseSource:
+    """The disk passphrase, derived from 1Password the first time it is needed
+    and then kept for the command (zeroed by clearing_passphrases)."""
+
+    def __init__(self) -> None:
+        self.derived: Optional[Passphrase] = None
+
+    def __call__(self) -> Passphrase:
+        if self.derived is None:
+            self.derived = luks_passphrase()
+        return self.derived
+
+    def require_key(self) -> None:
+        """Refuse unless the passphrase can be derived when an initrd asks:
+        1Password's agent answers and lists the one LUKS_KEY_ITEM key. A key
+        listing, never a signature, so nothing is approved and nothing prompts."""
+        if self.derived is None:
+            luks_key(state.driver().op_sock())
+
+
+def luks_key(sock_path: str) -> bytes:
+    """The LUKS_KEY_ITEM key's blob, as 1Password's agent at `sock_path` lists it."""
+    return pick_luks_key(ssh_agent_identities(sock_path))
+
+
 def luks_passphrase() -> Passphrase:
     sock_path = state.driver().op_sock()
-    if not os.path.exists(sock_path):
-        raise YoError(
-            "1Password is not running on this host (no socket at %s); it holds the %s key that unlocks the box"
-            % (sock_path, LUKS_KEY_ITEM)
-        )
-    blob = pick_luks_key(ssh_agent_identities(sock_path))
+    blob = luks_key(sock_path)
     ui.err(
-        "yo: 1Password: approve the %s key (Touch ID) to unlock %s's disk"
+        "yo: 1Password: approve the %s key (Touch ID); it derives %s's disk passphrase"
         % (LUKS_KEY_ITEM, state.box.name)
     )
     signature = ssh_agent_sign(sock_path, blob, LUKS_SIGN_DATA)

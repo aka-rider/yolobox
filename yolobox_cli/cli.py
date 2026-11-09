@@ -17,6 +17,7 @@ from . import (
     proc,
     release,
     session,
+    sshx,
     state,
     status,
     ui,
@@ -43,7 +44,9 @@ INSTANCE_NAME_RE = re.compile(r"[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*")
 
 
 def instance_name(value: str) -> str:
-    """argparse `type=` of -m/--machine: a lima instance name `yo` can drive."""
+    """argparse `type=` of -m/--machine: a lima instance name `yo` can drive,
+    whose instance directory on this host holds the box's unix sockets: a
+    name too long for them is refused before any command runs."""
     if (
         not INSTANCE_NAME_RE.fullmatch(value)
         or value.startswith("lima-")
@@ -57,6 +60,12 @@ def instance_name(value: str) -> str:
             "%r is not a usable machine name (letters and digits, joined by "
             "single '-', at most 55 characters, not starting with 'lima-')" % value
         )
+    directory = state.instance_dir_of(
+        driver_for(config.HOST_PLATFORM).instances_dir, value
+    )
+    refusal = state.sockets_refusal(directory, config.HOST_PLATFORM)
+    if refusal is not None:
+        raise argparse.ArgumentTypeError(refusal)
     return value
 
 
@@ -215,9 +224,10 @@ def build_parser() -> argparse.ArgumentParser:
     up = add(
         "up",
         "Start the VM.",
-        "Start the VM and unlock its encrypted disk. When the box has to be started\n"
-        "or unlocked, asks 1Password (Touch ID) for the yolobox-disk key; a box that\n"
-        "is already up needs no prompt. Safe to run again.\n"
+        "Start the VM and unlock its encrypted disk. When the box's initrd asks for\n"
+        "the passphrase, asks 1Password (Touch ID) for the yolobox-disk key; a box\n"
+        "that is already up, or whose disk is not encrypted yet, needs no prompt.\n"
+        "Safe to run again.\n"
         "--memory, --disk and --cpus size the box this command creates; a box that\n"
         "exists is refused them (yo destroy && yo up to resize it, yo disk-grow to\n"
         "grow its disk).",
@@ -233,10 +243,10 @@ def build_parser() -> argparse.ArgumentParser:
         "Delete the VM and everything on it.",
         "Delete the VM, its disk and the files yo keeps for it on this host, and\n"
         "remove its herdr machine. Everything on the box is lost, and a running\n"
-        "box is powered off without asking. Without --yes it only lists what\n"
-        "would be removed. It leaves what the host shares between machines: the\n"
-        "Include line in ~/.ssh/config, the downloaded base image and the AWS\n"
-        "broker.",
+        "box is powered off without asking, and its AWS broker stopped. Without\n"
+        "--yes it only lists what would be removed. It leaves what the host\n"
+        "shares between machines: the Include line in ~/.ssh/config and the\n"
+        "downloaded base image.",
     )
     destroy.add_argument(
         "--yes",
@@ -436,10 +446,21 @@ def main(argv: Sequence[str]) -> int:
         config.operator_account(release.host_user())
         state.driver().require_tool()
         if args.session:
-            # A session reaches the box without its forwards too: `yo ssh` is
-            # the way into a box whose forwards are broken.
+            # The services `yo up` declares, declared again: any session command
+            # restores a master, a forward or a broker that died since. A box
+            # not bootstrapped yet has none to serve. A session reaches the box
+            # without them too: `yo ssh` is the way into a box whose forwards
+            # are broken.
             try:
-                forwards.ensure_session()
+                if sshx.bootstrapped(mux=True):
+                    forwards.vm_services()
+            except sshx.Unreachable as lost:
+                # Not up, still in its initrd, or refusing the operator's key:
+                # ssh's own words below say which.
+                ui.err(
+                    "yo: %s does not take the operator's login, so nothing is "
+                    "forwarded into this session: %s" % (state.box.name, lost.message)
+                )
             except YoError as failure:
                 ui.err(
                     "yo: the 1Password and AWS forwards are not up, so this session "

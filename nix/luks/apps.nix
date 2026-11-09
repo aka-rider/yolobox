@@ -31,6 +31,7 @@ in
   unlock = app facts.initrd_unlock_helper ({
     YOLOBOX_UNLOCK_REPLY_PASSWORD = "${systemd}/lib/systemd/systemd-reply-password";
     YOLOBOX_UNLOCK_LUKS_DEVICE = facts.luks_device;
+    YOLOBOX_UNLOCK_UNLOCKED_LINE = facts.unlock_unlocked_line;
     YOLOBOX_ASK_DIR = facts.ask_password_dir;
     YOLOBOX_UNLOCK_UNIT = "systemd-cryptsetup@${facts.luks_mapper}.service";
     YOLOBOX_UNLOCK_ENCRYPT_UNIT = "${facts.luks_encrypt_unit}.service";

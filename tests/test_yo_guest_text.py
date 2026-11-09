@@ -230,7 +230,8 @@ class TestAStatusLineQuotesWhatTheBoxAnswered(unittest.TestCase):
         ]
         self.assertTrue(line.warning)
         self.assertNotIn("\n", line.text)
-        self.assertIn("is x — NOT encrypted", line.text)
+        # A word yo has no name for is shown as such, never read as plaintext.
+        self.assertIn("is 'x', neither crypto_LUKS nor ext4", line.text)
 
     def test_a_proxy_line_shows_a_forged_unit_state_on_one_line(self):
         status = yo.status.GuestStatus(

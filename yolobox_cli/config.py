@@ -34,10 +34,11 @@ OPERATOR_HOME_SUFFIX = FACTS["operator_home_suffix"]
 # rules and shell scripts in the box; the box asserts the same pattern at eval
 # time, and operator_account() refuses the name on the host first.
 OPERATOR_ACCOUNT_RE = re.compile(FACTS["operator_account_re"])
-# The word the box's stage-2 sshd appends to its SSH banner. The initrd's sshd
-# has none, so yo tells the two apart without logging in, and never offers
-# stage 2 a user it rejects.
+# The words the box's stage-2 sshd and its initrd's sshd append to their SSH
+# banners, so yo tells them, and the seed image's unmarked sshd, apart without
+# logging in, and never offers a stage 2 a user it rejects.
 STAGE2_SSH_BANNER_MARK = FACTS["stage2_ssh_banner_mark"]
+INITRD_SSH_BANNER_MARK = FACTS["initrd_ssh_banner_mark"]
 # The one ~/.ssh/config line that reaches every machine on both hosts: libvirt's
 # instance files and Lima's. An Include applies only to the Host or Match block
 # it follows, so it belongs above the first one (ssh_config_reaches_box()).
@@ -64,6 +65,8 @@ def operator_account(username: str) -> str:
 
 AGENT_HOME = FACTS["agent_home"]
 HELPER = "yolobox-guest"
+# What the box's build stamps; a box without it is not bootstrapped yet.
+VERSION_STAMP = FACTS["version_stamp"]
 # EX_USAGE (sysexits.h): the command cannot do what was asked on this host, and
 # what the guest script answers an unknown subcommand with.
 USAGE_EXIT = FACTS["usage_exit"]

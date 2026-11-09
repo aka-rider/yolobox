@@ -57,6 +57,9 @@ set -Eeuo pipefail
 # Without this a command substitution runs with errexit off, so `peers=$(f)`
 # would carry on past a failing step inside f.
 shopt -s inherit_errexit
+# The checks read virsh's, ss's and nft's words; a translated tool would say
+# something else.
+export LC_ALL=C
 
 readonly URI=qemu:///system
 # The positive control for the probes: a host on the internet the host layer
@@ -558,7 +561,7 @@ check_forward_bound_to_loopback() {
     listeners=$(ss -ltnH "sport = :${SSH_PORT}") || fail "ss failed"
     locals=$(awk '{ print $4 }' <<<"${listeners}")
     [ -n "${locals}" ] || fail "nothing listens on port ${SSH_PORT}"
-    [ "$(sort -u <<<"${locals}")" = "127.0.0.1:${SSH_PORT}" ] ||
+    [ "$(LC_ALL=C sort -u <<<"${locals}")" = "127.0.0.1:${SSH_PORT}" ] ||
         fail "port ${SSH_PORT} is bound beyond 127.0.0.1: ${locals}"
     ok "ssh port ${SSH_PORT} is bound on 127.0.0.1 only"
 }
