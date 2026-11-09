@@ -677,6 +677,7 @@ class TestMain(SocketDirCase):
         self.assertFalse(os.path.lexists(self.sock))
         self.assertFalse(os.path.lexists(self.ctl))
 
+    @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
     def test_a_socket_lock_that_cannot_be_taken_is_a_handshake_error(self):
         os.mkdir(self.sock + ".lock")
         self.addCleanup(os.rmdir, self.sock + ".lock")
@@ -1406,6 +1407,7 @@ class TestBindServers(SocketDirCase):
 
 
 class TestControlSocketReclaim(SocketDirCase):
+    @unittest.skipUnless(HAS_PID_WATCH, "this Python has neither kqueue nor pidfd_open")
     def test_a_live_control_socket_stops_a_second_broker_and_leaves_no_guest_socket(
         self,
     ):

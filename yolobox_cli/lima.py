@@ -417,8 +417,7 @@ def refuse_mirrored_ssh_port(port: int) -> None:
     )
     raise YoError(
         "%s has ssh.localPort %d, %s. Move it to a free port in %d-%d while it is "
-        "stopped:\n    %s\nor recreate it, which deletes everything on it and "
-        "picks a port itself:\n    %s"
+        "stopped:\n    %s\nor, because a new box picks its port itself, %s"
         % (
             state.box.name,
             port,
@@ -525,8 +524,7 @@ class LimaDriver:
         ):
             raise YoError(
                 "%s has ssh.localPort %r, which is not a fixed port. With 0 lima picks a "
-                "new port on every start, and yo must know it before the first one. "
-                "Recreate the instance, which deletes everything on it: %s"
+                "new port on every start, and yo must know it before the first one — %s"
                 % (state.box.name, port, self.recreate_command(NO_SIZE))
             )
         refuse_mirrored_ssh_port(port)
@@ -625,8 +623,8 @@ class LimaDriver:
         edits = list(dict.fromkeys(edit for _, edit in known.values()))
         if None in edits:
             lines.append(
-                "lima reads %s only when it creates an instance, so recreate it; "
-                "that deletes its disk, so copy out what you need first: %s"
+                "lima reads %s only when it creates an instance, so copy out what "
+                "you need first, then %s"
                 % (
                     " and ".join(
                         gap for gap, (_, edit) in known.items() if edit is None

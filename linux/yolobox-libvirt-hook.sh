@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # libvirt qemu hook: keep yolobox-vm's ACL on the passt socket directory.
-# linux/host-setup.sh installs it as /etc/libvirt/hooks/qemu.d/50-yolobox-passt.
+# It lives at /etc/libvirt/hooks/qemu.d/50-yolobox-passt.
 #
 # libvirt runs passt under the domain's DAC label, yolobox-vm, in a directory
-# it owns as qemu. host-setup's ACL entry lets yolobox-vm bind there, but
+# it owns as qemu. The ACL entry granted to yolobox-vm lets it bind there, but
 # libvirt recomputes the directory's ACL mask whenever it starts another passt
 # domain, and the entry is only as wide as the mask. So the fixed setfacl below
 # runs before a yolobox domain starts, and after any domain starts or is
@@ -22,8 +22,8 @@ PATH="${YOLOBOX_HOOK_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
 readonly PASST_DIR="${YOLOBOX_HOOK_PASST_DIR:-/run/libvirt/qemu/passt}"
 readonly VM_USER="yolobox-vm"
 readonly DOMAIN_NS="https://github.com/aka-rider/yolobox"
-# libvirt's own account, which creates the directory (linux/host-setup.sh's
-# tmpfiles rule spells the same owner).
+# libvirt's own account, which creates the directory; the host's tmpfiles rule
+# for it names the same owner.
 readonly DIR_OWNER="qemu"
 
 # The fixed setfacl, run as root on a directory that qemu owns. It is applied
@@ -35,8 +35,8 @@ readonly DIR_OWNER="qemu"
 # what that failure stops.
 fix_acl() {
     local owner
-    # Before the first passt domain the directory may not exist yet; there is
-    # nothing to fix then.
+    # Until libvirt or the boot-time tmpfiles rule has made it, on a new host,
+    # the directory does not exist; there is nothing to fix then.
     [ -e "${PASST_DIR}" ] || [ -L "${PASST_DIR}" ] || return 0
     if [ -L "${PASST_DIR}" ] || ! [ -d "${PASST_DIR}" ]; then
         printf 'yolobox passt hook: %s is not a directory (a symlink?), not touching its ACL during %s %s of %s\n' \

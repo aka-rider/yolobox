@@ -526,10 +526,10 @@ def helper_failure_message(attempt: HelperRun, initrd: InitrdEndpoint) -> str:
             code,
         )
     if code == HELPER_EXIT_ENCRYPT_FAILED:
-        return (
-            "the in-place encryption of %s failed in the initrd, and the box must be "
-            "recreated: %s\n%s"
-            % (LUKS_DEVICE, state.driver().recreate_command(NO_SIZE), stderr)
+        return "the in-place encryption of %s failed in the initrd — %s\n%s" % (
+            LUKS_DEVICE,
+            state.driver().recreate_command(NO_SIZE),
+            stderr,
         )
     if code == HELPER_EXIT_ROOT_MOUNT_FAILED:
         return (
@@ -619,7 +619,7 @@ def operator_round(kind: Endpoint, attempt: SshAttempt) -> Round:
         "asked for the operator",
         attempt,
         "an unmarked sshd that keeps refusing the operator is a seed image whose "
-        "key never landed; recreate it: %s" % state.driver().recreate_command(NO_SIZE),
+        "key never landed — %s" % state.driver().recreate_command(NO_SIZE),
     )
 
 

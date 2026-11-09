@@ -38,7 +38,7 @@ jobs:
       # whose check phase runs shellcheck at its default severity, so a finding
       # below `warning` that passes here fails the box build at `yo bootstrap`.
       - name: Shellcheck every tracked shell script
-        run: shellcheck nix/guest/yolobox-guest.sh nix/harnesses/claude.sh nix/harnesses/yolobox-claude-launcher-keep.sh nix/harnesses/yolobox-claude-versions.sh nix/harnesses/yolobox-harness-install.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-encrypt.sh nix/display/yolobox-screen-record.sh nix/display/yolobox-xvfb.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh
+        run: shellcheck nix/guest/yolobox-guest.sh nix/harnesses/claude.sh nix/harnesses/yolobox-claude-launcher-keep.sh nix/harnesses/yolobox-claude-versions.sh nix/harnesses/yolobox-harness-install.sh nix/harnesses/yolobox-network-ready.sh nix/luks/yolobox-initrd-authorized-keys.sh nix/luks/yolobox-unlock.sh nix/luks/yolobox-luks-encrypt.sh nix/display/yolobox-screen-record.sh nix/display/yolobox-xvfb.sh tests/box-hardening-check.sh tests/box-hardening-e2e.sh linux/host-setup.sh linux/yolobox-libvirt-hook.sh tests/box-libvirt-check.sh
 
       # nix cannot check the rule file (nft needs netlink, which the build
       # sandbox forbids), and a file that fails to load leaves the box with no
@@ -184,7 +184,8 @@ jobs:
             .#nixosConfigurations.yolobox.config.system.build.yoloboxClaudeVersions \
             .#nixosConfigurations.yolobox.config.system.build.yoloboxClaudeLauncher \
             .#nixosConfigurations.yolobox.config.system.build.yoloboxClaudeLauncherKeep \
-            .#nixosConfigurations.yolobox.config.system.build.yoloboxHarnessInstall
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxHarnessInstall \
+            .#nixosConfigurations.yolobox.config.system.build.yoloboxNetworkReady
 
       # The guest trusts github.com through these pinned keys, so each must
       # be the key GitHub publishes.

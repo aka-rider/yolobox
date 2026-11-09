@@ -1,13 +1,16 @@
 """What the Linux host must hold for a box to run on it.
 
 The preflight of the host (virsh, the daemon's version, the host unit, the
-`yolobox-vm` account, the passt socket directory, the port window) and the
-two reads yo makes of a domain's XML: its yolobox marker and the host ports it
-forwards. Only libvirt.py imports this module.
+`yolobox-vm` account, the port window), what only a start needs (the passt
+socket directory, the resolver's label), and the two reads yo makes of a
+domain's XML: its yolobox marker and the host ports it forwards. Only
+libvirt.py imports this module.
 """
 
 from __future__ import annotations
 
+import errno
+import os
 import pwd
 import re
 import shutil
@@ -30,6 +33,10 @@ PASST_DIR = FACTS["passt_dir"]
 # The namespace of the domain metadata that marks a domain as a yolobox's.
 DOMAIN_NS = FACTS["domain_ns"]
 MARKER_TAG = "{%s}instance" % DOMAIN_NS
+# The host resolver passt hands the guest, and the only SELinux type of it that
+# passt_t may read.
+RESOLV_CONF = FACTS["host_resolv_conf"]
+RESOLV_CONF_TYPE = FACTS["host_resolv_conf_type"]
 LIBVIRT_POOL = "default"
 PORT_RANGE_FILE = "/proc/sys/net/ipv4/ip_local_port_range"
 MEMINFO_FILE = "/proc/meminfo"
@@ -116,6 +123,37 @@ def read_port_window() -> range:
         raise YoError(
             "cannot read %s: %s" % (PORT_RANGE_FILE, ui.os_error_reason(failure))
         )
+
+
+def resolver_label_gap() -> Optional[str]:
+    """What keeps passt from reading the host's resolver, or None when nothing does.
+
+    passt_t may read only net_conf_t. A resolv.conf written by rename (a root
+    editor over resolved's stub) keeps the editor's label, passt is denied, and
+    the guest's DHCP lease then carries no DNS server. passt reads the file only
+    when a domain starts. Without SELinux the kernel has no label to answer
+    with, and then none can deny passt.
+    """
+    target = os.path.realpath(RESOLV_CONF)
+    try:
+        raw = os.getxattr(target, "security.selinux")
+    except OSError as failure:
+        if failure.errno in (errno.ENODATA, errno.EOPNOTSUPP):
+            return None
+        raise YoError(
+            "cannot read the SELinux label of %s: %s"
+            % (target, ui.os_error_reason(failure))
+        )
+    # `user:role:type:level`, NUL-terminated; the level holds colons itself.
+    label = raw.rstrip(b"\0").decode("utf-8", "replace")
+    fields = label.split(":", 3)
+    if len(fields) >= 3 and fields[2] == RESOLV_CONF_TYPE:
+        return None
+    return (
+        "passt cannot read the host resolver %s, labelled '%s' instead of type %s, "
+        'so the guest would get no DNS — fix it with: sudo restorecon -F "$(readlink -f %s)"'
+        % (target, ui.shown(label), RESOLV_CONF_TYPE, RESOLV_CONF)
+    )
 
 
 def forwarded_host_ports(root: ET.Element) -> List[int]:

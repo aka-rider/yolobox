@@ -24,7 +24,7 @@ On a Linux PC also create a second Ed25519 `SSH Key` item titled `yolobox-operat
 sudo bash linux/host-setup.sh
 ```
 
-It installs libvirt and passt, adds a host firewall table that keeps the VM off your LAN, creates the account `yolobox-vm` that runs the VM, and lets your account manage libvirt.
+It installs libvirt and passt, adds a host firewall table that keeps the VM off your LAN, creates the account `yolobox-vm` that runs the VM, and lets your account manage libvirt. It first checks your host's resolver, which passt hands the VM: its first nameserver must be a loopback address (systemd-resolved's stub is one), and `/etc/resolv.conf` must carry the SELinux type `net_conf_t`, the only one passt may read. A root editor that replaces the stub's file by rename leaves it mislabelled, the VM then boots without DNS, and `yo` refuses to start the VM until `sudo restorecon -F "$(readlink -f /etc/resolv.conf)"` has fixed the label.
 
 ## Install
 
@@ -86,7 +86,7 @@ yo cp -- -odd.txt :                 # a name that starts with -
 
 `yo cp` never uploads a symlink, and a download never lands `.git`, `.envrc`, `.vscode` or similar control files on the host: the agent wrote them, and your tools would run them as you. A download also skips `node_modules` and `.venv`, and `target` and `.next` where a `Cargo.toml` or `package.json` sits beside them; it names each skipped path. A `target` with no `Cargo.toml` may hold code, so it is copied.
 
-`yo ssh`, `yo enter`, `yo cp`, `yo code` and `yo zed` still run when the 1Password and AWS forwards cannot be set up; they print a warning. `yo ssh` is the way into a box whose forwards are broken.
+`yo ssh`, `yo enter`, `yo cp`, `yo code` and `yo zed` still run when a forward cannot be set up or is down; they print a warning naming each one that is not up. `yo ssh` is the way into a box whose forwards are broken. The VM's 1Password and AWS sockets start only after `yo` has made their forwards, so after a VM reboot they are inactive until the next `yo` command; `yo status` says so.
 
 On a Mac, VM ports 1024 to 49151 are mirrored onto the host's `localhost`, except a few fixed login-callback ports such as 8085. A service listening on `127.0.0.1` or on all addresses in the VM is mirrored. On Linux nothing is mapped until `yo port` opens it.
 
@@ -143,7 +143,7 @@ So recreate it before you upgrade, while it still runs and you can push your wor
 
 ## When something breaks
 
-- **DNS fails in the VM.** A full disk shows up as DNS failure first, because dhcpcd cannot write `resolv.conf`. Run `yo gc --yes` from the host, then `yo gc --deep --yes`.
+- **DNS fails in the VM.** A full disk shows up as DNS failure first, because dhcpcd cannot write `resolv.conf`. Run `yo gc --yes` from the host, then `yo gc --deep --yes`. A guest whose DHCP lease brought no nameserver fails `yolobox-network-ready`, and `yo status` warns with a `network-ready:` line.
 - **`yo` refuses a box it did not make, or the two do not understand each other.** Push your work out of the VM, then `yo destroy --yes && yo bootstrap`. A box is disposable; only the latest `yo` and box are supported together.
 - **The VM has no network at all after a boot.** Its egress table failed to load, and without the table the box takes no address. Recreate the box.
 - **No network in the VM while the host has it.** A full-tunnel VPN on the host blackholes the VM's traffic, and a fake-IP proxy (Clash, Surge) answers with addresses in `198.18.0.0/15`, which the VM refuses. On a Mac, `limactl stop <name> && yo up` clears Lima flows stuck after a VPN disconnects.

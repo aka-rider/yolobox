@@ -129,6 +129,13 @@ os.environ["HOME"] = SCRATCH_HOME
 atexit.register(shutil.rmtree, SCRATCH_HOME)
 sys.addaudithook(refuse_the_real_home)
 
+# A non-interactive bash whose stdin is a socket takes itself for an ssh
+# command and sources the system bashrc, which rebuilds PATH past every fake.
+# No test reads the runner's stdin, so every child inherits /dev/null.
+_devnull = os.open(os.devnull, os.O_RDONLY)
+os.dup2(_devnull, 0)
+os.close(_devnull)
+
 # RealHomeTouched raised in a thread ends only that thread; it is kept here,
 # and the test it ran under fails at its end.
 THREAD_HOME_TOUCHES = []

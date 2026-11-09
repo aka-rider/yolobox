@@ -3,7 +3,7 @@ let
   opProxy = { name, listen, target }: {
     systemd.sockets.${name} = {
       description = "Agent-owned socket proxied to the operator's ${name} forward";
-      wantedBy = [ "sockets.target" ];
+      # Wanted by no target: yo starts it once the forward it proxies exists.
       socketConfig = {
         ListenStream = listen;
         SocketUser = facts.agent_user;
@@ -236,11 +236,11 @@ in
   };
 
   services.openssh.enable = true;
-  # Lima's hostagent waits for, and forwards to, TCP 22 on 192.168.5.15
-  # (enp0s1, lima's NAT network, unreachable from the LAN), so 22 is the only
-  # port open there. tailscale0 is trusted whole (nix/tailscale.nix).
+  # Lima's hostagent waits for, and forwards to, the guest's ssh port on
+  # 192.168.5.15 (enp0s1, lima's NAT network, unreachable from the LAN), so that
+  # is the only port open there. tailscale0 is trusted whole (nix/tailscale.nix).
   services.openssh.openFirewall = false;
-  networking.firewall.interfaces.${facts.guest_nic}.allowedTCPPorts = [ 22 ];
+  networking.firewall.interfaces.${facts.guest_nic}.allowedTCPPorts = [ facts.guest_ssh_port ];
   services.openssh.settings = {
     PasswordAuthentication = false;
     KbdInteractiveAuthentication = false;

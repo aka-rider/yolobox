@@ -69,6 +69,11 @@ KEY_BLOB = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + bytes(range(32))
 OTHER_BLOB = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + bytes(range(1, 33))
 PUBLIC_KEY = "ssh-ed25519 %s yolobox-operator" % base64.b64encode(KEY_BLOB).decode()
 EPHEMERAL_RANGE = "32768\t60999\n"
+# Found before any test patches shutil.which, which LibvirtCase does.
+READLINK = shutil.which("readlink")
+BASH = shutil.which("bash")
+GOOD_LABEL = b"system_u:object_r:net_conf_t:s0\0"
+WRONG_LABEL = b"unconfined_u:object_r:systemd_resolved_var_run_t:s0\0"
 FIRST_PORT = 61000
 DAEMON_VERSION_TEXT = (
     "Compiled against library: libvirt 12.8.0\n"
@@ -128,6 +133,15 @@ def load_libvirt_yo(instance="box"):
     module.config.HOST_PLATFORM = "linux"
     module.set_box(module.driver_for("linux"), instance)
     return module, name
+
+
+def as_libvirt_prints(xml):
+    """A domain's definition as virsh prints it: the memory always in KiB."""
+    return re.sub(
+        r"<memory unit='GiB'>(\d+)</memory>",
+        lambda match: "<memory unit='KiB'>%d</memory>" % (int(match.group(1)) << 20),
+        xml,
+    )
 
 
 def completed(stdout="", returncode=0, stderr=""):
@@ -334,13 +348,14 @@ class FakeHost:
                 )
             )
         if sub == "dumpxml":
-            self.before_dumpxml(args[0])
-            if args[0] not in self.domains:
+            name = args[-1]
+            self.before_dumpxml(name)
+            if name not in self.domains:
                 return completed(
                     returncode=1,
-                    stderr="error: failed to get domain '%s'\n" % args[0],
+                    stderr="error: failed to get domain '%s'\n" % name,
                 )
-            return completed(self.domains[args[0]])
+            return completed(self.domains[name])
         if sub == "domstate":
             return completed(self.states[args[0]] + "\n")
         if sub == "define":
@@ -359,7 +374,7 @@ class FakeHost:
                     )
                 if self.states[name] != "shut off":
                     return completed()
-            self.domains[name] = xml
+            self.domains[name] = as_libvirt_prints(xml)
             self.states[name] = "shut off"
             memory = root.find("memory")
             assert memory.get("unit") == "GiB", memory.get("unit")
@@ -397,18 +412,19 @@ class FakeHost:
         return completed()
 
     def tagged_domain(self, name, port, memory_gib=None, cpus=DOMAIN_CPUS):
-        """A domain yo defined for the instance `name`, running, with the
-        record yo keeps of it in that instance's directory."""
+        """A domain yo defined for the instance `name`, running, beside the
+        instance directory yo made for it."""
         facts = self.box.DomainFacts(
             str(uuid.uuid4()), port, memory_gib or self.box.LIBVIRT_MEMORY_GIB, cpus
         )
-        directory = os.path.join(
-            self.box.state.home(), self.box.box.driver.instances_dir, name
+        os.makedirs(
+            os.path.join(
+                self.box.state.home(), self.box.box.driver.instances_dir, name
+            ),
+            exist_ok=True,
         )
-        os.makedirs(directory, exist_ok=True)
-        self.box.write_domain_facts(directory, facts)
-        self.domains["yolobox-" + name] = self.box.domain_xml(
-            name, facts, VM_UID, VM_GID
+        self.domains["yolobox-" + name] = as_libvirt_prints(
+            self.box.domain_xml(name, facts, VM_UID, VM_GID)
         )
         self.states["yolobox-" + name] = "running"
         self.max_memory_kib["yolobox-" + name] = facts.memory_gib << 20
@@ -452,6 +468,7 @@ class LibvirtCase(FakeHome):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.fake_resolver()
         self.range_file = Path(self.home) / "port_range"
         self.range_file.write_text(EPHEMERAL_RANGE)
         self.meminfo = Path(self.home) / "meminfo"
@@ -477,6 +494,36 @@ class LibvirtCase(FakeHome):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def fake_resolver(self):
+        """/etc/resolv.conf is a symlink to resolved's stub, as on Fedora: the
+        label that counts is the stub's, which `self.resolver_label` is (bytes
+        as the kernel answers, or the OSError it raises)."""
+        stub = Path(self.home) / "stub-resolv.conf"
+        stub.write_text("nameserver 127.0.0.53\n")
+        self.resolv_stub = os.path.realpath(stub)
+        self.resolv_conf = Path(self.home) / "resolv.conf"
+        self.resolv_conf.symlink_to(stub)
+        self.resolver_label = GOOD_LABEL
+
+        def getxattr(path, name):
+            self.assertEqual((path, name), (self.resolv_stub, "security.selinux"))
+            if isinstance(self.resolver_label, OSError):
+                raise self.resolver_label
+            return self.resolver_label
+
+        for patcher in (
+            mock.patch.object(
+                self.box.libvirt_host, "RESOLV_CONF", str(self.resolv_conf)
+            ),
+            # Not every host has getxattr (macOS has none), and no host's
+            # kernel answers with the label a test needs.
+            mock.patch.object(
+                self.box.libvirt_host.os, "getxattr", getxattr, create=True
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def kept_volume(self, gib, record="built"):
         """A disk volume of `gib` GiB left from an earlier run, and this host's
@@ -557,7 +604,7 @@ class TestDomainTemplate(LibvirtCase):
         self.assertEqual(forward.get("address"), "127.0.0.1")
         self.assertEqual(forward.get("proto"), "tcp")
         self.assertEqual(forward.find("range").get("start"), "61234")
-        self.assertEqual(forward.find("range").get("to"), "22")
+        self.assertEqual(forward.find("range").get("to"), str(FACTS["guest_ssh_port"]))
 
     def test_no_device_reaches_the_host(self):
         root = ET.fromstring(self.render())
@@ -766,40 +813,14 @@ class TestPortAllocation(LibvirtCase):
         ):
             self.assertEqual(self.driver.allocate_host_port(), FIRST_PORT + 1)
 
-    def test_the_ssh_port_is_the_one_recorded_at_creation(self):
-        self.host.tagged_domain("box", 61234)
+    def test_a_domains_facts_are_read_from_its_inactive_definition(self):
+        made = self.host.tagged_domain("box", 61234, memory_gib=24, cpus=3)
+        self.assertEqual(self.driver.domain_facts(), made)
         self.assertEqual(self.driver.ssh_port(), 61234)
-
-    def test_a_domain_without_its_record_is_only_good_for_a_destroy(self):
-        self.host.tagged_domain("box", 61234)
-        os.unlink(os.path.join(self.box.instance_dir(), "domain.json"))
-        with self.assertRaises(self.box.YoError) as caught:
-            self.driver.ssh_port()
-        self.assertIn("holds no record", caught.exception.message)
-        self.assertIn(
-            "yo -m box destroy --yes && yo -m box bootstrap", caught.exception.message
+        self.assertEqual(
+            self.host.calls_of("dumpxml")[-1][3:],
+            ["dumpxml", "--inactive", "yolobox-box"],
         )
-
-    def test_a_record_that_is_not_one_is_an_error_naming_the_file(self):
-        self.host.tagged_domain("box", 61234)
-        record = os.path.join(self.box.instance_dir(), "domain.json")
-        whole = '{"uuid": "u", "ssh_port": 1, "memory_gib": 1, "cpus": 1'
-        for text in (
-            "lizard",
-            "{}",
-            "[]",
-            whole.replace('"u"', "1") + "}",
-            whole.replace('"ssh_port": 1', '"ssh_port": "1"') + "}",
-            whole.replace('"ssh_port": 1', '"ssh_port": true') + "}",
-            whole.replace('"ssh_port": 1', '"ssh_port": 1.5') + "}",
-            whole + ', "x": 1}',
-        ):
-            with self.subTest(text=text):
-                Path(record).write_text(text)
-                with self.assertRaisesRegex(
-                    self.box.YoError, "domain.json is not a domain record"
-                ):
-                    self.driver.ssh_port()
 
     def test_the_ssh_port_of_a_missing_domain_says_to_create_it(self):
         with self.assertRaises(self.box.YoError) as caught:
@@ -1141,15 +1162,23 @@ class TestPreconditions(LibvirtCase):
         ):
             self.driver.require_tool()
 
-    def assertRefused(self, fragment, **kwargs):
+    def assertRefused(self, fragment, remedy="host-setup.sh", **kwargs):
         with self.assertRaises(self.box.YoError) as caught:
             self.check(**kwargs)
         message = caught.exception.message
         self.assertIn(fragment, message)
-        self.assertIn("host-setup.sh", message)
+        self.assertIn(remedy, message)
         return message
 
     def test_a_ready_host_passes(self):
+        self.check()
+
+    def test_a_mislabelled_resolver_does_not_fail_the_commands_that_never_start(
+        self,
+    ):
+        # passt reads the resolver only when a domain starts; start_refusal
+        # judges the label, so ssh, status, down and destroy still run.
+        self.resolver_label = WRONG_LABEL
         self.check()
 
     def test_each_missing_piece_has_its_own_message_naming_the_setup_script(self):
@@ -1280,6 +1309,108 @@ class TestPasstDirectory(LibvirtCase):
     def test_a_host_without_getfacl_is_told_so(self):
         with self.assertRaisesRegex(self.box.YoError, "getfacl not found"):
             self.gap(getfacl=False)
+
+
+class TestResolverLabel(LibvirtCase):
+    """passt reads the host's resolver when a domain starts, so a start is what
+    its label refuses, and nothing else is."""
+
+    def refusal(self, label):
+        self.resolver_label = label
+        return self.driver.start_refusal()
+
+    def test_a_resolver_not_labelled_net_conf_t_is_refused_with_the_relabel_command(
+        self,
+    ):
+        for label in (
+            b"unconfined_u:object_r:systemd_resolved_var_run_t:s0\0",
+            b"system_u:object_r:net_conf_t_x:s0\0",
+            b"system_u:object_r:xnet_conf_t:s0\0",
+            b"system_u:object_r:etc_t:net_conf_t\0",
+            b"net_conf_t:object_r:etc_t:s0\0",
+        ):
+            with self.subTest(label=label):
+                message = self.refusal(label)
+                self.assertIn("labelled '%s'" % label.rstrip(b"\0").decode(), message)
+                self.assertIn(
+                    'sudo restorecon -F "$(readlink -f %s)"' % self.resolv_conf,
+                    message,
+                )
+                self.assertIn(self.resolv_stub, message)
+                self.assertIn("no DNS", message)
+
+    def test_a_label_with_no_type_field_is_refused_and_shown(self):
+        for label, shown in (
+            (b"lizard\0", "lizard"),
+            (b"system_u:object_r\0", "system_u:object_r"),
+            (b"", ""),
+            (b"\0", ""),
+            (b":::", ":::"),
+            (b"\xff\xfe\0", "\ufffd\ufffd"),
+            (b"a:b:\xffnet_conf_t\0", "a:b:\ufffdnet_conf_t"),
+            (b"a\nb:c:d\0", "a\\nb:c:d"),
+        ):
+            with self.subTest(label=label):
+                self.assertIn(
+                    "labelled '%s' instead of type net_conf_t" % shown,
+                    self.refusal(label),
+                )
+
+    def test_the_level_of_a_good_label_may_hold_colons(self):
+        for label in (
+            b"system_u:object_r:net_conf_t:s0:c0.c1023\0",
+            b"system_u:object_r:net_conf_t",
+        ):
+            with self.subTest(label=label):
+                self.assertIsNone(self.refusal(label))
+
+    def test_a_host_without_selinux_has_no_label_to_deny_passt(self):
+        for code in (
+            self.box.libvirt_host.errno.ENODATA,
+            self.box.libvirt_host.errno.EOPNOTSUPP,
+        ):
+            with self.subTest(code=code):
+                self.assertIsNone(self.refusal(OSError(code, os.strerror(code))))
+
+    def test_a_resolver_that_cannot_be_read_is_an_error_naming_why(self):
+        for code in (
+            self.box.libvirt_host.errno.ENOENT,
+            self.box.libvirt_host.errno.EACCES,
+        ):
+            with self.subTest(code=code):
+                with self.assertRaises(self.box.YoError) as caught:
+                    self.assertIsNone(self.refusal(OSError(code, os.strerror(code))))
+                message = caught.exception.message
+                self.assertIn(
+                    "cannot read the SELinux label of %s: %s"
+                    % (self.resolv_stub, os.strerror(code)),
+                    message,
+                )
+                self.assertNotIn("restorecon", message)
+
+    def test_the_relabel_command_it_prints_relabels_the_stub_the_link_points_at(self):
+        message = self.refusal(WRONG_LABEL)
+        remedy = message.split("fix it with: ", 1)[1]
+        fakes = Path(self.home) / "fakes"
+        fakes.mkdir()
+        record = Path(self.home) / "restorecon-args"
+        for name, body in (
+            ("sudo", 'exec "$@"'),
+            ("restorecon", 'printf "%%s\\n" "$@" >%s' % shlex.quote(str(record))),
+        ):
+            script = fakes / name
+            script.write_text("#!/bin/sh\n%s\n" % body)
+            script.chmod(0o755)
+        # The fakes alone are on PATH, so the host's own sudo and restorecon
+        # are out of reach whatever goes wrong with a fake.
+        (fakes / "readlink").symlink_to(READLINK)
+        env = {"PATH": str(fakes), "LC_ALL": "C"}
+        subprocess.run([BASH, "-c", remedy], env=env, check=True)
+        self.assertEqual(record.read_text().splitlines(), ["-F", self.resolv_stub])
+
+    def test_a_directory_gap_is_named_before_a_resolver_gap(self):
+        self.host.acl = getfacl_listing(mask="r-x")
+        self.assertIn("sudo setfacl", self.refusal(WRONG_LABEL))
 
 
 class TestStatusAndSize(LibvirtCase):
@@ -2428,8 +2559,9 @@ class TestAnSshdYoCannotIdentify(LibvirtCase):
 
 
 class TestEnsureSession(LibvirtCase):
-    """`yo port` rides the operator's master, and both reverse forwards are
-    asked for first, whether a master answered or a login opened one."""
+    """`yo port` rides the operator's master alone: it forwards no reverse
+    socket and probes nothing, whether a master answered or a login opened one.
+    A session command declares both reverse forwards."""
 
     def setUp(self):
         super().setUp()
@@ -2454,24 +2586,23 @@ class TestEnsureSession(LibvirtCase):
             argv[argv.index("-R") + 1] for argv in self.host.forwarded if "-R" in argv
         ]
 
-    def assert_forwarded_whole(self, printed):
-        self.assertEqual(
-            self.reverse_forwards(),
-            [
-                "%s:%s" % (self.box.OP_GUEST_SOCK, self.driver.op_sock()),
-                "%s:%s"
-                % (self.box.AWS_BROKER_GUEST_SOCK, self.box.state.aws_broker_sock()),
-            ],
-        )
-        self.assertIn(
-            "127.0.0.1:%s:127.0.0.1:5173" % printed.split(":")[1],
-            self.host.forwarded[-1],
-        )
+    def assert_forwarded_only_the_port(self, printed):
+        (forward,) = self.host.forwarded
+        self.assertEqual(self.reverse_forwards(), [])
+        self.assertIn("127.0.0.1:%s:127.0.0.1:5173" % printed.split(":")[1], forward)
 
-    def test_a_master_that_answers_still_gets_both_reverse_forwards(self):
-        # It may be a master git or an editor opened, which carries none.
-        self.assert_forwarded_whole(self.port())
+    def test_a_master_that_answers_gets_only_the_port_forward(self):
+        self.assert_forwarded_only_the_port(self.port())
         self.assertEqual([argv for argv in self.host.calls if "exit" in argv], [])
+
+    def test_a_dead_1password_forward_does_not_keep_the_port_from_forwarding(self):
+        self.host.sshd = lambda argv: (
+            (2, "agent failed") if "ssh-add" in argv[-1] else (0, "")
+        )
+        self.host.master_session = (0, "")
+        self.assert_forwarded_only_the_port(self.port())
+        asked = [argv[-1] for argv in self.host.calls if argv[0] == "ssh"]
+        self.assertEqual([a for a in asked if "ssh-add" in a or "systemctl" in a], [])
 
     def test_a_master_whose_connection_died_fails_with_ssh_s_words(self):
         self.host.master_session = (255, "Connection to lima-box closed")
@@ -2497,16 +2628,16 @@ class TestEnsureSession(LibvirtCase):
         self.assertEqual(fresh, [])
         self.assertEqual(len(self.reverse_forwards()), 2)
 
-    def test_with_no_master_a_login_opens_one_with_both_reverse_forwards(self):
+    def test_with_no_master_a_login_opens_one_and_only_the_port_is_forwarded(self):
         self.host.master_running = False
-        self.assert_forwarded_whole(self.port())
+        self.assert_forwarded_only_the_port(self.port())
         self.assertTrue(self.host.master_running)
 
 
 class TestDefinition(LibvirtCase):
     """A stopped domain is defined again from libvirt/domain.xml on every start,
-    with the uuid, port and size recorded for it; one that is up is left as it
-    runs."""
+    with the uuid, port and size libvirt holds of it; one that is up is left as
+    it runs."""
 
     def setUp(self):
         super().setUp()
@@ -2537,7 +2668,7 @@ class TestDefinition(LibvirtCase):
         self.assertLess(subs.index("define"), subs.index("start"))
         self.assertEqual(
             self.host.domains["yolobox-box"],
-            self.box.domain_xml("box", self.facts, VM_UID, VM_GID),
+            as_libvirt_prints(self.box.domain_xml("box", self.facts, VM_UID, VM_GID)),
         )
         self.assertNotIn("tpm", self.host.domains["yolobox-box"])
         self.assertEqual(self.driver.ssh_port(), FIRST_PORT)
@@ -2552,25 +2683,125 @@ class TestDefinition(LibvirtCase):
                 self.assertNotIn("define", self.host.subcommands())
                 self.assertEqual(self.host.domains["yolobox-box"], self.tampered)
 
-    def test_without_its_record_the_domain_is_not_started(self):
-        os.unlink(os.path.join(self.box.instance_dir(), "domain.json"))
-        with self.assertRaises(self.box.YoError) as caught:
-            self.start()
-        self.assertIn(
-            "yo -m box destroy --yes && yo -m box bootstrap", caught.exception.message
+    def test_a_definition_that_is_not_a_boxs_is_refused_before_anything_is_defined(
+        self,
+    ):
+        range_line = "<range start='%d' to='22'/>" % FIRST_PORT
+        cases = (
+            ("no range to port 22", range_line, "", "has 0 portForward ranges"),
+            (
+                "a range to another port",
+                range_line,
+                "<range start='%d' to='23'/>" % FIRST_PORT,
+                "has 0 portForward ranges",
+            ),
+            (
+                "two ranges to port 22",
+                range_line,
+                range_line + "<range start='61001' to='22'/>",
+                "has 2 portForward ranges",
+            ),
+            (
+                "a start that is no port",
+                range_line,
+                "<range start='lizard' to='22'/>",
+                "start='lizard', which is not a port",
+            ),
+            (
+                "a start of 0",
+                range_line,
+                "<range start='0' to='22'/>",
+                "start='0', which is not a port",
+            ),
+            (
+                "memory that is not whole GiB",
+                "<memory unit='KiB'>16777216<",
+                "<memory unit='KiB'>16777217<",
+                "<memory> '16777217' KiB, which is not a positive whole number",
+            ),
+            (
+                "memory in MiB",
+                "<memory unit='KiB'>",
+                "<memory unit='MiB'>",
+                "<memory> in unit='MiB'",
+            ),
+            (
+                "memory with no unit",
+                "<memory unit='KiB'>",
+                "<memory>",
+                "<memory> in unit=None",
+            ),
+            (
+                "memory of 0",
+                "<memory unit='KiB'>16777216<",
+                "<memory unit='KiB'>0<",
+                "<memory> '0' KiB",
+            ),
+            (
+                "memory of -1",
+                "<memory unit='KiB'>16777216<",
+                "<memory unit='KiB'>-1<",
+                "<memory> '-1' KiB",
+            ),
+            (
+                "memory of a lizard",
+                "<memory unit='KiB'>16777216<",
+                "<memory unit='KiB'>lizard<",
+                "<memory> 'lizard' KiB",
+            ),
+            (
+                "vcpu of a lizard",
+                "'static'>8<",
+                "'static'>lizard<",
+                "<vcpu> 'lizard'",
+            ),
+            ("vcpu of 0", "'static'>8<", "'static'>0<", "<vcpu> '0'"),
+            ("vcpu of -1", "'static'>8<", "'static'>-1<", "<vcpu> '-1'"),
+            ("no vcpu", "<vcpu placement='static'>8</vcpu>", "", "<vcpu> ''"),
+            (
+                "no uuid",
+                "<uuid>%s</uuid>" % self.facts.uuid,
+                "",
+                "domain yolobox-box has no <uuid>",
+            ),
         )
-        self.assertNotIn("start", self.host.subcommands())
-        self.assertNotIn("define", self.host.subcommands())
+        for label, old, new, said in cases:
+            with self.subTest(label):
+                self.assertIn(old, self.tampered)
+                self.host.domains["yolobox-box"] = self.tampered.replace(old, new)
+                self.host.calls.clear()
+                with self.assertRaises(self.box.YoError) as caught:
+                    self.start()
+                self.assertIn("domain yolobox-box", caught.exception.message)
+                self.assertIn(said, caught.exception.message)
+                self.assertIn(
+                    "yo -m box destroy --yes && yo -m box bootstrap",
+                    caught.exception.message,
+                )
+                for step in ("define", "start", "vol-create-as", "vol-upload"):
+                    self.assertNotIn(step, self.host.subcommands())
+
+    def test_a_domain_of_the_boxs_name_that_is_not_the_boxs_is_refused_untouched(self):
+        untagged = re.sub(r"<metadata>.*?</metadata>", "", self.tampered, flags=re.S)
+        self.assertNotEqual(untagged, self.tampered)
+        self.host.domains["yolobox-box"] = untagged
+        for act in (self.start, self.driver.ssh_port):
+            with self.subTest(act=act.__name__):
+                self.host.calls.clear()
+                with self.assertRaisesRegex(self.box.YoError, "is not box's.*has none"):
+                    act()
+                for step in ("define", "start", "vol-create-as", "vol-upload"):
+                    self.assertNotIn(step, self.host.subcommands())
+                self.assertEqual(self.host.domains["yolobox-box"], untagged)
 
     def test_a_definition_libvirt_refuses_is_quoted_with_the_way_out(self):
-        self.box.write_domain_facts(
-            self.box.instance_dir(), self.facts._replace(uuid="another")
+        self.host.fail["define"] = (
+            "error: operation failed: domain 'yolobox-box' already exists with "
+            "uuid another"
         )
         with self.assertRaises(self.box.YoError) as caught:
             self.start()
-        self.assertIn(
-            "already exists with uuid %s" % self.facts.uuid, caught.exception.message
-        )
+        self.assertIn("already exists with uuid another", caught.exception.message)
         self.assertIn(
             "yo -m box destroy --yes && yo -m box bootstrap", caught.exception.message
         )
@@ -2655,22 +2886,29 @@ class TestVmUpRefusesSizeFlagsOnAnExistingBox(LibvirtCase):
         self.assertIsNone(status)
         self.assertEqual((new_box.memory_gib, new_box.disk_gib), (24, 250))
 
-    def test_a_passt_directory_the_vm_user_cannot_write_in_refuses_before_any_change(
-        self,
-    ):
+    def test_a_start_the_host_cannot_serve_refuses_before_any_change(self):
         # A refusal after the cidata sync or the definition would leave a host
         # changed for a box that never started.
-        self.host.acl = getfacl_listing(mask="r-x")
-        for domain in ("defined", "missing"):
-            with self.subTest(domain=domain):
-                if domain == "missing":
-                    self.host.domains.clear()
-                    self.host.states.clear()
-                error, stubs = self.vm_up(self.box.NO_SIZE)
-                self.assertIn("sudo setfacl -m u:yolobox-vm", error.message)
-                stubs["luks_key"].assert_not_called()
-                stubs["start"].assert_not_called()
-                self.assertEqual(self.writes(), [])
+        for gap, remedy in (
+            ("passt directory", "sudo setfacl -m u:yolobox-vm"),
+            ("resolver label", "sudo restorecon -F"),
+        ):
+            for domain in ("defined", "missing"):
+                with self.subTest(gap=gap, domain=domain):
+                    self.host.acl = getfacl_listing()
+                    self.resolver_label = GOOD_LABEL
+                    if gap == "passt directory":
+                        self.host.acl = getfacl_listing(mask="r-x")
+                    else:
+                        self.resolver_label = WRONG_LABEL
+                    if domain == "missing":
+                        self.host.domains.clear()
+                        self.host.states.clear()
+                    error, stubs = self.vm_up(self.box.NO_SIZE)
+                    self.assertIn(remedy, error.message)
+                    stubs["luks_key"].assert_not_called()
+                    stubs["start"].assert_not_called()
+                    self.assertEqual(self.writes(), [])
 
     def test_a_box_asked_for_nothing_is_started_as_it_is(self):
         error, stubs = self.vm_up(self.box.NO_SIZE)
@@ -2882,25 +3120,25 @@ class TestStart(LibvirtCase):
         unlock.assert_called_once_with(mock.ANY, self.passphrase)
 
     def memory(self):
-        """The <memory> of the defined domain, as (unit, value)."""
+        """The <memory> of the defined domain, as (unit, GiB)."""
         element = ET.fromstring(self.host.domains["yolobox-box"]).find("memory")
-        return element.get("unit"), element.text
+        return element.get("unit"), int(element.text) >> 20
 
     def test_a_box_given_no_size_gets_the_default_memory_and_disk(self):
         self.start()
-        self.assertEqual(self.memory(), ("GiB", str(self.box.LIBVIRT_MEMORY_GIB)))
+        self.assertEqual(self.memory(), ("KiB", self.box.LIBVIRT_MEMORY_GIB))
         self.assertEqual(
             self.host.capacity["yolobox-box.qcow2"], self.box.LIBVIRT_DISK_GIB << 30
         )
 
     def test_a_box_is_created_at_the_size_asked_for(self):
         self.start(memory_gib=24, disk_gib=250)
-        self.assertEqual(self.memory(), ("GiB", "24"))
+        self.assertEqual(self.memory(), ("KiB", 24))
         self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 250 << 30)
 
     def test_memory_alone_leaves_the_disk_at_its_default(self):
         self.start(memory_gib=24)
-        self.assertEqual(self.memory(), ("GiB", "24"))
+        self.assertEqual(self.memory(), ("KiB", 24))
         self.assertEqual(
             self.host.capacity["yolobox-box.qcow2"], self.box.LIBVIRT_DISK_GIB << 30
         )
@@ -3018,7 +3256,7 @@ class TestStart(LibvirtCase):
         self.assertFalse(os.path.exists(built_from))
         self.assertEqual(
             sorted(os.listdir(self.box.instance_dir())),
-            ["cidata", "disk-volume", "domain.json", "domain.xml", "operator.pub"],
+            ["cidata", "disk-volume", "domain.xml", "operator.pub"],
         )
         staged = Path(self.box.instance_dir()) / "cidata"
         self.assertEqual(
@@ -3140,7 +3378,7 @@ class TestStart(LibvirtCase):
                 self.start(existing=True)
         self.assertEqual(
             sorted(os.listdir(self.box.instance_dir())),
-            ["cidata", "disk-volume", "domain.json", "domain.xml", "operator.pub"],
+            ["cidata", "disk-volume", "domain.xml", "operator.pub"],
         )
         self.assertIn(
             "LIMA_CIDATA_USER=alice",

@@ -9,11 +9,17 @@ export LC_ALL=C
 
 MIN_LIBVIRT="12.2.0"
 VM_USER="yolobox-vm"
+RESOLV_CONF="/etc/resolv.conf"
+# The only SELinux type of it that passt_t may read.
+RESOLV_CONF_TYPE="net_conf_t"
 CONF_DIR="/etc/yolobox"
 NFT_DEST="$CONF_DIR/yolobox-host.nft"
 UNIT_DEST="/etc/systemd/system/yolobox-host.service"
 POLKIT_RULE="/etc/polkit-1/rules.d/50-yolobox-libvirt.rules"
-PASST_TMPFILES="/etc/tmpfiles.d/yolobox-passt.conf"
+PASST_TMPFILES="$CONF_DIR/yolobox-passt.conf"
+# Where this script put that rule before yolobox-host.service applied it: dracut
+# copies /etc/tmpfiles.d into the initrd, which has no qemu account.
+OLD_PASST_TMPFILES="/etc/tmpfiles.d/yolobox-passt.conf"
 PASST_DIR="/run/libvirt/qemu/passt"
 # libvirt's own account, which creates that directory; the hook refuses a
 # directory owned by anyone else.
@@ -66,11 +72,21 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f $HERE/yolobox-libvirt-hook.sh ]] || die "missing $HERE/yolobox-libvirt-hook.sh"
 
 # Checked before anything is installed or enabled, so a host that fails it is
-# left as it was.
+# left as it was. passt hands the guest the host's resolver, and the guest's DNS
+# dies without a word when passt cannot read the file: a root editor that
+# replaces resolved's stub by rename leaves it labelled as the editor's file.
+# Without SELinux stat prints ?, and then no label can deny passt.
 step "host resolver"
-resolver="$(awk '$1 == "nameserver" { print $2; exit }' /etc/resolv.conf)"
+resolver="$(awk '$1 == "nameserver" { print $2; exit }' "$RESOLV_CONF")"
 [[ $resolver =~ ^127\.[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-  die "the first nameserver in /etc/resolv.conf is '${resolver:-none}', not a loopback address. passt would hand the guest that resolver, which sits on the LAN. Point the host at a local resolver (systemd-resolved's stub, 127.0.0.53, is one) and run this again"
+  die "the first nameserver in $RESOLV_CONF is '${resolver:-none}', not a loopback address. passt would hand the guest that resolver, which sits on the LAN. Point the host at a local resolver (systemd-resolved's stub, 127.0.0.53, is one) and run this again"
+resolver_target="$(readlink -f "$RESOLV_CONF")"
+resolver_label="$(stat -c %C "$resolver_target")"
+if [[ $resolver_label != '?' ]]; then
+  IFS=: read -r _ _ resolver_type _ <<<"$resolver_label"
+  [[ $resolver_type == "$RESOLV_CONF_TYPE" ]] ||
+    die "$resolver_target is labelled '$resolver_label', not as type $RESOLV_CONF_TYPE, so passt cannot read the host resolver and the guest would get no DNS. Run: restorecon -F \"\$(readlink -f $RESOLV_CONF)\" and run this again"
+fi
 
 step "libvirt repository and packages"
 dnf copr enable -y @virtmaint-sig/virt-preview
@@ -140,16 +156,23 @@ fi
 # makes the socket directory owned by qemu with mode 0755, so passt's bind fails
 # with "Permission denied". An ACL entry for yolobox-vm leaves the owner alone,
 # and the mask is spelled out because an entry is only as wide as the mask.
-# /run is a tmpfs, so a tmpfiles rule re-applies it on every boot, before
-# virtqemud starts.
+# /run is a tmpfs, so yolobox-host.service re-applies a tmpfiles rule on every
+# boot, before virtqemud starts. The rule lives under $CONF_DIR, not in
+# /etc/tmpfiles.d: dracut copies that directory into the initrd, which has no
+# qemu account to resolve.
 step "passt socket directory"
 # A symlink there would send the ACL, and the hook's, to whatever it points at.
 [[ ! -L $PASST_DIR ]] || die "$PASST_DIR is a symlink, which libvirt never makes; remove it and run this again"
+install -d -m0755 "$CONF_DIR"
 cat >"$PASST_TMPFILES" <<RULE
 d $PASST_DIR 0755 $PASST_OWNER $PASST_OWNER -
 a+ $PASST_DIR - - - - u:$VM_USER:rwx,m::rwx
 RULE
 chmod 0644 "$PASST_TMPFILES"
+if [[ -e $OLD_PASST_TMPFILES ]]; then
+  rm "$OLD_PASST_TMPFILES"
+  printf 'removed %s. The initrd still holds a copy that logs "Failed to resolve user %s" at every boot; running: sudo dracut -f drops it now, and the next kernel update would.\n' "$OLD_PASST_TMPFILES" "$PASST_OWNER"
+fi
 systemd-tmpfiles --create "$PASST_TMPFILES"
 setfacl -P -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
 

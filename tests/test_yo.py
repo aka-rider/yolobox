@@ -2085,8 +2085,8 @@ class TestSshConfigReachesBox(FakeHome):
         os.makedirs(os.path.dirname(self.instance_cfg))
         with open(self.instance_cfg, "w") as handle:
             handle.write(
-                'Host %s\n  UserKnownHostsFile "%s"\n'
-                % (yo.box.vm_host, yo.known_hosts_path())
+                'Host %s\n  HostKeyAlias %s\n  UserKnownHostsFile "%s"\n'
+                % (yo.box.vm_host, yo.box.vm_host, yo.known_hosts_path())
             )
         self.config = os.path.join(self.home, ".ssh", "config")
 
@@ -2131,6 +2131,13 @@ class TestSshConfigReachesBox(FakeHome):
         self.write_config(
             'Host *\n  UserKnownHostsFile "%s" /tmp/other\nInclude %s\n'
             % (yo.known_hosts_path(), self.instance_cfg)
+        )
+        self.assertFalse(yo.ssh_config_reaches_box())
+
+    def test_an_earlier_block_that_renames_the_pin_does_not(self):
+        # The pin file is the right one, but ssh would look in it for another name.
+        self.write_config(
+            "Host *\n  HostKeyAlias other\nInclude %s\n" % self.instance_cfg
         )
         self.assertFalse(yo.ssh_config_reaches_box())
 
@@ -2450,11 +2457,16 @@ class TestWriteSshConfig(SshConfigCase):
             "ForwardAgent no",
             "ControlMaster auto",
             'ControlPath "%s"' % os.path.join(yo.instance_dir(), "yo-op.sock"),
+            "HostKeyAlias lima-yolobox",
             'UserKnownHostsFile "%s"' % yo.known_hosts_path(),
             "StrictHostKeyChecking accept-new",
             "NoHostAuthenticationForLocalhost no",
         ):
             self.assertIn("\n  " + line + "\n", block + "\n", line)
+
+    def test_both_blocks_pin_under_the_one_alias(self):
+        aliases = re.findall(r"^\s*HostKeyAlias (.*)$", self.write(), re.M)
+        self.assertEqual(aliases, [yo.box.vm_host] * 2)
 
     def test_the_agent_role_gets_its_own_master_above_the_operators_block(self):
         text = self.write()
@@ -2486,6 +2498,7 @@ class TestWriteSshConfig(SshConfigCase):
             "Hostname 127.0.0.1",
             "Port 60022",
             'IdentityFile "/Users/user/.lima/_config/user"',
+            "HostKeyAlias lima-yolobox",
             'UserKnownHostsFile "%s"' % yo.known_hosts_path(),
             "NoHostAuthenticationForLocalhost no",
         ):
@@ -2564,7 +2577,12 @@ class TestHostKeyPinning(SshConfigCase):
     }
 
     def pinned_keywords(self, argv, host=None):
-        wanted = ("stricthostkeychecking", "userknownhostsfile", "nohostauth")
+        wanted = (
+            "stricthostkeychecking",
+            "userknownhostsfile",
+            "nohostauth",
+            "hostkeyalias",
+        )
         return {
             key: value
             for key, value in self.effective(argv, host).items()
@@ -2575,6 +2593,7 @@ class TestHostKeyPinning(SshConfigCase):
         for keyword, value in self.PINNED.items():
             self.assertEqual(effective[keyword], value)
         self.assertEqual(effective["userknownhostsfile"], yo.known_hosts_path())
+        self.assertEqual(effective["hostkeyalias"], yo.box.vm_host)
 
     @needs_tool("ssh")
     def test_every_yo_role_pins_the_key(self):
@@ -2616,6 +2635,21 @@ class TestHostKeyPinning(SshConfigCase):
         self.assertEqual(resolved["nohostauthenticationforlocalhost"], "no")
 
     @needs_tool("ssh")
+    def test_the_pin_is_looked_up_under_the_same_name_after_the_port_changes(self):
+        # A port change (limactl edit --set .ssh.localPort) must not leave
+        # ssh without a pin to check the new port's answer against.
+        self.write()
+        before = self.effective(["ssh", "-F", yo.ssh_cfg()])
+        new_facts = yo.SshFacts(61999, *LIMA_FACTS[1:])
+        with mock.patch.object(yo.LIMA, "ssh_facts", return_value=new_facts):
+            self.write()
+        after = self.effective(["ssh", "-F", yo.ssh_cfg()])
+        self.assertEqual(before["port"], "60022")
+        self.assertEqual(after["port"], "61999")
+        self.assertEqual(after["hostkeyalias"], before["hostkeyalias"])
+        self.assertEqual(after["hostkeyalias"], yo.box.vm_host)
+
+    @needs_tool("ssh")
     def test_first_contact_overrides_all_three_pinned_keywords(self):
         self.write()
         effective = self.pinned_keywords(
@@ -2626,30 +2660,45 @@ class TestHostKeyPinning(SshConfigCase):
         self.assertEqual(effective["nohostauthenticationforlocalhost"], "yes")
 
 
-class TestKnownHostsLines(unittest.TestCase):
-    def test_formats_host_port_type_and_key(self):
+class TestKnownHostsLines(FakeHome):
+    def test_formats_alias_type_and_key(self):
         pubkeys = "ssh-ed25519 AAAAC3abc== root@yolobox\n"
-        lines = yo.known_hosts_lines(60022, pubkeys)
-        self.assertEqual(lines, ["[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc=="])
+        lines = yo.known_hosts_lines(pubkeys)
+        self.assertEqual(lines, ["lima-yolobox ssh-ed25519 AAAAC3abc=="])
+
+    def test_a_line_names_no_host_and_no_port(self):
+        # The pin must outlive the ssh port: a port in the line would tie it to one.
+        lines = yo.known_hosts_lines("ssh-ed25519 AAAAC3abc== root@yolobox\n")
+        self.assertNotIn("127.0.0.1", lines[0])
+        self.assertNotIn("[", lines[0])
 
     def test_handles_multiple_key_types_and_drops_the_comment(self):
         pubkeys = (
             "ssh-ed25519 AAAAC3abc== root@yolobox\n"
             "ecdsa-sha2-nistp256 AAAAE2abc== root@yolobox\n"
         )
-        lines = yo.known_hosts_lines(60022, pubkeys)
+        lines = yo.known_hosts_lines(pubkeys)
         self.assertEqual(
             lines,
             [
-                "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==",
-                "[127.0.0.1]:60022 ecdsa-sha2-nistp256 AAAAE2abc==",
+                "lima-yolobox ssh-ed25519 AAAAC3abc==",
+                "lima-yolobox ecdsa-sha2-nistp256 AAAAE2abc==",
             ],
+        )
+
+    def test_comment_lines_are_not_pins(self):
+        pubkeys = "# host keys\nssh-ed25519 AAAAC3abc== root@yolobox\n#ssh-rsa AAAB x\n"
+        self.assertEqual(
+            yo.known_hosts_lines(pubkeys), ["lima-yolobox ssh-ed25519 AAAAC3abc=="]
         )
 
     def test_blank_lines_and_lines_with_no_key_field_are_skipped(self):
         pubkeys = "ssh-ed25519 AAAAC3abc== root@yolobox\n\nnot-a-key-line\n"
-        lines = yo.known_hosts_lines(60022, pubkeys)
+        lines = yo.known_hosts_lines(pubkeys)
         self.assertEqual(len(lines), 1)
+
+    def test_no_keys_make_no_lines(self):
+        self.assertEqual(yo.known_hosts_lines(""), [])
 
 
 class TestSshOptionValuesSurviveAHomeWithASpace(FakeHome):
@@ -2697,9 +2746,6 @@ class TestSshOptionValuesSurviveAHomeWithASpace(FakeHome):
 class TestEnsureGuestKnownHosts(FakeHome):
     def setUp(self):
         super().setUp()
-        patcher = mock.patch.object(yo.LIMA, "ssh_facts", return_value=LIMA_FACTS)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         os.makedirs(yo.instance_dir())
 
     def test_fetches_via_operator_and_writes_the_known_hosts_file(self):
@@ -2717,7 +2763,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
 
         with open(yo.known_hosts_path(), "r") as handle:
             content = handle.read()
-        self.assertEqual(content, "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==\n")
+        self.assertEqual(content, "lima-yolobox ssh-ed25519 AAAAC3abc==\n")
         self.assertEqual(stat.S_IMODE(os.stat(yo.known_hosts_path()).st_mode), 0o600)
 
     def write_pin(self, text):
@@ -2725,7 +2771,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
             handle.write(text)
 
     def test_with_a_pin_the_fetch_is_pinned_and_a_passing_one_rewrites_it(self):
-        self.write_pin("[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
+        self.write_pin("lima-yolobox ssh-ed25519 OLD==\n")
         proc = mock.Mock(
             returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
         )
@@ -2733,9 +2779,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
             yo.ensure_guest_known_hosts()
         self.assertIs(fake_ssh_run.call_args[0][0], yo.OPERATOR)
         with open(yo.known_hosts_path()) as handle:
-            self.assertEqual(
-                handle.read(), "[127.0.0.1]:60022 ssh-ed25519 AAAAC3abc==\n"
-            )
+            self.assertEqual(handle.read(), "lima-yolobox ssh-ed25519 AAAAC3abc==\n")
 
     def test_a_pin_of_only_whitespace_is_no_pin(self):
         self.write_pin(" \n\t\n")
@@ -2749,7 +2793,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
     def test_a_changed_key_is_sshs_refusal_and_the_pin_stays(self):
         # A VM recreated behind yo's back, or something else on the port: the
         # old pin is kept and the warning shown, never a key learned anew.
-        self.write_pin("[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
+        self.write_pin("lima-yolobox ssh-ed25519 OLD==\n")
         warning = "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"
         proc = mock.Mock(returncode=255, stdout="", stderr=warning + "\n")
         with mock.patch.object(yo.sshx, "ssh_run", return_value=proc):
@@ -2757,7 +2801,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
                 yo.ensure_guest_known_hosts()
         self.assertIn(warning, caught.exception.message)
         with open(yo.known_hosts_path()) as handle:
-            self.assertEqual(handle.read(), "[127.0.0.1]:60022 ssh-ed25519 OLD==\n")
+            self.assertEqual(handle.read(), "lima-yolobox ssh-ed25519 OLD==\n")
 
     def test_failed_fetch_raises_naming_the_cause(self):
         proc = mock.Mock(
@@ -4333,7 +4377,8 @@ class TestLimaConfigGapMessage(unittest.TestCase):
         for gap in gaps:
             self.assertIn(gap, message)
         self.assertIn("yo destroy --yes && yo bootstrap", message)
-        self.assertIn("deletes its disk", message)
+        self.assertIn("copy out what you need first", message)
+        self.assertIn("deletes everything on it", message)
         self.assertNotIn("--set", message)
 
     def test_settings_limactl_edit_can_change_are_one_edit_of_the_stopped_box(self):

@@ -43,7 +43,9 @@ def host_key_fetch_role() -> SshRole:
     changed under a kept known_hosts (a VM recreated behind yo's back, or
     something else holding the port) is ssh's own REMOTE HOST IDENTIFICATION
     HAS CHANGED refusal, never learned anew and then trusted with the agent
-    forward. The way out of a stale pin is to delete the file.
+    forward. The pin is keyed on the machine's name (HostKeyAlias), so this
+    holds across a change of the ssh port too. The way out of a stale pin is
+    to delete the file.
     """
     pin = proc.read_text_file(state.known_hosts_path(), errors="surrogateescape")
     if pin is None or not pin.strip():

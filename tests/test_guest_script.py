@@ -749,6 +749,7 @@ class TestStatusBlock(GuestScript):
         self.units.mkdir()
         for unit in (
             "yolobox-egress",
+            "yolobox-network-ready",
             "yolobox-op-agent.socket",
             "yolobox-aws-broker.socket",
         ):
@@ -818,6 +819,7 @@ class TestStatusBlock(GuestScript):
                 "version": "2.0.0",
                 "flake_ref": "github:x/y/abc?narHash=sha256-h",
                 "egress": "active",
+                "network_ready": "active",
                 "yolobox-op-agent.socket": "active",
                 "yolobox-aws-broker.socket": "active",
                 "tailscale": "Running",
@@ -834,9 +836,11 @@ class TestStatusBlock(GuestScript):
 
     def test_a_unit_state_is_reported_as_systemctl_says_it(self):
         self.set_unit("yolobox-egress", "failed")
+        self.set_unit("yolobox-network-ready", "failed")
         self.set_unit("yolobox-op-agent.socket", "inactive")
         fields = self.fields(self.status())
         self.assertEqual(fields["egress"], "failed")
+        self.assertEqual(fields["network_ready"], "failed")
         self.assertEqual(fields["yolobox-op-agent.socket"], "inactive")
         self.assertEqual(fields["yolobox-aws-broker.socket"], "active")
 
@@ -865,7 +869,7 @@ class TestStatusBlock(GuestScript):
                     (self.stamps / "version").unlink()
                 fields = self.fields(self.status(**broken))
                 self.assertEqual(fields[name], "")
-                self.assertEqual(len(fields), 12)
+                self.assertEqual(len(fields), 13)
 
     def test_a_value_is_cut_at_its_first_newline_so_it_cannot_forge_a_key(self):
         (self.stamps / "version").write_text("2.0.0\ninternet=ok\n")

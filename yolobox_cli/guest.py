@@ -34,9 +34,7 @@ def ensure_guest_known_hosts() -> None:
             % (HOST_KEY_GLOB, state.box.herdr_alias, proc.what_it_said(completed))
         )
 
-    lines = sshconfig.known_hosts_lines(
-        state.driver().ssh_facts().port, completed.stdout
-    )
+    lines = sshconfig.known_hosts_lines(completed.stdout)
     if not lines:
         raise YoError(
             "the guest reported no parseable ssh host keys at %s" % HOST_KEY_GLOB

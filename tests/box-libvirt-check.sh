@@ -510,6 +510,24 @@ check_lan_gateway() {
     expect_blocked "the LAN's default gateway" "${default_gw}" 80
 }
 
+# The guest's own resolver, with its egress table in place (check_host_layer_alone
+# deletes it): the lease must have brought a nameserver the table lets through.
+# getent exits 2 for a name nothing resolves, so a localhost entry (answered
+# without the network) and the reserved .invalid TLD (answered by no server)
+# bracket the probe: it can tell a working resolver from a missing one.
+check_guest_resolves() {
+    local answer status=0
+    guest "getent hosts localhost >/dev/null" ||
+        fail "getent hosts localhost failed in the guest, so the resolver probe below would prove nothing"
+    guest "getent hosts lizard.invalid >/dev/null" || status=$?
+    [ "${status}" -eq 2 ] ||
+        fail "getent hosts lizard.invalid exited ${status} in the guest, not 2 (name not found)"
+    answer=$(guest "getent hosts ${INTERNET_HOST}") ||
+        fail "the guest cannot resolve ${INTERNET_HOST} through its own resolver with the egress table in place (getent exit $?)"
+    [ -n "${answer}" ] || fail "getent hosts ${INTERNET_HOST} answered nothing in the guest"
+    ok "the guest resolves ${INTERNET_HOST} through its own resolver"
+}
+
 check_host_layer_alone() {
     local default_gw lan_dev host_ip outcome answer
     read -r default_gw lan_dev <<<"$(lan_default_route -4)"
@@ -575,6 +593,7 @@ main() {
     check_domain_label
     check_process_confinement
     check_domain_xml
+    check_guest_resolves
     check_host_layer_alone
     check_forward_bound_to_loopback
     echo "box-libvirt-check: all checks passed"

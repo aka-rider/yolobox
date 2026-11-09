@@ -111,10 +111,14 @@ def yo_cmd(*words: str) -> str:
 
 
 def recreate_chain(flags: Sequence[str] = ()) -> str:
-    """The remedy for a box that must be made anew, to paste: `yo destroy --yes`,
-    then `yo bootstrap FLAGS`, which creates it. Drivers build their
-    recreate_command() with it."""
-    return "%s && %s" % (yo_cmd("destroy", "--yes"), yo_cmd("bootstrap", *flags))
+    """The remedy for a box that must be made anew, to paste after the reason:
+    `yo destroy --yes`, then `yo bootstrap FLAGS`, which creates it. It always
+    says the disk is lost, so no caller can print it without the warning.
+    Drivers build their recreate_command() with it."""
+    return "recreate the box, which deletes everything on it: %s && %s" % (
+        yo_cmd("destroy", "--yes"),
+        yo_cmd("bootstrap", *flags),
+    )
 
 
 def hint(template: str) -> str:

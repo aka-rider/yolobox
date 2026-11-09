@@ -240,7 +240,7 @@ class TestSshPort(unittest.TestCase):
                     with self.assertRaises(yo.YoError) as caught:
                         yo.box.driver.ssh_port()
                 self.assertIn(
-                    "Recreate the instance, which deletes everything on it: "
+                    "recreate the box, which deletes everything on it: "
                     "yo -m second destroy --yes && yo -m second bootstrap",
                     caught.exception.message,
                 )
@@ -822,7 +822,9 @@ class TestAConfigGapRecreatesAnInstanceByBootstrap(FakeHome):
 
     def test_the_default_instance_is_recreated_by_bootstrap_alone(self):
         self.assertEqual(
-            yo.LIMA.recreate_command(yo.NO_SIZE), "yo destroy --yes && yo bootstrap"
+            yo.LIMA.recreate_command(yo.NO_SIZE),
+            "recreate the box, which deletes everything on it: "
+            "yo destroy --yes && yo bootstrap",
         )
 
 

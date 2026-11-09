@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import os
 import re
 import string
@@ -39,6 +38,7 @@ from . import (
     unlock,
 )
 from .config import (
+    FACTS,
     FILE_MODE_PRIVATE,
     FILE_MODE_READABLE,
     GIB,
@@ -70,7 +70,7 @@ from .ui import YoError
 # connection, with passt for the network and an SELinux/DAC label from the host
 # layer. The domain is always what libvirt/domain.xml makes: a stopped domain
 # is defined again from the template on every start, filled in from the facts
-# the instance directory keeps (DomainFacts). The host's preflight is in
+# libvirt holds of its own definition (DomainFacts). The host's preflight is in
 # libvirt_host.py. Pure helpers first, then the driver, which calls them and
 # virsh by name at call time.
 # The 1Password item whose public key is the operator's login, in cidata.
@@ -103,9 +103,9 @@ STATE_REMEDIES = {
     "paused": ("resume", "resume"),
     "pmsuspended": ("wake", "dompmwakeup"),
 }
-# In the instance directory: what the template is filled in with, kept so every
-# start defines the same domain (libvirt refuses a new uuid under a known name).
-DOMAIN_FACTS_NAME = "domain.json"
+# The port inside the guest the domain's one portForward reaches.
+GUEST_SSH_PORT = str(FACTS["guest_ssh_port"])
+KIB_PER_GIB = 1 << 20
 
 SEED_NAME = "nixos-lima-v0.2.2-x86_64.qcow2"
 SEED_URL = (
@@ -131,33 +131,60 @@ class DomainFacts(NamedTuple):
     cpus: int
 
 
-def read_domain_facts(directory: str) -> Optional[DomainFacts]:
-    """The facts kept in `directory`, None when there are none."""
-    path = os.path.join(directory, DOMAIN_FACTS_NAME)
-    text = proc.read_text_file(path)
-    if text is None:
+def positive_number(text: Optional[str]) -> Optional[int]:
+    """The whole number `text` spells, None when it is not a positive one."""
+    stripped = (text or "").strip()
+    if not proc.is_ascii_number(stripped) or int(stripped) == 0:
         return None
-    try:
-        facts = DomainFacts(**json.loads(text))
-    except (ValueError, TypeError) as failure:
-        raise YoError("%s is not a domain record: %s" % (path, failure))
-    if not (
-        isinstance(facts.uuid, str)
-        and all(
-            isinstance(field, int) and not isinstance(field, bool)
-            for field in (facts.ssh_port, facts.memory_gib, facts.cpus)
+    return int(stripped)
+
+
+def parse_domain_facts(domain: str, root: ET.Element) -> DomainFacts:
+    """The facts of the definition `root` of `domain`, which is what libvirt
+    prints for it: its uuid, the host port forwarded to the guest's ssh, its
+    memory (always in KiB, whole GiB here) and its vCPUs. A value that is
+    missing or odd is an error naming the domain and the value."""
+    uuid_text = (root.findtext("uuid") or "").strip()
+    if not uuid_text:
+        raise YoError("domain %s has no <uuid>" % domain)
+    ranges = [
+        forward
+        for forward in root.findall("devices/interface/portForward/range")
+        if forward.get("to") == GUEST_SSH_PORT
+    ]
+    if len(ranges) != 1:
+        raise YoError(
+            "domain %s has %d portForward ranges to port %s, and yo needs exactly one"
+            % (domain, len(ranges), GUEST_SSH_PORT)
         )
-    ):
-        raise YoError("%s is not a domain record: %r" % (path, text))
-    return facts
-
-
-def write_domain_facts(directory: str, facts: DomainFacts) -> None:
-    proc.atomic_write(
-        os.path.join(directory, DOMAIN_FACTS_NAME),
-        json.dumps(facts._asdict(), indent=2) + "\n",
-        FILE_MODE_READABLE,
-    )
+    start = ranges[0].get("start")
+    ssh_port = positive_number(start)
+    if ssh_port is None:
+        raise YoError(
+            "domain %s forwards port %s from start=%r, which is not a port"
+            % (domain, GUEST_SSH_PORT, start)
+        )
+    memory = root.find("memory")
+    if memory is None:
+        raise YoError("domain %s has no <memory>" % domain)
+    if memory.get("unit") != "KiB":
+        raise YoError(
+            "domain %s has <memory> in unit=%r, and libvirt prints KiB"
+            % (domain, memory.get("unit"))
+        )
+    kib = positive_number(memory.text)
+    if kib is None or kib % KIB_PER_GIB:
+        raise YoError(
+            "domain %s has <memory> %r KiB, which is not a positive whole number "
+            "of GiB" % (domain, (memory.text or "").strip())
+        )
+    cpus = positive_number(root.findtext("vcpu"))
+    if cpus is None:
+        raise YoError(
+            "domain %s has <vcpu> %r, which is not a positive count"
+            % (domain, (root.findtext("vcpu") or "").strip())
+        )
+    return DomainFacts(uuid_text, ssh_port, kib // KIB_PER_GIB, cpus)
 
 
 def domain_name() -> str:
@@ -195,6 +222,7 @@ def domain_xml(instance: str, facts: DomainFacts, uid: int, gid: int) -> str:
         name=instance,
         uuid=facts.uuid,
         ssh_port=facts.ssh_port,
+        guest_ssh_port=GUEST_SSH_PORT,
         uid=uid,
         gid=gid,
         memory_gib=facts.memory_gib,
@@ -497,24 +525,19 @@ class LibvirtDriver:
             )
 
     def ssh_port(self) -> int:
-        self.require_domain()
         return self.domain_facts().ssh_port
 
     def domain_facts(self) -> DomainFacts:
-        """The facts the existing domain was defined with. Without them the
-        domain cannot be defined again, so it is only good for a destroy."""
-        facts = read_domain_facts(state.instance_dir())
-        if facts is None:
-            raise YoError(
-                "domain %s exists but %s holds no record of its uuid, port and "
-                "size, so yo cannot define it again — %s"
-                % (
-                    domain_name(),
-                    os.path.join(state.instance_dir(), DOMAIN_FACTS_NAME),
-                    self.recreate_command(NO_SIZE),
-                )
-            )
-        return facts
+        """The facts the domain is defined with, read from libvirt's own
+        definition of it, so there is no second copy to go missing. A domain that
+        does not exist, or is not this box's, is refused first."""
+        self.require_domain()
+        dump = libvirt_host.virsh("dumpxml", "--inactive", domain_name())
+        root = libvirt_host.domain_root(dump.stdout)
+        try:
+            return parse_domain_facts(domain_name(), root)
+        except YoError as refused:
+            raise self.refused_with_recreate(refused)
 
     def allocate_host_port(self) -> int:
         # Every domain's forwards count, not only the boxes': a shut-off domain
@@ -532,7 +555,7 @@ class LibvirtDriver:
         return driver.port_lock(os.path.join(state.home(), self.instances_dir))
 
     def forward_port(self, guest_port: int) -> int:
-        forwards.ensure_session()
+        forwards.open_master()
         with self.port_lock():
             host_port = self.allocate_host_port()
             proc.run(
@@ -694,7 +717,7 @@ class LibvirtDriver:
             return word == DISK_BUILT
         raise YoError(
             "volume %s exists, but %s, so yo cannot tell whether it holds a "
-            "finished disk — recreate the box, which deletes the volume: %s"
+            "finished disk — %s"
             % (
                 disk_volume(),
                 "this host's yo has no record of building it"
@@ -774,12 +797,11 @@ class LibvirtDriver:
             proc.delete_tree(work)
 
     def create_domain(self, memory_gib: int, cpus: int) -> DomainFacts:
-        """Record and define the domain on the lowest free host port."""
+        """Define the domain on the lowest free host port."""
         with self.port_lock():
             facts = DomainFacts(
                 str(uuid.uuid4()), self.allocate_host_port(), memory_gib, cpus
             )
-            write_domain_facts(state.instance_dir(), facts)
             self.define_domain(facts)
         return facts
 
@@ -797,10 +819,14 @@ class LibvirtDriver:
                 "virsh define %s" % path,
             )
         except YoError as refused:
-            raise YoError("%s — %s" % (refused.message, self.recreate_command(NO_SIZE)))
+            raise self.refused_with_recreate(refused)
 
     def recreate_command(self, size: Size) -> str:
         return state.recreate_chain(flags=size.flags())
+
+    def refused_with_recreate(self, refused: YoError) -> YoError:
+        """`refused` with the one way out of a domain yo cannot work with."""
+        return YoError("%s — %s" % (refused.message, self.recreate_command(NO_SIZE)))
 
     def create(self, held: state.HeldBox, new_box: NewBox) -> None:
         size = domain_size(new_box)
@@ -812,14 +838,15 @@ class LibvirtDriver:
         self.create_domain(size.memory_gib, size.cpus)
 
     def start_refusal(self) -> Optional[str]:
-        # Only a start needs passt to bind its socket, so only a start is
-        # refused for the directory's ACL; down, ssh and status work without it.
-        # start_domain() reads it again should another domain's start narrow it.
-        return libvirt_host.passt_dir_gap()
+        # Only a start needs passt to bind its socket and to read the host's
+        # resolver, so only a start is refused for the directory's ACL or the
+        # resolver's label; down, ssh and status work without either.
+        # start_domain() reads the ACL again should another domain's start narrow it.
+        return libvirt_host.passt_dir_gap() or libvirt_host.resolver_label_gap()
 
     def start(self, held: state.HeldBox, passphrase: Callable[[], bytes]) -> None:
-        self.sync_cidata(self.cidata())
         facts = self.domain_facts()
+        self.sync_cidata(self.cidata())
         # A stopped domain is always what this yo's template makes; a domain
         # that is up keeps the definition it runs.
         if self.domain_state() == STATE_OFF:
@@ -850,9 +877,9 @@ class LibvirtDriver:
 
         Another passt domain starting between yo's ACL check and this start
         recomputes the directory's mask; the hook restores it at that domain's
-        `started begin`. So
-        the ACL is read again: short, and the start is refused with the remedy;
-        restored, and the start is tried once more, whose failure is final.
+        `started begin`. So the ACL is read again: short, and the start is
+        refused with the remedy; restored, and the start is tried once more,
+        whose failure is final.
         """
         started = libvirt_host.virsh("start", domain_name(), check=False)
         if started.returncode == 0:

@@ -71,7 +71,11 @@ def host_block(host: str, facts: SshFacts, user: str, control_path: str) -> List
         "  ControlPath %s" % quoted(control_path),
         "  ControlPersist yes",
         # The pin: accept-new learns the key on first use when
-        # ensure_guest_known_hosts has not stored one yet.
+        # ensure_guest_known_hosts has not stored one yet. It is keyed on the
+        # machine's name, never on the port, which can change: a pin ssh
+        # cannot find is a key learned anew from whatever answers the new port.
+        # Both blocks name the one alias, so one pin serves both.
+        "  HostKeyAlias %s" % state.box.vm_host,
         "  UserKnownHostsFile %s" % quoted(state.known_hosts_path()),
         "  StrictHostKeyChecking accept-new",
         "  NoHostAuthenticationForLocalhost no",
@@ -116,15 +120,15 @@ def write_ssh_config() -> None:
         proc.atomic_write(state.ssh_cfg(), wanted, FILE_MODE_PRIVATE)
 
 
-def known_hosts_lines(port: int, pubkeys: str) -> List[str]:
-    host_port = "[%s]:%d" % (LOOPBACK, port)
+def known_hosts_lines(pubkeys: str) -> List[str]:
+    """The pin file's lines for the keys `pubkeys` holds, under the HostKeyAlias."""
     lines = []
     for raw in pubkeys.splitlines():
         parts = raw.split(None, 2)
-        if len(parts) < 2:
+        if len(parts) < 2 or parts[0].startswith("#"):
             continue
         keytype, key = parts[0], parts[1]
-        lines.append("%s %s %s" % (host_port, keytype, key))
+        lines.append("%s %s %s" % (state.box.vm_host, keytype, key))
     return lines
 
 
@@ -142,7 +146,8 @@ FIRST_CONTACT_OPTS = [
 
 def ssh_config_reaches_box() -> bool:
     """Whether a bare `ssh <vm_host>` uses this machine's ssh.config: ssh itself
-    reads ~/.ssh/config and says which known_hosts it would pin against.
+    reads ~/.ssh/config and says which known_hosts and which name in it it
+    would pin against.
 
     Asking ssh, not grepping, gets right what a grep cannot: a commented line,
     a glob, several paths on one Include, and an Include after a Host or Match
@@ -177,8 +182,11 @@ def ssh_config_reaches_box() -> bool:
                 completed.stderr.strip() or "exit %d" % completed.returncode,
             )
         )
-    wanted = "userknownhostsfile %s" % state.known_hosts_path()
-    return wanted in completed.stdout.splitlines()
+    effective = completed.stdout.splitlines()
+    return (
+        "userknownhostsfile %s" % state.known_hosts_path() in effective
+        and "hostkeyalias %s" % state.box.vm_host in effective
+    )
 
 
 def add_ssh_config_include() -> None:

@@ -571,7 +571,9 @@ check_hidepid() {
 # (nix/base.nix) that must hold nothing but the two sockets: no
 # writable system, no homes, no network, unix sockets only. The positive
 # control is that the agent still reaches the agent behind it: ssh-add -L
-# exits 0 with keys, 1 with none, and 2 when the socket is dead.
+# exits 0 with keys, 1 with none, and 2 when the socket is dead. Nothing
+# starts the proxy socket at boot, so the check holds from a `yo ssh` session,
+# which declares the forward and starts the socket, not from a bare login.
 check_proxy_confined() {
     local unit=${YOLOBOX_OP_AGENT_PROXY_UNIT}.service props want got keys status=0
     props=$(systemctl show -p ProtectSystem,ProtectHome,PrivateNetwork,RestrictAddressFamilies "${unit}") ||

@@ -463,8 +463,7 @@ def main(argv: Sequence[str]) -> int:
                 )
             except YoError as failure:
                 ui.err(
-                    "yo: the 1Password and AWS forwards are not up, so this session "
-                    "runs without them: %s" % failure.message
+                    "yo: this session runs without what is not up: %s" % failure.message
                 )
     args.func(args)
     return 0

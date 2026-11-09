@@ -20,7 +20,13 @@ from . import (
     unlock,
     vm,
 )
-from .config import EGRESS_UNIT, LUKS_DEVICE, MIB, PROXY_SOCKET_UNITS
+from .config import (
+    EGRESS_UNIT,
+    LUKS_DEVICE,
+    MIB,
+    NETWORK_READY_UNIT,
+    PROXY_SOCKET_UNITS,
+)
 from .sshx import OPERATOR
 from .ui import Report, StatusLine, YoError
 from .unlock import BootStage, Endpoint
@@ -112,7 +118,32 @@ def egress_line(active_state: str) -> StatusLine:
     )
 
 
+# The unit that drops the network-ready flag fails when the DHCP lease brought
+# no nameserver; its journal holds the lease it saw.
+def network_ready_line(active_state: str) -> StatusLine:
+    if active_state == "active":
+        return StatusLine("network-ready: active")
+    return StatusLine(
+        "network-ready: WARNING %s.service %s, so the guest may resolve no name; "
+        "its journal says why: %s"
+        % (
+            NETWORK_READY_UNIT,
+            active_state,
+            state.yo_cmd("ssh", "journalctl", "-u", NETWORK_READY_UNIT),
+        ),
+        True,
+    )
+
+
 def proxy_line(unit: str, active_state: str) -> StatusLine:
+    """Nothing starts a proxy socket at boot: `yo` does, once the forward it
+    proxies exists, so a box rebooted since its last `yo` command has them
+    inactive."""
+    if active_state == "inactive":
+        return StatusLine(
+            "proxy: %s is inactive — start it with: %s" % (unit, state.yo_cmd("up")),
+            True,
+        )
     return StatusLine(
         "proxy: %s is %s" % (unit, active_state), active_state != "active"
     )
@@ -185,6 +216,7 @@ def guest_lines(status: GuestStatus) -> List[StatusLine]:
     for key, line_of in (
         ("tailscale", tailscale_line),
         ("egress", egress_line),
+        ("network_ready", network_ready_line),
         ("fstype", fstype_line),
     ):
         value = status.value(key)
@@ -233,7 +265,10 @@ def forward_line(name: str, forward: forwards.ReverseForward) -> StatusLine:
 
 def status_guest(report: Report) -> None:
     """The guest's side of the report, from one `yolobox-guest status` as the
-    operator and the agent's probe of the 1Password forward."""
+    operator and the agent's probe of the 1Password forward. The probe is
+    made first and printed after the helper's own header: a box whose helper
+    fails still says whether its forward is up."""
+    forward = forward_line("1password", forwards.one_password_forward())
     completed = guest.guest_helper(OPERATOR, "status")
     if completed.returncode != 0:
         # A bootstrapped box whose helper fails: a box built by another yo may
@@ -250,6 +285,7 @@ def status_guest(report: Report) -> None:
                 state.yo_cmd("bootstrap"),
             )
         )
+        report.emit(forward)
         return
     status = GuestStatus(completed.stdout)
     guest_version = status.value("version")
@@ -266,7 +302,7 @@ def status_guest(report: Report) -> None:
         if drift:
             report.warn(drift)
 
-    report.emit(forward_line("1password", forwards.one_password_forward()))
+    report.emit(forward)
     for line in guest_lines(status):
         report.emit(line)
 

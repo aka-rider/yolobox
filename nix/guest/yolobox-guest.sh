@@ -704,10 +704,10 @@ cmd_aws_creds() {
         return 0
     fi
 
-    # systemd always accepts a connection on the agent-side socket, even
-    # with no proxy or Mac broker behind it, so a dead forward shows up as
-    # curl 52/56 (empty reply / connection reset), not 7 (couldn't connect).
-    # 7 still covers the case where the socket unit itself is absent.
+    # Once yo has started the socket unit, systemd accepts a connection on
+    # it even with no proxy or broker behind it, so a dead forward shows up as
+    # curl 52/56 (empty reply / connection reset). 7 (couldn't connect) is a
+    # socket unit nothing has started since boot.
     case "${rc}" in
     7 | 52 | 56)
         # shellcheck disable=SC2016
@@ -927,6 +927,7 @@ cmd_status() {
     field version "$(cat "${YOLOBOX_VERSION_STAMP}" 2>/dev/null || true)"
     field flake_ref "$(cat "${YOLOBOX_FLAKE_REF_STAMP}" 2>/dev/null || true)"
     field egress "$(unit_state "${YOLOBOX_EGRESS_UNIT}")"
+    field network_ready "$(unit_state "${YOLOBOX_NETWORK_READY_UNIT}")"
     for unit in "${PROXY_UNITS[@]}"; do
         field "${unit}" "$(unit_state "${unit}")"
     done

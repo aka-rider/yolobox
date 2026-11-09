@@ -52,7 +52,7 @@ def preflight(size: Size) -> Tuple[Optional[VmStatus], Optional[NewBox]]:
         # A box is sized when it is created; only its disk grows afterwards.
         raise YoError(
             "%s exists, and %s applies only when a box is created — drop the "
-            "flag%s, or recreate the box, which deletes everything on it: %s. A "
+            "flag%s, or %s. A "
             "disk grows in place: %s"
             % (
                 state.box.name,

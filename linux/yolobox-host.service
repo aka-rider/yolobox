@@ -13,6 +13,11 @@ After=nftables.service firewalld.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/yolobox/yolobox-host.nft
+# Creates the passt socket directory before virtqemud's first passt domain. It
+# is no /etc/tmpfiles.d file: dracut copies that directory into the initrd,
+# which has no qemu account. After the table, so a failure here never leaves
+# the host without it.
+ExecStart=/usr/bin/systemd-tmpfiles --create /etc/yolobox/yolobox-passt.conf
 ExecReload=/usr/sbin/nft -f /etc/yolobox/yolobox-host.nft
 
 [Install]

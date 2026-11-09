@@ -43,6 +43,9 @@ class TestHostSetupCanBeRerun(ShellCase):
         active=False,
         table_installed=False,
         libvirtd=False,
+        resolv="nameserver 127.0.0.53\n",
+        label=None,
+        old_rule=False,
     ):
         """Run host-setup.sh from the text `first` up to the text `last`, after
         its definitions, from a scratch checkout that lacks the file
@@ -52,13 +55,16 @@ class TestHostSetupCanBeRerun(ShellCase):
         `hook_mtime` pre-installs the hook with that mtime; `table_installed`
         pre-installs the table and its unit, identical to the repo's; `active`
         is whether the table unit is active; `libvirtd` whether the monolithic
-        libvirtd is enabled or active. virsh speaks German unless LC_ALL=C, as
-        a translated virsh would on a German host."""
+        libvirtd is enabled or active. `resolv` is the resolver file's text and
+        `label` what `stat -c %C` prints for it (None: the real stat); `old_rule`
+        pre-installs the passt tmpfiles rule where an earlier run put it.
+        The last slice's scratch root stays in `self.root`. virsh speaks German unless
+        LC_ALL=C, as a translated virsh would on a German host."""
         text = HOST_SETUP.read_text()
         definitions = text[: text.index("[[ $EUID -eq 0 ]]")]
         steps = text[text.index(first) : text.index(last)]
         # One root per slice: a test may run several.
-        root = Path(tempfile.mkdtemp(dir=self.tmp))
+        root = self.root = Path(tempfile.mkdtemp(dir=self.tmp))
         here = root / "repo"
         here.mkdir()
         for name in (
@@ -71,6 +77,9 @@ class TestHostSetupCanBeRerun(ShellCase):
         fakes = {
             "nft": "exit 0",
             "restorecon": "exit 0",
+            "dnf": 'echo "dnf $*" >>"$CALLS"',
+            "setfacl": 'echo "setfacl $*" >>"$CALLS"',
+            "systemd-tmpfiles": 'echo "systemd-tmpfiles $*" >>"$CALLS"',
             "systemctl": (
                 "case $1 in\n"
                 '  show) printf "%s\\n" "$FAKE_STARTED" ;;\n'
@@ -92,8 +101,24 @@ class TestHostSetupCanBeRerun(ShellCase):
                 "esac"
             ),
         }
+        if label is not None:
+            # resolv.conf is a link to resolved's stub, whose label counts.
+            fakes["stat"] = (
+                'test "$2" = %C && test "$3" = "$FAKE_STUB" && printf "%s\\n" "$FAKE_LABEL"'
+            )
         for name, body in fakes.items():
             self.fake(name, "#!/bin/sh\n%s\n" % body)
+        stub = root / "stub-resolv.conf"
+        stub.write_text(resolv)
+        resolv_conf = root / "resolv.conf"
+        resolv_conf.symlink_to(stub)
+        passt_dir = root / "passt"
+        passt_dir.mkdir()
+        old_passt_tmpfiles = root / "old-tmpfiles.conf"
+        if old_rule:
+            old_passt_tmpfiles.write_text(
+                "d /run/libvirt/qemu/passt 0755 qemu qemu -\n"
+            )
         hook = root / "hook"
         if hook_mtime is not None:
             shutil.copy(here / "yolobox-libvirt-hook.sh", hook)
@@ -110,13 +135,19 @@ class TestHostSetupCanBeRerun(ShellCase):
         # the scratch one.
         script = here / HOST_SETUP.name
         script.write_text(
-            '%sHERE="%s" PASST_HOOK="%s" NFT_DEST="%s" UNIT_DEST="%s"\n%s'
+            '%sHERE="%s" PASST_HOOK="%s" NFT_DEST="%s" UNIT_DEST="%s" RESOLV_CONF="%s"'
+            ' CONF_DIR="%s" PASST_TMPFILES="%s" OLD_PASST_TMPFILES="%s" PASST_DIR="%s"\n%s'
             % (
                 definitions,
                 here,
                 hook,
                 nft_dest,
                 unit_dest,
+                resolv_conf,
+                root / "conf",
+                root / "conf" / "yolobox-passt.conf",
+                old_passt_tmpfiles,
+                passt_dir,
                 steps.replace("/usr/sbin/nft", str(self.bin_dir / "nft")),
             )
         )
@@ -130,6 +161,8 @@ class TestHostSetupCanBeRerun(ShellCase):
                 "FAKE_STARTED": started,
                 "FAKE_IS_ACTIVE": "0" if active else "3",
                 "FAKE_LIBVIRTD": "0" if libvirtd else "1",
+                "FAKE_LABEL": label or "",
+                "FAKE_STUB": str(stub),
             },
         )
         return result, calls.read_text().splitlines()
@@ -229,6 +262,94 @@ class TestHostSetupCanBeRerun(ShellCase):
             ),
             ["daemon-reload", "enable --now yolobox-host.service"],
         )
+
+    def test_a_resolver_labelled_net_conf_t_lets_the_run_go_on(self):
+        for label in (
+            "system_u:object_r:net_conf_t:s0",
+            "system_u:object_r:net_conf_t:s0:c0.c1023",
+            "?",
+        ):
+            with self.subTest(label=label):
+                calls = self.run_steps("host resolver", "libvirt daemons", label=label)
+                self.assertEqual(
+                    [call.split()[:2] for call in calls],
+                    [["dnf", "copr"], ["dnf", "install"]],
+                )
+
+    def test_a_resolver_labelled_otherwise_stops_the_run_before_anything_is_installed(
+        self,
+    ):
+        for label in (
+            "unconfined_u:object_r:systemd_resolved_var_run_t:s0",
+            "system_u:object_r:net_conf_t_x:s0",
+            "system_u:object_r:etc_t:net_conf_t",
+            "net_conf_t:object_r:etc_t:s0",
+            "lizard",
+            "",
+        ):
+            with self.subTest(label=label):
+                result, calls = self.run_slice(
+                    'step "host resolver', 'step "libvirt daemons', label=label
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(
+                    "%s is labelled '%s', not as type net_conf_t"
+                    % (self.root / "stub-resolv.conf", label),
+                    result.stderr,
+                )
+                self.assertIn(
+                    'Run: restorecon -F "$(readlink -f %s)"'
+                    % (self.root / "resolv.conf"),
+                    result.stderr,
+                )
+                self.assertEqual(calls, [])
+
+    def test_a_resolver_that_is_not_a_loopback_address_stops_the_run(self):
+        for resolv in (
+            "nameserver 192.168.1.1\n",
+            "nameserver 10.0.0.1\nnameserver 127.0.0.53\n",
+            "search lan\n",
+            "",
+        ):
+            with self.subTest(resolv=resolv):
+                result, calls = self.run_slice(
+                    'step "host resolver',
+                    'step "libvirt daemons',
+                    resolv=resolv,
+                    label="system_u:object_r:net_conf_t:s0",
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("not a loopback address", result.stderr)
+                self.assertEqual(calls, [])
+
+    def test_the_passt_rule_is_written_outside_etc_tmpfiles_d_and_applied(self):
+        calls = self.run_steps("passt socket directory", "libvirt hook")
+        passt_dir = self.root / "passt"
+        rule = self.root / "conf" / "yolobox-passt.conf"
+        self.assertEqual(
+            rule.read_text(),
+            "d %s 0755 qemu qemu -\n"
+            "a+ %s - - - - u:yolobox-vm:rwx,m::rwx\n" % (passt_dir, passt_dir),
+        )
+        self.assertEqual(
+            calls,
+            [
+                "systemd-tmpfiles --create %s" % rule,
+                "setfacl -P -m u:yolobox-vm:rwx,m::rwx %s" % passt_dir,
+            ],
+        )
+
+    def test_the_rule_an_earlier_run_left_in_etc_tmpfiles_d_is_removed_once(self):
+        result, _ = self.run_slice(
+            'step "passt socket directory', 'step "libvirt hook', old_rule=True
+        )
+        old = self.root / "old-tmpfiles.conf"
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(old.exists())
+        self.assertIn("sudo dracut -f", result.stdout)
+        result, _ = self.run_slice('step "passt socket directory', 'step "libvirt hook')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("dracut", result.stdout)
 
 
 if __name__ == "__main__":

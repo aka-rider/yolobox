@@ -79,6 +79,8 @@ AGENT_AWS_BROKER_SOCK = FACTS["agent_aws_broker_sock"]
 SSH_LOCAL_PORT = FACTS["ssh_local_port"]
 # The unit that loads the guest's egress table.
 EGRESS_UNIT = FACTS["egress_unit"]
+# The unit that fails when the DHCP lease brought no nameserver.
+NETWORK_READY_UNIT = FACTS["network_ready_unit"]
 
 # The encrypted root: the partition and the name it is opened under. The
 # passphrase is derived from a 1Password-held key (luks_passphrase) and never stored.

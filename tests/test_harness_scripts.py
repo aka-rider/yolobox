@@ -20,6 +20,7 @@ VERSIONS = HARNESSES / "yolobox-claude-versions.sh"
 LAUNCHER = HARNESSES / "claude.sh"
 KEEPER = HARNESSES / "yolobox-claude-launcher-keep.sh"
 INSTALLER = HARNESSES / "yolobox-harness-install.sh"
+NETWORK_READY = HARNESSES / "yolobox-network-ready.sh"
 
 VERSION_RE = r"[0-9]+(\.[0-9]+)*(-[A-Za-z0-9.]+)?"
 HOUR = 3600
@@ -280,6 +281,124 @@ class TestInstaller(HarnessCase):
         self.assertEqual(
             os.readlink(self.home / ".local" / "bin" / "pi"),
             str(self.home / ".pi" / "agent" / "bin" / "pi"),
+        )
+
+
+class TestNetworkReady(ShellCase):
+    """The flag that the network works is made only when the guest's NIC holds
+    an IPv4 address and the lease brought a nameserver, read from
+    `dhcpcd --dumplease`."""
+
+    ADDRESS = (
+        "2: enp0s1    inet 192.168.5.15/24 brd 192.168.5.255 scope global "
+        "dynamic enp0s1\\       valid_lft 86399sec preferred_lft 86399sec\n"
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.flag = self.tmp / "network-ready"
+        self.asked = self.tmp / "dhcpcd-args"
+        self.listed = self.tmp / "ip-args"
+        self.env.update(NETWORK_READY_FLAG=str(self.flag), YOLOBOX_GUEST_NIC="enp0s1")
+        self.addresses(self.ADDRESS)
+
+    def addresses(self, text, code=0):
+        """What `ip` prints for the NIC, and the exit code it ends with."""
+        listing = self.tmp / "addresses"
+        listing.write_text(text)
+        self.fake(
+            "ip",
+            '#!/bin/sh\necho "$@" >%s\ncat %s\nexit %d\n'
+            % (self.listed, listing, code),
+        )
+
+    def lease(self, text, code=0):
+        lease = self.tmp / "lease"
+        lease.write_text(text)
+        self.fake(
+            "dhcpcd",
+            '#!/bin/sh\necho "$@" >%s\ncat %s\nexit %d\n' % (self.asked, lease, code),
+        )
+        return self.run_bash(NETWORK_READY)
+
+    def assertFlagged(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.flag.exists())
+
+    def assertRefused(self, result, said):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(self.flag.exists())
+        self.assertIn(said, result.stderr)
+
+    def test_a_lease_with_nameservers_makes_the_flag_from_the_nics_lease(self):
+        result = self.lease(
+            "ip_address=192.168.5.15\ndomain_name_servers=192.168.5.2 1.1.1.1\n"
+        )
+        self.assertFlagged(result)
+        self.assertEqual(self.asked.read_text(), "--dumplease enp0s1\n")
+        self.assertEqual(self.listed.read_text(), "-4 -o addr show dev enp0s1\n")
+
+    def test_a_lease_with_an_empty_nameserver_value_is_refused_with_what_it_said(self):
+        self.assertRefused(
+            self.lease("ip_address=192.168.5.15\ndomain_name_servers=\n"),
+            "domain_name_servers=\n",
+        )
+
+    def test_a_lease_with_a_blank_nameserver_value_is_refused(self):
+        self.assertRefused(
+            self.lease("domain_name_servers= \n"), "no domain_name_servers"
+        )
+
+    def test_a_lease_without_the_line_is_refused_with_what_it_said(self):
+        self.assertRefused(
+            self.lease("ip_address=192.168.5.15\nrouters=192.168.5.2\n"),
+            "routers=192.168.5.2",
+        )
+
+    def test_a_key_that_merely_contains_the_name_is_no_nameserver(self):
+        for line in (
+            "new_domain_name_servers=1.1.1.1",
+            "domain_name_servers_extra=1.1.1.1",
+            " domain_name_servers=1.1.1.1",
+        ):
+            with self.subTest(line=line):
+                self.assertRefused(self.lease(line + "\n"), "no domain_name_servers")
+
+    def test_an_empty_lease_is_refused(self):
+        self.assertRefused(self.lease(""), "no domain_name_servers")
+
+    def test_a_dhcpcd_that_fails_is_refused_even_when_it_printed_nameservers(self):
+        self.assertRefused(
+            self.lease("domain_name_servers=1.1.1.1\n", code=1), "could not dump"
+        )
+
+    def test_a_nic_without_an_address_is_refused_before_the_lease_is_read(self):
+        # dhcpcd's lease file outlives a boot, so a lease that names servers
+        # proves nothing about this one.
+        for listing in (
+            "",
+            "\n",
+            "2: enp0s1    inet6 fe80::1/64 scope link\n",
+            "2: enp0s1    foo inet\n",
+            "2: inet    enp0s1 192.168.5.15/24\n",
+            "inet\n",
+        ):
+            with self.subTest(listing=listing):
+                self.addresses(listing)
+                self.assertRefused(
+                    self.lease("domain_name_servers=1.1.1.1\n"),
+                    "enp0s1 has no IPv4 address",
+                )
+                self.assertFalse(self.asked.exists())
+
+    def test_the_address_may_be_any_line_of_the_listing(self):
+        self.addresses("2: enp0s1    inet6 fe80::1/64 scope link\n" + self.ADDRESS)
+        self.assertFlagged(self.lease("domain_name_servers=1.1.1.1\n"))
+
+    def test_an_ip_that_fails_is_refused_even_when_it_printed_an_address(self):
+        self.addresses(self.ADDRESS, code=1)
+        self.assertRefused(
+            self.lease("domain_name_servers=1.1.1.1\n"), "ip could not list"
         )
 
 

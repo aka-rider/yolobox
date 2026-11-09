@@ -25,6 +25,19 @@ let
   # unit waits for it.
   networkReadyFlag = "/run/yolobox-network-ready";
 
+  # The flag exists only when the NIC has an IPv4 address and the lease brought
+  # a nameserver; the script fails otherwise, and `yolobox-guest status`
+  # reports the failed unit.
+  networkReady = pkgs.writeShellApplication {
+    name = "yolobox-network-ready";
+    runtimeInputs = [ pkgs.coreutils pkgs.dhcpcd pkgs.iproute2 ];
+    runtimeEnv = {
+      NETWORK_READY_FLAG = networkReadyFlag;
+      YOLOBOX_GUEST_NIC = facts.guest_nic;
+    };
+    text = builtins.readFile ./harnesses/yolobox-network-ready.sh;
+  };
+
   # The scripts live in nix/harnesses/, shellchecked at build time. The
   # launcher takes no runtimeInputs on purpose: it execs claude, whose children
   # must keep the PATH the project's shell gave them.
@@ -121,7 +134,7 @@ in
   # the flag never outlives the network state it describes. A dhcpcd
   # restarted by hand does not bring it back: the install it gates has run
   # by then, or retries on its own.
-  systemd.services.yolobox-network-ready = {
+  systemd.services.${facts.network_ready_unit} = {
     description = "Flag that the network is up, for the agent's install unit";
     wantedBy = [ "multi-user.target" ];
     wants = [ "dhcpcd.service" ];
@@ -130,7 +143,7 @@ in
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
-      ExecStart = "${lib.getExe' pkgs.coreutils "touch"} ${networkReadyFlag}";
+      ExecStart = lib.getExe networkReady;
       ExecStop = "${lib.getExe' pkgs.coreutils "rm"} -f ${networkReadyFlag}";
     };
   };
@@ -199,4 +212,5 @@ in
   system.build.yoloboxClaudeLauncher = claudeLauncher;
   system.build.yoloboxClaudeLauncherKeep = claudeLauncherKeeper;
   system.build.yoloboxHarnessInstall = harnessInstall;
+  system.build.yoloboxNetworkReady = networkReady;
 }

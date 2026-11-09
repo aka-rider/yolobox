@@ -551,7 +551,7 @@ class TestMainEnsuresTheSessionBeforeSomeCommands(unittest.TestCase):
         (warning,), _ = said.call_args
         self.assertIn("yolobox does not take the operator's login", warning)
         self.assertIn("is it up?", warning)
-        self.assertNotIn("forwards are not up", warning)
+        self.assertNotIn("runs without what is not up", warning)
 
     def test_services_that_fail_are_said_and_the_command_still_runs(self):
         # `yo ssh` is the way into a box whose forwards are broken.
@@ -564,8 +564,9 @@ class TestMainEnsuresTheSessionBeforeSomeCommands(unittest.TestCase):
                     calls = self.run_main(argv, target, services=broken)
                 self.assertEqual(calls, ["services", "command"])
                 (warning,), _ = said.call_args
-                self.assertIn("forwards are not up", warning)
+                self.assertIn("this session runs without what is not up", warning)
                 self.assertIn("ssh -O forward failed (exit 255)", warning)
+                self.assertNotIn("1Password and AWS", warning)
 
 
 class TestSshRemainderPassthrough(unittest.TestCase):
@@ -1822,28 +1823,84 @@ class TestEnsureHerdrMachine(unittest.TestCase):
 
 class TestVmServices(unittest.TestCase):
     """`yo up`, `yo bootstrap` and `yo aws-check` bring the host side whole:
-    the session first, then the broker, whose answer says whether the guest
-    has AWS."""
+    everything is declared first (the session, then the broker, whose answer
+    says whether the guest has AWS), then each forward the guest uses is
+    probed, and one error names every one that is down."""
 
-    def test_the_session_then_the_broker_and_its_answer(self):
+    def vm_services(self, enabled, down=None):
+        """`down` maps a forward's name to what its probe said."""
+        down = down or {}
         order = []
-        for enabled in (True, False):
-            order.clear()
-            with (
-                self.subTest(enabled=enabled),
-                mock.patch.object(
-                    yo.forwards,
-                    "ensure_session",
-                    side_effect=lambda: order.append("session"),
-                ),
-                mock.patch.object(
-                    yo.aws,
-                    "ensure_aws_broker",
-                    side_effect=lambda: order.append("broker") or enabled,
-                ),
-            ):
-                self.assertIs(yo.vm_services(), enabled)
-                self.assertEqual(order, ["session", "broker"])
+
+        def probed(forward, mux):
+            self.assertTrue(mux, "a session command's logins ride the masters")
+            order.append("probe " + forward.name)
+            return down.get(forward.name)
+
+        with (
+            mock.patch.object(
+                yo.forwards,
+                "ensure_session",
+                side_effect=lambda: order.append("session"),
+            ),
+            mock.patch.object(
+                yo.aws,
+                "ensure_aws_broker",
+                side_effect=lambda: order.append("broker") or enabled,
+            ),
+            mock.patch.object(yo.forwards, "forward_failure", side_effect=probed),
+        ):
+            try:
+                return yo.vm_services(), order
+            except yo.YoError as raised:
+                return raised, order
+
+    def test_everything_is_declared_before_any_forward_is_probed(self):
+        enabled, order = self.vm_services(True)
+        self.assertIs(enabled, True)
+        self.assertEqual(
+            order, ["session", "broker", "probe 1password", "probe aws-broker"]
+        )
+
+    def test_a_guest_without_aws_probes_no_aws_forward(self):
+        enabled, order = self.vm_services(False)
+        self.assertIs(enabled, False)
+        self.assertEqual(order, ["session", "broker", "probe 1password"])
+
+    def test_a_down_1password_forward_still_gets_the_broker_started(self):
+        raised, order = self.vm_services(True, {"1password": "its probe exited 2"})
+        self.assertIsInstance(raised, yo.YoError)
+        self.assertIn("broker", order)
+        self.assertIn("1password", raised.message)
+        self.assertIn("its probe exited 2", raised.message)
+        self.assertNotIn("aws-broker", raised.message)
+
+    def test_a_down_aws_forward_is_an_error_naming_only_it_and_its_probe(self):
+        raised, _ = self.vm_services(True, {"aws-broker": "its probe exited 7"})
+        self.assertIsInstance(raised, yo.YoError)
+        self.assertIn("aws-broker", raised.message)
+        self.assertIn("its probe exited 7", raised.message)
+        self.assertNotIn("1password", raised.message)
+
+    def test_both_forwards_down_are_one_error_naming_both_and_the_remedy(self):
+        raised, order = self.vm_services(
+            True,
+            {"1password": "its probe exited 2", "aws-broker": "its probe exited 7"},
+        )
+        self.assertIsInstance(raised, yo.YoError)
+        self.assertEqual(order[-2:], ["probe 1password", "probe aws-broker"])
+        self.assertIn(
+            "the 1password guest forward is down (its probe exited 2)", raised.message
+        )
+        self.assertIn(
+            "the aws-broker guest forward is down (its probe exited 7)", raised.message
+        )
+        self.assertTrue(raised.message.endswith("restore with: yo up"), raised.message)
+
+    def test_a_disabled_aws_is_never_probed_even_when_its_forward_would_fail(self):
+        enabled, order = self.vm_services(False, {"aws-broker": "its probe exited 7"})
+        self.assertIs(enabled, False)
+        self.assertNotIn("probe aws-broker", order)
 
     def test_a_box_out_of_reach_starts_no_broker(self):
         with (
@@ -1860,21 +1917,24 @@ class TestVmServices(unittest.TestCase):
 
 
 class TestEnsureSession(FakeHome):
-    """`yo ssh`, `yo enter`, `yo cp`, `yo code`, `yo zed` and the libvirt `yo
-    port` run this first: one mux session opens the operator's master if none
-    answers, and the two reverse forwards are asked for through it, always."""
+    """`yo ssh`, `yo enter`, `yo cp`, `yo code` and `yo zed` run this first:
+    one mux session opens the operator's master if none answers, the two
+    reverse forwards are asked for through it, always, and the guest's proxy
+    sockets start once the forwards exist. Nothing is probed."""
 
-    def ensure(self, session=(0, "", ""), forward_rc=0):
-        calls = []
+    def ensure(self, session=(0, "", ""), start=(0, "", "")):
+        calls = self.calls = []
 
         def fake_run(argv, **kwargs):
             argv = list(argv)
             calls.append(argv)
             if "-O" in argv:
-                if forward_rc and kwargs.get("check"):
-                    raise yo.YoError("ssh -O forward failed (exit %d)" % forward_rc)
-                return mock.Mock(returncode=forward_rc, stdout="", stderr="")
-            code, stdout, stderr = session
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            words = guest_words(argv[-1])
+            if words[:3] == ["sudo", "systemctl", "start"]:
+                code, stdout, stderr = start
+            else:
+                code, stdout, stderr = session
             return mock.Mock(returncode=code, stdout=stdout, stderr=stderr)
 
         with mock.patch.object(yo.proc, "run", side_effect=fake_run):
@@ -1887,10 +1947,9 @@ class TestEnsureSession(FakeHome):
         calls = self.ensure()
         actions = [argv[argv.index("-O") + 1] for argv in calls if "-O" in argv]
         self.assertEqual(actions, ["forward", "forward"])
-        (opener,) = [argv for argv in calls if "-O" not in argv]
-        self.assertEqual(guest_words(opener[-1]), ["true"])
+        (opener,) = [argv for argv in calls if guest_words(argv[-1]) == ["true"]]
         self.assertNotIn("ControlPath=none", opener)
-        forwards = [argv for argv in calls if "forward" in argv]
+        forwards = [argv for argv in calls if "-O" in argv]
         self.assertEqual(
             [argv[argv.index("-R") + 1] for argv in forwards],
             [
@@ -1899,6 +1958,28 @@ class TestEnsureSession(FakeHome):
             ],
         )
         self.assertLess(calls.index(opener), calls.index(forwards[0]))
+
+    def test_the_proxy_sockets_start_as_root_once_after_both_forwards(self):
+        calls = self.ensure()
+        words = ["forward" if "-O" in argv else guest_words(argv[-1]) for argv in calls]
+        starts = [w for w in words if w[:3] == ["sudo", "systemctl", "start"]]
+        self.assertEqual(
+            starts, [["sudo", "systemctl", "start", *yo.config.PROXY_SOCKET_UNITS]]
+        )
+        started = words.index(starts[0])
+        self.assertEqual(words[started - 2 : started], ["forward", "forward"])
+        self.assertEqual(started, len(words) - 1)
+
+    def test_nothing_is_probed_even_when_no_forward_would_answer(self):
+        calls = self.ensure()
+        self.assertEqual(
+            [argv for argv in calls if "ssh-add" in argv[-1] or "curl" in argv[-1]], []
+        )
+
+    def test_no_login_but_the_masters_is_made(self):
+        # On libvirt every fresh login is a 1Password signature.
+        calls = self.ensure()
+        self.assertEqual([argv for argv in calls if "ControlPath=none" in argv], [])
 
     def test_a_box_out_of_reach_is_unreachable_and_nothing_is_forwarded(self):
         with self.assertRaisesRegex(yo.Unreachable, "is it up\\? yo status"):
@@ -1912,9 +1993,57 @@ class TestEnsureSession(FakeHome):
         self.assertIn("zsh: lizard", caught.exception.message)
         self.assertNotIsInstance(caught.exception, yo.Unreachable)
 
-    def test_a_forward_the_master_refuses_is_an_error(self):
-        with self.assertRaisesRegex(yo.YoError, "forward failed"):
-            self.ensure(forward_rc=255)
+    def test_a_forward_the_master_refuses_is_an_error_and_nothing_starts(
+        self,
+    ):
+        calls = []
+
+        def refuse(argv, **kwargs):
+            calls.append(list(argv))
+            if "-O" in argv:
+                raise yo.YoError("ssh -O forward failed (exit 255)")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(yo.proc, "run", side_effect=refuse):
+            with self.assertRaisesRegex(yo.YoError, "forward failed"):
+                yo.forwards.ensure_session()
+        self.assertEqual(
+            [guest_words(argv[-1]) for argv in calls if "-O" not in argv], [["true"]]
+        )
+
+    def test_a_proxy_socket_that_will_not_start_is_an_error_with_its_words(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.ensure(start=(1, "", "Unit lizard.socket not found."))
+        self.assertIn("Unit lizard.socket not found.", caught.exception.message)
+
+
+class TestRequireForwards(FakeHome):
+    """Every forward of the batch is probed through the agent's master, and one
+    error names each that is down."""
+
+    def require(self, forward, answer):
+        def fake_run(argv, **kwargs):
+            return mock.Mock(returncode=answer[0], stdout=answer[1], stderr=answer[2])
+
+        with mock.patch.object(yo.proc, "run", side_effect=fake_run):
+            yo.forwards.require_forwards([forward])
+
+    def test_a_1password_forward_that_does_not_answer_is_an_error_naming_it(self):
+        with self.assertRaises(yo.YoError) as caught:
+            self.require(yo.forwards.one_password_forward(), (2, "", "agent failed"))
+        self.assertIn("1password", caught.exception.message)
+        self.assertIn("exited 2", caught.exception.message)
+        self.assertIn("agent failed", caught.exception.message)
+
+    def test_an_agent_with_no_identities_is_a_working_forward(self):
+        self.require(
+            yo.forwards.one_password_forward(),
+            (1, "The agent has no identities.\n", ""),
+        )
+
+    def test_a_broker_probe_that_exits_nonzero_is_a_forward_that_is_down(self):
+        with self.assertRaisesRegex(yo.YoError, "aws-broker.*exited 7"):
+            self.require(yo.forwards.aws_broker_forward(), (7, "", ""))
 
     @needs_tool("perl")
     def test_the_1password_probe_runs_ssh_add_with_sigpipe_ignored(self):
@@ -1989,6 +2118,7 @@ HEALTHY_GUEST = {
     "version": yo.config.YO_VERSION,
     "flake_ref": "github:x/y/abc?narHash=sha256-h",
     "egress": "active",
+    "network_ready": "active",
     "yolobox-op-agent.socket": "active",
     "yolobox-aws-broker.socket": "active",
     "tailscale": "Running",
@@ -2333,11 +2463,42 @@ class TestCmdStatusReadsTheGuestBlock(StatusRunner, unittest.TestCase):
                     ["egress: WARNING yolobox-egress.service %s" % state],
                 )
 
+    def test_a_network_ready_unit_in_any_state_but_active_warns_naming_its_journal(
+        self,
+    ):
+        for state in ("failed", "inactive", "activating"):
+            with self.subTest(state=state):
+                (line,) = self.lines(
+                    "network-ready:", guest=guest_block(network_ready=state)
+                )
+                self.assertTrue(
+                    line.startswith(
+                        "network-ready: WARNING yolobox-network-ready.service %s,"
+                        % state
+                    ),
+                    line,
+                )
+                self.assertIn("yo ssh journalctl -u yolobox-network-ready", line)
+                self.assertEqual(self.raised.code, 1)
+
+    def test_a_network_ready_unit_that_is_not_reported_is_a_warning(self):
+        outs = self.run_status(guest=guest_block(network_ready=None))
+        self.assertIn("status: WARNING network_ready not reported", outs)
+
     def test_a_proxy_unit_in_any_state_but_active_is_a_warning(self):
         outs = self.run_status(
             guest=guest_block(**{"yolobox-op-agent.socket": "failed"})
         )
         self.assertIn("proxy: yolobox-op-agent.socket is failed", outs)
+        self.assertEqual(self.raised.code, 1)
+
+    def test_a_proxy_unit_nothing_has_started_names_the_command_that_starts_it(self):
+        outs = self.run_status(
+            guest=guest_block(**{"yolobox-aws-broker.socket": "inactive"})
+        )
+        self.assertIn(
+            "proxy: yolobox-aws-broker.socket is inactive — start it with: yo up", outs
+        )
         self.assertEqual(self.raised.code, 1)
 
     def test_tailscale_words(self):
@@ -2442,6 +2603,7 @@ class TestCmdStatusReadsTheGuestBlock(StatusRunner, unittest.TestCase):
                         for line in outs
                     )
                 )
+                self.assertIn("1password: guest forward is up", outs)
                 self.assertTrue(any(line.startswith("aws:") for line in outs))
                 self.assertEqual(self.raised.code, 1)
 
@@ -2984,7 +3146,8 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
         with self.assertRaises(yo.YoError) as caught:
             box.up()
         self.assertIn(
-            "must be recreated: yo destroy --yes && yo bootstrap",
+            "recreate the box, which deletes everything on it: "
+            "yo destroy --yes && yo bootstrap",
             caught.exception.message,
         )
         self.assertIn("no space", caught.exception.message)
@@ -3117,7 +3280,8 @@ class TestUpStartsAndUnlocks(unittest.TestCase):
             box.up()
         self.assertIn(
             "an unmarked sshd that keeps refusing the operator is a seed image whose "
-            "key never landed; recreate it: yo destroy --yes && yo bootstrap",
+            "key never landed — recreate the box, which deletes everything on "
+            "it: yo destroy --yes && yo bootstrap",
             caught.exception.message,
         )
         box.luks_passphrase.assert_not_called()

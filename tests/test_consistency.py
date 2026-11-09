@@ -312,6 +312,27 @@ class TestLinuxHostFilesStateTheFacts(unittest.TestCase):
         self.assertEqual(Path(dest).name, HOST_NFT.name)
         self.assertIn("ExecStart=/usr/sbin/nft -f %s\n" % dest, HOST_UNIT.read_text())
 
+    def test_host_setup_judges_the_resolver_the_preflight_judges(self):
+        self.assertEqual(
+            shell_value(HOST_SETUP, "RESOLV_CONF"), FACTS["host_resolv_conf"]
+        )
+        self.assertEqual(
+            shell_value(HOST_SETUP, "RESOLV_CONF_TYPE"), FACTS["host_resolv_conf_type"]
+        )
+
+    def test_the_host_unit_applies_the_passt_rule_host_setup_keeps_out_of_the_initrd(
+        self,
+    ):
+        dest = shell_value(HOST_SETUP, "PASST_TMPFILES").replace(
+            "$CONF_DIR", shell_value(HOST_SETUP, "CONF_DIR")
+        )
+        # dracut copies /etc/tmpfiles.d into the initrd, which has no qemu account.
+        self.assertFalse(dest.startswith("/etc/tmpfiles.d/"), dest)
+        self.assertIn(
+            "ExecStart=/usr/bin/systemd-tmpfiles --create %s\n" % dest,
+            HOST_UNIT.read_text(),
+        )
+
     def test_the_host_table_blocks_what_the_guest_table_blocks(self):
         """A guest that deletes its own table is still kept off the same ranges."""
         for family, extra in (("ip", set()), ("ip6", {"::1"})):

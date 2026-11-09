@@ -42,7 +42,7 @@
       <ip family='ipv4' address='192.168.5.15' prefix='24'/>
       <route family='ipv4' gateway='192.168.5.2'/>
       <portForward proto='tcp' address='127.0.0.1'>
-        <range start='$ssh_port' to='22'/>
+        <range start='$ssh_port' to='$guest_ssh_port'/>
       </portForward>
       <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x0'/>
     </interface>

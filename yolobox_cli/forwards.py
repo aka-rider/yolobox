@@ -7,13 +7,14 @@ import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from . import aws, proc, sshx, state, ui
 from .config import (
     AGENT_AWS_BROKER_SOCK,
     AWS_BROKER_GUEST_SOCK,
     OP_GUEST_SOCK,
+    PROXY_SOCKET_UNITS,
     SSH_CONFIG_INCLUDE_LINE,
 )
 from .driver import Removal
@@ -166,10 +167,11 @@ def forward_control_cmd(action: str, forward: ReverseForward) -> List[str]:
     )
 
 
-def forward_failure(forward: ReverseForward) -> Optional[str]:
+def forward_failure(forward: ReverseForward, *, mux: bool = False) -> Optional[str]:
     """None when the agent can use the forward; else what its probe said, for
-    `yo status` to show. The one probe of a forward."""
-    completed = sshx.ssh_run(AGENT, list(forward.probe))
+    `yo status` to show. The one probe of a forward. With `mux` it rides the
+    agent's master, as a session command's own logins do."""
+    completed = sshx.ssh_run(AGENT, list(forward.probe), mux=mux)
     if forward.alive(completed):
         return None
     said = " ".join((completed.stderr or completed.stdout or "").split())
@@ -179,25 +181,56 @@ def forward_failure(forward: ReverseForward) -> Optional[str]:
     )
 
 
-def ensure_session() -> None:
-    """The operator's ssh master, carrying both reverse forwards, declared
-    whole on every call: any master at the operator's ControlPath may have
-    been opened by a session that asked for no forward (git, an editor, `yo
-    gc`). A mux session opens the master when none answers (ControlMaster
-    auto), then both forwards are asked for. A master answers a forward it
-    already carries with success, and the guest's sshd runs with
-    StreamLocalBindUnlink, so it replaces a socket a dead master left."""
+def require_forwards(batch: Sequence[ReverseForward]) -> None:
+    """Probes every forward of `batch`, then raises once, naming each that is
+    down with what its probe said and the command that declares them again."""
+    down = []
+    for forward in batch:
+        failure = forward_failure(forward, mux=True)
+        if failure is not None:
+            down.append("the %s guest forward is down (%s)" % (forward.name, failure))
+    if down:
+        raise YoError("%s — restore with: %s" % ("; ".join(down), state.yo_cmd("up")))
+
+
+def open_master() -> None:
+    """The operator's ssh master, opened by a mux session when none answers
+    (ControlMaster auto)."""
     opener = ["true"]
     proc.checked(
         sshx.probe(OPERATOR, opener, mux=True), shlex.join(opener), "on the box"
     )
+
+
+def ensure_session() -> None:
+    """The operator's ssh master, carrying both reverse forwards, declared
+    whole on every call: any master at the operator's ControlPath may have
+    been opened by a session that asked for no forward (git, an editor, `yo
+    gc`). Both forwards are asked for through the master. A master answers a
+    forward it already carries with success, and the guest's sshd runs with
+    StreamLocalBindUnlink, so it replaces a socket a dead master left.
+
+    The guest's proxy sockets are wanted by no target: they start here, after
+    the forwards they proxy exist, so nothing the agent runs at boot connects
+    to a socket whose target is missing. Nothing is probed: vm_services does,
+    once the broker is up."""
+    open_master()
     for forward in (one_password_forward(), aws_broker_forward()):
         proc.run(forward_control_cmd("forward", forward), check=True)
+    sshx.guest_out(["sudo", "systemctl", "start", *PROXY_SOCKET_UNITS], mux=True)
 
 
 def vm_services() -> bool:
-    """The box's host-side services, whole: the master with its forwards, and
-    the AWS broker serving today's allowlist (or stopped). True when the guest
-    has AWS. They serve the agent, whose login the caller has checked."""
+    """The box's host-side services, declared whole (the master with its
+    forwards and proxy sockets, then the AWS broker serving today's allowlist,
+    or stopped) before any is probed, so one that is down never keeps another
+    from coming up. Then each forward the guest uses is probed, and one error
+    names every one that is down. True when the guest has AWS. They serve the
+    agent, whose login the caller has checked."""
     ensure_session()
-    return aws.ensure_aws_broker()
+    has_aws = aws.ensure_aws_broker()
+    used = [one_password_forward()]
+    if has_aws:
+        used.append(aws_broker_forward())
+    require_forwards(used)
+    return has_aws
