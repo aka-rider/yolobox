@@ -3629,7 +3629,7 @@ def fake_limactl(
     target = module or yo
 
     def run(argv, **kwargs):
-        if list(argv) == ["limactl", "list", "-q"]:
+        if list(argv) == ["limactl", "--log-level=warn", "list", "-q"]:
             names = [target.box.name] if listed is None else listed
             failure = "limactl: list exploded" if listing_returncode else ""
             return mock.Mock(
@@ -3708,10 +3708,10 @@ class TestLimaDestroy(FakeHome):
     def subprocess_run(self, argv, **kwargs):
         self.calls.append(list(argv))
         code, stdout, stderr = 0, b"", b""
-        if argv[:3] == ["limactl", "list", "-q"]:
+        if argv[:4] == ["limactl", "--log-level=warn", "list", "-q"]:
             code = self.list_code
             stdout = "".join(name + "\n" for name in self.listed).encode()
-        elif argv[:2] == ["limactl", "delete"]:
+        elif argv[:3] == ["limactl", "--log-level=warn", "delete"]:
             code = self.delete_code
         elif argv[0] == "ssh" and "check" in argv:
             code, stderr = (
@@ -3727,16 +3727,23 @@ class TestLimaDestroy(FakeHome):
         yo.cmd_destroy(argparse.Namespace(yes=yes))
 
     def deletes(self):
-        return [call for call in self.calls if call[:2] == ["limactl", "delete"]]
+        return [
+            call
+            for call in self.calls
+            if call[:3] == ["limactl", "--log-level=warn", "delete"]
+        ]
 
     def test_yes_force_deletes_the_listed_instance(self):
         self.destroy(yes=True)
-        self.assertEqual(self.deletes(), [["limactl", "delete", "--force", "yolobox"]])
+        self.assertEqual(
+            self.deletes(),
+            [["limactl", "--log-level=warn", "delete", "--force", "yolobox"]],
+        )
 
     def test_a_failing_delete_is_a_yo_error(self):
         self.delete_code = 1
         with self.assertRaisesRegex(
-            yo.YoError, "limactl delete --force yolobox failed"
+            yo.YoError, "limactl --log-level=warn delete --force yolobox failed"
         ):
             self.destroy(yes=True)
 
@@ -3842,7 +3849,7 @@ class TestLimaConfigGaps(FakeHome):
         with fake_limactl("", 1, "vz exploded"):
             with self.assertRaisesRegex(
                 yo.YoError,
-                "limactl list yolobox --json failed .exit 1.: vz exploded",
+                "limactl --log-level=warn list yolobox --json failed .exit 1.: vz exploded",
             ):
                 yo.LIMA.config_gaps()
 
@@ -3850,7 +3857,7 @@ class TestLimaConfigGaps(FakeHome):
         with fake_limactl("", listing_returncode=1):
             with self.assertRaisesRegex(
                 yo.YoError,
-                "limactl list -q failed .exit 1.: limactl: list exploded",
+                "limactl --log-level=warn list -q failed .exit 1.: limactl: list exploded",
             ):
                 yo.LIMA.config_gaps()
 
@@ -3887,7 +3894,8 @@ class TestLimaConfigGaps(FakeHome):
                         with self.assertRaises(yo.YoError) as caught:
                             read()
                         self.assertIn(
-                            "limactl list yolobox --json", caught.exception.message
+                            "limactl --log-level=warn list yolobox --json",
+                            caught.exception.message,
                         )
                         self.assertIn(said, caught.exception.message)
 
@@ -4258,7 +4266,7 @@ class TestLimaConfigGaps(FakeHome):
         # so the listener rules have no gap.
         self.assertEqual(self.gaps_for(forwards), [yo.GAP_REVERSE_SOCKETS])
         message = yo.LIMA.config_gap_message([yo.GAP_REVERSE_SOCKETS])
-        self.assertIn("limactl edit", message)
+        self.assertIn("limactl --log-level=warn edit", message)
         self.assertNotIn("destroy", message)
 
     def test_no_usable_port_forwards_reports_every_gap_without_raising(self):
@@ -4380,7 +4388,7 @@ class TestLimaStartRefusesOnlyTheGapsThatBreakThePromises(FakeHome):
                 for gap in gaps:
                     self.assertIn(gap, refused.message)
                 # Both are settings `limactl edit` undoes: nothing is lost.
-                self.assertIn("limactl edit", refused.message)
+                self.assertIn("limactl --log-level=warn edit", refused.message)
                 self.assertNotIn("destroy", refused.message)
                 spawn.assert_not_called()
 
@@ -4888,13 +4896,18 @@ class TestLimaStopThatExitsNonZeroOnARunningBox(unittest.TestCase):
 
     def test_a_polite_stop_carries_the_hang_recovery_and_its_exit(self):
         refused = self.failed_stop(yo.LIMA.stop, [LIMA_RUNNING, LIMA_RUNNING])
-        self.assertEqual(refused.reason, "limactl stop yolobox failed (exit 1)")
+        self.assertEqual(
+            refused.reason, "limactl --log-level=warn stop yolobox failed (exit 1)"
+        )
         self.assertIn("If yo ssh true succeeds", refused.message)
         self.assertIn("do not kill the hostagent", refused.message)
 
     def test_a_forced_stop_carries_the_hostagent_kill_alone(self):
         refused = self.failed_stop(yo.LIMA.force_stop, [LIMA_RUNNING])
-        self.assertEqual(refused.reason, "limactl stop --force yolobox failed (exit 1)")
+        self.assertEqual(
+            refused.reason,
+            "limactl --log-level=warn stop --force yolobox failed (exit 1)",
+        )
         self.assertIn("kill -9 any 'limactl hostagent'", refused.message)
         self.assertNotIn("systemctl reboot", refused.message)
 

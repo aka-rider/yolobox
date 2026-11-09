@@ -193,13 +193,22 @@ class LimaInfo:
     vm_type: object  # as limactl reports it
 
 
+def limactl(*args: str) -> List[str]:
+    """The argv of one limactl command: the one place that builds it.
+
+    Warnings and errors only: lima's info lines narrate every step of a start,
+    stop or delete that yo narrates itself.
+    """
+    return ["limactl", "--log-level=warn", *args]
+
+
 def lima_instance_exists() -> bool:
     """Whether limactl knows this machine's name: the one place that decides it.
 
     A failing `limactl list -q` is an error, never "no instance": a box whose
     limactl is broken would otherwise look like a new one to create.
     """
-    argv = ["limactl", "list", "-q"]
+    argv = limactl("list", "-q")
     completed = proc.checked(proc.run(argv), shlex.join(argv))
     return state.box.name in completed.stdout.splitlines()
 
@@ -213,7 +222,7 @@ def lima_instance_info() -> Optional[LimaInfo]:
     """
     if not lima_instance_exists():
         return None
-    argv = ["limactl", "list", state.box.name, "--json"]
+    argv = limactl("list", state.box.name, "--json")
     completed = proc.checked(proc.run(argv), shlex.join(argv))
     try:
         data = json.loads(completed.stdout.strip())
@@ -254,7 +263,7 @@ def lima_instance_info() -> Optional[LimaInfo]:
 def lima_ssh_ports() -> List[int]:
     """The ssh.localPort of every instance limactl lists. A port that is not
     an integer in limactl's own JSON is a listing yo cannot read."""
-    argv = ["limactl", "list", "--json"]
+    argv = limactl("list", "--json")
     completed = proc.checked(proc.run(argv), shlex.join(argv))
     ports: List[int] = []
     for line in completed.stdout.splitlines():
@@ -373,10 +382,17 @@ def lima_edit_command(expressions: Sequence[str]) -> str:
     state. `--tty=false` declines lima's "start the instance now?" prompt, so
     the start is `yo up`'s, with its unlock.
     """
-    return "%s && limactl edit --tty=false %s --set %s && %s" % (
+    return "%s && %s && %s" % (
         state.yo_cmd("down"),
-        state.box.name,
-        shlex.quote(" | ".join(expressions)),
+        shlex.join(
+            limactl(
+                "edit",
+                "--tty=false",
+                state.box.name,
+                "--set",
+                " | ".join(expressions),
+            )
+        ),
         state.yo_cmd("up"),
     )
 
@@ -546,7 +562,7 @@ class LimaDriver:
 
     def disk_gib(self) -> int:
         # The Disk field of limactl's own instance record, in bytes.
-        argv = ["limactl", "list", state.box.name, "--format", "{{.Disk}}"]
+        argv = limactl("list", state.box.name, "--format", "{{.Disk}}")
         probe = proc.checked(proc.run(argv), shlex.join(argv))
         disk = probe.stdout.strip()
         if not proc.is_ascii_number(disk):
@@ -659,9 +675,7 @@ class LimaDriver:
         # The lock spans the pick and `limactl create`, which writes the port
         # into the instance's record, where the next yo's pick sees it.
         with driver.port_lock(os.path.join(state.home(), self.instances_dir)):
-            argv = [
-                "limactl",
-                "--log-level=warn",
+            argv = limactl(
                 "create",
                 "--tty=false",
                 "--name",
@@ -669,7 +683,7 @@ class LimaDriver:
                 *self.ssh_port_flags(),
                 *new_box.flags(),
                 str(SCRIPT_DIR / "lima" / "yolobox.yaml"),
-            ]
+            )
             proc.checked(proc.run(argv, capture=False), shlex.join(argv))
 
     def ssh_port_flags(self) -> List[str]:
@@ -692,11 +706,10 @@ class LimaDriver:
         # limactl start blocks until lima's own ssh works, which needs the disk
         # unlocked, so it runs beside the unlock instead of before it, and its
         # own deadline must outlast the seed's in-place encryption.
-        # Warnings and errors only: lima's info lines narrate every step of a
-        # boot that yo narrates itself.
         starter = proc.spawn(
-            ["limactl", "--log-level=warn", "start", "--tty=false"]
-            + ["--timeout", LIMA_START_TIMEOUT, state.box.name]
+            limactl(
+                "start", "--tty=false", "--timeout", LIMA_START_TIMEOUT, state.box.name
+            )
         )
         try:
             self.wait_until_running(starter)
@@ -766,7 +779,7 @@ class LimaDriver:
         )
 
     def limactl_stop(self, args: List[str], hang_recovery: str) -> None:
-        argv = ["limactl", "stop", *args]
+        argv = limactl("stop", *args)
         try:
             completed = proc.run(argv, capture=False, timeout=LIMA_STOP_TIMEOUT)
         except RunTimeout as failure:
@@ -795,11 +808,11 @@ class LimaDriver:
 
     def delete_instance(self, held: state.HeldBox) -> None:
         proc.run(
-            ["limactl", "delete", "--force", state.box.name], capture=False, check=True
+            limactl("delete", "--force", state.box.name), capture=False, check=True
         )
 
     def show_status(self) -> Optional[str]:
-        argv = ["limactl", "list", state.box.name]
+        argv = limactl("list", state.box.name)
         listed = proc.run(argv, capture=False)
         if listed.returncode == 0:
             return None
@@ -816,14 +829,7 @@ class LimaDriver:
     def grow_disk(self, held: state.HeldBox, wanted_gib: int) -> None:
         ui.out("lima: raising %s's disk to %dGiB" % (state.box.name, wanted_gib))
         resize = proc.run(
-            [
-                "limactl",
-                "edit",
-                "--tty=false",
-                state.box.name,
-                "--disk",
-                str(wanted_gib),
-            ],
+            limactl("edit", "--tty=false", state.box.name, "--disk", str(wanted_gib)),
             capture=False,
         )
         if resize.returncode != 0:

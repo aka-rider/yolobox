@@ -220,7 +220,8 @@ class TestSshPort(unittest.TestCase):
         with as_instance(INSTANCE_B), fake_limactl(limactl_json(60023)) as fake_run:
             self.assertEqual(yo.box.driver.ssh_port(), 60023)
         self.assertEqual(
-            fake_run.call_args.args[0], ["limactl", "list", INSTANCE_B, "--json"]
+            fake_run.call_args.args[0],
+            ["limactl", "--log-level=warn", "list", INSTANCE_B, "--json"],
         )
 
     def test_a_port_that_is_not_fixed_is_an_error_naming_the_remedy(self):
@@ -254,7 +255,7 @@ class TestSshPort(unittest.TestCase):
                         yo.box.driver.ssh_port()
                 self.assertIn("ssh.localPort %d" % port, caught.exception.message)
                 self.assertIn(
-                    "yo -m second down && limactl edit --tty=false second --set "
+                    "yo -m second down && limactl --log-level=warn edit --tty=false second --set "
                     "'.ssh.localPort=<PORT>' && yo -m second up",
                     caught.exception.message,
                 )
@@ -280,7 +281,8 @@ class TestSshPort(unittest.TestCase):
                         caught.exception.message,
                     )
                     self.assertIn(
-                        "yo -m second down && limactl edit", caught.exception.message
+                        "yo -m second down && limactl --log-level=warn edit",
+                        caught.exception.message,
                     )
 
     def test_the_lowest_and_highest_safe_ports_are_accepted(self):
@@ -307,7 +309,10 @@ class TestSshPort(unittest.TestCase):
                 with as_instance(INSTANCE_B), fake_limactl(stdout, returncode, stderr):
                     with self.assertRaises(yo.YoError) as caught:
                         yo.box.driver.ssh_port()
-                self.assertIn("limactl list second --json", caught.exception.message)
+                self.assertIn(
+                    "limactl --log-level=warn list second --json",
+                    caught.exception.message,
+                )
                 self.assertIn(stdout or stderr, caught.exception.message)
                 self.assertNotIn("does not exist", caught.exception.message)
 
@@ -600,7 +605,15 @@ class TestLimaGrowDisk(unittest.TestCase):
             locked(yo, yo.LIMA.grow_disk, 200)
         self.assertEqual(
             run.call_args.args[0],
-            ["limactl", "edit", "--tty=false", "second", "--disk", "200"],
+            [
+                "limactl",
+                "--log-level=warn",
+                "edit",
+                "--tty=false",
+                "second",
+                "--disk",
+                "200",
+            ],
         )
         self.assertEqual(
             caught.exception.message, "limactl edit refused the disk resize (exit 3)"
@@ -620,11 +633,70 @@ class TestLimaShowStatus(unittest.TestCase):
     def test_a_listing_that_worked_is_left_to_the_terminal(self):
         line, run = self.show_status(0)
         self.assertIsNone(line)
-        self.assertEqual(run.call_args.args[0], ["limactl", "list", "second"])
+        self.assertEqual(
+            run.call_args.args[0], ["limactl", "--log-level=warn", "list", "second"]
+        )
 
     def test_a_listing_that_failed_is_a_line_with_its_exit_code(self):
         line, _ = self.show_status(3)
-        self.assertIn("limactl list second failed (exit 3)", line)
+        self.assertIn("limactl --log-level=warn list second failed (exit 3)", line)
+
+
+class TestEveryLimactlCommandIsQuiet(FakeHome):
+    """limactl narrates every step at info level; yo narrates its own, so every
+    limactl command it builds, start and stop and delete among them, asks for
+    warnings only."""
+
+    def test_every_command_the_driver_runs_carries_log_level_warn(self):
+        argvs = []
+
+        def run(argv, **kwargs):
+            argvs.append(list(argv))
+            stdout = {
+                "-q": "second\n",
+                "{{.Disk}}": "107374182400\n",
+                "--json": limactl_json(49153) + "\n",
+            }.get(argv[-1], "")
+            return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+        def spawn(argv, **kwargs):
+            argvs.append(list(argv))
+            return mock.Mock(wait=mock.Mock(return_value=0))
+
+        running = yo.VmStatus(yo.VmState.RUNNING, "Running")
+        with (
+            as_instance(INSTANCE_B),
+            mock.patch.object(yo.ui, "out"),
+            mock.patch.object(yo.proc, "run", side_effect=run),
+            mock.patch.object(yo.proc, "spawn", side_effect=spawn),
+            mock.patch.object(yo.driver, "loopback_port_bound", return_value=False),
+            mock.patch.object(yo.LIMA, "refuse_fatal_gaps"),
+            mock.patch.object(yo.LIMA, "wait_until_running"),
+            mock.patch.object(yo.LIMA, "vm_status", return_value=running),
+            mock.patch.object(yo.unlock, "unlock_disk"),
+            mock.patch.object(yo.unlock, "wait_for_operator"),
+        ):
+            locked(yo, yo.LIMA.start, lambda: b"")
+            locked(yo, yo.LIMA.stop)
+            locked(yo, yo.LIMA.force_stop)
+            locked(yo, yo.LIMA.delete_instance)
+            locked(yo, yo.LIMA.grow_disk, 200)
+            yo.LIMA.show_status()
+            yo.LIMA.disk_gib()
+            yo.LIMA.config_gaps()
+            with mock.patch.object(yo.lima, "lima_instance_exists", return_value=False):
+                locked(yo, yo.LIMA.create, yo.NewBox(24, 250, 3))
+        self.assertEqual(
+            {argv[2] for argv in argvs},
+            {"start", "stop", "delete", "edit", "list", "create"},
+        )
+        for argv in argvs:
+            self.assertEqual(argv[:2], ["limactl", "--log-level=warn"], argv)
+
+    def test_the_printed_edit_chain_carries_it_too(self):
+        with as_instance(INSTANCE_B):
+            chain = yo.lima.lima_edit_command([".ssh.overVsock = false"])
+        self.assertIn("limactl --log-level=warn edit --tty=false second --set", chain)
 
 
 class TestLimaDiskGib(unittest.TestCase):
@@ -650,7 +722,8 @@ class TestLimaDiskGib(unittest.TestCase):
         size, run = self.disk_gib("%d\n" % (100 * self.GIB))
         self.assertEqual(size, 100)
         self.assertEqual(
-            run.call_args.args[0][:4], ["limactl", "list", "second", "--format"]
+            run.call_args.args[0][:5],
+            ["limactl", "--log-level=warn", "list", "second", "--format"],
         )
 
     def test_a_disk_that_is_not_whole_gib_is_an_error_not_a_rounded_one(self):
@@ -666,7 +739,7 @@ class TestLimaDiskGib(unittest.TestCase):
 
     def test_a_limactl_that_fails_says_why_instead_of_naming_a_missing_instance(self):
         error, _ = self.disk_gib("", returncode=1, stderr="no such instance: x")
-        self.assertIn("limactl list second --format", error.message)
+        self.assertIn("limactl --log-level=warn list second --format", error.message)
         self.assertIn("failed (exit 1): no such instance: x", error.message)
         self.assertNotIn("reports no disk", error.message)
 
@@ -674,6 +747,8 @@ class TestLimaDiskGib(unittest.TestCase):
 FAKE_LIMACTL = """#!/bin/sh
 # A limactl whose stop fails on a stopped instance, as lima's does, and whose
 # edit refuses a running one. $STATE holds the status, $LOG what was applied.
+[ "$1" = --log-level=warn ] || { echo "limactl without --log-level=warn: $*" >&2; exit 1; }
+shift
 case "$1" in
   stop)
     [ "$(cat "$STATE")" = Running ] || { echo "instance is already stopped" >&2; exit 1; }
@@ -691,7 +766,7 @@ FAKE_YO = """#!/bin/sh
 # What yo down and yo up do to limactl, for the machine named or the default.
 [ "$1" = -m ] && shift 2
 case "$1" in
-  down) [ "$(cat "$STATE")" = Running ] && exec limactl stop "$NAME"; exit 0 ;;
+  down) [ "$(cat "$STATE")" = Running ] && exec limactl --log-level=warn stop "$NAME"; exit 0 ;;
   up) echo up >> "$LOG" ;;
   *) echo "unexpected yo $*" >&2; exit 1 ;;
 esac

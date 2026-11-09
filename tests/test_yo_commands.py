@@ -764,16 +764,16 @@ class TestBootstrapRebootDecision(FakeHome):
 
         yo.ssh_run.side_effect = fake_ssh_run
         calls = self.run_bootstrap_with_real_generations()
-        self.assertEqual(calls, [["limactl", "stop", "yolobox"]])
+        self.assertEqual(calls, [["limactl", "--log-level=warn", "stop", "yolobox"]])
         self.assertFalse([argv for argv in asked if argv[0] == yo.HELPER])
 
     def test_no_restart_when_already_running_the_built_generation(self):
         calls = self.run_bootstrap([("g1", "g1")])
-        self.assertNotIn(["limactl", "restart", "yolobox"], calls)
+        self.assertNotIn(["limactl", "--log-level=warn", "restart", "yolobox"], calls)
 
     def test_stops_exactly_once_then_starts_again_when_the_second_read_agrees(self):
         calls = self.run_bootstrap([("g1", "g0"), ("g1", "g1")])
-        self.assertEqual(calls, [["limactl", "stop", "yolobox"]])
+        self.assertEqual(calls, [["limactl", "--log-level=warn", "stop", "yolobox"]])
         self.assertEqual(
             [call.kwargs for call in yo.vm_up.call_args_list],
             [
@@ -902,8 +902,10 @@ class TestBootstrapRebootDecision(FakeHome):
 
     def test_failed_stop_aborts_naming_the_recovery(self):
         def fake_run(argv, **kwargs):
-            if argv[:2] == ["limactl", "stop"]:
-                raise yo.YoError("limactl stop yolobox failed (exit 1)")
+            if argv[:3] == ["limactl", "--log-level=warn", "stop"]:
+                raise yo.YoError(
+                    "limactl --log-level=warn stop yolobox failed (exit 1)"
+                )
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         args = yo.build_parser().parse_args(["bootstrap", "--version", "github:x/y/z"])
@@ -918,14 +920,17 @@ class TestBootstrapRebootDecision(FakeHome):
                 (caught.exception.message, caught.exception.code), (None, 1)
             )
         messages = " ".join(call.args[0] for call in fake_err.call_args_list)
-        self.assertIn("the box did not stop: limactl stop yolobox failed", messages)
+        self.assertIn(
+            "the box did not stop: limactl --log-level=warn stop yolobox failed",
+            messages,
+        )
         self.assertIn("yo bootstrap", messages)
 
     def test_a_hung_stop_aborts_with_its_reason_and_this_contexts_advice_only(self):
         # The box just ran nixos-rebuild, so it is in stage 2: no "do not kill
         # the hostagent" from yo down beside the recovery that is safe here.
         def fake_run(argv, **kwargs):
-            if argv[:2] == ["limactl", "stop"]:
+            if argv[:3] == ["limactl", "--log-level=warn", "stop"]:
                 raise yo.RunTimeout("limactl stop yolobox did not finish within 300 s")
             return mock.Mock(returncode=0, stdout="", stderr="")
 
@@ -2786,15 +2791,15 @@ class FakeBox:
 
     def run(self, argv, **kwargs):
         argv = list(argv)
-        if argv[:3] == ["limactl", "list", "yolobox"]:
+        if argv[:4] == ["limactl", "--log-level=warn", "list", "yolobox"]:
             status = self.next(self.statuses)
             if status == "Running" and self.starts and self.running_since is None:
                 self.running_since = self.clock.now
             payload = json.dumps({"status": status, "config": {}})
             return subprocess.CompletedProcess(argv, 0, payload, "")
-        if argv[:3] == ["limactl", "list", "-q"]:
+        if argv[:4] == ["limactl", "--log-level=warn", "list", "-q"]:
             return subprocess.CompletedProcess(argv, 0, "yolobox\n", "")
-        if argv[:2] == ["limactl", "stop"]:
+        if argv[:3] == ["limactl", "--log-level=warn", "stop"]:
             self.stops += 1
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[0] == "ssh" and guest_words(argv[-1]) == yo.sshx.STAMP_PROBE:
@@ -3305,7 +3310,9 @@ class TestLimaStop(FakeHome):
             mock.patch.object(yo.LIMA, "vm_status", return_value=None),
             mock.patch.object(yo.subprocess, "run", return_value=failed),
         ):
-            with self.assertRaisesRegex(yo.YoError, "limactl stop yolobox failed"):
+            with self.assertRaisesRegex(
+                yo.YoError, "limactl --log-level=warn stop yolobox failed"
+            ):
                 locked(yo, yo.LIMA.stop)
 
     def test_a_hung_stop_carries_the_recovery(self):
@@ -3323,7 +3330,7 @@ class TestLimaStop(FakeHome):
     def test_a_hung_force_stop_does_not_send_the_operator_into_the_guest(self):
         # A box in its initrd has no guest to ssh into: only the hostagent's kill helps.
         expired = subprocess.TimeoutExpired(
-            ["limactl", "stop", "--force"], yo.LIMA_STOP_TIMEOUT
+            ["limactl", "--log-level=warn", "stop", "--force"], yo.LIMA_STOP_TIMEOUT
         )
         with mock.patch.object(yo.subprocess, "run", side_effect=expired):
             with self.assertRaises(yo.YoError) as caught:
@@ -3345,7 +3352,10 @@ class TestLimaStop(FakeHome):
                     with self.assertRaises(yo.YoError) as caught:
                         locked(yo, yo.LIMA.stop)
                 self.assertNotIsInstance(caught.exception, yo.StopRefused)
-                self.assertIn("limactl stop yolobox failed", caught.exception.message)
+                self.assertIn(
+                    "limactl --log-level=warn stop yolobox failed",
+                    caught.exception.message,
+                )
                 self.assertNotIn("kill -9", caught.exception.message)
 
     def assert_box_lock_held(self):
@@ -3391,7 +3401,7 @@ class TestLimaStop(FakeHome):
         for stage in (yo.BootStage.STAGE2, yo.BootStage.NONE):
             with self.subTest(stage=stage):
                 self.down(stage).assert_called_once_with(
-                    ["limactl", "stop", "yolobox"],
+                    ["limactl", "--log-level=warn", "stop", "yolobox"],
                     capture=False,
                     timeout=yo.LIMA_STOP_TIMEOUT,
                 )
@@ -3400,7 +3410,7 @@ class TestLimaStop(FakeHome):
         # The initrd has no ACPI handler: a polite stop would wait out the timeout.
         fake_run = self.down(yo.BootStage.INITRD, PROBE_AT_THE_PASSPHRASE_PROMPT)
         fake_run.assert_called_with(
-            ["limactl", "stop", "--force", "yolobox"],
+            ["limactl", "--log-level=warn", "stop", "--force", "yolobox"],
             capture=False,
             timeout=yo.LIMA_STOP_TIMEOUT,
         )
@@ -3523,7 +3533,7 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         def fake_run(argv, **kwargs):
             under_the_lock(argv)
             limactl.append(list(argv))
-            if argv[:2] == ["limactl", "list"]:
+            if argv[:3] == ["limactl", "--log-level=warn", "list"]:
                 return mock.Mock(returncode=0, stdout="%d\n" % (100 << 30), stderr="")
             return mock.Mock(returncode=0, stdout="", stderr="")
 
@@ -3566,7 +3576,9 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         return calls
 
     def edits(self):
-        return [c for c in self.limactl if c[:2] == ["limactl", "edit"]]
+        return [
+            c for c in self.limactl if c[:3] == ["limactl", "--log-level=warn", "edit"]
+        ]
 
     def resized(self, calls):
         resize = (
@@ -3588,7 +3600,17 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         )
         self.assertEqual(
             self.edits(),
-            [["limactl", "edit", "--tty=false", "yolobox", "--disk", "200"]],
+            [
+                [
+                    "limactl",
+                    "--log-level=warn",
+                    "edit",
+                    "--tty=false",
+                    "yolobox",
+                    "--disk",
+                    "200",
+                ]
+            ],
         )
         self.resized(calls)
         self.assertIn("before: /dev/mapper/root 100G 50G 50G 50% /", self.out)
