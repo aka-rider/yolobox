@@ -171,7 +171,7 @@ RULE
 chmod 0644 "$PASST_TMPFILES"
 if [[ -e $OLD_PASST_TMPFILES ]]; then
   rm "$OLD_PASST_TMPFILES"
-  printf 'removed %s. The initrd still holds a copy that logs "Failed to resolve user %s" at every boot; running: sudo dracut -f drops it now, and the next kernel update would.\n' "$OLD_PASST_TMPFILES" "$PASST_OWNER"
+  printf 'removed %s. The initrd still holds a copy that logs "Failed to resolve user %s" at every boot until the initrd is rebuilt: run sudo dracut -f to drop it now, or the next kernel update will.\n' "$OLD_PASST_TMPFILES" "$PASST_OWNER"
 fi
 systemd-tmpfiles --create "$PASST_TMPFILES"
 setfacl -P -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
