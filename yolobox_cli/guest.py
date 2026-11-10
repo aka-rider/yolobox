@@ -22,10 +22,18 @@ def ensure_guest_known_hosts() -> None:
     # first contact only while nothing is pinned; with a pin it is pinned
     # itself (sshx.host_key_fetch_role), so a changed key is refused, never
     # learned anew, and the file is rewritten only after a fetch that passed.
+    #
+    # First contact checks no host key, and the login offers the operator's
+    # key to whoever answers. The listener proof of the initrd's gate runs
+    # first: a stranger already holding the port is not asked for that key,
+    # and nothing it prints is pinned. The fetch dials the port proved, not
+    # the one the ssh config names.
+    facts = sshx.proved_ssh_facts()
     completed = sshx.ssh_run(
         sshx.host_key_fetch_role(),
         ["sh", "-c", "cat %s" % HOST_KEY_GLOB],
         check=False,
+        port=facts.port,
     )
     if completed.returncode != 0:
         raise YoError(

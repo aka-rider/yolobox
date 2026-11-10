@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, List, NamedTuple, Optional, Union
 
-from . import proc, release, sshconfig, state, ui
+from . import proc, release, sshconfig, sshx, state, ui
 from .config import (
     FACTS,
     LOOPBACK,
@@ -106,7 +106,7 @@ def unpinned_argv(remote: str, facts: SshFacts, user: str) -> List[str]:
 
     Before the disk is unlocked only the initrd's sshd answers, with a host key
     it generated this boot, so nothing can be pinned and whoever holds the
-    loopback port gets the session: the driver's verify_initrd_listener()
+    loopback port gets the session: the driver's verify_vm_listener()
     proves it the VM's before every root login. No pinned role may be used
     here: accept-new would write the initrd's key into known_hosts, and every
     stage-2 connection after it would be refused."""
@@ -231,8 +231,7 @@ def initrd_endpoint(held: state.HeldBox) -> Union[InitrdEndpoint, Banner]:
     initrd's word yields an InitrdEndpoint; any other banner comes back as it
     was read. The facts are read once, so the listener checked is the one ssh
     then dials."""
-    facts = state.driver().ssh_facts()
-    state.driver().verify_initrd_listener(facts.port)
+    facts = sshx.proved_ssh_facts()
     banner = endpoint_kind(facts)
     if banner.kind is Endpoint.INITRD:
         return InitrdEndpoint(INITRD_ENDPOINT_KEY, facts)
@@ -255,7 +254,7 @@ def root_argv(remote: str, initrd: InitrdEndpoint) -> List[str]:
     """The one root login: to a proved initrd, whose listener is proved the
     VM's again right before ssh dials it, since a port nothing held at the
     gate can be taken after it."""
-    state.driver().verify_initrd_listener(initrd.facts.port)
+    state.driver().verify_vm_listener(initrd.facts.port)
     return unpinned_argv(remote, initrd.facts, "root")
 
 

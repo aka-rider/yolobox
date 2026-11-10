@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import sys
 from typing import List
@@ -18,6 +19,16 @@ SSH_CONNECT_TIMEOUT_SECONDS = 5
 SSH_ALIVE_INTERVAL_SECONDS = 15
 STAGE2_CONNECT_TIMEOUT_SECONDS = 30
 STAGE2_ALIVE_COUNT_MAX = 8
+
+
+# A public host key, as the guest's sshd writes it: the key type of one of
+# the two host keys NixOS generates (rsa and ed25519; neither the box nor the
+# seed image asks for another) and its base64 blob. The fetch runs in the
+# guest's shell, so the text is whatever answered. A known_hosts marker
+# (@cert-authority, @revoked) or a second host pattern must not land in the
+# file yo trusts later, and a line that is not a host key fails the fetch.
+HOST_KEY_TYPE_RE = re.compile(r"ssh-(?:rsa|ed25519)")
+HOST_KEY_BLOB_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 
 
 def ssh_opt(key: str, value: str) -> List[str]:
@@ -121,14 +132,28 @@ def write_ssh_config() -> None:
 
 
 def known_hosts_lines(pubkeys: str) -> List[str]:
-    """The pin file's lines for the keys `pubkeys` holds, under the HostKeyAlias."""
+    """The pin file's lines for the keys `pubkeys` holds, under the HostKeyAlias.
+
+    A blank line is skipped. Any other line must be a host key (its type, its
+    blob, and an optional comment), or the whole fetch is an error that shows
+    the line as it came: skipping it would pin the rest and hide that the
+    fetch did not return only keys.
+    """
     lines = []
     for raw in pubkeys.splitlines():
         parts = raw.split(None, 2)
-        if len(parts) < 2 or parts[0].startswith("#"):
+        if not parts:
             continue
-        keytype, key = parts[0], parts[1]
-        lines.append("%s %s %s" % (state.box.vm_host, keytype, key))
+        if (
+            len(parts) < 2
+            or HOST_KEY_TYPE_RE.fullmatch(parts[0]) is None
+            or HOST_KEY_BLOB_RE.fullmatch(parts[1]) is None
+        ):
+            raise YoError(
+                "the guest's host key file has a line that is not a host key, so "
+                "nothing is pinned: %s" % ui.shown(raw)
+            )
+        lines.append("%s %s %s" % (state.box.vm_host, parts[0], parts[1]))
     return lines
 
 

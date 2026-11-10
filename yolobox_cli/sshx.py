@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Sequence
 
 from . import proc, sshconfig, state, ui
 from .config import AGENT_USER, SSH_UNREACHABLE, VERSION_STAMP
-from .driver import Removal
+from .driver import Removal, SshFacts
 from .sshconfig import FIRST_CONTACT_OPTS
 from .ui import YoError
 
@@ -53,6 +53,17 @@ def host_key_fetch_role() -> SshRole:
     return OPERATOR
 
 
+def proved_ssh_facts() -> SshFacts:
+    """The box's ssh facts, read once, with the listener on their port proved
+    the VM's (Lima's hostagent, or passt's account). Every connection that
+    offers the operator's key or root to a host key nothing checked goes
+    through here first: the initrd's gate and the host-key fetch. The caller
+    dials the port these facts name, so the port proved is the port reached."""
+    facts = state.driver().ssh_facts()
+    state.driver().verify_vm_listener(facts.port)
+    return facts
+
+
 def ssh_options(role: SshRole, mux: bool = False) -> List[str]:
     """The options every ssh and scp that yo spawns for the guest starts with."""
     argv = ["-F", state.ssh_cfg()]
@@ -80,16 +91,19 @@ def guest_argv(
     stdin: bool,
     mux: bool = False,
     ssh_log: Optional[str] = None,
+    port: Optional[int] = None,
 ) -> List[str]:
     """`ssh` running `argv` on the box under the C locale: the one way a
     command yo reads reaches the guest. Without `stdin`, ssh's stdin is
     closed (-n). With `ssh_log`, ssh writes its own messages to that file
-    (-E), apart from the guest's stderr, which the guest controls."""
+    (-E), apart from the guest's stderr, which the guest controls. With
+    `port`, ssh dials that port, whatever the ssh config says."""
     return (
         ["ssh"]
         + ssh_options(role, mux)
         + ([] if stdin else ["-n"])
         + ([] if ssh_log is None else ["-E", ssh_log])
+        + ([] if port is None else sshconfig.ssh_opt("Port", str(port)))
         + [state.box.vm_host, shlex.join(GUEST_C_LOCALE + list(argv))]
     )
 
@@ -188,9 +202,12 @@ def ssh_run(
     binary: bool = False,
     filtered: bool = False,
     ssh_log: Optional[str] = None,
+    port: Optional[int] = None,
 ) -> subprocess.CompletedProcess:
     return proc.run(
-        guest_argv(role, argv, stdin=stdin is not None, mux=mux, ssh_log=ssh_log),
+        guest_argv(
+            role, argv, stdin=stdin is not None, mux=mux, ssh_log=ssh_log, port=port
+        ),
         capture=capture,
         check=check,
         stdin=stdin,

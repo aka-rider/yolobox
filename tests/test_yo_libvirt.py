@@ -2973,7 +2973,7 @@ SS_LINE = (
 class TestInitrdListener(LibvirtCase):
     def verify(self, *listeners, port=61000):
         self.host.listeners = "".join(line + "\n" for line in listeners)
-        self.driver.verify_initrd_listener(port)
+        self.driver.verify_vm_listener(port)
 
     def test_the_owner_is_read_from_every_listing_line(self):
         self.assertEqual(
@@ -3037,7 +3037,7 @@ class TestInitrdListener(LibvirtCase):
         self.host.listeners = SS_LINE % 1000 + "\n"
         started, message = self.send_passphrase()
         self.assertFalse(started)
-        self.assertIn("not sent there", message)
+        self.assertIn("yo does not connect", message)
 
     def test_a_stranger_that_takes_the_port_after_the_gate_gets_no_session(self):
         # Nothing held the port at the gate, which is fine there; the check

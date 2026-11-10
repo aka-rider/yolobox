@@ -247,7 +247,8 @@ class TestSshPort(unittest.TestCase):
 
     def test_a_port_another_boxs_listener_can_claim_is_refused_with_the_remedy(self):
         # Lima mirrors guest TCP ports 1024-49151 onto the host's loopback, and
-        # the initrd unlock writes the passphrase to this port unauthenticated.
+        # root, the passphrase and the first host-key fetch go to this port
+        # with no host key checked.
         for port in (1, 1023, 1024, 22222, 49151):
             with self.subTest(localPort=port):
                 with as_instance(INSTANCE_B), fake_limactl(limactl_json(port)):
@@ -270,11 +271,11 @@ class TestSshPort(unittest.TestCase):
         # ssh.config is lima's own file, so the port read from it gets the
         # bounds ssh_port() gives the one read from limactl.
         with as_instance(INSTANCE_B), hostagent_holds_the_port():
-            yo.LIMA.verify_initrd_listener(65535)
+            yo.LIMA.verify_vm_listener(65535)
             for port in (65536, 70000):
                 with self.subTest(port=port):
                     with self.assertRaises(yo.YoError) as caught:
-                        yo.LIMA.verify_initrd_listener(port)
+                        yo.LIMA.verify_vm_listener(port)
                     self.assertIn(
                         "second has ssh.localPort %d, which is past the last TCP "
                         "port, 65535" % port,

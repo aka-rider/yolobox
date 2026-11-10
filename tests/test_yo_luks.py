@@ -499,7 +499,7 @@ class TestRootLogsInOnlyThroughTheInitrdGate(FakeHome):
 
         with (
             mock.patch.object(yo.LIMA, "ssh_facts", return_value=self.FACTS),
-            mock.patch.object(yo.LIMA, "verify_initrd_listener", side_effect=verify),
+            mock.patch.object(yo.LIMA, "verify_vm_listener", side_effect=verify),
             mock.patch.object(yo.unlock, "ssh_banner", side_effect=read),
             yo.box_lock(wait=True) as held,
         ):
@@ -573,7 +573,7 @@ class TestInitrdAskPending(FakeHome):
             return completed
 
         with (
-            mock.patch.object(yo.LIMA, "verify_initrd_listener", side_effect=verify),
+            mock.patch.object(yo.LIMA, "verify_vm_listener", side_effect=verify),
             mock.patch.object(yo.proc, "run", side_effect=run),
         ):
             result = yo.unlock.initrd_ask_pending(gate)
@@ -593,7 +593,7 @@ class TestInitrdAskPending(FakeHome):
         stage2 = "SSH-2.0-x " + yo.STAGE2_SSH_BANNER_MARK
         with (
             mock.patch.object(yo.LIMA, "ssh_facts", return_value=self.FACTS),
-            mock.patch.object(yo.LIMA, "verify_initrd_listener"),
+            mock.patch.object(yo.LIMA, "verify_vm_listener"),
             mock.patch.object(yo.unlock, "ssh_banner", return_value=stage2),
             mock.patch.object(yo.proc, "run") as run,
             yo.box_lock(wait=True) as held,
@@ -647,7 +647,7 @@ class TestUnpinnedSshArgv(FakeHome):
         operator = yo.unlock.operator_argv("true", self.FACTS)
         self.assertIn("User=%s" % yo.release.host_user(), operator)
         self.assertNotIn("User=root", operator)
-        with mock.patch.object(yo.LIMA, "verify_initrd_listener"):
+        with mock.patch.object(yo.LIMA, "verify_vm_listener"):
             root = yo.unlock.root_argv("true", proved_initrd(self.FACTS))
         self.assertIn("User=root", root)
 

@@ -312,7 +312,7 @@ def proved_initrd(facts, namespace=None):
     banner = "SSH-2.0-OpenSSH_10.0 " + ns.config.INITRD_SSH_BANNER_MARK
     with (
         mock.patch.object(driver, "ssh_facts", return_value=facts),
-        mock.patch.object(driver, "verify_initrd_listener"),
+        mock.patch.object(driver, "verify_vm_listener"),
         mock.patch.object(ns.unlock, "ssh_banner", return_value=banner),
         ns.state.box_lock(wait=True) as held,
     ):
@@ -2678,33 +2678,52 @@ class TestKnownHostsLines(FakeHome):
         self.assertNotIn("127.0.0.1", lines[0])
         self.assertNotIn("[", lines[0])
 
-    def test_handles_multiple_key_types_and_drops_the_comment(self):
+    def test_both_key_types_nixos_generates_pin_without_their_comment(self):
         pubkeys = (
             "ssh-ed25519 AAAAC3abc== root@yolobox\n"
-            "ecdsa-sha2-nistp256 AAAAE2abc== root@yolobox\n"
+            "ssh-rsa AAAAB3NzaC1yc2E= root@yolobox\n"
         )
         lines = yo.known_hosts_lines(pubkeys)
         self.assertEqual(
             lines,
             [
                 "lima-yolobox ssh-ed25519 AAAAC3abc==",
-                "lima-yolobox ecdsa-sha2-nistp256 AAAAE2abc==",
+                "lima-yolobox ssh-rsa AAAAB3NzaC1yc2E=",
             ],
         )
 
-    def test_comment_lines_are_not_pins(self):
-        pubkeys = "# host keys\nssh-ed25519 AAAAC3abc== root@yolobox\n#ssh-rsa AAAB x\n"
+    def test_blank_lines_are_skipped(self):
+        pubkeys = "\nssh-ed25519 AAAAC3abc== root@yolobox\n \t\n\n"
         self.assertEqual(
             yo.known_hosts_lines(pubkeys), ["lima-yolobox ssh-ed25519 AAAAC3abc=="]
         )
 
-    def test_blank_lines_and_lines_with_no_key_field_are_skipped(self):
-        pubkeys = "ssh-ed25519 AAAAC3abc== root@yolobox\n\nnot-a-key-line\n"
-        lines = yo.known_hosts_lines(pubkeys)
-        self.assertEqual(len(lines), 1)
-
     def test_no_keys_make_no_lines(self):
         self.assertEqual(yo.known_hosts_lines(""), [])
+
+    def test_a_line_that_is_not_a_host_key_fails_the_whole_fetch(self):
+        # The fetch is the guest's words. A known_hosts marker, a second host
+        # pattern, a comment or a key type the guest never generates must not
+        # be written beside a real key, and must not be written on its own
+        # either.
+        key = "ssh-ed25519 AAAAC3abc== root@yolobox\n"
+        for raw in (
+            "@cert-authority * ssh-ed25519 AAAAC3abc==",
+            "@revoked *",
+            "lima-other ssh-ed25519 AAAAC3abc==",
+            "ssh-ed25519 not-a-key",
+            "ssh-ed25519",
+            "not-a-key-line",
+            "# host keys",
+            "#ssh-ed25519 AAAAC3abc==",
+            "ecdsa-sha2-nistp256 AAAAE2abc==",
+            "ssh-dss AAAAB3NzaC1kc3M=",
+            "ssh-ed25519\x1b[2J AAAAC3abc==",
+        ):
+            for pubkeys in (raw + "\n", key + raw + "\n", raw + "\n" + key):
+                with self.subTest(pubkeys=pubkeys):
+                    with self.assertRaisesRegex(yo.YoError, "not a host key"):
+                        yo.known_hosts_lines(pubkeys)
 
 
 class TestSshOptionValuesSurviveAHomeWithASpace(FakeHome):
@@ -2753,6 +2772,9 @@ class TestEnsureGuestKnownHosts(FakeHome):
     def setUp(self):
         super().setUp()
         os.makedirs(yo.instance_dir())
+        self.listener = mock.patch.object(yo.LIMA, "verify_vm_listener")
+        self.listener.start()
+        self.addCleanup(self.listener.stop)
 
     def test_fetches_via_operator_and_writes_the_known_hosts_file(self):
         proc = mock.Mock(
@@ -2761,6 +2783,7 @@ class TestEnsureGuestKnownHosts(FakeHome):
         with mock.patch.object(yo.sshx, "ssh_run", return_value=proc) as fake_ssh_run:
             yo.ensure_guest_known_hosts()
 
+        yo.LIMA.verify_vm_listener.assert_called_once_with(yo.SSH_LOCAL_PORT)
         role, argv = fake_ssh_run.call_args[0]
         # Nothing pinned yet: first contact is the only way to learn the key.
         self.assertIs(role, yo.OPERATOR_FIRST_CONTACT)
@@ -2828,6 +2851,54 @@ class TestEnsureGuestKnownHosts(FakeHome):
             with self.assertRaises(yo.YoError) as caught:
                 yo.ensure_guest_known_hosts()
         self.assertFalse(caught.exception.message.startswith("yo:"))
+
+    def test_the_fetch_dials_the_port_it_proved(self):
+        # ssh.config may name another port (written before a port change, or
+        # not at all yet); the fetch must reach the listener that was proved.
+        facts = yo.SshFacts(60123, "op", "/k", "none")
+        proc = mock.Mock(
+            returncode=0, stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n", stderr=""
+        )
+        with mock.patch.object(yo.LIMA, "ssh_facts", return_value=facts):
+            with mock.patch.object(yo.proc, "run", return_value=proc) as fake_run:
+                yo.ensure_guest_known_hosts()
+        yo.LIMA.verify_vm_listener.assert_called_once_with(60123)
+        argv = fake_run.call_args[0][0]
+        self.assertEqual(argv[0], "ssh")
+        pairs = list(zip(argv, argv[1:]))
+        self.assertIn(("-o", "Port=60123"), pairs)
+        # Before the host: ssh reads options only ahead of its destination.
+        self.assertLess(pairs.index(("-o", "Port=60123")), argv.index(yo.box.vm_host))
+
+    NO_HOST_KEY_FETCH = mock.Mock(
+        returncode=0,
+        stdout="ssh-ed25519 AAAAC3abc== root@yolobox\n@revoked * ssh-rsa AAAAB3==\n",
+        stderr="",
+    )
+
+    def test_a_first_fetch_with_a_line_that_is_no_host_key_pins_nothing(self):
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=self.NO_HOST_KEY_FETCH):
+            with self.assertRaisesRegex(yo.YoError, "not a host key"):
+                yo.ensure_guest_known_hosts()
+        self.assertFalse(os.path.exists(yo.known_hosts_path()))
+
+    def test_a_fetch_with_a_line_that_is_no_host_key_keeps_the_pin(self):
+        self.write_pin("lima-yolobox ssh-ed25519 OLD==\n")
+        with mock.patch.object(yo.sshx, "ssh_run", return_value=self.NO_HOST_KEY_FETCH):
+            with self.assertRaisesRegex(yo.YoError, "not a host key"):
+                yo.ensure_guest_known_hosts()
+        with open(yo.known_hosts_path()) as handle:
+            self.assertEqual(handle.read(), "lima-yolobox ssh-ed25519 OLD==\n")
+
+    def test_a_stranger_on_the_port_is_not_asked_and_pins_nothing(self):
+        yo.LIMA.verify_vm_listener.side_effect = yo.YoError(
+            "127.0.0.1:60022 is held by pid 77, so yo does not connect"
+        )
+        with mock.patch.object(yo.sshx, "ssh_run") as fake_ssh_run:
+            with self.assertRaisesRegex(yo.YoError, "does not connect"):
+                yo.ensure_guest_known_hosts()
+        fake_ssh_run.assert_not_called()
+        self.assertFalse(os.path.exists(yo.known_hosts_path()))
 
 
 class Reached(Exception):
@@ -4661,7 +4732,7 @@ class TestBootStageNeverOffersStage2ARoot(unittest.TestCase):
                 yo.LIMA, "ssh_facts", return_value=yo.SshFacts(port, "op", "/k", "none")
             ),
             # The test's port is whatever the OS gave, maybe in Lima's mirrored range.
-            mock.patch.object(yo.LIMA, "verify_initrd_listener"),
+            mock.patch.object(yo.LIMA, "verify_vm_listener"),
             mock.patch.object(yo.unlock, "ssh_attempt", probe),
             mock.patch.object(yo.release, "host_user", return_value="op"),
             mock.patch.object(socket, "create_connection", REAL_CREATE_CONNECTION),
@@ -5177,12 +5248,12 @@ class TestSshArgv(FakeHome):
 
 
 class TestLimaProvesItsHostagentHoldsTheSshPort(unittest.TestCase):
-    """Root, and the passphrase, go to the box's port only while lsof names
+    """A login on the box's port, root's included, runs only while lsof names
     this instance's hostagent as its one listener: any process of the host
     user's can bind a port nothing holds."""
 
     def verify(self, lsof, hostagent=HOSTAGENT_PID, port=60022):
-        """verify_initrd_listener(port) with lsof ending as `lsof` (exit,
+        """verify_vm_listener(port) with lsof ending as `lsof` (exit,
         stdout, stderr); the argv lsof ran with, or the refusal's message."""
         self.ran = []
 
@@ -5195,7 +5266,7 @@ class TestLimaProvesItsHostagentHoldsTheSshPort(unittest.TestCase):
             mock.patch.object(yo.proc, "run", side_effect=run),
         ):
             try:
-                yo.LIMA.verify_initrd_listener(port)
+                yo.LIMA.verify_vm_listener(port)
             except yo.YoError as refused:
                 return refused.message
         return None
@@ -5233,7 +5304,7 @@ class TestLimaProvesItsHostagentHoldsTheSshPort(unittest.TestCase):
                 message = self.verify(lsof)
                 self.assertIn(
                     "cannot prove that yolobox's hostagent holds 127.0.0.1:60022, "
-                    "so root is not offered there",
+                    "so yo does not connect",
                     message,
                 )
                 self.assertIn(said, message)

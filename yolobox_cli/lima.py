@@ -56,9 +56,9 @@ GAP_VM_TYPE = "vmType"
 MIRRORED_TCP_PORTS = [1024, 49151]
 
 # The lowest port a non-default instance may use for ssh.localPort: above every
-# mirrored guest port. The initrd unlock sends the passphrase to that port
-# without checking the host key, so a port inside the mirror could be answered
-# by a listener of another running box.
+# mirrored guest port. A root login, the passphrase and the first host-key
+# fetch go to that port without checking a host key, so a port inside the
+# mirror could be answered by a listener of another running box.
 MIN_SSH_LOCAL_PORT = MIRRORED_TCP_PORTS[1] + 1
 
 # Fixed OAuth callback ports inside MIRRORED_TCP_PORTS that are never mirrored:
@@ -401,17 +401,19 @@ def refuse_mirrored_ssh_port(port: int) -> None:
     """Refuse an ssh port another box's listener can claim, or that no socket has.
 
     Lima mirrors every guest TCP port up to MIRRORED_TCP_PORTS[1] onto the
-    host's 127.0.0.1, and the disk unlock sends the passphrase to the ssh port
-    without checking the host key. The one check for the port read from
-    limactl (ssh_port) and the port read from ssh.config (the listener check
-    before every passphrase), so a port past the last one is refused here too.
+    host's 127.0.0.1, and yo dials the ssh port without checking a host key
+    for a root login, the passphrase and the first host-key fetch. The one
+    check for the port read from limactl (ssh_port) and the port the listener
+    check proves before each of those (verify_vm_listener), so a port past
+    the last one is refused here too.
     """
     if MIN_SSH_LOCAL_PORT <= port <= MAX_PORT:
         return
     why = (
         "which another box's listener can claim: lima mirrors every guest TCP "
-        "port up to %d onto the host's 127.0.0.1, and the disk unlock sends the "
-        "passphrase to this port without checking the host key" % MIRRORED_TCP_PORTS[1]
+        "port up to %d onto the host's 127.0.0.1, and yo logs in as root, sends "
+        "the disk passphrase and fetches the host key to pin on this port without "
+        "checking a host key" % MIRRORED_TCP_PORTS[1]
         if port < MIN_SSH_LOCAL_PORT
         else "which is past the last TCP port, %d" % MAX_PORT
     )
@@ -639,7 +641,7 @@ class LimaDriver:
             )
         return "\n".join(lines)
 
-    def verify_initrd_listener(self, port: int) -> None:
+    def verify_vm_listener(self, port: int) -> None:
         """Prove that this instance's hostagent, and nothing else, listens on
         the box's ssh port: below the mirrored range's end another box's
         listener could claim it, and any process of the host user's could
@@ -650,14 +652,14 @@ class LimaDriver:
             holders = tcp_listener_pids(port)
         except YoError as unproved:
             raise YoError(
-                "cannot prove that %s's hostagent holds %s:%d, so root is not "
-                "offered there: %s" % (state.box.name, LOOPBACK, port, unproved.message)
+                "cannot prove that %s's hostagent holds %s:%d, so yo does not "
+                "connect: %s" % (state.box.name, LOOPBACK, port, unproved.message)
             )
         strangers = [pid for pid in holders if pid != hostagent]
         if strangers:
             raise YoError(
-                "%s:%d is held by pid %s, not by %s's hostagent (%s), so root is not "
-                "offered there. Find the holder with `lsof -nP -iTCP:%d -sTCP:LISTEN`, "
+                "%s:%d is held by pid %s, not by %s's hostagent (%s), so yo does not "
+                "connect. Find the holder with `lsof -nP -iTCP:%d -sTCP:LISTEN`, "
                 "stop it, and run the command again"
                 % (
                     LOOPBACK,

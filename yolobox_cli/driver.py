@@ -221,7 +221,7 @@ class Driver(Protocol):
     # The disk ceiling of the instance that exists, in whole GiB, read from the
     # host (YoError when it cannot be read).
     def disk_gib(self) -> int: ...
-    def verify_initrd_listener(self, port: int) -> None: ...  # YoError: not the VM's
+    def verify_vm_listener(self, port: int) -> None: ...  # YoError: not the VM's
     # Create the instance at `new_box` from the seed image, stopped.
     def create(self, held: HeldBox, new_box: NewBox) -> None: ...
     # Start the instance, unlock its disk with `passphrase()` should an initrd

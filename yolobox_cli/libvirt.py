@@ -627,10 +627,11 @@ class LibvirtDriver:
         self.require_domain()
         return driver.exact_gib(self.volume_sizes()["Capacity"], "disk")
 
-    def verify_initrd_listener(self, port: int) -> None:
-        # No listener at all is fine: ssh finds nothing and the passphrase goes
-        # nowhere, and root_argv() checks again right before ssh dials, so a
-        # port taken after the gate is caught. Any listener must be passt's.
+    def verify_vm_listener(self, port: int) -> None:
+        # No listener at all is fine: ssh finds nothing, so no root login, no
+        # passphrase and no host-key fetch reaches anyone, and root_argv()
+        # checks again right before root's ssh dials, so a port taken after
+        # the gate is caught. Any listener must be passt's.
         listing = proc.run(["ss", "-ltnHe", "sport = :%d" % port], check=True).stdout
         uid, _ = libvirt_host.vm_account()
         strangers = [
@@ -639,7 +640,7 @@ class LibvirtDriver:
         if strangers:
             raise YoError(
                 "%s:%d is held by uid %s, not by the account %s (uid %d) that runs "
-                "the box's passt, so the disk passphrase is not sent there. Find "
+                "the box's passt, so yo does not connect. Find "
                 "the holder with `ss -ltnp 'sport = :%d'`, stop it, and run %s again"
                 % (
                     LOOPBACK,
