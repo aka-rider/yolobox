@@ -46,6 +46,9 @@ A_RELEASE = "2.3.4"
 # os.cpu_count itself.
 HOST_CPUS = 16
 
+# The host account every loaded yo runs as (load_yo).
+HOST_ACCOUNT = "op"
+
 
 def host_cpus(count=HOST_CPUS):
     return mock.patch.object(os, "cpu_count", return_value=count)
@@ -130,7 +133,7 @@ def load_yo(name="yo"):
 
     The copy drives the Lima driver on the default machine, whatever host runs
     the tests, so `main()` and every function that reads the driver behave as
-    they do on a Mac.
+    they do on a Mac. Its host account is HOST_ACCOUNT, whoever runs the tests.
     """
     spec = importlib.util.spec_from_file_location(
         name, PKG / "__init__.py", submodule_search_locations=[str(PKG)]
@@ -148,6 +151,9 @@ def load_yo(name="yo"):
         unload_yo(name)
         raise
     modules["config"].HOST_PLATFORM = "darwin"
+    # The operator is a fixed account, not whoever runs the tests: inside a box
+    # that is the agent, the one name yo refuses for the operator.
+    modules["release"].host_user = lambda: HOST_ACCOUNT
     modules["state"].set_box(modules["lima"].LIMA, modules["config"].DEFAULT_INSTANCE)
     return YoNamespace(modules)
 

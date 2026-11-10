@@ -127,6 +127,9 @@ def refuse_the_real_home(event, args):
 SCRATCH_HOME = os.path.realpath(tempfile.mkdtemp(prefix="yo-home-", dir="/tmp"))
 os.environ["HOME"] = SCRATCH_HOME
 atexit.register(shutil.rmtree, SCRATCH_HOME)
+# AWS_CONFIG_FILE moves the AWS config out of the scratch HOME; inside a box
+# the runner's names the agent's real one. A test that needs it sets it.
+os.environ.pop("AWS_CONFIG_FILE", None)
 sys.addaudithook(refuse_the_real_home)
 
 # A non-interactive bash whose stdin is a socket takes itself for an ssh
