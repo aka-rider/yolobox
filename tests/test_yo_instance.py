@@ -98,7 +98,7 @@ class TestNamesFollowTheMachine(unittest.TestCase):
 
 
 class TestHostnameFollowsTheMachine(unittest.TestCase):
-    """Each machine's box gets its own hostname, so its own tailnet node."""
+    """Each machine's box gets its own hostname, so its own name on any network."""
 
     def hostname_env(self):
         (entry,) = [

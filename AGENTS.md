@@ -7,7 +7,7 @@ This file is for whoever changes the repo: where things live, how to check a cha
 - **Two halves of one tool.** `yo` runs on the host and does everything the host does to the VM. `yolobox-guest` runs in the box and holds the guest-side logic `yo` calls over ssh. A new guest subcommand exists on a box only after the box is rebuilt.
 - **Two accounts.** The operator has the host account's name, uid 501 and `wheel`. The agent is the constant account `agent`, uid 1000, with no `sudo`. Every coding session runs as the agent.
 - **Two hosts, one guest.** `yo` picks a driver once, from the host OS: Lima (vz) on macOS, libvirt (`qemu:///system`, passt, sVirt) on Linux. The guest copies Lima's address plan on both (gateway 192.168.5.2, guest 192.168.5.15, NIC `enp0s1`) and is never told which OS runs it. A Mac runs its own CPU's guest; a Linux host runs x86_64 only.
-- **Egress.** One constant nft table in the guest rejects traffic to the host and to private networks, except DNS to the gateway and DHCP. `tailscale0` is trusted; the tailnet ACL is the gate there. `dhcpcd` and `tailscaled` require the table's unit, so a box whose table fails to load at boot has no address and is unreachable; recreate it. A switch reloads the table in place and never restarts either. `yolobox-network-ready` fails unless the NIC holds an IPv4 address now (`ip -4 -o addr show`; dhcpcd's lease file outlives a boot, so a lease alone can be last boot's) and `dhcpcd --dumplease` shows the lease brought a `domain_name_servers` line with a value, printing the lease on stderr, and `yo status` warns while that unit is not active. A Linux host adds its own table, keyed on the uid `yolobox-vm`, that the guest cannot undo.
+- **Egress.** One constant nft table in the guest rejects traffic to the host and to private networks, except DNS to the gateway and DHCP. `dhcpcd` requires the table's unit, so a box whose table fails to load at boot has no address and is unreachable; recreate it. A switch reloads the table in place and never restarts it. `yolobox-network-ready` fails unless the NIC holds an IPv4 address now (`ip -4 -o addr show`; dhcpcd's lease file outlives a boot, so a lease alone can be last boot's) and `dhcpcd --dumplease` shows the lease brought a `domain_name_servers` line with a value, printing the lease on stderr, and `yo status` warns while that unit is not active. A Linux host adds its own table, keyed on the uid `yolobox-vm`, that the guest cannot undo.
 - **Git is the bridge.** No host mounts. Checkouts in the VM accept pushes with `receive.denyCurrentBranch = updateInstead`.
 - **Encrypted root.** `/dev/vda2` is LUKS2. `yo up` derives the passphrase from the 1Password key `yolobox-disk` only for an sshd whose banner carries the initrd's word `yolobox-initrd`, read under the box lock after proving the listener is the VM's (`unlock.initrd_endpoint()`, the one gate of every `root` login), and feeds it to that sshd. Any other sshd, the seed image's unmarked one included, is asked for the operator alone, so a plaintext box never prompts. Before it starts a box that exists and is off, which may be encrypted, `yo up` lists 1Password's agent keys (a listing, no signature, so no prompt) and refuses while the box is still off unless `yolobox-disk` is there. The seed image's first boot of a yolobox generation encrypts the plain root in place.
 - **Published flake ref.** `yo bootstrap` builds `github:aka-rider/yolobox/<rev>?narHash=<hash>` resolved from a release, branch or `github:OWNER/REPO/REF`. The box stamps that ref into `/etc/yolobox/flake-ref`, and `yolobox-guest rebuild` builds it again and refuses a stamp that does not start with `github:`. The ref names the full rev, so every new rev is a new system generation, a docs-only commit included. The VM holds no checkout of this repo.
@@ -30,7 +30,6 @@ This file is for whoever changes the repo: where things live, how to check a cha
 | `nix/luks.nix`, `nix/luks/` | the initrd: unlock, in-place encryption, lima's key from cidata |
 | `nix/egress.nix`, `nix/egress/yolobox-egress.nft` | the guest's egress table and its unit |
 | `nix/hardening.nix` | blocked modules, the wrapper allowlist and agent groups with their one assertion, sysctls, `/proc` |
-| `nix/tailscale.nix` | the optional tailnet |
 | `nix/harnesses.nix`, `nix/harnesses/` | the claude launcher, its keeper, and the claude and pi installs |
 | `nix/herd-server.nix`, `nix/pkgs/herdr-bin.nix` | the VM's herdr server and the pinned herdr release |
 | `nix/display.nix`, `nix/display/` | Xvfb, openbox, Chromium and the screen recorder |
@@ -128,7 +127,7 @@ A change is done when:
 
 ### Before a release
 
-The release is a GitHub release with tag `vX.Y.Z` published from the tip of `main`; the workflow writes `.version` and moves the tag. The next one is `v2.0.0`: it removes `lanAllow`, the hardening escape hatches and the old stamps, and changes the guest contract, so every box is recreated. Run these live first; until each passed it is unproven:
+The release is a GitHub release with tag `vX.Y.Z` published from the tip of `main`; the workflow writes `.version` and moves the tag. The next one is `v2.0.0`: it removes `lanAllow`, the hardening escape hatches, the old stamps and the built-in Tailscale (moved to an external module), and changes the guest contract, so every box is recreated. Run these live first; until each passed it is unproven:
 
 - The box's evaluation and build for the x86_64 and aarch64 guests, and shellcheck over `verify.yml`'s list.
 - `box-hardening-e2e.sh` and `box-libvirt-check.sh` on throwaway boxes, on a Mac and on a Linux host.
@@ -138,7 +137,6 @@ The release is a GitHub release with tag `vX.Y.Z` published from the tip of `mai
 - On Lima, `yo ssh` issues both reverse forwards over `yo`'s own control master (`yo-op.sock`, never Lima's `ssh.sock`): `ssh-add -l` and `aws-creds` work as the agent on a box created from the current `lima/yolobox.yaml`.
 - After boot, Xvfb and openbox are up with Xvfb as `Type=notify` and started with `-displayfd`, and Xvfb picked `:0`.
 - The initrd's bash supports `wait -n -p` (bash 5.1 or newer), and a first boot encrypts and unlocks.
-- `tailscale status --json` prints `"BackendState": "..."` in the shape `yolobox-guest status` parses.
 - `yo cp :dir ~/x` on a Mac, whose `tar` is bsdtar: the download unpacks, and only regular files and directories land.
 - A `yo cp` round trip of a tree with non-ASCII names (`café.txt`, `日本語/ファイル.txt`) up and down lands every name byte for byte, on a Mac and on a Linux host. bsdtar 3.5.3 under `LC_ALL=C` keeps a GNU-format member's raw bytes and NFD-normalises a PAX one in every locale, so also check that the guest's `tar --show-defaults` says `--format=gnu`.
 - As the agent, `/run/wrappers/bin/newuidmap` with no arguments prints its usage and exits 1: `check_sudo_refuses_agent`'s positive control waits for that exit.
@@ -150,7 +148,7 @@ The release is a GitHub release with tag `vX.Y.Z` published from the tip of `mai
 - On a Linux host: whether a signature with `yolobox-operator` asked from an agent session prompts 1Password or rides the master's earlier approval.
 - On a Mac, `yo cp` from the guest unpacks with bsdtar using `--no-same-owner --no-same-permissions --no-acls --no-xattrs --no-fflags --no-mac-metadata`; confirm bsdtar accepts every flag and a download lands.
 - In the initrd, a wrong passphrase makes systemd-cryptsetup log `Passphrase incorrect?`, and `journalctl -n 1 --show-cursor` prints a cursor; the unlock helper's exit 1 versus exit 7 depends on both.
-- A switch that changes the egress rules reloads yolobox-egress in place and does not restart dhcpcd or tailscaled.
+- A switch that changes the egress rules reloads yolobox-egress in place and does not restart dhcpcd.
 - `dhcpcd --dumplease enp0s1` as root on a booted box prints `domain_name_servers=` followed by the lease's servers (the script's test fakes that shape; it was written from dhcpcd's documentation, not a live box), and `yolobox-network-ready` is active.
 - After a reboot and before any `yo` command, `systemctl is-active yolobox-op-agent.socket yolobox-aws-broker.socket` says `inactive`, and herdr connecting in that window cannot reach a half-made proxy; the next `yo ssh` makes both `active` and `ssh-add -l` works as the agent.
 - In a box with a `local.nix`, `YOLOBOX_SKIP_LOCAL_NIX=1` on the `nix eval` leaves the file out of the evaluation.
@@ -190,7 +188,7 @@ SSH:
 Network:
 
 - In the output hook, `oifname` is the interface of the route chosen before NAT; a DNAT that reroutes does not update it. Hence the egress table judges destinations.
-- passt keeps the guest's source port, so a fixed tailscaled port collides with the host's own tailscaled. Hence `port = 0`.
+- passt keeps the guest's source port, so a fixed tailscaled port in a box collides with the host's own tailscaled. Hence a box's tailscale module sets `port = 0`.
 - passt reads the host's resolver at start and puts it into the guest's DHCP lease. `passt_t` may read only `net_conf_t`, and a resolver file (resolved's stub, which `/etc/resolv.conf` links to) that a root editor replaced by rename keeps the editor's label, so passt is denied, the lease has no DNS server and the guest boots without DNS, silently. Hence a start (never ssh, status, down or destroy) and `host-setup.sh` refuse a resolver whose label's type field is not `net_conf_t`, read with `getxattr` and `stat -c %C`. With SELinux disabled the kernel returns no `security.selinux` attribute (ENODATA or EOPNOTSUPP) and `stat` prints `?`; no label can deny passt then, so that passes. A local policy module that lets passt read the wrong label is the wrong fix: chronyd is denied the same read.
 - The passt directory's tmpfiles rule lives in `/etc/yolobox/yolobox-passt.conf` and `yolobox-host.service` applies it before virtqemud on every boot. Never put it in `/etc/tmpfiles.d`: dracut copies that directory into the initrd, which has no `qemu` account, and every boot then logs `Failed to resolve user 'qemu'`. The libvirt hook cannot create the directory itself, since it returns when the directory does not exist yet.
 - `ss -e` prints `ino:` for every socket and `uid:` only for an owner that is not root (iproute2's `sock_details`), so a listener line with its `ino:` and no `uid:` is root's.

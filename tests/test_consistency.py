@@ -100,30 +100,6 @@ def uncommented(path: Path) -> str:
     )
 
 
-class TestTailscaledLogFilter(unittest.TestCase):
-    """The filter drops the relayed-path line and nothing else."""
-
-    DERP = "magicsock: new contact: peer=[+1OFL] usec=13217671625 cached=false via=derp"
-    DIRECT = DERP.replace("via=derp", "via=direct")
-    NOW_USING = "magicsock: disco: node [+1OFL] d:1b4eb41609986a64 now using 203.0.113.7:41641 mtu=1360"
-
-    def pattern(self):
-        found = re.search(
-            r'systemd\.services\.tailscaled\.serviceConfig\.LogFilterPatterns\s*=\s*"~([^"]+)";',
-            uncommented(REPO / "nix" / "tailscale.nix"),
-        )
-        self.assertIsNotNone(found, "tailscaled has no negated LogFilterPatterns")
-        return found.group(1)
-
-    def test_a_relayed_contact_is_dropped(self):
-        self.assertRegex(self.DERP, self.pattern())
-
-    def test_a_direct_contact_and_path_changes_are_kept(self):
-        for line in (self.DIRECT, self.NOW_USING):
-            with self.subTest(line=line):
-                self.assertNotRegex(line, self.pattern())
-
-
 def yaml_scalar(value):
     value = value.strip().strip('"')
     if value == "true":
@@ -481,12 +457,10 @@ class TestFailClosedPieces(unittest.TestCase):
     def test_the_guest_egress_unit_has_no_stop_hook_and_the_network_requires_it(self):
         egress = uncommented(REPO / "nix" / "egress.nix")
         self.assertNotIn("ExecStop", egress)
-        for service in ("dhcpcd", "tailscaled"):
-            with self.subTest(service=service):
-                self.assertRegex(
-                    egress,
-                    r"systemd\.services\.%s = \{[^}]*requires = \[ unit \]" % service,
-                )
+        self.assertRegex(
+            egress,
+            r"systemd\.services\.dhcpcd = \{[^}]*requires = \[ unit \]",
+        )
 
     def test_the_host_table_unit_has_no_stop_hook_and_libvirt_requires_it(self):
         unit = uncommented(HOST_UNIT)

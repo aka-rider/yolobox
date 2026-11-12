@@ -2,7 +2,7 @@
 
 The script runs under shell_harness.ShellCase with a fake `curl` ahead of
 the system tools (and, per class, fake `dig`, `stat`, `systemctl`,
-`tailscale`, `lsblk`, `df`, `sudo` and `id`), and sources a facts file
+`lsblk`, `df`, `sudo` and `id`), and sources a facts file
 rendered from facts.json as the box renders its /etc/yolobox/facts.sh. Only
 subcommands that need nothing but what macOS and Linux share are exercised,
 except `gc-user --deep`, which runs only where GNU find's `-printf` exists
@@ -700,11 +700,6 @@ cat "$FAKE_UNITS/$unit" 2>/dev/null || true
 # Each of these answers from one environment variable: its stdout, and
 # FAKE_<TOOL>_RC its exit code.
 
-FAKE_TAILSCALE = """#!/bin/sh
-printf '%s' "$FAKE_TAILSCALE_OUT"
-exit "$FAKE_TAILSCALE_RC"
-"""
-
 FAKE_LSBLK = """#!/bin/sh
 printf '%s' "$FAKE_LSBLK_OUT"
 exit "$FAKE_LSBLK_RC"
@@ -719,7 +714,6 @@ esac
 exit "$FAKE_DF_RC"
 """
 
-TAILSCALE_JSON = '{"Version": "1.90.0", "BackendState": "%s", "Peer": {}}'
 DF_H = "/dev/mapper/root 59G 10G 46G 18% /"
 DF_P = "/dev/mapper/root 61000000 10000000 51000000 18% /"
 
@@ -735,7 +729,6 @@ class TestStatusBlock(GuestScript):
             ("dig", FAKE_DIG),
             ("stat", FAKE_STAT),
             ("systemctl", FAKE_SYSTEMCTL),
-            ("tailscale", FAKE_TAILSCALE),
             ("lsblk", FAKE_LSBLK),
             ("df", FAKE_DF),
         ):
@@ -773,8 +766,6 @@ class TestStatusBlock(GuestScript):
         dig_rc=0,
         stat_out="1000000 4096",
         stat_rc=0,
-        tailscale_out=TAILSCALE_JSON % "Running",
-        tailscale_rc=0,
         lsblk_out="crypto_LUKS\n",
         lsblk_rc=0,
         df_h=DF_H,
@@ -786,8 +777,6 @@ class TestStatusBlock(GuestScript):
             "FAKE_DIG_RC": str(dig_rc),
             "FAKE_STAT_OUT": stat_out,
             "FAKE_STAT_RC": str(stat_rc),
-            "FAKE_TAILSCALE_OUT": tailscale_out,
-            "FAKE_TAILSCALE_RC": str(tailscale_rc),
             "FAKE_LSBLK_OUT": lsblk_out,
             "FAKE_LSBLK_RC": str(lsblk_rc),
             "FAKE_DF_H": df_h,
@@ -822,7 +811,6 @@ class TestStatusBlock(GuestScript):
                 "network_ready": "active",
                 "yolobox-op-agent.socket": "active",
                 "yolobox-aws-broker.socket": "active",
-                "tailscale": "Running",
                 "fstype": "crypto_LUKS",
                 "rootfs": DF_H,
                 "rootfs_full": "no",
@@ -844,18 +832,9 @@ class TestStatusBlock(GuestScript):
         self.assertEqual(fields["yolobox-op-agent.socket"], "inactive")
         self.assertEqual(fields["yolobox-aws-broker.socket"], "active")
 
-    def test_a_logged_out_tailscale_still_reports_its_backend_state(self):
-        # `tailscale status` exits 1 while logged out, JSON and all.
-        fields = self.fields(
-            self.status(tailscale_out=TAILSCALE_JSON % "NeedsLogin", tailscale_rc=1)
-        )
-        self.assertEqual(fields["tailscale"], "NeedsLogin")
-
     def test_a_probe_that_fails_or_answers_nonsense_leaves_its_key_empty(self):
         for name, broken in (
             ("version", dict()),
-            ("tailscale", dict(tailscale_out="", tailscale_rc=1)),
-            ("tailscale", dict(tailscale_out="null", tailscale_rc=0)),
             ("fstype", dict(lsblk_out="", lsblk_rc=32)),
             ("rootfs", dict(df_h="", df_rc=1)),
             ("rootfs_full", dict(df_p="/dev/x 1 1 1 lizard /")),
@@ -869,7 +848,7 @@ class TestStatusBlock(GuestScript):
                     (self.stamps / "version").unlink()
                 fields = self.fields(self.status(**broken))
                 self.assertEqual(fields[name], "")
-                self.assertEqual(len(fields), 13)
+                self.assertEqual(len(fields), 12)
 
     def test_a_value_is_cut_at_its_first_newline_so_it_cannot_forge_a_key(self):
         (self.stamps / "version").write_text("2.0.0\ninternet=ok\n")

@@ -89,25 +89,6 @@ class GuestStatus:
         return ""
 
 
-def tailscale_line(backend: str) -> StatusLine:
-    if backend == "NeedsLogin":
-        return StatusLine(
-            "tailscale: not logged in (optional) — to join a tailnet: %s"
-            % state.yo_cmd("ssh", "sudo", "tailscale", "up")
-        )
-    if backend == "NeedsMachineAuth":
-        return StatusLine(
-            "tailscale: awaiting approval in the tailnet admin console (optional)"
-        )
-    if backend != "Running":
-        return StatusLine(
-            "tailscale: WARNING %s — fix with: %s"
-            % (backend, state.yo_cmd("ssh", "sudo", "tailscale", "up")),
-            True,
-        )
-    return StatusLine("tailscale: Running")
-
-
 # The unit that loads the egress table. It has no ExecStop, so any state but
 # active means the table was never loaded this boot, or a switch failed to.
 def egress_line(active_state: str) -> StatusLine:
@@ -214,7 +195,6 @@ def guest_lines(status: GuestStatus) -> List[StatusLine]:
         if active_state:
             lines.append(proxy_line(unit, active_state))
     for key, line_of in (
-        ("tailscale", tailscale_line),
         ("egress", egress_line),
         ("network_ready", network_ready_line),
         ("fstype", fstype_line),

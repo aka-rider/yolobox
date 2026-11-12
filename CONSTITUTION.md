@@ -86,11 +86,9 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 
 ## Network
 
-- ALWAYS keep the egress table, one constant file, loaded before the network, reloaded in place on a switch, with `dhcpcd` and `tailscaled` requiring its unit and no stop hook. It is what keeps the guest off the host and the LAN, and a box without it must have no network at all.
+- ALWAYS keep the egress table, one constant file, loaded before the network, reloaded in place on a switch, with `dhcpcd` requiring its unit and no stop hook. It is what keeps the guest off the host and the LAN, and a box without it must have no network at all.
 - ALWAYS judge destinations in the egress table, never output interfaces. The output hook sees the interface of the route chosen before a DNAT, so `oifname` cannot say where a packet leaves.
-- ALWAYS keep `--netfilter-mode=off`, `--ssh=false` and `--accept-dns=false` in tailscale's `extraSetFlags`, and NEVER answer a refused `tailscale up` with `--reset`. nixos-fw owns the firewall, the repo's keys own ssh, the guest's resolver stays its own, and `--reset` clears the pinned flags.
-- ALWAYS keep `tailscale0` trusted and `enp0s1` open on port 22 only. The tailnet ACL decides who reaches a service, and Lima's start-up wait dials port 22 over TCP, where a dropped packet is a 600 s timeout.
-- ALWAYS keep `RemainAfterExit = true` on `tailscaled-set`. A switch restarts a changed oneshot only while it is active.
+- ALWAYS keep `enp0s1` open on port 22 only. Lima's start-up wait dials port 22 over TCP, where a dropped packet is a 600 s timeout.
 - ALWAYS put a box-local route in `networking.dhcpcd.runHook`. A dhcpcd restart flushes routes a oneshot added once.
 
 ## The Linux host
@@ -107,7 +105,7 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 ## Kernel attack surface
 
 - NEVER unblock a kernel module without saying, in a comment beside its entry, what needs it. The agent autoloads a protocol module with one `socket()` call, and the comment is how the next person learns why it was blocked.
-- NEVER block `vsock`, `virtiofs` or `binfmt_misc`, and keep `overlay`, `fuse`, `tun`, `bridge`, `veth`, `dm_crypt`, `af_alg` and `sch_fq_codel` loadable. Lima, rosetta, podman, tailscale and the LUKS root need them.
+- NEVER block `vsock`, `virtiofs` or `binfmt_misc`, and keep `overlay`, `fuse`, `tun`, `bridge`, `veth`, `dm_crypt`, `af_alg` and `sch_fq_codel` loadable. Lima, rosetta, podman, a mesh VPN in `local.nix` and the LUKS root need them.
 - NEVER turn off unprivileged user namespaces. The Chromium sandbox, rootless podman and the nix build sandbox all create them.
 - ALWAYS mount `/proc` with `hidepid=invisible,gid=wheel` and keep `systemd-logind` in `wheel`. Otherwise the agent reads the operator's `sudo` command lines, and without the group logind stops tracking sessions.
 

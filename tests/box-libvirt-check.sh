@@ -32,7 +32,7 @@
 # that fails any other way (no route, a missing tool) fails the run. A probe
 # is run only against a listener the host itself can reach, so a "blocked"
 # never means "nothing listens": the host's own canary for its addresses, and
-# a host-side connect first for the LAN gateway and the tailnet address.
+# a host-side connect first for the LAN gateway.
 #
 # Lines it prints besides "ok:":
 #   SKIP peer       no other yolobox domain is running, so the box-to-box
@@ -41,18 +41,12 @@
 #                   the host has no LAN default gateway, or that gateway's
 #                   port 80 does not answer the host, so the LAN probe did
 #                   not run
-#   SKIP tailnet    the host or the box is not on a tailnet, or the host's
-#                   tailnet address does not answer the host on port 22
 #   SKIP v6-gateway the guest has no IPv6 default route, or the host cannot
 #                   bind an IPv6 listener, so the probe through the IPv6
 #                   gateway (mapped to the host's ::1) did not run
 #   SKIP v6-host    the host has no global IPv6 route, or the guest has no
 #                   IPv6 default route, so the probe to the host's global
 #                   IPv6 address did not run
-#   RESIDUAL tailnet-host-ssh
-#                   the box reached the host's sshd over the tailnet. A host
-#                   sshd listening on 0.0.0.0 is reachable from a box on the
-#                   same tailnet by design, so it does not change the exit status.
 set -Eeuo pipefail
 # Without this a command substitution runs with errexit off, so `peers=$(f)`
 # would carry on past a failing step inside f.
@@ -438,41 +432,6 @@ check_peers() {
     fi
 }
 
-check_tailnet() {
-    local addrs tail_ip status=0 outcome
-    if [ ! -d /sys/class/net/tailscale0 ]; then
-        echo "SKIP tailnet"
-        return
-    fi
-    addrs=$(ip -4 -o addr show dev tailscale0) || fail "ip addr show dev tailscale0 failed"
-    tail_ip=$(awk '{ sub("/.*", "", $4); print $4; exit }' <<<"${addrs}")
-    if [ -z "${tail_ip}" ]; then
-        echo "SKIP tailnet"
-        return
-    fi
-    guest "tailscale status >/dev/null 2>&1" || status=$?
-    case ${status} in
-    0) ;;
-    255) fail "ssh to ${SSH_HOST} failed while asking for tailscale status" ;;
-    *)
-        echo "SKIP tailnet"
-        return
-        ;;
-    esac
-    # The canary: a host sshd that does not answer on the tailnet address
-    # makes the guest's failure meaningless.
-    if ! host_connects "${tail_ip}" 22; then
-        echo "SKIP tailnet"
-        return
-    fi
-    outcome=$(guest_tcp "${tail_ip}" 22)
-    case ${outcome} in
-    connected) echo "RESIDUAL tailnet-host-ssh" ;;
-    timeout | refused) ok "the guest cannot reach the host's tailnet address on port 22 (${outcome})" ;;
-    *) fail "the probe of the host's tailnet address ended neither connected nor blocked: ${outcome}" ;;
-    esac
-}
-
 # The host table also rejects ::1, which passt maps the IPv6 gateway to.
 check_v6_gateway() {
     local v6_gateway
@@ -558,7 +517,6 @@ check_host_layer_alone() {
     check_v6_host
     check_lan_gateway "${default_gw}"
     check_peers
-    check_tailnet
 
     guest "curl -sSI --max-time 20 https://github.com >/dev/null" ||
         fail "the guest cannot fetch https://github.com with the host layer alone"

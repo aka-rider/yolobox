@@ -10,7 +10,7 @@ let
     "sctp" "rds" "tipc" # rare transports that autoload from socket(); nothing on the box speaks them
     "x25" "psnap" "llc2" "atm" # legacy link and network layers, unused
     "can" "ieee802154" "phonet" "nfc" # fieldbus, radio and modem families; a VM has none of the hardware
-    "af_key" # the PF_KEY IPsec socket; tailscale is WireGuard in userspace, nothing here uses kernel IPsec
+    "af_key" # the PF_KEY IPsec socket; nothing here uses kernel IPsec
     "mctp" # AF_MCTP, a management bus for BMCs; a VM has no such bus
     "rxrpc" "kcm" "smc" "qrtr" # AF_RXRPC, AF_KCM, AF_SMC and AF_QIPCRTR autoload from socket(); AFS, message framing, IBM SMC and Qualcomm modems, none used here
     "pppoe" "l2tp_ppp" "pptp" # the AF_PPPOX protocols; the box makes no PPP link, and pptp parses every GRE packet once loaded
@@ -18,7 +18,7 @@ let
     "scsi_transport_iscsi" # NETLINK_ISCSI autoloads from socket() and its parser gave root to any user (CVE-2021-27365); the root disk is virtio-blk
     "xfrm_user" # NETLINK_XFRM, the IPsec policy socket, with its own CVE history (CVE-2024-27404); nothing here uses kernel IPsec
     # link kinds `ip link add type <kind>` autoloads, which the agent can run as root of its own user and network namespace;
-    # each is a packet parser the box never configures (podman uses bridge and veth, tailscale uses tun)
+    # each is a packet parser the box never configures (podman uses bridge and veth, a mesh VPN in local.nix uses tun)
     "vxlan" "geneve" "bareudp" "gtp" "hsr" "macsec" "bonding" "team" "ipvlan"
     # net/sched: a user namespace's root can attach any of these to its own netns, and nothing on the box shapes traffic
     # classifiers: cls_route gave root (CVE-2022-2588), cls_u32 and cls_fw have the same kind of history

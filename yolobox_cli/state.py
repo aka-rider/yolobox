@@ -38,10 +38,10 @@ INSTANCE_SOCKETS = (
 
 
 def hostname_for(name: str) -> str:
-    """The guest hostname, and tailnet node name, of the machine `name`.
+    """The guest hostname of the machine `name`.
 
     The default machine is `yolobox`, any other `yolobox-<name>`, lowercased
-    because DNS labels are case-insensitive and tailscale lowercases them. The
+    because DNS labels are case-insensitive and a mesh VPN lowercases them. The
     result is not checked here: instance_name() refuses a machine whose
     hostname is no DNS label, before anything runs.
     """

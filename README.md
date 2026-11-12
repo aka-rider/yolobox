@@ -107,11 +107,9 @@ AWS_PROFILE=<profile> aws sts get-caller-identity             # in the VM
 
 Copies of the VM's disk image made before its first bootstrap, such as Time Machine backups or APFS snapshots, still hold the unencrypted disk.
 
-## herdr, Tailscale, devbox
+## herdr, devbox
 
 [herdr](https://herdr.dev/) runs inside the VM, and `yo bootstrap` adds it to herdr on your host as a machine. Run `claude` or `pi` in a workspace on that machine; an agent started from `yo enter`, `yo ssh` or an editor is invisible to herdr. When `claude update` prints a "Fix" line about `~/.local/bin/claude`, ignore it: that file is the box's launcher.
-
-[Tailscale](https://tailscale.com/) is optional. `yo ssh sudo tailscale up` logs the VM in. Then every port in it is open to whatever your tailnet's access policy admits, so review the policy. ssh from a tailnet peer is refused by design. If `tailscale up` refuses with "requires mentioning all non-default flags", do not pass `--reset`: it clears the flags the box pins. Run `yo ssh sudo tailscale up`, then `yo ssh sudo systemctl restart tailscaled-set`, which applies the flags again.
 
 Each project gets its tools from [devbox](https://www.jetify.com/devbox): `devbox add nodejs`, then `devbox shell` or `devbox run -- <cmd>`. Nothing loads a project's tools because you changed into its directory. Editor language servers run through devbox, so add them to the project's `devbox.json`.
 
@@ -130,6 +128,8 @@ systemd.services.yolobox-egress.serviceConfig =
 ```
 
 On a Linux host the host table still keeps the VM off the LAN.
+
+A mesh VPN such as Tailscale or WireGuard is not part of the box. Add one in `/etc/yolobox/local.nix`, through that same egress-replacement seam, since the table rejects private ranges, including the CGNAT range Tailscale uses. The box admits ssh only from the gateway, so a mesh peer cannot ssh in unless your module widens `AllowUsers`.
 
 ## Upgrading
 

@@ -55,7 +55,7 @@ def instance_name(value: str) -> str:
         # "lima-" is excluded because instance "lima-x" would give its herdr alias
         # the name of instance "x"'s ssh host. The hostname rule excludes '.' and
         # '_' (no DNS label has them) and names over 55 characters, because the
-        # box's hostname, yolobox-<name>, is also its tailnet node name.
+        # box's hostname, yolobox-<name>, is one DNS label of at most 63.
         raise argparse.ArgumentTypeError(
             "%r is not a usable machine name (letters and digits, joined by "
             "single '-', at most 55 characters, not starting with 'lima-')" % value

@@ -25,13 +25,9 @@ in
     };
   };
 
-  # Fail closed by dependency: without the table there is no address and no
-  # tailnet, so nothing leaves the box.
+  # Fail closed by dependency: without the table there is no address, so
+  # nothing leaves the box.
   systemd.services.dhcpcd = {
-    requires = [ unit ];
-    after = [ unit ];
-  };
-  systemd.services.tailscaled = {
     requires = [ unit ];
     after = [ unit ];
   };

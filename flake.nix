@@ -44,11 +44,11 @@
         else if u == "root" then
           throw "${facts.nix_env_username} is root — the operator mirrors the Mac user, never root"
         else u;
-      # The box's hostname, and with it the tailnet node name, is the one
-      # input that is optional: unset or empty means "yolobox", so CI and a
-      # bare `nix eval` of the box evaluate without it. `yo` sets it per machine
-      # (-m NAME gives yolobox-NAME). A set value must be one RFC 1123 label,
-      # lowercase, because it reaches the kernel, DHCP and tailscale.
+      # The box's hostname is the one input that is optional: unset or empty
+      # means "yolobox", so CI and a bare `nix eval` of the box evaluate
+      # without it. `yo` sets it per machine (-m NAME gives yolobox-NAME). A
+      # set value must be one RFC 1123 label, lowercase, because it reaches
+      # the kernel and DHCP, and any mesh VPN's node name.
       hostname =
         let n = builtins.getEnv facts.nix_env_hostname;
         in if n == "" then facts.default_instance
@@ -106,7 +106,6 @@
           ./nix/display.nix
           ./nix/lsp.nix
           ./nix/guest.nix
-          ./nix/tailscale.nix
           ./nix/egress.nix
           ./nix/hardening.nix
         ];

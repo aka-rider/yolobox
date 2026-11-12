@@ -842,7 +842,7 @@ probe_gateway_dns() {
 
 # Free space on / below which status reports the disk full. `stat -f` counts
 # the blocks ext4 reserves for root (%f), which `df`'s Avail column leaves out:
-# dhcpcd and tailscaled run as root, and only when those are gone does a full
+# dhcpcd runs as root, and only when those are gone does a full
 # disk look like a DNS failure (empty resolv.conf, ENOSPC in dhcpcd).
 ROOT_MIN_FREE_MIB=64
 
@@ -878,16 +878,6 @@ field() {
 # A unit's ActiveState; empty when systemctl cannot say.
 unit_state() {
     systemctl show -p ActiveState --value "$1" 2>/dev/null || true
-}
-
-# tailscale's BackendState, out of its own JSON; empty when there is none.
-# `tailscale status` exits nonzero while logged out and still prints it.
-tailscale_state() {
-    local json
-    json=$(tailscale status --json 2>/dev/null) || true
-    if [[ "${json}" =~ \"BackendState\":[[:space:]]*\"([^\"]*)\" ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    fi
 }
 
 # `df -h /`'s data line, as the operator reads it; empty when df fails.
@@ -931,7 +921,6 @@ cmd_status() {
     for unit in "${PROXY_UNITS[@]}"; do
         field "${unit}" "$(unit_state "${unit}")"
     done
-    field tailscale "$(tailscale_state)"
     field fstype "$(lsblk -dno FSTYPE "${YOLOBOX_LUKS_DEVICE}" 2>/dev/null || true)"
     field rootfs "$(rootfs_line)"
     field rootfs_full "$(rootfs_full)"

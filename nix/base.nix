@@ -124,9 +124,9 @@ in
 
   networking.hostName = hostname;
   # nixos-lima turns NAT on, and nixpkgs' nat module turns IPv4 forwarding on
-  # with it. Nothing here routes for others: rootless podman uses pasta and
-  # tailscale is only a client. Forwarding would let the host side route
-  # through the guest into the tailnet.
+  # with it. Nothing here routes for others: rootless podman uses pasta.
+  # Forwarding would let the host side route through the guest into whatever
+  # network the guest reaches.
   networking.nat.enable = lib.mkForce false;
   users.mutableUsers = true;
   system.stateVersion = "25.11";
@@ -238,7 +238,7 @@ in
   services.openssh.enable = true;
   # Lima's hostagent waits for, and forwards to, the guest's ssh port on
   # 192.168.5.15 (enp0s1, lima's NAT network, unreachable from the LAN), so that
-  # is the only port open there. tailscale0 is trusted whole (nix/tailscale.nix).
+  # is the only port open there.
   services.openssh.openFirewall = false;
   networking.firewall.interfaces.${facts.guest_nic}.allowedTCPPorts = [ facts.guest_ssh_port ];
   services.openssh.settings = {
@@ -258,11 +258,12 @@ in
   # ~/.zshenv first; the in-process server runs no shell at all.
   services.openssh.sftpServerExecutable = "internal-sftp";
   # Both accounts log in only from the gateway, where every yo and herdr
-  # session arrives, and which the agent cannot spoof off enp0s1. The agent
-  # holds the forwarded 1Password agent, which serves the operator's key, and
-  # on a Linux host that one key opens every box of the host: from anywhere
-  # else (the tailnet, loopback) neither account is a way in. It holds on every
-  # box, whatever the host OS.
+  # session arrives, and which the agent cannot spoof off enp0s1. The base
+  # cannot see the ACL of any mesh VPN a box may join, and the agent holds the
+  # forwarded 1Password agent, which serves the operator's key; on a Linux host
+  # that one key opens every box of the host. So from anywhere else (a mesh,
+  # loopback) neither account is a way in, unless a module of the box's own
+  # widens this list on purpose. It holds on every box, whatever the host OS.
   services.openssh.settings.AllowUsers = [ "${username}@${facts.gateway}" "${facts.agent_user}@${facts.gateway}" ];
   # Every host connection arrives from the gateway, so a penalty on it locks
   # the host out; yo reads the banner mark so it never offers stage 2 a root login.

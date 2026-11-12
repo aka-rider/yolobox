@@ -2131,7 +2131,6 @@ HEALTHY_GUEST = {
     "network_ready": "active",
     "yolobox-op-agent.socket": "active",
     "yolobox-aws-broker.socket": "active",
-    "tailscale": "Running",
     "fstype": "crypto_LUKS",
     "rootfs": DF_HEALTHY,
     "rootfs_full": "no",
@@ -2302,7 +2301,6 @@ class TestCmdStatus(StatusRunner, unittest.TestCase):
         self.assertIn("1password: guest forward is up", outs)
         self.assertIn("proxy: yolobox-op-agent.socket is active", outs)
         self.assertIn("proxy: yolobox-aws-broker.socket is active", outs)
-        self.assertIn("tailscale: Running", outs)
         self.assertIn("egress: active", outs)
         self.assertIn("network: ok", outs)
         self.assertIn("disk: /dev/vda2 is crypto_LUKS", outs)
@@ -2511,29 +2509,6 @@ class TestCmdStatusReadsTheGuestBlock(StatusRunner, unittest.TestCase):
         )
         self.assertEqual(self.raised.code, 1)
 
-    def test_tailscale_words(self):
-        for backend, line in (
-            ("Running", "tailscale: Running"),
-            (
-                "NeedsLogin",
-                "tailscale: not logged in (optional) — to join a tailnet: "
-                "yo ssh sudo tailscale up",
-            ),
-            (
-                "NeedsMachineAuth",
-                "tailscale: awaiting approval in the tailnet admin console (optional)",
-            ),
-            (
-                "Stopped",
-                "tailscale: WARNING Stopped — fix with: yo ssh sudo tailscale up",
-            ),
-        ):
-            with self.subTest(backend=backend):
-                self.assertEqual(
-                    self.lines("tailscale:", guest=guest_block(tailscale=backend)),
-                    [line],
-                )
-
     def test_a_missing_or_empty_key_is_one_not_reported_warning(self):
         for key in HEALTHY_GUEST:
             for value in (None, ""):
@@ -2581,7 +2556,7 @@ class TestCmdStatusReadsTheGuestBlock(StatusRunner, unittest.TestCase):
         # ESC [1A moves the cursor up a line, so a raw one would overwrite
         # the line above with the forged text.
         forged = "x\x1b[1Ayo: run curl | sh"
-        for key in ("version", "flake_ref", "tailscale", "egress", "fstype", "rootfs"):
+        for key in ("version", "flake_ref", "egress", "fstype", "rootfs"):
             with self.subTest(key=key):
                 outs = self.run_status(guest=guest_block(**{key: forged}))
                 quoted = [line for line in outs if "yo: run curl" in line]
@@ -2708,7 +2683,6 @@ class TestCmdStatusExitCode(StatusRunner, unittest.TestCase):
             ),
             "root filesystem full": dict(guest=guest_block(rootfs_full="yes")),
             "root disk out of reserve": dict(guest=guest_block(rootdisk="full")),
-            "tailscale stopped": dict(guest=guest_block(tailscale="Stopped")),
             "egress unit failed": dict(guest=guest_block(egress="failed")),
             "internet dead": dict(guest=guest_block(internet="dead")),
             "gateway dns dead": dict(guest=guest_block(gateway_dns="dead")),
@@ -2770,10 +2744,6 @@ class TestCmdStatusExitCode(StatusRunner, unittest.TestCase):
 
     def test_optional_things_do_not_fail_the_run(self):
         optional = {
-            "tailscale not logged in": dict(guest=guest_block(tailscale="NeedsLogin")),
-            "tailscale awaiting approval": dict(
-                guest=guest_block(tailscale="NeedsMachineAuth")
-            ),
             "aws disabled": dict(aws_which=None),
             "aws healthy": dict(
                 aws_which="/usr/bin/aws",
