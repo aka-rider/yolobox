@@ -463,14 +463,31 @@ class TestRunInADirectory(FakeHome):
     """Every way yo runs a tool honours `cwd`, so a tool that writes beside
     itself (limactl's rejected-edit file) writes where yo says."""
 
+    WAYS = {
+        "host": {},
+        "guest": {"guest": "agent"},
+        "streamed": {"filtered": True},
+        "to the terminal": {"capture": False},
+    }
+
+    def test_a_directory_that_is_missing_is_said_so_and_a_missing_tool_still_is(self):
+        gone = os.path.join(self.home, "gone")
+        for name, way in self.WAYS.items():
+            with self.subTest(way=name):
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.run(["touch", "witness"], cwd=gone, **way)
+                self.assertEqual(
+                    caught.exception.message,
+                    "cannot run touch in %s: the directory does not exist" % gone,
+                )
+                with self.assertRaises(yo.YoError) as caught:
+                    yo.run(["no-such-tool-here"], cwd=self.home, **way)
+                self.assertEqual(
+                    caught.exception.message, "no-such-tool-here not found on PATH"
+                )
+
     def test_each_way_of_running_a_tool_runs_it_in_the_directory_asked_for(self):
-        ways = {
-            "host": {},
-            "guest": {"guest": "agent"},
-            "streamed": {"filtered": True},
-            "to the terminal": {"capture": False},
-        }
-        for name, way in ways.items():
+        for name, way in self.WAYS.items():
             with self.subTest(way=name):
                 here = Path(self.home) / name.replace(" ", "-")
                 here.mkdir()

@@ -208,7 +208,12 @@ def run(
                 timeout=timeout,
                 cwd=cwd,
             )
-    except FileNotFoundError:
+    except FileNotFoundError as missing:
+        # A missing directory to run in names itself as the file that is missing.
+        if cwd is not None and missing.filename == cwd:
+            raise YoError(
+                "cannot run %s in %s: the directory does not exist" % (argv[0], cwd)
+            )
         raise YoError("%s not found on PATH" % argv[0])
     except subprocess.TimeoutExpired:
         raise RunTimeout(
