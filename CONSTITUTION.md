@@ -47,7 +47,7 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 - ALWAYS keep `restartIfChanged` false on `lima-init` and `lima-guestagent`, until the `nixos-lima` input sets it itself. Restarting the guest agent breaks every port Lima forwards until the VM restarts.
 - ALWAYS treat `lima/yolobox.yaml` as read once, at creation. An existing instance changes only through `limactl edit` while stopped, or by being recreated.
 - NEVER let Lima mirror a guest UDP listener, a guest port outside 1024-49151, or a known OAuth callback port onto the host. A mirrored tailscaled port took a host's own Tailscale port, port 68 intercepts the host's DHCP, and a squatted callback port receives a host login.
-- ALWAYS keep `vmType`, `propagateProxyEnv: false`, `ssh.loadDotSSHPubKeys: false`, `ssh.overVsock: false` and `user.uid: 501` pinned in `lima/yolobox.yaml`. Lima's defaults leak the Mac's proxy variables and every `~/.ssh/*.pub` into the guest, let ssh ride vsock where the initrd cannot answer, and give the operator the Mac's uid.
+- ALWAYS keep `vmType`, `propagateProxyEnv: false`, `ssh.loadDotSSHPubKeys: false`, `ssh.overVsock: false` and `user.uid: 501` pinned in `lima/yolobox.yaml`. Lima's defaults leak the Mac's proxy variables and every `~/.ssh/*.pub` into the guest, let ssh ride vsock where the initrd cannot answer, and give the operator the Mac's uid. An sshd on vsock sees every peer as UNKNOWN, and the guest's own vsock loopback reaches it, so the agent, holding the forwarded 1Password agent, could log in as the operator.
 
 ## Disk encryption
 
