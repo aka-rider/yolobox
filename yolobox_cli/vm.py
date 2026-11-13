@@ -34,11 +34,13 @@ DISK_FSTYPE_PLAIN = "ext4"
 DISK_FSTYPE_LUKS = "crypto_LUKS"
 
 
-def preflight(size: Size) -> Tuple[Optional[VmStatus], Optional[NewBox]]:
+def preflight(size: Size, restart: bool) -> Tuple[Optional[VmStatus], Optional[NewBox]]:
     """The size flags and the host, judged before the box or the host is
     touched: no creation, resize, start or 1Password prompt is spent on a box
     that was going to be refused. Returns the box's status and the size a
-    creation gets: exactly one of the two is None."""
+    creation gets: exactly one of the two is None. `restart` says the box ran
+    at this size a moment ago (bootstrap's reboot, disk-grow's restart), so its
+    start adds no load for the host to refuse."""
     driver = state.driver()
     status = driver.vm_status()
     if status is None:
@@ -46,7 +48,9 @@ def preflight(size: Size) -> Tuple[Optional[VmStatus], Optional[NewBox]]:
         refuse_start()
         # The default CPU count is decided here, so a host that cannot give one
         # is refused before the passphrase and both drivers create the same box.
-        return status, size.for_creation()
+        new_box = size.for_creation()
+        refuse(driver.memory_refusal(size))
+        return status, new_box
     if size.disk_gib is not None:
         refuse_disk_flag(size.disk_gib, driver.disk_gib())
     if size.asked and status.state is not VmState.OFF:
@@ -55,6 +59,8 @@ def preflight(size: Size) -> Tuple[Optional[VmStatus], Optional[NewBox]]:
         refuse(driver.resize_refusal(size))
     if status.state is not VmState.RUNNING:
         refuse_start()
+    if status.state is VmState.OFF and not restart:
+        refuse(driver.memory_refusal(size))
     return status, None
 
 
@@ -106,12 +112,14 @@ def vm_up(
     run_services: bool = True,
     passphrase: Optional[agent.PassphraseSource] = None,
     size: Size = NO_SIZE,
+    restart: bool = False,
 ) -> agent.PassphraseSource:
     """Bring the box up, unlocked, under the caller's box lock; the passphrase
     source it used, which derives only when an initrd asks (a plaintext seed
-    boots without 1Password)."""
+    boots without 1Password). `restart`: the box ran at this size a moment ago
+    in this command, so the host's free-memory check lets its start pass."""
     passphrase = passphrase or agent.PassphraseSource()
-    power_up(held, passphrase, size)
+    power_up(held, passphrase, size, restart)
     sshconfig.write_ssh_config()
     guest.ensure_guest_known_hosts()
     if run_services:
@@ -128,12 +136,15 @@ def vm_up(
 
 
 def power_up(
-    held: state.HeldBox, passphrase: agent.PassphraseSource, size: Size
+    held: state.HeldBox,
+    passphrase: agent.PassphraseSource,
+    size: Size,
+    restart: bool,
 ) -> None:
     """Create, resize, start and unlock the box as it needs, judged from what it
     is now, under the box lock; every check that can refuse runs before the
     first step that changes the box."""
-    status, new_box = preflight(size)
+    status, new_box = preflight(size, restart)
     if new_box is not None:
         state.driver().create(held, new_box)
         state.driver().start(held, passphrase)
@@ -418,7 +429,7 @@ def bootstrap(held: state.HeldBox, args: argparse.Namespace) -> None:
             raise stop_aborted(e.reason)
         except YoError as e:
             raise stop_aborted(e.message)
-        vm_up(held, run_services=False, passphrase=passphrase)
+        vm_up(held, run_services=False, passphrase=passphrase, restart=True)
         profile, booted = booted_generations(report)
         if profile != booted:
             raise report.abort(
@@ -514,7 +525,7 @@ def grow_disk(held: state.HeldBox, wanted: int) -> None:
         # The partition grows at the next boot (boot.growPartition).
         state.driver().stop(held)
         state.driver().grow_disk(held, wanted)
-        vm_up(held, passphrase=passphrase)
+        vm_up(held, passphrase=passphrase, restart=True)
     grow_mapping_and_filesystem(key)
     after = guest.guest_root_usage()
     ui.out("before: %s" % before.human_line)

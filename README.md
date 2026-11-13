@@ -61,6 +61,12 @@ A stopped box takes a new memory or CPU count the same way: `yo up --memory 12 -
 
 On Linux the redefinition is one `virsh define`: libvirt keeps the old definition or has the new one, and a host that dies between the define and the start leaves the box stopped at the new size, which a plain `yo up` starts. On a Mac it is one `limactl edit`, validated first, which Lima writes into `lima.yaml` in place: a crash inside that write could leave the instance unreadable, and then only `yo destroy --yes` and a new bootstrap help. A Mac refuses a `--memory` above its RAM.
 
+### Memory on a Linux host
+
+A libvirt box has no memory balloon: its qemu grows to all of the box's memory, and a host that runs short ends in the kernel's OOM killer, which may pick a box or anything else. So before `yo` creates a box or starts one that is off, it reads `MemAvailable` in `/proc/meminfo` and refuses unless the box's memory plus 4 GiB for the host fits in it. Swap does not count. This holds for the default 16 GiB too: a 16 GiB host cannot create a default box, and the refusal names the largest `--memory` that fits, `ask for at most --memory N`, or says to stop another domain or free host memory. A `--memory` above what the host has in total, less the 4 GiB and what every active domain may take, is refused first.
+
+The guard judges one moment: the start. A box that fits then can still grow into memory another box takes later, so a small box built beside a running large one (a throwaway box's bootstrap and reboot beside the working box) can still end in an OOM kill. Stop the working box first when both do not fit. The reboot inside `yo bootstrap` and the restart inside `yo disk-grow` are not judged again, since the box ran at that size a moment before. A Mac has no such guard: macOS reports no free-memory figure that means "available".
+
 ## Daily use
 
 The VM has two accounts. You are the operator: same name as on the host, with `sudo`. Agents run as `agent`, which has no `sudo`.

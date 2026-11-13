@@ -234,7 +234,8 @@ def build_parser() -> argparse.ArgumentParser:
         "stopped one is redefined with them before it starts, keeping its disk and\n"
         "its data. A box that is up is refused them: yo down && yo up --memory N.\n"
         "--disk sizes a new box; the disk of a box that exists grows with yo\n"
-        "disk-grow.",
+        "disk-grow. A box starts only when the host's free memory (MemAvailable on\n"
+        "Linux) holds its memory and 4 GiB more.",
     )
     add_size_arguments(up)
     up.set_defaults(func=vm.cmd_up)

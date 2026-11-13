@@ -79,7 +79,7 @@ OPERATOR_KEY_ITEM = "yolobox-operator"
 # in driver.py, which vm_up fills into the size.
 LIBVIRT_MEMORY_GIB = 16
 LIBVIRT_DISK_GIB = 100
-# What an explicit --memory leaves the host itself: its kernel, page cache and
+# What a box's memory leaves the host itself: its kernel, page cache and
 # desktop. A domain has no balloon (memballoon model='none'), so its qemu grows
 # to the whole of its memory, and a host short of it OOM-kills a qemu.
 HOST_MEMORY_RESERVE_GIB = 4
@@ -373,13 +373,24 @@ def gib_text(size: int) -> str:
     return "%.1f GiB" % (size / GIB)
 
 
+def others_text(others: Dict[str, int]) -> str:
+    """The active domains and the whole max memory each may take, as a message names them."""
+    return "%s (%s)" % (
+        gib_text(sum(others.values())),
+        ", ".join("%s %s" % (name, gib_text(others[name])) for name in sorted(others))
+        or "none",
+    )
+
+
 def memory_room(host: int, others: Dict[str, int]) -> int:
     """What is left for a new domain, in bytes: MemTotal less the host's reserve
     and the whole max memory of every active domain (none has a balloon)."""
     return host - HOST_MEMORY_RESERVE_GIB * GIB - sum(others.values())
 
 
-def memory_refusal(memory_gib: int, host: int, others: Dict[str, int]) -> Optional[str]:
+def total_memory_refusal(
+    memory_gib: int, host: int, others: Dict[str, int]
+) -> Optional[str]:
     """Why a new domain of `memory_gib` does not fit beside the active `others`
     on a host of `host` bytes, or None when it does."""
     room = memory_room(host, others)
@@ -394,19 +405,50 @@ def memory_refusal(memory_gib: int, host: int, others: Dict[str, int]) -> Option
         ways.append("that is under the %d GiB a box needs" % MIN_MEMORY_GIB)
     return (
         "--memory %d does not fit on this host: %s reads MemTotal %s, the host "
-        "keeps %d GiB for itself, and the other active domains may take %s (%s), "
+        "keeps %d GiB for itself, and the other active domains may take %s, "
         "which leaves %s for this box — %s"
         % (
             memory_gib,
             libvirt_host.MEMINFO_FILE,
             gib_text(host),
             HOST_MEMORY_RESERVE_GIB,
-            gib_text(sum(others.values())),
-            ", ".join(
-                "%s %s" % (name, gib_text(others[name])) for name in sorted(others)
-            )
-            or "none",
+            others_text(others),
             gib_text(max(room, 0)),
+            " or ".join(ways),
+        )
+    )
+
+
+def available_room(available: int) -> int:
+    """What a starting box may take of `available` bytes of MemAvailable, the
+    host's own reserve kept back. Swap is not counted: a guest's memory that
+    spills into it is slow, and a host that swaps is a host short of memory."""
+    return available - HOST_MEMORY_RESERVE_GIB * GIB
+
+
+def available_memory_refusal(
+    memory_gib: int, available: int, others: Dict[str, int]
+) -> str:
+    """Why a box that starts with `memory_gib` does not fit in what the host has
+    free now (`available` bytes of MemAvailable), naming the active `others`."""
+    room = available_room(available)
+    ways = []
+    if room >= MIN_MEMORY_GIB * GIB:
+        ways.append("ask for at most --memory %d" % (room // GIB))
+    if others:
+        ways.append("stop another domain")
+    ways.append("free host memory")
+    return (
+        "%d GiB of memory does not fit on this host now: %s reads MemAvailable "
+        "%s, the host keeps %d GiB for itself, which leaves %s for this box, and "
+        "the other active domains may take %s — %s"
+        % (
+            memory_gib,
+            libvirt_host.MEMINFO_FILE,
+            gib_text(available),
+            HOST_MEMORY_RESERVE_GIB,
+            gib_text(max(room, 0)),
+            others_text(others),
             " or ".join(ways),
         )
     )
@@ -594,9 +636,28 @@ class LibvirtDriver:
 
     def memory_fit_refusal(self, memory_gib: int) -> Optional[str]:
         """Why a domain of `memory_gib` does not fit beside the active ones."""
-        return memory_refusal(
-            memory_gib, libvirt_host.host_memory_bytes(), active_domains_memory()
+        return total_memory_refusal(
+            memory_gib, libvirt_host.meminfo_bytes("MemTotal"), active_domains_memory()
         )
+
+    def starting_memory_gib(self, size: Size) -> int:
+        """The memory this box starts with: the asked, else its definition's,
+        else a new box's default."""
+        if size.memory_gib is not None:
+            return size.memory_gib
+        if self.domain_exists():
+            return self.domain_facts().memory_gib
+        return LIBVIRT_MEMORY_GIB
+
+    def memory_refusal(self, size: Size) -> Optional[str]:
+        # A domain has no balloon, so its qemu grows to the whole of its memory,
+        # and a start that does not fit in what the host has free ends in the
+        # host's OOM killer. The default memory is judged like any other.
+        memory = self.starting_memory_gib(size)
+        available = libvirt_host.meminfo_bytes("MemAvailable")
+        if memory * GIB <= available_room(available):
+            return None
+        return available_memory_refusal(memory, available, active_domains_memory())
 
     def resize_refusal(self, size: Size) -> Optional[str]:
         # This box is off, so the active domains the check sums are the others.
@@ -621,8 +682,8 @@ class LibvirtDriver:
         return state_hint(word)
 
     def creation_refusal(self, size: Size) -> Optional[str]:
-        # Explicit values only: the default must not refuse a 16 GiB host, whose
-        # MemTotal is a little under 16 GiB.
+        # Explicit values only: the default is judged by memory_refusal, against
+        # what is free now.
         if size.memory_gib is not None:
             refusal = self.memory_fit_refusal(size.memory_gib)
             if refusal is not None:

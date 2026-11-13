@@ -40,7 +40,6 @@ RESOLV_CONF_TYPE = FACTS["host_resolv_conf_type"]
 LIBVIRT_POOL = "default"
 PORT_RANGE_FILE = "/proc/sys/net/ipv4/ip_local_port_range"
 MEMINFO_FILE = "/proc/meminfo"
-MEMTOTAL_RE = re.compile(r"^MemTotal:\s+(\d+) kB$", re.M)
 
 
 def host_setup_hint() -> str:
@@ -170,8 +169,9 @@ def forwarded_host_ports(root: ET.Element) -> List[int]:
     return ports
 
 
-def host_memory_bytes() -> int:
-    """The host's MemTotal: the most memory a domain can be given."""
+def meminfo_bytes(field: str) -> int:
+    """The `field` line of /proc/meminfo, in bytes. A missing, garbled or
+    unreadable one is an error: no other field stands in for it."""
     try:
         with open(MEMINFO_FILE, "r") as handle:
             text = handle.read()
@@ -179,9 +179,9 @@ def host_memory_bytes() -> int:
         raise YoError(
             "cannot read %s: %s" % (MEMINFO_FILE, ui.os_error_reason(failure))
         )
-    found = MEMTOTAL_RE.search(text)
+    found = re.search(r"^%s:[ \t]+(\d+) kB$" % re.escape(field), text, re.M)
     if found is None:
-        raise YoError("%s has no MemTotal line in kB" % MEMINFO_FILE)
+        raise YoError("%s has no %s line in kB" % (MEMINFO_FILE, field))
     return int(found.group(1)) * KIB
 
 

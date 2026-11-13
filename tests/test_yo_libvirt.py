@@ -555,10 +555,13 @@ class LibvirtCase(FakeHome):
         server.bind(str(sock))
         server.close()
 
-    def host_memory(self, kib):
-        """The host's MemTotal, as /proc/meminfo prints it."""
+    def host_memory(self, total_kib, available_kib=None):
+        """The host's MemTotal and MemAvailable (the same, unless a test says
+        the host has less free than it has), as /proc/meminfo prints them."""
         self.meminfo.write_text(
-            "MemTotal:       %d kB\nMemFree:         1048576 kB\n" % kib
+            "MemTotal:       %d kB\nMemFree:         1048576 kB\n"
+            "MemAvailable:   %d kB\n"
+            % (total_kib, total_kib if available_kib is None else available_kib)
         )
 
     def vm_word(self):
@@ -2810,7 +2813,7 @@ class TestDefinition(LibvirtCase):
 
 class TestVmUpOnAnExistingBox(LibvirtCase):
     """`yo up` on a box whose domain exists: its size flags resize it while it
-    is off."""
+    is off, and every start is judged against the host's free memory."""
 
     DISK_GIB = 100
 
@@ -2852,11 +2855,11 @@ class TestVmUpOnAnExistingBox(LibvirtCase):
             stubs["broken_agent_login"].return_value = None
             yield stubs
 
-    def vm_up(self, size):
+    def vm_up(self, size, restart=False):
         """Run vm_up; return the error it raised (or None) and its stubs."""
         with self.stubbed() as stubs:
             try:
-                locked(self.box, self.box.vm_up, size=size)
+                locked(self.box, self.box.vm_up, size=size, restart=restart)
             except self.box.YoError as failure:
                 return failure, stubs
         return None, stubs
@@ -3134,6 +3137,141 @@ class TestVmUpOnAnExistingBox(LibvirtCase):
         stubs["luks_key"].assert_called_once_with(self.driver.op_sock())
         stubs["luks_passphrase"].assert_not_called()
         self.assertEqual(self.writes(), [])
+
+    def free(self, gib, kib=0):
+        """The host has `gib` GiB (less `kib`) of memory available, of its 64."""
+        self.host_memory(HOST_MEMORY_GIB << 20, (gib << 20) - kib)
+
+    def test_a_start_that_fits_exactly_beside_the_hosts_reserve_passes(self):
+        self.free(self.facts.memory_gib + self.box.HOST_MEMORY_RESERVE_GIB)
+        error, _ = self.vm_up(self.box.NO_SIZE)
+        self.assertIsNone(error)
+
+    def test_one_kib_short_is_refused_naming_every_number_and_the_way_out(self):
+        self.free(self.facts.memory_gib + self.box.HOST_MEMORY_RESERVE_GIB, kib=1)
+        error, stubs = self.vm_up(self.box.NO_SIZE)
+        self.assert_refused_before_anything(
+            error, stubs, "16 GiB of memory does not fit"
+        )
+        self.assertIn("MemAvailable 20.0 GiB", error.message)
+        self.assertIn("keeps 4 GiB for itself", error.message)
+        self.assertIn("leaves 16.0 GiB for this box", error.message)
+        self.assertIn("ask for at most --memory 15 or free host memory", error.message)
+
+    def test_the_guard_judges_the_size_the_box_will_start_with_not_the_one_it_has(self):
+        self.free(22)
+        # The box has 16 GiB, which fits; 20 GiB, asked, does not.
+        error, stubs = self.up("--memory", "20")
+        self.assert_refused_before_anything(
+            error, stubs, "20 GiB of memory does not fit"
+        )
+        self.assertIn("ask for at most --memory 18", error.message)
+        # The box is defined at 32 GiB, which does not fit; 16 GiB, asked, does.
+        self.host.domains["yolobox-box"] = as_libvirt_prints(
+            self.box.domain_xml(
+                "box", self.facts._replace(memory_gib=32), VM_UID, VM_GID
+            )
+        )
+        error, _ = self.vm_up(self.box.NO_SIZE)
+        self.assertIn("32 GiB of memory does not fit", error.message)
+        error, _ = self.vm_up(self.box.Size(16, None, None))
+        self.assertIsNone(error)
+
+    def test_a_host_with_too_little_free_to_name_a_smaller_box_says_to_free_memory(
+        self,
+    ):
+        self.free(self.box.HOST_MEMORY_RESERVE_GIB + self.box.MIN_MEMORY_GIB - 1)
+        error, _ = self.vm_up(self.box.NO_SIZE)
+        self.assertIn("leaves 3.0 GiB for this box", error.message)
+        self.assertIn("— free host memory", error.message)
+        self.assertNotIn("at most", error.message)
+
+    def test_swap_is_not_free_memory(self):
+        self.meminfo.write_text(
+            "MemTotal: %d kB\nMemAvailable: %d kB\nSwapFree: %d kB\n"
+            % (HOST_MEMORY_GIB << 20, 8 << 20, 64 << 20)
+        )
+        error, _ = self.vm_up(self.box.NO_SIZE)
+        self.assertIn("MemAvailable 8.0 GiB", error.message)
+
+    def test_a_meminfo_without_a_readable_available_line_is_an_error_not_a_guess(self):
+        total = "MemTotal: %d kB\n" % (HOST_MEMORY_GIB << 20)
+        for text in (
+            "",
+            total,
+            total + "MemAvailable: lizard kB\n",
+            total + "MemAvailable: 1 MB\n",
+            total + "MemAvailable: -1 kB\n",
+            total + "MemAvailable:\n1 kB\n",
+        ):
+            with self.subTest(text=text):
+                self.meminfo.write_text(text)
+                error, stubs = self.vm_up(self.box.NO_SIZE)
+                self.assert_refused_before_anything(
+                    error, stubs, "has no MemAvailable line in kB"
+                )
+        self.meminfo.unlink()
+        error, stubs = self.vm_up(self.box.NO_SIZE)
+        self.assert_refused_before_anything(error, stubs, "cannot read")
+
+    def test_a_box_that_is_up_is_not_judged_and_the_host_memory_is_not_read(self):
+        self.host.states["yolobox-box"] = "running"
+        self.meminfo.unlink()
+        with mock.patch.object(
+            self.box.unlock,
+            "boot_stage",
+            return_value=self.box.Stage(self.box.BootStage.STAGE2, ""),
+        ):
+            error, _ = self.vm_up(self.box.NO_SIZE)
+        self.assertIsNone(error)
+
+    def test_the_restart_of_a_box_that_ran_a_moment_ago_is_not_judged_again(self):
+        self.free(1)
+        error, _ = self.vm_up(self.box.NO_SIZE, restart=True)
+        self.assertIsNone(error)
+        self.host.states["yolobox-box"] = "shut off"
+        error, _ = self.vm_up(self.box.NO_SIZE)
+        self.assertIn("does not fit", error.message)
+
+    def test_the_other_domains_are_read_and_named_only_to_explain_a_refusal(self):
+        self.host.foreign_domain("win", 6 << 20)
+        error, _ = self.vm_up(self.box.NO_SIZE)
+        self.assertIsNone(error)
+        self.assertEqual(self.host.calls_of("dominfo"), [])
+        self.host.states["yolobox-box"] = "shut off"
+        self.free(8)
+        error, _ = self.vm_up(self.box.NO_SIZE)
+        self.assertIn("may take 6.0 GiB (win 6.0 GiB)", error.message)
+        self.assertIn("stop another domain", error.message)
+
+    def test_a_box_that_does_not_exist_is_judged_at_the_default_memory(self):
+        self.host.domains.clear()
+        self.host.states.clear()
+        self.free(self.box.LIBVIRT_MEMORY_GIB + self.box.HOST_MEMORY_RESERVE_GIB, kib=1)
+        error, stubs = self.vm_up(self.box.NO_SIZE)
+        self.assert_refused_before_anything(
+            error, stubs, "16 GiB of memory does not fit"
+        )
+        self.assertIn("ask for at most --memory 15", error.message)
+
+    def test_a_default_box_does_not_fit_a_host_of_its_own_size(self):
+        # A 16 GiB host reports a little under 16 GiB, and keeps 4 for itself.
+        self.host.domains.clear()
+        self.host.states.clear()
+        self.host_memory((self.box.LIBVIRT_MEMORY_GIB << 20) - 1)
+        error, stubs = self.vm_up(self.box.NO_SIZE)
+        self.assert_refused_before_anything(error, stubs, "does not fit")
+        self.assertIn("ask for at most --memory 11", error.message)
+
+    def test_a_new_box_is_refused_by_the_total_the_host_has_before_what_it_has_free(
+        self,
+    ):
+        self.host.domains.clear()
+        self.host.states.clear()
+        self.free(2)
+        error, stubs = self.vm_up(self.box.Size(HOST_MEMORY_GIB, None, None))
+        self.assert_refused_before_anything(error, stubs, "reads MemTotal")
+        self.assertNotIn("MemAvailable", error.message)
 
 
 class TestVmUpCreatesAtTheAskedSize(LibvirtCase):

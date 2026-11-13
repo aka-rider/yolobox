@@ -833,8 +833,8 @@ class TestNamesAreJudgedWhole(unittest.TestCase):
     ALLOWED = {
         # The daemon's version out of `virsh version --daemon`.
         ("libvirt_host.py", "parse_daemon_version"): 1,
-        # MemTotal's number out of /proc/meminfo.
-        ("libvirt_host.py", "host_memory_bytes"): 1,
+        # One field's number out of /proc/meminfo.
+        ("libvirt_host.py", "meminfo_bytes"): 1,
         # The uid field out of each `ss -e` line, and its inode field.
         ("libvirt_host.py", "listener_uids"): 2,
         # The Max memory number out of `virsh dominfo`.

@@ -566,6 +566,11 @@ class LimaDriver:
         # start() judges the instance's own settings before it changes anything.
         return None
 
+    def memory_refusal(self, size: Size) -> Optional[str]:
+        # macOS has no reliable "available" figure: its free memory is mostly
+        # cache the system hands back, so no start is judged by it.
+        return None
+
     def resize_refusal(self, size: Size) -> Optional[str]:
         if size.memory_gib is None:
             return None

@@ -789,7 +789,11 @@ class TestBootstrapRebootDecision(FakeHome):
             [call.kwargs for call in yo.vm_up.call_args_list],
             [
                 {"run_services": False, "size": yo.NO_SIZE},
-                {"run_services": False, "passphrase": yo.vm_up.return_value},
+                {
+                    "run_services": False,
+                    "passphrase": yo.vm_up.return_value,
+                    "restart": True,
+                },
             ],
         )
 
@@ -816,6 +820,10 @@ class TestBootstrapRebootDecision(FakeHome):
         first, second = yo.vm_up.call_args_list
         self.assertEqual(first.kwargs["size"], yo.Size(memory_gib=24, disk_gib=250))
         self.assertEqual(second.kwargs.get("size", yo.NO_SIZE), yo.NO_SIZE)
+        # The reboot is the same box at the same size a moment later: the host's
+        # free memory was judged at the first start only.
+        self.assertFalse(first.kwargs.get("restart", False))
+        self.assertTrue(second.kwargs["restart"])
 
     def test_the_passphrase_is_derived_before_the_vm_stops(self):
         # A missing 1Password key must leave the running box alone.
@@ -3740,7 +3748,8 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         # The passphrase is derived before the stop, so a missing 1Password key
         # leaves the box running, and reused for the restart.
         self.assertEqual(
-            self.order, [{}, "passphrase", "stop", {"passphrase": self.source}]
+            self.order,
+            [{}, "passphrase", "stop", {"passphrase": self.source, "restart": True}],
         )
         self.assertEqual(
             self.edits(),
