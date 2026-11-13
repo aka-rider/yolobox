@@ -459,6 +459,32 @@ class TestToolsSpeakTheCLocale(unittest.TestCase):
         self.assertEqual(printed, [yo.ui.quoted_line("C de_DE.UTF-8")])
 
 
+class TestRunInADirectory(FakeHome):
+    """Every way yo runs a tool honours `cwd`, so a tool that writes beside
+    itself (limactl's rejected-edit file) writes where yo says."""
+
+    def test_each_way_of_running_a_tool_runs_it_in_the_directory_asked_for(self):
+        ways = {
+            "host": {},
+            "guest": {"guest": "agent"},
+            "streamed": {"filtered": True},
+            "to the terminal": {"capture": False},
+        }
+        for name, way in ways.items():
+            with self.subTest(way=name):
+                here = Path(self.home) / name.replace(" ", "-")
+                here.mkdir()
+                with mock.patch.object(yo.ui, "out"):
+                    yo.run(["touch", "witness"], cwd=str(here), check=True, **way)
+                self.assertEqual(os.listdir(here), ["witness"])
+
+    def test_no_directory_runs_the_tool_in_yos_own(self):
+        here = os.getcwd()
+        self.assertEqual(
+            yo.run(["pwd", "-P"], check=True).stdout.strip(), os.path.realpath(here)
+        )
+
+
 class TestAtomicWrite(FakeHome):
     def test_an_interrupt_before_the_replace_removes_the_temp_file(self):
         target = os.path.join(self.home, "file")

@@ -165,11 +165,12 @@ def run(
     filtered: bool = False,
     timeout: Optional[float] = None,
     guest: Optional[str] = None,
+    cwd: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
-    """Run `argv` to completion. `guest` names the account whose session on the
-    box this is ("operator", "root", the agent's name); None is a host tool. A
-    guest session's captured channels are capped at GUEST_CAPTURE_LIMIT bytes,
-    and its result is a GuestRun."""
+    """Run `argv` to completion, in the directory `cwd` (None: yo's own). `guest`
+    names the account whose session on the box this is ("operator", "root", the
+    agent's name); None is a host tool. A guest session's captured channels are
+    capped at GUEST_CAPTURE_LIMIT bytes, and its result is a GuestRun."""
     if filtered:
         unsupported = [
             name
@@ -192,9 +193,9 @@ def run(
         raise ValueError("run(guest=...) caps the session's output and has no timeout")
     try:
         if filtered:
-            completed = run_filtered(argv)
+            completed = run_filtered(argv, cwd)
         elif capture and guest is not None:
-            completed = run_capped(argv, stdin, env, merge_stderr, guest)
+            completed = run_capped(argv, stdin, env, merge_stderr, guest, cwd)
         else:
             completed = subprocess.run(
                 list(argv),
@@ -205,6 +206,7 @@ def run(
                 else None,
                 env=tool_env(env),
                 timeout=timeout,
+                cwd=cwd,
             )
     except FileNotFoundError:
         raise YoError("%s not found on PATH" % argv[0])
@@ -229,6 +231,7 @@ def run_capped(
     env: Optional[Dict[str, str]],
     merge_stderr: bool,
     guest: str,
+    cwd: Optional[str],
 ) -> GuestRun:
     """subprocess.run for a guest session that reads at most GUEST_CAPTURE_LIMIT
     bytes per channel. A channel that overflows kills the session, and the
@@ -246,6 +249,7 @@ def run_capped(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
         env=tool_env(env),
+        cwd=cwd,
     ) as child:
         sources = {"stdout": child.stdout}
         if not merge_stderr:
@@ -354,7 +358,9 @@ def spawn(
         raise YoError("%s not found on PATH" % argv[0])
 
 
-def run_filtered(argv: Sequence[str]) -> subprocess.CompletedProcess:
+def run_filtered(
+    argv: Sequence[str], cwd: Optional[str]
+) -> subprocess.CompletedProcess:
     """Stream the guest session's output live, each line behind ui.GUEST_LINE_PREFIX
     through out() and err(), so a project path or a Makefile recipe it prints is
     filtered like any other guest text and can never pass for a line of yo's own.
@@ -370,6 +376,7 @@ def run_filtered(argv: Sequence[str]) -> subprocess.CompletedProcess:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=tool_env(None),
+        cwd=cwd,
     ) as child:
         errors = threading.Thread(target=pump, args=(child.stderr, ui.err))
         errors.start()
