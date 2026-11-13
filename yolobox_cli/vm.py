@@ -592,7 +592,16 @@ def grow_disk(
         # The partition grows at the next boot (boot.growPartition).
         state.driver().grow_disk(held, growth.wanted)
         vm_restart(held, passphrase, run_services=run_services)
-    grow_mapping_and_filesystem(key)
+    try:
+        grow_mapping_and_filesystem(key)
+    except YoError as failed:
+        # The disk has grown, so what is left is the root's growth, which the
+        # same command runs again as it is.
+        raise YoError(
+            "%s\nrun %s to finish"
+            % (failed.message, state.yo_cmd("disk-grow", str(growth.wanted))),
+            failed.code,
+        )
     after = guest.guest_root_usage()
     ui.out("before: %s" % before.human_line)
     ui.out("after:  %s" % after.human_line)

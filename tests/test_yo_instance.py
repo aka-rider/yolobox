@@ -621,30 +621,40 @@ class TestVmUpOnAnExistingBox(VmUpOnLima):
     def test_a_size_flag_on_an_instance_yo_cannot_stop_is_told_why_not_sent_to_yo_down(
         self,
     ):
-        for status, says in (
-            (
-                "Broken",
-                "lima cannot load the instance, so there is nothing yo can stop",
-            ),
-            (
-                "Starting",
-                "yo does not know how to stop an instance lima reports as Starting",
-            ),
-        ):
+        error, stubs = self.up(yo.Size(24, None, 3), "Broken")
+        self.assertEqual(
+            error.message,
+            "second is Broken, so --memory 24 --cpus 3 cannot apply to it; lima "
+            "cannot load the instance, so there is nothing yo can stop. `limactl "
+            "list` says why. Once it is stopped, start it at that size: "
+            "yo -m second up --memory 24 --cpus 3",
+        )
+        self.assertEqual(self.order, [])
+
+    def test_the_refusal_says_what_yo_down_does_for_each_state_lima_reports(self):
+        # `yo down` hands every state but Broken to limactl, so the refusal sends
+        # the operator to it for those, and says what it says for Broken.
+        for status in ("Starting", "Installing", "Stopping"):
             with self.subTest(status=status):
-                error, stubs = self.up(yo.Size(24, None, 3), status)
-                self.assertEqual(
+                error, _ = self.up(yo.Size(24, None, None), status)
+                self.assertIn(
+                    "stop it and start it at that size: yo -m second down && "
+                    "yo -m second up --memory 24",
                     error.message,
-                    "second is %s, so --memory 24 --cpus 3 cannot apply to it; %s: "
-                    "`limactl list` %s. Once it is stopped, start it at that size: "
-                    "yo -m second up --memory 24 --cpus 3"
-                    % (
-                        status,
-                        says,
-                        "says why" if status == "Broken" else "shows its state",
-                    ),
                 )
-                self.assertEqual(self.order, [])
+        with (
+            as_instance(INSTANCE_B),
+            mock.patch.object(
+                yo.LIMA,
+                "vm_status",
+                return_value=yo.VmStatus(yo.VmState.OTHER, "Broken"),
+            ),
+            mock.patch.object(yo.proc, "run") as limactl,
+            self.assertRaises(yo.StopRefused) as down,
+        ):
+            locked(yo, yo.LIMA.stop)
+        limactl.assert_not_called()
+        self.assertEqual(down.exception.message, yo.LIMA.stop_refusal("Broken"))
 
     def test_bootstrap_names_itself_in_the_remedy(self):
         with (

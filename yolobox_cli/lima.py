@@ -586,18 +586,22 @@ class LimaDriver:
             % (size.memory_gib, ram // GIB, ram // GIB)
         )
 
-    def stop_refusal(self, word: str) -> Optional[str]:
-        if word == RUNNING:
-            return None
+    def require_stoppable(self, word: str) -> None:
+        """Raise StopRefused for the one state `limactl stop` has nothing to
+        stop in: an instance lima cannot load. Every other state is handed to
+        limactl, which stops it or says why not."""
         if word == BROKEN:
-            return (
-                "lima cannot load the instance, so there is nothing yo can stop: "
-                "`limactl list` says why"
+            raise StopRefused(
+                "lima cannot load the instance, so there is nothing yo can stop",
+                "`limactl list` says why",
             )
-        return (
-            "yo does not know how to stop an instance lima reports as %s: "
-            "`limactl list` shows its state" % word
-        )
+
+    def stop_refusal(self, word: str) -> Optional[str]:
+        try:
+            self.require_stoppable(word)
+        except StopRefused as refused:
+            return refused.message
+        return None
 
     def disk_gib(self) -> int:
         # The Disk field of limactl's own instance record, in bytes.
@@ -794,6 +798,8 @@ class LimaDriver:
         status = self.vm_status()
         if status is not None and status.state is VmState.OFF:
             return
+        if status is not None:
+            self.require_stoppable(status.word)
         # `yo down` reaches this without proof the box is past its initrd, so
         # the hostagent's kill, which ends the VM, is offered only once `yo ssh
         # true` succeeds: the initrd refuses that login (with a host-key or a

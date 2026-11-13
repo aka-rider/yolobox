@@ -3396,6 +3396,13 @@ class TestUpGrowsTheDisk(ExistingBoxCase):
             )
             stack.enter_context(
                 mock.patch.object(
+                    self.box.unlock,
+                    "boot_stage",
+                    return_value=self.box.Stage(self.box.BootStage.STAGE2, ""),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
                     self.box.guest,
                     "guest_root_usage",
                     return_value=mock.Mock(human_line="usage"),
@@ -3520,6 +3527,29 @@ class TestUpGrowsTheDisk(ExistingBoxCase):
         self.assertEqual(
             self.events, [("start", ["define"]), ("services",)] + self.GROWN
         )
+
+    def test_a_failed_root_growth_ends_with_the_command_that_finishes_it(self):
+        for failing in ("cryptsetup", "resize2fs"):
+            with self.subTest(failing=failing):
+                self.events.clear()
+                self.host.states["yolobox-box"] = "shut off"
+                self.guest_fails = failing
+                error, _ = self.grow("up", "--memory", "12", "--disk", "200")
+                self.assertEqual(
+                    error.message,
+                    "guest command failed\nrun yo -m box disk-grow 200 to finish",
+                )
+                # The command is run as printed, on the box that is up, and
+                # grows the root: the disk is done, so it stops nothing.
+                finish = shlex.split(
+                    error.message.rsplit("run ", 1)[1].rsplit(" to finish", 1)[0]
+                )
+                self.events.clear()
+                self.host.calls.clear()
+                error, _ = self.grow(*finish[3:])
+                self.assertIsNone(error)
+                self.assertEqual(self.host.calls_of("vol-resize"), [])
+                self.assertEqual(self.events, [("services",)] + self.GROWN)
 
     def test_a_rerun_after_the_root_s_growth_failed_finishes_it_once_the_box_is_down(
         self,
