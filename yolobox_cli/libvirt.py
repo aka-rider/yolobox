@@ -370,7 +370,9 @@ def active_domains_memory() -> Dict[str, int]:
 
 
 def gib_text(size: int) -> str:
-    return "%.1f GiB" % (size / GIB)
+    """`size` bytes as GiB in whole tenths, rounded down: a figure short of what
+    was asked never reads as the asked size (1 KiB under 16 GiB is 15.9)."""
+    return "%d.%d GiB" % divmod(size * 10 // GIB, 10)
 
 
 def others_text(others: Dict[str, int]) -> str:
@@ -440,15 +442,16 @@ def available_memory_refusal(
     ways.append("free host memory")
     return (
         "%d GiB of memory does not fit on this host now: %s reads MemAvailable "
-        "%s, the host keeps %d GiB for itself, which leaves %s for this box, and "
-        "the other active domains may take %s — %s"
+        "%s, the host keeps %d GiB for itself, which leaves %s for this box%s — %s"
         % (
             memory_gib,
             libvirt_host.MEMINFO_FILE,
             gib_text(available),
             HOST_MEMORY_RESERVE_GIB,
             gib_text(max(room, 0)),
-            others_text(others),
+            ", and the other active domains may take %s" % others_text(others)
+            if others
+            else "",
             " or ".join(ways),
         )
     )
@@ -674,8 +677,8 @@ class LibvirtDriver:
                 "%s — %s keeps its old size" % (refused.message, state.box.name)
             )
         ui.out(
-            "libvirt: resized %s to %d GiB, %d CPUs"
-            % (state.box.name, facts.memory_gib, facts.cpus)
+            "libvirt: resized %s to %s"
+            % (state.box.name, driver.size_words(facts.memory_gib, facts.cpus))
         )
 
     def resume_hint(self, word: str) -> Optional[str]:

@@ -595,9 +595,7 @@ class TestVmUpOnAnExistingBox(VmUpOnLima):
         self.assertEqual(
             kwargs["cwd"], os.path.join(yo.state.home(), ".lima", "second")
         )
-        stubs["out"].assert_called_once_with(
-            "lima: resized second to --memory 24 --cpus 3"
-        )
+        stubs["out"].assert_called_once_with("lima: resized second to 24 GiB, 3 CPUs")
         stubs["luks_passphrase"].assert_not_called()
 
     def test_memory_alone_and_cpus_alone_edit_only_what_was_asked(self):
@@ -694,6 +692,11 @@ class TestVmUpOnAnExistingBox(VmUpOnLima):
         self.assertIsNone(error)
         ((argv, _),) = self.edits
         self.assertEqual(argv[5:], ["--memory", "24"])
+
+    def test_a_resize_that_says_only_what_it_set(self):
+        error, stubs = self.up(yo.Size(None, None, 1))
+        self.assertIsNone(error)
+        stubs["out"].assert_called_once_with("lima: resized second to 1 CPU")
 
     def test_a_running_box_asked_for_nothing_goes_on_to_the_boot_stage(self):
         with mock.patch.object(

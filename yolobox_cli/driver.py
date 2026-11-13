@@ -140,6 +140,16 @@ class Size(NamedTuple):
 NO_SIZE = Size(None, None, None)
 
 
+def size_words(memory_gib: Optional[int], cpus: Optional[int]) -> str:
+    """ "12 GiB, 4 CPUs": what a resize set, naming only what it set."""
+    words = []
+    if memory_gib is not None:
+        words.append("%d GiB" % memory_gib)
+    if cpus is not None:
+        words.append("%d CPU%s" % (cpus, "" if cpus == 1 else "s"))
+    return ", ".join(words)
+
+
 def exact_gib(nbytes: int, what: str) -> int:
     """`nbytes` as whole GiB, the unit yo compares sizes in; an error for a
     fraction, which a comparison in whole GiB would round into a wrong answer."""

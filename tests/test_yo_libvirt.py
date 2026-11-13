@@ -1474,10 +1474,10 @@ class TestStatusAndSize(LibvirtCase):
         self.host_memory(((24 + 6 + self.box.HOST_MEMORY_RESERVE_GIB) << 20) - 1)
         refusal = self.refusal(memory_gib=24)
         self.assertIn("--memory 24 does not fit on this host", refusal)
-        self.assertIn("MemTotal 34.0 GiB", refusal)
+        self.assertIn("MemTotal 33.9 GiB", refusal)
         self.assertIn("keeps 4 GiB for itself", refusal)
         self.assertIn("may take 6.0 GiB (win 6.0 GiB)", refusal)
-        self.assertIn("leaves 24.0 GiB for this box", refusal)
+        self.assertIn("leaves 23.9 GiB for this box", refusal)
         self.assertIn("ask for at most --memory 23 or stop another domain", refusal)
 
     def test_memory_under_memtotal_is_refused_when_another_domain_holds_the_rest(
@@ -3153,10 +3153,15 @@ class TestVmUpOnAnExistingBox(LibvirtCase):
         self.assert_refused_before_anything(
             error, stubs, "16 GiB of memory does not fit"
         )
-        self.assertIn("MemAvailable 20.0 GiB", error.message)
-        self.assertIn("keeps 4 GiB for itself", error.message)
-        self.assertIn("leaves 16.0 GiB for this box", error.message)
-        self.assertIn("ask for at most --memory 15 or free host memory", error.message)
+        # The figures are rounded down, so a box that is short never reads as
+        # one that fits, and no domain is named when none is active.
+        self.assertEqual(
+            error.message,
+            "16 GiB of memory does not fit on this host now: %s reads MemAvailable "
+            "19.9 GiB, the host keeps 4 GiB for itself, which leaves 15.9 GiB for "
+            "this box — ask for at most --memory 15 or free host memory"
+            % self.box.libvirt_host.MEMINFO_FILE,
+        )
 
     def test_the_guard_judges_the_size_the_box_will_start_with_not_the_one_it_has(self):
         self.free(22)

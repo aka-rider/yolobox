@@ -874,7 +874,10 @@ class LimaDriver:
                 "limactl edit refused the resize (exit %d), so %s keeps its old size"
                 % (code, state.box.name)
             )
-        ui.out("lima: resized %s to %s" % (state.box.name, " ".join(flags)))
+        ui.out(
+            "lima: resized %s to %s"
+            % (state.box.name, driver.size_words(size.memory_gib, size.cpus))
+        )
 
 
 LIMA = LimaDriver()
