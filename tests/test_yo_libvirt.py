@@ -2811,9 +2811,9 @@ class TestDefinition(LibvirtCase):
         self.assertNotIn("start", self.host.subcommands())
 
 
-class TestVmUpOnAnExistingBox(LibvirtCase):
-    """`yo up` on a box whose domain exists: its size flags resize it while it
-    is off, and every start is judged against the host's free memory."""
+class ExistingBoxCase(LibvirtCase):
+    """A box whose domain exists, off, with its disk, and the stubs `yo up`
+    reaches around its definition and start."""
 
     DISK_GIB = 100
 
@@ -2855,11 +2855,12 @@ class TestVmUpOnAnExistingBox(LibvirtCase):
             stubs["broken_agent_login"].return_value = None
             yield stubs
 
-    def vm_up(self, size, restart=False):
+    def vm_up(self, size, mode=None):
         """Run vm_up; return the error it raised (or None) and its stubs."""
+        modes = {} if mode is None else {"mode": mode}
         with self.stubbed() as stubs:
             try:
-                locked(self.box, self.box.vm_up, size=size, restart=restart)
+                locked(self.box, self.box.vm_up, size=size, **modes)
             except self.box.YoError as failure:
                 return failure, stubs
         return None, stubs
@@ -2889,6 +2890,11 @@ class TestVmUpOnAnExistingBox(LibvirtCase):
         stubs["start"].assert_not_called()
         stubs["create"].assert_not_called()
         self.assertEqual(self.writes(), [])
+
+
+class TestVmUpOnAnExistingBox(ExistingBoxCase):
+    """`yo up` on a box whose domain exists: its size flags resize it while it
+    is off, and every start is judged against the host's free memory."""
 
     # What a resize does.
 
@@ -2997,21 +3003,6 @@ class TestVmUpOnAnExistingBox(LibvirtCase):
         self.assert_refused_before_anything(error, stubs, "does not fit on this host")
         self.assertIn("reads MemTotal 64.0 GiB", error.message)
         self.assertIn("ask for at most --memory 20", error.message)
-
-    def test_a_larger_disk_is_left_to_disk_grow_and_refused_before_anything(self):
-        error, stubs = self.up("--memory", "24", "--disk", "200")
-        self.assert_refused_before_anything(
-            error, stubs, "only yo -m box disk-grow 200"
-        )
-        self.assertNotIn("--memory", error.message)
-
-    def test_the_disk_grow_command_it_names_is_one_yo_runs(self):
-        error, _ = self.up("--disk", "200")
-        words = shlex.split(error.message.split("only ")[1].split(" does that")[0])
-        self.assertEqual(words[:3], ["yo", "-m", "box"])
-        args = self.box.build_parser().parse_args(words[3:])
-        self.assertIs(args.func, self.box.cmd_disk_grow)
-        self.assertEqual(args.size, 200)
 
     def test_a_smaller_disk_is_refused_before_anything(self):
         error, stubs = self.up("--disk", "50")
@@ -3232,7 +3223,7 @@ class TestVmUpOnAnExistingBox(LibvirtCase):
 
     def test_the_restart_of_a_box_that_ran_a_moment_ago_is_not_judged_again(self):
         self.free(1)
-        error, _ = self.vm_up(self.box.NO_SIZE, restart=True)
+        error, _ = self.vm_up(self.box.NO_SIZE, mode=self.box.StartMode.RESTART)
         self.assertIsNone(error)
         self.host.states["yolobox-box"] = "shut off"
         error, _ = self.vm_up(self.box.NO_SIZE)
@@ -3277,6 +3268,151 @@ class TestVmUpOnAnExistingBox(LibvirtCase):
         error, stubs = self.vm_up(self.box.Size(HOST_MEMORY_GIB, None, None))
         self.assert_refused_before_anything(error, stubs, "reads MemTotal")
         self.assertNotIn("MemAvailable", error.message)
+
+
+class TestUpGrowsTheDisk(ExistingBoxCase):
+    """`yo up --disk`, `yo up --memory --disk` and `yo disk-grow` on a stopped
+    box: one path, which starts the box as it is, stops it, changes its
+    definition and its disk while it is off, and starts it again."""
+
+    def setUp(self):
+        super().setUp()
+        self.events = []
+        self.memories = []
+        self.sources = []
+        self.on_first_start = lambda: None
+
+    def grow(self, *argv, fstype="crypto_LUKS"):
+        """`yo -m box ARGV` with the box's start and stop stubbed, recording in
+        `self.events` what the host had been asked to change at each of them and
+        which guest commands ran. Returns the error, if any, and the stubs."""
+        error = None
+        with self.stubbed() as stubs, contextlib.ExitStack() as stack:
+
+            def start(held, source):
+                self.events.append(("start", self.writes()))
+                self.memories.append(self.driver.domain_facts().memory_gib)
+                self.sources.append(source)
+                if len(self.events) == 1:
+                    self.on_first_start()
+                self.host.states["yolobox-box"] = "running"
+
+            def stop(held):
+                self.events.append(("stop", self.writes()))
+                self.host.states["yolobox-box"] = "shut off"
+
+            def guest(role, command, **kwargs):
+                self.events.append(("guest", command[:3], kwargs.get("stdin")))
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            stubs["start"].side_effect = start
+            stubs["luks_passphrase"].return_value = b"p" * 64
+            for target, name, replacement in (
+                (self.driver, "stop", stop),
+                (self.box.sshx, "ssh_run", guest),
+            ):
+                stack.enter_context(mock.patch.object(target, name, replacement))
+            stack.enter_context(
+                mock.patch.object(
+                    self.box.vm, "luks_device_fstype", return_value=fstype
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    self.box.guest,
+                    "guest_root_usage",
+                    return_value=mock.Mock(human_line="usage"),
+                )
+            )
+            try:
+                self.box.main(["-m", "box", *argv])
+            except self.box.YoError as failure:
+                error = failure
+        return error, stubs
+
+    def assert_grown(self, writes, memory, stubs):
+        grown = [
+            ("guest", ["sudo", "cryptsetup", "resize"], b"p" * 64),
+            ("guest", ["sudo", "resize2fs", "/dev/mapper/root"], None),
+        ]
+        self.assertEqual(
+            self.events, [("start", []), ("stop", []), ("start", writes)] + grown
+        )
+        self.assertEqual(self.memories, [self.facts.memory_gib, memory])
+        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 200 << 30)
+        # One source for both boots, and one signature: a Touch ID per command.
+        self.assertIs(self.sources[0], self.sources[1])
+        stubs["luks_passphrase"].assert_called_once_with()
+
+    def test_the_memory_and_the_disk_change_in_the_stop_between_two_boots(self):
+        error, stubs = self.grow("up", "--memory", "12", "--disk", "200")
+        self.assertIsNone(error)
+        self.assert_grown(["define", "vol-resize"], 12, stubs)
+
+    def test_a_disk_alone_changes_only_the_disk(self):
+        error, stubs = self.grow("up", "--disk", "200")
+        self.assertIsNone(error)
+        self.assert_grown(["vol-resize"], self.facts.memory_gib, stubs)
+
+    def test_disk_grow_is_the_same_path_without_a_size(self):
+        error, stubs = self.grow("disk-grow", "200")
+        self.assertIsNone(error)
+        self.assert_grown(["vol-resize"], self.facts.memory_gib, stubs)
+
+    def test_a_box_with_no_encrypted_root_is_refused_having_only_been_started(self):
+        error, stubs = self.grow("up", "--memory", "12", "--disk", "200", fstype="ext4")
+        self.assertIn("yo -m box bootstrap", error.message)
+        self.assertEqual(self.events, [("start", [])])
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.driver.domain_facts().memory_gib, self.facts.memory_gib)
+        self.assertEqual(self.host.capacity["yolobox-box.qcow2"], self.DISK_GIB << 30)
+        stubs["luks_passphrase"].assert_not_called()
+
+    def test_everything_refusable_is_refused_before_the_first_start(self):
+        # Too much memory for the host, for its CPUs, a smaller disk, a box that
+        # is up: the box is not started for any of them.
+        cases = (
+            (("--memory", str(HOST_MEMORY_GIB - 3), "--disk", "200"), "does not fit"),
+            (("--memory", "12", "--disk", "50"), "ask for at least 100"),
+        )
+        for flags, says in cases:
+            with self.subTest(flags=flags):
+                error, stubs = self.grow("up", *flags)
+                self.assertIn(says, error.message)
+                self.assertEqual(self.events, [])
+                self.assertEqual(self.writes(), [])
+                stubs["luks_key"].assert_not_called()
+        for word in ("running", "paused"):
+            with self.subTest(state=word):
+                self.host.states["yolobox-box"] = word
+                error, _ = self.grow("up", "--disk", "200")
+                self.assertIn("cannot apply to it", error.message)
+                self.assertEqual(self.events, [])
+
+    def test_both_starts_are_judged_before_the_first_one(self):
+        # The box starts with 16 GiB and restarts with 24: 22 GiB free hold the
+        # first and not the second; then the reverse, with the box at 32.
+        self.host_memory(HOST_MEMORY_GIB << 20, 22 << 20)
+        error, stubs = self.grow("up", "--memory", "24", "--disk", "200")
+        self.assertIn("24 GiB of memory does not fit", error.message)
+        self.host.domains["yolobox-box"] = as_libvirt_prints(
+            self.box.domain_xml(
+                "box", self.facts._replace(memory_gib=32), VM_UID, VM_GID
+            )
+        )
+        error, stubs = self.grow("up", "--memory", "16", "--disk", "200")
+        self.assertIn("32 GiB of memory does not fit", error.message)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.writes(), [])
+
+    def test_the_restart_inside_the_dance_is_not_judged_again(self):
+        # The host has the room for both starts when the command begins; by the
+        # restart it has none, which the restart does not look at.
+        self.host_memory(HOST_MEMORY_GIB << 20, 22 << 20)
+        self.on_first_start = lambda: self.host_memory(HOST_MEMORY_GIB << 20, 1 << 20)
+        error, _ = self.grow("up", "--memory", "18", "--disk", "200")
+        self.assertIsNone(error)
+        self.assertEqual(self.memories, [16, 18])
 
 
 class TestVmUpCreatesAtTheAskedSize(LibvirtCase):

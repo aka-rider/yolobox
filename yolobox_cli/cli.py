@@ -154,8 +154,9 @@ def add_size_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="GiB",
         type=box_gib("--disk", MIN_DISK_GIB, MIN_DISK_WHY),
         default=None,
-        help="the disk of the box this command creates (at least %d); the disk of "
-        "a box that exists grows with disk-grow" % MIN_DISK_GIB,
+        help="the disk of the box (at least %d): a new box is created with it, a "
+        "stopped one grows to it (booting twice, as disk-grow does), a smaller "
+        "disk is refused, and a box that is up is refused the flag" % MIN_DISK_GIB,
     )
     parser.add_argument(
         "--cpus",
@@ -232,10 +233,13 @@ def build_parser() -> argparse.ArgumentParser:
         "Safe to run again.\n"
         "--memory and --cpus size the box: a new box is created with them, and a\n"
         "stopped one is redefined with them before it starts, keeping its disk and\n"
-        "its data. A box that is up is refused them: yo down && yo up --memory N.\n"
-        "--disk sizes a new box; the disk of a box that exists grows with yo\n"
-        "disk-grow. A box starts only when the host's free memory (MemAvailable on\n"
-        "Linux) holds its memory and 4 GiB more.",
+        "its data. --disk sizes a new box; on a stopped box that exists it grows\n"
+        "the disk, and the encrypted root into it, as yo disk-grow does: the box\n"
+        "starts as it is, stops, takes the new memory, CPUs and disk, and starts\n"
+        "again, so it boots twice and 1Password is asked once. A box that is up is\n"
+        "refused all three: yo down && yo up --memory N. A box starts only when\n"
+        "the host's free memory (MemAvailable on Linux) holds its memory and 4 GiB\n"
+        "more.",
     )
     add_size_arguments(up)
     up.set_defaults(func=vm.cmd_up)

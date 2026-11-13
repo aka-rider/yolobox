@@ -668,15 +668,11 @@ class TestVmUpOnAnExistingBox(VmUpOnLima):
                 self.assertEqual(self.order, [])
                 stubs["luks_passphrase"].assert_not_called()
 
-    def test_a_disk_is_left_to_disk_grow_and_refused_before_anything(self):
-        for status in ("Stopped", "Running"):
-            with self.subTest(status=status):
-                with mock.patch.object(yo.LIMA, "disk_gib", return_value=100):
-                    error, stubs = self.up(yo.Size(24, 250, None), status)
-                self.assertIn(
-                    "only yo -m second disk-grow 250 does that", error.message
-                )
-                self.assertEqual(self.order, [])
+    def test_a_disk_flag_on_a_box_that_is_not_off_is_refused_like_any_size_flag(self):
+        with mock.patch.object(yo.LIMA, "disk_gib", return_value=100):
+            error, _ = self.up(yo.Size(None, 250, None), "Running")
+        self.assertIn("second is Running, so --disk 250 cannot apply", error.message)
+        self.assertEqual(self.order, [])
 
     def test_a_smaller_disk_is_refused_and_the_disk_it_has_is_no_change(self):
         with mock.patch.object(yo.LIMA, "disk_gib", return_value=100):
@@ -686,12 +682,16 @@ class TestVmUpOnAnExistingBox(VmUpOnLima):
         self.assertIsNone(error)
         self.assertEqual(self.order, ["start"])
 
-    def test_the_disk_the_box_has_is_never_part_of_the_edit(self):
-        with mock.patch.object(yo.LIMA, "disk_gib", return_value=100):
-            error, _ = self.up(yo.Size(24, 100, None))
-        self.assertIsNone(error)
-        ((argv, _),) = self.edits
-        self.assertEqual(argv[5:], ["--memory", "24"])
+    def test_the_disk_is_never_part_of_the_resize_edit(self):
+        # A larger one is grown by disk-grow's own stop, after this start.
+        for disk in (100, 250):
+            with self.subTest(disk=disk):
+                self.edits.clear()
+                with mock.patch.object(yo.LIMA, "disk_gib", return_value=100):
+                    error, _ = self.up(yo.Size(24, disk, None))
+                self.assertIsNone(error)
+                ((argv, _),) = self.edits
+                self.assertEqual(argv[5:], ["--memory", "24"])
 
     def test_a_resize_that_says_only_what_it_set(self):
         error, stubs = self.up(yo.Size(None, None, 1))
