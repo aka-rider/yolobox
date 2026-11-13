@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import enum
 import shlex
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from . import (
     agent,
@@ -35,30 +34,15 @@ DISK_FSTYPE_PLAIN = "ext4"
 DISK_FSTYPE_LUKS = "crypto_LUKS"
 
 
-class StartMode(enum.Enum):
-    """How vm_up starts a box that is off, which decides what is judged against
-    the host's free memory and when the memory and CPUs asked are applied."""
-
-    # The box was off when the command began: judged at the size it starts
-    # with, which is the asked one, applied by this start.
-    FRESH = "fresh"
-    # The box ran at this size a moment ago in this command (bootstrap's
-    # reboot, disk-grow's restart), so its start adds no load for the host to
-    # refuse and nothing new to apply.
-    RESTART = "restart"
-    # The start of disk-grow's first stop-and-start: the box starts with its
-    # definition, and the asked memory and CPUs are applied by the restart
-    # after the stop. Both starts are judged now, before anything changes.
-    STAGED = "staged"
-
-
 def preflight(
-    size: Size, mode: StartMode
+    size: Size, judge_memory: bool, command: str
 ) -> Tuple[Optional[VmStatus], Optional[NewBox]]:
     """The size flags and the host, judged before the box or the host is
     touched: no creation, resize, start or 1Password prompt is spent on a box
     that was going to be refused. Returns the box's status and the size a
-    creation gets: exactly one of the two is None."""
+    creation gets: exactly one of the two is None. `judge_memory` says whether
+    a start of a box that is off is judged against the host's free memory, at
+    the memory it starts with; `command` is the one a refusal tells to run again."""
     driver = state.driver()
     status = driver.vm_status()
     if status is None:
@@ -67,20 +51,16 @@ def preflight(
         # The default CPU count is decided here, so a host that cannot give one
         # is refused before the passphrase and both drivers create the same box.
         new_box = size.for_creation()
-        refuse(driver.memory_refusal(size))
+        refuse(driver.memory_refusal(size, exists=False))
         return status, new_box
-    if size.disk_gib is not None:
-        refuse_shrink(size.disk_gib, driver.disk_gib())
     if size.asked and status.state is not VmState.OFF:
-        raise YoError(started_box_refusal(status, size))
+        raise YoError(started_box_refusal(status, size, command))
     if size.resizes:
         refuse(driver.resize_refusal(size))
     if status.state is not VmState.RUNNING:
         refuse_start()
-    if status.state is VmState.OFF and mode is not StartMode.RESTART:
-        if mode is StartMode.STAGED and size.memory_gib is not None:
-            refuse(driver.memory_refusal(NO_SIZE))
-        refuse(driver.memory_refusal(size))
+    if status.state is VmState.OFF and judge_memory:
+        refuse(driver.memory_refusal(size, exists=True))
     return status, None
 
 
@@ -93,22 +73,24 @@ def refuse_start() -> None:
     refuse(state.driver().start_refusal())
 
 
-def started_box_refusal(status: VmStatus, size: Size) -> str:
+def started_box_refusal(status: VmStatus, size: Size, command: str) -> str:
     """The refusal of a size flag on a box that is not off: a definition applies
     only to a box that starts, and `yo up` restarts nothing. One place builds the
-    remedy, which names the commands that lead out of the state the box is in."""
-    resume = state.driver().resume_hint(status.word)
-    stop = "stop it" if resume is None else "%s, then stop it" % resume
-    return (
-        "%s is %s, so %s cannot apply to it; %s and start it at that size: %s && %s"
-        % (
-            state.box.name,
-            status.word,
-            " ".join(size.flags()),
-            stop,
-            state.yo_cmd("down"),
-            state.yo_cmd("up", *size.flags()),
-        )
+    remedy, which names the command refused and, from the driver's own refusal
+    of `yo down` for the state, the way out: `yo down` itself only when it can
+    stop the box from there, never a command that would loop."""
+    again = state.yo_cmd(command, *size.flags())
+    stuck = state.driver().stop_refusal(status.word)
+    way = (
+        "stop it and start it at that size: %s && %s" % (state.yo_cmd("down"), again)
+        if stuck is None
+        else "%s. Once it is stopped, start it at that size: %s" % (stuck, again)
+    )
+    return "%s is %s, so %s cannot apply to it; %s" % (
+        state.box.name,
+        status.word,
+        " ".join(size.flags()),
+        way,
     )
 
 
@@ -117,13 +99,36 @@ def vm_up(
     run_services: bool = True,
     passphrase: Optional[agent.PassphraseSource] = None,
     size: Size = NO_SIZE,
-    mode: StartMode = StartMode.FRESH,
+    command: str = "up",
 ) -> agent.PassphraseSource:
-    """Bring the box up, unlocked, under the caller's box lock; the passphrase
+    """Bring the box up, unlocked, under the caller's box lock, at the size
+    asked and judged against the host's free memory at it; the passphrase
     source it used, which derives only when an initrd asks (a plaintext seed
-    boots without 1Password)."""
+    boots without 1Password). `command` is the one a refusal names."""
+    return bring_up(held, run_services, passphrase, size, command, judge_memory=True)
+
+
+def vm_restart(
+    held: state.HeldBox,
+    passphrase: agent.PassphraseSource,
+    run_services: bool = True,
+) -> agent.PassphraseSource:
+    """Bring up again a box that this command stopped after it ran at its size:
+    bootstrap's reboot, disk-grow's restart. It carries no size and is not judged
+    against the host's free memory, since the box held that memory a moment ago."""
+    return bring_up(held, run_services, passphrase, NO_SIZE, "up", judge_memory=False)
+
+
+def bring_up(
+    held: state.HeldBox,
+    run_services: bool,
+    passphrase: Optional[agent.PassphraseSource],
+    size: Size,
+    command: str,
+    judge_memory: bool,
+) -> agent.PassphraseSource:
     passphrase = passphrase or agent.PassphraseSource()
-    power_up(held, passphrase, size, mode)
+    power_up(held, passphrase, size, judge_memory, command)
     sshconfig.write_ssh_config()
     guest.ensure_guest_known_hosts()
     if run_services:
@@ -143,12 +148,13 @@ def power_up(
     held: state.HeldBox,
     passphrase: agent.PassphraseSource,
     size: Size,
-    mode: StartMode,
+    judge_memory: bool,
+    command: str,
 ) -> None:
-    """Create, resize, start and unlock the box as it needs, judged from what it
-    is now, under the box lock; every check that can refuse runs before the
-    first step that changes the box."""
-    status, new_box = preflight(size, mode)
+    """Create, start (resized, when the box is off and asked) and unlock the box
+    as it needs, judged from what it is now, under the box lock; every check
+    that can refuse runs before the first step that changes the box."""
+    status, new_box = preflight(size, judge_memory, command)
     if new_box is not None:
         state.driver().create(held, new_box)
         state.driver().start(held, passphrase)
@@ -157,9 +163,9 @@ def power_up(
         # passphrase only after the start: a 1Password that cannot give the
         # key is refused while the box is still off.
         passphrase.require_key()
-        if size.resizes and mode is not StartMode.STAGED:
-            state.driver().resize(held, size)
-        state.driver().start(held, passphrase)
+        # The memory and CPUs asked are part of this start: one definition
+        # (libvirt) or one edit (Lima), made just before the box starts.
+        state.driver().start(held, passphrase, size)
     else:
         stage = unlock.boot_stage(held)
         if stage.kind is BootStage.UNKNOWN:
@@ -234,25 +240,40 @@ def asked_size(args: argparse.Namespace) -> Size:
     return Size(args.memory, args.disk, args.cpus)
 
 
-def disk_growth(size: Size) -> Optional[int]:
-    """The disk, in GiB, that a box which exists is grown to by a command asked
-    for `size`: None for no --disk, for a box that does not exist (it is created
-    at the disk) and for a disk the box has. A smaller one is refused by the
-    start's preflight."""
-    if size.disk_gib is None or state.driver().vm_status() is None:
+class DiskGrowth(NamedTuple):
+    """The disk a box that exists is asked to have, and the one it has, in GiB."""
+
+    wanted: int
+    current: int
+
+
+def existing_disk_growth(wanted: int) -> DiskGrowth:
+    """The growth of the disk of the box that exists to `wanted` GiB, read once,
+    before anything is spent on the box: a smaller disk is refused here."""
+    current = state.driver().disk_gib()
+    refuse_shrink(wanted, current)
+    return DiskGrowth(wanted, current)
+
+
+def disk_growth(wanted: Optional[int]) -> Optional[DiskGrowth]:
+    """The growth a --disk asks of a box that exists, None for no --disk and for
+    a box that does not exist, which is created at the disk. The disk the box has
+    is a growth too: it runs the root's growth again, which a run that failed
+    after the volume grew needs."""
+    if wanted is None or state.driver().vm_status() is None:
         return None
-    return size.disk_gib if size.disk_gib > state.driver().disk_gib() else None
+    return existing_disk_growth(wanted)
 
 
 @agent.clearing_passphrases
 def cmd_up(args: argparse.Namespace) -> None:
     with state.box_lock(wait=True) as held:
         size = asked_size(args)
-        wanted = disk_growth(size)
-        if wanted is None:
+        growth = disk_growth(size.disk_gib)
+        if growth is None:
             vm_up(held, size=size)
         else:
-            grow_disk(held, wanted, size)
+            grow_disk(held, growth, size)
 
 
 def initrd_down_refusal(initrd: unlock.InitrdEndpoint) -> str:
@@ -387,9 +408,9 @@ def bootstrap(held: state.HeldBox, args: argparse.Namespace) -> None:
 
     size = asked_size(args)
     # Read before the box is created or resized: a box that exists and is asked
-    # for a larger disk grows it once its root is encrypted, below.
-    wanted_disk = disk_growth(size)
-    passphrase = vm_up(held, run_services=False, size=size)
+    # for a disk grows it once its root is encrypted, below.
+    growth = disk_growth(size.disk_gib)
+    passphrase = vm_up(held, run_services=False, size=size, command="bootstrap")
     report.ok("VM up")
 
     if luks_device_fstype() == DISK_FSTYPE_PLAIN:
@@ -452,12 +473,7 @@ def bootstrap(held: state.HeldBox, args: argparse.Namespace) -> None:
             raise stop_aborted(e.reason)
         except YoError as e:
             raise stop_aborted(e.message)
-        vm_up(
-            held,
-            run_services=False,
-            passphrase=passphrase,
-            mode=StartMode.RESTART,
-        )
+        vm_restart(held, passphrase, run_services=False)
         profile, booted = booted_generations(report)
         if profile != booted:
             raise report.abort(
@@ -469,11 +485,11 @@ def bootstrap(held: state.HeldBox, args: argparse.Namespace) -> None:
             )
         report.ok("rebooted into the built generation")
 
-    if wanted_disk is not None:
+    if growth is not None:
         # After the encrypting reboot, since only an encrypted root can grow,
         # and with the passphrase this command already derived. The services
         # come last, as they do without a disk.
-        grow_disk(held, wanted_disk, passphrase=passphrase, run_services=False)
+        grow_disk(held, growth, passphrase=passphrase, run_services=False)
 
     include_present = sshconfig.ensure_ssh_config_include(refuse=False)
     guest.ensure_guest_known_hosts()
@@ -541,52 +557,41 @@ def cmd_disk_grow(args: argparse.Namespace) -> None:
     # Under the box lock from the size read to the resize: a `yo down` must not
     # stop the box mid-resize, and no other yo may grow it meanwhile.
     with state.box_lock(wait=True) as held:
-        grow_disk(held, args.size)
+        grow_disk(held, existing_disk_growth(args.size))
 
 
 def grow_disk(
     held: state.HeldBox,
-    wanted: int,
+    growth: DiskGrowth,
     size: Size = NO_SIZE,
     passphrase: Optional[agent.PassphraseSource] = None,
     run_services: bool = True,
 ) -> None:
-    """Grow the box's disk to `wanted` GiB, and the encrypted root into it: the
-    one path of `yo disk-grow`, of `yo up --disk` and of a bootstrap that is
-    asked for a larger disk. `size` is the memory and CPUs asked besides, which
-    are applied in the same stop, so the box boots twice and `passphrase`, one
-    source for both boots, derives once."""
-    current = state.driver().disk_gib()
-    # Refused before anything is spent on the box.
-    refuse_shrink(wanted, current)
-    # The box up first, as it is defined: the reads below need its guest, and the
-    # start's preflight judges everything asked, the resize included, before
-    # anything is spent on the box. A box that has no encrypted root is refused
-    # right after, having only been started.
+    """Grow the box's disk, and the encrypted root into it: the one path of
+    `yo disk-grow`, of `yo up --disk` and of a bootstrap asked for a disk. `size`
+    is the memory and CPUs asked besides, applied by the box's first start; a
+    disk to grow takes a stop and a second start, and `passphrase`, one source
+    for both boots, derives once. At the disk the box has there is no stop, and
+    the root's growth, which is a no-op at full size, runs again as it is."""
+    grows = growth.wanted != growth.current
+    # The box up first, at the size asked and judged at it: the reads below need
+    # its guest. A box that has no encrypted root is refused right after, having
+    # only been started. The services wait for the last start.
     passphrase = vm_up(
         held,
-        run_services=run_services,
+        run_services=run_services and not grows,
         passphrase=passphrase,
         size=size,
-        mode=StartMode.STAGED,
     )
     require_encrypted_root()
     before = guest.guest_root_usage()
     # Derived before the stop, so a missing 1Password key leaves the box running.
     key = passphrase()
-    if wanted != current:
+    if grows:
         state.driver().stop(held)
-        # Both while the box is off. The partition grows at the next boot
-        # (boot.growPartition).
-        if size.resizes:
-            state.driver().resize(held, size)
-        state.driver().grow_disk(held, wanted)
-        vm_up(
-            held,
-            run_services=run_services,
-            passphrase=passphrase,
-            mode=StartMode.RESTART,
-        )
+        # The partition grows at the next boot (boot.growPartition).
+        state.driver().grow_disk(held, growth.wanted)
+        vm_restart(held, passphrase, run_services=run_services)
     grow_mapping_and_filesystem(key)
     after = guest.guest_root_usage()
     ui.out("before: %s" % before.human_line)

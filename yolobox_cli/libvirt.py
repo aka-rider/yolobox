@@ -52,6 +52,7 @@ from .config import (
 from .driver import (
     BoxSize,
     DriverHints,
+    NO_SIZE,
     NewBox,
     Removal,
     Size,
@@ -583,6 +584,10 @@ class LibvirtDriver:
         definition of it, so there is no second copy to go missing. A domain that
         does not exist, or is not this box's, is refused first."""
         self.require_domain()
+        return self.read_domain_facts()
+
+    def read_domain_facts(self) -> DomainFacts:
+        """domain_facts() of a domain that is known to exist."""
         dump = libvirt_host.virsh("dumpxml", "--inactive", domain_name())
         root = libvirt_host.domain_root(dump.stdout)
         try:
@@ -643,20 +648,20 @@ class LibvirtDriver:
             memory_gib, libvirt_host.meminfo_bytes("MemTotal"), active_domains_memory()
         )
 
-    def starting_memory_gib(self, size: Size) -> int:
+    def starting_memory_gib(self, size: Size, exists: bool) -> int:
         """The memory this box starts with: the asked, else its definition's,
         else a new box's default."""
         if size.memory_gib is not None:
             return size.memory_gib
-        if self.domain_exists():
-            return self.domain_facts().memory_gib
+        if exists:
+            return self.read_domain_facts().memory_gib
         return LIBVIRT_MEMORY_GIB
 
-    def memory_refusal(self, size: Size) -> Optional[str]:
+    def memory_refusal(self, size: Size, exists: bool) -> Optional[str]:
         # A domain has no balloon, so its qemu grows to the whole of its memory,
         # and a start that does not fit in what the host has free ends in the
         # host's OOM killer. The default memory is judged like any other.
-        memory = self.starting_memory_gib(size)
+        memory = self.starting_memory_gib(size, exists)
         available = libvirt_host.meminfo_bytes("MemAvailable")
         if memory * GIB <= available_room(available):
             return None
@@ -668,21 +673,12 @@ class LibvirtDriver:
             return None
         return self.memory_fit_refusal(size.memory_gib)
 
-    def resize(self, held: state.HeldBox, size: Size) -> None:
-        facts = self.domain_facts().resized(size)
+    def stop_refusal(self, word: str) -> Optional[str]:
         try:
-            self.define_domain(facts)
-        except YoError as refused:
-            raise YoError(
-                "%s — %s keeps its old size" % (refused.message, state.box.name)
-            )
-        ui.out(
-            "libvirt: resized %s to %s"
-            % (state.box.name, driver.size_words(facts.memory_gib, facts.cpus))
-        )
-
-    def resume_hint(self, word: str) -> Optional[str]:
-        return state_hint(word)
+            self.require_stoppable(word)
+        except StopRefused as refused:
+            return refused.message
+        return None
 
     def creation_refusal(self, size: Size) -> Optional[str]:
         # Explicit values only: the default is judged by memory_refusal, against
@@ -910,6 +906,20 @@ class LibvirtDriver:
             libvirt_host.virsh("define", path, check=False), "virsh define %s" % path
         )
 
+    def define_resized(self, facts: DomainFacts) -> None:
+        """define_domain of the facts a resize asked for: a refusal says the box
+        keeps its old size, which destroying it would not help."""
+        try:
+            self.define_domain(facts)
+        except YoError as refused:
+            raise YoError(
+                "%s — %s keeps its old size" % (refused.message, state.box.name)
+            )
+        ui.out(
+            "libvirt: resized %s to %s"
+            % (state.box.name, driver.size_words(facts.memory_gib, facts.cpus))
+        )
+
     def define_or_recreate(self, facts: DomainFacts) -> None:
         """define_domain, with the way out when libvirt refuses a domain that
         yo cannot work with."""
@@ -938,13 +948,22 @@ class LibvirtDriver:
         # start_domain() reads the ACL again should another domain's start narrow it.
         return libvirt_host.passt_dir_gap() or libvirt_host.resolver_label_gap()
 
-    def start(self, held: state.HeldBox, passphrase: Callable[[], bytes]) -> None:
-        facts = self.domain_facts()
+    def start(
+        self,
+        held: state.HeldBox,
+        passphrase: Callable[[], bytes],
+        size: Size = NO_SIZE,
+    ) -> None:
+        facts = self.domain_facts().resized(size)
         self.sync_cidata(self.cidata())
-        # A stopped domain is always what this yo's template makes; a domain
-        # that is up keeps the definition it runs.
+        # A stopped domain is always what this yo's template makes, with the
+        # memory and CPUs asked, in this one definition; a domain that is up
+        # keeps the definition it runs.
         if self.domain_state() == STATE_OFF:
-            self.define_or_recreate(facts)
+            if size.resizes:
+                self.define_resized(facts)
+            else:
+                self.define_or_recreate(facts)
         # libvirt starts no foreground process: the domain is Running as soon as
         # `virsh start` returns, and unlock_disk judges it by its state alone.
         self.start_domain()

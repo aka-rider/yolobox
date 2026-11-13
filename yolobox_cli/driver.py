@@ -235,23 +235,28 @@ class Driver(Protocol):
     def creation_refusal(self, size: Size) -> Optional[str]: ...
     # Why start() will not start it on this host, read before anything changes.
     def start_refusal(self) -> Optional[str]: ...
-    # Why the start of the box that is off (or will be created) does not fit the
-    # host's free memory, at the memory it starts with: the asked, else its own.
-    def memory_refusal(self, size: Size) -> Optional[str]: ...
+    # Why the start of the box that is off (or will be created: `exists` False)
+    # does not fit the host's free memory, at the memory it starts with: the
+    # asked, else its own, else a new box's default.
+    def memory_refusal(self, size: Size, exists: bool) -> Optional[str]: ...
     # Why the box that is off cannot be resized to the memory and CPUs asked.
     def resize_refusal(self, size: Size) -> Optional[str]: ...
-    # How to bring a box stuck in the host's word `word` back, so that it can be
-    # stopped; None when the driver knows none.
-    def resume_hint(self, word: str) -> Optional[str]: ...
+    # Why `yo down` cannot stop a box in the host's word `word`, with the way out
+    # the driver knows, as `yo down` itself says it; None when it can.
+    def stop_refusal(self, word: str) -> Optional[str]: ...
     # The disk ceiling of the instance that exists, in whole GiB, read from the
     # host (YoError when it cannot be read).
     def disk_gib(self) -> int: ...
     def verify_vm_listener(self, port: int) -> None: ...  # YoError: not the VM's
     # Create the instance at `new_box` from the seed image, stopped.
     def create(self, held: HeldBox, new_box: NewBox) -> None: ...
-    # Start the instance, unlock its disk with `passphrase()` should an initrd
-    # ask, and wait for the operator's ssh, under the box lock.
-    def start(self, held: HeldBox, passphrase: Callable[[], bytes]) -> None: ...
+    # Start the instance (given the memory and CPUs `size` asks for, None: as
+    # they are, in one definition or one edit just before the start), unlock its
+    # disk with `passphrase()` should an initrd ask, and wait for the operator's
+    # ssh, under the box lock.
+    def start(
+        self, held: HeldBox, passphrase: Callable[[], bytes], size: Size = NO_SIZE
+    ) -> None: ...
     def stop(self, held: HeldBox) -> None: ...  # YoError when it will not stop
     def force_stop(self, held: HeldBox) -> None: ...  # a hard power-off
     # What of this machine the driver holds and `yo destroy` removes, in the order
@@ -264,9 +269,6 @@ class Driver(Protocol):
     def disk_image(self) -> Optional[Tuple[str, int]]: ...  # label and host KiB
     # Raise the disk's ceiling. The VM must be off, and it stays off.
     def grow_disk(self, held: HeldBox, wanted_gib: int) -> None: ...
-    # Give the box that is off the memory and CPUs `size` asks for (None: as
-    # they are), all or nothing; the box stays off.
-    def resize(self, held: HeldBox, size: Size) -> None: ...
 
 
 # In the directory of every instance: the lock that makes picking a host

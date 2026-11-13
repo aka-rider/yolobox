@@ -24,6 +24,7 @@ from .config import (
     USAGE_EXIT,
 )
 from .driver import (
+    NO_SIZE,
     DriverHints,
     NewBox,
     Removal,
@@ -154,6 +155,8 @@ LIMA_START_TIMEOUT = "4h"
 # limactl's status for an instance it cannot load: a lima.yaml it refuses, or a
 # hostagent pid file left behind.
 BROKEN = "Broken"
+# limactl's status for an instance that runs.
+RUNNING = "Running"
 # What limactl reports while `limactl start` is still creating, downloading or
 # booting: a start waits through these and through an unlisted instance.
 PRE_BOOT_STATUSES = ("Installing", "Starting", "Stopped")
@@ -555,7 +558,7 @@ class LimaDriver:
                 "limactl list %s --json printed the status %r, not a word"
                 % (state.box.name, info.status)
             )
-        states = {"Running": VmState.RUNNING, "Stopped": VmState.OFF}
+        states = {RUNNING: VmState.RUNNING, "Stopped": VmState.OFF}
         return VmStatus(states.get(info.status, VmState.OTHER), info.status)
 
     def creation_refusal(self, size: Size) -> Optional[str]:
@@ -566,7 +569,7 @@ class LimaDriver:
         # start() judges the instance's own settings before it changes anything.
         return None
 
-    def memory_refusal(self, size: Size) -> Optional[str]:
+    def memory_refusal(self, size: Size, exists: bool) -> Optional[str]:
         # macOS has no reliable "available" figure: its free memory is mostly
         # cache the system hands back, so no start is judged by it.
         return None
@@ -583,8 +586,18 @@ class LimaDriver:
             % (size.memory_gib, ram // GIB, ram // GIB)
         )
 
-    def resume_hint(self, word: str) -> Optional[str]:
-        return None
+    def stop_refusal(self, word: str) -> Optional[str]:
+        if word == RUNNING:
+            return None
+        if word == BROKEN:
+            return (
+                "lima cannot load the instance, so there is nothing yo can stop: "
+                "`limactl list` says why"
+            )
+        return (
+            "yo does not know how to stop an instance lima reports as %s: "
+            "`limactl list` shows its state" % word
+        )
 
     def disk_gib(self) -> int:
         # The Disk field of limactl's own instance record, in bytes.
@@ -727,8 +740,15 @@ class LimaDriver:
         )
         return ["--set", ".ssh.localPort=%d" % port]
 
-    def start(self, held: state.HeldBox, passphrase: Callable[[], bytes]) -> None:
+    def start(
+        self,
+        held: state.HeldBox,
+        passphrase: Callable[[], bytes],
+        size: Size = NO_SIZE,
+    ) -> None:
         self.refuse_fatal_gaps()
+        if size.resizes:
+            self.resize(size)
         # limactl start blocks until lima's own ssh works, which needs the disk
         # unlocked, so it runs beside the unlock instead of before it, and its
         # own deadline must outlast the seed's in-place encryption.
@@ -866,7 +886,9 @@ class LimaDriver:
         if code != 0:
             raise YoError("limactl edit refused the disk resize (exit %d)" % code)
 
-    def resize(self, held: state.HeldBox, size: Size) -> None:
+    def resize(self, size: Size) -> None:
+        """The memory and CPUs asked, in one edit of the stopped instance, just
+        before its start."""
         flags = Size(size.memory_gib, None, size.cpus).flags()
         code = self.edit_instance(flags)
         if code != 0:

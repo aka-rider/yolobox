@@ -235,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
         "stopped one is redefined with them before it starts, keeping its disk and\n"
         "its data. --disk sizes a new box; on a stopped box that exists it grows\n"
         "the disk, and the encrypted root into it, as yo disk-grow does: the box\n"
-        "starts as it is, stops, takes the new memory, CPUs and disk, and starts\n"
+        "starts (at the memory and CPUs asked), stops, grows its disk and starts\n"
         "again, so it boots twice and 1Password is asked once. A box that is up is\n"
         "refused all three: yo down && yo up --memory N. A box starts only when\n"
         "the host's free memory (MemAvailable on Linux) holds its memory and 4 GiB\n"

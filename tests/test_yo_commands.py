@@ -688,6 +688,7 @@ class TestBootstrapRebootDecision(FakeHome):
         self.addCleanup(pinned.stop)
         for module, name in (
             (yo.vm, "vm_up"),
+            (yo.vm, "vm_restart"),
             (yo.forwards, "vm_services"),
             (yo.forwards, "ensure_herdr_machine"),
             (yo.guest, "ensure_guest_known_hosts"),
@@ -785,19 +786,15 @@ class TestBootstrapRebootDecision(FakeHome):
     def test_stops_exactly_once_then_starts_again_when_the_second_read_agrees(self):
         calls = self.run_bootstrap([("g1", "g0"), ("g1", "g1")])
         self.assertEqual(calls, [["limactl", "--log-level=warn", "stop", "yolobox"]])
-        self.assertEqual(
-            [call.kwargs for call in yo.vm_up.call_args_list],
-            [
-                {"run_services": False, "size": yo.NO_SIZE},
-                {
-                    "run_services": False,
-                    "passphrase": yo.vm_up.return_value,
-                    "mode": yo.StartMode.RESTART,
-                },
-            ],
+        yo.vm_up.assert_called_once_with(
+            mock.ANY, run_services=False, size=yo.NO_SIZE, command="bootstrap"
+        )
+        # The reboot carries the source the first start made, and no size.
+        yo.vm_restart.assert_called_once_with(
+            mock.ANY, yo.vm_up.return_value, run_services=False
         )
 
-    def test_the_size_asked_for_reaches_only_the_first_vm_up(self):
+    def test_the_size_asked_for_reaches_the_first_start_and_the_reboot_has_none(self):
         args = yo.build_parser().parse_args(
             [
                 "bootstrap",
@@ -811,6 +808,7 @@ class TestBootstrapRebootDecision(FakeHome):
         )
         with (
             mock.patch.object(yo.LIMA, "disk_gib", return_value=250),
+            mock.patch.object(yo.vm, "grow_disk"),
             mock.patch.object(
                 yo.vm, "guest_generations", side_effect=[("g1", "g0"), ("g1", "g1")]
             ),
@@ -818,15 +816,12 @@ class TestBootstrapRebootDecision(FakeHome):
             mock.patch.object(yo.LIMA, "stop"),
         ):
             yo.cmd_bootstrap(args)
-        first, second = yo.vm_up.call_args_list
-        self.assertEqual(first.kwargs["size"], yo.Size(memory_gib=24, disk_gib=250))
-        self.assertEqual(second.kwargs.get("size", yo.NO_SIZE), yo.NO_SIZE)
-        # The reboot is the same box at the same size a moment later: the host's
-        # free memory was judged at the first start only.
-        self.assertEqual(
-            first.kwargs.get("mode", yo.StartMode.FRESH), yo.StartMode.FRESH
-        )
-        self.assertEqual(second.kwargs["mode"], yo.StartMode.RESTART)
+        ((held,), kwargs) = yo.vm_up.call_args
+        self.assertEqual(kwargs["size"], yo.Size(memory_gib=24, disk_gib=250))
+        # The reboot is the same box at the same size a moment later: there is
+        # no size to give it, and the host's free memory is not judged again.
+        ((_, _), restart_kwargs) = yo.vm_restart.call_args
+        self.assertEqual(restart_kwargs, {"run_services": False})
 
     def test_a_larger_disk_for_a_box_that_exists_is_grown_after_the_reboot_and_before_the_services(
         self,
@@ -839,6 +834,7 @@ class TestBootstrapRebootDecision(FakeHome):
             (yo.forwards, "ensure_herdr_machine"),
             (yo.forwards, "vm_services"),
             (yo.vm, "vm_up"),
+            (yo.vm, "vm_restart"),
         ):
             patcher = mock.patch.object(
                 module,
@@ -861,25 +857,45 @@ class TestBootstrapRebootDecision(FakeHome):
             yo.cmd_bootstrap(args)
         self.assertEqual(
             order,
-            ["vm_up", "vm_up", "grow_disk", "ensure_herdr_machine", "vm_services"],
+            [
+                "vm_up",
+                "vm_restart",
+                "grow_disk",
+                "ensure_herdr_machine",
+                "vm_services",
+            ],
         )
-        ((held, wanted), kwargs) = yo.vm.grow_disk.call_args
+        ((held, growth), kwargs) = yo.vm.grow_disk.call_args
         self.assertIsInstance(held, yo.state.HeldBox)
-        self.assertEqual(wanted, 250)
+        self.assertEqual(growth, yo.DiskGrowth(wanted=250, current=100))
         # The source the first vm_up made, so the passphrase derives once.
         self.assertEqual(kwargs, {"passphrase": source, "run_services": False})
 
-    def test_a_disk_the_box_has_or_a_box_that_does_not_exist_grows_nothing(self):
+    def test_a_box_that_does_not_exist_is_created_at_its_disk_and_not_grown(self):
         args = yo.build_parser().parse_args(
             ["bootstrap", "--version", "github:x/y/z", "--disk", "100"]
         )
-        for status, disk in (
-            (yo.VmStatus(yo.VmState.RUNNING, "Running"), 100),
-            (None, 40),
+        with (
+            mock.patch.object(yo.LIMA, "vm_status", return_value=None),
+            mock.patch.object(yo.LIMA, "disk_gib") as disk,
+            mock.patch.object(yo.vm, "grow_disk") as grow,
+            mock.patch.object(yo.vm, "guest_generations", return_value=("g1", "g1")),
+            mock.patch.object(yo.proc, "run"),
         ):
-            with self.subTest(status=status):
+            yo.cmd_bootstrap(args)
+        grow.assert_not_called()
+        disk.assert_not_called()
+
+    def test_the_disk_the_box_has_still_runs_the_roots_growth_and_a_smaller_one_is_refused(
+        self,
+    ):
+        for disk, wanted in ((100, "100"), (200, "50")):
+            with self.subTest(disk=disk, wanted=wanted):
+                args = yo.build_parser().parse_args(
+                    ["bootstrap", "--version", "github:x/y/z", "--disk", wanted]
+                )
+                yo.vm_up.reset_mock()
                 with (
-                    mock.patch.object(yo.LIMA, "vm_status", return_value=status),
                     mock.patch.object(yo.LIMA, "disk_gib", return_value=disk),
                     mock.patch.object(yo.vm, "grow_disk") as grow,
                     mock.patch.object(
@@ -887,8 +903,15 @@ class TestBootstrapRebootDecision(FakeHome):
                     ),
                     mock.patch.object(yo.proc, "run"),
                 ):
-                    yo.cmd_bootstrap(args)
-                grow.assert_not_called()
+                    if wanted == "50":
+                        with self.assertRaisesRegex(yo.YoError, "ask for at least 200"):
+                            yo.cmd_bootstrap(args)
+                        grow.assert_not_called()
+                        yo.vm_up.assert_not_called()
+                    else:
+                        yo.cmd_bootstrap(args)
+                        ((_, growth), _) = grow.call_args
+                        self.assertEqual(growth, yo.DiskGrowth(100, 100))
 
     def test_the_passphrase_is_derived_before_the_vm_stops(self):
         # A missing 1Password key must leave the running box alone.
@@ -920,6 +943,7 @@ class TestBootstrapRebootDecision(FakeHome):
             return record
 
         yo.vm_up.side_effect = recorded("vm_up", yo.vm_up.return_value)
+        yo.vm_restart.side_effect = recorded("vm_restart", yo.vm_up.return_value)
 
         def ssh_run(role, argv, **kwargs):
             recorded("ssh_run")()
@@ -933,7 +957,8 @@ class TestBootstrapRebootDecision(FakeHome):
         self.assertEqual(
             held,
             {
-                "vm_up": [True, True],
+                "vm_up": [True],
+                "vm_restart": [True],
                 "ssh_run": [True] * len(held["ssh_run"]),
                 "stop": [True],
                 "herdr": [True],
@@ -944,7 +969,9 @@ class TestBootstrapRebootDecision(FakeHome):
 
     def test_vm_up_brings_the_vm_up_without_services(self):
         self.run_bootstrap([("g1", "g1")])
-        yo.vm_up.assert_called_once_with(mock.ANY, run_services=False, size=yo.NO_SIZE)
+        yo.vm_up.assert_called_once_with(
+            mock.ANY, run_services=False, size=yo.NO_SIZE, command="bootstrap"
+        )
         self.assertIsInstance(yo.vm_up.call_args.args[0], yo.state.HeldBox)
 
     def test_vm_services_runs_once_after_deciding_the_generation_already_matches(self):
@@ -3783,6 +3810,14 @@ class TestDiskGrowResizesTheMapping(FakeHome):
                 side_effect=lambda held, **kw: order.append(kw) or self.source,
             ),
             mock.patch.object(
+                yo.vm,
+                "vm_restart",
+                side_effect=lambda held, passphrase, run_services=True: (
+                    order.append({"restart": passphrase, "run_services": run_services})
+                    or self.source
+                ),
+            ),
+            mock.patch.object(
                 yo.agent,
                 "luks_passphrase",
                 side_effect=lambda: order.append("passphrase") or b"p" * 64,
@@ -3810,19 +3845,12 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         self.assertIn(resize, calls)
         self.assertEqual(calls.index(grow_fs), calls.index(resize) + 1)
 
-    FIRST_UP = {
-        "run_services": True,
-        "passphrase": None,
-        "size": yo.NO_SIZE,
-        "mode": yo.StartMode.STAGED,
-    }
+    # The services wait for the last start: the first one has no services when
+    # a restart follows it.
+    FIRST_UP = {"run_services": False, "passphrase": None, "size": yo.NO_SIZE}
 
     def restart(self):
-        return {
-            "run_services": True,
-            "passphrase": self.source,
-            "mode": yo.StartMode.RESTART,
-        }
+        return {"restart": self.source, "run_services": True}
 
     def test_the_box_is_up_then_stopped_grown_restarted_and_its_root_grown_into_it(
         self,
@@ -3869,7 +3897,6 @@ class TestDiskGrowResizesTheMapping(FakeHome):
                 {**self.FIRST_UP, "size": yo.Size(12, 200, None)},
                 "passphrase",
                 "stop",
-                ("edit", ["--memory", "12"]),
                 ("edit", ["--disk", "200"]),
                 self.restart(),
             ],
@@ -3880,15 +3907,22 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         # The mapping and filesystem grows are no-ops at full size, so a grow
         # that failed after the ceiling moved is finished by asking again.
         calls = self.disk_grow(size="100")
-        self.assertEqual(self.order, [self.FIRST_UP, "passphrase"])
+        self.assertEqual(
+            self.order, [{**self.FIRST_UP, "run_services": True}, "passphrase"]
+        )
         self.assertEqual(self.edits(), [])
         self.resized(calls)
 
     def test_a_ceiling_below_the_current_one_is_refused_before_anything_runs(self):
-        with self.assertRaises(yo.YoError) as caught:
-            self.disk_grow(size="50")
-        self.assertIn("at least 100", caught.exception.message)
-        self.assertEqual(self.order, [])
+        for command in (["disk-grow", "50"], ["up", "--memory", "12", "--disk", "50"]):
+            with self.subTest(command=command):
+                with (
+                    mock.patch.object(yo.LIMA, "vm_status", return_value=STOPPED),
+                    self.assertRaises(yo.YoError) as caught,
+                ):
+                    self.disk_grow(command=command)
+                self.assertIn("at least 100", caught.exception.message)
+                self.assertEqual(self.order, [])
 
     def test_an_unencrypted_disk_is_refused_before_the_passphrase_and_the_stop(self):
         with self.assertRaises(yo.YoError) as caught:
