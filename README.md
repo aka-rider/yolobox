@@ -55,7 +55,11 @@ Include ~/.local/state/yolobox/instances/*/ssh.config ~/.lima/*/ssh.config
 
 The first bootstrap encrypts the disk in place. That can take many minutes on a large disk, and the first few must not be interrupted. If it is interrupted anyway, run `yo destroy --yes && yo bootstrap`.
 
-The box gets 16 GiB of memory, a 100 GiB disk and one CPU less than your machine has, at most 4. Sizes apply only when a box is created: `yo bootstrap --memory 24 --disk 250 --cpus 3`. Later, `yo disk-grow <GiB>` grows the disk; any other size change means `yo destroy --yes` and a new bootstrap.
+The box gets 16 GiB of memory, a 100 GiB disk and one CPU less than your machine has, at most 4. Ask for another size when the box is created: `yo bootstrap --memory 24 --disk 250 --cpus 3`.
+
+A stopped box takes a new memory or CPU count the same way: `yo up --memory 12 --cpus 2` checks the flags, redefines the box with them, keeps its disk and everything on it, and starts it. Run again with the same flags, it does the same. A box that is up (or paused) is refused the flags, and the refusal names the commands: `yo down && yo up --memory 12`. A disk only grows, and only with `yo disk-grow <GiB>`: `yo up --disk <GiB>` on a box that exists is refused and names it.
+
+On Linux the redefinition is one `virsh define`: libvirt keeps the old definition or has the new one, and a host that dies between the define and the start leaves the box stopped at the new size, which a plain `yo up` starts. On a Mac it is one `limactl edit`, validated first, which Lima writes into `lima.yaml` in place: a crash inside that write could leave the instance unreadable, and then only `yo destroy --yes` and a new bootstrap help. A Mac refuses a `--memory` above its RAM.
 
 ## Daily use
 
@@ -67,7 +71,8 @@ The VM has two accounts. You are the operator: same name as on the host, with `s
 | `yo ssh [cmd...]` | a shell or one command as the operator, for maintenance |
 | `yo code [proj]`, `yo zed [proj]` | VS Code Remote-SSH or Zed, as the agent |
 | `yo cp SRC... DST` | copy like `scp`; a leading `:` means the VM |
-| `yo up`, `yo down` | start and unlock the VM, stop it |
+| `yo up [--memory GiB] [--cpus N]` | start and unlock the VM; a stopped box takes the memory and CPU count asked for first |
+| `yo down` | stop the VM |
 | `yo status` | describe the VM; exits 1 when any check warns |
 | `yo gc [--deep] [--yes]` | report disk usage; `--yes` reclaims caches, `--deep` also build output |
 | `yo disk-grow <GiB>` | grow the disk |

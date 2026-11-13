@@ -95,7 +95,8 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 
 - ALWAYS run a box on `qemu:///system` with a passt interface, never `qemu:///session`, a bridge or libvirt's `default` network. Only the system connection gives each domain its own sVirt category and a static DAC account, and a bridge gives the guest a layer 2 path to the LAN.
 - NEVER add graphics, vsock, filesystem, channel, hostdev or tpm devices, or a second interface, to `domain.xml`, and ALWAYS redefine a stopped domain from it. Each device is a path to the host that no table sees, and the template is the only shape a domain may have.
-- NEVER act on a domain that lacks `yo`'s `yolobox:instance` tag for that machine. `yo destroy --yes` must not remove another tool's domain that happens to carry a box's name.
+- ALWAYS change a domain's memory or vCPUs by one `virsh define` of the rendered template while the domain is off, NEVER by several `virsh set*` calls. One define leaves libvirt the old definition or the new one, and `setmaxmem`, `setmem` and `setvcpus` each leave half a resize behind.
+- NEVER act on a domain that lacks `yo`'s `yolobox:instance` tag- NEVER act on a domain that lacks `yo`'s `yolobox:instance` tag for that machine. `yo destroy --yes` must not remove another tool's domain that happens to carry a box's name.
 - ALWAYS keep the `yolobox-host` nft table, `RequiredBy=virtqemud.service` on its unit and the account `yolobox-vm`, and NEVER give the unit an `ExecStop`. passt turns every guest connection into a host `connect()`, so the table, keyed on that uid, is the only layer the guest cannot undo.
 - NEVER put the passt directory's tmpfiles rule in `/etc/tmpfiles.d`. dracut copies that directory into the initrd, which has no `qemu` account, and every boot logs a failed lookup; the rule lives in `/etc/yolobox` and `yolobox-host.service` applies it before virtqemud.
 - ALWAYS give a `portForward` the address `127.0.0.1`, and take host ports only from above the kernel's ephemeral range. Without an address passt binds every host address; above the range nothing else picks the port.
@@ -113,7 +114,8 @@ The rules for changing this repo. Each rule is followed by the reason it exists,
 
 - ALWAYS keep `YO_VERSION = "dev"` and `YO_SOURCE_REV = "dev"` in `config.py` as those exact lines, once each. The nix build rewrites both and the brew formula rewrites the first; a miss ships a `yo` that reports `dev`.
 - NEVER import `lima` or `libvirt` anywhere but `cli.driver_for`, and ship each host only its own driver. A host runs one driver.
-- ALWAYS set `allow_abbrev=False` on every parser. Otherwise a typo's prefix reaches `--yes`.
+- ALWAYS refuse a size flag on a box that is not off before anything changes, and name the commands that lead out of its state. A definition applies only to a box that starts, and `yo up` restarts nothing.
+- ALWAYS set `allow_abbrev=False` on every parser.- ALWAYS set `allow_abbrev=False` on every parser. Otherwise a typo's prefix reaches `--yes`.
 - ALWAYS print through `ui.out()` and `ui.err()`, and pass guest text only through `ui.shown()` or `ui.quoted_block()`. Guest output is attacker-controlled text that reaches the host's terminal. Only a guest session's output is quoted; a host tool's stderr is printed inline, so the reader can tell whose words they are.
 - NEVER disable `services.openssh.allowSFTP`. `yo cp` uploads with scp's sftp mode, served by `internal-sftp` so no agent login shell runs for an upload.
 - NEVER upload a symlink with `yo cp`. `scp -r` follows it and copies the target.

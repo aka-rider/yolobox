@@ -109,7 +109,8 @@ class NewBox(NamedTuple):
 class Size(NamedTuple):
     """What `--memory`, `--disk` and `--cpus` asked of a box, in GiB and CPUs; None: not asked.
 
-    A box that does not exist is created at it; one that exists is refused them.
+    A box that does not exist is created at it; one that exists and is off is
+    resized to the memory and CPUs asked, and its disk is grown by `disk-grow`.
     """
 
     memory_gib: Optional[int]
@@ -120,6 +121,12 @@ class Size(NamedTuple):
     def asked(self) -> bool:
         """Whether any flag was given."""
         return any(value is not None for value in self)
+
+    @property
+    def resizes(self) -> bool:
+        """Whether the memory or the CPUs were asked: what a box that exists is
+        redefined with while it is off."""
+        return self.memory_gib is not None or self.cpus is not None
 
     def for_creation(self) -> NewBox:
         """This size with the default CPU count when --cpus was not asked."""
@@ -218,6 +225,11 @@ class Driver(Protocol):
     def creation_refusal(self, size: Size) -> Optional[str]: ...
     # Why start() will not start it on this host, read before anything changes.
     def start_refusal(self) -> Optional[str]: ...
+    # Why the box that is off cannot be resized to the memory and CPUs asked.
+    def resize_refusal(self, size: Size) -> Optional[str]: ...
+    # How to bring a box stuck in the host's word `word` back, so that it can be
+    # stopped; None when the driver knows none.
+    def resume_hint(self, word: str) -> Optional[str]: ...
     # The disk ceiling of the instance that exists, in whole GiB, read from the
     # host (YoError when it cannot be read).
     def disk_gib(self) -> int: ...
@@ -239,9 +251,9 @@ class Driver(Protocol):
     def disk_image(self) -> Optional[Tuple[str, int]]: ...  # label and host KiB
     # Raise the disk's ceiling. The VM must be off, and it stays off.
     def grow_disk(self, held: HeldBox, wanted_gib: int) -> None: ...
-    # The one remedy for a box that must be made anew, to paste: destroy it,
-    # then bootstrap it at `size`, which creates it.
-    def recreate_command(self, size: Size) -> str: ...
+    # Give the box that is off the memory and CPUs `size` asks for (None: as
+    # they are), all or nothing; the box stays off.
+    def resize(self, held: HeldBox, size: Size) -> None: ...
 
 
 # In the directory of every instance: the lock that makes picking a host

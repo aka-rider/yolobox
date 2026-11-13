@@ -52,7 +52,6 @@ from .config import (
 from .driver import (
     BoxSize,
     DriverHints,
-    NO_SIZE,
     NewBox,
     Removal,
     Size,
@@ -129,6 +128,13 @@ class DomainFacts(NamedTuple):
     ssh_port: int
     memory_gib: int
     cpus: int
+
+    def resized(self, size: Size) -> DomainFacts:
+        """These facts with the memory and CPUs `size` asked for; the rest as they are."""
+        return self._replace(
+            memory_gib=self.memory_gib if size.memory_gib is None else size.memory_gib,
+            cpus=self.cpus if size.cpus is None else size.cpus,
+        )
 
 
 def positive_number(text: Optional[str]) -> Optional[int]:
@@ -592,6 +598,28 @@ class LibvirtDriver:
             memory_gib, libvirt_host.host_memory_bytes(), active_domains_memory()
         )
 
+    def resize_refusal(self, size: Size) -> Optional[str]:
+        # This box is off, so the active domains the check sums are the others.
+        if size.memory_gib is None:
+            return None
+        return self.memory_fit_refusal(size.memory_gib)
+
+    def resize(self, held: state.HeldBox, size: Size) -> None:
+        facts = self.domain_facts().resized(size)
+        try:
+            self.define_domain(facts)
+        except YoError as refused:
+            raise YoError(
+                "%s — %s keeps its old size" % (refused.message, state.box.name)
+            )
+        ui.out(
+            "libvirt: resized %s to %d GiB, %d CPUs"
+            % (state.box.name, facts.memory_gib, facts.cpus)
+        )
+
+    def resume_hint(self, word: str) -> Optional[str]:
+        return state_hint(word)
+
     def creation_refusal(self, size: Size) -> Optional[str]:
         # Explicit values only: the default must not refuse a 16 GiB host, whose
         # MemTotal is a little under 16 GiB.
@@ -724,7 +752,7 @@ class LibvirtDriver:
                 "this host's yo has no record of building it"
                 if record is None
                 else "the record of building it says '%s'" % ui.shown(word),
-                self.recreate_command(NO_SIZE),
+                state.recreate_chain(),
             )
         )
 
@@ -803,7 +831,7 @@ class LibvirtDriver:
             facts = DomainFacts(
                 str(uuid.uuid4()), self.allocate_host_port(), memory_gib, cpus
             )
-            self.define_domain(facts)
+            self.define_or_recreate(facts)
         return facts
 
     def define_domain(self, facts: DomainFacts) -> None:
@@ -814,20 +842,21 @@ class LibvirtDriver:
         proc.atomic_write(
             path, domain_xml(state.box.name, facts, uid, gid), FILE_MODE_READABLE
         )
+        proc.checked(
+            libvirt_host.virsh("define", path, check=False), "virsh define %s" % path
+        )
+
+    def define_or_recreate(self, facts: DomainFacts) -> None:
+        """define_domain, with the way out when libvirt refuses a domain that
+        yo cannot work with."""
         try:
-            proc.checked(
-                libvirt_host.virsh("define", path, check=False),
-                "virsh define %s" % path,
-            )
+            self.define_domain(facts)
         except YoError as refused:
             raise self.refused_with_recreate(refused)
 
-    def recreate_command(self, size: Size) -> str:
-        return state.recreate_chain(flags=size.flags())
-
     def refused_with_recreate(self, refused: YoError) -> YoError:
         """`refused` with the one way out of a domain yo cannot work with."""
-        return YoError("%s — %s" % (refused.message, self.recreate_command(NO_SIZE)))
+        return YoError("%s — %s" % (refused.message, state.recreate_chain()))
 
     def create(self, held: state.HeldBox, new_box: NewBox) -> None:
         size = domain_size(new_box)
@@ -851,7 +880,7 @@ class LibvirtDriver:
         # A stopped domain is always what this yo's template makes; a domain
         # that is up keeps the definition it runs.
         if self.domain_state() == STATE_OFF:
-            self.define_domain(facts)
+            self.define_or_recreate(facts)
         # libvirt starts no foreground process: the domain is Running as soon as
         # `virsh start` returns, and unlock_disk judges it by its state alone.
         self.start_domain()

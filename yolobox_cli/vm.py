@@ -36,41 +36,69 @@ DISK_FSTYPE_LUKS = "crypto_LUKS"
 
 def preflight(size: Size) -> Tuple[Optional[VmStatus], Optional[NewBox]]:
     """The size flags and the host, judged before the box or the host is
-    touched: no creation, start or 1Password prompt is spent on a box that was
-    going to be refused. Returns the box's status and the size a creation
-    gets: exactly one of the two is None."""
-    status = state.driver().vm_status()
+    touched: no creation, resize, start or 1Password prompt is spent on a box
+    that was going to be refused. Returns the box's status and the size a
+    creation gets: exactly one of the two is None."""
+    driver = state.driver()
+    status = driver.vm_status()
     if status is None:
-        refusal = state.driver().creation_refusal(size)
-        if refusal is not None:
-            raise YoError(refusal)
+        refuse(driver.creation_refusal(size))
         refuse_start()
         # The default CPU count is decided here, so a host that cannot give one
         # is refused before the passphrase and both drivers create the same box.
         return status, size.for_creation()
-    if size.asked:
-        # A box is sized when it is created; only its disk grows afterwards.
-        raise YoError(
-            "%s exists, and %s applies only when a box is created — drop the "
-            "flag%s, or %s. A "
-            "disk grows in place: %s"
-            % (
-                state.box.name,
-                " ".join(size.flags()),
-                "s" if len(size.flags()) > 2 else "",
-                state.driver().recreate_command(size),
-                state.yo_cmd("disk-grow", "<GiB>"),
-            )
-        )
+    if size.disk_gib is not None:
+        refuse_disk_flag(size.disk_gib, driver.disk_gib())
+    if size.asked and status.state is not VmState.OFF:
+        raise YoError(started_box_refusal(status, size))
+    if size.resizes:
+        refuse(driver.resize_refusal(size))
     if status.state is not VmState.RUNNING:
         refuse_start()
     return status, None
 
 
-def refuse_start() -> None:
-    refusal = state.driver().start_refusal()
+def refuse(refusal: Optional[str]) -> None:
     if refusal is not None:
         raise YoError(refusal)
+
+
+def refuse_start() -> None:
+    refuse(state.driver().start_refusal())
+
+
+def refuse_disk_flag(wanted: int, current: int) -> None:
+    """--disk on a box that exists: a size it has is fine, a smaller one is
+    refused, and a larger one is left to disk-grow, which grows the encrypted
+    root inside the booted box. A box that is off cannot show whether it has
+    one, and a refusal after the resize and the start would leave a half-done
+    command."""
+    refuse_shrink(wanted, current)
+    if wanted > current:
+        raise YoError(
+            "--disk %d would grow %s's disk, which is %dGiB, and only %s does that: "
+            "run it, and drop --disk from this command"
+            % (wanted, state.box.name, current, state.yo_cmd("disk-grow", str(wanted)))
+        )
+
+
+def started_box_refusal(status: VmStatus, size: Size) -> str:
+    """The refusal of a size flag on a box that is not off: a definition applies
+    only to a box that starts, and `yo up` restarts nothing. One place builds the
+    remedy, which names the commands that lead out of the state the box is in."""
+    resume = state.driver().resume_hint(status.word)
+    stop = "stop it" if resume is None else "%s, then stop it" % resume
+    return (
+        "%s is %s, so %s cannot apply to it; %s and start it at that size: %s && %s"
+        % (
+            state.box.name,
+            status.word,
+            " ".join(size.flags()),
+            stop,
+            state.yo_cmd("down"),
+            state.yo_cmd("up", *size.flags()),
+        )
+    )
 
 
 def vm_up(
@@ -102,9 +130,9 @@ def vm_up(
 def power_up(
     held: state.HeldBox, passphrase: agent.PassphraseSource, size: Size
 ) -> None:
-    """Create, start and unlock the box as it needs, judged from what it is now,
-    under the box lock; every check that can refuse runs before the first
-    step that changes the box."""
+    """Create, resize, start and unlock the box as it needs, judged from what it
+    is now, under the box lock; every check that can refuse runs before the
+    first step that changes the box."""
     status, new_box = preflight(size)
     if new_box is not None:
         state.driver().create(held, new_box)
@@ -114,6 +142,8 @@ def power_up(
         # passphrase only after the start: a 1Password that cannot give the
         # key is refused while the box is still off.
         passphrase.require_key()
+        if size.resizes:
+            state.driver().resize(held, size)
         state.driver().start(held, passphrase)
     else:
         stage = unlock.boot_stage(held)

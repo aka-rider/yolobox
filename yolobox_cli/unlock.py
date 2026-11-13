@@ -23,7 +23,7 @@ from .config import (
     INITRD_SSH_BANNER_MARK,
     STAGE2_SSH_BANNER_MARK,
 )
-from .driver import NO_SIZE, SshFacts, VmState, VmStatus
+from .driver import SshFacts, VmState, VmStatus
 from .ui import YoError
 
 
@@ -527,7 +527,7 @@ def helper_failure_message(attempt: HelperRun, initrd: InitrdEndpoint) -> str:
     if code == HELPER_EXIT_ENCRYPT_FAILED:
         return "the in-place encryption of %s failed in the initrd — %s\n%s" % (
             LUKS_DEVICE,
-            state.driver().recreate_command(NO_SIZE),
+            state.recreate_chain(),
             stderr,
         )
     if code == HELPER_EXIT_ROOT_MOUNT_FAILED:
@@ -618,7 +618,7 @@ def operator_round(kind: Endpoint, attempt: SshAttempt) -> Round:
         "asked for the operator",
         attempt,
         "an unmarked sshd that keeps refusing the operator is a seed image whose "
-        "key never landed — %s" % state.driver().recreate_command(NO_SIZE),
+        "key never landed — %s" % state.recreate_chain(),
     )
 
 

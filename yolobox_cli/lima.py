@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import aws, driver, proc, release, state, ui, unlock
 from .config import (
     DEFAULT_INSTANCE,
+    GIB,
     KIB,
     LOOPBACK,
     MAX_PORT,
@@ -23,7 +24,6 @@ from .config import (
     USAGE_EXIT,
 )
 from .driver import (
-    NO_SIZE,
     DriverHints,
     NewBox,
     Removal,
@@ -461,6 +461,15 @@ def tcp_listener_pids(port: int) -> List[int]:
     return pids
 
 
+def mac_memory_bytes() -> int:
+    """The RAM this Mac has, in bytes, as `sysctl -n hw.memsize` says."""
+    argv = ["sysctl", "-n", "hw.memsize"]
+    said = proc.checked(proc.run(argv), shlex.join(argv)).stdout.strip()
+    if not proc.is_ascii_number(said):
+        raise YoError("%s printed %r, not a number of bytes" % (shlex.join(argv), said))
+    return int(said)
+
+
 class LimaDriver:
     """macOS: one Lima instance per machine, run by the vz driver."""
 
@@ -500,9 +509,6 @@ class LimaDriver:
             code=USAGE_EXIT,
         )
 
-    def recreate_command(self, size: Size) -> str:
-        return state.recreate_chain(flags=size.flags())
-
     def ssh_port(self) -> int:
         """Where lima's hostagent listens on the Mac for this instance's sshd.
 
@@ -527,7 +533,7 @@ class LimaDriver:
             raise YoError(
                 "%s has ssh.localPort %r, which is not a fixed port. With 0 lima picks a "
                 "new port on every start, and yo must know it before the first one — %s"
-                % (state.box.name, port, self.recreate_command(NO_SIZE))
+                % (state.box.name, port, state.recreate_chain())
             )
         refuse_mirrored_ssh_port(port)
         return port
@@ -558,6 +564,21 @@ class LimaDriver:
 
     def start_refusal(self) -> Optional[str]:
         # start() judges the instance's own settings before it changes anything.
+        return None
+
+    def resize_refusal(self, size: Size) -> Optional[str]:
+        if size.memory_gib is None:
+            return None
+        ram = mac_memory_bytes()
+        if size.memory_gib * GIB <= ram:
+            return None
+        return (
+            "--memory %d is more than the %d GiB of memory this Mac has (sysctl "
+            "hw.memsize): ask for at most --memory %d"
+            % (size.memory_gib, ram // GIB, ram // GIB)
+        )
+
+    def resume_hint(self, word: str) -> Optional[str]:
         return None
 
     def disk_gib(self) -> int:
@@ -631,7 +652,7 @@ class LimaDriver:
                     " and ".join(
                         gap for gap, (_, edit) in known.items() if edit is None
                     ),
-                    self.recreate_command(NO_SIZE),
+                    state.recreate_chain(),
                 )
             )
         else:
@@ -826,16 +847,29 @@ class LimaDriver:
             return None
         return "%s/disk" % state.box.tilde_dir, kib
 
+    def edit_instance(self, flags: Sequence[str]) -> int:
+        """One `limactl edit` of the stopped instance, which lima validates and
+        then writes into lima.yaml in place (a crash inside that write may leave
+        a file lima reads as Broken). It runs in the instance's directory, where
+        lima leaves an edit it rejected; the exit code is returned."""
+        argv = limactl("edit", "--tty=false", state.box.name, *flags)
+        return proc.run(argv, capture=False, cwd=state.instance_dir()).returncode
+
     def grow_disk(self, held: state.HeldBox, wanted_gib: int) -> None:
         ui.out("lima: raising %s's disk to %dGiB" % (state.box.name, wanted_gib))
-        resize = proc.run(
-            limactl("edit", "--tty=false", state.box.name, "--disk", str(wanted_gib)),
-            capture=False,
-        )
-        if resize.returncode != 0:
+        code = self.edit_instance(["--disk", str(wanted_gib)])
+        if code != 0:
+            raise YoError("limactl edit refused the disk resize (exit %d)" % code)
+
+    def resize(self, held: state.HeldBox, size: Size) -> None:
+        flags = Size(size.memory_gib, None, size.cpus).flags()
+        code = self.edit_instance(flags)
+        if code != 0:
             raise YoError(
-                "limactl edit refused the disk resize (exit %d)" % resize.returncode
+                "limactl edit refused the resize (exit %d), so %s keeps its old size"
+                % (code, state.box.name)
             )
+        ui.out("lima: resized %s to %s" % (state.box.name, " ".join(flags)))
 
 
 LIMA = LimaDriver()

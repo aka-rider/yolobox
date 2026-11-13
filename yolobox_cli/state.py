@@ -6,7 +6,7 @@ import contextlib
 import os
 import pwd
 from dataclasses import dataclass
-from typing import Iterator, Optional, Sequence, Set
+from typing import Iterator, Optional, Set
 
 from . import common, proc, ui
 from .config import DEFAULT_INSTANCE
@@ -110,14 +110,13 @@ def yo_cmd(*words: str) -> str:
     return "yo -m %s %s" % (box.name, " ".join(words))
 
 
-def recreate_chain(flags: Sequence[str] = ()) -> str:
+def recreate_chain() -> str:
     """The remedy for a box that must be made anew, to paste after the reason:
-    `yo destroy --yes`, then `yo bootstrap FLAGS`, which creates it. It always
-    says the disk is lost, so no caller can print it without the warning.
-    Drivers build their recreate_command() with it."""
+    `yo destroy --yes`, then `yo bootstrap`, which creates it. It always says
+    the disk is lost, so no caller can print it without the warning."""
     return "recreate the box, which deletes everything on it: %s && %s" % (
         yo_cmd("destroy", "--yes"),
-        yo_cmd("bootstrap", *flags),
+        yo_cmd("bootstrap"),
     )
 
 

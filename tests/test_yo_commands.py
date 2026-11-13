@@ -3790,19 +3790,24 @@ class TestDiskGrowResizesTheMapping(FakeHome):
         self.assertEqual(self.edits(), [])
 
 
-class TestUpRefusesSizeFlagsOnAnExistingBox(unittest.TestCase):
-    def test_up_with_a_disk_on_a_box_that_exists_names_disk_grow(self):
+class TestUpLeavesAGrowingDiskToDiskGrow(unittest.TestCase):
+    def test_up_with_a_larger_disk_on_a_box_that_exists_names_disk_grow(self):
         with (
             mock.patch.object(yo.LIMA, "vm_status", return_value=STOPPED),
+            mock.patch.object(yo.LIMA, "disk_gib", return_value=100),
             mock.patch.object(yo.LIMA, "start") as start,
+            mock.patch.object(yo.LIMA, "resize") as resize,
             mock.patch.object(yo.agent, "luks_passphrase") as passphrase,
         ):
             with self.assertRaises(yo.YoError) as caught:
-                yo.cmd_up(yo.build_parser().parse_args(["up", "--disk", "200"]))
-        self.assertIn(
-            "--disk 200 applies only when a box is created", caught.exception.message
-        )
-        self.assertIn("yo disk-grow <GiB>", caught.exception.message)
+                yo.cmd_up(
+                    yo.build_parser().parse_args(
+                        ["up", "--disk", "200", "--memory", "24"]
+                    )
+                )
+        self.assertIn("--disk 200 would grow", caught.exception.message)
+        self.assertIn("only yo disk-grow 200 does that", caught.exception.message)
+        resize.assert_not_called()
         start.assert_not_called()
         passphrase.assert_not_called()
 

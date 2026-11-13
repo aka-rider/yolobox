@@ -395,9 +395,10 @@ ORDERED = ("luks_passphrase", "start", "create")
 class VmUpOnLima(unittest.TestCase):
     """vm_up on an instance limactl reports as `info`, with every side effect stubbed."""
 
-    def vm_up(self, instance, size=yo.NO_SIZE, info=None, cpus=16):
+    def vm_up(self, instance, size=yo.NO_SIZE, info=None, cpus=16, run=None):
         """Return the error vm_up raised (or None) and the stubs, which also
-        record the order of the calls that change the box in `self.order`."""
+        record the order of the calls that change the box in `self.order`.
+        `run` answers the host tools the driver runs (proc.run)."""
         stubs = {}
         self.order = []
         with contextlib.ExitStack() as stack:
@@ -417,6 +418,7 @@ class VmUpOnLima(unittest.TestCase):
                 (yo.sshx, "bootstrapped"),
                 (yo.sshx, "broken_agent_login"),
                 (yo.ui, "err"),
+                (yo.ui, "out"),
                 (yo.proc, "run"),
             ):
                 stubs[name] = stack.enter_context(mock.patch.object(target, name))
@@ -425,6 +427,7 @@ class VmUpOnLima(unittest.TestCase):
                         self.order.append(_n) or mock.DEFAULT
                     )
             stubs["broken_agent_login"].return_value = None
+            stubs["run"].side_effect = run
             stack.enter_context(
                 mock.patch.object(yo.lima, "lima_instance_info", return_value=info)
             )
@@ -543,32 +546,70 @@ class TestVmUpCreatesAtTheAskedSize(VmUpOnLima):
                     self.create(INSTANCE_B, listing)
 
 
-class TestVmUpRefusesSizeFlagsOnAnExistingBox(VmUpOnLima):
-    """A box is sized when it is created; afterwards only its disk grows."""
+class TestVmUpOnAnExistingBox(VmUpOnLima):
+    """A box that exists is resized while it is off, by one `limactl edit`;
+    only its disk is left to disk-grow."""
+
+    MAC_RAM = 32 << 30
+
+    def setUp(self):
+        self.edits = []
+        self.sysctl = ["sysctl", "-n", "hw.memsize"]
+        self.edit_code = 0
+        self.rejected = []
+
+    def fake_run(self, argv, **kwargs):
+        if list(argv) == self.sysctl:
+            return subprocess.CompletedProcess(argv, 0, "%d\n" % self.MAC_RAM, "")
+        assert argv[:4] == ["limactl", "--log-level=warn", "edit", "--tty=false"], argv
+        self.order.append("edit")
+        self.edits.append((list(argv), kwargs))
+        return subprocess.CompletedProcess(argv, self.edit_code, None, None)
 
     def up(self, size, status="Stopped"):
-        return self.vm_up(INSTANCE_B, size, info=lima_info(status))
+        error, stubs = self.vm_up(
+            INSTANCE_B, size, info=lima_info(status), run=self.fake_run
+        )
+        return error, stubs
 
-    def test_a_size_flag_on_a_box_that_exists_is_refused_before_anything(self):
+    def test_a_stopped_box_gets_one_edit_with_both_flags_before_it_starts(self):
+        error, stubs = self.up(yo.Size(24, None, 3))
+        self.assertIsNone(error)
+        self.assertEqual(self.order, ["edit", "start"])
+        ((argv, kwargs),) = self.edits
+        self.assertEqual(
+            argv,
+            [
+                "limactl",
+                "--log-level=warn",
+                "edit",
+                "--tty=false",
+                "second",
+                "--memory",
+                "24",
+                "--cpus",
+                "3",
+            ],
+        )
+        # Where lima leaves the file of an edit it rejected.
+        self.assertEqual(
+            kwargs["cwd"], os.path.join(yo.state.home(), ".lima", "second")
+        )
+        stubs["out"].assert_called_once_with(
+            "lima: resized second to --memory 24 --cpus 3"
+        )
+        stubs["luks_passphrase"].assert_not_called()
+
+    def test_memory_alone_and_cpus_alone_edit_only_what_was_asked(self):
         for size, flags in (
-            (yo.Size(24, None, None), "--memory 24"),
-            (yo.Size(None, 250, None), "--disk 250"),
-            (yo.Size(16, 100, 4), "--memory 16 --disk 100 --cpus 4"),
+            (yo.Size(24, None, None), ["--memory", "24"]),
+            (yo.Size(None, None, 3), ["--cpus", "3"]),
         ):
-            for status in ("Stopped", "Running"):
-                with self.subTest(size=size, status=status):
-                    error, stubs = self.up(size, status)
-                    self.assertIn("second exists", error.message)
-                    self.assertIn(
-                        "%s applies only when a box is created" % flags, error.message
-                    )
-                    self.assertIn(
-                        "yo -m second destroy --yes && yo -m second bootstrap %s."
-                        % flags,
-                        error.message,
-                    )
-                    self.assertIn("yo -m second disk-grow <GiB>", error.message)
-                    self.assert_refused_before_anything(stubs)
+            with self.subTest(size=size):
+                self.edits.clear()
+                self.up(size)
+                ((argv, _),) = self.edits
+                self.assertEqual(argv[5:], flags)
 
     def test_a_stopped_box_asked_for_nothing_is_started_as_it_is(self):
         error, stubs = self.up(yo.NO_SIZE)
@@ -579,6 +620,80 @@ class TestVmUpRefusesSizeFlagsOnAnExistingBox(VmUpOnLima):
         self.assertIsInstance(source, yo.agent.PassphraseSource)
         # A box that is off may be encrypted: the key is listed before it starts.
         stubs["require_key"].assert_called_once_with()
+
+    def test_an_edit_lima_refuses_starts_nothing_and_says_the_box_keeps_its_size(self):
+        self.edit_code = 1
+        error, stubs = self.up(yo.Size(24, None, None))
+        self.assertEqual(
+            error.message,
+            "limactl edit refused the resize (exit 1), so second keeps its old size",
+        )
+        self.assertEqual(self.order, ["edit"])
+        stubs["luks_passphrase"].assert_not_called()
+
+    def test_memory_above_the_macs_is_refused_before_anything(self):
+        error, stubs = self.up(yo.Size(33, None, None))
+        self.assertIn("--memory 33 is more than the 32 GiB", error.message)
+        self.assertIn("ask for at most --memory 32", error.message)
+        self.assertEqual(self.order, [])
+        stubs["luks_passphrase"].assert_not_called()
+
+    def test_the_most_memory_the_mac_has_is_accepted(self):
+        error, _ = self.up(yo.Size(32, None, None))
+        self.assertIsNone(error)
+        self.assertEqual(self.order, ["edit", "start"])
+
+    def test_a_sysctl_that_prints_no_number_is_an_error_not_a_cap(self):
+        for said in ("", "lizard", "-1", "32 GiB"):
+            with self.subTest(said=said):
+                with mock.patch.object(
+                    self,
+                    "fake_run",
+                    side_effect=lambda argv, **kw: subprocess.CompletedProcess(
+                        argv, 0, said + "\n", ""
+                    ),
+                ):
+                    error, _ = self.up(yo.Size(24, None, None))
+                self.assertIn("not a number of bytes", error.message)
+                self.assertEqual(self.order, [])
+
+    def test_a_size_flag_on_a_box_that_is_not_off_is_refused_before_anything(self):
+        for status in ("Running", "Starting", "Broken"):
+            with self.subTest(status=status):
+                error, stubs = self.up(yo.Size(24, None, 3), status)
+                self.assertEqual(
+                    error.message,
+                    "second is %s, so --memory 24 --cpus 3 cannot apply to it; stop "
+                    "it and start it at that size: yo -m second down && "
+                    "yo -m second up --memory 24 --cpus 3" % status,
+                )
+                self.assertEqual(self.order, [])
+                stubs["luks_passphrase"].assert_not_called()
+
+    def test_a_disk_is_left_to_disk_grow_and_refused_before_anything(self):
+        for status in ("Stopped", "Running"):
+            with self.subTest(status=status):
+                with mock.patch.object(yo.LIMA, "disk_gib", return_value=100):
+                    error, stubs = self.up(yo.Size(24, 250, None), status)
+                self.assertIn(
+                    "only yo -m second disk-grow 250 does that", error.message
+                )
+                self.assertEqual(self.order, [])
+
+    def test_a_smaller_disk_is_refused_and_the_disk_it_has_is_no_change(self):
+        with mock.patch.object(yo.LIMA, "disk_gib", return_value=100):
+            error, _ = self.up(yo.Size(None, 50, None))
+            self.assertIn("ask for at least 100", error.message)
+            error, _ = self.up(yo.Size(None, 100, None))
+        self.assertIsNone(error)
+        self.assertEqual(self.order, ["start"])
+
+    def test_the_disk_the_box_has_is_never_part_of_the_edit(self):
+        with mock.patch.object(yo.LIMA, "disk_gib", return_value=100):
+            error, _ = self.up(yo.Size(24, 100, None))
+        self.assertIsNone(error)
+        ((argv, _),) = self.edits
+        self.assertEqual(argv[5:], ["--memory", "24"])
 
     def test_a_running_box_asked_for_nothing_goes_on_to_the_boot_stage(self):
         with mock.patch.object(
@@ -618,6 +733,10 @@ class TestLimaGrowDisk(unittest.TestCase):
         )
         self.assertEqual(
             caught.exception.message, "limactl edit refused the disk resize (exit 3)"
+        )
+        self.assertEqual(
+            run.call_args.kwargs["cwd"],
+            os.path.join(yo.state.home(), ".lima", "second"),
         )
 
 
@@ -682,6 +801,7 @@ class TestEveryLimactlCommandIsQuiet(FakeHome):
             locked(yo, yo.LIMA.force_stop)
             locked(yo, yo.LIMA.delete_instance)
             locked(yo, yo.LIMA.grow_disk, 200)
+            locked(yo, yo.LIMA.resize, yo.Size(24, None, 3))
             yo.LIMA.show_status()
             yo.LIMA.disk_gib()
             yo.LIMA.config_gaps()
@@ -823,7 +943,7 @@ class TestAConfigGapRecreatesAnInstanceByBootstrap(FakeHome):
 
     def test_the_default_instance_is_recreated_by_bootstrap_alone(self):
         self.assertEqual(
-            yo.LIMA.recreate_command(yo.NO_SIZE),
+            yo.state.recreate_chain(),
             "recreate the box, which deletes everything on it: "
             "yo destroy --yes && yo bootstrap",
         )

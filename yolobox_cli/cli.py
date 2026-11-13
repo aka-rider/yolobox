@@ -139,30 +139,32 @@ def box_cpus(value: str) -> int:
 
 
 def add_size_arguments(parser: argparse.ArgumentParser) -> None:
-    """--memory, --disk and --cpus, for the commands that create a box."""
+    """--memory, --disk and --cpus, for the commands that create or start a box."""
     parser.add_argument(
         "--memory",
         metavar="GiB",
         type=box_gib("--memory", MIN_MEMORY_GIB, MIN_MEMORY_WHY),
         default=None,
-        help="the memory of the box this command creates (at least %d); a box "
-        "that exists is refused the flag" % MIN_MEMORY_GIB,
+        help="the memory of the box (at least %d): a new box is created with it, a "
+        "stopped one is resized to it before it starts, and a box that is up is "
+        "refused the flag" % MIN_MEMORY_GIB,
     )
     parser.add_argument(
         "--disk",
         metavar="GiB",
         type=box_gib("--disk", MIN_DISK_GIB, MIN_DISK_WHY),
         default=None,
-        help="the disk of the box this command creates (at least %d); an existing "
-        "box's disk grows with disk-grow" % MIN_DISK_GIB,
+        help="the disk of the box this command creates (at least %d); the disk of "
+        "a box that exists grows with disk-grow" % MIN_DISK_GIB,
     )
     parser.add_argument(
         "--cpus",
         metavar="N",
         type=box_cpus,
         default=None,
-        help="the CPU count of the box this command creates, from 1 to one less "
-        "than the host's",
+        help="the CPU count of the box, from 1 to one less than the host's: a new "
+        "box is created with it, a stopped one is resized to it before it "
+        "starts, and a box that is up is refused the flag",
     )
 
 
@@ -228,9 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
         "the passphrase, asks 1Password (Touch ID) for the yolobox-disk key; a box\n"
         "that is already up, or whose disk is not encrypted yet, needs no prompt.\n"
         "Safe to run again.\n"
-        "--memory, --disk and --cpus size the box this command creates; a box that\n"
-        "exists is refused them (yo destroy && yo up to resize it, yo disk-grow to\n"
-        "grow its disk).",
+        "--memory and --cpus size the box: a new box is created with them, and a\n"
+        "stopped one is redefined with them before it starts, keeping its disk and\n"
+        "its data. A box that is up is refused them: yo down && yo up --memory N.\n"
+        "--disk sizes a new box; the disk of a box that exists grows with yo\n"
+        "disk-grow.",
     )
     add_size_arguments(up)
     up.set_defaults(func=vm.cmd_up)
