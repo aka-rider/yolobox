@@ -465,6 +465,67 @@ class BoxCheck(ShellCase):
             "a rootless container connected to 192.168.5.2:22",
         )
 
+    # What each root escape through podman is refused on: the shell pattern
+    # that picks its probe out of podman's argv (its control's argv never
+    # matches), the check, and what the check says when the probe works.
+    PODMAN_ESCAPES = (
+        (
+            "*/run/podman/podman.sock",
+            "check_rootful_podman_socket_refused",
+            "the agent reached the rootful podman socket",
+        ),
+        (
+            "/etc/shadow:*",
+            "check_container_root_cannot_read_root_files",
+            "a rootless container read /etc/shadow through a bind mount",
+        ),
+        (
+            "/etc:*",
+            "check_privileged_container_cannot_write_box_state",
+            "a privileged rootless container wrote into /etc through a bind mount",
+        ),
+        (
+            "echo*",
+            "check_privileged_container_cannot_write_sysctls",
+            "a privileged rootless container wrote kernel.kptr_restrict through /proc/sys",
+        ),
+        (
+            "dd",
+            "check_container_cannot_read_root_disk",
+            "a rootless container with SYS_MODULE and SYS_RAWIO read the root disk",
+        ),
+    )
+
+    def podman_refusing(self, *patterns):
+        """A podman that exits 1 when an argument matches a pattern, else 0."""
+        cases = "".join("%s) exit 1 ;;\n" % pattern for pattern in patterns)
+        self.fake(
+            "podman",
+            "#!/bin/sh\nfor a; do\ncase $a in\n%s*) ;;\nesac\ndone\nexit 0\n" % cases,
+        )
+
+    def test_podman_that_refuses_every_root_escape_passes(self):
+        self.podman_refusing(*(pattern for pattern, _, _ in self.PODMAN_ESCAPES))
+        for _, check, _ in self.PODMAN_ESCAPES:
+            with self.subTest(check=check):
+                self.assert_passes(self.run_check(check))
+
+    def test_a_root_escape_through_podman_that_works_fails(self):
+        for escape, check, message in self.PODMAN_ESCAPES:
+            with self.subTest(check=check):
+                self.podman_refusing(
+                    *(p for p, _, _ in self.PODMAN_ESCAPES if p != escape)
+                )
+                self.assert_fail(self.run_check(check), message)
+
+    def test_podman_that_refuses_a_control_proves_nothing(self):
+        self.podman_refusing("*")
+        for _, check, _ in self.PODMAN_ESCAPES:
+            with self.subTest(check=check):
+                result = self.run_check(check)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("so a refusal would prove nothing", result.stderr)
+
     # -- link kinds -----------------------------------------------------
 
     def link_tools(self, refusal):

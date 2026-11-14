@@ -18,9 +18,11 @@
 # its containers, both accounts refused off the gateway to the agent's
 # forwarded 1Password agent (SKIP, and nothing tested, when that agent lists
 # no key), the agent's own authorized_keys ignored by sshd's configuration,
-# and tmpfiles refusing a symlink of the agent's into /etc. Its probes run as
-# the agent WITHOUT the agent's login shell, since the agent edits that
-# shell's rc files and PATH.
+# and tmpfiles refusing a symlink of the agent's into /etc, and rootless podman
+# giving the agent nothing it lacks (no rootful podman socket, no read of a
+# root-only file or the root disk, no write to /etc or a sysctl, from a
+# privileged container either). Its probes run as the agent WITHOUT the
+# agent's login shell, since the agent edits that shell's rc files and PATH.
 #
 # The compat half proves nothing the agent needs broke: the kept qdisc,
 # podman, chromium, a nix build, strace -p, the harness binaries, the herdr
@@ -41,6 +43,9 @@ readonly FACTS=/etc/yolobox/facts.sh
 readonly WRAPPERS=/run/wrappers/bin
 readonly SYSBIN=/run/current-system/sw/bin
 readonly HK_NET=hk-test
+readonly BUSYBOX=docker.io/library/busybox
+# The root disk is virtio-blk on both drivers (nix/base.nix names its ESP /dev/vda1).
+readonly ROOT_DISK=/dev/vda
 # What sshd logs when AllowUsers refuses a name (openssh auth.c allowed_user).
 readonly ALLOWUSERS_REFUSAL="not allowed because not listed in AllowUsers"
 
@@ -611,15 +616,85 @@ agent_podman() {
 check_container_egress() {
     local network out
     positive_control "a rootless container reaches github.com:443" 0 \
-        agent_podman run --rm docker.io/library/busybox nc -z -w 3 github.com 443
+        agent_podman run --rm "${BUSYBOX}" nc -z -w 3 github.com 443
     for network in "" --network=host; do
         # ${network} is one option or nothing; an empty word would be an image name.
         # shellcheck disable=SC2086
-        if out=$(agent_podman run --rm ${network} docker.io/library/busybox nc -z -w 3 "${YOLOBOX_GATEWAY}" 22 2>&1); then
+        if out=$(agent_podman run --rm ${network} "${BUSYBOX}" nc -z -w 3 "${YOLOBOX_GATEWAY}" 22 2>&1); then
             fail "a rootless container${network:+ on ${network}} connected to ${YOLOBOX_GATEWAY}:22"
         fi
         ok "a rootless container${network:+ on ${network}} cannot reach ${YOLOBOX_GATEWAY}:22 (${out})"
     done
+}
+
+# A rootless container's root is the agent's own uid, and the agent is in no
+# group that owns a root-only file, device or socket. So no option podman takes
+# (a bind mount, --privileged, --device, --cap-add, --url) may give the agent
+# more than it has. Each refusal is paired with a control of the same shape
+# that the agent's own files pass.
+
+# nixpkgs' rootful socket is root:podman 0660 and the agent is not in podman.
+# Whether the socket exists or not, the connection must fail; the control is
+# the agent's own user socket.
+check_rootful_podman_socket_refused() {
+    local out
+    positive_control "the agent reaches its own podman socket" 0 \
+        agent_podman --url "unix:///run/user/${YOLOBOX_AGENT_UID}/podman/podman.sock" info
+    if out=$(agent_podman --url unix:///run/podman/podman.sock info 2>&1); then
+        fail "the agent reached the rootful podman socket"
+    fi
+    ok "the agent cannot connect to the rootful podman socket (${out})"
+}
+
+check_container_root_cannot_read_root_files() {
+    local out
+    positive_control "a rootless container reads a world-readable file through a bind mount" 0 \
+        agent_podman run --rm -v /etc/passwd:/probe:ro "${BUSYBOX}" cat /probe
+    if out=$(agent_podman run --rm -v /etc/shadow:/probe:ro "${BUSYBOX}" cat /probe 2>&1); then
+        fail "a rootless container read /etc/shadow through a bind mount"
+    fi
+    ok "a rootless container cannot read /etc/shadow through a bind mount (${out})"
+}
+
+# The probe creates a file and removes it again, so a box where the write
+# works is left as it was, and the check fails.
+check_privileged_container_cannot_write_box_state() {
+    local out
+    positive_control "a privileged rootless container writes into the agent's home through a bind mount" 0 \
+        agent_podman run --rm --privileged -v "${AGENT_HOME}:/hostdir" "${BUSYBOX}" \
+        sh -c "touch /hostdir/yolobox-write-probe && rm /hostdir/yolobox-write-probe"
+    if out=$(agent_podman run --rm --privileged -v /etc:/hostdir "${BUSYBOX}" \
+        sh -c "touch /hostdir/yolobox-write-probe && rm /hostdir/yolobox-write-probe" 2>&1); then
+        fail "a privileged rootless container wrote into /etc through a bind mount"
+    fi
+    ok "a privileged rootless container cannot write into /etc through a bind mount (${out})"
+}
+
+# The refused write stores the value check_sysctls already proved, so a box
+# where it works is unchanged, and the check fails.
+check_privileged_container_cannot_write_sysctls() {
+    local out
+    positive_control "a privileged rootless container reads kernel.kptr_restrict through /proc/sys" 0 \
+        agent_podman run --rm --privileged -v /proc/sys:/hostsys "${BUSYBOX}" cat /hostsys/kernel/kptr_restrict
+    if out=$(agent_podman run --rm --privileged -v /proc/sys:/hostsys "${BUSYBOX}" \
+        sh -c "echo 2 >/hostsys/kernel/kptr_restrict" 2>&1); then
+        fail "a privileged rootless container wrote kernel.kptr_restrict through /proc/sys"
+    fi
+    ok "a privileged rootless container cannot write kernel.kptr_restrict through /proc/sys (${out})"
+}
+
+# --device only binds the node; opening it is checked against the agent's
+# own uid and groups, whatever capabilities the container is given.
+check_container_cannot_read_root_disk() {
+    local out
+    positive_control "a rootless container with SYS_MODULE and SYS_RAWIO sees the root disk as a block device" 0 \
+        agent_podman run --rm --cap-add SYS_MODULE --cap-add SYS_RAWIO --device "${ROOT_DISK}" "${BUSYBOX}" \
+        test -b "${ROOT_DISK}"
+    if out=$(agent_podman run --rm --cap-add SYS_MODULE --cap-add SYS_RAWIO --device "${ROOT_DISK}" "${BUSYBOX}" \
+        dd if="${ROOT_DISK}" of=/dev/null bs=512 count=1 2>&1); then
+        fail "a rootless container with SYS_MODULE and SYS_RAWIO read the root disk"
+    fi
+    ok "a rootless container with SYS_MODULE and SYS_RAWIO cannot read the root disk (${out})"
 }
 
 # Puts the agent's ~/.config/zed aside and points the name at /etc, or
@@ -812,6 +887,11 @@ hardening_checks() {
     check_sshd_settings
     check_gateway_ssh_closed
     check_container_egress
+    check_rootful_podman_socket_refused
+    check_container_root_cannot_read_root_files
+    check_privileged_container_cannot_write_box_state
+    check_privileged_container_cannot_write_sysctls
+    check_container_cannot_read_root_disk
     check_logins_refused_off_gateway "$(id -un)"
     check_gateway_spoof_dropped
     check_agent_authorized_keys_ignored
@@ -901,13 +981,13 @@ check_default_qdisc() {
 check_podman() {
     # Clear a leftover from an interrupted run; -f makes a missing one fine.
     as_agent podman network rm -f "${HK_NET}" >/dev/null
-    as_agent podman run --rm docker.io/library/busybox true ||
+    as_agent podman run --rm "${BUSYBOX}" true ||
         fail "rootless podman run failed"
     ok "rootless podman runs a container"
     as_agent podman network create "${HK_NET}" >/dev/null ||
         fail "podman network create ${HK_NET} failed"
     NET_CREATED=1
-    as_agent podman run --rm --network "${HK_NET}" docker.io/library/busybox true ||
+    as_agent podman run --rm --network "${HK_NET}" "${BUSYBOX}" true ||
         fail "podman run on a bridge network failed"
     as_agent podman network rm "${HK_NET}" >/dev/null || fail "podman network rm ${HK_NET} failed"
     NET_CREATED=""
