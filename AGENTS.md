@@ -31,7 +31,7 @@ This file is for whoever changes the repo: where things live, how to check a cha
 | `nix/egress.nix`, `nix/egress/yolobox-egress.nft` | the guest's egress table and its unit |
 | `nix/hardening.nix` | blocked modules, the wrapper allowlist and agent groups with their one assertion, sysctls, `/proc` |
 | `nix/harnesses.nix`, `nix/harnesses/` | the claude launcher, its keeper, and the claude and pi installs |
-| `nix/herd-server.nix`, `nix/pkgs/herdr-bin.nix` | the VM's herdr server and the pinned herdr release |
+| `nix/herd-server.nix`, `nix/guest/herdr-agent-lease.sh`, `nix/pkgs/herdr-bin.nix` | the VM's herdr server, the holder of its SSH agent registration, and the pinned herdr release |
 | `nix/display.nix`, `nix/display/` | Xvfb, openbox, Chromium and the screen recorder |
 | `nix/podman.nix`, `nix/swap.nix`, `nix/lsp.nix` | rootless podman, the swapfile option, editor language servers through devbox |
 | `nix/guest.nix`, `nix/guest/yolobox-guest.sh` | the guest helper; its header lists the subcommands |
@@ -83,6 +83,7 @@ YOLOBOX_USERNAME=$(id -un) YOLOBOX_FLAKE_REF=github:aka-rider/yolobox/ci nix eva
 | `test_luks_scripts.py` | the three initrd scripts under bash | gawk; the unlock helper's tests need bash 5.1 |
 | `test_screen_record.py` | the recorder under bash with a fake ffmpeg | Linux `/proc`, `pidfd_open`, flock |
 | `test_xvfb.py` | the Xvfb wrapper under bash with a fake Xvfb and `systemd-notify` | |
+| `test_herdr_agent_lease.py` | the herdr agent lease holder under bash and socat against a fake herdr API socket | socat |
 | `test_harness_scripts.py` | the claude version predicate, launcher keeper and installer, and the network-ready flag script, under bash | GNU find and sort |
 | `test_box_checks.py` | `box-hardening-check.sh`: one green run per check family, then the refusals | GNU find, GNU stat |
 | `test_host_setup.py` | `linux/host-setup.sh` rerun | GNU stat and install |
@@ -148,6 +149,7 @@ The release is a GitHub release with tag `vX.Y.Z` published from the tip of `mai
 - On a Mac, `limactl edit --tty=false NAME --memory N --cpus C` on a stopped instance is accepted by the shipped Lima and `limactl list` shows the new values; an edit it rejects leaves `lima.REJECTED.yaml` in the instance directory; `sysctl -n hw.memsize` prints the RAM in bytes.
 - In a box: `nixos-rebuild` of `github:O/R/<rev>?narHash=<hash>` is accepted with the hash's `+`, `/` and `=` unencoded and refused with one character changed; `yolobox-guest rebuild switch` after editing `local.nix` builds the stamped ref.
 - In a herdr pane: `command -v claude` is `~/.local/bin/claude`, and after `claude update` the `yolobox-claude-launcher.path` unit is not `Trigger limit hit`.
+- After a reboot, `yo ssh true` starts `herdr-agent-lease` (the user service), and `readlink ~/.config/herdr/herdr.sock.agent` points at `/run/yolobox/op-agent.sock` with no host herdr attached, and still does after the host herdr attaches and quits.
 - On a Linux host: whether a signature with `yolobox-operator` asked from an agent session prompts 1Password or rides the master's earlier approval.
 - On a Mac, `yo cp` from the guest unpacks with bsdtar using `--no-same-owner --no-same-permissions --no-acls --no-xattrs --no-fflags --no-mac-metadata`; confirm bsdtar accepts every flag and a download lands.
 - In the initrd, a wrong passphrase makes systemd-cryptsetup log `Passphrase incorrect?`, and `journalctl -n 1 --show-cursor` prints a cursor; the unlock helper's exit 1 versus exit 7 depends on both.
@@ -182,6 +184,7 @@ SSH:
 - Lima 2 pins the guest's host key in the instance's `ssh.known_hosts` and logs `host key mismatch` when the initrd's per-boot key answers instead. The warning is Lima's; the initrd's key is never stored, so it cannot be made to match. `yo` checks its own pin and the banner. `yo` starts Lima with `--log-level=warn`, so only Lima's warnings and errors reach the terminal.
 - `yo`'s own pin is the instance's `known_hosts`, with its lines under the `HostKeyAlias` that both ssh blocks name (`vm_host`), not under `[127.0.0.1]:port`: the ssh port can change (`limactl edit --set .ssh.localPort`), and a pin keyed on it would be missed, and the new port's answer learned by `accept-new`. The fetch that writes it proves the listener the VM's first (`sshx.proved_ssh_facts()`, the same proof as the initrd's gate), dials the port it proved with an explicit `Port`, not the one `ssh.config` names, and fails on any line but a blank one or an `ssh-rsa` or `ssh-ed25519` host key, the two NixOS generates. First contact checks no host key, so without that proof a process already on the port would be offered the operator's key and could have its own key pinned.
 - sshd opens an `AuthorizedKeysFile` with the target user's privileges, so the agent cannot read the root-owned key file lima-init writes; it gets the key from a root-run `AuthorizedKeysCommand`.
+- herdr gives panes `SSH_AUTH_SOCK=<its API socket>.agent`, a symlink whose fallback is fixed at server start and which otherwise follows agents registered over the API only while their connection lives; the box's `herdr-agent-lease` holds that registration.
 - `ssh-add -l` saying "communication with agent failed" means a dead forward; "The agent has no identities" means a live one.
 - ssh exits 255 both when it cannot connect and, without a word, when the remote command dies of a signal; only a 255 with ssh's own message means the box is out of reach.
 - `ssh -E FILE` writes ssh's own messages to FILE and leaves the remote command's stderr on stderr. sshd refusing every key makes ssh print `USER@HOST: Permission denied (publickey).` there; the agent's rc files can print the same line on the session's stderr and exit 255, so `yo` judges the agent's login (`sshx.broken_agent_login`, which runs `echo yolobox-agent-login`) by that file alone.

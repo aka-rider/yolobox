@@ -20,6 +20,7 @@
   "op_agent_proxy_unit": "yolobox-op-agent",
   "op_guest_sock": "/run/yolobox-op/agent.sock",
   "agent_auth_sock": "/run/yolobox/op-agent.sock",
+  "herdr_api_sock": "/home/agent/.config/herdr/herdr.sock",
   "aws_broker_proxy_unit": "yolobox-aws-broker",
   "aws_broker_guest_sock": "/run/yolobox-op/aws-broker.sock",
   "agent_aws_broker_sock": "/run/yolobox/aws-broker.sock",
