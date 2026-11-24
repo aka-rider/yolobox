@@ -4,7 +4,3 @@
 - [herdrdev/herdr#4291](https://github.com/herdrdev/herdr/issues/4291): `remote-client-bridge` has no attach-only mode. While the `herdr-server` user unit restarts, the host's bridge can start a server of its own outside the unit, and the unit then fails with "already running" until that server is killed. `restartIfChanged = false` in `nix/herd-server.nix` keeps switches out of that gap; only a crash opens it. When the option ships, have the host connect attach-only.
 - [herdrdev/herdr#4833](https://github.com/herdrdev/herdr/issues/4833) (open): herdr's own selection and copy mode in machine panes copies server-side, so the text never reaches the Mac clipboard. Separately, the Mac client drops a Clipboard message from a machine that is not the active one; not yet reported.
 - lima, not yet written up: `limactl stop yolobox` hangs on lima 2.2.0's `vz` driver with `did not receive an event with the "exiting" status`, and a child `limactl hostagent` spins at ~99% CPU and outlives `limactl stop -f`. Seen 2026-09-05, 2026-09-28 and 2026-10-01, with no trigger isolated. Recovery: `yo ssh sudo systemctl reboot`, then `kill -9` the spinning child. File it once a narrower repro exists.
-
-# Known problems
-
-- The 1Password-not-running error raised in `yolobox_cli/agent.py` (around line 284, "1Password is not running on this host...") has no test checking it reaches the user; nothing in `tests/` matches its wording. Add one.

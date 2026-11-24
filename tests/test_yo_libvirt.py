@@ -2906,6 +2906,36 @@ class ExistingBoxCase(LibvirtCase):
         self.assertEqual(self.writes(), [])
 
 
+class TestUpOfAStoppedBoxWithoutOnePassword(ExistingBoxCase):
+    """`yo up` on a box that exists and is off asks 1Password for the LUKS key
+    before it starts the box. Only the host's virsh is faked: the key listing
+    runs for real, against a socket that is not there."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(
+            self.box.agent, "ssh_agent_identities", self.real_agent_identities
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.unlink(self.driver.op_sock())
+
+    def test_up_says_1password_is_not_running_on_stderr_and_starts_nothing(self):
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.driver, "require_tool"),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = self.box.entry(["-m", "box", "up"])
+        message = stderr.getvalue()
+        self.assertEqual(code, 1)
+        self.assertTrue(
+            message.startswith("yo: 1Password is not running on this host"), message
+        )
+        self.assertIn(self.driver.op_sock(), message)
+        self.assertEqual(self.writes(), [])
+
+
 class TestVmUpOnAnExistingBox(ExistingBoxCase):
     """`yo up` on a box whose domain exists: its size flags resize it while it
     is off, and every start is judged against the host's free memory."""
