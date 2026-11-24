@@ -282,9 +282,8 @@ def ssh_agent_call(sock_path: str, payload: bytes) -> bytes:
     except (FileNotFoundError, ConnectionRefusedError) as failure:
         raise YoError(
             "1Password is not running on this host: nothing serves its SSH agent "
-            "at %s (%s), and it holds the %s key that unlocks the box — start "
-            "1Password with its SSH agent turned on, then run the command again"
-            % (sock_path, ui.os_error_reason(failure), LUKS_KEY_ITEM)
+            "at %s (%s) — start 1Password with its SSH agent turned on, then run "
+            "the command again" % (sock_path, ui.os_error_reason(failure))
         )
     except OSError as failure:
         raise YoError(

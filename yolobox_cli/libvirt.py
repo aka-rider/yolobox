@@ -743,22 +743,17 @@ class LibvirtDriver:
 
     def operator_key(self) -> bytes:
         sock_path = self.op_sock()
-        dead = (
-            "1Password's SSH agent at %s is not running (or locked) — start or "
-            "unlock 1Password; its %s key logs in to the box"
-            % (sock_path, OPERATOR_KEY_ITEM)
-        )
-        if not os.path.exists(sock_path):
-            raise YoError(dead)
-        try:
-            identities = agent.ssh_agent_identities(sock_path)
-        except YoError as failure:
-            raise YoError("%s (%s)" % (dead, failure.message))
+        identities = agent.ssh_agent_identities(sock_path)
         # An agent that lists no key at all cannot serve the login now, which
         # is the shape a locked or half-started 1Password may take; one that
         # lists others but not this key gets unique_key_titled's own message.
+        # A missing or dead agent never gets here: ssh_agent_identities raises it.
         if not identities:
-            raise YoError(dead)
+            raise YoError(
+                "1Password's SSH agent at %s lists no key (it may be locked) — "
+                "unlock 1Password; its %s key logs in to the box"
+                % (sock_path, OPERATOR_KEY_ITEM)
+            )
         return agent.unique_key_titled(identities, OPERATOR_KEY_ITEM)
 
     def volume_exists(self, volume: str) -> bool:

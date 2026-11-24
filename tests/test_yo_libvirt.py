@@ -959,11 +959,11 @@ class TestOperatorKey(LibvirtCase):
         thread.start()
         self.addCleanup(thread.join)
 
-    def assert_named_dead(self, message):
+    def assert_agent_not_running(self, message):
         self.assertTrue(
             message.startswith(
-                "1Password's SSH agent at %s is not running (or locked) — start or "
-                "unlock 1Password" % self.sock
+                "1Password is not running on this host: nothing serves its SSH agent "
+                "at %s" % self.sock
             ),
             message,
         )
@@ -984,23 +984,32 @@ class TestOperatorKey(LibvirtCase):
             self.driver.operator_key()
         self.assertIn("offers 2 keys titled yolobox-operator", caught.exception.message)
 
-    def test_a_missing_agent_socket_is_a_dead_agent(self):
+    def test_a_missing_agent_socket_is_an_agent_not_running(self):
         with self.assertRaises(self.box.YoError) as caught:
             self.driver.operator_key()
-        self.assert_named_dead(caught.exception.message)
+        self.assert_agent_not_running(caught.exception.message)
 
-    def test_an_agent_that_refuses_connections_is_named_dead_with_the_cause(self):
+    def test_an_agent_that_refuses_connections_is_not_running_with_the_cause(self):
         self.dead_agent()
         with self.assertRaises(self.box.YoError) as caught:
             self.driver.operator_key()
-        self.assert_named_dead(caught.exception.message)
+        self.assert_agent_not_running(caught.exception.message)
         self.assertIn("Connection refused", caught.exception.message)
 
-    def test_an_agent_that_lists_no_key_is_named_dead(self):
+    def test_an_agent_that_lists_no_key_says_it_may_be_locked_and_names_the_key(self):
         self.agent([])
         with self.assertRaises(self.box.YoError) as caught:
             self.driver.operator_key()
-        self.assert_named_dead(caught.exception.message)
+        self.assertTrue(
+            caught.exception.message.startswith(
+                "1Password's SSH agent at %s lists no key (it may be locked)"
+                % self.sock
+            ),
+            caught.exception.message,
+        )
+        self.assertIn(
+            "its yolobox-operator key logs in to the box", caught.exception.message
+        )
 
     def test_the_public_key_line_carries_the_key_and_the_title_only(self):
         self.assertEqual(self.box.public_key_line(KEY_BLOB), PUBLIC_KEY)
@@ -2322,7 +2331,7 @@ class TestADeadAgent(LibvirtCase):
     main() and the real boot_stage; a start names the agent before anything
     is created, and a session reports what ssh said."""
 
-    DEAD = "1Password's SSH agent at %s is not running (or locked)"
+    DEAD = "1Password is not running on this host: nothing serves its SSH agent at %s"
     REFUSED = "Connection closed by authenticating user op 127.0.0.1 port 1 [preauth]"
 
     def setUp(self):
