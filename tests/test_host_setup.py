@@ -16,6 +16,8 @@ from shell_harness import REPO, ShellCase, is_gnu, needs_tool
 
 HOST_SETUP = REPO / "linux" / "host-setup.sh"
 HOOK_STEP = "libvirt hook that keeps the passt ACL"
+SELINUX_STEP = "SELinux module that lets virtqemud run the hook"
+MODULE = "yolobox-virt-hook.cil"
 EGRESS_STEP = "host egress table"
 
 
@@ -46,6 +48,8 @@ class TestHostSetupCanBeRerun(ShellCase):
         resolv="nameserver 127.0.0.53\n",
         label=None,
         old_rule=False,
+        module=None,
+        semodule_fails=(),
     ):
         """Run host-setup.sh from the text `first` up to the text `last`, after
         its definitions, from a scratch checkout that lacks the file
@@ -58,6 +62,8 @@ class TestHostSetupCanBeRerun(ShellCase):
         libvirtd is enabled or active. `resolv` is the resolver file's text and
         `label` what `stat -c %C` prints for it (None: the real stat); `old_rule`
         pre-installs the passt tmpfiles rule where an earlier run put it.
+        `module` is the text of the SELinux module the host already has (None:
+        none); `semodule_fails` the options of the fake semodule that fail.
         The last slice's scratch root stays in `self.root`. virsh speaks German unless
         LC_ALL=C, as a translated virsh would on a German host."""
         text = HOST_SETUP.read_text()
@@ -69,6 +75,7 @@ class TestHostSetupCanBeRerun(ShellCase):
         here.mkdir()
         for name in (
             "yolobox-libvirt-hook.sh",
+            MODULE,
             "yolobox-host.nft",
             "yolobox-host.service",
         ):
@@ -79,6 +86,14 @@ class TestHostSetupCanBeRerun(ShellCase):
             "restorecon": "exit 0",
             "dnf": 'echo "dnf $*" >>"$CALLS"',
             "setfacl": 'echo "setfacl $*" >>"$CALLS"',
+            "semodule": (
+                'for failing in $FAKE_SEMODULE_FAILS; do test "$1" = "$failing" && exit 1; done\n'
+                "case $1 in\n"
+                '  -l) echo other-module; test -f "$FAKE_MODULE" && echo yolobox-virt-hook; exit 0 ;;\n'
+                '  -E) cp "$FAKE_MODULE" "./$2.cil" ;;\n'
+                '  *) echo "semodule $*" >>"$CALLS" ;;\n'
+                "esac"
+            ),
             "systemd-tmpfiles": 'echo "systemd-tmpfiles $*" >>"$CALLS"',
             "systemctl": (
                 "case $1 in\n"
@@ -124,6 +139,9 @@ class TestHostSetupCanBeRerun(ShellCase):
             shutil.copy(here / "yolobox-libvirt-hook.sh", hook)
             hook.chmod(0o755)
             os.utime(hook, (hook_mtime, hook_mtime))
+        installed_module = root / "installed-module"
+        if module is not None:
+            installed_module.write_text(module)
         nft_dest = root / "nft-file"
         unit_dest = root / "unit-file"
         if table_installed:
@@ -163,6 +181,8 @@ class TestHostSetupCanBeRerun(ShellCase):
                 "FAKE_LIBVIRTD": "0" if libvirtd else "1",
                 "FAKE_LABEL": label or "",
                 "FAKE_STUB": str(stub),
+                "FAKE_MODULE": str(installed_module),
+                "FAKE_SEMODULE_FAILS": " ".join(semodule_fails),
             },
         )
         return result, calls.read_text().splitlines()
@@ -177,8 +197,8 @@ class TestHostSetupCanBeRerun(ShellCase):
         self,
     ):
         text = HOST_SETUP.read_text()
-        read = sorted(set(re.findall(r"\$HERE/([\w.-]+)", text)))
-        self.assertTrue(read)
+        # The module's file is named through a variable, which the pattern skips.
+        read = sorted({MODULE, *re.findall(r"\$HERE/([\w.-]+)", text)})
         for name in read:
             with self.subTest(file=name):
                 result, _ = self.run_slice('HERE="', 'step "', missing=name)
@@ -206,6 +226,52 @@ class TestHostSetupCanBeRerun(ShellCase):
             self.run_steps("libvirt's default network off", "polkit rule"),
             ["net-autostart --disable default", "net-destroy default"],
         )
+
+    def test_the_selinux_module_is_installed_when_the_host_has_none(self):
+        self.assertEqual(
+            self.run_steps(SELINUX_STEP, HOOK_STEP),
+            ["semodule -i %s/%s" % (self.root / "repo", MODULE)],
+        )
+
+    def test_the_selinux_module_is_installed_again_when_the_host_has_another_text(
+        self,
+    ):
+        for module in ("", "(allow virtqemud_t virt_hook_t (file (execute)))\n"):
+            with self.subTest(module=module):
+                self.assertEqual(
+                    self.run_steps(SELINUX_STEP, HOOK_STEP, module=module),
+                    ["semodule -i %s/%s" % (self.root / "repo", MODULE)],
+                )
+
+    def test_the_selinux_module_is_left_alone_when_the_host_has_the_same_text(self):
+        self.assertEqual(
+            self.run_steps(
+                SELINUX_STEP,
+                HOOK_STEP,
+                module=(REPO / "linux" / MODULE).read_text(),
+            ),
+            [],
+        )
+
+    def test_a_semodule_that_fails_stops_the_run(self):
+        """Not installing would leave the hook running only while virtqemud_t
+        is permissive, silently."""
+        current = (REPO / "linux" / MODULE).read_text()
+        for options, module in (
+            (("-l",), None),
+            (("-E",), current),
+            (("-i",), None),
+            (("-i",), ""),
+        ):
+            with self.subTest(failing=options, module=module):
+                result, calls = self.run_slice(
+                    'step "%s' % SELINUX_STEP,
+                    'step "%s' % HOOK_STEP,
+                    module=module,
+                    semodule_fails=options,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(calls, [])
 
     def test_virtqemud_restarts_when_it_started_before_the_hook_was_written(self):
         self.assertEqual(
@@ -323,7 +389,7 @@ class TestHostSetupCanBeRerun(ShellCase):
                 self.assertEqual(calls, [])
 
     def test_the_passt_rule_is_written_outside_etc_tmpfiles_d_and_applied(self):
-        calls = self.run_steps("passt socket directory", "libvirt hook")
+        calls = self.run_steps("passt socket directory", "SELinux module")
         passt_dir = self.root / "passt"
         rule = self.root / "conf" / "yolobox-passt.conf"
         self.assertEqual(
@@ -341,13 +407,15 @@ class TestHostSetupCanBeRerun(ShellCase):
 
     def test_the_rule_an_earlier_run_left_in_etc_tmpfiles_d_is_removed_once(self):
         result, _ = self.run_slice(
-            'step "passt socket directory', 'step "libvirt hook', old_rule=True
+            'step "passt socket directory', 'step "SELinux module', old_rule=True
         )
         old = self.root / "old-tmpfiles.conf"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(old.exists())
         self.assertIn("sudo dracut -f", result.stdout)
-        result, _ = self.run_slice('step "passt socket directory', 'step "libvirt hook')
+        result, _ = self.run_slice(
+            'step "passt socket directory', 'step "SELinux module'
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("dracut", result.stdout)
 

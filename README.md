@@ -24,7 +24,7 @@ On a Linux PC also create a second Ed25519 `SSH Key` item titled `yolobox-operat
 sudo bash linux/host-setup.sh
 ```
 
-It installs libvirt and passt, adds a host firewall table that keeps the VM off your LAN, creates the account `yolobox-vm` that runs the VM, and lets your account manage libvirt. It first checks your host's resolver, which passt hands the VM: its first nameserver must be a loopback address (systemd-resolved's stub is one), and `/etc/resolv.conf` must carry the SELinux type `net_conf_t`, the only one passt may read. A root editor that replaces the stub's file by rename leaves it mislabelled, the VM then boots without DNS, and `yo` refuses to start the VM until `sudo restorecon -F "$(readlink -f /etc/resolv.conf)"` has fixed the label.
+It installs libvirt and passt, adds a host firewall table that keeps the VM off your LAN, creates the account `yolobox-vm` that runs the VM, lets your account manage libvirt, and installs the SELinux module `yolobox-virt-hook` that lets `virtqemud` run yolobox's qemu hook (remove it with `sudo semodule -r yolobox-virt-hook`). It first checks your host's resolver, which passt hands the VM: its first nameserver must be a loopback address (systemd-resolved's stub is one), and `/etc/resolv.conf` must carry the SELinux type `net_conf_t`, the only one passt may read. A root editor that replaces the stub's file by rename leaves it mislabelled, the VM then boots without DNS, and `yo` refuses to start the VM until `sudo restorecon -F "$(readlink -f /etc/resolv.conf)"` has fixed the label.
 
 ## Install
 

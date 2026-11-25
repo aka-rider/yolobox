@@ -25,6 +25,8 @@ PASST_DIR="/run/libvirt/qemu/passt"
 # directory owned by anyone else.
 PASST_OWNER="qemu"
 PASST_HOOK="/etc/libvirt/hooks/qemu.d/50-yolobox-passt"
+# The SELinux module that lets virtqemud run that hook; its name is the file's.
+SELINUX_MODULE="yolobox-virt-hook"
 POOL_NAME="default"
 POOL_PATH="/var/lib/libvirt/images"
 VIRSH=(virsh -c qemu:///system)
@@ -70,6 +72,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f $HERE/yolobox-host.nft ]] || die "missing $HERE/yolobox-host.nft"
 [[ -f $HERE/yolobox-host.service ]] || die "missing $HERE/yolobox-host.service"
 [[ -f $HERE/yolobox-libvirt-hook.sh ]] || die "missing $HERE/yolobox-libvirt-hook.sh"
+[[ -f $HERE/$SELINUX_MODULE.cil ]] || die "missing $HERE/$SELINUX_MODULE.cil"
 
 # Checked before anything is installed or enabled, so a host that fails it is
 # left as it was. passt hands the guest the host's resolver, and the guest's DNS
@@ -90,7 +93,7 @@ fi
 
 step "libvirt repository and packages"
 dnf copr enable -y @virtmaint-sig/virt-preview
-dnf install -y libvirt-daemon-kvm libvirt-client edk2-ovmf passt passt-selinux xorriso nftables acl
+dnf install -y libvirt-daemon-kvm libvirt-client edk2-ovmf passt passt-selinux xorriso nftables acl policycoreutils
 
 # The system connection needs its daemons running, so this comes before the
 # version gate and the network step. virtnetworkd is started only so the
@@ -176,6 +179,28 @@ fi
 systemd-tmpfiles --create "$PASST_TMPFILES"
 setfacl -P -m "u:$VM_USER:rwx,m::rwx" "$PASST_DIR"
 
+# The hook below is labelled virt_hook_t, and the policy lets virtqemud_t
+# execute it only while that domain is permissive. The module is installed when
+# it is missing or differs from the checkout's file; semodule -E extracts the
+# installed copy into the current directory as it was installed.
+step "SELinux module that lets virtqemud run the hook"
+modules="$(semodule -l)"
+selinux_module_current=0
+if awk -v m="$SELINUX_MODULE" '$1 == m { found = 1 } END { exit !found }' <<<"$modules"; then
+  extract_dir="$(mktemp -d)"
+  (cd "$extract_dir" && semodule -E "$SELINUX_MODULE" >/dev/null) || {
+    rm -rf "$extract_dir"
+    die "cannot extract the installed SELinux module $SELINUX_MODULE with 'semodule -E'"
+  }
+  if cmp -s "$extract_dir/$SELINUX_MODULE.cil" "$HERE/$SELINUX_MODULE.cil"; then
+    selinux_module_current=1
+  fi
+  rm -rf "$extract_dir"
+fi
+if ((!selinux_module_current)); then
+  semodule -i "$HERE/$SELINUX_MODULE.cil"
+fi
+
 # libvirt recomputes that directory's ACL mask whenever it starts another passt
 # domain, which cuts yolobox-vm's entry down to r-x. A qemu hook re-applies the
 # same fixed setfacl before a yolobox domain starts and after any domain starts
@@ -260,6 +285,7 @@ host-setup done:
   libvirt daemon $libvirt_version, network 'default' off, daemons enabled
   polkit: $SUDO_USER may manage the system libvirt connection
   passt socket directory $PASST_DIR writable by $VM_USER, kept so by $PASST_HOOK
+  SELinux module $SELINUX_MODULE lets virtqemud run $PASST_HOOK
   account $VM_USER, table 'inet yolobox-host' via yolobox-host.service
   resolver $resolver, pool $POOL_NAME at $POOL_PATH
 SUMMARY

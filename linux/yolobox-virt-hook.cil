@@ -1,0 +1,5 @@
+; virtqemud runs the qemu hooks in /etc/libvirt/hooks/qemu.d/, which carry the
+; type virt_hook_t. Fedora's policy lets virtnetworkd_t run a network hook but
+; not virtqemud_t a qemu hook; it works only while virtqemud_t is permissive.
+; open, read and getattr on the hook are already allowed.
+(allow virtqemud_t virt_hook_t (file (execute execute_no_trans)))
