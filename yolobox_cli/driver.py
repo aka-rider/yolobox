@@ -20,7 +20,7 @@ from typing import (
 )
 
 from . import common, ui
-from .config import GIB, LOOPBACK
+from .config import GIB, KIB, LOOPBACK
 from .ui import YoError
 
 if TYPE_CHECKING:
@@ -140,14 +140,45 @@ class Size(NamedTuple):
 NO_SIZE = Size(None, None, None)
 
 
-def size_words(memory_gib: Optional[int], cpus: Optional[int]) -> str:
-    """ "12 GiB, 4 CPUs": what a resize set, naming only what it set."""
-    words = []
-    if memory_gib is not None:
-        words.append("%d GiB" % memory_gib)
-    if cpus is not None:
-        words.append("%d CPU%s" % (cpus, "" if cpus == 1 else "s"))
-    return ", ".join(words)
+def gib_tenths(size: int) -> str:
+    """`size` bytes as a number of GiB in whole tenths, rounded down: a figure
+    short of what was asked never reads as the asked size (1 KiB under 16 GiB
+    is 15.9)."""
+    return "%d.%d" % divmod(size * 10 // GIB, 10)
+
+
+def gib_text(size: int) -> str:
+    return "%s GiB" % gib_tenths(size)
+
+
+def gib_figure(size: int) -> str:
+    """`size` bytes as GiB in whole tenths, rounded down, with no ".0": "16", "1.5"."""
+    return gib_tenths(size).removesuffix(".0")
+
+
+class StartSize(NamedTuple):
+    """The whole size of a box about to start, as the host reports it: an info
+    line never judges whether the box may start, so no part is rounded or
+    refused. Every part is required, so that a driver cannot leave one out."""
+
+    memory_bytes: int
+    cpus: int
+    disk_used_kib: int  # what the image allocates on the host
+    disk_max_bytes: int
+
+
+def start_line(driver_name: str, box_name: str, size: StartSize) -> str:
+    """The one line every start prints: "libvirt: starting ops: 12 GiB RAM, 12
+    CPUs, 3.2/100 GiB disk"."""
+    return "%s: starting %s: %s GiB RAM, %d CPU%s, %s/%s GiB disk" % (
+        driver_name,
+        box_name,
+        gib_figure(size.memory_bytes),
+        size.cpus,
+        "" if size.cpus == 1 else "s",
+        gib_tenths(size.disk_used_kib * KIB),
+        gib_figure(size.disk_max_bytes),
+    )
 
 
 def exact_gib(nbytes: int, what: str) -> int:

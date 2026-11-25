@@ -216,15 +216,8 @@ def lima_instance_exists() -> bool:
     return state.box.name in completed.stdout.splitlines()
 
 
-def lima_instance_info() -> Optional[LimaInfo]:
-    """What limactl reports of this machine; None when there is no such instance.
-
-    Any failure to read an instance that exists is an error, never a missing
-    instance: a box whose limactl is broken would otherwise look like one with
-    no gaps.
-    """
-    if not lima_instance_exists():
-        return None
+def instance_record() -> Tuple[List[str], dict]:
+    """The argv of `limactl list <name> --json` and the one JSON object it printed."""
     argv = limactl("list", state.box.name, "--json")
     completed = proc.checked(proc.run(argv), shlex.join(argv))
     try:
@@ -236,6 +229,42 @@ def lima_instance_info() -> Optional[LimaInfo]:
             "%s did not print one JSON object: %r"
             % (shlex.join(argv), completed.stdout.strip()[:200])
         )
+    return argv, data
+
+
+def positive_int(data: dict, key: str, argv: Sequence[str]) -> int:
+    """`data[key]`, which must be a positive integer. lima omits a zero, so a
+    missing key is a listing yo cannot read, never a size of 0."""
+    value = data.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise YoError(
+            "%s printed %s as %r for %s, not a positive integer"
+            % (shlex.join(argv), key, value, state.box.name)
+        )
+    return value
+
+
+def lima_instance_size() -> Tuple[int, int, int]:
+    """The memory in bytes, the CPU count and the disk's capacity in bytes of
+    this instance, as limactl lists them."""
+    argv, data = instance_record()
+    return (
+        positive_int(data, "memory", argv),
+        positive_int(data, "cpus", argv),
+        positive_int(data, "disk", argv),
+    )
+
+
+def lima_instance_info() -> Optional[LimaInfo]:
+    """What limactl reports of this machine; None when there is no such instance.
+
+    Any failure to read an instance that exists is an error, never a missing
+    instance: a box whose limactl is broken would otherwise look like one with
+    no gaps.
+    """
+    if not lima_instance_exists():
+        return None
+    argv, data = instance_record()
     status = data.get("status")
     if status == BROKEN:
         raise BrokenInstance(broken_instance_message(argv, data))
@@ -753,6 +782,7 @@ class LimaDriver:
         self.refuse_fatal_gaps()
         if size.resizes:
             self.resize(size)
+        ui.out(driver.start_line("lima", state.box.name, self.start_size()))
         # limactl start blocks until lima's own ssh works, which needs the disk
         # unlocked, so it runs beside the unlock instead of before it, and its
         # own deadline must outlast the seed's in-place encryption.
@@ -776,6 +806,15 @@ class LimaDriver:
             starter.terminate()
             starter.wait()
             raise
+
+    def start_size(self) -> driver.StartSize:
+        """The box's whole size, read after any resize and before the start."""
+        memory_bytes, cpus, disk_max_bytes = lima_instance_size()
+        # Lima makes the disk file at the instance's first start, so a box that
+        # was created and never started has none yet.
+        image = self.disk_image()
+        used_kib = 0 if image is None else image[1]
+        return driver.StartSize(memory_bytes, cpus, used_kib, disk_max_bytes)
 
     def wait_until_running(self, starter: subprocess.Popen) -> None:
         """Poll limactl until it reports the instance Running; `limactl start`
@@ -902,10 +941,6 @@ class LimaDriver:
                 "limactl edit refused the resize (exit %d), so %s keeps its old size"
                 % (code, state.box.name)
             )
-        ui.out(
-            "lima: resized %s to %s"
-            % (state.box.name, driver.size_words(size.memory_gib, size.cpus))
-        )
 
 
 LIMA = LimaDriver()

@@ -2672,7 +2672,8 @@ class TestDefinition(LibvirtCase):
             self.addCleanup(patcher.stop)
 
     def start(self):
-        locked(self.box, self.driver.start, lambda: b"pass")
+        with mock.patch.object(self.box.ui, "out"):
+            locked(self.box, self.driver.start, lambda: b"pass")
 
     def test_a_stopped_domain_is_defined_again_from_the_template_on_up(self):
         self.start()
@@ -2833,6 +2834,7 @@ class ExistingBoxCase(LibvirtCase):
         self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
         self.host.capacity["yolobox-box.qcow2"] = self.DISK_GIB << 30
         self.starts = []
+        self.lines = []
 
     @contextlib.contextmanager
     def stubbed(self):
@@ -2847,7 +2849,9 @@ class ExistingBoxCase(LibvirtCase):
             self.host.states["yolobox-box"] = "running"
 
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(self.box.ui, "out"))
+            stack.enter_context(
+                mock.patch.object(self.box.ui, "out", self.lines.append)
+            )
             stack.enter_context(mock.patch.object(self.driver, "require_tool"))
             for target, name, key in (
                 (self.box.agent, "luks_passphrase", "luks_passphrase"),
@@ -3457,8 +3461,23 @@ class TestUpGrowsTheDisk(ExistingBoxCase):
         self.assertEqual(self.events, self.STOPPED_AND_RESTARTED + self.GROWN)
         self.assertEqual(self.memories, [memory, memory])
         self.assertEqual(self.host.capacity["yolobox-box.qcow2"], 200 << 30)
-        # The disk is read once, before anything starts, and not again.
-        self.assertEqual(len(self.host.calls_of("vol-info")), 1)
+        # The disk is read once before anything starts, for the judgement, and
+        # once more by each of the two boots, for the line it prints.
+        self.assertEqual(len(self.host.calls_of("vol-info")), 1 + 2)
+        # Each boot names the box's size, the second one with the grown disk.
+        first, second = [
+            line for line in self.lines if line.startswith("libvirt: starting")
+        ]
+        self.assertEqual(
+            first,
+            "libvirt: starting box: %d GiB RAM, %d CPUs, 2.0/%d GiB disk"
+            % (memory, self.facts.cpus, self.DISK_GIB),
+        )
+        self.assertEqual(
+            second,
+            "libvirt: starting box: %d GiB RAM, %d CPUs, 2.0/200 GiB disk"
+            % (memory, self.facts.cpus),
+        )
         # One source for both boots, and one signature: a Touch ID per command.
         self.assertIs(self.sources[0], self.sources[1])
         stubs["luks_passphrase"].assert_called_once_with()
@@ -3750,12 +3769,22 @@ class TestInitrdListener(LibvirtCase):
 
 
 class TestStart(LibvirtCase):
-    def start(self, memory_gib=None, disk_gib=None, cpus=None, existing=False):
+    def start(
+        self,
+        memory_gib=None,
+        disk_gib=None,
+        cpus=None,
+        existing=False,
+        resize=None,
+    ):
         """driver.create() of the flags as vm_up decides a creation size from
-        them (unless the domain exists), then driver.start()."""
+        them (unless the domain exists), then driver.start() of the `resize`
+        asked of a box that exists."""
         seed = Path(self.home) / "seed.qcow2"
         seed.write_bytes(b"Q" * 4096)
+        self.lines = []
         with (
+            mock.patch.object(self.box.ui, "out", self.lines.append),
             mock.patch.object(
                 self.box.shutil, "which", return_value="/usr/bin/getfacl"
             ),
@@ -3773,7 +3802,10 @@ class TestStart(LibvirtCase):
                     self.driver.create,
                     self.box.Size(memory_gib, disk_gib, cpus).for_creation(),
                 )
-            locked(self.box, self.driver.start, self.passphrase)
+            if resize is None:
+                locked(self.box, self.driver.start, self.passphrase)
+            else:
+                locked(self.box, self.driver.start, self.passphrase, resize)
         return unlock
 
     def passphrase(self):
@@ -3832,6 +3864,59 @@ class TestStart(LibvirtCase):
         self.assertEqual(
             self.host.capacity["yolobox-box.qcow2"], self.box.LIBVIRT_DISK_GIB << 30
         )
+
+    def existing_box(self, cpus=DOMAIN_CPUS):
+        self.host.tagged_domain("box", FIRST_PORT, cpus=cpus)
+        self.host.states["yolobox-box"] = "shut off"
+        self.host.volumes["yolobox-box.qcow2"] = b"a whole disk"
+
+    def test_every_start_says_the_boxs_ram_cpus_and_disk_used_and_max(self):
+        self.start(memory_gib=24, disk_gib=250, cpus=3)
+        # The fake volume allocates 2 GiB on the host.
+        self.assertEqual(
+            self.lines, ["libvirt: starting box: 24 GiB RAM, 3 CPUs, 2.0/250 GiB disk"]
+        )
+
+    def test_a_disk_that_is_not_whole_gib_is_named_in_tenths_and_never_refused(self):
+        self.existing_box()
+        self.host.capacity["yolobox-box.qcow2"] = (100 << 30) + (512 << 20)
+        self.start(existing=True)
+        self.assertEqual(self.host.states["yolobox-box"], "running")
+        self.assertEqual(
+            self.lines,
+            [
+                "libvirt: starting box: %d GiB RAM, %d CPUs, 2.0/100.5 GiB disk"
+                % (self.box.LIBVIRT_MEMORY_GIB, DOMAIN_CPUS)
+            ],
+        )
+
+    def test_a_box_of_one_cpu_says_so_in_the_singular(self):
+        self.start(cpus=1)
+        self.assertEqual(
+            self.lines,
+            [
+                "libvirt: starting box: %d GiB RAM, 1 CPU, 2.0/%d GiB disk"
+                % (self.box.LIBVIRT_MEMORY_GIB, self.box.LIBVIRT_DISK_GIB)
+            ],
+        )
+
+    def test_a_memory_only_resize_still_names_the_cpus_the_domain_has(self):
+        self.existing_box(cpus=6)
+        self.host.capacity["yolobox-box.qcow2"] = 40 << 30
+        self.start(existing=True, resize=self.box.Size(12, None, None))
+        self.assertEqual(
+            self.lines, ["libvirt: starting box: 12 GiB RAM, 6 CPUs, 2.0/40 GiB disk"]
+        )
+
+    def test_a_start_in_which_the_box_cannot_be_measured_says_nothing_and_starts_nothing(
+        self,
+    ):
+        self.existing_box()
+        self.host.fail["vol-info"] = "error: lizard"
+        with self.assertRaisesRegex(self.box.YoError, "lizard"):
+            self.start(existing=True)
+        self.assertEqual(self.lines, [])
+        self.assertEqual(self.host.calls_of("start"), [])
 
     def vcpus(self):
         return ET.fromstring(self.host.domains["yolobox-box"]).findtext("vcpu")

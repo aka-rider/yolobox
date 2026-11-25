@@ -370,17 +370,13 @@ def active_domains_memory() -> Dict[str, int]:
     return memory
 
 
-def gib_text(size: int) -> str:
-    """`size` bytes as GiB in whole tenths, rounded down: a figure short of what
-    was asked never reads as the asked size (1 KiB under 16 GiB is 15.9)."""
-    return "%d.%d GiB" % divmod(size * 10 // GIB, 10)
-
-
 def others_text(others: Dict[str, int]) -> str:
     """The active domains and the whole max memory each may take, as a message names them."""
     return "%s (%s)" % (
-        gib_text(sum(others.values())),
-        ", ".join("%s %s" % (name, gib_text(others[name])) for name in sorted(others))
+        driver.gib_text(sum(others.values())),
+        ", ".join(
+            "%s %s" % (name, driver.gib_text(others[name])) for name in sorted(others)
+        )
         or "none",
     )
 
@@ -413,10 +409,10 @@ def total_memory_refusal(
         % (
             memory_gib,
             libvirt_host.MEMINFO_FILE,
-            gib_text(host),
+            driver.gib_text(host),
             HOST_MEMORY_RESERVE_GIB,
             others_text(others),
-            gib_text(max(room, 0)),
+            driver.gib_text(max(room, 0)),
             " or ".join(ways),
         )
     )
@@ -447,9 +443,9 @@ def available_memory_refusal(
         % (
             memory_gib,
             libvirt_host.MEMINFO_FILE,
-            gib_text(available),
+            driver.gib_text(available),
             HOST_MEMORY_RESERVE_GIB,
-            gib_text(max(room, 0)),
+            driver.gib_text(max(room, 0)),
             ", and the other active domains may take %s" % others_text(others)
             if others
             else "",
@@ -910,10 +906,6 @@ class LibvirtDriver:
             raise YoError(
                 "%s — %s keeps its old size" % (refused.message, state.box.name)
             )
-        ui.out(
-            "libvirt: resized %s to %s"
-            % (state.box.name, driver.size_words(facts.memory_gib, facts.cpus))
-        )
 
     def define_or_recreate(self, facts: DomainFacts) -> None:
         """define_domain, with the way out when libvirt refuses a domain that
@@ -959,6 +951,19 @@ class LibvirtDriver:
                 self.define_resized(facts)
             else:
                 self.define_or_recreate(facts)
+        disk = self.volume_sizes()
+        ui.out(
+            driver.start_line(
+                "libvirt",
+                state.box.name,
+                driver.StartSize(
+                    facts.memory_gib * GIB,
+                    facts.cpus,
+                    disk["Allocation"] // KIB,
+                    disk["Capacity"],
+                ),
+            )
+        )
         # libvirt starts no foreground process: the domain is Running as soon as
         # `virsh start` returns, and unlock_disk judges it by its state alone.
         self.start_domain()

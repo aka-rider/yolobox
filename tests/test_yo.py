@@ -4530,9 +4530,15 @@ class TestLimaStartRefusesOnlyTheGapsThatBreakThePromises(FakeHome):
             mock.patch.object(yo.LIMA, "config_gaps", return_value=gaps),
             mock.patch.object(yo.lima, "lima_instance_exists", return_value=True),
             mock.patch.object(yo.proc, "spawn", return_value=starter) as spawn,
+            mock.patch.object(
+                yo.LIMA,
+                "start_size",
+                return_value=yo.StartSize(16 << 30, 4, 3 << 20, 100 << 30),
+            ),
             mock.patch.object(yo.LIMA, "wait_until_running"),
             mock.patch.object(yo.unlock, "unlock_disk"),
             mock.patch.object(yo.unlock, "wait_for_operator"),
+            mock.patch.object(yo.ui, "out"),
             mock.patch.object(yo.ui, "err", side_effect=warnings.append),
             yo.box_lock(wait=True) as held,
         ):

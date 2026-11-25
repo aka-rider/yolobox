@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import unittest
 from unittest import mock
@@ -689,13 +690,32 @@ class TestVmUpOnAnExistingBox(VmUpOnLima):
 
 class TestLimaStartResizes(unittest.TestCase):
     """The memory and CPUs asked are one `limactl edit` of the stopped instance,
-    made by the start just before it spawns `limactl start`."""
+    made by the start just before it reads the box's size, says it and spawns
+    `limactl start`."""
 
-    def start(self, size, edit_code=0, fatal_gap=None):
+    ALLOCATED_KIB = 3407872  # 3.25 GiB, which is said as 3.2
+    # lima leaves a zero out of the listing (omitempty), so a missing key is
+    # what it sends for a box it cannot size.
+    LEFT_OUT = object()
+
+    def start(
+        self, size, edit_code=0, fatal_gap=None, listed=None, allocated=ALLOCATED_KIB
+    ):
+        """The error the start raised, or None. `listed` is what `limactl list
+        --json` prints of the instance, by default 16 GiB, 4 CPUs and a 100 GiB
+        disk."""
+        listed = {"memory": 16 << 30, "cpus": 4, "disk": 100 << 30, **(listed or {})}
+        listed = {
+            key: value for key, value in listed.items() if value is not self.LEFT_OUT
+        }
         self.order = []
         self.edits = []
 
         def run(argv, **kwargs):
+            if argv[2] == "list":
+                self.order.append("list")
+                payload = json.dumps({"status": "Stopped", "config": {}, **listed})
+                return subprocess.CompletedProcess(argv, 0, payload, "")
             self.order.append("edit")
             self.edits.append((list(argv), kwargs))
             return subprocess.CompletedProcess(argv, edit_code, None, None)
@@ -709,6 +729,9 @@ class TestLimaStartResizes(unittest.TestCase):
             self.out = stack.enter_context(mock.patch.object(yo.ui, "out"))
             stack.enter_context(mock.patch.object(yo.proc, "run", side_effect=run))
             stack.enter_context(mock.patch.object(yo.proc, "spawn", side_effect=spawn))
+            stack.enter_context(
+                mock.patch.object(yo.lima, "du_kib", return_value=allocated)
+            )
             stack.enter_context(
                 mock.patch.object(
                     yo.LIMA,
@@ -726,8 +749,9 @@ class TestLimaStartResizes(unittest.TestCase):
         return None
 
     def test_both_flags_are_one_edit_in_the_instance_directory_before_the_start(self):
-        self.assertIsNone(self.start(yo.Size(24, None, 3)))
-        self.assertEqual(self.order, ["edit", "spawn"])
+        listed = {"memory": 24 << 30, "cpus": 3}
+        self.assertIsNone(self.start(yo.Size(24, None, 3), listed=listed))
+        self.assertEqual(self.order, ["edit", "list", "spawn"])
         ((argv, kwargs),) = self.edits
         self.assertEqual(
             argv,
@@ -747,25 +771,81 @@ class TestLimaStartResizes(unittest.TestCase):
         self.assertEqual(
             kwargs["cwd"], os.path.join(yo.state.home(), ".lima", "second")
         )
-        self.out.assert_called_once_with("lima: resized second to 24 GiB, 3 CPUs")
+        self.out.assert_called_once_with(
+            "lima: starting second: 24 GiB RAM, 3 CPUs, 3.2/100 GiB disk"
+        )
 
     def test_only_what_was_asked_is_edited_and_the_disk_never(self):
-        for size, flags, said in (
-            (yo.Size(24, None, None), ["--memory", "24"], "24 GiB"),
-            (yo.Size(None, None, 3), ["--cpus", "3"], "3 CPUs"),
-            (yo.Size(None, None, 1), ["--cpus", "1"], "1 CPU"),
-            (yo.Size(24, 250, None), ["--memory", "24"], "24 GiB"),
+        for size, flags in (
+            (yo.Size(24, None, None), ["--memory", "24"]),
+            (yo.Size(None, None, 3), ["--cpus", "3"]),
+            (yo.Size(None, None, 1), ["--cpus", "1"]),
+            (yo.Size(24, 250, None), ["--memory", "24"]),
         ):
             with self.subTest(size=size):
                 self.assertIsNone(self.start(size))
                 ((argv, _),) = self.edits
                 self.assertEqual(argv[5:], flags)
-                self.out.assert_called_once_with("lima: resized second to " + said)
+
+    def test_a_start_names_the_whole_box_not_only_what_was_asked(self):
+        for size, listed, said in (
+            (yo.Size(24, None, None), {"memory": 24 << 30}, "24 GiB RAM, 4 CPUs"),
+            (yo.Size(None, None, 1), {"cpus": 1}, "16 GiB RAM, 1 CPU,"),
+            (yo.NO_SIZE, {"disk": 250 << 30}, "16 GiB RAM, 4 CPUs, 3.2/250 GiB disk"),
+        ):
+            with self.subTest(size=size):
+                self.assertIsNone(self.start(size, listed=listed))
+                ((line,), _) = self.out.call_args
+                self.assertIn(said, line)
+
+    def test_the_disk_used_is_rounded_down_and_an_empty_one_is_zero(self):
+        for allocated, said in (((4 << 20) - 1, "3.9"), (0, "0.0")):
+            with self.subTest(allocated=allocated):
+                self.assertIsNone(self.start(yo.NO_SIZE, allocated=allocated))
+                ((line,), _) = self.out.call_args
+                self.assertTrue(line.endswith(", %s/100 GiB disk" % said), line)
 
     def test_a_start_asked_for_nothing_edits_nothing(self):
         self.assertIsNone(self.start(yo.NO_SIZE))
-        self.assertEqual(self.order, ["spawn"])
-        self.out.assert_not_called()
+        self.assertEqual(self.order, ["list", "spawn"])
+        self.out.assert_called_once_with(
+            "lima: starting second: 16 GiB RAM, 4 CPUs, 3.2/100 GiB disk"
+        )
+
+    def test_a_listing_that_does_not_name_the_size_starts_nothing_and_says_so(self):
+        for key, bad in (
+            ("memory", self.LEFT_OUT),
+            ("memory", None),
+            ("memory", 0),
+            ("memory", "lizard"),
+            ("memory", 1.5),
+            ("memory", True),
+            ("cpus", self.LEFT_OUT),
+            ("cpus", 0),
+            ("cpus", -1),
+            ("disk", self.LEFT_OUT),
+            ("disk", 0),
+        ):
+            with self.subTest(key=key, bad=bad):
+                error = self.start(yo.NO_SIZE, listed={key: bad})
+                self.assertIn(key, error.message)
+                self.assertEqual(self.order, ["list"])
+                self.out.assert_not_called()
+
+    def test_a_size_that_is_not_whole_gib_is_named_in_tenths_and_never_refused(self):
+        listed = {"memory": 3 << 29, "disk": (100 << 30) + (512 << 20)}
+        self.assertIsNone(self.start(yo.NO_SIZE, listed=listed))
+        self.assertEqual(self.order, ["list", "spawn"])
+        self.out.assert_called_once_with(
+            "lima: starting second: 1.5 GiB RAM, 4 CPUs, 3.2/100.5 GiB disk"
+        )
+
+    def test_a_box_created_but_never_started_has_no_disk_file_and_says_0_used(self):
+        self.assertIsNone(self.start(yo.NO_SIZE, allocated=None))
+        self.assertEqual(self.order, ["list", "spawn"])
+        self.out.assert_called_once_with(
+            "lima: starting second: 16 GiB RAM, 4 CPUs, 0.0/100 GiB disk"
+        )
 
     def test_an_edit_lima_refuses_starts_nothing_and_says_the_box_keeps_its_size(self):
         error = self.start(yo.Size(24, None, None), edit_code=1)
@@ -782,6 +862,67 @@ class TestLimaStartResizes(unittest.TestCase):
         )
         self.assertIn("mounts host directories", error.message)
         self.assertEqual(self.order, [])
+
+
+class TestLimaCreatedThenStarted(unittest.TestCase):
+    """A box made by `limactl create` has no disk file until its first start,
+    since lima makes it then; the start of the new box must name its size anyway."""
+
+    def yaml_gib(self, key):
+        text = (yo.SCRIPT_DIR / "lima" / "yolobox.yaml").read_text()
+        return int(re.search(r"^%s: (\d+)GiB$" % key, text, re.MULTILINE).group(1))
+
+    def test_a_new_box_starts_with_the_yamls_memory_and_disk_and_no_disk_used(self):
+        created = []
+
+        def run(argv, **kwargs):
+            if argv[2] == "create":
+                created.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, None, None)
+            if argv[2:4] == ["list", "--json"]:
+                # The ports of the instances there are, which are none yet.
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            self.assertEqual(argv[2:4], ["list", "second"], argv)
+            # What lima lists of an instance created from the yaml and --cpus.
+            cpus = int(created[0][created[0].index("--cpus") + 1])
+            listing = {
+                "status": "Stopped",
+                "config": {},
+                "memory": self.yaml_gib("memory") << 30,
+                "cpus": cpus,
+                "disk": self.yaml_gib("disk") << 30,
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps(listing), "")
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(as_instance(INSTANCE_B))
+            out = stack.enter_context(mock.patch.object(yo.ui, "out"))
+            stack.enter_context(mock.patch.object(yo.proc, "run", side_effect=run))
+            stack.enter_context(
+                mock.patch.object(
+                    yo.proc,
+                    "spawn",
+                    return_value=mock.Mock(wait=mock.Mock(return_value=0)),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(yo.lima, "lima_instance_exists", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(yo.driver, "loopback_port_bound", return_value=False)
+            )
+            stack.enter_context(mock.patch.object(yo.LIMA, "refuse_fatal_gaps"))
+            stack.enter_context(mock.patch.object(yo.LIMA, "wait_until_running"))
+            stack.enter_context(mock.patch.object(yo.unlock, "unlock_disk"))
+            stack.enter_context(mock.patch.object(yo.unlock, "wait_for_operator"))
+            locked(yo, yo.LIMA.create, yo.NewBox(None, None, 2))
+            self.assertFalse(
+                os.path.exists(os.path.join(yo.state.instance_dir(), "disk"))
+            )
+            locked(yo, yo.LIMA.start, lambda: b"")
+        out.assert_called_once_with(
+            "lima: starting second: 16 GiB RAM, 2 CPUs, 0.0/100 GiB disk"
+        )
 
 
 class TestLimaGrowDisk(unittest.TestCase):
@@ -853,7 +994,15 @@ class TestEveryLimactlCommandIsQuiet(FakeHome):
             stdout = {
                 "-q": "second\n",
                 "{{.Disk}}": "107374182400\n",
-                "--json": limactl_json(49153) + "\n",
+                "--json": json.dumps(
+                    {
+                        **json.loads(limactl_json(49153)),
+                        "memory": 24 << 30,
+                        "cpus": 3,
+                        "disk": 100 << 30,
+                    }
+                )
+                + "\n",
             }.get(argv[-1], "")
             return subprocess.CompletedProcess(argv, 0, stdout, "")
 
@@ -869,6 +1018,7 @@ class TestEveryLimactlCommandIsQuiet(FakeHome):
             mock.patch.object(yo.proc, "spawn", side_effect=spawn),
             mock.patch.object(yo.driver, "loopback_port_bound", return_value=False),
             mock.patch.object(yo.LIMA, "refuse_fatal_gaps"),
+            mock.patch.object(yo.lima, "du_kib", return_value=1 << 20),
             mock.patch.object(yo.LIMA, "wait_until_running"),
             mock.patch.object(yo.LIMA, "vm_status", return_value=running),
             mock.patch.object(yo.unlock, "unlock_disk"),

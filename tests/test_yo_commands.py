@@ -3004,6 +3004,11 @@ class FakeBox:
             mock.patch.object(yo.sshconfig, "write_ssh_config"),
             mock.patch.object(yo.guest, "ensure_guest_known_hosts"),
             mock.patch.object(yo.LIMA, "config_gaps", return_value=[]),
+            mock.patch.object(
+                yo.LIMA,
+                "start_size",
+                return_value=yo.StartSize(16 << 30, 4, 3 << 20, 100 << 30),
+            ),
             hostagent_holds_the_port(),
             self.clock,
             contextlib.redirect_stdout(self.stdout),
